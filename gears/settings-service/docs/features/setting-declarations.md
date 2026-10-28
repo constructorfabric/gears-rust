@@ -19,6 +19,7 @@
   - [Update Declaration Metadata](#update-declaration-metadata)
   - [Retire Declaration](#retire-declaration)
   - [Reactivate Declaration](#reactivate-declaration)
+  - [Report a Revival](#report-a-revival)
   - [Evolve Declaration](#evolve-declaration)
   - [Declare Dependency Group](#declare-dependency-group)
   - [Read Declarations](#read-declarations)
@@ -36,6 +37,7 @@
   - [Derived Data Classification](#derived-data-classification)
   - [Mutation Class Discipline](#mutation-class-discipline)
   - [Retire and Reactivate Lifecycle](#retire-and-reactivate-lifecycle)
+  - [Revival Report](#revival-report)
   - [Contributed Declaration Protection](#contributed-declaration-protection)
   - [Dependency Group Declaration](#dependency-group-declaration)
   - [Declaration Read Surface](#declaration-read-surface)
@@ -211,14 +213,47 @@ The hardest constraint here is not any single field but the rule connecting them
 5. [x] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
 6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key; an active declaration anywhere on the setting's version-stripped path is found first and the request is an evolution or a `409` (Evolve Declaration), so a revive considers only a path with no active major - `inst-decl-react-6`
 7. [x] - `p1` - **IF** the retired declaration is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, nothing written: a gear's declaration changes only through its owning module, a revive would replace its Schema Default and metadata, and the `settings` package an admin key is composed with is not reserved from modules — judged right after the key is looked up, before the request's value type, classification or default is resolved and before step-up, so no refusal about them stands in front of it - `inst-decl-react-15`
-8. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
-9. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-10. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
-11. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
-12. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-13. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
-14. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
-15. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+8. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
+9. [x] - `p1` - Validate the Schema Default and the remaining body fields against the stored value type before step-up is asked, as the create does - `inst-decl-react-16`
+10. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
+11. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
+12. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
+14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+15. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
+16. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+
+### Report a Revival
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-revival-report`
+
+**Actor**: `cpt-cf-settings-service-actor-platform-admin`
+
+**Success Scenarios**:
+- For a create body that would revive a retired declaration, the retained values that revive would bring back within the caller's administration, each masked by the stricter of its stored classification and the one the body derives and marked when the revive's re-validation would flag it, with the counts — nothing written, no step-up asked, and nothing the revive later requires or checks
+- More retained values than `limit`, or a subtree past the node budget: the first `limit` in traversal order, and `complete` false with lower-bound counts when the budget cut the walk
+- Values at standalone descendants and below them: neither listed nor counted
+- No retained value within the caller's administration: an empty list with `total` 0
+
+**Error Scenarios**:
+- The body is refused as the create would refuse it — the create's own `400`, `404` or `409`, in the create's order — or an active declaration off the body's path — another vendor or package — holds the leaf name in the category (`409 LeafNameTaken`)
+- The body would create, evolve or duplicate rather than revive (`404 nothing_to_revive`)
+- The caller may not create declarations or may not read values (`403`, whatever exists); a retired declaration the caller could not read answers as no retired declaration does (`404 nothing_to_revive`)
+- The Type Validator cannot answer (`503`)
+- A `limit` below 1 (`400`)
+
+**Steps**:
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations/revival-preview with the create body and an optional `limit` (default 100; above 500 clamped to it; below 1 refused `400`) - `inst-decl-revival-1`
+2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` and `read` on the settings value base type, as browse does; **IF** either decision is deny or cannot be obtained → **RETURN** `403`, before the body is looked at, so the answer does not depend on what exists - `inst-decl-revival-2`
+3. [x] - `p1` - Run the create's own checks on the body in the create's order up to the lookup at the composed key and on its version-stripped path — body shape (the create's JSON answers: `400`, `415`, `422`), category (`404`), key segments, display name, Scope Class present and valid (`400`) — and an active `module_contributed` declaration on the path (`409 ContributedDeclarationImmutable`); **IF** one refuses → **RETURN** the create's answer - `inst-decl-revival-3`
+4. [x] - `p1` - **IF** the body would not revive a retired declaration — no retired declaration at the key, or an active declaration on the path, which makes the create an evolution — **OR** the retired declaration fails the single read's gates for the caller — its grant on the key, the administrative domain, `hidden`, licence → **RETURN** `404 nothing_to_revive`, the same answer either way, so beyond the create's own refusals in step 3 the answer reveals nothing of a declaration the caller could not read; the licence predicate joins in R2, as for the single read - `inst-decl-revival-4`
+5. [x] - `p1` - Run the rest of the create's checks on the revive in the create's order, stopping where the create would ask for step-up — the retired declaration `module_contributed` (`409 ContributedDeclarationImmutable`), the value type's traits and the derived classification, the secret boundary (`409 SecretnessChanged`), the Scope Class unchanged (`409 ScopeClassChanged`), the value type unchanged (`409 ValueTypeChanged`), the Schema Default and the remaining body fields (`400`); **IF** one refuses → **RETURN** the create's answer - `inst-decl-revival-5`
+6. [x] - `p1` - **IF** an active declaration off the body's path — another vendor or package — holds the retired declaration's leaf name in the category → **RETURN** `409 LeafNameTaken` - `inst-decl-revival-6`
+7. [x] - `p1` - Walk the caller's own tenant and its descendants breadth-first under the subtree node budget, standalone descendants and their subtrees left out, noting whether the budget or the depth ceiling cut the walk - `inst-decl-revival-7`
+8. [x] - `p1` - DB: under the caller's value-read scope, COUNT the retired declaration's subject-less rows at the walked tenants, SELECT its distinct values there grouped with their multiplicity, and SELECT the listed rows in the walk's order, a batch of tenants at a time, until `limit` rows are in hand - `inst-decl-revival-8`
+9. [x] - `p1` - Re-validate each distinct value, once, as the revive would re-validate it, so every row holding a value that would be flagged is counted and marked, one that validates again is reported clear and a secret is never flagged; **IF** the Type Validator cannot answer → **RETURN** `503` - `inst-decl-revival-9`
+10. [x] - `p1` - Mask each listed value by the stricter of its stored classification and the one the body derives, and withhold the re-validation detail whenever the value is masked - `inst-decl-revival-10`
+11. [x] - `p1` - **RETURN** `200` with the declaration's `key` and id, the first `limit` values in traversal order, `total`, `total_needs_review`, `scanned` and `complete`; nothing stored, no step-up, no audit, no cache touched - `inst-decl-revival-11`
 
 ### Evolve Declaration
 
@@ -473,6 +508,21 @@ Retire **MUST** be an immediate soft delete setting `status` to `retired` in one
 - DB Table: `setting_declarations`
 - Entities: `DeclarationStatus`
 
+### Revival Report
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-revival-report`
+
+The system **MUST** serve `POST /settings-service/v1/declarations/revival-preview`, taking the body of the create that would revive a retired declaration. It **MUST** authorize `create` on the declaration type and `read` on the settings value base type before looking at the body, refusing `403` whatever exists; **MUST** answer the create's own refusals in the create's order, then `409 LeafNameTaken` for an active declaration off the body's path — another vendor or package — holding the leaf name in the category; and **MUST** answer `404 nothing_to_revive` both when the body would not revive and when the retired declaration fails the single read's gates for the caller. It **MUST** report the declaration's retained subject-less values within the caller's administration — the caller's tenant and its descendants under the subtree node budget, standalone descendants left out of the list and the counts — each re-validated as the revive would (a value that validates again reported clear, a secret never flagged), masked by the stricter classification with its detail withheld when masked; the first `limit` (default 100, above 500 clamped, below 1 refused `400`) in traversal order, `total`, `total_needs_review`, `scanned` and `complete`. It **MUST** store nothing, ask no step-up, emit no audit and touch no cache, **MUST** answer `503` when the Type Validator cannot answer, and is advisory: reactivation neither requires it nor checks it. Beyond the create's own refusals, which a caller allowed to create gets from the create as well, it **MUST** disclose nothing of a retired declaration the caller could not read.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-setting-declarations-revival-report`
+
+**Constraints**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
+
+**Touches**:
+- API: `POST /settings-service/v1/declarations/revival-preview`
+- DB Table: `setting_values`
+
 ### Contributed Declaration Protection
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-contributed-protection`
@@ -566,6 +616,20 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
 - [x] Re-declaring a retired key with a different value type is refused `409 value_type_changed` with nothing written; a revive under the same type re-validates every retained value, one that validates goes live and one that does not is flagged `needs_review` with its detail
 - [x] Re-declaring a retired key with a type that flips the secret trait, or with a different scope class, returns `409` and leaves the row retired and its values untouched
+- [x] The revival report for a create body that would revive a retired declaration lists its retained values at the caller's tenant and descendants in traversal order with `total`, `total_needs_review`, `scanned` and `complete`, a value the revive would flag marked with its detail, a previously flagged one that validates again reported clear; nothing is written, no audit is recorded and no step-up is asked
+- [x] A retained value at a standalone descendant, or below one, is neither listed nor counted by the revival report
+- [x] A `pii` retained value is masked, with its detail withheld, for a caller without the PII entitlement; a secret one is the mask token for every caller and never flagged; a stored `public` value under a body deriving `pii` is masked
+- [x] A retired declaration with no retained value in the caller's administration gives `200` with an empty list, `total` 0 and `complete` true
+- [x] The revival report answers `404 nothing_to_revive` for a body that would create, evolve or duplicate, distinct from a missing category's `404`
+- [x] The revival report answers the create's own refusals in the create's order: a missing category `404`, a malformed segment `400`, an active module-contributed declaration on the path `409 ContributedDeclarationImmutable`, an invalid Schema Default `400`
+- [x] The revival report answers the revive's refusals `409 SecretnessChanged`, `409 ScopeClassChanged` and `409 ValueTypeChanged`, and `409 LeafNameTaken` for a leaf name held by an active declaration off the body's path — another vendor or package — in the category, judged after the create's checks so an invalid Schema Default answers first
+- [x] A body that changes both the Scope Class and the value type gets `409 ScopeClassChanged`
+- [x] The revival report answers `403` without `create` or without `read` on the settings value base type, whatever exists, and `404 nothing_to_revive` for a retired declaration `hidden` from the caller — the same answer as when nothing is retired
+- [ ] The revival report answers `404 nothing_to_revive` for a retired declaration outside the caller's grant on its key or its administrative domain, or behind a licence its tenant lacks — the same answer as when nothing is retired
+- [x] An active module-contributed declaration on the body's path answers `409 ContributedDeclarationImmutable` exactly as the create with the same body does, whether or not the caller could read it
+- [x] More retained values than `limit` give the first `limit` and exact counts; a subtree past the node budget gives `complete` false and lower-bound counts; a `limit` above 500 is clamped and one below 1 refused `400`
+- [x] A Type Validator that cannot answer makes the revival report `503`
+- [x] A revive with step-up succeeds whether or not the revival report was requested first, and nothing the report answered is consulted by it
 - [x] Re-declaring an active setting with a different value type evolves it: `200` with `evolved: true`, the next major created and active, every value copied and re-validated with failures flagged `needs_review`, the previous major retired
 - [x] A later shape change evolves the active major, not a retired one, and a repeat of a request that matches the active declaration returns `409` without minting a major
 - [x] An evolution without step-up, of a contributed declaration, or across the secret boundary is refused and leaves the active declaration and its values untouched

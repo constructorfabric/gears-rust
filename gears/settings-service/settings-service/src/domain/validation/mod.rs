@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The Type Validator port and its vocabulary.
 //!
 //! The service consumes GTS types and never authors them. What it owns is the

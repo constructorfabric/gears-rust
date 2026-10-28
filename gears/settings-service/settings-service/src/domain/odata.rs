@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Query options this gear declines across every listing, the fields a
 //! listing orders by, and the shape every listing answers with.
 

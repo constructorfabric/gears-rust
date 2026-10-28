@@ -301,11 +301,12 @@ impl RegisterInstanceInfo {
 
     /// Set the stable addressing labels.
     ///
-    /// Re-registration replaces the directory entry wholesale, but an **empty**
-    /// label set is treated as "preserve the stored labels", not "clear them"
-    /// (see `GearManager::with_metadata_of`): the periodic self-heal and REST
-    /// augmentation re-register without labels and must not erase a shard's
-    /// identity. A non-empty set replaces the stored one. Clearing labels
+    /// Re-registration replaces the directory entry, but an **empty** label
+    /// set is treated as "preserve the stored labels", not "clear them" (see
+    /// `GearManager::with_metadata_of`, which treats an absent REST endpoint,
+    /// `OpenAPI` spec or gRPC service set the same way): the periodic self-heal
+    /// and REST augmentation re-register without labels and must not erase a
+    /// shard's identity. A non-empty set replaces the stored one. Clearing labels
     /// outright is therefore intentionally not expressible — an instance's
     /// labels are its static shard/peer identity for its lifetime; changing
     /// them means restarting with new configuration.

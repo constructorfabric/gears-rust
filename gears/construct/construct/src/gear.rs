@@ -85,6 +85,12 @@ impl Gear for ConstructGear {
         // The settings service and the types registry are resolved from
         // ClientHub on each read, so their start order does not matter.
         let hub = ctx.client_hub();
+        // Everything that can fail runs before either service is stored, so a
+        // failed start leaves the gear uninitialized and a retry can succeed.
+        let types = Arc::new(
+            RegistryRecordTypes::new(Arc::clone(&hub))
+                .context("construct-sdk record base schema")?,
+        );
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
         let defaults = SettingsServiceDefaults::new(Arc::clone(&hub), cfg.personalization_default)
             .context("personalization default setting key")?;
@@ -99,7 +105,7 @@ impl Gear for ConstructGear {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         // @cpt-end:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
         let ports = IntakePorts {
-            types: Arc::new(RegistryRecordTypes::new(hub)?),
+            types,
             switch: Arc::new(ConfigConnectorSwitch::new(cfg.connectors_off)),
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
         };

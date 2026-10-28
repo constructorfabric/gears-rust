@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 //! The minimum the policy table and the trigger floor are written against.
 
 /// The migration's own source, read at compile time.

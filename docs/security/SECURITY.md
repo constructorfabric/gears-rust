@@ -1,6 +1,6 @@
 # Security in Gears
 
-Gears take a **defense-in-depth** approach to security, combining Rust's compile-time safety guarantees with layered static analysis, runtime enforcement, continuous scanning, and structured development processes. This document summarizes the security measures in place across the project.
+Gears take a **defense-in-depth** approach to security and provide application-layer controls that can support a **zero-trust architecture**: request authentication, identity-aware policy enforcement, scoped database access, workload authentication, and protected egress. These controls do not by themselves make a deployment a complete ZTA; several controls require explicit adoption by each gear or enforcement by the deployment platform. See [Section 15, Zero-Trust Architecture Support (NIST SP 800-207 / SP 800-207A)](#15-zero-trust-architecture-support-nist-sp-800-207--sp-800-207a) for implemented controls and current gaps. This document summarizes the security measures in place across the project.
 
 ---
 
@@ -50,7 +50,13 @@ Gears take a **defense-in-depth** approach to security, combining Rust's compile
   - [12. PR Review Bots](#12-pr-review-bots)
   - [13. Specification Templates \& SDLC](#13-specification-templates--sdlc)
   - [14. Repository Scaffolding — Gears CLI](#14-repository-scaffolding--gears-cli)
-  - [15. Opportunities for Improvement](#15-opportunities-for-improvement)
+  - [15. Zero-Trust Architecture Support (NIST SP 800-207 / SP 800-207A)](#15-zero-trust-architecture-support-nist-sp-800-207--sp-800-207a)
+    - [Can Gears Be Used to Build a ZTA-Aligned Service?](#can-gears-be-used-to-build-a-zta-aligned-service)
+    - [Framework, ISV, and Deployment Responsibilities](#framework-isv-and-deployment-responsibilities)
+    - [Coverage of the SP 800-207 Tenets](#coverage-of-the-sp-800-207-tenets)
+    - [Requirements for a ZTA-Aligned Gears Service](#requirements-for-a-zta-aligned-gears-service)
+    - [What Is Not Automatic](#what-is-not-automatic)
+  - [16. Opportunities for Improvement](#16-opportunities-for-improvement)
 
 ---
 
@@ -76,7 +82,7 @@ Additional Rust-specific project practices:
 
 > Source: [`libs/toolkit-db-macros`](../../libs/toolkit-db-macros/) · [`guidelines/SECURITY.md`](../../guidelines/SECURITY.md) · [`docs/toolkit_unified_system/06_authn_authz_secure_orm.md`](../toolkit_unified_system/06_authn_authz_secure_orm.md)
 
-Gears provide a **compile-time enforced** secure ORM layer over SeaORM. The `#[derive(Scopable)]` macro ensures every database entity explicitly declares its scoping dimensions:
+Gears provide a **compile-time enforced secure query path** over SeaORM. For each entity that participates in row-level security, the `#[derive(Scopable)]` macro requires explicit declarations for its supported scoping dimensions:
 
 ```rust
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Scopable)]
@@ -97,10 +103,10 @@ pub struct Model {
 
 **Key compile-time guarantees:**
 
-- **Explicit scoping required** — every entity must declare all four dimensions (`tenant`, `resource`, `owner`, `type`). Missing declarations cause a compile error.
-- **No accidental bypass** — `clippy.toml` configures `disallowed-methods` to block direct `sea_orm::Select::all()`, `::one()`, `::count()`, `UpdateMany::exec()`, and `DeleteMany::exec()`. All queries must go through `SecureSelect`/`SecureUpdateMany`/`SecureDeleteMany`.
-- **Deny-by-default** — empty `AccessScope` (no tenant IDs, no resource IDs) produces `WHERE 1=0`, denying all rows.
-- **Immutable tenant ownership** — updates cannot change `tenant_id` (enforced in `secure_insert`).
+- **Explicit dimensions for scopable entities** — every `Scopable` entity must declare each of the four dimensions (`tenant`, `resource`, `owner`, `type`) as either a concrete column or an explicit `no_*` opt-out. Missing declarations cause a compile error.
+- **Guarded application query path** — `clippy.toml` configures `disallowed-methods` to block common direct SeaORM execution methods in linted code. `SecureConn` keeps its raw connection private, and application queries are expected to use `SecureSelect`/`SecureUpdateMany`/`SecureDeleteMany`. This does not prove that every entity or system/background workflow is tenant-scoped; broad or manually constructed scopes require review.
+- **Deny-by-default** — a deny-all `AccessScope` (no constraints and not explicitly unconstrained) compiles to a `WHERE false` predicate, denying all rows. `AccessScope::allow_all()` is a separate, explicit broad grant that requires review.
+- **Immutable tenant ownership** — secure update paths reject attempts to change `tenant_id`; `secure_insert` separately validates the inserted tenant against the supplied scope.
 - **No SQL injection** — all queries use SeaORM's parameterized query builder.
 
 ## 3. Authentication & Authorization Architecture
@@ -130,7 +136,7 @@ pub struct SecurityContext {
 }
 ```
 
-`bearer_token` is stored as `Secret<String>` — redacted in `Debug`/`Display`, never serialized or logged. Introspection caches key by `sha256(token)`, not the raw token.
+`bearer_token` is stored as `SecretString`, redacted in `Debug`/`Display`, and skipped by `SecurityContext` serialization. The bundled OIDC plugin validates JWTs locally and rejects opaque tokens; it does not maintain a bearer-token introspection cache.
 
 ### AuthN Resolver
 
@@ -142,7 +148,7 @@ The current **OIDC AuthN plugin** supports:
 
 - **JWT tokens** — local validation via OIDC discovery → JWKS → signature verification (`kid`, `exp`, optional `aud`), with configurable claim mapping to `SecurityContext` fields.
 - **Opaque tokens** — out of scope for this plugin; non-JWT bearer tokens are rejected.
-- **S2S identity** — `exchange_client_credentials` (OAuth2 client credentials grant) for service-to-service calls, producing the same `SecurityContext` pipeline.
+- **OAuth2 client credentials** — `exchange_client_credentials` obtains an `AuthenticationResult` for tenant-plane service clients. This is separate from platform-plane workload authentication, which uses `X-ToolKit-Internal-Token` and `PlatformSecurityContext` (Section 15).
 - **Caching** — JWKS cached with refresh and bounded stale serving; S2S tokens cached with TTL bounded by `min(token_exp - now, configured_ttl)`.
 
 ### AuthZ Resolver (PDP) — AuthZEN with Constraint Extensions
@@ -174,7 +180,7 @@ Constraints **OR** across alternatives, **AND** predicates within each constrain
 
 **Token scopes as capability ceiling** — `effective_access = min(token_scopes, user_permissions)`. First-party apps typically carry `["*"]` (unrestricted).
 
-**Deny contract** — `decision: false` must include a `deny_reason` with a GTS `error_code`. Details are logged for audit but never exposed to clients (generic 403 only, no policy leakage).
+**Deny contract** — the design requires `decision: false` to include a `deny_reason` with a machine-readable `error_code`, but the current SDK model accepts an absent reason for interoperability and still denies. Individual gears may log the reason and map it to a generic client error; centralized audit logging is not enforced by `PolicyEnforcer`.
 
 **404 vs 403 for point reads** — Constrained queries returning 0 rows yield 404, preventing existence leakage.
 
@@ -283,7 +289,7 @@ The credential storage design specifies **AES-256-GCM** encryption with **per-te
 
 > Source: [`gears/system/oagw/`](../../gears/system/oagw/) · [`gears/system/oagw/docs/DESIGN.md`](../../gears/system/oagw/docs/DESIGN.md)
 
-OAGW is a **centralized outbound API gateway** built on [Pingora](https://github.com/cloudflare/pingora). All platform traffic to external HTTP services is routed through OAGW, enforcing security and observability policies via a **Control Plane / Data Plane** architecture.
+OAGW is a **centralized outbound API gateway** built on the platform's upstream proxy engine (`libs/toolkit-http-proxy`, [ADR toolkit/0004](../adrs/toolkit/0004-toolkit-http-proxy-engine.md)). All platform traffic to external HTTP services is routed through OAGW, enforcing security and observability policies via a **Control Plane / Data Plane** architecture.
 
 ### Authorization (Platform PEP)
 
@@ -357,19 +363,20 @@ The project enforces **90+ Clippy rules at `deny` level**, including the full `p
 
 ## 7. Compile-Time Linting — Custom Architecture Lints
 
-Project-specific architectural lints run on every CI build via `cargo gears lint` (provided by the `cargo-gears` CLI). These enforce design boundaries that generic linters cannot:
+Project-specific Dylint rules are orchestrated by [`cargo-gears`](https://github.com/constructorfabric/cargo-gears). CI runs `cargo gears lint --dylint`; the CLI embeds a versioned rule set, while [`Gears.toml`](../../Gears.toml) and [`dylint.toml`](../../dylint.toml) select temporary skips and allow-lists. Relevant current rules include:
 
-| ID | Lint | Security Relevance |
+| ID | Lint | Security relevance |
 |---|---|---|
-| **DE0706** | `no_direct_sqlx` | Prohibits direct `sqlx` usage — forces all DB access through SeaORM/SecORM |
-| **DE0708** | `no_non_fips_hasher` | Prohibits `sha2`/`sha1`/`md5` imports outside allow-list — prevents unreviewed non-FIPS crypto usage |
-| DE0103 | `no_http_types_in_contract` | Prevents HTTP types leaking into contract layer |
-| DE0301 | `no_infra_in_domain` | Prevents domain layer from importing `sea_orm`, `sqlx`, `axum`, `hyper`, `http` |
-| DE0308 | `no_http_in_domain` | Prevents HTTP types in domain logic |
+| **DE0706** | `no_direct_sqlx` | Prohibits direct `sqlx` imports so application code uses the SeaORM/SecORM path instead of bypassing scoped access |
+| **DE0707** | `drop_zeroize` | Rejects manual byte-zeroing in `Drop`; secret memory cleanup must use `zeroize` or `secrecy` |
+| **DE0708** | `no_non_fips_hasher` | Prohibits direct `sha2`/`sha1`/`md5` imports outside the configured allow-list |
+| DE0301 | `no_infra_in_domain` | Prevents domain modules from importing infrastructure dependencies such as database and HTTP stacks |
+| DE0308 | `no_http_in_domain` | Prevents HTTP types and status codes from becoming domain policy |
 | DE0801 | `api_endpoint_version` | Enforces versioned API paths (`/{service}/v{N}/{resource}`) |
-| DE1301 | `no_print_macros` | Forbids `println!`/`dbg!` in production code (prevents info leakage) |
+`DE0902` forbids `schema_for` on GTS-typed structs |
+| DE1301 | `no_print_macros` | Forbids print/debug macros in production code, reducing uncontrolled disclosure |
 
-The architectural lints in the `DE03xx` series enforce **strict layering** (contract → domain → infrastructure), preventing accidental coupling that could undermine security boundaries.
+These lints materially strengthen the secure development path, especially layer isolation, direct-SQL prevention, plugin contracts, and GTS correctness. They complement rather than replace framework type-state and runtime controls: the current published rule catalog does **not** itself prove that every protected handler invokes `PolicyEnforcer`, that every entity derives `Scopable`, or that every outbound connection uses OAGW. Those properties come from `OperationBuilder`, Secure ORM APIs/macros, code review and tests, and deployment policy; additional Dylint rules can make more of them build-breaking over time.
 
 ## 8. Dependency Security — cargo-deny
 
@@ -451,7 +458,7 @@ make security           # Runs both `deny` (license/advisory) and `fips-policy`
 
 **Non-FIPS hasher guard** — Architecture lint **DE0708** (`no_non_fips_hasher`, via `cargo gears lint`) rejects new `sha2`/`sha1`/`md5` imports outside an explicit allow-list (one entry: file-storage content hashing — see [Non-cryptographic `sha2` and `rand` usage](#non-cryptographic-sha2-and-rand-usage)), preventing unreviewed non-FIPS crypto usage from creeping in. All previous direct use sites have been replaced with inline FNV-1a (a deterministic, non-cryptographic fingerprint): `libs/toolkit-odata/src/pagination.rs` (cursor consistency) and `oidc-authn-plugin/src/infra/token_client.rs` (credential cache key). `sha2` remains in the dependency graph as a Phase B transitive (via `sqlx-core`, `sqlx-postgres`, `lopdf`, `rust-embed-utils`) and will be promoted to Phase A once those pull-throughs are eliminated.
 
-**Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`pingora-rustls`/`ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
+**Phase B** (pending transitive cleanup) is documented inline in `deny-fips.toml` — `ring`, non-FIPS `aws-lc-rs`, `chacha20`, `md-5`, `sha1`, `blake2`/`blake3`, `aes`, `hmac`, `hkdf`, etc. — currently pulled by upstream deps (`sqlx-core`'s rustls features, `ureq`, rustls's default features, `rand`). Each moves to Phase A as its upstream pull-through is replaced. **Tracking**: [ADR 0005 §"Phasing"](fips/adrs/0005-fips-dependency-policy.md) and [FIPS PRD §13 TODO-7](fips/PRD.md#13-open-questions) — promotion to Phase A is the unit of work; no per-crate sub-tickets today.
 
 ### Runtime Operational Environment validation
 
@@ -562,7 +569,7 @@ See [`examples/cf-gears-fips-probe/README.md`](../../examples/cf-gears-fips-prob
 - **`CryptoProvider::fips() = true` is a runtime witness, not just design intent.** On macOS it reflects the OE check (`oe::fips_witness_ok`); on Windows, the OS FIPS-mode flag. On Linux, runtime OE-validation is not yet implemented; OE coverage is verified manually per release via the §release-checklist CMVP-cert search.
 - **TLS 1.2 PRF on macOS is not CAVS-listed.** Apple corecrypto exposes generic HMAC primitives but not a CAVS-listed dedicated TLS PRF (unlike `aws-lc-fips`'s `tls_prf::Algorithm`). Consequence: `fips_provider()` on macOS is TLS-1.3-only; customers requiring TLS 1.2 on macOS+FIPS must accept that those connections do not carry a FIPS claim.
 - **JWT signature validation does not go through the FIPS path.** `jsonwebtoken` uses `ring` / non-FIPS `aws-lc-rs` for RSA / ECDSA verification on bearer tokens. Treat tokens as authentication context, not as data covered by the cryptographic claim. Out of scope today; tracked as **TODO-7** in [FIPS PRD §13](fips/PRD.md#13-open-questions). Cleanup is gated by `deny-fips.toml` Phase B promotion.
-- **Non-FIPS crypto crates remain in the final binary on macOS+fips.** `ring` is pulled in transitively by `pingora-rustls`, `pingora-pool`, and `ureq`; non-FIPS `aws-lc-rs` is pulled in by rustls's default feature set; `chacha20` is pulled in by the `rand` ecosystem. These are **not invoked** on the TLS data plane (the installed `CryptoProvider` routes every TLS primitive through the validated module) but the symbols are linked into the binary. Linkage smoke (above) confirms no non-validated shared libraries appear at runtime.
+- **Non-FIPS crypto crates remain in the final binary on macOS+fips.** `ring` is pulled in transitively by `sqlx-core`'s rustls features, `file-storage`, and `ureq`; non-FIPS `aws-lc-rs` is pulled in by rustls's default feature set; `chacha20` is pulled in by the `rand` ecosystem. These are **not invoked** on the TLS data plane (the installed `CryptoProvider` routes every TLS primitive through the validated module) but the symbols are linked into the binary. Linkage smoke (above) confirms no non-validated shared libraries appear at runtime.
 - **Server-side TLS keys load from PEM/DER bytes by default.** The bytes transit user-space memory before reaching `SecKeyCreateWithData` / `BCryptImportKeyPair` / `EVP_PKEY_new`. Strict-FIPS auditors operating under "no plaintext CSPs outside the boundary" require a Keychain / NCrypt / HSM flow; tracked as **TODO-1**.
 - **Server-side TLS termination (inbound HTTPS) is out of scope.** The FIPS scope here covers the toolkit's outbound TLS data path; inbound HTTPS termination is delegated to the reverse proxy in front of the gear and is the deployment's responsibility.
 - **The wrapper crates are not themselves CMVP-listed.** Neither `rustls-cng-crypto` nor `cf-gears-rustls-corecrypto-provider` is a CMVP-validated module — each is a thin wrapper over the validated system module it consumes (Windows CNG and Apple corecrypto respectively). The chain-of-trust comes from the underlying validated module, not the wrapper crate.
@@ -657,7 +664,87 @@ Gears provide a CLI tool for scaffolding new repositories that automatically inh
 
 This ensures every new service or gear repository starts with the same defense-in-depth baseline described in this document, eliminating configuration drift across the platform.
 
-## 15. Opportunities for Improvement
+## 15. Zero-Trust Architecture Support (NIST SP 800-207 / SP 800-207A)
+
+> Source: [NIST SP 800-207](https://doi.org/10.6028/NIST.SP.800-207) | [NIST SP 800-207A](https://csrc.nist.gov/pubs/sp/800/207/a/final) | [`docs/arch/authorization/`](../arch/authorization/) | [`toolkit-security`](../../libs/toolkit-security/) | Sections 2-5 and 9
+
+### Can Gears Be Used to Build a ZTA-Aligned Service?
+
+**Yes.** Gears provide the application-level architecture and enforcement primitives needed to build a service aligned with NIST SP 800-207 and SP 800-207A: explicit authentication posture, request identity, PDP/PEP authorization, tenant- and resource-scoped data access, workload identity, protected egress, and structured telemetry. A service built on the guarded path can evaluate access per request without relying on network location.
+
+NIST SP 800-207 describes an architecture rather than a product certification program. Consequently, “ZTA-compliant” is a property of the **implemented service and its deployment**, not of a Rust library in isolation. Gears make that architecture practical and reusable; the ISV using gears supplies organization-specific identity, policy, tenant, and resource semantics, while the deployment supplies network and operational controls.
+
+The resolver and plugin model is a deliberate design choice, not a missing security feature. Different products built on Gears will use different identity providers, policy engines, tenant directories, and resource-group sources. Gears standardize the contracts and the enforcement mechanisms; ISVs then choose or implement plugins that connect those standardized contracts to their own sources of truth.
+
+### Framework, ISV, and Deployment Responsibilities
+
+| Layer | Gears framework provides | ISV / service provides | Deployment provides |
+|---|---|---|---|
+| **Tenant identity** | `OperationBuilder` requires every route to declare `.authenticated()` or `.anonymous()`; AuthN middleware creates a request-scoped `SecurityContext` | AuthN plugin configuration or implementation for the chosen IdP, claim mapping, token scopes, and explicit review of anonymous APIs | IdP availability, key rotation, issuer/audience policy, and production configuration with authentication enabled |
+| **Authorization policy** | AuthZEN-style resolver contract, `PolicyEnforcer`, fail-closed constraint compilation, and `AccessScope` | AuthZ plugin or policy-service integration; resource/action model; RBAC, ABAC, ReBAC, or hybrid policies; calls to `PolicyEnforcer` at sensitive operations | Reliable PDP operation, policy administration, change control, and emergency revocation procedures |
+| **Tenant and group information** | Tenant Resolver and resource-group contracts, hierarchy/barrier predicates, PEP capability negotiation | Tenant Resolver plugin and authoritative tenant/group mappings appropriate to the product | Availability, freshness, and integrity of directory/projection data |
+| **Data enforcement** | `Scopable`, Secure ORM typestate, private raw connection, scoped select/update/delete/insert paths, and deny-all scope semantics | Correct entity scope declarations; use of the PDP-derived scope; explicit justification and tests for global entities, system jobs, and `allow_all()` | Database identity, backup/access controls, encryption, and operational monitoring |
+| **Workload identity** | Separate platform plane with `PlatformSecurityContext`; bootstrap-selected `InternalAuthenticator` with shared-secret and Kubernetes TokenReview providers; HTTP/gRPC internal-token propagation | Selection and configuration of a production-appropriate provider; workload authorization in platform-only handlers and for tenant-plane east-west calls | ServiceAccount lifecycle or equivalent workload identity, protected transport, and optional mesh identity |
+| **Egress** | OAGW authorization, tenant/subject credential isolation, TLS-by-default upstream policy, SSRF controls, rate limits, and observability | Route external integrations through OAGW and define allowed upstreams/plugins | Block direct egress and enforce DNS, firewall, proxy, and certificate policy |
+| **Engineering controls** | `cargo gears lint`/Dylint, Clippy secure-query restrictions, Rust type-state/macros, tests, fuzzing, and dependency policy | Keep the checks enabled, minimize documented skips, add service-specific deny-all/two-tenant tests, and review lint exceptions | Make the checks mandatory in CI and protect the release path |
+| **Telemetry and posture** | Structured logs, metrics, tracing, canonical errors, and secret-redacting types | Security decision/audit events and policy-relevant application signals | Central retention, correlation/SIEM, alerting, device/workload posture sources, and incident response |
+
+Platform authentication uses an `InternalAuthenticator` that is selected at bootstrap by configuration. It does not use GTS plugin discovery. Platform authentication protects discovery itself (DirectoryService and global GTS registration), so using discovery to find the authenticator would create a circular dependency ([ADR-0008](../arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)). Kubernetes TokenReview validates the token only. It does not encrypt the connection, so remote calls still need TLS or mTLS.
+
+### Coverage of the SP 800-207 Tenets
+
+| # | NIST SP 800-207 tenet | Gears capability | What completes the tenet in a service |
+|---|---|---|---|
+| 1 | All data sources and computing services are resources | GTS resource types, versioned service/plugin contracts, `ResourceType` descriptors, and scopable entities provide a consistent resource model | Inventory the protected services and data, assign resource/action identifiers, and define policy for global as well as tenant-scoped resources. NIST does not require every internal ORM table to be a separately exposed policy resource. |
+| 2 | All communication is secured regardless of network location | TLS-capable toolkit clients; OAGW rejects cleartext upstreams by default and FIPS builds reject its insecure opt-out | Terminate inbound TLS, protect remote inter-service traffic with mTLS or an equivalent protected channel (see requirement 7), route external egress through OAGW, and prevent bypass with network policy. |
+| 3 | Access is granted per session or request | Protected requests are authenticated into `SecurityContext`; every `PolicyEnforcer` invocation performs a PDP evaluation and returns operation-specific constraints | Invoke the PEP for every sensitive operation, define the intended lifetime of any policy/backend caches, and test that deny-all policy blocks all protected paths. |
+| 4 | Access is determined by dynamic policy and attributes | The AuthZ contract carries subject, token scopes, tenant context, resource type/properties, and negotiated tenant/group capabilities; constraints become SQL filters | Implement or select the vendor AuthZ plugin and policy source. This ISV-controlled policy is the expected extension point for roles, relationships, risk, time, device posture, and product-specific attributes. |
+| 5 | Integrity and security posture of assets are monitored | Source/build posture controls include Dylint (via `cargo gears`), Clippy, dependency checks, scanners, fuzzing, and review automation; runtime telemetry can carry additional signals | Integrate deployment/device/workload posture sources and decide how those signals affect policy. CI posture alone is not runtime asset posture. |
+| 6 | Authentication and authorization are dynamic and strictly enforced before access | Protected routes reject invalid identity; the PEP yields no grant for deny, timeout/transport failure, missing required constraints, or unsupported constraints; Secure ORM applies accepted scope to data access | Keep production AuthN/workload-auth configured, use the guarded path for every entry point (HTTP, gRPC, local client, worker), and map failures without accidentally granting access. |
+| 7 | Telemetry is collected to improve security posture | OpenTelemetry-compatible traces/metrics, structured logging, canonical errors, and gateway/resolver instrumentation provide the collection foundation | Centralize immutable decision/audit records (see requirement 9), correlate identity-policy-resource outcomes, alert on anomalies, and feed reviewed findings or live risk signals back into policy. |
+
+SP 800-207A’s identity tier maps to Gears’ tenant and platform planes. Select the plane by the operation's tenant scope, not by the caller's user or system role ([ADR-0008](../arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)):
+
+- **Tenant-scoped operations** use `SecurityContext` and tenant AuthZ. This includes background tasks and service-to-service calls that read or write tenant data (for example, with an S2S client-credentials token).
+- **Non-tenant platform operations** use `PlatformSecurityContext`. Examples are DirectoryService registration, heartbeats, and global GTS type registration.
+
+AuthN, AuthZ, and Tenant Resolver plugins let ISVs bind the tenant plane to their own identity and policy infrastructure. The bootstrap-selected `InternalAuthenticator` binds the platform plane to the workload identity source. The SP 800-207A network tier remains composable with a reverse proxy, service mesh, Kubernetes network policy, or equivalent platform controls.
+
+### Requirements for a ZTA-Aligned Gears Service
+
+1. **Model the protection surface** — inventory APIs, local clients, background tasks, data sources, resource types, actions, tenants, groups, and trust boundaries.
+2. **Configure tenant AuthN** — keep API Gateway authentication enabled, retain fail-closed route defaults, connect an AuthN plugin to the production IdP, and explicitly justify every `.anonymous()` route.
+3. **Provide dynamic policy** — implement or select an AuthZ plugin/PDP and define policies using the service’s resource/action model, tenant hierarchy, groups, token scopes, and any required posture attributes.
+4. **Enforce at every tenant-scoped path** — pass `SecurityContext` through public and local clients, call `PolicyEnforcer` before sensitive work, and pass the resulting `AccessScope` into Secure ORM operations. Cover in-process calls and workers as well as REST routes. Platform operations use `PlatformSecurityContext` and workload authorization instead. Do not pass a platform context to the tenant `PolicyEnforcer`. Do not create a tenant context with a nil tenant ID for platform work.
+5. **Prove tenant isolation** — derive `Scopable` where row-level controls apply; test at least two tenants, deny-all policy, cross-tenant reads/writes, global entities, group/hierarchy predicates, and every justified `AccessScope::allow_all()` path.
+6. **Configure workload identity and authorization** — authenticate remote platform-plane calls and require `PlatformSecurityContext` in platform-only handlers. Prefer per-workload Kubernetes TokenReview or an equivalent identity over the shared-secret development provider. For tenant-plane east-west calls, the receiving service must also check that the calling workload may perform the operation. A valid tenant token does not prove this. Keep this workload check separate from tenant authorization.
+7. **Protect communications** — enforce inbound TLS and protected inter-service transport; route external traffic through OAGW; leave cleartext upstreams disabled; prevent direct egress at the deployment layer. A channel other than mTLS counts as equivalent only if it meets these conditions:
+   - It protects integrity and confidentiality and authenticates each peer workload.
+   - Local IPC (for example, a Unix socket) is equivalent only when each workload has its own OS identity. File permissions cannot tell apart workloads that share one OS user. [ADR-0006](../arch/toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md) allows plain UDS between gears that share a UID as a trusted single-node mode. That mode cannot detect a compromised sibling workload, so it does not meet this requirement.
+   - If a service mesh terminates mTLS, the application must receive the verified peer identity from the proxy over a trusted path. The proxy must remove any client-supplied copy of that identity.
+   - The application port must not be reachable around the proxy. Bind it to localhost or block it with network policy.
+8. **Protect credentials and keys** — use production credential-store and key-management backends, least-privilege access, rotation, and audit rather than static development plugins. Define revocation explicitly:
+   - Issuing a replacement certificate does not revoke the previous one. Revoke it, and reject renewal for revoked credentials.
+   - Removing a workload from the directory does not block calls to an endpoint it already knows. Revoke its credential as well.
+   - Set a maximum delay for revoked access to stop, including existing connections and streams. The TokenReview cache can accept a revoked token until its cached result expires (30 s by default, 5 min at most). Streams that were authorized when they opened keep running until the service closes them.
+9. **Operationalize telemetry and posture** — retain AuthN/AuthZ/workload/OAGW decisions centrally, alert on failures and anomalies, and integrate runtime posture or step-up signals when the threat model requires them. Audit records must:
+   - Cover rejected requests, TLS handshake failures, request cancellation, and stream termination, not only successful calls.
+   - Record the workload decision, the tenant decision, and the operation result as separate fields. A workload allow does not prove tenant authorization.
+   - Follow a defined policy when audit storage is unavailable: either reject the operation (fail closed) or buffer records with a stated loss limit and an alert.
+10. **Make validation mandatory** — run Clippy, `cargo gears lint --dylint` (use `--strict` when warning-level rules must fail the build), security/dependency checks, and service-specific security tests in protected CI. Review every `Gears.toml` skip, `dylint.toml` allow-list, lint suppression, and auth-disabled configuration.
+
+### What Is Not Automatic
+
+- `cargo gears` currently enforces many architectural and security-adjacent rules, including direct-`sqlx` prohibition, layer boundaries, plugin contract conventions, and GTS correctness. Its published rules do not yet perform whole-program proof that every sensitive method calls `PolicyEnforcer`, consumes the returned scope, or routes egress through OAGW.
+- `OperationBuilder` makes route authentication posture explicit at compile time, but an authenticated route still needs the service’s resource/action authorization check.
+- Secure ORM makes scoped access the guarded path, but global resources and system/background operations still need an explicit authorization design. Broad scopes are possible by design for legitimate privileged operations and must be reviewed and tested.
+- Plugins deliberately leave IdP, PDP policy semantics, and tenant/group sources under ISV control. A permissive plugin or policy produces a permissive service even though the framework is functioning correctly.
+- Development configurations may disable authentication or use static/shared-secret plugins. They are not a production ZTA baseline.
+- Inbound TLS, inter-workload mTLS, network segmentation, direct-egress prevention, runtime device/workload posture, centralized audit retention, and incident response are deployment capabilities, as is normal for an application framework.
+- Tenant-plane calls carry only the tenant token. The toolkit does not yet give the receiving service a verified identity of the calling workload, so workload authorization for these calls (requirement 6) needs mesh mTLS or an equivalent deployment control.
+- The integrated SPIFFE workload identity flow is not implemented. `toolkit-http` clients can already present a client certificate (`TlsConfig.client_auth`), and `PlatformIdentity::Spiffe` is reserved. What is missing is certificate issuance and rotation, peer identity checks on the receiving side, and workload policy enforcement based on that identity. A SPIFFE URI alone does not make a service compatible with the SPIFFE Workload API. Closing this gap needs a separate implementation design that covers initial trust, enrollment, peer identity checks, certificate renewal, and revocation. [ADR-0006](../arch/toolkit-oop/ADR/0006-cpt-cf-adr-platform-plane-auth.md) sets the direction, and the [ModKit zero-trust design](https://github.com/MikeFalcon77/modkit-zero-trust/blob/main/modkit_zero_trust.MD) is a starting point. The controls in that design are proposed, not implemented.
+
+## 16. Opportunities for Improvement
 
 The following areas have been identified for future hardening:
 
@@ -665,16 +752,25 @@ The following areas have been identified for future hardening:
    - **TODO-7** — JWT signature validation (`jsonwebtoken`) currently uses `ring` / non-FIPS `aws-lc-rs`. Audit the surface and either replace upstream, fork, or restrict JWT to symmetric HMAC. Build-time floor enforced via [`deny-fips.toml`](../../deny-fips.toml) Phase B promotion.
    - **TODO-8** — Runtime Operational Environment validation on Linux + Windows (macOS already has a sysctl-based fail-closed gate). Today OE coverage on Linux + Windows is verified manually per release via CMVP cert search.
    - **TODO-1** — Keychain / NCrypt / HSM-stored private keys for server-side TLS (today's PEM/DER load is acceptable for development and most production deployments where filesystem permissions guard the key).
+
 2. **Secure ORM type-column auto-injection** — the `ScopableEntity` trait supports a `type_col` dimension, but automatic GTS type constraint injection from PDP → `AccessScope` → SQL `WHERE` is under development
+
 3. **Tenant Resolver access-control plugins** — the `Unauthorized` error variant is reserved in the SDK, but no production plugin enforces caller-vs-target authorization (the static plugin allows any caller to query any configured tenant; the single-tenant plugin uses identity matching only). A policy-backed plugin would enforce fine-grained tenant visibility
+
 4. **Security guidelines in spec templates** — add explicit security checklist sections to PRD and DESIGN templates (threat modeling, data classification, authentication requirements per feature)
+
 5. **Security-focused architecture lints** — extend the `DE07xx` series with additional rules:
    - Detecting hardcoded secrets or API keys
    - Enforcing `SecretString` / `SecretValue` usage for sensitive fields
    - Flagging raw SQL string construction
    - Validating `SecurityContext` propagation in gear handlers
+   - Detecting a discarded PDP-derived `AccessScope` or an unjustified production `AccessScope::allow_all()`
+   - Detecting protected service paths with no `PolicyEnforcer` gate and direct external clients that bypass OAGW
+
 6. **Fuzz target expansion** — current implemented targets cover OData parsers (`fuzz_odata_filter`, `fuzz_odata_cursor`, `fuzz_odata_orderby`). Planned targets: `fuzz_yaml_config`, `fuzz_html_parser`, `fuzz_pdf_parser`, `fuzz_json_config`, `fuzz_markdown_parser`
+
 7. **Kani formal verification** — expand use of the [Kani Rust Verifier](https://model-checking.github.io/kani/) for proving safety properties on critical code paths (`make kani`)
+
 8. **SBOM generation** — add Software Bill of Materials generation to CI for supply-chain transparency
 
 ---

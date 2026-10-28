@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-gates:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-atomicity:p1
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-stale:p1
@@ -430,7 +429,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-3
-        if declaration.status == "retired" {
+        if declaration.status.is_retired() {
             return Err(DomainError::Retired {
                 key: declaration.key.clone(),
             });
@@ -832,7 +831,7 @@ where
             .ok_or(DomainError::NotFound {
                 resource: "declaration",
             })?;
-        if live.status == "retired" {
+        if live.status.is_retired() {
             return Err(DomainError::Retired { key: live.key });
         }
         // From here on the declaration is the row as it is inside this

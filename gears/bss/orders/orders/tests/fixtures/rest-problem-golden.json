@@ -1,0 +1,1057 @@
+{
+  "_comment": "REST Problem bytes captured from the pre-D-219 SDK encoder (53091e0d5). D-219 moved the encoder into the gear REST layer; tests/rest_problems.rs proves the wire unchanged.",
+  "boundary_refusals": [
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"not-admissible\",\"context\":{\"data\":{}},\"error_code\":\"NOT_ADMISSIBLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "not-admissible",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\",\"title\":\"Aborted\",\"status\":409,\"detail\":\"version-conflict\",\"context\":{\"data\":{}},\"error_code\":\"VERSION_CONFLICT\",\"error_domain\":\"orders.v1\"}",
+      "reason": "version-conflict",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":412,\"detail\":\"precondition-failed\",\"context\":{\"data\":{}},\"error_code\":\"PRECONDITION_FAILED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "precondition-failed",
+      "status": 412
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\",\"title\":\"Already exists\",\"status\":409,\"detail\":\"idempotency-mismatch\",\"context\":{\"data\":{}},\"error_code\":\"IDEMPOTENCY_MISMATCH\",\"error_domain\":\"orders.v1\"}",
+      "reason": "idempotency-mismatch",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\",\"title\":\"Aborted\",\"status\":409,\"detail\":\"still-processing\",\"context\":{\"data\":{}},\"error_code\":\"STILL_PROCESSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "still-processing",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\",\"title\":\"Aborted\",\"status\":409,\"detail\":\"Authorization context changed. Refresh the order before retrying.\",\"context\":{\"data\":{}},\"error_code\":\"AUTHORIZATION_CONTEXT_CHANGED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "authorization-context-changed",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":428,\"detail\":\"Expected version is required.\",\"context\":{\"data\":{}},\"error_code\":\"EXPECTED_VERSION_REQUIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "expected-version-required",
+      "status": 428
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"request-invalid\",\"context\":{\"data\":{}},\"error_code\":\"REQUEST_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "request-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"category-not-admitted\",\"context\":{\"data\":{}},\"error_code\":\"CATEGORY_NOT_ADMITTED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "category-not-admitted",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\",\"title\":\"Not found\",\"status\":404,\"detail\":\"line-not-found\",\"context\":{\"data\":{}},\"error_code\":\"LINE_NOT_FOUND\",\"error_domain\":\"orders.v1\"}",
+      "reason": "line-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"commercial-field-immutable\",\"context\":{\"data\":{}},\"error_code\":\"COMMERCIAL_FIELD_IMMUTABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "commercial-field-immutable",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"mixed-field-classes\",\"context\":{\"data\":{}},\"error_code\":\"MIXED_FIELD_CLASSES\",\"error_domain\":\"orders.v1\"}",
+      "reason": "mixed-field-classes",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"line-cap-exceeded\",\"context\":{\"data\":{}},\"error_code\":\"LINE_CAP_EXCEEDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "line-cap-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"date-cascade-invalid\",\"context\":{\"data\":{}},\"error_code\":\"DATE_CASCADE_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "date-cascade-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"axis-invalid\",\"context\":{\"data\":{}},\"error_code\":\"AXIS_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "axis-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"contract-not-active\",\"context\":{\"data\":{}},\"error_code\":\"CONTRACT_NOT_ACTIVE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "contract-not-active",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"contract-party-ineligible\",\"context\":{\"data\":{}},\"error_code\":\"CONTRACT_PARTY_INELIGIBLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "contract-party-ineligible",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"quantity-below-floor\",\"context\":{\"data\":{}},\"error_code\":\"QUANTITY_BELOW_FLOOR\",\"error_domain\":\"orders.v1\"}",
+      "reason": "quantity-below-floor",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"market-inconsistent\",\"context\":{\"data\":{}},\"error_code\":\"MARKET_INCONSISTENT\",\"error_domain\":\"orders.v1\"}",
+      "reason": "market-inconsistent",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"reference-unresolvable\",\"context\":{\"data\":{}},\"error_code\":\"REFERENCE_UNRESOLVABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "reference-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"reference-duplicated\",\"context\":{\"data\":{}},\"error_code\":\"REFERENCE_DUPLICATED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "reference-duplicated",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"currency-mixed\",\"context\":{\"data\":{}},\"error_code\":\"CURRENCY_MIXED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "currency-mixed",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"overlap-cardinality-exceeded\",\"context\":{\"data\":{}},\"error_code\":\"OVERLAP_CARDINALITY_EXCEEDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overlap-cardinality-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\",\"title\":\"Already exists\",\"status\":409,\"detail\":\"order-in-flight-for-key\",\"context\":{\"data\":{}},\"error_code\":\"ORDER_IN_FLIGHT_FOR_KEY\",\"error_domain\":\"orders.v1\"}",
+      "reason": "order-in-flight-for-key",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"overlap-key-unresolvable\",\"context\":{\"data\":{}},\"error_code\":\"OVERLAP_KEY_UNRESOLVABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overlap-key-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"pin-unresolvable\",\"context\":{\"data\":{}},\"error_code\":\"PIN_UNRESOLVABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "pin-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"no-lines\",\"context\":{\"data\":{}},\"error_code\":\"NO_LINES\",\"error_domain\":\"orders.v1\"}",
+      "reason": "no-lines",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"catalog-predicates-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"CATALOG_PREDICATES_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "catalog-predicates-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"pricing-revision-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"PRICING_REVISION_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "pricing-revision-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"pricing-revision-absent\",\"context\":{\"data\":{}},\"error_code\":\"PRICING_REVISION_ABSENT\",\"error_domain\":\"orders.v1\"}",
+      "reason": "pricing-revision-absent",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"catalog-pin-composition-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"CATALOG_PIN_COMPOSITION_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "catalog-pin-composition-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"order-binding-expired\",\"context\":{\"data\":{}},\"error_code\":\"ORDER_BINDING_EXPIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "order-binding-expired",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"order-binding-policy-missing\",\"context\":{\"data\":{}},\"error_code\":\"ORDER_BINDING_POLICY_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "order-binding-policy-missing",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~\",\"title\":\"Resource exhausted\",\"status\":429,\"detail\":\"purchase-capacity-exceeded\",\"context\":{\"data\":{}},\"error_code\":\"PURCHASE_CAPACITY_EXCEEDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "purchase-capacity-exceeded",
+      "status": 429
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"overlap-key-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"OVERLAP_KEY_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overlap-key-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"catalog-predicate-failed\",\"context\":{\"data\":{}},\"error_code\":\"CATALOG_PREDICATE_FAILED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "catalog-predicate-failed",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"catalog-predicate-unevaluable\",\"context\":{\"data\":{}},\"error_code\":\"CATALOG_PREDICATE_UNEVALUABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "catalog-predicate-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"identity-party-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"IDENTITY_PARTY_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "identity-party-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"contract-resolution-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"CONTRACT_RESOLUTION_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "contract-resolution-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"overlap-presence-unevaluable\",\"context\":{\"data\":{}},\"error_code\":\"OVERLAP_PRESENCE_UNEVALUABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overlap-presence-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"evaluation-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"EVALUATION_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "evaluation-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"indicative-tax-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"INDICATIVE_TAX_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "indicative-tax-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"market-divergence\",\"context\":{\"data\":{}},\"error_code\":\"MARKET_DIVERGENCE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "market-divergence",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"overlap-collision\",\"context\":{\"data\":{}},\"error_code\":\"OVERLAP_COLLISION\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overlap-collision",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"payer-rebinding-requires-seller\",\"context\":{\"data\":{}},\"error_code\":\"PAYER_REBINDING_REQUIRES_SELLER\",\"error_domain\":\"orders.v1\"}",
+      "reason": "payer-rebinding-requires-seller",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"tenant-axis-immutable\",\"context\":{\"data\":{}},\"error_code\":\"TENANT_AXIS_IMMUTABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "tenant-axis-immutable",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"administrative-field-in-amendment\",\"context\":{\"data\":{}},\"error_code\":\"ADMINISTRATIVE_FIELD_IN_AMENDMENT\",\"error_domain\":\"orders.v1\"}",
+      "reason": "administrative-field-in-amendment",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"amendment-empty\",\"context\":{\"data\":{}},\"error_code\":\"AMENDMENT_EMPTY\",\"error_domain\":\"orders.v1\"}",
+      "reason": "amendment-empty",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"amendment-reason-invalid\",\"context\":{\"data\":{}},\"error_code\":\"AMENDMENT_REASON_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "amendment-reason-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\",\"title\":\"Not found\",\"status\":404,\"detail\":\"version-not-found\",\"context\":{\"data\":{}},\"error_code\":\"VERSION_NOT_FOUND\",\"error_domain\":\"orders.v1\"}",
+      "reason": "version-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"amendment-cap-exhausted\",\"context\":{\"data\":{}},\"error_code\":\"AMENDMENT_CAP_EXHAUSTED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "amendment-cap-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"administrative-edit-unchanged\",\"context\":{\"data\":{}},\"error_code\":\"ADMINISTRATIVE_EDIT_UNCHANGED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "administrative-edit-unchanged",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\",\"title\":\"Already exists\",\"status\":409,\"detail\":\"acceptance-already-recorded\",\"context\":{\"data\":{}},\"error_code\":\"ACCEPTANCE_ALREADY_RECORDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acceptance-already-recorded",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\",\"title\":\"Permission denied\",\"status\":403,\"detail\":\"acceptance-recording-party-barred\",\"context\":{\"data\":{}},\"error_code\":\"ACCEPTANCE_RECORDING_PARTY_BARRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acceptance-recording-party-barred",
+      "status": 403
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"acceptance-required-not-recorded\",\"context\":{\"data\":{}},\"error_code\":\"ACCEPTANCE_REQUIRED_NOT_RECORDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acceptance-required-not-recorded",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"authorization-pending\",\"context\":{\"data\":{}},\"error_code\":\"AUTHORIZATION_PENDING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "authorization-pending",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"authorization-failed\",\"context\":{\"data\":{}},\"error_code\":\"AUTHORIZATION_FAILED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "authorization-failed",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"acceptance-requirement-unevaluable\",\"context\":{\"data\":{}},\"error_code\":\"ACCEPTANCE_REQUIREMENT_UNEVALUABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acceptance-requirement-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"verdict-authority-missing\",\"context\":{\"data\":{}},\"error_code\":\"VERDICT_AUTHORITY_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "verdict-authority-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"denial-reason-missing\",\"context\":{\"data\":{}},\"error_code\":\"DENIAL_REASON_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "denial-reason-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\",\"title\":\"Already exists\",\"status\":409,\"detail\":\"spawn-signal-already-recorded\",\"context\":{\"data\":{}},\"error_code\":\"SPAWN_SIGNAL_ALREADY_RECORDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "spawn-signal-already-recorded",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"acknowledgement-lines-incomplete\",\"context\":{\"data\":{}},\"error_code\":\"ACKNOWLEDGEMENT_LINES_INCOMPLETE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acknowledgement-lines-incomplete",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"acknowledgement-subscription-missing\",\"context\":{\"data\":{}},\"error_code\":\"ACKNOWLEDGEMENT_SUBSCRIPTION_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acknowledgement-subscription-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"acknowledgement-subscription-duplicated\",\"context\":{\"data\":{}},\"error_code\":\"ACKNOWLEDGEMENT_SUBSCRIPTION_DUPLICATED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "acknowledgement-subscription-duplicated",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"failure-reason-missing\",\"context\":{\"data\":{}},\"error_code\":\"FAILURE_REASON_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "failure-reason-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"compensation-evidence-missing\",\"context\":{\"data\":{}},\"error_code\":\"COMPENSATION_EVIDENCE_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "compensation-evidence-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"compensation-evidence-incomplete\",\"context\":{\"data\":{}},\"error_code\":\"COMPENSATION_EVIDENCE_INCOMPLETE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "compensation-evidence-incomplete",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"prehold-not-in-fulfillment\",\"context\":{\"data\":{}},\"error_code\":\"PREHOLD_NOT_IN_FULFILLMENT\",\"error_domain\":\"orders.v1\"}",
+      "reason": "prehold-not-in-fulfillment",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"resume-target-missing\",\"context\":{\"data\":{}},\"error_code\":\"RESUME_TARGET_MISSING\",\"error_domain\":\"orders.v1\"}",
+      "reason": "resume-target-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"resume-cap-exhausted\",\"context\":{\"data\":{}},\"error_code\":\"RESUME_CAP_EXHAUSTED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "resume-cap-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"expiry-exempt-prehold\",\"context\":{\"data\":{}},\"error_code\":\"EXPIRY_EXEMPT_PREHOLD\",\"error_domain\":\"orders.v1\"}",
+      "reason": "expiry-exempt-prehold",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"expiry-not-due\",\"context\":{\"data\":{}},\"error_code\":\"EXPIRY_NOT_DUE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "expiry-not-due",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\",\"title\":\"Aborted\",\"status\":409,\"detail\":\"expiry-candidate-stale\",\"context\":{\"data\":{}},\"error_code\":\"EXPIRY_CANDIDATE_STALE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "expiry-candidate-stale",
+      "status": 409
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"cancel-reason-required\",\"context\":{\"data\":{}},\"error_code\":\"CANCEL_REASON_REQUIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "cancel-reason-required",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"direct-cancel-window-closed\",\"context\":{\"data\":{}},\"error_code\":\"DIRECT_CANCEL_WINDOW_CLOSED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "direct-cancel-window-closed",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"forced-failure-reason-required\",\"context\":{\"data\":{}},\"error_code\":\"FORCED_FAILURE_REASON_REQUIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "forced-failure-reason-required",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"spawn-signal-not-recorded\",\"context\":{\"data\":{}},\"error_code\":\"SPAWN_SIGNAL_NOT_RECORDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "spawn-signal-not-recorded",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"grant-source-mismatch\",\"context\":{\"data\":{}},\"error_code\":\"GRANT_SOURCE_MISMATCH\",\"error_domain\":\"orders.v1\"}",
+      "reason": "grant-source-mismatch",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"grant-predecessor-unsettled\",\"context\":{\"data\":{}},\"error_code\":\"GRANT_PREDECESSOR_UNSETTLED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "grant-predecessor-unsettled",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"grant-generation-exhausted\",\"context\":{\"data\":{}},\"error_code\":\"GRANT_GENERATION_EXHAUSTED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "grant-generation-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"overdue-window-not-elapsed\",\"context\":{\"data\":{}},\"error_code\":\"OVERDUE_WINDOW_NOT_ELAPSED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "overdue-window-not-elapsed",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"second-approver-required\",\"context\":{\"data\":{}},\"error_code\":\"SECOND_APPROVER_REQUIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "second-approver-required",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\",\"title\":\"Not found\",\"status\":404,\"detail\":\"order-not-found\",\"context\":{\"data\":{}},\"error_code\":\"ORDER_NOT_FOUND\",\"error_domain\":\"orders.v1\"}",
+      "reason": "order-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\",\"title\":\"Permission denied\",\"status\":403,\"detail\":\"delegation-proof-required\",\"context\":{\"data\":{}},\"error_code\":\"DELEGATION_PROOF_REQUIRED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "delegation-proof-required",
+      "status": 403
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\",\"title\":\"Permission denied\",\"status\":403,\"detail\":\"delegation-proof-invalid\",\"context\":{\"data\":{}},\"error_code\":\"DELEGATION_PROOF_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "delegation-proof-invalid",
+      "status": 403
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\",\"title\":\"Permission denied\",\"status\":403,\"detail\":\"operation-not-permitted-for-actor\",\"context\":{\"data\":{}},\"error_code\":\"OPERATION_NOT_PERMITTED_FOR_ACTOR\",\"error_domain\":\"orders.v1\"}",
+      "reason": "operation-not-permitted-for-actor",
+      "status": 403
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"page-size-exceeded\",\"context\":{\"data\":{}},\"error_code\":\"PAGE_SIZE_EXCEEDED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "page-size-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"filter-invalid\",\"context\":{\"data\":{}},\"error_code\":\"FILTER_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "filter-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"cursor-invalid\",\"context\":{\"data\":{}},\"error_code\":\"CURSOR_INVALID\",\"error_domain\":\"orders.v1\"}",
+      "reason": "cursor-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"read-store-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"READ_STORE_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
+      "reason": "read-store-unavailable",
+      "status": 503
+    }
+  ],
+  "infrastructure": [
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service Unavailable\",\"status\":503,\"detail\":\"Service temporarily unavailable\",\"context\":{}}",
+      "error": "unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~\",\"title\":\"Internal\",\"status\":500,\"detail\":\"An internal error occurred. Please retry later.\",\"context\":{}}",
+      "error": "integration",
+      "status": 500
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~\",\"title\":\"Internal\",\"status\":500,\"detail\":\"An internal error occurred. Please retry later.\",\"context\":{}}",
+      "error": "internal",
+      "status": 500
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service Unavailable\",\"status\":503,\"detail\":\"The outcome is unknown. Retry with the same idempotency key to resolve it.\",\"context\":{}}",
+      "error": "outcome-unknown",
+      "status": 503
+    }
+  ],
+  "settled_refusals": [
+    {
+      "body": "{\"context\":{\"data\":{\"state\":\"submitted\",\"trigger\":\"draft-mutate\"}},\"detail\":\"not-admissible\",\"error_code\":\"NOT_ADMISSIBLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "state": "submitted",
+        "trigger": "draft-mutate"
+      },
+      "reason": "not-admissible",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"current_version\":3,\"draft_revision\":2}},\"detail\":\"version-conflict\",\"error_code\":\"VERSION_CONFLICT\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Aborted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\"}",
+      "data": {
+        "current_version": 3,
+        "draft_revision": 2
+      },
+      "reason": "version-conflict",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"current_version\":7}},\"detail\":\"version-conflict\",\"error_code\":\"VERSION_CONFLICT\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Aborted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\"}",
+      "data": {
+        "current_version": 7
+      },
+      "reason": "version-conflict",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"current_version\":3,\"draft_revision\":2}},\"detail\":\"precondition-failed\",\"error_code\":\"PRECONDITION_FAILED\",\"error_domain\":\"orders.v1\",\"status\":412,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "current_version": 3,
+        "draft_revision": 2
+      },
+      "reason": "precondition-failed",
+      "status": 412
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"current_version\":7}},\"detail\":\"precondition-failed\",\"error_code\":\"PRECONDITION_FAILED\",\"error_domain\":\"orders.v1\",\"status\":412,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "current_version": 7
+      },
+      "reason": "precondition-failed",
+      "status": 412
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"idempotency-mismatch\",\"error_code\":\"IDEMPOTENCY_MISMATCH\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Already exists\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\"}",
+      "data": {},
+      "reason": "idempotency-mismatch",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"still-processing\",\"error_code\":\"STILL_PROCESSING\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Aborted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\"}",
+      "data": {},
+      "reason": "still-processing",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"authorization-context-changed\",\"error_code\":\"AUTHORIZATION_CONTEXT_CHANGED\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Aborted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\"}",
+      "data": {},
+      "reason": "authorization-context-changed",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"expected-version-required\",\"error_code\":\"EXPECTED_VERSION_REQUIRED\",\"error_domain\":\"orders.v1\",\"status\":428,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "expected-version-required",
+      "status": 428
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"request-invalid\",\"error_code\":\"REQUEST_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "request-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"category-not-admitted\",\"error_code\":\"CATEGORY_NOT_ADMITTED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "category-not-admitted",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"line-not-found\",\"error_code\":\"LINE_NOT_FOUND\",\"error_domain\":\"orders.v1\",\"status\":404,\"title\":\"Not found\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\"}",
+      "data": {},
+      "reason": "line-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"commercial-field-immutable\",\"error_code\":\"COMMERCIAL_FIELD_IMMUTABLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "commercial-field-immutable",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"mixed-field-classes\",\"error_code\":\"MIXED_FIELD_CLASSES\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "mixed-field-classes",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"line-cap-exceeded\",\"error_code\":\"LINE_CAP_EXCEEDED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "line-cap-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"date-cascade-invalid\",\"error_code\":\"DATE_CASCADE_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "date-cascade-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"axis-invalid\",\"error_code\":\"AXIS_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "axis-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"contract-not-active\",\"error_code\":\"CONTRACT_NOT_ACTIVE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "contract-not-active",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"contract-party-ineligible\",\"error_code\":\"CONTRACT_PARTY_INELIGIBLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "contract-party-ineligible",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"quantity-below-floor\",\"error_code\":\"QUANTITY_BELOW_FLOOR\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "quantity-below-floor",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"market-inconsistent\",\"error_code\":\"MARKET_INCONSISTENT\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "market-inconsistent",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"reference-unresolvable\",\"error_code\":\"REFERENCE_UNRESOLVABLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "reference-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"reference-duplicated\",\"error_code\":\"REFERENCE_DUPLICATED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "reference-duplicated",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"currency-mixed\",\"error_code\":\"CURRENCY_MIXED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "currency-mixed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"overlap-cardinality-exceeded\",\"error_code\":\"OVERLAP_CARDINALITY_EXCEEDED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "overlap-cardinality-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"order-in-flight-for-key\",\"error_code\":\"ORDER_IN_FLIGHT_FOR_KEY\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Already exists\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\"}",
+      "data": {},
+      "reason": "order-in-flight-for-key",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"overlap-key-unresolvable\",\"error_code\":\"OVERLAP_KEY_UNRESOLVABLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "overlap-key-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"pin-unresolvable\",\"error_code\":\"PIN_UNRESOLVABLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "pin-unresolvable",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"no-lines\",\"error_code\":\"NO_LINES\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "no-lines",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"catalog-predicates-unavailable\",\"error_code\":\"CATALOG_PREDICATES_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "catalog-predicates-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"pricing-revision-unavailable\",\"error_code\":\"PRICING_REVISION_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "pricing-revision-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"pricing-revision-absent\",\"error_code\":\"PRICING_REVISION_ABSENT\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "pricing-revision-absent",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"catalog-pin-composition-unavailable\",\"error_code\":\"CATALOG_PIN_COMPOSITION_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "catalog-pin-composition-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"order-binding-expired\",\"error_code\":\"ORDER_BINDING_EXPIRED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "order-binding-expired",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"order-binding-policy-missing\",\"error_code\":\"ORDER_BINDING_POLICY_MISSING\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "order-binding-policy-missing",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"purchase-capacity-exceeded\",\"error_code\":\"PURCHASE_CAPACITY_EXCEEDED\",\"error_domain\":\"orders.v1\",\"status\":429,\"title\":\"Resource exhausted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.resource_exhausted.v1~\"}",
+      "data": {},
+      "reason": "purchase-capacity-exceeded",
+      "status": 429
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"overlap-key-unavailable\",\"error_code\":\"OVERLAP_KEY_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "overlap-key-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"catalog-predicate-failed\",\"error_code\":\"CATALOG_PREDICATE_FAILED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "catalog-predicate-failed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"catalog-predicate-unevaluable\",\"error_code\":\"CATALOG_PREDICATE_UNEVALUABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "catalog-predicate-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"identity-party-unavailable\",\"error_code\":\"IDENTITY_PARTY_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "identity-party-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"contract-resolution-unavailable\",\"error_code\":\"CONTRACT_RESOLUTION_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "contract-resolution-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"overlap-presence-unevaluable\",\"error_code\":\"OVERLAP_PRESENCE_UNEVALUABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "overlap-presence-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"evaluation-unavailable\",\"error_code\":\"EVALUATION_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "evaluation-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"indicative-tax-unavailable\",\"error_code\":\"INDICATIVE_TAX_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "indicative-tax-unavailable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"market-divergence\",\"error_code\":\"MARKET_DIVERGENCE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "market-divergence",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"blocked\":[{\"conflicting_order_id\":\"6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11\",\"overlap_scope_key\":\"k-1\"},{\"conflicting_order_id\":null,\"overlap_scope_key\":\"k-2\"}]}},\"detail\":\"overlap-collision\",\"error_code\":\"OVERLAP_COLLISION\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "blocked": [
+          {
+            "conflicting_order_id": "6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11",
+            "overlap_scope_key": "k-1"
+          },
+          {
+            "conflicting_order_id": null,
+            "overlap_scope_key": "k-2"
+          }
+        ]
+      },
+      "reason": "overlap-collision",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"payer-rebinding-requires-seller\",\"error_code\":\"PAYER_REBINDING_REQUIRES_SELLER\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "payer-rebinding-requires-seller",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"tenant-axis-immutable\",\"error_code\":\"TENANT_AXIS_IMMUTABLE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "tenant-axis-immutable",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"administrative-field-in-amendment\",\"error_code\":\"ADMINISTRATIVE_FIELD_IN_AMENDMENT\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "administrative-field-in-amendment",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"amendment-empty\",\"error_code\":\"AMENDMENT_EMPTY\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "amendment-empty",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"amendment-reason-invalid\",\"error_code\":\"AMENDMENT_REASON_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "amendment-reason-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"version-not-found\",\"error_code\":\"VERSION_NOT_FOUND\",\"error_domain\":\"orders.v1\",\"status\":404,\"title\":\"Not found\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\"}",
+      "data": {},
+      "reason": "version-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"amendment-cap-exhausted\",\"error_code\":\"AMENDMENT_CAP_EXHAUSTED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "amendment-cap-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"administrative-edit-unchanged\",\"error_code\":\"ADMINISTRATIVE_EDIT_UNCHANGED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "administrative-edit-unchanged",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acceptance-already-recorded\",\"error_code\":\"ACCEPTANCE_ALREADY_RECORDED\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Already exists\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\"}",
+      "data": {},
+      "reason": "acceptance-already-recorded",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acceptance-recording-party-barred\",\"error_code\":\"ACCEPTANCE_RECORDING_PARTY_BARRED\",\"error_domain\":\"orders.v1\",\"status\":403,\"title\":\"Permission denied\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\"}",
+      "data": {},
+      "reason": "acceptance-recording-party-barred",
+      "status": 403
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acceptance-required-not-recorded\",\"error_code\":\"ACCEPTANCE_REQUIRED_NOT_RECORDED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "acceptance-required-not-recorded",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"authorization-pending\",\"error_code\":\"AUTHORIZATION_PENDING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "authorization-pending",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"authorization-failed\",\"error_code\":\"AUTHORIZATION_FAILED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "authorization-failed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acceptance-requirement-unevaluable\",\"error_code\":\"ACCEPTANCE_REQUIREMENT_UNEVALUABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "acceptance-requirement-unevaluable",
+      "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"verdict-authority-missing\",\"error_code\":\"VERDICT_AUTHORITY_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "verdict-authority-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"denial-reason-missing\",\"error_code\":\"DENIAL_REASON_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "denial-reason-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"spawn-signal-already-recorded\",\"error_code\":\"SPAWN_SIGNAL_ALREADY_RECORDED\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Already exists\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.already_exists.v1~\"}",
+      "data": {},
+      "reason": "spawn-signal-already-recorded",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acknowledgement-lines-incomplete\",\"error_code\":\"ACKNOWLEDGEMENT_LINES_INCOMPLETE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "acknowledgement-lines-incomplete",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acknowledgement-subscription-missing\",\"error_code\":\"ACKNOWLEDGEMENT_SUBSCRIPTION_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "acknowledgement-subscription-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"acknowledgement-subscription-duplicated\",\"error_code\":\"ACKNOWLEDGEMENT_SUBSCRIPTION_DUPLICATED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "acknowledgement-subscription-duplicated",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"failure-reason-missing\",\"error_code\":\"FAILURE_REASON_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "failure-reason-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"compensation-evidence-missing\",\"error_code\":\"COMPENSATION_EVIDENCE_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "compensation-evidence-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"compensation-evidence-incomplete\",\"error_code\":\"COMPENSATION_EVIDENCE_INCOMPLETE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "compensation-evidence-incomplete",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"prehold-not-in-fulfillment\",\"error_code\":\"PREHOLD_NOT_IN_FULFILLMENT\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "prehold-not-in-fulfillment",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"resume-target-missing\",\"error_code\":\"RESUME_TARGET_MISSING\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "resume-target-missing",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"resume-cap-exhausted\",\"error_code\":\"RESUME_CAP_EXHAUSTED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "resume-cap-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"expiry-exempt-prehold\",\"error_code\":\"EXPIRY_EXEMPT_PREHOLD\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "expiry-exempt-prehold",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"expiry-not-due\",\"error_code\":\"EXPIRY_NOT_DUE\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "expiry-not-due",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"expiry-candidate-stale\",\"error_code\":\"EXPIRY_CANDIDATE_STALE\",\"error_domain\":\"orders.v1\",\"status\":409,\"title\":\"Aborted\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.aborted.v1~\"}",
+      "data": {},
+      "reason": "expiry-candidate-stale",
+      "status": 409
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"cancel-reason-required\",\"error_code\":\"CANCEL_REASON_REQUIRED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "cancel-reason-required",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"direct-cancel-window-closed\",\"error_code\":\"DIRECT_CANCEL_WINDOW_CLOSED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "direct-cancel-window-closed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"forced-failure-reason-required\",\"error_code\":\"FORCED_FAILURE_REASON_REQUIRED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "forced-failure-reason-required",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"spawn-signal-not-recorded\",\"error_code\":\"SPAWN_SIGNAL_NOT_RECORDED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "spawn-signal-not-recorded",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"grant-source-mismatch\",\"error_code\":\"GRANT_SOURCE_MISMATCH\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "grant-source-mismatch",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"grant-predecessor-unsettled\",\"error_code\":\"GRANT_PREDECESSOR_UNSETTLED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "grant-predecessor-unsettled",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"grant-generation-exhausted\",\"error_code\":\"GRANT_GENERATION_EXHAUSTED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "grant-generation-exhausted",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"overdue-window-not-elapsed\",\"error_code\":\"OVERDUE_WINDOW_NOT_ELAPSED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "overdue-window-not-elapsed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"request_audit_id\":\"0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10\"}},\"detail\":\"second-approver-required\",\"error_code\":\"SECOND_APPROVER_REQUIRED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "request_audit_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10"
+      },
+      "reason": "second-approver-required",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"order-not-found\",\"error_code\":\"ORDER_NOT_FOUND\",\"error_domain\":\"orders.v1\",\"status\":404,\"title\":\"Not found\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.not_found.v1~\"}",
+      "data": {},
+      "reason": "order-not-found",
+      "status": 404
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"delegation-proof-required\",\"error_code\":\"DELEGATION_PROOF_REQUIRED\",\"error_domain\":\"orders.v1\",\"status\":403,\"title\":\"Permission denied\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\"}",
+      "data": {},
+      "reason": "delegation-proof-required",
+      "status": 403
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"delegation-proof-invalid\",\"error_code\":\"DELEGATION_PROOF_INVALID\",\"error_domain\":\"orders.v1\",\"status\":403,\"title\":\"Permission denied\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\"}",
+      "data": {},
+      "reason": "delegation-proof-invalid",
+      "status": 403
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"operation-not-permitted-for-actor\",\"error_code\":\"OPERATION_NOT_PERMITTED_FOR_ACTOR\",\"error_domain\":\"orders.v1\",\"status\":403,\"title\":\"Permission denied\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.permission_denied.v1~\"}",
+      "data": {},
+      "reason": "operation-not-permitted-for-actor",
+      "status": 403
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"page-size-exceeded\",\"error_code\":\"PAGE_SIZE_EXCEEDED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "page-size-exceeded",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"filter-invalid\",\"error_code\":\"FILTER_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "filter-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"cursor-invalid\",\"error_code\":\"CURSOR_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
+      "data": {},
+      "reason": "cursor-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"read-store-unavailable\",\"error_code\":\"READ_STORE_UNAVAILABLE\",\"error_domain\":\"orders.v1\",\"status\":503,\"title\":\"Service unavailable\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\"}",
+      "data": {},
+      "reason": "read-store-unavailable",
+      "status": 503
+    }
+  ]
+}

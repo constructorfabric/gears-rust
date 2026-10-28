@@ -2,8 +2,8 @@ use sea_orm::entity::prelude::*;
 use toolkit_db_macros::Scopable;
 use uuid::Uuid;
 
-/// One subject's settings. The subject id is the resource id the policy
-/// service constrains on.
+/// One subject's settings. The subject id is both the resource id and the
+/// owner the policy service constrains on: a subject owns its settings.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-subject-settings-storage:p1
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel, Scopable)]
@@ -11,7 +11,7 @@ use uuid::Uuid;
 #[secure(
     tenant_col = "tenant_id",
     resource_col = "subject_id",
-    no_owner,
+    owner_col = "subject_id",
     no_type
 )]
 pub struct Model {

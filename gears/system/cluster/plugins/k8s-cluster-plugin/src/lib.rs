@@ -34,6 +34,8 @@ mod plugin;
 mod preflight;
 mod provider;
 mod shutdown;
+#[cfg(test)]
+mod test_support;
 
 // Public API re-exports (Phase 4 complete), mirroring the postgres plugin's
 // `lib.rs`.

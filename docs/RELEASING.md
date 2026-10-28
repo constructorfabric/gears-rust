@@ -74,8 +74,9 @@ Per-crate git tags (`<crate>-v<version>`) are created for every published crate 
 either rule — `git_tag_enable` is left at its default and never set in this repo.
 
 `make check-release-config` also enforces this half: a missing `libs/**` entry, an entry
-for a `gears/**` crate, an entry for an unpublishable or no-longer-existing crate, or a
-flag set to the wrong value all fail the build. An omitted entry is not inert — the crate
+for a `gears/**` crate (other than a `semver_check`-only one, see below), an entry for an
+unpublishable or no-longer-existing crate, or a flag set to the wrong value all fail the
+build. An omitted entry is not inert — the crate
 silently starts producing its own changelog and releases.
 
 Known rough edge: release-plz parses the root `CHANGELOG.md` to build a release body, and
@@ -173,6 +174,20 @@ Fallback if CI is unavailable: publish locally from a clean checkout (you must h
 export CARGO_REGISTRY_TOKEN=***   # your crates.io token
 cargo publish -p <crate_name>
 ```
+
+### Release PR blocked by the semver check
+
+The **Create release PR** job runs `cargo-semver-checks` on every crate with changes of its
+own. It builds the crate and its last published version without `Cargo.lock`, so with the
+newest versions of its dependencies, the same way a crates.io user gets them. If a
+third-party release breaks that build, the job fails on every push and no release PR is
+opened, even though normal builds still pass.
+
+Fix it by upgrading the dependency. Until that is possible, give the crate an entry with
+`semver_check = false` under "Semver check opt-outs" in `release-plz.toml`, with a comment
+saying when to remove it. Its version bumps then come from commit messages alone.
+
+`cf-gears-file-parser` has such an entry today because of `kreuzberg`.
 
 ### Notes for the very first publish (bootstrap)
 

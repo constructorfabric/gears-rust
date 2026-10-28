@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-gear-foundation-persistence:p1
 //! The migration harness.
 //!

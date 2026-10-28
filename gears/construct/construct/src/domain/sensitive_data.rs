@@ -32,13 +32,14 @@ pub enum SensitiveDataKind {
     OtherProtected,
 }
 
-/// What Admission does with a value in which a check found content.
+/// What Admission does with a text piece in which a check found content.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
-    /// Drop the value and keep the rest of the plan.
+    /// Drop the whole value the piece belongs to, and keep the rest of the
+    /// plan.
     Block,
-    /// Remove the found content from the value.
+    /// Remove the found content from the piece; the value stays valid JSON.
     Redact,
 }
 
@@ -90,8 +91,11 @@ impl SensitiveDataKind {
     }
 }
 
-/// Content of one sensitive-data kind found in one value. For a kind that
-/// redacts, `spans` are the byte ranges of the found content in the value.
+/// Content of one sensitive-data kind found in one text piece of a value: a
+/// string, or a number as its text. `at` names the piece. For a kind that
+/// redacts, `spans` are the byte ranges of the found content in that piece's
+/// text, and every redacting finding must name at least one. A finding in a
+/// number, or one Admission cannot apply exactly, blocks the whole value.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
@@ -99,8 +103,9 @@ pub struct Found {
     pub spans: Vec<Range<usize>>,
 }
 
-/// The answer of one check for the values of a plan. A value without a
-/// [`Found`] is allowed.
+/// The answer of one check for the text pieces of a plan. A piece without a
+/// [`Found`] is allowed; a value is stored only if none of its pieces is
+/// blocked.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Verdict {
@@ -119,12 +124,16 @@ impl Verdict {
 }
 
 /// One check for one sensitive-data kind: a pattern check in code, a model
-/// check, or both. A model check gets the values as a tool call result, never
-/// inside its prompt.
+/// check, or both. It sees the text pieces of the values a plan would store
+/// ([`PlanValue`]), never the keys of an object. A model check gets the pieces
+/// as a tool call result, never inside its prompt.
 #[async_trait]
 pub trait SensitiveDataCheck: Send + Sync {
     fn kind(&self) -> SensitiveDataKind;
 
+    /// The verdict for `values`: one [`Found`] for each piece with content of
+    /// this check's kind, naming the piece by its [`PlanValue::at`].
+    ///
     /// # Errors
     ///
     /// When the check cannot answer, for example because its model call failed
@@ -207,7 +216,7 @@ impl SensitiveDataChecks {
     }
 }
 
-/// Whether every finding names a value of the plan. A span is checked by
+/// Whether every finding names a text piece of the plan. A span is checked by
 /// Admission, which blocks a value whose span it cannot apply.
 fn refers_to(verdict: &Verdict, values: &[PlanValue]) -> bool {
     verdict

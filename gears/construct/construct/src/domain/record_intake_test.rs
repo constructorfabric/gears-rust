@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::domain::record_intake::{IntakeOutcome, Place, RefusalReason};
-use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
+use crate::domain::subject_settings::{ScopeRefusal, SubjectKey, SubjectSettings};
 use crate::test_support::{
     DenyResolver, ErroringResolver, IntakeFixture, OwnTenantOnlyResolver, PendingResolver,
     RecordingResolver, chat_record, inmem_db, seed_subject_settings, stored_record_ids,
@@ -166,6 +166,46 @@ async fn a_record_that_breaks_its_type_is_refused_with_the_place_and_nothing_is_
 }
 
 #[tokio::test]
+async fn a_record_of_a_type_about_a_person_without_a_subject_is_refused() {
+    let db = inmem_db().await;
+    let fixture = IntakeFixture::default();
+    let intake = fixture.build(&db);
+    let mut record = chat_record(Uuid::new_v4(), "chat/t/1", "v1");
+    record.as_object_mut().unwrap().remove("subject_id");
+
+    let result = intake.submit(&connector(), Uuid::new_v4(), record).await;
+
+    let Err(DomainError::Refused(refusal)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(refusal.reason, RefusalReason::SchemaViolation);
+    assert_eq!(
+        refusal.type_id.as_deref(),
+        Some(construct_sdk::gts::CHAT_MESSAGE_TYPE)
+    );
+    assert_eq!(refusal.place, Place::pointer("/subject_id"));
+    assert_eq!(refusal.rule, "required");
+    assert!(fixture.received().is_empty());
+    assert_eq!(stored_record_ids(&db).await, 0);
+}
+
+#[tokio::test]
+async fn the_type_schema_is_checked_before_the_subject() {
+    let db = inmem_db().await;
+    let intake = IntakeFixture::default().build(&db);
+    let mut record = chat_record(Uuid::new_v4(), "chat/t/1", "v1");
+    record.as_object_mut().unwrap().remove("subject_id");
+    record["payload"].as_object_mut().unwrap().remove("text");
+
+    let result = intake.submit(&connector(), Uuid::new_v4(), record).await;
+
+    let Err(DomainError::Refused(refusal)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(refusal.place, Place::pointer("/payload/text"));
+}
+
+#[tokio::test]
 async fn a_connector_that_is_off_is_refused() {
     let db = inmem_db().await;
     let ctx = connector();
@@ -296,7 +336,7 @@ async fn a_record_without_a_subject_skips_the_subject_checks() {
         ..IntakeFixture::default()
     };
     let intake = fixture.build(&db);
-    // The rolos-cyber example of a source-scoped record, without its store id.
+    // A source-scoped record: a course catalog has no subject.
     let catalog = json!({
         "type": construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE,
         "provenance": "lms-eu/course-101",
@@ -353,27 +393,44 @@ async fn a_connector_without_permission_is_refused_before_the_record_is_checked(
 
 #[tokio::test]
 async fn a_connector_authorized_only_for_its_own_tenant_cannot_write_into_another() {
-    let db = inmem_db().await;
-    let fixture = IntakeFixture {
-        resolver: Arc::new(OwnTenantOnlyResolver),
-        ..IntakeFixture::default()
-    };
-    let intake = fixture.build(&db);
+    // With or without a stored opt-out in the named tenant: the subject's
+    // settings there are outside the connector's scope, so the record is
+    // refused before anything is read or written.
+    for stored in [false, true] {
+        let db = inmem_db().await;
+        let fixture = IntakeFixture {
+            resolver: Arc::new(OwnTenantOnlyResolver),
+            ..IntakeFixture::default()
+        };
+        let intake = fixture.build(&db);
+        let (ctx, tenant, subject) = (connector(), Uuid::new_v4(), Uuid::new_v4());
+        let key = SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        };
+        if stored {
+            seed_subject_settings(&db, key, SubjectSettings::new_subject(false)).await;
+        }
 
-    let result = intake
-        .submit(
-            &connector(),
-            Uuid::new_v4(),
-            chat_record(Uuid::new_v4(), "chat/t/1", "v1"),
-        )
-        .await;
+        let result = intake
+            .submit(&ctx, tenant, chat_record(subject, "chat/t/1", "v1"))
+            .await;
 
-    assert!(
-        matches!(result, Err(DomainError::Forbidden(_))),
-        "got {result:?}"
-    );
-    assert!(fixture.received().is_empty());
-    assert_eq!(stored_record_ids(&db).await, 0);
+        match &result {
+            Err(DomainError::OutOfScope(refused)) => {
+                assert_eq!(
+                    (refused.tenant_id, refused.subject_id),
+                    (tenant, subject),
+                    "stored {stored}: {refused}"
+                );
+                assert_eq!(refused.refusal, ScopeRefusal::NotCovered, "{refused}");
+                assert_eq!(refused.caller_tenant, ctx.subject_tenant_id(), "{refused}");
+            }
+            other => panic!("stored {stored}: expected the scope refusal, got {other:?}"),
+        }
+        assert!(fixture.received().is_empty());
+        assert_eq!(stored_record_ids(&db).await, 0);
+    }
 }
 
 async fn submit_with_policy(
@@ -465,8 +522,12 @@ async fn until_the_planner_exists_a_record_is_received_and_dropped_with_an_event
     assert_eq!(dropped[0].subject_id, Some(subject));
     assert_eq!(dropped[0].connector, ctx.subject_id().to_string());
     assert_eq!(
-        (dropped[0].provenance.as_str(), dropped[0].version.as_str()),
-        ("chat/t/1", "v1")
+        dropped[0].record_key,
+        crate::domain::record_intake::RecordKey::of(crate::domain::record_intake::IdentityParts {
+            connector: &ctx.subject_id().to_string(),
+            provenance: "chat/t/1",
+            version: "v1",
+        })
     );
 }
 
@@ -604,6 +665,65 @@ async fn an_observed_at_that_is_no_real_date_is_refused_with_its_place() {
     };
     assert_eq!(refusal.reason, RefusalReason::SchemaViolation);
     assert_eq!(refusal.place, Place::pointer("/observed_at"));
+    assert!(fixture.received().is_empty());
+    assert_eq!(stored_record_ids(&db).await, 0);
+}
+
+/// The subject rule across a type's chain, the record's type first and the
+/// base last.
+#[test]
+fn the_subject_rule_resolves_across_the_type_chain() {
+    use crate::domain::record_intake::{SubjectTrait as S, TypeTraits};
+
+    let required = |chain: &[S]| {
+        TypeTraits {
+            type_chain: Vec::new(),
+            subject_chain: chain.to_vec(),
+        }
+        .subject_required()
+    };
+
+    // The base alone decides when nothing below it declares the trait.
+    assert!(required(&[S::Unset, S::On]));
+    assert!(!required(&[S::Unset, S::Off]));
+    // The closest declared value wins.
+    assert!(!required(&[S::Off, S::On]));
+    assert!(!required(&[S::Unset, S::Off, S::On]));
+    // A type derived from a person type stays about a person.
+    assert!(required(&[S::Off, S::On, S::On]));
+    assert!(required(&[S::Off, S::Unset, S::On, S::Off]));
+    // A malformed value requires a subject.
+    assert!(required(&[S::Malformed, S::Off, S::Off]));
+    // With nothing declared, the SDK's default: a subject is required.
+    assert!(required(&[S::Unset, S::Unset]));
+    assert!(required(&[]));
+}
+
+/// The rules a generated schema cannot carry are the domain's: a fact
+/// candidate whose provenance is no digest is refused and nothing is stored.
+#[tokio::test]
+async fn a_record_that_breaks_its_types_rules_beyond_the_schema_is_refused() {
+    let db = inmem_db().await;
+    let fixture = IntakeFixture::default();
+    let intake = fixture.build(&db);
+    let mut record = crate::test_support::example_records()
+        .into_iter()
+        .find(|record| record["type"] == construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE)
+        .expect("a fact candidate example");
+    record["provenance"] = json!("board/whatever");
+
+    let result = intake.submit(&connector(), Uuid::new_v4(), record).await;
+
+    let Err(DomainError::Refused(refusal)) = result else {
+        panic!("expected a refusal, got {result:?}");
+    };
+    assert_eq!(refusal.reason, RefusalReason::SchemaViolation);
+    assert_eq!(refusal.place, Place::pointer("/provenance"));
+    assert_eq!(refusal.rule, "pattern");
+    assert_eq!(
+        refusal.type_id.as_deref(),
+        Some(construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE)
+    );
     assert!(fixture.received().is_empty());
     assert_eq!(stored_record_ids(&db).await, 0);
 }

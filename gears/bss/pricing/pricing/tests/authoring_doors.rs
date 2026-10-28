@@ -391,7 +391,6 @@ async fn every_route_denies_authorization_before_preconditions_or_disclosure() {
         ("GET", format!("/price-books/{id}/export")),
         ("GET", "/settings".into()),
         ("PUT", "/settings".into()),
-        ("GET", "/currencies".into()),
         ("GET", "/dimension-keys".into()),
         ("PUT", "/dimension-keys".into()),
         ("POST", format!("/price-book-entries/{id}/prices")),
@@ -445,6 +444,33 @@ async fn every_route_denies_authorization_before_preconditions_or_disclosure() {
             "{method} {path}"
         );
     }
+    // D-537: the currency table is the one door that asks no permission. A PDP that denies
+    // everything is never asked, and a caller with no security context is still 401.
+    let (status, body, _) = request(
+        &f.denied,
+        &f.ctx,
+        "GET",
+        "/currencies",
+        json!({}),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(165), "{body}");
+    let response = f
+        .denied
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/bss-pricing/v1/currencies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401, "no context, no table");
 }
 
 use bss_pricing::infra::storage::{
@@ -712,8 +738,9 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
         ),
         ("GET", "/settings".into(), "config", "read"),
         ("PUT", "/settings".into(), "config", "settings"),
-        // D-537: the deployment's table, read under config read like the settings.
-        ("GET", "/currencies".into(), "config", "read"),
+        // D-537: the deployment's table, read by any authenticated caller; an empty label
+        // marks the one door that asks no permission.
+        ("GET", "/currencies".into(), "", ""),
         ("GET", "/dimension-keys".into(), "config", "read"),
         ("PUT", "/dimension-keys".into(), "config", "settings"),
         (
@@ -890,21 +917,22 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
             403,
             "{method} {path}"
         );
-        assert_eq!(
-            request(
-                &f.app,
-                &context("wrong:wrong"),
-                method,
-                &path,
-                json!({}),
-                None,
-                None
-            )
-            .await
-            .0,
-            403,
-            "{method} {path}"
-        );
+        let wrong = request(
+            &f.app,
+            &context("wrong:wrong"),
+            method,
+            &path,
+            json!({}),
+            None,
+            None,
+        )
+        .await
+        .0;
+        if label.is_empty() {
+            assert_eq!(wrong, 200, "{method} {path}: no grant is asked");
+        } else {
+            assert_eq!(wrong, 403, "{method} {path}");
+        }
     }
     let stranger = SecurityContext::builder()
         .subject_id(Uuid::new_v4())

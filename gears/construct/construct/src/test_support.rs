@@ -30,7 +30,8 @@ use crate::domain::record_intake::{
 };
 use crate::domain::sensitive_data::{Found, SensitiveDataCheck, SensitiveDataKind, Verdict};
 use crate::domain::subject_settings::{
-    SubjectKey, SubjectSettings, SubjectSettingsReader, SubjectSettingsService, TenantDefaults,
+    SettingsLookup, SubjectKey, SubjectSettings, SubjectSettingsReader, SubjectSettingsService,
+    TenantDefaults,
 };
 use crate::infra::connector_switch::ConfigConnectorSwitch;
 use crate::infra::record_types::RegistryRecordTypes;
@@ -84,6 +85,29 @@ impl AuthZResolverApi for AllowResolver {
                 ..Default::default()
             },
         })
+    }
+}
+
+/// Allows every request like [`AllowResolver`] and adds an owner constraint for
+/// the caller, as a policy that says "owner only" would.
+pub struct OwnerOnlyResolver;
+
+#[async_trait]
+impl AuthZResolverApi for OwnerOnlyResolver {
+    async fn evaluate(
+        &self,
+        ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let caller = request.subject.id;
+        let mut response = AllowResolver.evaluate(ctx, request).await?;
+        for constraint in &mut response.context.constraints {
+            constraint.predicates.push(Predicate::In(InPredicate::new(
+                pep_properties::OWNER_ID,
+                [caller],
+            )));
+        }
+        Ok(response)
     }
 }
 
@@ -203,6 +227,24 @@ pub async fn seed_subject_settings(db: &Db, key: SubjectKey, settings: SubjectSe
     .expect("insert subject settings");
 }
 
+/// A lookup read as "the stored row, or none": for tests whose scope covers
+/// the key, so the lookup is `Stored` or `Absent`.
+pub trait CoveredLookup {
+    fn stored(self) -> Option<SubjectSettings>;
+}
+
+impl CoveredLookup for SettingsLookup {
+    fn stored(self) -> Option<SubjectSettings> {
+        match self {
+            Self::Stored(settings) => Some(settings),
+            Self::Absent => None,
+            Self::OutOfScope(refusal) => {
+                panic!("the scope should cover the key, got {refusal:?}")
+            }
+        }
+    }
+}
+
 /// One request to the policy service: resource type, action, the context
 /// tenant and the tenant named as the owner of the resource.
 pub type AskedOfPolicyService = (String, String, Option<Uuid>, Option<String>);
@@ -292,8 +334,7 @@ pub fn received_chat_record(tenant_id: Uuid, subject_id: Uuid) -> ReceivedRecord
     }
 }
 
-/// One valid record of each derived type: the rolos-cyber examples
-/// (`docs/construct/GTS/examples/valid/`) without their store `id`.
+/// One valid record of each derived type.
 pub fn example_records() -> Vec<serde_json::Value> {
     let subject = "5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b";
     vec![
@@ -304,24 +345,18 @@ pub fn example_records() -> Vec<serde_json::Value> {
         ),
         serde_json::json!({
             "type": construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE,
-            "provenance": "openalex/A5012345678/works/W2741809807",
-            "version": "2026-09-09T18:00:00Z",
+            "provenance": "sha256:274b22ce748a45969ec5ead82845fc9324ffa01755758d9f2ab44c98f690fc15",
+            "version": "sha256:f0606b676be2895716327ce8c55faa64bfbcd9e6231d2a25f081e6e8bb716e79",
             "observed_at": "2026-09-10T07:30:00Z",
             "subject_id": subject,
             "payload": {
-                "claim": "Jane Doe is a professor of computational biology at ETH Zurich.",
-                "fact_type": "role",
+                "field": "board",
+                "value": "Jane Doe serves on the scientific advisory board of the Swiss Institute of Bioinformatics.",
+                "evidence": "Jane Doe joined the institute's scientific advisory board in 2024.",
+                "source_url": "https://example.org/news/sib-advisory-board",
                 "confidence": 0.83,
                 "trust_tier": "found",
-                "source_url": "https://openalex.org/A5012345678",
-                "date": "2026-09-09",
-                "citations": [{
-                    "source_url": "https://openalex.org/A5012345678",
-                    "chunk_id": "affiliations-0",
-                    "verbatim_quote": "ETH Zurich, Department of Biosystems Science and Engineering",
-                    "char_start": 0,
-                    "char_end": 60
-                }]
+                "identity_confidence": 0.91
             }
         }),
         serde_json::json!({
@@ -364,24 +399,33 @@ pub fn example_records() -> Vec<serde_json::Value> {
 pub fn sdk_record_type_schemas() -> Vec<types_registry_sdk::GtsTypeSchema> {
     use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
 
+    let registered =
+        toolkit_gts::all_inventory_type_schemas().expect("the inventory schemas parse");
+    let schema = |type_id: &str| -> serde_json::Value {
+        registered
+            .iter()
+            .find(|schema| schema["$id"] == format!("gts://{type_id}"))
+            .cloned()
+            .expect("the SDK submits every record type")
+    };
     let base = Arc::new(
         GtsTypeSchema::try_new(
             GtsTypeId::new(construct_sdk::gts::RECORD_BASE_TYPE),
-            serde_json::from_str(construct_sdk::gts::RECORD_BASE_SCHEMA).expect("base schema"),
+            schema(construct_sdk::gts::RECORD_BASE_TYPE),
             None,
             None,
         )
         .expect("base type"),
     );
     let mut schemas = vec![(*base).clone()];
-    for record_type in construct_sdk::gts::RECORD_TYPES
-        .iter()
-        .filter(|record_type| record_type.type_id != construct_sdk::gts::RECORD_BASE_TYPE)
+    for type_id in construct_sdk::gts::RECORD_TYPES
+        .into_iter()
+        .filter(|type_id| *type_id != construct_sdk::gts::RECORD_BASE_TYPE)
     {
         schemas.push(
             GtsTypeSchema::try_new(
-                GtsTypeId::new(record_type.type_id),
-                serde_json::from_str(record_type.schema).expect("derived schema"),
+                GtsTypeId::new(type_id),
+                schema(type_id),
                 None,
                 Some(Arc::clone(&base)),
             )
@@ -596,6 +640,19 @@ pub fn add_entity(kind: &str, properties: &[(&str, &str)]) -> Step {
     }
 }
 
+/// A model's step that adds an entity of `kind` with one property whose value
+/// is `value`, such as an object of fields.
+pub fn add_value(kind: &str, name: &str, value: serde_json::Value) -> Step {
+    Step {
+        entity_kind: kind.to_owned(),
+        change: Change::AddEntity {
+            key: NodeKey(Uuid::new_v4().to_string()),
+            properties: vec![Property::new(name, value)],
+        },
+        confidence: Some(0.9),
+    }
+}
+
 /// A model's step that gives an existing property of `kind` a new value.
 pub fn replace_property(kind: &str, name: &str, value: &str) -> Step {
     Step {
@@ -738,7 +795,8 @@ impl AdmissionRulesSource for FixedRules {
     }
 }
 
-/// Rules that let every plan in the tests through, with avatar's floor.
+/// Rules that let every plan in the tests through, with a confidence floor
+/// of 0.6.
 pub fn open_rules() -> AdmissionRules {
     AdmissionRules {
         trusted_connectors: Allowed::Any,

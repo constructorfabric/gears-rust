@@ -67,7 +67,19 @@ async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
 async fn seeded_spec_manager(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     registry: Option<super::type_registry::StaticTypesRegistry>,
+    live: Option<(
+        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        crate::config::EventBrokerConfig,
+    )>,
 ) -> Arc<dyn SpecificationManager> {
+    // A caller-supplied registry client (for example the real `types-registry` service another
+    // gear registered its contract into) is loaded unchanged, under that deployment's config.
+    if let Some((client, config)) = live {
+        crate::infra::specification::bulk_load(&client, &db, &config)
+            .await
+            .expect("SpecificationManager bulk-load must not fail");
+        return Arc::new(TypesRegistrySpecificationManager::new(db));
+    }
     let mut instances = Vec::new();
     let (schemas, config) = if let Some(registry) = registry {
         for document in registry.topics {
@@ -422,6 +434,10 @@ impl EventBrokerHarness {
 #[derive(Default)]
 pub struct EventBrokerHarnessBuilder {
     type_registry: Option<StaticTypesRegistry>,
+    types_registry_client: Option<(
+        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        crate::config::EventBrokerConfig,
+    )>,
     policy_enforcer: Option<PolicyEnforcer>,
     heartbeat: Option<std::time::Duration>,
 }
@@ -431,6 +447,38 @@ impl EventBrokerHarnessBuilder {
     #[must_use]
     pub fn with_type_registry(mut self, registry: StaticTypesRegistry) -> Self {
         self.type_registry = Some(registry);
+        self
+    }
+
+    /// Loads topics and event types from `client` - typically the real `types-registry`
+    /// service a producing gear registered its own contract into - through the same startup
+    /// bulk-load production runs, instead of from static fixtures. `topic_partitions` is the
+    /// deployment's per-topic partition configuration, since a topic carries no count.
+    ///
+    /// # Panics
+    /// Panics if the partition configuration does not deserialize.
+    #[must_use]
+    pub fn with_types_registry_client(
+        mut self,
+        client: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        topic_partitions: &[(&str, u32)],
+    ) -> Self {
+        let topics: serde_json::Map<String, serde_json::Value> = topic_partitions
+            .iter()
+            .map(|(topic, partitions)| {
+                (
+                    (*topic).to_owned(),
+                    serde_json::json!({ "partitions": partitions }),
+                )
+            })
+            .collect();
+        let config = serde_json::from_value(serde_json::json!({
+            "mode": "standalone",
+            "default_storage_backend": "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~",
+            "topics": topics,
+        }))
+        .expect("harness topic configuration deserializes");
+        self.types_registry_client = Some((client, config));
         self
     }
 
@@ -459,7 +507,12 @@ impl EventBrokerHarnessBuilder {
             .unwrap_or_else(|| PolicyEnforcer::new(Arc::new(AllowAllAuthZ)));
 
         let db = test_db().await;
-        let spec_manager = seeded_spec_manager(Arc::clone(&db), self.type_registry).await;
+        let spec_manager = seeded_spec_manager(
+            Arc::clone(&db),
+            self.type_registry,
+            self.types_registry_client,
+        )
+        .await;
 
         let (_hub, cluster) = crate::test_support::standalone_event_broker_cluster().await;
         let storage = Arc::new(Storage::new(

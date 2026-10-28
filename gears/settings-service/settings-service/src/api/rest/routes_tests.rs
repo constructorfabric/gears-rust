@@ -1,4 +1,3 @@
-// Created: 2026-08-25 by Virtuozzo International GmbH
 //! Guards on how the category routes are declared.
 //!
 //! `OperationBuilder`'s typestate forces every route to *choose* an

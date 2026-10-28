@@ -1,0 +1,77 @@
+[
+  {
+    "name": "a-stated-name-is-added",
+    "profile": [],
+    "record": { "user_says": "My name is Maria Kovač." },
+    "expect": { "full_name": "add" }
+  },
+  {
+    "name": "a-corrected-name-replaces-the-old-spelling",
+    "profile": [{ "property": "full_name", "value": "Maria Kovac" }],
+    "record": { "user_says": "Small fix: my surname is spelled Kovač, with a č." },
+    "expect": { "full_name": "replace" },
+    "gone": [{ "property": "full_name", "value": "Maria Kovac" }]
+  },
+  {
+    "name": "a-move-replaces-the-location",
+    "profile": [{ "property": "location", "value": "Lisbon" }],
+    "record": { "user_says": "I moved from Lisbon to Porto last month." },
+    "expect": { "location": "replace" },
+    "gone": [{ "property": "location", "value": "Lisbon" }]
+  },
+  {
+    "name": "a-city-gives-no-time-zone",
+    "profile": [],
+    "record": { "user_says": "I live in Graz." },
+    "expect": { "location": "add" }
+  },
+  {
+    "name": "a-stated-time-zone-is-added",
+    "profile": [],
+    "record": { "user_says": "My time zone is Europe/Warsaw." },
+    "expect": { "timezone": "add" }
+  },
+  {
+    "name": "an-orcid-is-added",
+    "profile": [],
+    "record": { "user_says": "My ORCID is 0000-0002-1825-0097." },
+    "expect": { "orcid_id": "add" }
+  },
+  {
+    "name": "a-public-profile-is-added",
+    "profile": [],
+    "record": { "user_says": "My portfolio is at https://example.org/code/mkovac, have a look." },
+    "expect": { "public_profiles": "add" }
+  },
+  {
+    "name": "a-nickname-is-a-name-variant",
+    "profile": [{ "property": "full_name", "value": "Maria Kovač" }],
+    "record": { "user_says": "Most people call me Masha." },
+    "expect": { "name_variants": "add" }
+  },
+  {
+    "name": "a-full-name-with-two-surnames-is-added",
+    "profile": [],
+    "record": { "user_says": "My full name is Ana María López García." },
+    "expect": { "full_name": "add" }
+  },
+  {
+    "name": "a-new-time-zone-replaces-the-old-one",
+    "profile": [{ "property": "timezone", "value": "Europe/Paris" }],
+    "record": { "user_says": "Please use the America/Toronto time zone for me from now on." },
+    "expect": { "timezone": "replace" },
+    "gone": [{ "property": "timezone", "value": "Europe/Paris" }]
+  },
+  {
+    "name": "a-second-public-profile-is-added",
+    "profile": [{ "property": "public_profiles", "value": "https://example.org/code/jweber" }],
+    "record": { "user_says": "My personal site is https://example.net/jonas-weber." },
+    "expect": { "public_profiles": "add" }
+  },
+  {
+    "name": "a-scholar-id-is-added",
+    "profile": [],
+    "record": { "user_says": "My Google Scholar ID is kq3Xa9EAAAAJ." },
+    "expect": { "google_scholar_id": "add" }
+  }
+]

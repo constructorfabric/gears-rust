@@ -579,6 +579,47 @@ async fn named_consumer_group_get_and_delete_reject_a_caller_without_permission(
 }
 
 #[tokio::test]
+async fn list_consumer_groups_checks_a_named_group_on_its_own_id() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let recorder = Arc::clone(&asked);
+    let harness = EventBrokerHarness::builder()
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((req.action.name.clone(), req.resource.resource_type.clone()));
+                false
+            },
+        })))
+        .build()
+        .await;
+    let named_id = "gts.cf.core.events.consumer_group.v1~x.eb.t1.namedgroup.v1";
+    seed_consumer_group(&harness, named_id, ConsumerGroupKind::Named, Uuid::new_v4()).await;
+
+    harness
+        .api_v1()
+        .get_consumer_groups()
+        .send()
+        .await
+        .assert_status(200);
+
+    let asked = asked.lock().unwrap();
+    assert!(
+        asked
+            .iter()
+            .any(|(action, resource)| action == "consume" && resource == named_id),
+        "named group must be checked on its own id, asked: {asked:?}"
+    );
+    assert!(
+        !asked
+            .iter()
+            .any(|(_, resource)| resource == "gts.cf.core.events.consumer_group.v1~"),
+        "no check may fall back to the family label, asked: {asked:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_consumer_groups_excludes_a_named_group_without_consume_permission() {
     let harness = EventBrokerHarness::builder()
         .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {

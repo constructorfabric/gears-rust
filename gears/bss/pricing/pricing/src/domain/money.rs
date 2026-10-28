@@ -112,6 +112,30 @@ fn has_number(value: &Value) -> bool {
         _ => false,
     }
 }
+/// Where the first JSON number sits in a price body, judged in the order the decimals are: the
+/// body's own fields, then each tier's. A number under a key that is no decimal of a price is
+/// `None`: the shape check refuses it, so the violation names the price.
+fn number_place(value: &Value) -> Option<Place> {
+    let Value::Object(fields) = value else {
+        return None;
+    };
+    let at = |fields: &Map<String, Value>, allowed: &[PriceField], tier: Option<usize>| {
+        allowed
+            .iter()
+            .copied()
+            .find(|field| fields.get(field.name()).is_some_and(Value::is_number))
+            .map(|field| Place { field, tier })
+    };
+    at(fields, &PRICE_FIELDS, None).or_else(|| {
+        let Some(Value::Array(tiers)) = fields.get("tiers") else {
+            return None;
+        };
+        tiers.iter().enumerate().find_map(|(i, tier)| match tier {
+            Value::Object(tier) => at(tier, &TIER_FIELDS, Some(i)),
+            _ => None,
+        })
+    })
+}
 /// What a client is told when it sent a decimal as a JSON number.
 pub const DECIMALS_ARE_STRINGS: &str =
     "decimals are JSON strings (\"0.10\"), never JSON numbers, so no digit is lost to f64";
@@ -187,6 +211,27 @@ impl PriceField {
     }
 }
 
+/// Where a decimal sits in a price body: its field, and the index of the tier it is in, if any.
+#[toolkit_macros::domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Place {
+    /// The decimal's field.
+    pub field: PriceField,
+    /// The index of the tier the field is in; `None` for a field of the body itself.
+    pub tier: Option<usize>,
+}
+impl Place {
+    /// The place's path under the request's `price`, for a field violation (D-538):
+    /// `price.rate`, `price.package_size`, `price.tiers[1].up_to`.
+    #[must_use]
+    pub fn path(self) -> String {
+        match self.tier {
+            Some(i) => format!("price.tiers[{i}].{}", self.field.name()),
+            None => format!("price.{}", self.field.name()),
+        }
+    }
+}
+
 /// The rule code of a refused decimal: `AMOUNT_OUT_OF_RANGE` over a limit, else
 /// `AMOUNT_INVALID` (invalid text, a negative value, or a zero package size). The client's
 /// message names the field.
@@ -206,20 +251,23 @@ const fn numeric_code(error: NumericError) -> &'static str {
 pub enum DecodeError {
     /// A decimal was sent as a JSON number.
     #[error("decimal sent as a JSON number")]
-    JsonNumber,
+    JsonNumber {
+        /// Where the first number sits; `None` when it is under no decimal field of a price.
+        at: Option<Place>,
+    },
     /// A decimal string that its field's limit refuses.
-    #[error("{}: {error}", field.name())]
+    #[error("{}: {error}", at.field.name())]
     Numeric {
-        /// The refused field.
-        field: PriceField,
+        /// The refused decimal.
+        at: Place,
         /// What the limit refused.
         error: NumericError,
     },
     /// A stored decimal that is not its canonical text. Only [`decode_stored`] returns it.
-    #[error("{} is not canonical decimal text", field.name())]
+    #[error("{} is not canonical decimal text", at.field.name())]
     NotCanonical {
-        /// The field that is not canonical.
-        field: PriceField,
+        /// The decimal that is not canonical.
+        at: Place,
     },
     /// The JSON does not have the model's shape, or has extra fields.
     #[error("price is not in the shape of its model")]
@@ -230,9 +278,21 @@ impl DecodeError {
     #[must_use]
     pub const fn code(self) -> &'static str {
         match self {
-            Self::JsonNumber | Self::NotCanonical { .. } => "AMOUNT_INVALID",
+            Self::JsonNumber { .. } | Self::NotCanonical { .. } => "AMOUNT_INVALID",
             Self::Numeric { error, .. } => numeric_code(error),
             Self::Shape => "PRICE_MISSING",
+        }
+    }
+    /// The field a violation names (D-538): the refused decimal's path under `price`, and
+    /// `price` itself when no one decimal is named (a shape error, or a JSON number under no
+    /// decimal field).
+    #[must_use]
+    pub fn path(self) -> String {
+        match self {
+            Self::JsonNumber { at: Some(at) }
+            | Self::Numeric { at, .. }
+            | Self::NotCanonical { at } => at.path(),
+            Self::JsonNumber { at: None } | Self::Shape => "price".to_owned(),
         }
     }
     /// What a client is told: a JSON number is told to send a string, invalid text to send plain
@@ -240,27 +300,27 @@ impl DecodeError {
     #[must_use]
     pub fn message(self) -> String {
         match self {
-            Self::JsonNumber => DECIMALS_ARE_STRINGS.into(),
+            Self::JsonNumber { .. } => DECIMALS_ARE_STRINGS.into(),
             Self::Numeric {
                 error: NumericError::InvalidText,
                 ..
             } => PLAIN_DECIMAL_TEXT.into(),
             Self::Numeric {
-                field,
+                at,
                 error: NumericError::OutOfRange,
             } => format!(
                 "{} has at most {} fractional places and 28 digits in all",
-                field.name(),
-                field.places()
+                at.field.name(),
+                at.field.places()
             ),
             Self::Numeric {
-                field,
+                at,
                 error: NumericError::Negative,
-            } => format!("{} must not be negative", field.name()),
+            } => format!("{} must not be negative", at.field.name()),
             Self::Numeric {
-                field,
+                at,
                 error: NumericError::NotPositive,
-            } => format!("{} must be above zero", field.name()),
+            } => format!("{} must be above zero", at.field.name()),
             Self::Numeric {
                 error: NumericError::InvalidMinimumFee,
                 ..
@@ -281,15 +341,17 @@ fn canonical_fields(
     fields: &mut Map<String, Value>,
     allowed: &[PriceField],
     stored: bool,
+    tier: Option<usize>,
 ) -> Result<(), DecodeError> {
     for &field in allowed {
         if let Some(Value::String(text)) = fields.get_mut(field.name()) {
+            let at = Place { field, tier };
             let value = field
                 .parse(text)
-                .map_err(|error| DecodeError::Numeric { field, error })?;
+                .map_err(|error| DecodeError::Numeric { at, error })?;
             let canonical = bss_money::canonical_decimal(value);
             if stored && canonical != *text {
-                return Err(DecodeError::NotCanonical { field });
+                return Err(DecodeError::NotCanonical { at });
             }
             *text = canonical;
         }
@@ -302,11 +364,11 @@ fn canonical_price(value: &mut Value, stored: bool) -> Result<(), DecodeError> {
     let Value::Object(fields) = value else {
         return Ok(());
     };
-    canonical_fields(fields, &PRICE_FIELDS, stored)?;
+    canonical_fields(fields, &PRICE_FIELDS, stored, None)?;
     if let Some(Value::Array(tiers)) = fields.get_mut("tiers") {
-        for tier in tiers {
+        for (i, tier) in tiers.iter_mut().enumerate() {
             if let Value::Object(tier) = tier {
-                canonical_fields(tier, &TIER_FIELDS, stored)?;
+                canonical_fields(tier, &TIER_FIELDS, stored, Some(i))?;
             }
         }
     }
@@ -315,7 +377,9 @@ fn canonical_price(value: &mut Value, stored: bool) -> Result<(), DecodeError> {
 /// Read a price body: no JSON number, each decimal within its limit, the model's shape.
 fn read(model: Model, mut value: Value, stored: bool) -> Result<PriceData, DecodeError> {
     if has_number(&value) {
-        return Err(DecodeError::JsonNumber);
+        return Err(DecodeError::JsonNumber {
+            at: number_place(&value),
+        });
     }
     canonical_price(&mut value, stored)?;
     let data: PriceData = serde_json::from_value::<PriceWire>(value)

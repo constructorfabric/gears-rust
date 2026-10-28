@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for category key validation.
 //!
 //! Acceptance: FEATURE `category-management.md` §6 and CDSL

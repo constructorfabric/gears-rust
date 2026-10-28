@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 //! Guards on how the value routes are declared.
 
 /// The route declarations, read at compile time rather than from disk.

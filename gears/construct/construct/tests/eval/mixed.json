@@ -1,0 +1,40 @@
+[
+  {
+    "name": "a-name-and-a-city-in-one-message",
+    "profile": [],
+    "record": { "user_says": "I'm Priya Natarajan and I live in Bangalore." },
+    "expect": { "full_name": "add", "location": "add" }
+  },
+  {
+    "name": "only-the-new-skill-of-a-message-is-added",
+    "profile": [{ "property": "skills", "value": { "name": "Python" } }],
+    "record": { "user_says": "I use Python and Rust every day." },
+    "expect": { "skills": "add" },
+    "holds": [{ "property": "skills", "value": { "name": "Rust" } }]
+  },
+  {
+    "name": "a-job-and-a-goal-in-one-message",
+    "profile": [],
+    "record": { "user_says": "I'm a nurse and I want to become a nurse practitioner within three years." },
+    "expect": { "role": "add", "long_term_goals": "add" }
+  },
+  {
+    "name": "a-language-and-a-format-in-spanish",
+    "profile": [],
+    "record": { "user_says": "Respóndeme en español y con ejemplos resueltos." },
+    "expect": { "answer_language": "add", "preferred_format": "add" }
+  },
+  {
+    "name": "a-correction-and-a-new-fact-in-one-message",
+    "profile": [{ "property": "location", "value": "Boston" }],
+    "record": { "user_says": "Actually I live in Cambridge, not Boston, and I teach high school physics." },
+    "expect": { "location": "replace", "role": "add" },
+    "gone": [{ "property": "location", "value": "Boston" }]
+  },
+  {
+    "name": "a-time-zone-and-a-study-time-in-one-message",
+    "profile": [],
+    "record": { "user_says": "I'm on Europe/Lisbon time and I study on Tuesday mornings from 8 to 10." },
+    "expect": { "timezone": "add", "study_window": "add" }
+  }
+]

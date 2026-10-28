@@ -1,0 +1,267 @@
+{
+  "$id": "gts://gts.cf.core.tasks.queue.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Queue base type. A queue is a named dispatch channel; every queue is registered as a GTS well-known instance of this type. The registration carries concurrency limits, a default priority, default timeout values, a default retry policy, optional queue-depth and worker-blacklist settings, optional default progress settings, and an optional dead-letter queue reference. A queue of kind 'dead_letter' is not a dispatch channel: it only holds parked dead_lettered tasks, is never claimable, and declares no dispatch settings. Task domains route by queue; dead-letter queues are not routed, so one dead-letter queue can serve queues in several domains (PRD cpt-cf-task-engine-fr-task-domains). Values declared here are defaults that operators MAY override in the Task Engine config file by GTS queue pattern (most specific pattern wins). Trait/field keys use snake_case per platform GTS convention.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "description": "Full GTS queue identifier (e.g. gts.cf.core.tasks.queue.v1~cf.core.tasks.default.v1). An instance, so it never ends in '~'.",
+      "type": "string",
+      "x-gts-instance-ref": "/$id"
+    },
+    "description": {
+      "description": "Human-readable description of what the queue carries. ASCII only.",
+      "type": "string",
+      "maxLength": 1024,
+      "pattern": "^[\\x20-\\x7E]*$"
+    },
+    "kind": {
+      "description": "'dispatch' (default): a normal queue that workers claim from. 'dead_letter': holds parked dead_lettered tasks only (PRD cpt-cf-task-engine-fr-dead-letter); it is never dispatched, a claim naming it is rejected 400 invalid_argument, and it MUST NOT declare any dispatch setting (concurrency, priority, timeouts, retry, depth, blacklist, progress, fairness, dead_letter_queue, operated_by, accepted_types).",
+      "type": "string",
+      "enum": [
+        "dispatch",
+        "dead_letter"
+      ],
+      "default": "dispatch"
+    },
+    "global_concurrency_limit": {
+      "description": "Maximum number of simultaneously executing (claimed + running) tasks from this queue across all tenants. 0 means unlimited (PRD cpt-cf-task-engine-fr-queue-concurrency).",
+      "type": "integer",
+      "minimum": 0
+    },
+    "per_tenant_concurrency_limit": {
+      "description": "Maximum number of simultaneously executing (claimed + running) tasks from this queue per tenant. 0 means unlimited.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "default_priority": {
+      "description": "Default task priority for tasks enqueued to this queue when the creator supplies none. Range 0 (highest) to 1000 (lowest), the same range as task priority (PRD cpt-cf-task-engine-fr-priority-dispatch). Priority orders one tenant's own tasks only; it never ranks one tenant above another.",
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1000
+    },
+    "timeouts": {
+      "description": "Default timeout values applied to tasks on this queue when the task itself declares none. All values are in seconds. null/absent means 'no timeout of that kind' for every field except heartbeat_timeout_secs and execution_timeout_secs: a claimed task always has a lease, so null there means 'use the engine default lease' (default_lease_duration_secs); and every task has an execution timeout, so null there means 'use the engine default' (default_execution_timeout_secs).",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "queue_timeout_secs": {
+          "description": "Maximum time a task may wait in 'queued' before it is force-completed as timed out (terminal).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null
+        },
+        "assignment_timeout_secs": {
+          "description": "Maximum time a claimed task may remain 'claimed' before it starts (assignment_deadline); on expiry it is a liveness failure and the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null
+        },
+        "execution_timeout_secs": {
+          "description": "Maximum running time per attempt (execution_deadline, re-armed on each start so time spent waiting is never counted). Terminal, task-attributed, never retried. Every task has an execution timeout: null/absent here falls through to the next level (task request, then type trait, then queue) and finally to the engine default default_execution_timeout_secs; it never means 'no limit'. Values above the engine trust limit (trust_limits max_execution_timeout_secs, tighter for tenant-owned types) make the type non-creatable or the queue refuse new tasks (PRD cpt-cf-task-engine-fr-timeouts, cpt-cf-task-engine-fr-type-trust).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null
+        },
+        "heartbeat_timeout_secs": {
+          "description": "Lease duration: the maximum interval between worker heartbeats before the lease expires; falls back to default_lease_duration_secs when null. Workers MUST heartbeat at the heartbeat_interval_secs returned on claim (one third of this value, rounded down, minimum 1) so a single delayed heartbeat does not expire the lease. A lease below the engine minimum (config trust_limits.min_lease_secs, default 10) makes the queue refuse new tasks (PRD cpt-cf-task-engine-fr-type-trust). An expired lease is a liveness failure: the task is requeued with backoff against max_liveness_requeues (not max_retries).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null
+        },
+        "lifetime_timeout_secs": {
+          "description": "Absolute wall-clock budget from creation to terminal state, surviving requeues. On expiry the task is force-completed as timed out (overrides retry/lease handling).",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1,
+          "default": null
+        }
+      }
+    },
+    "retry_policy": {
+      "description": "Default retry policy for tasks on this queue when the task declares none.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_retries": {
+          "description": "Maximum number of retries after explicit retryable failures reported by a worker. Liveness requeues (lease expiry, assignment timeout) do not consume this budget; see max_liveness_requeues.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_liveness_requeues": {
+          "description": "Maximum number of liveness requeues (lease expiry or assignment timeout) before the task is routed terminally with a timed_out result. Counted separately from max_retries so losing the worker never burns the failure-retry budget. Backoff uses this policy's strategy and intervals, applied to the liveness-requeue count. 0 means unlimited (bounded only by the lifetime timeout, if any).",
+          "type": "integer",
+          "minimum": 0,
+          "default": 20
+        },
+        "strategy": {
+          "description": "Backoff strategy used to compute run_after for a retry.",
+          "type": "string",
+          "enum": [
+            "fixed",
+            "linear",
+            "exponential"
+          ]
+        },
+        "base_interval_secs": {
+          "description": "Base backoff interval in seconds.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_interval_secs": {
+          "description": "Maximum backoff interval in seconds (caps exponential/linear growth). MUST be greater than or equal to base_interval_secs; the engine rejects a queue whose policy breaks this rule when it resolves the queue (JSON Schema cannot compare two fields).",
+          "type": "integer",
+          "minimum": 0
+        },
+        "jitter_factor": {
+          "description": "Fractional jitter (0.0-1.0) to de-synchronize retries. Jitter only shortens a wait: each wait is drawn from [d * (1 - jitter_factor), d], where d is the capped backoff, so it never exceeds max_interval_secs. 1.0 gives full jitter (PRD cpt-cf-task-engine-fr-retry, Backoff).",
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0
+        },
+        "non_retryable_codes": {
+          "description": "Error codes that are always terminal regardless of the worker's retryable flag.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        }
+      },
+      "required": [
+        "max_retries",
+        "strategy",
+        "base_interval_secs",
+        "max_interval_secs"
+      ]
+    },
+    "queue_max_queue_depth": {
+      "description": "Maximum 'queued' tasks in this queue across all tenants. 0 means unlimited. When omitted, the config default queue_depth.queue_max_queue_depth applies (shipped value 1,000,000); overridable in config. The name matches that config key and its siblings tenant_max_queue_depth and global_max_queue_depth.",
+      "type": "integer",
+      "minimum": 0
+    },
+    "blacklist_failure_threshold": {
+      "description": "Consecutive worker failures on this queue that trigger a worker blacklisting (PRD cpt-cf-task-engine-fr-worker-blacklist). When omitted, the config default blacklist_failure_threshold applies; the schema default shows the shipped value.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 10
+    },
+    "blacklist_duration_minutes": {
+      "description": "How long a blacklisted worker is excluded from claiming on this queue. When omitted, the config default blacklist_duration_minutes applies; the schema default shows the shipped value.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 60
+    },
+    "progress_events": {
+      "description": "Default progress event mode for tasks on this queue (PRD cpt-cf-task-engine-fr-progress-events): 'none', 'milestones', or 'all'. Lower precedence than task-type traits and config overrides. When omitted, the global default applies ('none').",
+      "type": "string",
+      "default": "none",
+      "enum": [
+        "none",
+        "milestones",
+        "all"
+      ]
+    },
+    "progress_flush_interval_secs": {
+      "description": "Default progress flush interval (seconds) for tasks on this queue. Effective value is clamped to progress_min_flush_interval_secs. When omitted, the config default progress_flush_interval_secs applies; the schema default shows the shipped value.",
+      "type": "integer",
+      "minimum": 1,
+      "default": 5
+    },
+    "tenant_fairness": {
+      "description": "How tasks of different tenants are ordered within one urgency class (PRD cpt-cf-task-engine-fr-tenant-fairness, cpt-cf-task-engine-fr-priority-dispatch). 'round_robin' (default): tenants take turns; each turn takes that tenant's best task (highest priority, then oldest), so priority only reorders a tenant's own tasks. 'fifo': all tenants' tasks ordered together by priority, then age; because priority then ranks tenants against each other, use it only for single-tenant or trusted queues. Urgency 'critical' always comes first. Overridable in config by queue pattern.",
+      "type": "string",
+      "enum": [
+        "round_robin",
+        "fifo"
+      ],
+      "default": "round_robin"
+    },
+    "dead_letter_queue": {
+      "description": "Optional GTS identifier of the queue that tasks are dead-lettered into when they exhaust retries or exceed their lifetime. MUST reference a queue of kind 'dead_letter' (checked by the engine when it resolves the queue). It may be shared by queues in different task domains: a dead-lettered task stays in its source queue's database. Absent means failing tasks transition to 'failed' instead of being dead-lettered.",
+      "type": [
+        "string",
+        "null"
+      ],
+      "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~",
+      "default": null
+    },
+    "operated_by": {
+      "description": "Who runs this queue's workers (PRD cpt-cf-task-engine-fr-worker-principals). 'tenant' (default): tenant workers; claims respect tenant barriers. 'platform': platform workers; a claim may cross tenant barriers if the PDP allows it, and tenant-owned task types cannot be placed here (PRD cpt-cf-task-engine-fr-type-trust).",
+      "type": "string",
+      "enum": [
+        "tenant",
+        "platform"
+      ],
+      "default": "tenant"
+    },
+    "accepted_types": {
+      "description": "Optional task types this queue accepts. Each entry is a GTS task type identifier and also covers the types derived from it (GTS §10). Create, bulk move, and re-enqueue of another type are rejected 400 invalid_argument (PRD cpt-cf-task-engine-fr-type-trust).",
+      "type": "array",
+      "items": {
+        "type": "string",
+        "x-gts-type-ref": "gts.cf.core.tasks.task.v1~"
+      },
+      "minItems": 1,
+      "maxItems": 64,
+      "uniqueItems": true
+    }
+  },
+  "required": [
+    "id"
+  ],
+  "if": {
+    "properties": {
+      "kind": {
+        "const": "dead_letter"
+      }
+    },
+    "required": [
+      "kind"
+    ]
+  },
+  "then": {
+    "$comment": "Dead-letter queues carry no dispatch settings.",
+    "properties": {
+      "global_concurrency_limit": false,
+      "per_tenant_concurrency_limit": false,
+      "default_priority": false,
+      "timeouts": false,
+      "retry_policy": false,
+      "queue_max_queue_depth": false,
+      "blacklist_failure_threshold": false,
+      "blacklist_duration_minutes": false,
+      "progress_events": false,
+      "progress_flush_interval_secs": false,
+      "tenant_fairness": false,
+      "dead_letter_queue": false,
+      "operated_by": false,
+      "accepted_types": false
+    }
+  },
+  "else": {
+    "required": [
+      "global_concurrency_limit",
+      "per_tenant_concurrency_limit",
+      "default_priority",
+      "timeouts",
+      "retry_policy"
+    ]
+  }
+}

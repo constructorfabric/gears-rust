@@ -9,6 +9,1966 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.31](https://github.com/constructorfabric/gears-rust/compare/cf-gears-nodes-registry-sdk-v0.1.30...cf-gears-nodes-registry-sdk-v0.1.31) - 2026-10-28
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-gts, cf-gears-toolkit-canonical-errors, cf-gears-toolkit-node-info
+
+## [0.2.4](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-parser-sdk-v0.2.3...cf-gears-file-parser-sdk-v0.2.4) - 2026-10-28
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-security
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-chat-engine-sdk-v0.2.0...cf-chat-engine-sdk-v0.2.1) - 2026-10-28
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-utils
+
+## [0.1.12](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.1.11...cf-gears-llm-gateway-sdk-v0.1.12) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.12](https://github.com/constructorfabric/gears-rust/compare/cf-gears-model-registry-sdk-v0.1.11...cf-gears-model-registry-sdk-v0.1.12) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.1.15...cf-gears-noop-usage-collector-plugin-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-firebase-authn-plugin-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(authn)* a Firebase AuthN plugin (by @MikeFalcon77)
+
+### Fixed
+
+- *(gears)* address the CodeRabbit review of #5487 (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-construct-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(construct)* add the planner evaluation set
+- *(construct)* store plan values as JSON and check their text pieces
+- *(construct)* bring the fact candidate to its current shape
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(construct)* add the manage-facts operation
+- *(construct)* process records from a queue
+- *(construct)* add the planner prompt
+- *(construct)* add the planner agent loop
+- *(construct)* add the planner core
+- *(construct)* add the model client
+- *(construct)* add sensitive-data checks and admission
+- *(construct)* keep the record's observed_at in the envelope
+- *(construct)* drop received records with an event until the planner exists
+- *(construct)* add record intake
+- *(construct)* add the subject's settings routes
+- *(construct)* add subject settings storage and read
+- *(construct)* add tracing spans to the note operations
+- *(construct)* add the gear foundation shell
+
+### Fixed
+
+- *(construct)* build again after the record types and manage-facts merges
+- *(construct)* write one admission event per value and kind
+- *(construct)* block a piece one redacting kind names twice, once without a range
+- *(construct)* apply the local review of the checks and admission
+- *(construct)* apply the review of admission's verdict enforcement
+- *(construct)* cap a plan value as a whole, not each text piece
+- *(construct)* apply the local review of the fact candidate rules
+- *(construct)* apply the local review of the record key and types
+- *(construct)* keep and log a record identity only as its key
+- *(construct)* apply the CodeRabbit review of the record intake stack
+- *(construct)* refuse out-of-scope settings writes like reads
+- *(construct)* refuse out-of-scope settings reads with their own error
+- *(construct)* name the settings resource by its GTS type and its owner
+- *(construct)* apply the CodeRabbit review of record intake
+- *(construct)* pin utf8mb4 for the MySQL record identity table
+- *(construct)* apply the review of the subject's settings routes
+- *(construct)* pin utf8mb4 for the MySQL notes table
+- *(construct)* keep the retry meaning of a policy-service failure, reject unknown request fields
+- *(construct)* report a failing policy service as unavailable, add tests
+- *(construct)* return RFC 9457 problems for malformed request bodies
+- *(construct)* follow the database object-namespacing ADR
+- *(construct)* apply review findings to the gear foundation shell
+
+### Other
+
+- Merge pull request #5311 from tob71/ROL-17377-sensitive-data-checks-admission (by @Artifizer) - #5311
+- Merge pull request #5385 from nikbackdev/construct-manage-facts (by @Artifizer) - #5385
+- *(construct)* drop planning and tracker references from the checks and admission
+- *(construct)* drop planning and tracker references from record intake
+- *(construct)* name the broken-constraint case type
+- *(construct)* define the record types as Rust structs
+- *(construct)* drop the first-feature claim, test the migration runs twice
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- *(construct)* state that the hand-off carries no security context
+- *(construct)* let record intake name the tenant
+- *(construct)* log settings read errors once, where they are mapped
+- *(construct)* log each failure once and simplify the retry check
+- *(construct)* cover the policy-service failure paths and the 403 body
+- *(construct)* add @cpt traceability markers to the gear foundation
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-construct-sdk-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(construct)* bring the fact candidate to its current shape
+- *(construct)* add the person types
+- *(construct)* add record intake
+- *(construct)* add the gear foundation shell
+
+### Fixed
+
+- *(construct)* build again after the record types and manage-facts merges
+- *(construct)* apply the local review of the fact candidate rules
+- *(construct)* follow GTS 0.16 for the record types
+- *(construct)* apply the local review of the record key and types
+- *(construct)* build the record type ids with gts_id!
+- *(construct)* keep the retry meaning of a policy-service failure, reject unknown request fields
+- *(construct)* report a failing policy service as unavailable, add tests
+- *(construct)* apply review findings to the gear foundation shell
+
+### Other
+
+- *(construct)* drop planning and tracker references from record intake
+- *(construct)* define the record types as Rust structs
+- correct GTS references and tenant traits (by @aviator5) - #5284
+- *(construct)* let record intake name the tenant
+
+### Contributors
+
+* @aviator5
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-keycloak-idp-plugin-v0.1.7...cf-gears-keycloak-idp-plugin-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(keycloak-idp-plugin)* implement `update_user` (by @fluiderson)
+
+### Fixed
+
+- *(keycloak-idp-plugin)* honor list_users order
+- *(keycloak-idp-plugin)* seconds-scale bucket boundaries for duration histograms (by @Jotunhei)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(account-management)* decouple quota responses from admission source (by @diffora)
+- Merge pull request #4841 from Jotunhei/fix/keycloak-idp-histogram-bucket-boundaries (by @entropyshift) - #4841
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @diffora
+* @entropyshift
+* @Jotunhei
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-flight-control-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(deploy)* publish gear images and Helm charts on release (by @mattgarmon)
+- *(toolkit-oop)* toolkit helm charts (by @mattgarmon)
+- *(toolkit-oop)* add flight-control for OoP deployments (by @mattgarmon)
+
+### Other
+
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- *(service-discovery)* [**breaking**] rename gear-orchestrator to service-discovery (by @mattgarmon)
+
+### Contributors
+
+* @MikeFalcon77
+* @mattgarmon
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.2.13...cf-gears-oidc-authn-plugin-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(oidc-authn-plugin)* make probe race test deterministic (by @fluiderson)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.3.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-conformance-v0.3.8...cf-gears-cluster-conformance-v0.3.9) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.21...cf-gears-tr-authz-plugin-v0.1.22) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(gears)* address the CodeRabbit review of #5487 (by @MikeFalcon77)
+- *(gears)* OAGW and AuthN/AuthZ plugin fixes (by @MikeFalcon77)
+- *(authz)* type native group predicates (by @fdlockgraf)
+
+### Other
+
+- Merge pull request #4744 from fdlockgraf/fix/type-native-group-predicates (by @entropyshift) - #4744
+- Merge remote-tracking branch 'upstream/main' into fix/type-native-group-predicates (by @fdlockgraf) - #4744
+
+### Contributors
+
+* @MikeFalcon77
+* @entropyshift
+* @fdlockgraf
+
+## [0.3.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-timescaledb-usage-collector-plugin-v0.3.0...cf-gears-timescaledb-usage-collector-plugin-v0.3.1) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.40](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.39...cf-gears-static-tr-plugin-v0.1.40) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-license-plugin-v0.1.5...cf-gears-static-license-plugin-v0.1.6) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.19](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.18...cf-gears-static-idp-plugin-v0.1.19) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.16](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.2.15...cf-gears-static-credstore-plugin-v0.2.16) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.41](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.40...cf-gears-single-tenant-tr-plugin-v0.1.41) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-v0.2.5...cf-gears-simple-user-settings-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(simple-user-settings)* delete all of a caller's named settings in one call (by @AndrejK666)
+- *(simple-user-settings)* named settings — any key, a JSON value, per user (by @AndrejK666)
+
+### Fixed
+
+- *(simple-user-settings)* pin the full (tenant_id, user_id) key on reads (by @AndrejK666)
+- *(simple-user-settings)* read and merge only the caller's own settings row (by @AndrejK666)
+- *(simple-user-settings)* cap the named-setting bounds by their product (by @AndrejK666)
+- *(simple-user-settings)* bound the key count and the named request body (by @AndrejK666)
+- *(simple-user-settings)* check the named-setting quota and write in one transaction (by @AndrejK666)
+- *(simple-user-settings)* named settings — quota as 429, resilient list, PRD scoped (by @AndrejK666)
+- *(simple-user-settings)* named settings — hard count bound, full-key pins, startup validation (by @AndrejK666)
+- *(simple-user-settings)* named settings pin the caller's user_id themselves (by @AndrejK666)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(simple-user-settings)* the 16 MiB cap counts value bytes, not the whole list response (by @AndrejK666)
+- *(simple-user-settings)* named settings over HTTP; one count check, after the write (by @AndrejK666)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @AndrejK666
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-sdk-v0.1.7...cf-gears-simple-user-settings-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(simple-user-settings)* delete all of a caller's named settings in one call (by @AndrejK666)
+- *(simple-user-settings)* named settings — any key, a JSON value, per user (by @AndrejK666)
+
+### Fixed
+
+- *(simple-user-settings)* bound the key count and the named request body (by @AndrejK666)
+- *(simple-user-settings)* named settings — quota as 429, resilient list, PRD scoped (by @AndrejK666)
+- *(simple-user-settings)* named settings — hard count bound, full-key pins, startup validation (by @AndrejK666)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @fluiderson
+* @AndrejK666
+
+## [0.1.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-v0.1.3...cf-gears-settings-service-v0.1.7) - 2026-10-28
+
+### Added
+
+- *(settings-service)* report what a revive brings back before it is confirmed (by @shaneemberton)
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(settings-service)* [**breaking**] narrow browse by needs-review and list flagged values on their own route (by @shaneemberton)
+- *(settings-service)* order categories by their display weight (by @shaneemberton)
+- *(settings-service)* [**breaking**] add a display name to setting declarations (by @shaneemberton)
+- *(settings-service)* per-category setting counts and listing totals (by @shaneemberton)
+
+### Fixed
+
+- *(settings-service)* walk live tenants only under the subtree budget (by @shaneemberton)
+
+### Other
+
+- *(settings-service)* type the declaration status (by @shaneemberton)
+- *(settings-service)* drop the authorship header from source files (by @shaneemberton)
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- Merge pull request #5346 from shaneemberton/feat/settings-service-improvements-for-frontend (by @entropyshift) - #5346
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @shaneemberton
+* @MikeFalcon77
+* @entropyshift
+* @modcrafter77
+* @fluiderson
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-sdk-v0.1.0...cf-gears-settings-service-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(settings-service)* [**breaking**] narrow browse by needs-review and list flagged values on their own route (by @shaneemberton)
+- *(settings-service)* order categories by their display weight (by @shaneemberton)
+- *(settings-service)* [**breaking**] add a display name to setting declarations (by @shaneemberton)
+
+### Other
+
+- *(settings-service)* drop the authorship header from source files (by @shaneemberton)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @shaneemberton
+* @MikeFalcon77
+* @fluiderson
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-service-discovery-v0.2.3...cf-gears-service-discovery-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.1.22](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.1.21...cf-gears-rg-tr-plugin-v0.1.22) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-quota-enforcement-storage-plugin-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(quota-enforcement-storage-plugin)* lease tables, lease store and bounded lock contention (by @vgprod)
+- *(quota-enforcement-storage-plugin)* consumption counters, idempotency records and transactional mutations (by @vgprod)
+- *(quota-enforcement-storage-plugin)* policy tables, store and platform-scoped notifications (by @vgprod)
+- *(quota-enforcement-storage-plugin)* quota tables, store and notification outbox (by @vgprod)
+- *(quota-enforcement-storage-plugin)* configuration, bootstrap and (by @vgprod)
+- *(quota-enforcement-storage-plugin)* foundation store port and SQL (by @vgprod)
+- *(quota-enforcement-storage-plugin)* schema, migrations and (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* refuse a settlement whose counter row is missing (by @vgprod)
+- *(quota-enforcement)* address the leases review (by @vgprod)
+- *(quota-enforcement)* wrap counter versions, guard the retention cutoff, and name the engine in preview errors (by @vgprod)
+- *(quota-enforcement)* re-check expiry when the sweeper deletes an idempotency record (by @vgprod)
+- *(quota-enforcement)* meter CEL by bytes copied with in-place map and filter, store policy audit time as a timestamp, default history to the platform page, check rollback terminal states in storage order (by @vgprod)
+- *(quota-enforcement)* a singleton schema-meta key, and no cluster detail in /health (by @vgprod)
+
+### Other
+
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge remote-tracking branch 'origin/feat/quota-enforcement-policies' into tmp/qe-pr5 (by @vgprod) - #5309
+- *(quota-enforcement-storage-plugin)* wait at the PG barrier off the Tokio worker (by @vgprod)
+- *(quota-enforcement)* build m0005_leases, m0006_idempotency_stripes with sea-query (by @vgprod)
+- Merge feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* build m0004_consumption with sea-query (by @vgprod)
+- Merge feat/quota-enforcement-policies into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- *(quota-enforcement)* build m0003_policies with sea-query (by @vgprod)
+- Merge feat/quota-enforcement-lifecycle into feat/quota-enforcement-policies (by @vgprod) - #5308
+- *(quota-enforcement)* build m0002_quotas with sea-query (by @vgprod)
+- Merge feat/quota-enforcement-contracts into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- *(quota-enforcement)* build the foundation migration with sea-query (by @vgprod)
+- *(quota-enforcement)* bound the held-transaction waits and kill hung tests (by @vgprod)
+- *(quota-enforcement)* force record-key races; fix a dead-letter read race (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* force record-key races; fix a dead-letter read race (by @vgprod)
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- *(quota-enforcement)* cover lease, policy, mapping and catalogue paths (by @vgprod)
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- *(quota-enforcement)* SQLite can refuse concurrent writes (by @vgprod)
+- *(quota-enforcement)* rustfmt (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- *(quota-enforcement-storage-plugin)* a deleted policy cannot be rolled back (by @vgprod)
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement-storage-plugin)* a quota outside the scope answers like an unknown one (by @vgprod)
+
+### Contributors
+
+* @vgprod
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-quota-enforcement-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(quota-enforcement)* engines register themselves when linked (by @vgprod)
+- *(quota-enforcement)* lease operations, lease sweeper and lease API (by @vgprod)
+- *(quota-enforcement)* consumption operations, idempotency and the debit benchmark (by @vgprod)
+- *(quota-enforcement)* resolution policies, engine registry and policy API (by @vgprod)
+- *(quota-enforcement)* quota lifecycle, metadata validation and lifecycle gauges (by @vgprod)
+- *(quota-enforcement)* projection contract catalogue and subject attribution (by @vgprod)
+- *(quota-enforcement)* register the gear and its storage plugin in the example server (by @vgprod)
+- *(quota-enforcement)* REST surface and healthcheck (by @vgprod)
+- *(quota-enforcement)* bootstrap, readiness and the PDP reachability probe (by @vgprod)
+- *(quota-enforcement)* plugin resolution, admission and the enforcement point (by @vgprod)
+- *(quota-enforcement)* sweeper election on the cluster gear (by @vgprod)
+- *(quota-enforcement)* domain output ports and the metrics meter (by @vgprod)
+- *(quota-enforcement)* gear configuration and canonical error mapping (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* address the leases review (by @vgprod)
+- *(quota-enforcement)* wrap counter versions, guard the retention cutoff, and name the engine in preview errors (by @vgprod)
+- *(quota-enforcement)* meter CEL by bytes copied with in-place map and filter, store policy audit time as a timestamp, default history to the platform page, check rollback terminal states in storage order (by @vgprod)
+- *(types-registry-sdk)* fail incomplete reconciliation (by @aviator5)
+- *(quota-enforcement)* leave a misclassified metric out of the classification snapshot (by @vgprod)
+- *(quota-enforcement)* flag a misclassified metric at bootstrap and scope an absent list tenant to the caller (by @vgprod)
+- *(quota-enforcement)* preview at /operations/preview, UNKNOWN_* tokens on 404s (by @vgprod)
+- *(quota-enforcement)* mark the lease sweeper, tick lease-operations and the deactivation cascade (by @vgprod)
+- *(quota-enforcement)* mark the consumption domain types, tick consumption-operations and threshold emission (by @vgprod)
+- *(quota-enforcement)* document the CEL engine items, mark the policy domain types, tick resolution-policy-engine (by @vgprod)
+- *(quota-enforcement)* mark the lifecycle domain types with domain_model (by @vgprod)
+- *(quota-enforcement)* mark domain types with domain_model, scope the catalogue compatibility step to Quotas, document helpers (by @vgprod)
+- *(quota-enforcement)* build GTS ids with gts_id! and document the canonical resources (by @vgprod)
+- *(quota-enforcement)* a singleton schema-meta key, and no cluster detail in /health (by @vgprod)
+- *(quota-enforcement)* keep the bootstrap error out of /health (by @vgprod)
+- *(quota-enforcement)* path-only cluster dev-deps (by @vgprod)
+- *(quota-enforcement)* bound write-path policy validation and cover denial, cache and determinism (by @vgprod)
+- *(quota-enforcement)* bound plugin selection and test the coordinator stop timeout (by @vgprod)
+- *(quota-enforcement)* bound the admission PDP call with pdp_deadline_ms (by @vgprod)
+
+### Other
+
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- Merge pull request #5309 from vgprod/feat/quota-enforcement-consumption (by @nonameffh) - #5309
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- migrate GTS validation and consumers to v0.15.1 (by @aviator5) - #5284
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch feat/quota-enforcement-policies into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge remote-tracking branch 'origin/feat/quota-enforcement-policies' into tmp/qe-pr5 (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge remote-tracking branch 'upstream/main' into tmp/qe-pr3 (by @vgprod) - #5273
+- Merge remote-tracking branch 'origin/feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge remote-tracking branch 'origin/feat/quota-enforcement-policies' into tmp/qe-pr5 (by @vgprod) - #5309
+- Merge remote-tracking branch 'origin/feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge feat/quota-enforcement-policies into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge feat/quota-enforcement-lifecycle into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- Merge feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge feat/quota-enforcement-policies into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge feat/quota-enforcement-lifecycle into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge feat/quota-enforcement-contracts into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge feat/quota-enforcement-foundation into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- *(quota-enforcement)* cover lease, policy, mapping and catalogue paths (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* cover lease, policy, mapping and catalogue paths (by @vgprod)
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- *(quota-enforcement)* cover lease, policy, mapping and catalogue paths (by @vgprod)
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- *(quota-enforcement)* cover lease, policy, mapping and catalogue paths (by @vgprod)
+- *(quota-enforcement)* show the acquire response in a lease test (by @vgprod)
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- *(quota-enforcement)* rustfmt (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- *(quota-enforcement)* if_match_version must be a positive integer (by @vgprod)
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- Merge branch 'docs/quota-enforcement-projection-contracts' into feat/quota-enforcement-foundation (by @vgprod) - #5245
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- Merge branch 'docs/quota-enforcement-projection-contracts' into feat/quota-enforcement-foundation (by @vgprod) - #5245
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement-sdk)* credit is a manager-client operation (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-contracts' into feat/quota-enforcement-lifecycle (by @vgprod) - #5273
+- Merge branch 'feat/quota-enforcement-foundation' into feat/quota-enforcement-contracts (by @vgprod) - #5272
+
+### Contributors
+
+* @vgprod
+* @MikeFalcon77
+* @nonameffh
+* @aviator5
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-quota-enforcement-engine-most-restrictive-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(quota-enforcement)* engines register themselves when linked (by @vgprod)
+- *(quota-enforcement)* CEL and most-restrictive evaluation engine plugins (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* bound write-path policy validation and cover denial, cache and determinism (by @vgprod)
+
+### Other
+
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+
+### Contributors
+
+* @vgprod
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-quota-enforcement-engine-cel-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(quota-enforcement)* engines register themselves when linked (by @vgprod)
+- *(quota-enforcement)* CEL and most-restrictive evaluation engine plugins (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* parse and check CEL on the parser stack so a rejected deep tree never drops on the caller (by @vgprod)
+- *(quota-enforcement)* meter CEL by bytes copied with in-place map and filter, store policy audit time as a timestamp, default history to the platform page, check rollback terminal states in storage order (by @vgprod)
+- *(quota-enforcement)* document the CEL engine items, mark the policy domain types, tick resolution-policy-engine (by @vgprod)
+
+### Other
+
+- *(quota-enforcement)* give the CEL runtime tests a generous timeout (by @vgprod)
+- *(quota-enforcement)* cover contract forwarding and CEL type rules (by @vgprod)
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+
+### Contributors
+
+* @vgprod
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-sdk-v0.1.0...cf-gears-quota-enforcement-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(quota-enforcement)* engines register themselves when linked (by @vgprod)
+- *(quota-enforcement-sdk)* lease contract and acquisition outcome (by @vgprod)
+- *(quota-enforcement-sdk)* consumption operations, idempotency and FIPS digests (by @vgprod)
+- *(quota-enforcement-sdk)* resolution policy contract and engine plugin trait (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* address the leases review (by @vgprod)
+- *(quota-enforcement)* wrap counter versions, guard the retention cutoff, and name the engine in preview errors (by @vgprod)
+
+### Other
+
+- *(quota-enforcement)* document the contention timeout on the client write calls (by @vgprod)
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge pull request #5309 from vgprod/feat/quota-enforcement-consumption (by @nonameffh) - #5309
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- migrate GTS validation and consumers to v0.15.1 (by @aviator5) - #5284
+- Merge branch feat/quota-enforcement-consumption into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch feat/quota-enforcement-policies into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-policies' into feat/quota-enforcement-consumption (by @vgprod) - #5309
+- Merge branch 'feat/quota-enforcement-lifecycle' into feat/quota-enforcement-policies (by @vgprod) - #5308
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement-sdk)* credit is a manager-client operation (by @vgprod)
+- Merge branch 'feat/quota-enforcement-consumption' into feat/quota-enforcement-leases (by @vgprod) - #5312
+- *(quota-enforcement-storage-plugin)* a quota outside the scope answers like an unknown one (by @vgprod)
+
+### Contributors
+
+* @vgprod
+* @nonameffh
+* @aviator5
+
+## [0.1.44](https://github.com/constructorfabric/gears-rust/compare/cf-gears-nodes-registry-v0.1.43...cf-gears-nodes-registry-v0.1.44) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.5.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-v0.4.5...cf-gears-mini-chat-v0.5.0) - 2026-10-28
+
+### Added
+
+- move OAGW and event-broker from Pingora to toolkit-http-proxy (by @MikeFalcon77) - #5469
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(mini-chat)* upload reaper for attachments stuck in pending or uploaded (by @MikeFalcon77)
+
+### Fixed
+
+- *(gears)* OAGW and AuthN/AuthZ plugin fixes (by @MikeFalcon77)
+- *(mini-chat)* INVALID_TITLE reason; correct the conflict, summary prompt and UUID notes (by @MikeFalcon77)
+- *(mini-chat)* machine-readable reasons for invalid reaction and code-interpreter-only upload (by @MikeFalcon77)
+- *(mini-chat)* address the second review round of PR #5025 (by @MikeFalcon77)
+- *(mini-chat)* id tiebreaker on list ordering; 503 on quota status (by @MikeFalcon77)
+- *(mini-chat)* return 503 with Retry-After when the PDP cannot evaluate (by @MikeFalcon77)
+- *(mini-chat)* address the PR #5025 review findings (by @MikeFalcon77)
+- *(mini-chat)* send sampling parameters only when the model config sets them (by @MikeFalcon77)
+- *(mini-chat)* finish vector store indexing in the background after the request deadline (by @MikeFalcon77)
+- *(mini-chat)* fit the provider user field into 64 characters (by @MikeFalcon77)
+- *(mini-chat)* keep usage of response.failed; summary estimate without reasoning tokens (by @MikeFalcon77)
+- *(mini-chat)* typed message role, reaction and attachment summary fields in OpenAPI (by @MikeFalcon77)
+- *(mini-chat)* reaper skips rows owned by chat cleanup; strict kill_switches keys (by @MikeFalcon77)
+- *(mini-chat)* typed enums and required usage in the OpenAPI schema (by @MikeFalcon77)
+- *(mini-chat)* reject summary tasks for an unavailable model; separate skip metrics (by @MikeFalcon77)
+- *(mini-chat)* accept a partial kill_switches object (by @MikeFalcon77)
+- *(mini-chat)* scope the chat cleanup vector store queries to the event tenant (by @MikeFalcon77)
+- *(mini-chat)* reserve tool surcharges only for tools the turn sends (by @MikeFalcon77)
+- *(mini-chat)* plain read in the reserve re-check, quota_exceeded on the failed mutation turn (by @MikeFalcon77)
+- *(mini-chat)* bound the indexing wait by the api-gateway request timeout (by @MikeFalcon77)
+- *(mini-chat)* clear is_compressed when a mutation drops the thread summary (by @MikeFalcon77)
+- *(mini-chat)* no duplicate question when retrying or editing the only live turn (by @MikeFalcon77)
+- *(mini-chat)* register the OAGW GET route for vector store file status (by @MikeFalcon77)
+- *(mini-chat)* mark a document ready only after vector store indexing completes (by @MikeFalcon77)
+- *(mini-chat)* drop the thread summary when a mutation changes a turn it covers (by @MikeFalcon77)
+- *(mini-chat)* re-check quota limits in the reserve transaction (by @MikeFalcon77)
+- *(mini-chat)* check each cascade candidate with its own reserve (by @MikeFalcon77)
+- *(mini-chat)* route a downgraded turn to the effective model's provider (by @MikeFalcon77)
+- *(mini-chat)* reject corrupt audit payloads before resolving the plugin (by @MikeFalcon77)
+- *(mini-chat)* fixed detail for 409 turn conflicts, drop unused ServiceUnavailable error (by @MikeFalcon77)
+- *(mini-chat)* take the Responses event name from data.type when the event line is missing (by @MikeFalcon77)
+- *(mini-chat)* send file_search only when the effective model supports it (by @MikeFalcon77)
+- *(mini-chat)* mask another user's attachment as 404 on GET too (by @MikeFalcon77)
+- *(mini-chat)* declare Location on POST /chats and require my_reaction (by @MikeFalcon77)
+- *(mini-chat)* expand env vars in tenant override host (by @MikeFalcon77)
+- *(mini-chat)* re-resolve a missing audit plugin and retry a missing client (by @MikeFalcon77)
+- *(mini-chat)* reject uploads when the chat model cannot be resolved (by @MikeFalcon77)
+- *(mini-chat)* return 404 on DELETE of another user's attachment (by @MikeFalcon77)
+- *(mini-chat)* return a generic detail for 409 already_exists (by @MikeFalcon77)
+- *(mini-chat)* reject zero credit multipliers (by @MikeFalcon77)
+- *(mini-chat)* offer knowledge search and web search only when they can run (by @MikeFalcon77)
+- *(mini-chat)* stop declaring 503 on stream, retry and edit (by @MikeFalcon77)
+- *(mini-chat)* slice citation snippets by characters of the annotated part (by @MikeFalcon77)
+- *(mini-chat)* report the gateway's own 504 as provider_timeout (by @MikeFalcon77)
+- *(mini-chat)* return a canonical 400 for a path parameter that is not a UUID (by @MikeFalcon77)
+- *(mini-chat)* treat max_input_tokens 0 as no limit in the input-length check (by @MikeFalcon77)
+- *(mini-chat)* parse the real OpenAI Responses error, code interpreter and citation shapes (by @MikeFalcon77)
+- *(mini-chat)* fail provider deletes on error status and bound vector store retries (by @MikeFalcon77)
+- *(mini-chat)* drop stale dead_code allows in credit_arithmetic (by @MikeFalcon77)
+- *(mini-chat)* reject azure storage_kind without api_version at config validation (by @MikeFalcon77)
+- *(mini-chat)* reject reaction DELETE on a non-assistant message (by @MikeFalcon77)
+- *(mini-chat)* return canonical OData reasons for repo-layer query errors (by @MikeFalcon77)
+- *(mini-chat)* report the attachment resource type on attachment 404s (by @MikeFalcon77)
+- *(mini-chat)* correct audit, summary-trigger and usage attribution metrics (by @MikeFalcon77)
+- *(mini-chat)* check image support on the effective model (by @MikeFalcon77)
+- *(mini-chat)* authorize sending with send_message only and retry/edit once (by @MikeFalcon77)
+- *(mini-chat)* take estimation budgets from the model catalog everywhere (by @MikeFalcon77)
+- *(mini-chat)* cap the context budget by max_input_tokens and truncate by turns (by @MikeFalcon77)
+- *(mini-chat)* keep the latest turn out of the thread summary (by @MikeFalcon77)
+- *(mini-chat)* use bounded reason values on the cleanup retry metric (by @MikeFalcon77)
+- *(mini-chat)* scrub Anthropic file IDs from provider errors (by @MikeFalcon77)
+- *(mini-chat)* skip the code interpreter quota when its kill switch is set (by @MikeFalcon77)
+- *(mini-chat)* address review findings (error context) (by @MikeFalcon77)
+- *(mini-chat)* attachment failure state and provider cleanup (by @MikeFalcon77)
+- *(mini-chat)* report a lost request_id race as request_id_conflict (by @MikeFalcon77)
+- *(mini-chat)* canonical errors for invalid bodies and provider 429 (by @MikeFalcon77)
+- *(mini-chat)* store requester_type as user/system, not the subject type (by @MikeFalcon77)
+- *(mini-chat)* smaller correctness fixes (by @MikeFalcon77)
+- *(mini-chat)* map OData and PDP failures to client errors (by @MikeFalcon77)
+- *(mini-chat)* bound outbox retries and set dedupe keys (by @MikeFalcon77)
+- *(mini-chat)* exclude deleted turns from replay and turn status (by @MikeFalcon77)
+- *(mini-chat)* align SSE terminal events with persisted turn state (by @MikeFalcon77)
+- *(mini-chat)* fail turns on pre-provider errors after reserve (by @MikeFalcon77)
+- *(mini-chat)* gate daily tool quotas on request flags (by @MikeFalcon77)
+- *(outbox)* defer partition dirty signal to post-commit flush (by @striped-zebra-dev)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge pull request #5065 from fluiderson/chore/rust-1.98.1 (by @MikeFalcon77) - #5065
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- *(mini-chat)* tighten tests flagged in the PR #5025 review (by @MikeFalcon77)
+- *(mini-chat)* unit-test the uncovered patch logic; keep tests out of coverage (by @MikeFalcon77)
+- *(mini-chat)* fix broken intra-doc links (by @MikeFalcon77)
+- *(mini-chat)* correct stale comments on upstream_alias, SDK models and the audit trait (by @MikeFalcon77)
+- *(mini-chat)* align docs with the re-audit fixes and remaining drift (by @MikeFalcon77)
+- *(mini-chat)* fix stale comments and dead_code allows (by @MikeFalcon77)
+- *(mini-chat)* remove unused config keys (by @MikeFalcon77)
+- *(mini-chat)* drop the no-op DefaultBodyLimit on the upload route (by @MikeFalcon77)
+- *(mini-chat)* correct the vision error text and OAGW alias comments (by @MikeFalcon77)
+- *(mini-chat)* describe the SSE wire format and real error codes in OpenAPI (by @MikeFalcon77)
+- *(mini-chat)* correct the OAGW upstream alias comment (by @MikeFalcon77)
+- *(mini-chat)* second pass on DESIGN, PRD and ADR drift (by @MikeFalcon77)
+- *(mini-chat)* pin the orphan watchdog timeout bounds (by @MikeFalcon77)
+- *(mini-chat)* remove the unused WebSearchCallsExceeded error (by @MikeFalcon77)
+- *(mini-chat)* correct stale comments on Anthropic file search and audit (by @MikeFalcon77)
+- *(mini-chat)* declare upload body, 422 and 503 in OpenAPI (by @MikeFalcon77)
+- *(mini-chat)* cover behaviours flagged by the branch review (by @MikeFalcon77)
+- *(mini-chat)* move turn DTOs to dto.rs (by @MikeFalcon77)
+- *(mini-chat)* unit-test scenarios the E2E rig cannot reach (by @MikeFalcon77)
+- *(mini-chat)* update feature docs, README and manifest (by @MikeFalcon77)
+- Merge pull request #4868 from striped-zebra-dev/outbox-flush-fix (by @MikeFalcon77) - #4868
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @striped-zebra-dev
+
+## [0.10.27](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-sdk-v0.10.26...cf-gears-mini-chat-sdk-v0.10.27) - 2026-10-28
+
+### Fixed
+
+- *(mini-chat)* address the second review round of PR #5025 (by @MikeFalcon77)
+- *(mini-chat)* address the PR #5025 review findings (by @MikeFalcon77)
+- *(mini-chat)* send sampling parameters only when the model config sets them (by @MikeFalcon77)
+- *(mini-chat)* accept a partial kill_switches object (by @MikeFalcon77)
+
+### Other
+
+- *(mini-chat)* document the PR #5025 review fixes (by @MikeFalcon77)
+- *(mini-chat)* unit-test the uncovered patch logic; keep tests out of coverage (by @MikeFalcon77)
+- *(mini-chat)* align PRD, DESIGN and ADRs with the code after the third audit (by @MikeFalcon77)
+- *(mini-chat)* correct stale comments on upstream_alias, SDK models and the audit trait (by @MikeFalcon77)
+- *(mini-chat)* align docs with the re-audit fixes and remaining drift (by @MikeFalcon77)
+- *(mini-chat)* align DESIGN §5, PRD, features and error tables with the code (by @MikeFalcon77)
+- *(mini-chat)* update feature docs, README and manifest (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-v0.1.5...cf-gears-license-resolver-v0.1.6) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(license-resolver)* switch to REST toolkit (by @nonameffh)
+
+### Contributors
+
+* @MikeFalcon77
+* @nonameffh
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-sdk-v0.1.4...cf-gears-license-resolver-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(license-resolver)* add maxLength and minLength constraints for id properties (by @nonameffh)
+- *(license-resolver)* switch to REST toolkit (by @nonameffh)
+
+### Other
+
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+
+### Contributors
+
+* @aviator5
+* @nonameffh
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-v0.1.4...cf-gears-graph-storage-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(graph-storage)* m0010 matches the schema by name, not through ::regnamespace (by @vasylcf)
+- *(graph-storage)* [**breaking**] retire the SQL/PGQ hop — PostgreSQL 19 GA ships without it (by @vasylcf)
+
+### Other
+
+- Merge pull request #5337 from vasylcf/fix/graph-storage-retire-sqlpgq (by @Artifizer) - #5337
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- *(graph-storage)* DESIGN, PRD and README describe the current state only (by @vasylcf)
+- *(graph-storage)* code comments describe the current hop, not the SQL/PGQ history (by @vasylcf)
+- *(graph-storage)* doc comments say what the hop does now; drop a dead assert, a leftover block and the floating image tag (by @vasylcf)
+- *(graph-storage)* no SQL/PGQ path or unrecorded latency claim left in the present tense (by @vasylcf)
+- *(graph-storage)* SQL/PGQ retired — ADR-0001 addendum, ADR-0005 superseded (by @vasylcf)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+* @aviator5
+* @vasylcf
+* @fluiderson
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-remote-embedding-plugin-v0.1.0...cf-gears-graph-storage-remote-embedding-plugin-v0.1.1) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-onnx-embedding-plugin-v0.1.0...cf-gears-graph-storage-onnx-embedding-plugin-v0.1.1) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-sdk-v0.1.1...cf-gears-graph-storage-sdk-v0.2.0) - 2026-10-28
+
+### Fixed
+
+- *(graph-storage)* [**breaking**] retire the SQL/PGQ hop — PostgreSQL 19 GA ships without it (by @vasylcf)
+
+### Other
+
+- *(graph-storage)* code comments describe the current hop, not the SQL/PGQ history (by @vasylcf)
+
+### Contributors
+
+* @vasylcf
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-github-mirror-v0.1.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(github-mirror)* rate-limited GitHub client, cache backends, session telemetry and the github-mirror CLI (by @AndIConstructor)
+- *(github-mirror)* phased sync engine with sessions, watermarks and resume (by @AndIConstructor)
+- *(authz-resolver)* [**breaking**] migrate to toolkit contract with REST projection (by @mattgarmon)
+- *(authz-resolver)* [**breaking**] migrate to toolkit contract with REST projection (by @mattgarmon)
+
+### Fixed
+
+- *(github-mirror)* mark syncs that never started as interrupted at shutdown (by @AndIConstructor)
+- *(github-mirror)* bound a failed sync's error and drift list, and keep its typed cause (by @AndIConstructor)
+- *(github-mirror)* skip entities GitHub deleted mid-sync, and free a lock only for a session that took it (by @AndIConstructor)
+- *(github-mirror)* heartbeat task, same-host redirects, and resume reports what it could not queue (by @AndIConstructor)
+- *(github-mirror)* keep refinement at full width above the backlog bound (by @AndIConstructor)
+- *(github-mirror)* track in-process syncs and cap the workflow-run walk (by @AndIConstructor)
+- *(github-mirror)* close a sync session that cannot start, and retry its final write (by @AndIConstructor)
+- *(github-mirror)* address the low-risk ninth-wave review findings (by @AndIConstructor)
+- *(github-mirror)* keep the per-repository sync claim in gm_active_syncs (by @AndIConstructor)
+- *(github-mirror)* close only dead sessions in the start-up sweep (by @AndIConstructor)
+- *(github-mirror)* list new commits by comparing with the last synced head (by @AndIConstructor)
+- *(github-mirror)* keep an issue's stored timeline when the sync did not fetch it (by @AndIConstructor)
+- *(github-mirror)* check the sync permission before answering 202 (by @AndIConstructor)
+- *(github-mirror)* recheck the rate-limit cooldown after taking a request slot (by @AndIConstructor)
+- *(secure-orm)* [**breaking**] own the syntax error, opt into the anchor, check membership by table (by @vasylcf)
+
+### Other
+
+- *(github-mirror)* publish the gear to crates.io (by @AndIConstructor)
+- publish turned off (by @AndIConstructor) - #5397
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(github-mirror)* wait for the limited request's retry instead of checking once (by @AndIConstructor)
+- Fixed. record_heartbeat now only writes while the session is queued or in_progress, and the final write in run_and_record is a conditional update on the same two statuses. A session the sweep already marked interrupted is no longer written to, and the run then also leaves the repository status alone. (by @AndIConstructor) - #4777
+- *(github-mirror)* cover each rate-limit answer GitHub sends (by @AndIConstructor)
+- *(github-mirror)* cover retries, paging, the decompression cap, the request slot and the sync pool (by @AndIConstructor)
+- Merge pull request #4704 from Andrei-Iliushin-Constructor/andrei-i/4532-Gear-skeleton (by @MikeFalcon77) - #4704
+- Catch joined credential schemes, tie-break test for milestones, drop the tenant id from the lock warning (by @AndIConstructor) - #4704
+- Read each page and its total on one transaction (by @AndIConstructor) - #4704
+- Merge remote-tracking branch 'origin/main' into feature/secure-orm-pgq (by @vasylcf) - #4639
+- Redact the server-to-server and refresh token prefixes too (by @AndIConstructor) - #4704
+- Tie-break the label and milestone windows, redact the client URL log, widen the paging tests (by @AndIConstructor) - #4704
+- Redact URL credentials, tie-break the repos window, cover filters in Link headers (by @AndIConstructor) - #4704
+- Apply since on the commit listing, redact bearer values, guard the rounding overflow (by @AndIConstructor) - #4704
+- Round a fractional since bound up so it excludes its own second (by @AndIConstructor) - #4704
+- Name the row in stored-JSON decode warnings, cover the OData request bounds (by @AndIConstructor) - #4704
+- Cap the page row count in PageWindow, redact logged error messages (by @AndIConstructor) - #4704
+- Enforce per-field OData operators, name the rejected parameter, ASCII comments (by @AndIConstructor) - #4704
+- Bound the page window in the domain, strict sort and direction, decode timeline payload in storage (by @AndIConstructor) - #4704
+- Validate paths in the domain, keep filters in Link headers, fix the paging cap (by @AndIConstructor) - #4704
+- Cover all 26 tables in the tenancy test; validate the path in 17 more handlers (by @AndIConstructor) - #4704
+- Address the CodeRabbit findings on #4704 (by @AndIConstructor) - #4704
+- Cover the gaps MikeFalcon77's review found in the tests (by @AndIConstructor) - #4704
+- Page the compat listings in SQL (by @AndIConstructor) - #4704
+- Address MikeFalcon77's review: 4 small findings (by @AndIConstructor) - #4704
+- Apply OData filters and cursors on the v1 listings (by @AndIConstructor) - #4704
+- Drop the 26 generic parameters from Service (by @AndIConstructor) - #4704
+- Type the SDK's embedded GitHub objects (by @AndIConstructor) - #4704
+- Address MikeFalcon77's review: 7 medium findings (by @AndIConstructor) - #4704
+- Address MikeFalcon77's review: 4 high, 7 medium findings (by @AndIConstructor) - #4704
+- Merge remote-tracking branch 'origin/main' into feature/secure-orm-pgq (by @vasylcf) - #4639
+- 4593 review: keep sea_orm out of the domain layer (DE0301) (by @AndIConstructor) - #4593
+- 4593 review: bound trace-log content and state data governance (PRD); name the last page from a real count (by @AndIConstructor) - #4593
+- 4593 review: bound trace-log content and state data-governance requirements (PRD) (by @AndIConstructor) - #4593
+- 4593 review: mirror GitHub's user and label objects whole on issues and pull requests (by @AndIConstructor) - #4593
+- 4593 review: store node_id, modern review-comment anchors and PR file patches; rewrite issue timelines idempotently (by @AndIConstructor) - #4593
+- 4593 review: pin GitHub API version, honor state=open default, keep pull_request_review_id, skip orphan comments (by @AndIConstructor) - #4593
+- 4593 review: derive contributors from mirrored entities (PRD 5.2), typed local timestamps, low-severity fixes (by @AndIConstructor) - #4593
+- 4593 review: derive contributors from mirrored entities per PRD 5.2 (by @AndIConstructor) - #4593
+- 4593 review: single-source the gear name via MODULE_NAME, widen remaining MySQL TEXT columns to MEDIUMTEXT (by @AndIConstructor) - #4593
+- 4593 review: deletion reconciliation via extracted_at, rate-limit retry, URL validation, AccessLost/Conflict mapping, release assets, nullable contributor login, keyset repo cursor, tie-breaks, operation-id prefixes + descriptions, deny-path/tenancy/config tests, README+PRD increment scope, regenerated api.json (by @AndIConstructor) - #4593
+- 4593 review: transaction around sync writes, per-repo sync lock (409), GraphQL failure isolation, HTTP timeouts, readyz healthcheck, review-comment diff anchors, MySQL parity (by @AndIConstructor) - #4593
+- route GitHub-compatible paths through consts — documented DE0801 exception (PRD 5.8 mandates unversioned GitHub paths) (by @AndIConstructor) - #4593
+- github-mirror gear — GitHub-compatible REST surface over a local mirror (by @AndIConstructor) - #4593
+
+### Contributors
+
+* @AndIConstructor
+* @MikeFalcon77
+* @fluiderson
+* @vasylcf
+* @mattgarmon
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-github-mirror-sdk-v0.1.0...cf-gears-github-mirror-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(github-mirror)* rate-limited GitHub client, cache backends, session telemetry and the github-mirror CLI (by @AndIConstructor)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @AndIConstructor
+* @fluiderson
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-v0.2.8...cf-gears-file-storage-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(file-storage)* [**breaking**] bind listing page parameters through the toolkit OData extractor (by @ffedoroff)
+- *(file-storage)* [**breaking**] cursor pagination for the file, version and retention-rule listings (by @ffedoroff)
+- *(file-storage)* trust the sidecar's measured digest, drop the background sweep (by @ffedoroff)
+- *(file-storage)* docs, compatible fixes and non-breaking extensions (1/N of #4708) (by @ffedoroff)
+
+### Fixed
+
+- *(file-storage)* mark the cursor types as domain models (by @ffedoroff)
+- *(file-storage)* reject a zero page size; make the page-size rejection tests fail for their own reason (by @ffedoroff)
+- *(file-storage)* back out the CodeRabbit follow-ups from fa0ec9c0e (by @ffedoroff)
+- *(file-storage)* address review of #5112 — drop unused code, owner-pair list check, doc fixes (by @ffedoroff)
+- *(file-storage)* address review of #5112 (by @ffedoroff)
+
+### Other
+
+- *(file-storage)* cover the control-plane route table registered by register_routes (by @ffedoroff)
+- *(file-storage)* share the listing page parameters and hide crate-only pagination items (by @ffedoroff)
+- *(file-storage)* trim redundant code comments, regenerate api.json (by @ffedoroff)
+- *(file-storage)* drop the @cpt traceability markers from the gear's sources (by @ffedoroff)
+- *(file-storage)* drop the modules this MR never calls (by @ffedoroff)
+- *(file-storage)* drop docs/migration.sql, the SeaORM migrations are the schema source (by @ffedoroff)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+
+### Contributors
+
+* @MikeFalcon77
+* @ffedoroff
+* @fluiderson
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-sdk-v0.1.3...cf-gears-file-storage-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(file-storage)* docs, compatible fixes and non-breaking extensions (1/N of #4708) (by @ffedoroff)
+
+### Fixed
+
+- *(file-storage)* address review of #5112 — drop unused code, owner-pair list check, doc fixes (by @ffedoroff)
+
+### Other
+
+- *(file-storage)* trim redundant code comments, regenerate api.json (by @ffedoroff)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @ffedoroff
+* @fluiderson
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-parser-v0.1.46...cf-gears-file-parser-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.1.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-clickhouse-usage-collector-plugin-v0.1.0...cf-gears-clickhouse-usage-collector-plugin-v0.1.1) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- Return the answerd sibilding port from start_named (by @CommName) - #5172
+- Run clickhosue tests across same container and timeout for brin_up (by @CommName) - #5172
+
+### Contributors
+
+* @MikeFalcon77
+* @modcrafter77
+* @CommName
+
+## [0.3.9](https://github.com/constructorfabric/gears-rust/compare/cf-chat-engine-v0.3.8...cf-chat-engine-v0.3.9) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-http-json-plugin-v0.1.10...cf-gears-bss-rate-provider-http-json-plugin-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- *(ledger)* [**breaking**] decimal money in major units across contracts and storage (by @diffora)
+
+### Contributors
+
+* @MikeFalcon77
+* @diffora
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-ecb-plugin-v0.1.10...cf-gears-bss-rate-provider-ecb-plugin-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- *(ledger)* [**breaking**] decimal money in major units across contracts and storage (by @diffora)
+
+### Contributors
+
+* @MikeFalcon77
+* @diffora
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-v0.1.10...cf-gears-bss-rate-provider-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(types-registry)* add tenant read API and shared helpers (by @aviator5)
+
+### Other
+
+- *(ledger)* [**breaking**] decimal money in major units across contracts and storage (by @diffora)
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+* @diffora
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-sdk-v0.1.10...cf-gears-bss-rate-provider-sdk-v0.2.0) - 2026-10-28
+
+### Other
+
+- *(ledger)* [**breaking**] decimal money in major units across contracts and storage (by @diffora)
+
+### Contributors
+
+* @diffora
+
+## [0.5.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.4.0...cf-gears-usage-collector-v0.5.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(toolkit)* harden platform route auth wiring (by @aviator5)
+- *(authz)* type native group predicates (by @fdlockgraf)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge pull request #4744 from fdlockgraf/fix/type-native-group-predicates (by @entropyshift) - #4744
+- Merge remote-tracking branch 'upstream/main' into fix/type-native-group-predicates (by @fdlockgraf) - #4744
+- *(authz)* reconcile native group typing with main (by @fdlockgraf)
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+* @fluiderson
+* @entropyshift
+* @fdlockgraf
+
+## [0.3.15](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.3.14...cf-gears-usage-collector-sdk-v0.3.15) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.2.8...cf-gears-event-broker-v0.3.0) - 2026-10-28
+
+### Added
+
+- move OAGW and event-broker from Pingora to toolkit-http-proxy (by @MikeFalcon77) - #5469
+- *(authz)* consume AuthZResolverApi as a contract instead of linking the PDP (by @MikeFalcon77)
+- *(event-broker)* fault-injecting broker and registry-backed harness for producer tests (by @fdlockgraf)
+
+### Fixed
+
+- *(event-broker)* refuse non-event types early (by @fdlockgraf)
+- *(event-broker)* authorize concrete event types during delivery (by @fdlockgraf)
+- *(event-broker)* [**breaking**] authorize concrete resources (by @fdlockgraf)
+- fix windows producer push error (by @striped-zebra-dev) - #4439
+
+### Other
+
+- Merge pull request #5469 from MikeFalcon77/refactor/toolkit-http-proxy (by @MikeFalcon77) - #5469
+- Merge pull request #5383 from fdlockgraf/fix/eb-authz-concrete-resource-types (by @entropyshift) - #5383
+- Merge pull request #5381 from fdlockgraf/event-broker/test-support-faults (by @Artifizer) - #5381
+- *(event-broker)* simplify authorization docs (by @fdlockgraf)
+- *(event-broker)* fix flaky rebalance tests (by @mattgarmon)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(service-discovery)* [**breaking**] rename gear-orchestrator to service-discovery (by @mattgarmon)
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- Fix subscriber timeout logic. (by @striped-zebra-dev) - #4439
+- Implement event-broker dispatcher routing, REST handlers, and standalone single-process service (gears-rust#4345, #4346, #4347) (by @striped-zebra-dev) - #4439
+
+### Contributors
+
+* @MikeFalcon77
+* @entropyshift
+* @Artifizer
+* @fdlockgraf
+* @mattgarmon
+* @fluiderson
+* @striped-zebra-dev
+
+## [0.1.39](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.38...cf-gears-static-authz-plugin-v0.1.39) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(authz)* type native group predicates (by @fdlockgraf)
+
+### Other
+
+- Merge pull request #4744 from fdlockgraf/fix/type-native-group-predicates (by @entropyshift) - #4744
+- Merge remote-tracking branch 'upstream/main' into fix/type-native-group-predicates (by @fdlockgraf) - #4744
+
+### Contributors
+
+* @MikeFalcon77
+* @entropyshift
+* @fdlockgraf
+
+## [0.3.19](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.3.18...cf-gears-static-authn-plugin-v0.3.19) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(gears)* OAGW and AuthN/AuthZ plugin fixes (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-sqlite-event-broker-plugin-v0.1.0) - 2026-10-28
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Implement event-broker dispatcher routing, REST handlers, and standalone single-process service (gears-rust#4345, #4346, #4347) (by @striped-zebra-dev) - #4439
+
+### Contributors
+
+* @fluiderson
+* @striped-zebra-dev
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-v0.2.9...cf-gears-cluster-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(grpc-hub,cluster)* a hardened hub, and cluster's contracts over gRPC (by @MikeFalcon77)
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(toolkit-oop)* add flight-control for OoP deployments (by @mattgarmon)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge pull request #5065 from fluiderson/chore/rust-1.98.1 (by @MikeFalcon77) - #5065
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @mattgarmon
+
+## [0.1.6](https://github.com/constructorfabric/gears-rust/compare/cf-redis-cluster-plugin-v0.1.5...cf-redis-cluster-plugin-v0.1.6) - 2026-10-28
+
+### Other
+
+- *(test-containers)* add pinned redis() helper and use it in redis-cluster-plugin (by @asmith987)
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+
+### Contributors
+
+* @asmith987
+* @modcrafter77
+* @fluiderson
+
+## [0.5.0](https://github.com/constructorfabric/gears-rust/compare/cf-postgres-cluster-plugin-v0.4.6...cf-postgres-cluster-plugin-v0.5.0) - 2026-10-28
+
+### Added
+
+- *(toolkit-oop)* add flight-control for OoP deployments (by @mattgarmon)
+
+### Fixed
+
+- *(docs)* repair broken markdown links and check all markdown in CI (by @lobster40)
+
+### Other
+
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge pull request #5025 from MikeFalcon77/chore/mini-chat-docs_vs_code (by @Artifizer) - #5025
+- *(postgres-cluster-plugin)* seed PG-SPEC-009's live lock without try_lock (by @MikeFalcon77)
+- *(cluster)* run pg_spec_009 without the background reaper so its sweep counts are exact (by @asmith987)
+
+### Contributors
+
+* @lobster40
+* @modcrafter77
+* @fluiderson
+* @mattgarmon
+* @Artifizer
+* @MikeFalcon77
+* @asmith987
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-k8s-cluster-plugin-v0.1.2...cf-k8s-cluster-plugin-v0.1.3) - 2026-10-28
+
+### Fixed
+
+- *(cluster)* treat a 404 on a guarded k8s replace as a vanished object (by @asmith987)
+
+### Other
+
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+
+### Contributors
+
+* @asmith987
+* @modcrafter77
+* @fluiderson
+
+## [0.2.9](https://github.com/constructorfabric/gears-rust/compare/cf-gears-standalone-cluster-plugin-v0.2.8...cf-gears-standalone-cluster-plugin-v0.2.9) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-sdk-v0.2.8...cf-gears-cluster-sdk-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(toolkit-contract)* tune consumer clients via consumer_wiring (by @mattgarmon)
+
+### Fixed
+
+- *(gears)* OAGW and AuthN/AuthZ plugin fixes (by @MikeFalcon77)
+- *(cluster)* tolerate anchor sampling skew in the remaining lease clock tests (by @asmith987)
+
+### Other
+
+- *(cluster)* bound lease clock tests by measured sampling windows (by @asmith987)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @MikeFalcon77
+* @asmith987
+* @fluiderson
+* @mattgarmon
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-ledger-sdk-v0.1.8...cf-gears-bss-ledger-sdk-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(pricing)* [**breaking**] exact decimal money on the shared money contract (by @diffora)
+
+### Other
+
+- *(ledger)* [**breaking**] decimal money in major units across contracts and storage (by @diffora)
+
+### Contributors
+
+* @diffora
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-money-v0.1.0...cf-gears-bss-money-v0.2.0) - 2026-10-28
+
+### Added
+
+- *(pricing)* list the currency table (GET /currencies) (by @diffora)
+- *(pricing)* [**breaking**] exact decimal money on the shared money contract (by @diffora)
+
+### Contributors
+
+* @diffora
+
+## [0.6.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-api-gateway-v0.5.2...cf-gears-api-gateway-v0.6.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(toolkit)* enforce platform route auth (by @aviator5)
+- *(toolkit-oop)* add flight-control for OoP deployments (by @mattgarmon)
+
+### Fixed
+
+- support platform identity throttling (by @aviator5) - #5256
+- enforce one authentication plane per request (by @aviator5) - #5256
+- *(toolkit)* harden platform route auth wiring (by @aviator5)
+- *(observability)* use live otel trace context as the single source of truth for trace_id (by @mattgarmon)
+
+### Other
+
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(service-discovery)* [**breaking**] rename gear-orchestrator to service-discovery (by @mattgarmon)
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+* @fluiderson
+* @mattgarmon
+
+## [0.4.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-grpc-hub-v0.3.2...cf-gears-grpc-hub-v0.4.0) - 2026-10-28
+
+### Added
+
+- *(grpc-hub,cluster)* a hardened hub, and cluster's contracts over gRPC (by @MikeFalcon77)
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(toolkit-oop)* add flight-control for OoP deployments (by @mattgarmon)
+
+### Fixed
+
+- *(grpc-hub)* set TCP_NODELAY on accepted connections (by @asmith987)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(service-discovery)* [**breaking**] rename gear-orchestrator to service-discovery (by @mattgarmon)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @asmith987
+* @mattgarmon
+
+## [0.2.38](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-v0.2.37...cf-gears-authn-resolver-v0.2.38) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.3.38](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-sdk-v0.3.37...cf-gears-authn-resolver-sdk-v0.3.38) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.6.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-v0.5.5...cf-gears-oagw-v0.6.0) - 2026-10-28
+
+### Added
+
+- move OAGW and event-broker from Pingora to toolkit-http-proxy (by @MikeFalcon77) - #5469
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(authz)* consume AuthZResolverApi as a contract instead of linking the PDP (by @MikeFalcon77)
+- *(oagw)* support persistence for upstreams and routes (by @asmith987)
+
+### Fixed
+
+- *(gears)* address the CodeRabbit review of #5487 (by @MikeFalcon77)
+- *(gears)* OAGW and AuthN/AuthZ plugin fixes (by @MikeFalcon77)
+- *(oagw)* restore 413/502 proxy error status codes (by @asmith987)
+
+### Other
+
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(oagw)* harden the e2e suite per the test review and link tests to scenarios (by @asmith987)
+- Merge pull request #4918 from constructorfabric/fix/rate-limit-tests-mock-clock (by @Artifizer) - #4918
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- Merge pull request #4911 from asmith987/fix/oagw-status-codes-413-502 (by @MikeFalcon77) - #4911
+- *(oagw)* run every rate-limit timing test on the mock clock (by @lobster40)
+
+### Contributors
+
+* @MikeFalcon77
+* @asmith987
+* @fluiderson
+* @Artifizer
+* @lobster40
+
+## [0.5.16](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-sdk-v0.5.15...cf-gears-oagw-sdk-v0.5.16) - 2026-10-28
+
+### Added
+
+- *(oagw)* support persistence for upstreams and routes (by @asmith987)
+
+### Other
+
+- *(deps)* Bump octocrab from 0.49.9 to 0.54.2 (by @dependabot[bot])
+
+### Contributors
+
+* @asmith987
+* @dependabot[bot]
+
+## [0.6.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-v0.5.2...cf-gears-credstore-v0.6.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(authz)* consume AuthZResolverApi as a contract instead of linking the PDP (by @MikeFalcon77)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(credstore)* credential API, immutable value versions, row-scoped authorization (ADR-0004–0010) (by @ffedoroff)
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+* @ffedoroff
+
+## [0.2.18](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-sdk-v0.2.17...cf-gears-credstore-sdk-v0.2.18) - 2026-10-28
+
+### Other
+
+- *(credstore)* credential API, immutable value versions, row-scoped authorization (ADR-0004–0010) (by @ffedoroff)
+
+### Contributors
+
+* @ffedoroff
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-sdk-v0.2.6...cf-gears-event-broker-sdk-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(event-broker)* fault-injecting broker and registry-backed harness for producer tests (by @fdlockgraf)
+
+### Fixed
+
+- *(event-broker)* refuse non-event types early (by @fdlockgraf)
+- *(event-broker-sdk)* bind producer registration timestamps as UTC datetimes (by @fdlockgraf)
+- *(event-broker-sdk)* name the outbox producer mode's wire mirror as what it is (by @diffora)
+- *(outbox)* defer partition dirty signal to post-commit flush (by @striped-zebra-dev)
+
+### Other
+
+- Merge pull request #5383 from fdlockgraf/fix/eb-authz-concrete-resource-types (by @entropyshift) - #5383
+- Merge pull request #5381 from fdlockgraf/event-broker/test-support-faults (by @Artifizer) - #5381
+- *(event-broker)* simplify authorization docs (by @fdlockgraf)
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- migrate GTS validation and consumers to v0.15.1 (by @aviator5) - #5284
+- update GTS crates to v0.14.0 (by @aviator5) - #5284
+- Merge constructorfabric/gears-rust main (c47375d24) into producer-registration timestamptz fix (by @fdlockgraf) - #5234
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge commit '58dda020b95c5947d671794b9a2596a3ef5bea24' of https://github.com/constructorfabric/gears-rust into fix/eb-sdk-producer-registration-timestamptz (by @fdlockgraf) - #5234
+- *(event-broker-sdk)* the compile-fail suites are skipped under coverage, like every other trybuild suite (by @diffora)
+- Merge pull request #5161 from diffora/fix/event-broker-sdk-producer-mode-wire (by @MikeFalcon77) - #5161
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- Fix subscriber timeout logic. (by @striped-zebra-dev) - #4439
+- Implement event-broker dispatcher routing, REST handlers, and standalone single-process service (gears-rust#4345, #4346, #4347) (by @striped-zebra-dev) - #4439
+- Merge pull request #4868 from striped-zebra-dev/outbox-flush-fix (by @MikeFalcon77) - #4868
+
+### Contributors
+
+* @entropyshift
+* @Artifizer
+* @fdlockgraf
+* @aviator5
+* @fluiderson
+* @diffora
+* @MikeFalcon77
+* @striped-zebra-dev
+
+## [0.11.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.10.0...cf-gears-account-management-v0.11.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(types-registry)* add tenant read API and shared helpers (by @aviator5)
+- *(account-management)* recursive, name-searchable tenant children listing (by @diffora)
+
+### Fixed
+
+- *(account-management)* reject an all-whitespace tenant name
+- *(toolkit,account-management)* opt-in null equality, literal LIKE, scoped update-returning; AM cursor order (by @diffora)
+- *(account-management)* narrow the user-groups cascade to roots client-side (by @mo3g89)
+
+### Other
+
+- Merge pull request #5365 from macrocheese1/fix/am-reject-whitespace-only-tenant-name (by @entropyshift) - #5365
+- migrate GTS validation and consumers to v0.15.1 (by @aviator5) - #5284
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(account-management)* decouple quota responses from admission source (by @diffora)
+- Merge pull request #4909 from mo3g89/fix/am-user-groups-cascade-root-filter (by @entropyshift) - #4909
+- *(account-management)* say why the cascade narrows to roots in memory (by @mo3g89)
+
+### Contributors
+
+* @MikeFalcon77
+* @entropyshift
+* @aviator5
+* @fluiderson
+* @diffora
+* @mo3g89
+
+## [0.1.42](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-v0.1.41...cf-gears-tenant-resolver-v0.1.42) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.4.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-v0.4.5...cf-gears-resource-group-v0.4.6) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(authz)* consume AuthZResolverApi as a contract instead of linking the PDP (by @MikeFalcon77)
+
+### Fixed
+
+- *(resource-group)* address filter review and pagination regressions (by @fdlockgraf)
+- *(resource-group)* preserve legacy type filters (by @fdlockgraf)
+- *(resource-group)* handle typed membership filters (by @fdlockgraf)
+- *(authz)* type native group predicates (by @fdlockgraf)
+
+### Other
+
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- Merge pull request #5109 from fdlockgraf/fdlockgraf/VHP-2042-resource-group-memberships-500 (by @entropyshift) - #5109
+- *(resource-group)* cover filter review cases and PostgreSQL resolution (by @fdlockgraf)
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- Merge pull request #4744 from fdlockgraf/fix/type-native-group-predicates (by @entropyshift) - #4744
+- Merge remote-tracking branch 'upstream/main' into fix/type-native-group-predicates (by @fdlockgraf) - #4744
+- *(authz)* reuse canonical resource type for group scopes (by @fdlockgraf)
+
+### Contributors
+
+* @MikeFalcon77
+* @modcrafter77
+* @entropyshift
+* @fdlockgraf
+* @fluiderson
+
+## [0.3.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-sdk-v0.3.5...cf-gears-resource-group-sdk-v0.3.6) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Fixed
+
+- *(resource-group)* handle typed membership filters (by @fdlockgraf)
+
+### Other
+
+- *(resource-group)* cover filter review cases and PostgreSQL resolution (by @fdlockgraf)
+
+### Contributors
+
+* @MikeFalcon77
+* @fdlockgraf
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-v0.2.5...cf-gears-authz-resolver-v0.3.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+
+### Contributors
+
+* @MikeFalcon77
+* @fluiderson
+
+## [0.5.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-v0.4.0...cf-gears-types-registry-v0.5.0) - 2026-10-28
+
+### Added
+
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- add the policy-engine gear as the default admission-control engine, with built-in policies (by @fluiderson) - #5310
+- add explicit cache policy to typed registry reads (by @aviator5) - #5244
+- *(types-registry)* expose compatibility waiver outcome (by @aviator5)
+- *(types-registry-sdk)* trace types registry reconciliation (by @aviator5)
+- *(types-registry)* pass the caller's context into the domain (by @aviator5)
+- *(types-registry-sdk)* typed ids and kind-typed read models (by @aviator5)
+- *(types-registry)* add tenant read API and shared helpers (by @aviator5)
+- *(types-registry-sdk)* own platform error vocabulary (by @aviator5)
+- *(types-registry)* add local platform client (by @aviator5)
+- *(types-registry)* [**breaking**] nest operation item error details under context (by @aviator5)
+- *(types-registry)* Add key-aware admission and deletion outcomes (by @aviator5)
+- *(types-registry)* encode the freshness validator as a version byte and digest (by @aviator5)
+- *(types-registry)* serve conditional exact and batch reads (T22d) (by @aviator5)
+- *(types-registry)* add the freshness validator digest and wire form (T22d) (by @aviator5)
+- *(types-registry)* filter discovery by parsed GTS segments (by @aviator5)
+- *(types-registry)* require kind and defer owning gear in reads (by @aviator5)
+- *(types-registry)* require entity identity and filter discovery by lifecycle (by @aviator5)
+- *(types-registry)* filter discovery by kind and depth (T22c) (by @aviator5)
+- *(types-registry)* project reads and discovery by $select (T22b) (by @aviator5)
+- *(types-registry)* implement T22a REST batchGet and discovery (by @aviator5)
+
+### Fixed
+
+- *(types-registry-sdk)* fail incomplete reconciliation (by @aviator5)
+- [**breaking**] harden types registry SDK contracts (by @aviator5) - #5244
+- *(types-registry)* Align types registry contracts and test configuration (by @aviator5)
+- *(types-registry)* align key handling and admission errors (by @aviator5)
+- *(outbox)* bound in-flight work on shutdown (by @striped-zebra-dev)
+- *(types-registry)* declare positive page limits and clarify cursors (by @aviator5)
+- *(types-registry)* bound and validate registry reads (by @aviator5)
+- *(types-registry)* reject mismatched schema IDs before admission (by @aviator5)
+- *(types-registry)* harden read-surface limits (by @aviator5)
+- *(types-registry)* preserve operation errors and tighten discovery limits (by @aviator5)
+- *(outbox)* defer partition dirty signal to post-commit flush (by @striped-zebra-dev)
+
+### Other
+
+- *(toolkit-oop)* Profile 2 is Self-Hosted, its host is Flight Control (by @MikeFalcon77)
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- migrate GTS validation and consumers to v0.15.1 (by @aviator5) - #5284
+- update GTS crates to v0.14.0 (by @aviator5) - #5284
+- *(build)* split the Makefile into a driver, gears-rust.mk and .gears-dna/gears.mk (by @modcrafter77)
+- *(types-registry)* trim comments and reflow markdown (by @aviator5)
+- *(types-registry)* align P0 task numbering with main (by @aviator5)
+- *(types-registry)* add mock conformance checks (by @aviator5)
+- *(types-registry)* organize helpers and clarify docs (by @aviator5)
+- *(types-registry)* simplify and harden reconciliation (by @aviator5)
+- *(types-registry)* move the local client into the domain (by @aviator5)
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- *(types-registry)* batch-read helpers no longer print UUID keys on a miss (by @aviator5)
+- *(types-registry)* cover scalar Type Schema registration in e2e (by @aviator5)
+- *(types-registry)* cover asynchronous registration contract (by @aviator5)
+- *(types-registry)* cover read and discovery APIs (by @aviator5)
+- *(types-registry)* document conditional reads and close T22d (by @aviator5)
+- *(types-registry)* move conditional reads into Phase 6 as T22d (by @aviator5)
+- *(types-registry)* remove authored content hash (by @aviator5)
+- Merge pull request #4868 from striped-zebra-dev/outbox-flush-fix (by @MikeFalcon77) - #4868
+
+### Contributors
+
+* @MikeFalcon77
+* @aviator5
+* @modcrafter77
+* @fluiderson
+* @striped-zebra-dev
+
+## [0.4.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-sdk-v0.3.9...cf-gears-types-registry-sdk-v0.4.0) - 2026-10-28
+
+### Added
+
+- add explicit cache policy to typed registry reads (by @aviator5) - #5244
+- *(types-registry)* expose compatibility waiver outcome (by @aviator5)
+- *(types-registry-sdk)* trace types registry reconciliation (by @aviator5)
+- *(types-registry-sdk)* typed ids and kind-typed read models (by @aviator5)
+- *(types-registry)* add tenant read API and shared helpers (by @aviator5)
+- *(types-registry-sdk)* own platform error vocabulary (by @aviator5)
+- *(types-registry)* add local platform client (by @aviator5)
+- *(types-registry-sdk)* add platform API and GTS publication (by @aviator5)
+
+### Fixed
+
+- *(types-registry-sdk)* fail incomplete reconciliation (by @aviator5)
+- [**breaking**] harden types registry SDK contracts (by @aviator5) - #5244
+
+### Other
+
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- *(types-registry)* trim comments and reflow markdown (by @aviator5)
+- *(types-registry)* add mock conformance checks (by @aviator5)
+- *(types-registry)* organize helpers and clarify docs (by @aviator5)
+- *(types-registry)* simplify and harden reconciliation (by @aviator5)
+- *(types-registry)* move the local client into the domain (by @aviator5)
+- *(types-registry)* cover asynchronous registration contract (by @aviator5)
+
+### Contributors
+
+* @aviator5
+
+## [0.6.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-sdk-v0.5.2...cf-gears-authz-resolver-sdk-v0.6.0) - 2026-10-28
+
+### Fixed
+
+- *(authz)* type native group predicates (by @fdlockgraf)
+
+### Other
+
+- bump the Rust version to 1.98.1 (by @fluiderson) - #5065
+- Merge pull request #4744 from fdlockgraf/fix/type-native-group-predicates (by @entropyshift) - #4744
+- Merge remote-tracking branch 'upstream/main' into fix/type-native-group-predicates (by @fdlockgraf) - #4744
+- *(authz)* reuse canonical resource type for group scopes (by @fdlockgraf)
+
+### Contributors
+
+* @fluiderson
+* @entropyshift
+* @fdlockgraf
+
+## [0.8.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.7.5...cf-gears-account-management-sdk-v0.8.0) - 2026-10-28
+
+### Added
+
+- *(account-management)* recursive, name-searchable tenant children listing (by @diffora)
+
+### Other
+
+- correct GTS references and tenant traits (by @aviator5) - #5284
+- migrate GTS schemas and validation to v0.16.1 (by @aviator5) - #5284
+- *(account-management)* decouple quota responses from admission source (by @diffora)
+
+### Contributors
+
+* @aviator5
+* @diffora
+
+## [0.4.6](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-sdk-v0.4.5...cf-gears-tenant-resolver-sdk-v0.4.6) - 2026-10-28
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.11.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.10.0...cf-gears-toolkit-v0.11.0) - 2026-10-28
+
+### Added
+
+- *(grpc-hub,cluster)* a hardened hub, and cluster's contracts over gRPC (by @MikeFalcon77)
+- move OAGW and event-broker from Pingora to toolkit-http-proxy (by @MikeFalcon77) - #5469
+- *(gdl)* introduce GDL, the description language for gears (by @MikeFalcon77)
+- *(durable-execution)* add embedded durable execution gear (by @modcrafter77)
+- *(toolkit)* enforce platform route auth (by @aviator5)
+- *(toolkit-contract)* tune consumer clients via consumer_wiring (by @mattgarmon)
+- *(github-mirror)* phased sync engine with sessions, watermarks and resume (by @AndIConstructor)
+
+### Fixed
+
+- *(gears)* address the CodeRabbit review of #5487 (by @MikeFalcon77)
+- support platform identity throttling (by @aviator5) - #5256
+- enforce one authentication plane per request (by @aviator5) - #5256
+- *(toolkit)* harden platform route auth wiring (by @aviator5)
+- *(observability)* use live otel trace context as the single source of truth for trace_id (by @mattgarmon)
+
+### Other
+
+- [**breaking**] install cargo-gears from its repository and fix the latest dylint findings (by @fluiderson) - #5178
+- Merge branch 'main' into andrei-i/4632-sync-engine (by @AndIConstructor) - #4777
+- Merge pull request #4910 from mattgarmon/feature/consumer-tuning (by @MikeFalcon77) - #4910
+- *(service-discovery)* [**breaking**] rename gear-orchestrator to service-discovery (by @mattgarmon)
+- Merge branch 'main' into andrei-i/4632-sync-engine (by @AndIConstructor) - #4777
+- *(mini-chat)* tighten tests flagged in the PR #5025 review (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+* @modcrafter77
+* @aviator5
+* @fluiderson
+* @AndIConstructor
+* @mattgarmon
+
 ### Added
 
 - `toolkit-auth`: shared asynchronous OAuth2 acquisition, explicit shutdown and

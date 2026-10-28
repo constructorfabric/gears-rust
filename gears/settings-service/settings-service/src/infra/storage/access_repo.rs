@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! `AccessRepository` over `tenant_permissions`.
 
 use async_trait::async_trait;

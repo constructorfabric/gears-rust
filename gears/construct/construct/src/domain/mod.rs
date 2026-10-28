@@ -19,10 +19,13 @@ pub mod profile;
 pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
+pub mod settings_scope;
 pub mod subject_settings;
 
 #[cfg(test)]
 mod admission_test;
+#[cfg(test)]
+mod plan_test;
 #[cfg(test)]
 mod record_intake_test;
 #[cfg(test)]

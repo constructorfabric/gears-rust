@@ -206,6 +206,8 @@ OAGW reads the upstream and route instances that other gears, or the types-regis
 
 ### Endpoint Pool Freshness Across Replicas
 
+> **Amended by [ADR-0019](./0019-upstream-proxy-engine.md)** (`cpt-cf-oagw-adr-upstream-proxy-engine`): the selector is now `PoolEndpointSelector` over `toolkit-http-proxy`'s `BackendPool`; every rule below applies to it unchanged.
+
 `PingoraEndpointSelector` caches each upstream's endpoint pool by `upstream_id`. Management handlers invalidate that cache only on the replica that handled the write. With a shared database, other replicas would keep the old endpoints. The selector **MUST** rebuild a cached pool whenever the endpoints passed to `select()` differ from the cached list. This needs no messaging between instances.
 
 An upstream deleted through another replica leaves its pool cached here, and each pool runs a background task (DNS every 30 s, TCP health checks every 10 s). The selector therefore drops a pool not selected for 10 minutes, checking every minute, and rebuilds it if it is used again. Dropping a pool, by this sweep, by invalidation, or by a rebuild, **MUST** stop its background task. Updates and deletes through the SDK invalidate the local pool as the Management API handlers do.

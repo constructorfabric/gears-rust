@@ -121,6 +121,7 @@ Set these in `<project>.mk`, in the environment, or on the command line.
 | `NEXTEST_STORE_DIR` | `target/nextest` | where `nextest_run` finds nextest's JUnit report (nextest's `[store] dir`, from the workspace root) |
 | `GEARS_JUNIT_ENRICH` | empty | script that `nextest_run` runs on each saved JUnit report |
 | `DENY_MIN_VERSION`, `NEXTEST_MIN_VERSION`, `CARGO_GEARS_VERSION` | see `gears.mk` | `install-tools`, `deny` |
+| `CI_PREINSTALLED_TOOLS` | empty | `install-tools` only checks `cargo-<tool>` for each listed tool and installs nothing |
 | `RUST_NIGHTLY` | see `gears.mk` | `shear` |
 | `CFS`, `CFS_PIPX_SPEC` | `cfs`, Constructor Studio git URL | `cfs-*` |
 | `PYTHON_BOOTSTRAP` | `python3` from `PATH` | `help`, `GEARS_JUNIT_ENRICH` |

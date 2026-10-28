@@ -8,12 +8,14 @@ use toolkit_security::SecurityContext;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::api::rest::error::{for_rest, for_settings};
+use crate::api::rest::error::{for_facts, for_rest, for_settings, too_long};
 use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
+use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
-    PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto,
+    ManageFactsRequest, ManageFactsResponse, PutSubjectSettingsRequest, RecordOutcomeDto,
+    RecordQuery, RecordRequest, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -91,4 +93,24 @@ pub async fn put_subject_settings(
 /// browser cache keeps one subject's privacy state.
 fn not_stored(dto: SubjectSettingsDto) -> impl IntoResponse {
     ([(header::CACHE_CONTROL, "no-store")], Json(dto))
+}
+
+/// Plans what the subject told an agent, stores it and answers what changed.
+/// A field past its limit answers 400 before any model call.
+///
+/// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
+pub async fn manage_facts(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(manage): Extension<Arc<ManageFacts>>,
+    Path(subject_id): Path<Uuid>,
+    Json(req): Json<ManageFactsRequest>,
+) -> ApiResult<impl IntoResponse> {
+    if let Some((field, limit)) = req.field_past_its_limit() {
+        return Err(too_long(field, limit));
+    }
+    let managed = manage
+        .manage(&ctx, subject_id, req.message, req.conversation)
+        .await
+        .map_err(|error| for_facts(error, subject_id))?;
+    Ok(Json(ManageFactsResponse::from(managed)))
 }

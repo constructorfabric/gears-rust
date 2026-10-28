@@ -324,9 +324,10 @@ def _patch_file_storage_config(config_text: str, env) -> str:
     sidecar_url = f"http://localhost:{sidecar_port}"
 
     # Replace storage_root (any current value).
+    root = Path(storage_root).as_posix()
     config_text = re.sub(
         r"(storage_root\s*:\s*).*",
-        rf'\1"{storage_root}"',
+        lambda m: f'{m.group(1)}"{root}"',
         config_text,
         count=1,
     )

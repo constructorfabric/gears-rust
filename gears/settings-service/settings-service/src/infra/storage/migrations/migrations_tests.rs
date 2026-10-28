@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the migration harness.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 — *the gear starts

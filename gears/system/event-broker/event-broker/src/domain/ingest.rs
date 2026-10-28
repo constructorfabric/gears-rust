@@ -10,7 +10,7 @@ use toolkit_gts::GtsInstanceId;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::domain::authz::{EVENT_TYPE_RESOURCE, tenant_authorized};
+use crate::domain::authz::{event_type_resource, tenant_authorized};
 use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use event_broker_sdk::models::EventType;
@@ -366,13 +366,13 @@ where
     ) -> Result<PublishAck, DomainError> {
         use crate::domain::idempotency::ProducerIdempotencyOutcome;
 
-        // Authz/tenant-scope enforcement (`gears-rust#4516`,
-        // `eb-authz-enforcement`) - before topic/schema validation, per
-        // `DESIGN.md`'s Validation Pipeline step 1 ordering.
+        // Reject non-event types, then authorize before topic/schema validation
+        // (`docs/DESIGN.md`, Validation Pipeline step 1 and §3.3).
+        let event_type_resource = event_type_resource(&request.r#type)?;
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &EVENT_TYPE_RESOURCE,
+                &event_type_resource,
                 "produce",
                 None,
                 &AccessRequest::new()

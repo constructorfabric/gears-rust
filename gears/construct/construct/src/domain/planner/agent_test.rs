@@ -1,94 +1,17 @@
-use std::collections::VecDeque;
-use std::num::{NonZeroU32, NonZeroU64};
-use std::sync::{Arc, Mutex};
+use std::num::NonZeroU64;
+use std::sync::Arc;
 
-use async_trait::async_trait;
 use serde_json::{Value, json};
-use toolkit_security::SecurityContext;
+use uuid::Uuid;
 
-use super::agent::{Planner, PlannerCaps};
-use super::test_data::{SUBJECT, TENANT, catalog, origin, profile};
-use crate::domain::model_client::{
-    Message, ModelClient, ModelError, ModelOutput, ModelRequest, ModelResponse, ToolCall, Usage,
+use super::agent::{AgentMessage, Planner, PlannerCaps};
+use super::test_data::{
+    Answer, SUBJECT, ScriptedModel, TENANT, caps, catalog, done, origin, profile, tool_calls, usage,
 };
+use crate::domain::model_client::{Message, ModelError, ModelOutput, ModelResponse, ToolCall};
 use crate::domain::plan::{Change, Origin, Plan, Step};
 use crate::domain::record_intake::{DropEvent, DropReason, DropStage, ReceivedRecord};
 use crate::test_support::{RecordingEvents, context_in, received_chat_record};
-
-type Answer = Result<ModelResponse, ModelError>;
-
-fn caps() -> PlannerCaps {
-    PlannerCaps {
-        max_rounds: NonZeroU32::new(3).expect("rounds"),
-        max_tokens: NonZeroU64::new(10_000).expect("tokens"),
-    }
-}
-
-struct ScriptedModel {
-    answers: Mutex<VecDeque<Answer>>,
-    requests: Mutex<Vec<ModelRequest>>,
-}
-
-impl ScriptedModel {
-    fn answering(answers: Vec<Answer>) -> Arc<Self> {
-        Arc::new(Self {
-            answers: Mutex::new(answers.into()),
-            requests: Mutex::default(),
-        })
-    }
-
-    fn requests(&self) -> Vec<ModelRequest> {
-        self.requests.lock().expect("lock").clone()
-    }
-}
-
-#[async_trait]
-impl ModelClient for ScriptedModel {
-    async fn complete(
-        &self,
-        _: &SecurityContext,
-        request: &ModelRequest,
-    ) -> Result<ModelResponse, ModelError> {
-        self.requests.lock().expect("lock").push(request.clone());
-        let mut answers = self.answers.lock().expect("lock");
-        if answers.len() > 1 {
-            answers.pop_front().expect("an answer")
-        } else {
-            answers.front().cloned().expect("an answer")
-        }
-    }
-}
-
-fn usage(input_tokens: u64) -> Usage {
-    Usage {
-        input_tokens,
-        output_tokens: 20,
-    }
-}
-
-fn tool_calls(calls: &[(&str, Value)], input_tokens: u64) -> ModelResponse {
-    ModelResponse {
-        output: ModelOutput::ToolCalls(
-            calls
-                .iter()
-                .enumerate()
-                .map(|(index, (name, arguments))| ToolCall {
-                    id: format!("call_{index}"),
-                    name: (*name).to_owned(),
-                    arguments: arguments.clone(),
-                })
-                .collect(),
-        ),
-        usage: Some(usage(input_tokens)),
-    }
-}
-
-fn done(input_tokens: u64) -> ModelResponse {
-    ModelResponse {
-        output: ModelOutput::Text("The plan is complete.".to_owned()),
-        usage: Some(usage(input_tokens)),
-    }
-}
 
 fn add_go() -> (&'static str, Value) {
     (
@@ -246,6 +169,9 @@ async fn the_model_gets_the_record_and_the_profile_as_data_but_no_id() {
             assert!(!text.contains(&id), "{text} shows {id}");
         }
         assert!(!text.contains("gts."), "{text} shows a type id");
+        for source_id in ["msg-7", "thread-42"] {
+            assert!(!text.contains(source_id), "{text} shows {source_id}");
+        }
     }
 }
 
@@ -469,4 +395,57 @@ async fn a_drop_is_logged_by_its_kind_without_the_prompt_or_the_answer() {
     assert!(logs_contain("kind=\"model_bad_answer\""));
     assert!(logs_contain(&format!("tenant_id={TENANT}")));
     assert!(!logs_contain("contradict"));
+}
+
+fn agent_message() -> AgentMessage {
+    AgentMessage {
+        tenant_id: TENANT,
+        subject_id: SUBJECT,
+        agent: Uuid::from_u128(0x5a),
+        message: "I also know Go.".to_owned(),
+        conversation: "agent: Which languages do you code in?".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn what_a_subject_told_an_agent_becomes_a_plan_with_the_agent_as_origin() {
+    let model = ScriptedModel::answering(vec![Ok(tool_calls(&[add_go()], 900)), Ok(done(950))]);
+    let events = Arc::new(RecordingEvents::default());
+    let planner = Planner::new(model.clone(), Arc::new(catalog()), events.clone(), caps());
+
+    let plan = planner
+        .plan_message(&context_in(TENANT), &agent_message(), profile())
+        .await
+        .expect("a plan");
+
+    assert_eq!((plan.tenant_id, plan.subject_id), (TENANT, SUBJECT));
+    assert_eq!(
+        plan.origin,
+        Origin::Agent {
+            agent: Uuid::from_u128(0x5a)
+        }
+    );
+    assert_eq!(plan.steps.len(), 1);
+    let Message::User(input) = &model.requests()[0].messages[1] else {
+        panic!("the input as the user message");
+    };
+    assert!(
+        input.contains("The person said: \"I also know Go.\""),
+        "{input}"
+    );
+    assert!(events.taken().is_empty());
+}
+
+#[tokio::test]
+async fn a_message_the_planner_drops_answers_its_reason_and_sends_no_drop_event() {
+    let model = ScriptedModel::answering(vec![Err(ModelError::Timeout)]);
+    let events = Arc::new(RecordingEvents::default());
+    let planner = Planner::new(model, Arc::new(catalog()), events.clone(), caps());
+
+    let dropped = planner
+        .plan_message(&context_in(TENANT), &agent_message(), profile())
+        .await;
+
+    assert_eq!(dropped, Err(DropReason::ModelFailed));
+    assert!(events.taken().is_empty());
 }

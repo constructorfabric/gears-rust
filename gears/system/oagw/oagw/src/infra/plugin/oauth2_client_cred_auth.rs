@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pingora_memory_cache::MemoryCache;
+use crate::infra::ttl_cache::TtlCache;
 use toolkit_auth::oauth2::types::{ClientAuthMethod, SecretString};
 use toolkit_auth::oauth2::{OAuthClientConfig, fetch_token};
 use url::Url;
@@ -79,12 +79,10 @@ impl OAuth2PluginConfig {
     }
 }
 
-/// Cached token entry stored alongside the original cache key so that hash
-/// collisions inside `TinyUfo` (which hashes keys to `u64` without `Eq`
-/// verification) cannot silently return another tenant's token.
+/// Cached bearer token. The cache compares full keys, so one tenant's entry
+/// can never be returned for another's key.
 #[derive(Clone)]
 struct CachedToken {
-    key: String,
     token: SecretString,
 }
 
@@ -122,7 +120,7 @@ pub struct OAuth2ClientCredAuthPlugin {
     credstore: Arc<dyn CredStoreClientV1>,
     auth_method: ClientAuthMethod,
     http_config: Option<toolkit_http::HttpClientConfig>,
-    cache: MemoryCache<String, CachedToken>,
+    cache: TtlCache<String, CachedToken>,
     cache_ttl: Duration,
 }
 
@@ -139,7 +137,7 @@ impl OAuth2ClientCredAuthPlugin {
             credstore,
             auth_method,
             http_config: None,
-            cache: MemoryCache::new(cache_capacity),
+            cache: TtlCache::new(cache_capacity),
             cache_ttl,
         }
     }
@@ -178,18 +176,12 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
         let config = OAuth2PluginConfig::parse(&ctx.config)?;
         let key = build_cache_key(ctx, self.auth_method);
 
-        // Cache hit — verify key matches to prevent hash-collision leakage.
-        let (cached, _status) = self.cache.get(&key);
-        if let Some(entry) = cached
-            && entry.key == key
-        {
+        if let Some(entry) = self.cache.get(&key) {
             ctx.headers.insert(
                 "authorization".into(),
                 format!("Bearer {}", entry.token.expose()),
             );
             return Ok(());
-
-            // Hash collision — treat as miss, do not use this entry.
         }
 
         // Cache miss — resolve credentials and fetch token.
@@ -223,11 +215,10 @@ impl AuthPlugin for OAuth2ClientCredAuthPlugin {
                 .saturating_sub(TOKEN_EXPIRY_SAFETY_MARGIN),
         );
 
-        // Cache with key for verification — ZeroizeOnDrop fires on eviction.
+        // ZeroizeOnDrop fires on eviction.
         self.cache.put(
-            &key,
+            key,
             CachedToken {
-                key: key.clone(),
                 token: fetched.bearer.clone(),
             },
             Some(ttl),
@@ -951,7 +942,7 @@ mod tests {
             then.status(200)
                 .header("content-type", "application/json")
                 // expires_in=20 → ttl = min(3600, 20-30) = min(3600, 0) = 0
-                // pingora-memory-cache skips zero-TTL puts → not cached.
+                // The token cache skips zero-TTL puts → not cached.
                 .body(mock_token_response("tok-ephemeral", 20));
         });
 
@@ -1010,42 +1001,28 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Group 9: Hash-collision safety
+    // Group 9: Key isolation
     // -----------------------------------------------------------------------
 
     #[tokio::test]
-    async fn hash_collision_does_not_leak_token() {
-        // Directly test CachedToken key verification.
-        let cache: MemoryCache<String, CachedToken> = MemoryCache::new(100);
-
+    async fn distinct_keys_never_share_a_token() {
+        let cache: TtlCache<String, CachedToken> = TtlCache::new(100);
         let key_a = "tenant-a:subject-a:form:12345".to_string();
         cache.put(
-            &key_a,
+            key_a.clone(),
             CachedToken {
-                key: key_a.clone(),
                 token: SecretString::new("secret-token-a"),
             },
             Some(Duration::from_secs(3600)),
         );
 
-        // Look up with the correct key — should hit.
-        let (hit, _) = cache.get(&key_a);
-        assert!(hit.is_some());
-        let entry = hit.unwrap();
-        assert_eq!(entry.key, key_a);
-        assert_eq!(entry.token.expose(), "secret-token-a");
-
-        // Look up with a different key — should not match even if it were
-        // to collide at the u64 level (no collision here, but we verify the
-        // key-verification logic).
-        let key_b = "tenant-b:subject-b:form:99999".to_string();
-        let (hit_b, _) = cache.get(&key_b);
-        // Either None (no collision) or key mismatch (collision).
-        if let Some(entry_b) = hit_b {
-            assert_ne!(
-                entry_b.key, key_b,
-                "key verification must detect cross-key leakage"
-            );
-        }
+        let hit = cache.get(&key_a).expect("own key hits");
+        assert_eq!(hit.token.expose(), "secret-token-a");
+        assert!(
+            cache
+                .get(&"tenant-b:subject-b:form:99999".to_string())
+                .is_none(),
+            "another tenant's key must miss"
+        );
     }
 }

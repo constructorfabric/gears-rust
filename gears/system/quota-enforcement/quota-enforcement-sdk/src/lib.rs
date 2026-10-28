@@ -20,7 +20,7 @@
 //! (consumption, leases, snapshots) and [`QuotaOperatorApi`] (policies).
 //!
 //! Enable the `test-util` feature for a complete in-memory double of the
-//! storage contract in [`testing`].
+//! storage contract in `testing`.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
 pub mod bulk;

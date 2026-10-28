@@ -1,4 +1,3 @@
-// Created: 2026-08-11 by Virtuozzo International GmbH
 //! Tests for the setting key value object.
 //!
 //! Contract source: ADR-002 and DESIGN.md §3 *Setting key by author* — the

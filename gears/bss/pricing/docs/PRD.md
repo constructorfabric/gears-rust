@@ -446,7 +446,7 @@ Not built (D-415): the owner dropped quote and the Studio wiring; consumers read
 
 **Phase:** 2. **Source:** spec §2.2, §5–§7, §12–§13; phase 2 plan for delivery details.
 
-Every door authenticates and enforces deny-by-default pricing:read, author, submit, approve or settings through PolicyEnforcer. Resource labels cover books, entries, prices, approval units, config and, from phase 3, plans (read, author and submit, D-418); the four route censuses carry positive, denial and precondition probes. Combined grants never bypass author separation.
+Every door authenticates, and every door but the currency table (D-537: deployment data with no tenant in it, read by any authenticated caller) enforces deny-by-default pricing:read, author, submit, approve or settings through PolicyEnforcer. Resource labels cover books, entries, prices, approval units, config and, from phase 3, plans (read, author and submit, D-418); the four route censuses carry positive, denial and precondition probes. Combined grants never bypass author separation.
 
 #### `nfr-audit`
 

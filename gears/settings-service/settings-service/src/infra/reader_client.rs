@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The in-process `SettingsReaderClient`.
 //!
 //! Bound into `ClientHub` at init and resolved by consumers for runtime

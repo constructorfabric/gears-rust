@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Fakes and fixtures shared by this crate's unit tests.
 //!
 //! Every fake here stands in for a port the gear resolves from the platform at
@@ -34,7 +33,7 @@ use serde_json::json;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
-use crate::domain::declaration::{DeclarationDraft, DeclarationRepository};
+use crate::domain::declaration::{DeclarationDraft, DeclarationRepository, DeclarationStatus};
 use crate::domain::resolution::{EffectiveCache, ScopeTarget, ValueResolver};
 use crate::domain::value::{ValueDraft, ValueRepository};
 use crate::infra::storage::access_repo::AccessRepo;
@@ -811,7 +810,7 @@ impl ResolutionHarness {
                 &conn,
                 &AccessScope::allow_all(),
                 declaration_id,
-                "retired",
+                DeclarationStatus::Retired,
                 None,
             )
             .await
@@ -1235,6 +1234,27 @@ impl authz_resolver_sdk::AuthZResolverApi for AllowButValues {
     }
 }
 
+/// A policy decision point that allows every action but one: the per-action
+/// denial a surface that asks two decisions needs to prove each is asked.
+struct DenyAction(&'static str);
+
+#[async_trait]
+impl authz_resolver_sdk::AuthZResolverApi for DenyAction {
+    async fn evaluate(
+        &self,
+        _ctx: toolkit_security::PlatformSecurityContext,
+        request: authz_resolver_sdk::models::EvaluationRequest,
+    ) -> Result<
+        authz_resolver_sdk::models::EvaluationResponse,
+        toolkit::api::canonical_prelude::CanonicalError,
+    > {
+        Ok(authz_resolver_sdk::models::EvaluationResponse {
+            decision: request.action.name != self.0,
+            context: authz_resolver_sdk::models::EvaluationResponseContext::default(),
+        })
+    }
+}
+
 /// A policy decision point that denies everything.
 struct DenyAll;
 
@@ -1260,6 +1280,9 @@ impl authz_resolver_sdk::AuthZResolverApi for DenyAll {
 pub struct Answer {
     pub status: axum::http::StatusCode,
     pub body: Value,
+    /// The response body exactly as sent, for the tests that compare two
+    /// answers byte for byte or whose body is not JSON.
+    pub raw: String,
     pub etag: Option<String>,
     pub location: Option<String>,
     /// Every response header as text, for the ones a test reads by name —
@@ -1285,6 +1308,8 @@ pub struct RestHarness {
     /// What the write path published, for the tests that assert the event as
     /// well as the answer.
     pub published: Arc<RecordingPublisher>,
+    /// The setting types the declaration admin registered.
+    pub registrar: Arc<RecordingRegistrar>,
     router: axum::Router,
 }
 
@@ -1295,10 +1320,34 @@ impl RestHarness {
         Self::build(Arc::new(AllowAll), Arc::new(FixedStepUp::verified())).await
     }
 
+    /// The same surface whose declaration admin cannot reach the type
+    /// registry: every answer that needs a type's schema or traits is the
+    /// validator being unavailable.
+    pub async fn with_unavailable_registry() -> Self {
+        Self::build_with(
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            FakeSource {
+                unavailable: true,
+                ..resolution_catalogue()
+            },
+        )
+        .await
+    }
+
     /// The same surface with every authorization decision denied, for the
     /// tests that assert the gate rather than what is behind it.
     pub async fn denying() -> Self {
         Self::build(Arc::new(DenyAll), Arc::new(FixedStepUp::verified())).await
+    }
+
+    /// The same surface with one action denied and every other allowed.
+    pub async fn denying_action(action: &'static str) -> Self {
+        Self::build(
+            Arc::new(DenyAction(action)),
+            Arc::new(FixedStepUp::verified()),
+        )
+        .await
     }
 
     /// The same surface for a caller that may read but may not see `pii`
@@ -1328,6 +1377,14 @@ impl RestHarness {
     async fn build(
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+    ) -> Self {
+        Self::build_with(pdp, step_up, resolution_catalogue()).await
+    }
+
+    async fn build_with(
+        pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
+        step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+        admin_catalogue: FakeSource,
     ) -> Self {
         let inner = ResolutionHarness::new().await;
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
@@ -1387,14 +1444,15 @@ impl RestHarness {
             Arc::clone(&types),
         ));
         let step_up_for_writes = Arc::clone(&step_up);
+        let registrar = Arc::new(RecordingRegistrar::default());
         let admin = Arc::new(crate::domain::declaration::DeclarationAdmin::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,
             crate::infra::storage::category_repo::CategoryRepo,
             crate::infra::storage::value_repo::ValueRepo,
             Arc::new(crate::infra::type_validator::GtsTypeValidator::new(
-                resolution_catalogue(),
+                admin_catalogue,
             )),
-            Arc::new(RecordingRegistrar::default()),
+            Arc::clone(&registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
             step_up,
             crate::infra::storage::audit_store::AuditStore,
             Arc::clone(&inner.cache),
@@ -1404,6 +1462,7 @@ impl RestHarness {
             &openapi,
             declarations,
             admin,
+            Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );
@@ -1428,6 +1487,7 @@ impl RestHarness {
             inner,
             secrets,
             published,
+            registrar,
             router,
         }
     }
@@ -1464,7 +1524,15 @@ impl RestHarness {
         caller: SecurityContext,
     ) -> Answer {
         let body = body.map(|json| serde_json::to_vec(&json).expect("serializes"));
-        self.dispatch(method, uri, body, if_match, caller).await
+        self.dispatch(
+            method,
+            uri,
+            body,
+            if_match,
+            caller,
+            Some("application/json"),
+        )
+        .await
     }
 
     /// The same, with the body sent as the exact text given — for a request
@@ -1484,6 +1552,28 @@ impl RestHarness {
             Some(body.as_bytes().to_vec()),
             if_match,
             context_for(caller),
+            Some("application/json"),
+        )
+        .await
+    }
+
+    /// The same, with the body's exact text and the `Content-Type` the test
+    /// names — `None` sends none — for the requests whose framing is the point.
+    pub async fn send_with_content_type(
+        &self,
+        method: &str,
+        uri: &str,
+        body: &str,
+        content_type: Option<&str>,
+        caller: Uuid,
+    ) -> Answer {
+        self.dispatch(
+            method,
+            uri,
+            Some(body.as_bytes().to_vec()),
+            None,
+            context_for(caller),
+            content_type,
         )
         .await
     }
@@ -1495,11 +1585,14 @@ impl RestHarness {
         body: Option<Vec<u8>>,
         if_match: Option<&str>,
         caller: SecurityContext,
+        content_type: Option<&str>,
     ) -> Answer {
         use tower::ServiceExt as _;
         let mut builder = axum::http::Request::builder().method(method).uri(uri);
-        if body.is_some() {
-            builder = builder.header("content-type", "application/json");
+        if body.is_some()
+            && let Some(content_type) = content_type
+        {
+            builder = builder.header("content-type", content_type);
         }
         if let Some(tag) = if_match {
             builder = builder.header("if-match", tag);
@@ -1537,10 +1630,12 @@ impl RestHarness {
         let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await
             .expect("a bounded body");
+        let raw = String::from_utf8_lossy(&bytes).into_owned();
         let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         Answer {
             status,
             body,
+            raw,
             etag,
             location,
             headers,

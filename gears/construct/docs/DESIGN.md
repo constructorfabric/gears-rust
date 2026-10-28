@@ -609,6 +609,7 @@ Construct offers three surfaces. REST and the Rust SDK realize `cpt-cf-construct
 | `GET` | `/api/construct/v1/subjects/{subject_id}/profile` | Profile read by category for applications | Read profiles | unstable |
 | `GET` | `/api/construct/v1/subjects/{subject_id}/facts` | The subject's own view of all facts with origin | Control the profiles one owns | unstable |
 | `DELETE` | `/api/construct/v1/subjects/{subject_id}/facts/{fact_id}` | Delete one fact | Control the profiles one owns | unstable |
+| `POST` | `/api/construct/v1/subjects/{subject_id}/facts/manage` | Store what the subject told an agent, through the planner, and answer what changed | Manage facts | unstable |
 | `POST`, `GET` | `/api/construct/v1/subjects/{subject_id}/review-requests` | Mark a fact incorrect; list the subject's requests | Control the profiles one owns | unstable |
 | `GET`, `PUT` | `/api/construct/v1/subjects/{subject_id}/settings` | Read and change personalization | Control the profiles one owns | unstable |
 | `POST` | `/api/construct/v1/subjects/{subject_id}/erasure` | Erase everything about the subject | Control the profiles one owns | unstable |

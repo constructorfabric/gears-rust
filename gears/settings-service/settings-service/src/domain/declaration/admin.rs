@@ -1,4 +1,3 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! Administrative authoring of declarations: create, revive, edit metadata,
 //! retire.
 //!
@@ -8,6 +7,7 @@
 //! or a classification and every lifecycle change demand credential step-up,
 //! and a gear's contributed declarations are not admin-editable at all.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use toolkit_macros::domain_model;
 
@@ -23,7 +23,8 @@ use crate::domain::category::repo::CategoryRepository;
 use crate::domain::category::visibility;
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    DataClassification, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    DeclarationStatus,
 };
 use crate::domain::error::DomainError;
 use crate::domain::precondition::{self, ETag};
@@ -85,12 +86,146 @@ pub struct Created {
     pub retired: Option<String>,
 }
 
+/// What the create's first phase found: the composed key, the normalised
+/// display name and the declarations at the key and on its path.
+#[domain_model]
+#[derive(Debug, Clone)]
+struct Located {
+    key: SettingKey,
+    display_name: Option<String>,
+    existing: Option<Declaration>,
+    on_path: Vec<Declaration>,
+}
+
+impl Located {
+    /// The active declaration on the version-stripped path, whatever its major.
+    fn active(&self) -> Option<&Declaration> {
+        self.on_path.iter().find(|d| d.status.is_active())
+    }
+
+    /// The retired declaration a create here would revive: the one at the
+    /// composed key, when nothing active is on the path.
+    fn retired(&self) -> Option<&Declaration> {
+        if self.active().is_some() {
+            return None;
+        }
+        self.existing.as_ref().filter(|d| d.status.is_retired())
+    }
+}
+
+/// What the create's second phase resolved for the dispatch: the derived
+/// classification and the metadata a new or revived row carries.
+#[domain_model]
+struct Checked {
+    derived: DerivedClassification,
+    metadata: DeclarationMetadata,
+}
+
+/// The problem code of a revival report that has nothing to revive: no retired
+/// declaration at the key, or an active one on its path. It rides the
+/// `NotFound` the report answers, distinct from a missing category's.
+pub const NOTHING_TO_REVIVE: &str = "nothing_to_revive";
+
+/// A body that would revive a retired declaration, as far as the create's
+/// first checks can tell.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct RevivalPlan {
+    retired: Declaration,
+    located: Located,
+}
+
+impl RevivalPlan {
+    /// The retired declaration the body would revive.
+    #[must_use]
+    pub fn retired(&self) -> &Declaration {
+        &self.retired
+    }
+}
+
+/// The tenants a report walks, the caller's first and the rest in
+/// breadth-first order, and whether the node budget cut the walk.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Walk {
+    pub tenants: Vec<Uuid>,
+    pub truncated: bool,
+}
+
+/// One retained value a revive would re-validate, as far as it is listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalRow {
+    pub tenant_id: Uuid,
+    /// The inline value; `None` for a secret, held by reference.
+    pub value: Option<Value>,
+    /// The classification the row itself is stored under.
+    pub data_classification: DataClassification,
+    /// Whether the revive would flag the value: it no longer validates.
+    pub needs_review: bool,
+    /// Why, when it would be flagged.
+    pub needs_review_detail: Option<String>,
+}
+
+/// What a revive would do to the retained values: every row counted, the
+/// first `limit` of them, in the walk's order, listed.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct RevivalReport {
+    pub key: String,
+    pub declaration_id: Uuid,
+    /// The stricter of the declaration's stored classification and the body's
+    /// derived one; a listed value is masked by the strictest of this and its
+    /// row's own.
+    pub data_classification: DataClassification,
+    /// The first `limit` rows, values and details kept for these alone.
+    pub rows: Vec<RevivalRow>,
+    /// Every row found at the walked tenants.
+    pub total: usize,
+    /// How many of them the revive would flag.
+    pub total_needs_review: usize,
+    /// The tenants walked, the caller included.
+    pub scanned: usize,
+    /// Whether the walk was whole: the counts are all there are.
+    pub complete: bool,
+}
+
+/// How many tenants of the walk one listing read asks for: the listing is
+/// fetched in the walk's order, a batch at a time, until `limit` rows are in
+/// hand. Well inside the bind-parameter bound of every backend.
+const REVIVAL_TENANT_BATCH: usize = 500;
+
+/// The port the report's read gate is asked through: whether the caller may
+/// read the retired declaration the way the single read would show it — its
+/// grant, administrative domain and `hidden` restriction, the licence
+/// predicate joining in R2. The adapter owns the caller's scope and chain.
+#[async_trait::async_trait]
+pub trait RevivalReadGate: Send + Sync {
+    /// # Errors
+    /// [`DomainError`] when the gate's own reads fail.
+    async fn may_read(&self, declaration: &Declaration) -> Result<bool, DomainError>;
+}
+
+/// The strictest of any number of classifications: `secret` over `pii` over
+/// `public`, and `public` for none. A stored string reaches this through
+/// [`DataClassification::from_stored`], which is where an unknown class fails
+/// closed.
+#[must_use]
+pub fn strictest_classification(
+    classifications: impl IntoIterator<Item = DataClassification>,
+) -> DataClassification {
+    classifications
+        .into_iter()
+        .max()
+        .unwrap_or(DataClassification::Public)
+}
+
 /// What the value type's traits and the author's wish resolve to.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DerivedClassification {
     pub has_secret_trait: bool,
-    pub data_classification: &'static str,
+    pub data_classification: DataClassification,
 }
 
 /// The class a field of an update request falls into.
@@ -153,7 +288,7 @@ fn validation(field: &str, code: &'static str, message: impl Into<String>) -> Do
 fn revive_refusal(
     retired: &Declaration,
     request: &CreateDeclaration,
-    derived: &DerivedClassification,
+    derived: DerivedClassification,
 ) -> Result<(), DomainError> {
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-13
     // What a revive may not change: the secret boundary (a secret's values
@@ -250,7 +385,7 @@ pub fn derive_classification(
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-3
         // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-4
         if let Some(other) = supplied
-            && other != "secret"
+            && other != DataClassification::Secret.as_str()
         {
             return Err(validation(
                 "data_classification",
@@ -261,7 +396,7 @@ pub fn derive_classification(
                 ),
             ));
         }
-        "secret"
+        DataClassification::Secret
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-4
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-3
         // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-classification:p1:inst-decl-class-2
@@ -278,8 +413,8 @@ pub fn derive_classification(
                      classification",
                 ));
             }
-            Some("pii") => "pii",
-            Some("public") | None => "public",
+            Some("pii") => DataClassification::Pii,
+            Some("public") | None => DataClassification::Public,
             Some(other) => {
                 return Err(validation(
                     "data_classification",
@@ -359,12 +494,12 @@ pub fn classify_field(
             Some("secret") => FieldClass::Immutable,
             // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-6
             Some(requested @ ("public" | "pii")) => {
-                match (current.data_classification.as_str(), requested) {
+                match (current.classification(), requested) {
                     // Derived from the trait: never author-changed.
-                    ("secret", _) => FieldClass::Immutable,
+                    (DataClassification::Secret, _) => FieldClass::Immutable,
                     // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-5
                     // Loosening un-masks content previously withheld.
-                    ("pii", "public") => FieldClass::StepUp,
+                    (DataClassification::Pii, "public") => FieldClass::StepUp,
                     // @cpt-end:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-5
                     // @cpt-begin:cpt-cf-settings-service-algo-setting-declarations-mutation-class:p1:inst-decl-mutcls-4
                     // Tightening, and a no-op, both apply at once.
@@ -393,7 +528,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "default_value": declaration.default_value,
         "scope_class": declaration.scope_class,
         "mode": declaration.mode,
-        "status": declaration.status,
+        "status": declaration.status.as_str(),
         "description": declaration.description,
         "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
@@ -418,6 +553,7 @@ fn optional_string(value: &Value) -> Option<String> {
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-lifecycle:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-contributed-protection:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-audit:p1
+// @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-revival-report:p1
 #[domain_model]
 pub struct DeclarationAdmin<R, Cat, Val, S> {
     declarations: R,
@@ -477,6 +613,277 @@ where
         request: CreateDeclaration,
         actor: &WriteActor,
     ) -> Result<Created, DomainError> {
+        let located = self.locate(conn, scope, &request).await?;
+        let Checked { derived, metadata } = self.check(&located, &request).await?;
+        let Located {
+            key,
+            existing,
+            on_path,
+            ..
+        } = located;
+
+        if let Some(active) = on_path.iter().find(|d| d.status.is_active()) {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            // A request matching the active declaration is not evolution: a
+            // retry after a lost response must not mint a major by accident,
+            // and a metadata change goes through PATCH.
+            if !changes_behaviour(active, &request) {
+                return Err(conflict(
+                    conflict::KEY_CONFLICT,
+                    format!(
+                        "`{}` is the active declaration of this setting and the request changes \
+                         none of its value type, Schema Default or scope class; metadata changes \
+                         use PATCH",
+                        active.key
+                    ),
+                ));
+            }
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
+            return self
+                .evolve(
+                    conn,
+                    scope,
+                    &key,
+                    active.clone(),
+                    &on_path,
+                    &request,
+                    derived,
+                    metadata,
+                    actor,
+                )
+                .await;
+        }
+
+        match existing {
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
+            Some(active) if active.status.is_active() => Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is an active declaration; metadata changes use PATCH",
+                    active.key
+                ),
+            )),
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
+            Some(retired) => {
+                self.revive(
+                    conn, scope, &key, retired, &request, derived, metadata, actor,
+                )
+                .await
+            }
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
+            None => {
+                self.insert_new(conn, scope, &key, &request, derived, metadata, actor)
+                    .await
+            } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
+        }
+    }
+
+    /// Plan a revival report: the create's first checks on the body, whether
+    /// the body would revive a retired declaration at all, and whether the
+    /// caller may read that declaration.
+    ///
+    /// # Errors
+    /// The create's own refusals up to the lookup, as [`Self::create`] answers
+    /// them; [`DomainError::NotFound`] with [`NOTHING_TO_REVIVE`] when no
+    /// retired declaration sits at the key, an active one sits on the path —
+    /// the create would then evolve or duplicate, not revive — or the gate
+    /// refuses the retired declaration to the caller.
+    pub async fn plan_revival<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+        gate: &dyn RevivalReadGate,
+    ) -> Result<RevivalPlan, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        let located = self.locate(conn, scope, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-3
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+        let nothing = || DomainError::NotFound {
+            resource: NOTHING_TO_REVIVE,
+        };
+        let retired = located.retired().cloned().ok_or_else(nothing)?;
+        // One answer for every way of not being there, so what the caller
+        // may not read is not told apart from what does not exist.
+        if !gate.may_read(&retired).await? {
+            return Err(nothing());
+        }
+        Ok(RevivalPlan { retired, located })
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-4
+    }
+
+    /// Report what a revive of the planned declaration would do to the values
+    /// it retained, changing nothing: the create's remaining checks, the leaf
+    /// name, the retained subject-less rows at the walked tenants, each
+    /// re-validated as the revive would re-validate it. Every row is counted;
+    /// the first `limit`, in the walk's order, are listed.
+    ///
+    /// The walk is asked for only here, after every refusal.
+    ///
+    /// # Errors
+    /// The create's refusals up to step-up, as [`Self::create`] answers them;
+    /// [`DomainError::Conflict`] with `leaf_name_taken` when an active
+    /// declaration holds the leaf name in the category;
+    /// [`DomainError::Unavailable`] when the Type Validator cannot answer.
+    pub async fn revival_report<C, F, Fut>(
+        &self,
+        conn: &C,
+        value_scope: &AccessScope,
+        plan: RevivalPlan,
+        request: &CreateDeclaration,
+        limit: usize,
+        walk: F,
+    ) -> Result<RevivalReport, DomainError>
+    where
+        C: DBRunner,
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<Walk, DomainError>>,
+    {
+        let RevivalPlan { retired, located } = plan;
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        let checked = self.check(&located, request).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-5
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // Unscoped, as the revive's unique index is: a holder outside the
+        // caller's scope still blocks the revive, so it must be found. What
+        // this tells the caller — that the leaf name is taken in the
+        // declaration's own category — the create tells it too, as its insert
+        // collides on the same index.
+        if self
+            .declarations
+            .find_active_by_leaf(
+                conn,
+                &AccessScope::allow_all(),
+                retired.category_id,
+                &retired.leaf_slug,
+            )
+            .await?
+            .is_some_and(|holder| holder.id != retired.id)
+        {
+            return Err(conflict(
+                conflict::LEAF_NAME_TAKEN,
+                format!(
+                    "the leaf name `{}` is held by an active declaration in this category; \
+                     a revive of `{}` would collide with it",
+                    retired.leaf_slug, retired.key
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-6
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        let walked = walk().await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        // Three reads, none of them whole rows. The count is every row of the
+        // declaration at the walked tenants; the grouped read is its distinct
+        // `(value, classification)` pairs with their multiplicity; the listing
+        // is the first `limit` rows in the walk's order, fetched a batch of
+        // tenants at a time and no further than `limit` needs. The work grows
+        // with `limit` and the number of distinct values, not the subtree.
+        let total = self
+            .values
+            .count_in_tenants(conn, value_scope, retired.id, &walked.tenants)
+            .await?;
+        let groups = self
+            .values
+            .distinct_values_in_tenants(conn, value_scope, retired.id, &walked.tenants)
+            .await?;
+        // The walk's position of every tenant, built once: the order of a
+        // batch is a sort on an O(1) lookup.
+        let position: HashMap<Uuid, usize> = walked
+            .tenants
+            .iter()
+            .enumerate()
+            .map(|(at, tenant)| (*tenant, at))
+            .collect();
+        let mut listed = Vec::with_capacity(limit.min(walked.tenants.len()));
+        for batch in walked.tenants.chunks(REVIVAL_TENANT_BATCH) {
+            if listed.len() >= limit {
+                break;
+            }
+            let mut found = self
+                .values
+                .list_in_tenants(conn, value_scope, retired.id, batch)
+                .await?;
+            found.sort_by_key(|row| position.get(&row.tenant_id).copied().unwrap_or(usize::MAX));
+            listed.extend(found);
+        }
+        listed.truncate(limit);
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        // A value shared by many rows — the same override copied down a
+        // tree — is judged once: the verdict depends on the value and the
+        // type alone, so it is reused for every row holding that value. The
+        // groups are judged first; a group that fails adds its multiplicity to
+        // the count. The verdicts are keyed by the value itself: `Value`
+        // hashes an object's members in key order whatever the build, as its
+        // equality ignores their order, so one verdict stands per value — a
+        // backend that groups JSON textually (sqlite) may return two equal
+        // objects with different key order as two groups, and they still meet
+        // one judgement. A secret row has no value here to judge.
+        let mut verdicts: HashMap<Value, Option<String>> = HashMap::new();
+        let mut total_needs_review: u64 = 0;
+        for group in &groups {
+            if let Some(value) = &group.value
+                && self
+                    .verdict_of(&retired.value_type_id, &mut verdicts, value)
+                    .await?
+                    .is_some()
+            {
+                total_needs_review += group.count;
+            }
+        }
+        // Each listed row takes its verdict from the same map; a value the
+        // groups somehow did not cover is judged on the spot.
+        let mut rows = Vec::with_capacity(listed.len());
+        for row in listed {
+            let detail = match &row.value {
+                None => None,
+                Some(value) => {
+                    self.verdict_of(&retired.value_type_id, &mut verdicts, value)
+                        .await?
+                }
+            };
+            rows.push(RevivalRow {
+                tenant_id: row.tenant_id,
+                value: row.value,
+                data_classification: DataClassification::from_stored(&row.data_classification),
+                needs_review: detail.is_some(),
+                needs_review_detail: detail,
+            });
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-9
+        Ok(RevivalReport {
+            key: retired.key.clone(),
+            declaration_id: retired.id,
+            data_classification: strictest_classification([
+                retired.classification(),
+                checked.derived.data_classification,
+            ]),
+            rows,
+            total: usize::try_from(total).unwrap_or(usize::MAX),
+            total_needs_review: usize::try_from(total_needs_review).unwrap_or(usize::MAX),
+            scanned: walked.tenants.len(),
+            complete: !walked.truncated,
+        })
+    }
+
+    /// The create's first phase, which the revival report shares: the
+    /// category, the key composed from the body, its display name and Scope
+    /// Class, the declarations found at the key and on its version-stripped
+    /// path, and the refusal of an active `module_contributed` one on the path.
+    ///
+    /// # Errors
+    /// [`DomainError::NotFound`] on the category; [`DomainError::Validation`]
+    /// for a key segment, display name or Scope Class the rules refuse;
+    /// [`DomainError::Conflict`] for an active contributed declaration on the
+    /// path.
+    async fn locate<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        request: &CreateDeclaration,
+    ) -> Result<Located, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-5
         let category = self
@@ -528,11 +935,11 @@ where
         // and looking it up alone would revive it beside the live `v2`.
         let on_path = self.declarations_on_path(conn, scope, &key).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-1
-        let active = on_path.iter().find(|d| d.status == "active");
-        let retired = if active.is_none() {
-            existing.as_ref().filter(|d| d.status == "retired")
-        } else {
-            None
+        let located = Located {
+            key,
+            display_name,
+            existing,
+            on_path,
         };
         // Who may change the row at all is judged before anything about the
         // request is resolved: a gear's declaration answers with its owner,
@@ -543,7 +950,7 @@ where
         // package an admin key is composed with, so its declaration can sit at
         // this key or on this path.
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
-        if let Some(active) = active
+        if let Some(active) = located.active()
             && active.source == "module_contributed"
         {
             return Err(conflict(
@@ -556,6 +963,24 @@ where
             ));
         }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-8
+        Ok(located)
+    }
+
+    /// The create's second phase, which the revival report shares: everything
+    /// the create judges before it would ask for step-up — a retired
+    /// `module_contributed` declaration, the value type's traits and the
+    /// derived classification, a revive's own refusals, the Schema Default and
+    /// the remaining body fields.
+    ///
+    /// # Errors
+    /// [`DomainError::Conflict`], [`DomainError::Validation`] and
+    /// [`DomainError::Unavailable`], as the create answers them.
+    async fn check(
+        &self,
+        located: &Located,
+        request: &CreateDeclaration,
+    ) -> Result<Checked, DomainError> {
+        let retired = located.retired();
         if let Some(retired) = retired {
             // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-15
             // A revive would replace its Schema Default and metadata.
@@ -577,8 +1002,9 @@ where
         // judged first, so a retype is refused as one rather than as a default
         // that does not fit the type it could never adopt.
         if let Some(retired) = retired {
-            revive_refusal(retired, &request, &derived)?;
+            revive_refusal(retired, request, derived)?;
         }
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-12
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-13
@@ -603,13 +1029,13 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-11
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-14
         let anonymous_exposable = request.anonymous_exposable.unwrap_or(false);
-        if anonymous_exposable && derived.data_classification != "public" {
+        if anonymous_exposable && derived.data_classification != DataClassification::Public {
             return Err(validation(
                 "anonymous_exposable",
                 field::EXPOSABLE_NOT_SENSITIVE,
                 format!(
                     "a `{}` setting cannot be exposed on the anonymous surface",
-                    derived.data_classification
+                    derived.data_classification.as_str()
                 ),
             ));
         }
@@ -628,70 +1054,17 @@ where
         };
         let metadata = DeclarationMetadata {
             mode: mode.to_owned(),
-            display_name,
+            display_name: located.display_name.clone(),
             description: request.description.clone(),
             domain_affinity: request.domain_affinity.clone(),
             licence_feature: request.licence_feature.clone(),
-            data_classification: derived.data_classification.to_owned(),
+            data_classification: derived.data_classification.as_str().to_owned(),
             requires_step_up: request.requires_step_up.unwrap_or(true),
             anonymous_exposable,
         };
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-create:p1:inst-decl-create-15
-
-        if let Some(active) = on_path.iter().find(|d| d.status == "active") {
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
-            // A request matching the active declaration is not evolution: a
-            // retry after a lost response must not mint a major by accident,
-            // and a metadata change goes through PATCH.
-            if !changes_behaviour(active, &request) {
-                return Err(conflict(
-                    conflict::KEY_CONFLICT,
-                    format!(
-                        "`{}` is the active declaration of this setting and the request changes \
-                         none of its value type, Schema Default or scope class; metadata changes \
-                         use PATCH",
-                        active.key
-                    ),
-                ));
-            }
-            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-2
-            return self
-                .evolve(
-                    conn,
-                    scope,
-                    &key,
-                    active.clone(),
-                    &on_path,
-                    &request,
-                    derived,
-                    metadata,
-                    actor,
-                )
-                .await;
-        }
-
-        match existing {
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
-            Some(active) if active.status == "active" => Err(conflict(
-                conflict::KEY_CONFLICT,
-                format!(
-                    "`{}` is an active declaration; metadata changes use PATCH",
-                    active.key
-                ),
-            )),
-            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-6
-            Some(retired) => {
-                self.revive(
-                    conn, scope, &key, retired, &request, derived, metadata, actor,
-                )
-                .await
-            }
-            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
-            None => {
-                self.insert_new(conn, scope, &key, &request, derived, metadata, actor)
-                    .await
-            } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-5
-        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-16
+        Ok(Checked { derived, metadata })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -728,7 +1101,7 @@ where
             anonymous_exposable: metadata.anonymous_exposable,
             domain_affinity: metadata.domain_affinity.clone(),
             has_secret_trait: derived.has_secret_trait,
-            data_classification: derived.data_classification.to_owned(),
+            data_classification: derived.data_classification.as_str().to_owned(),
             source: "admin_authored".to_owned(),
             owner_module: None,
             licence_feature: metadata.licence_feature.clone(),
@@ -798,7 +1171,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
         // Again here, whoever calls: `create` asks first, before the default.
-        revive_refusal(&retired, request, &derived)?;
+        revive_refusal(&retired, request, derived)?;
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-14
         // The type the row goes live under is the registered one, confirmed
         // before anything is written — as a create registers before it inserts.
@@ -834,7 +1207,7 @@ where
         }
         if let Err(err) = self
             .declarations
-            .set_status(conn, scope, retired.id, "active", None)
+            .set_status(conn, scope, retired.id, DeclarationStatus::Active, None)
             .await
         {
             return Err(match err {
@@ -950,7 +1323,7 @@ where
         // all the unique index admits.
         // @cpt-begin:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         self.declarations
-            .set_status(conn, scope, active.id, "retired", None)
+            .set_status(conn, scope, active.id, DeclarationStatus::Retired, None)
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-5
         let retired = self.reload(conn, scope, &active.key).await?;
@@ -992,7 +1365,7 @@ where
                         tenant_id: row.tenant_id,
                         value: row.value.clone(),
                         secret_ref: row.secret_ref.clone(),
-                        data_classification: derived.data_classification.to_owned(),
+                        data_classification: derived.data_classification.as_str().to_owned(),
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
@@ -1031,6 +1404,36 @@ where
             .collect())
     }
 
+    /// The verdict on one value, judged once: found in `verdicts` by hash and
+    /// `Value` equality, or judged now and remembered.
+    async fn verdict_of(
+        &self,
+        value_type_id: &str,
+        verdicts: &mut HashMap<Value, Option<String>>,
+        value: &Value,
+    ) -> Result<Option<String>, DomainError> {
+        if let Some(verdict) = verdicts.get(value) {
+            return Ok(verdict.clone());
+        }
+        let judged = self.judge(value_type_id, value).await?;
+        verdicts.insert(value.clone(), judged.clone());
+        Ok(judged)
+    }
+
+    /// The first violation of a value against `value_type_id`, as the detail
+    /// a `needs_review` flag carries; `None` when it validates.
+    async fn judge(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<Option<String>, DomainError> {
+        let result = self.validator.validate_value(value_type_id, value).await?;
+        Ok(result
+            .violations
+            .first()
+            .map(|first| format!("{} — {}", first.field, first.message)))
+    }
+
     /// The first violation of a retained value against `value_type_id`, as
     /// the detail a `needs_review` flag carries; `None` when it validates, and
     /// for a secret row, whose plaintext is not here to validate.
@@ -1042,11 +1445,7 @@ where
         let Some(value) = &row.value else {
             return Ok(None);
         };
-        let result = self.validator.validate_value(value_type_id, value).await?;
-        Ok(result
-            .violations
-            .first()
-            .map(|first| format!("{} — {}", first.field, first.message)))
+        self.judge(value_type_id, value).await
     }
 
     /// Edit a declaration's metadata under the mutation-class discipline.
@@ -1133,13 +1532,19 @@ where
                     metadata.anonymous_exposable = value.as_bool().unwrap_or(false);
                 }
                 "data_classification" => {
-                    metadata.data_classification = value.as_str().unwrap_or("public").to_owned();
+                    metadata.data_classification = value
+                        .as_str()
+                        .unwrap_or(DataClassification::Public.as_str())
+                        .to_owned();
                 }
                 _ => {}
             }
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-12
-        if metadata.anonymous_exposable && metadata.data_classification != "public" {
+        if metadata.anonymous_exposable
+            && DataClassification::from_stored(&metadata.data_classification)
+                != DataClassification::Public
+        {
             return Err(validation(
                 "anonymous_exposable",
                 field::EXPOSABLE_NOT_SENSITIVE,
@@ -1231,7 +1636,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
         precondition::evaluate(if_match, &etag_of(&current))?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
-        if current.status == "retired" {
+        if current.status.is_retired() {
             return Ok(current);
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-10
@@ -1242,7 +1647,13 @@ where
         // excluded from resolution by the status alone and revived with it. A
         // retired declaration keeps occupying its category with them.
         self.declarations
-            .set_status(conn, scope, id, "retired", Some(current.updated_at))
+            .set_status(
+                conn,
+                scope,
+                id,
+                DeclarationStatus::Retired,
+                Some(current.updated_at),
+            )
             .await?;
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-4
         // @cpt-end:cpt-cf-settings-service-state-setting-declarations-lifecycle:p1:inst-decl-state-2

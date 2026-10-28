@@ -5,7 +5,7 @@ use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord, RecordHandOff,
 };
 
-/// [`RecordHandOff`] until the Planner (Story 5.2) delivers the entry point:
+/// [`RecordHandOff`] until the Planner delivers the entry point:
 /// it takes every record and drops it, with a content-free drop event. Intake
 /// answers received and keeps the record's identity, so a resend after the
 /// Planner ships is a repeat: records received while this stub is wired in are

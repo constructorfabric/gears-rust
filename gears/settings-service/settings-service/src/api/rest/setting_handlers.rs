@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Handlers for the administrative read surface over effective values.
 
 use std::sync::Arc;

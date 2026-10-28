@@ -1,0 +1,26 @@
+{
+  "id": "gts.cf.core.tasks.queue.v1~cf.core.tasks.default.v1",
+  "description": "Default general-purpose task queue. Used when a task creation request names no specific queue.",
+  "global_concurrency_limit": 0,
+  "per_tenant_concurrency_limit": 0,
+  "default_priority": 100,
+  "timeouts": {
+    "queue_timeout_secs": null,
+    "assignment_timeout_secs": 300,
+    "execution_timeout_secs": 86400,
+    "heartbeat_timeout_secs": 30,
+    "lifetime_timeout_secs": null
+  },
+  "retry_policy": {
+    "max_retries": 3,
+    "max_liveness_requeues": 20,
+    "strategy": "exponential",
+    "base_interval_secs": 5,
+    "max_interval_secs": 300,
+    "jitter_factor": 0.2,
+    "non_retryable_codes": []
+  },
+  "progress_events": "none",
+  "tenant_fairness": "round_robin",
+  "dead_letter_queue": "gts.cf.core.tasks.queue.v1~cf.core.tasks.dead_letter.v1"
+}

@@ -8,12 +8,15 @@ use std::ops::Range;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::error::DomainError;
-use super::plan::{Origin, Plan, Step, ValueRef};
+use super::plan::{
+    Origin, PieceMut, Plan, PropertyRef, Step, ValueRef, text_chars_up_to, text_piece_mut,
+};
 use super::record_intake::{DropEvent, DropReason, DropStage, IntakeEvents};
 use super::sensitive_data::{Action, SensitiveDataKind, Verdict};
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
@@ -49,7 +52,8 @@ pub struct AdmissionRules {
     pub entity_kinds: Allowed<String>,
     /// The most steps one plan may hold.
     pub max_steps: usize,
-    /// The longest value, in characters, a plan may store.
+    /// The longest value a plan may store, in characters of its text: every
+    /// string and number in it together, never the keys.
     pub max_value_chars: usize,
 }
 
@@ -85,8 +89,8 @@ pub trait AdmissionEvents: Send + Sync {
     fn redacted(&self, event: SensitiveDataEvent);
 }
 
-/// One sensitive-data kind enforced on one value. `at` names the value in the
-/// plan as the checks saw it.
+/// One sensitive-data kind enforced on one text piece. `at` names the piece in
+/// the plan as the checks saw it.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Enforced {
@@ -100,9 +104,9 @@ pub struct Enforced {
 pub struct AdmittedPlan {
     /// The steps to store. It can be empty when every value was blocked.
     pub plan: Plan,
-    /// Values dropped: blocked, or redacted down to nothing.
+    /// Text pieces whose value was dropped: blocked, or not redactable.
     pub blocked: Vec<Enforced>,
-    /// Values stored with the found content removed.
+    /// Text pieces stored with the found content removed.
     pub redacted: Vec<Enforced>,
     /// Steps dropped because a value they store was blocked, by their place
     /// in the plan as the checks saw it. A replace whose new value is blocked
@@ -210,11 +214,19 @@ impl Admission {
             origin: admitted.plan.origin.clone(),
             kind,
         };
-        for enforced in &admitted.blocked {
-            self.ports.events.blocked(event(enforced.kind));
+        // One event per value and kind, not per piece: two pieces of one value
+        // that a kind blocks are one blocked value for that kind.
+        let per_value = |enforced: &[Enforced]| {
+            enforced
+                .iter()
+                .map(|e| (e.at.property_ref(), e.kind))
+                .collect::<BTreeSet<_>>()
+        };
+        for (_, kind) in per_value(&admitted.blocked) {
+            self.ports.events.blocked(event(kind));
         }
-        for enforced in &admitted.redacted {
-            self.ports.events.redacted(event(enforced.kind));
+        for (_, kind) in per_value(&admitted.redacted) {
+            self.ports.events.redacted(event(kind));
         }
         // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-events
     }
@@ -256,11 +268,18 @@ fn broken_rule(plan: &Plan, rules: &AdmissionRules) -> Option<DropReason> {
     // @cpt-end:cpt-cf-construct-algo-admission-admit:p1:inst-admit-kinds
 
     // @cpt-begin:cpt-cf-construct-algo-admission-admit:p1:inst-admit-caps
-    let too_long = plan
-        .values()
-        .iter()
-        .any(|value| value.text.chars().count() > rules.max_value_chars);
-    if plan.steps.len() > rules.max_steps || too_long {
+    // The step count is cheap, so it goes first. A value is measured as a
+    // whole, so an object of many short pieces cannot pass a cap that each
+    // piece alone would; the count stops once it passes the cap.
+    if plan.steps.len() > rules.max_steps {
+        return Some(DropReason::WriteCapExceeded);
+    }
+    let too_long = plan.steps.iter().any(|step| {
+        step.change.properties().iter().any(|property| {
+            text_chars_up_to(&property.value, rules.max_value_chars) > rules.max_value_chars
+        })
+    });
+    if too_long {
         return Some(DropReason::WriteCapExceeded);
     }
     // @cpt-end:cpt-cf-construct-algo-admission-admit:p1:inst-admit-caps
@@ -275,21 +294,77 @@ fn meets_floor(step: &Step, floor: f32) -> bool {
         .is_some_and(|confidence| confidence.is_finite() && confidence >= floor)
 }
 
-/// What the verdicts do to one value.
+/// What the verdicts do to one text piece.
 #[derive(Default)]
 struct Treatment {
     block: BTreeSet<SensitiveDataKind>,
-    redact: BTreeMap<SensitiveDataKind, Vec<Range<usize>>>,
+    /// The ranges of each redacting kind, or `None` once any of its findings
+    /// on the piece named no range: such a kind cannot be redacted, and its
+    /// other findings' ranges must not hide that.
+    redact: BTreeMap<SensitiveDataKind, Option<Vec<Range<usize>>>>,
 }
 
-/// Apply the verdicts to the values they name. Block drops the value and keeps
-/// the rest; redact removes the found content. A value that cannot be redacted
-/// as the check asks, or is empty after it, is dropped like a blocked one. A
-/// step that keeps no value, or a replace that loses any value, is dropped
-/// whole, so a replace never removes the old value without storing the new one.
+impl Treatment {
+    /// Every kind that named the piece, blocking or redacting.
+    fn kinds(&self) -> impl Iterator<Item = SensitiveDataKind> + '_ {
+        self.block.iter().chain(self.redact.keys()).copied()
+    }
+}
+
+/// Apply the verdicts to the text pieces they name. Block drops the whole value
+/// the piece belongs to and keeps the rest of the plan; redact removes the
+/// found content from the piece, so the value stays valid JSON. A piece that
+/// cannot be redacted as the check asks (a number, or a range that does not
+/// fit), or is empty after it, drops its value like a block. A step that keeps
+/// no value, or a replace that loses any value, is dropped whole, so a replace
+/// never removes the old value without storing the new one.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-admission-verdicts:p1
 fn enforce(mut plan: Plan, verdicts: &[Verdict]) -> AdmittedPlan {
+    let mut taken = Taken::default();
+    for (at, treatment) in collect(verdicts) {
+        apply(&mut plan, at, &treatment, &mut taken);
+    }
+    let dropped_steps = drop_blocked_values(&mut plan, &taken.blocked_values);
+
+    let Taken {
+        mut blocked,
+        mut redacted,
+        blocked_values,
+    } = taken;
+    // A redaction in a value that another piece blocked, or in a step dropped
+    // whole, stored nothing. `dropped_steps` is in ascending order.
+    redacted.retain(|enforced| {
+        !blocked_values.contains(&enforced.at.property_ref())
+            && dropped_steps.binary_search(&enforced.at.step).is_err()
+    });
+    blocked.sort();
+    redacted.sort();
+    AdmittedPlan {
+        plan,
+        blocked,
+        redacted,
+        dropped_steps,
+    }
+}
+
+/// What enforcing the verdicts took out of the plan so far.
+#[derive(Default)]
+struct Taken {
+    blocked: Vec<Enforced>,
+    redacted: Vec<Enforced>,
+    blocked_values: BTreeSet<PropertyRef>,
+}
+
+impl Taken {
+    fn block(&mut self, at: ValueRef, kinds: impl Iterator<Item = SensitiveDataKind>) {
+        self.blocked.extend(kinds.map(|kind| Enforced { at, kind }));
+        self.blocked_values.insert(at.property_ref());
+    }
+}
+
+/// What the verdicts do to each text piece they name.
+fn collect(verdicts: &[Verdict]) -> BTreeMap<ValueRef, Treatment> {
     // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-collect
     let mut treatments: BTreeMap<ValueRef, Treatment> = BTreeMap::new();
     for verdict in verdicts {
@@ -299,46 +374,89 @@ fn enforce(mut plan: Plan, verdicts: &[Verdict]) -> AdmittedPlan {
                 Action::Block => {
                     treatment.block.insert(verdict.kind);
                 }
-                Action::Redact => treatment
-                    .redact
-                    .entry(verdict.kind)
-                    .or_default()
-                    .extend(found.spans.iter().cloned()),
+                Action::Redact => {
+                    let ranges = treatment
+                        .redact
+                        .entry(verdict.kind)
+                        .or_insert_with(|| Some(Vec::new()));
+                    if found.spans.is_empty() {
+                        *ranges = None;
+                    } else if let Some(ranges) = ranges {
+                        ranges.extend(found.spans.iter().cloned());
+                    }
+                }
             }
         }
     }
+    treatments
     // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-collect
+}
 
-    let mut blocked = Vec::new();
-    let mut redacted = Vec::new();
-    let mut blocked_values: BTreeSet<ValueRef> = BTreeSet::new();
-    for (at, treatment) in treatments {
-        let Some(value) = value_mut(&mut plan, at) else {
-            continue;
-        };
-        // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-block
-        if !treatment.block.is_empty() {
-            blocked.extend(treatment.block.iter().map(|&kind| Enforced { at, kind }));
-            blocked_values.insert(at);
-            continue;
-        }
-        // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-block
-        // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-redact
-        let spans: Vec<Range<usize>> = treatment.redact.values().flatten().cloned().collect();
-        let kinds = treatment.redact.keys().map(|&kind| Enforced { at, kind });
-        match redact(value, &spans) {
-            Some(kept) if !kept.trim().is_empty() => {
-                *value = kept;
-                redacted.extend(kinds);
-            }
-            _ => {
-                blocked.extend(kinds);
-                blocked_values.insert(at);
-            }
-        }
-        // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-redact
+/// Apply the verdicts on one text piece: block its value, or redact the piece.
+fn apply(plan: &mut Plan, at: ValueRef, treatment: &Treatment, taken: &mut Taken) {
+    let Some(value) = value_mut(plan, at) else {
+        // No such value in the plan, so nothing of it can be stored.
+        tracing::warn!(
+            step = at.step,
+            property = at.property,
+            "a verdict names a value the plan does not hold"
+        );
+        return;
+    };
+    // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-block
+    // A verdict on a piece the value does not have fails closed: the whole
+    // value is blocked for every kind that named it.
+    let Some(piece) = text_piece_mut(value, at.piece) else {
+        taken.block(at, treatment.kinds());
+        return;
+    };
+    if !treatment.block.is_empty() {
+        taken.block(at, treatment.block.iter().copied());
+        return;
     }
+    // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-block
+    // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-redact
+    let kinds = treatment.redact.keys().copied();
+    if redact_piece(piece, treatment) {
+        taken
+            .redacted
+            .extend(kinds.map(|kind| Enforced { at, kind }));
+    } else {
+        taken.block(at, kinds);
+    }
+    // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-redact
+}
 
+/// Remove every redacting kind's ranges from a string piece. `false` when the
+/// piece cannot be redacted as asked: it is a number, a redacting kind named
+/// no range (another kind's ranges must not hide that), a range does not fit,
+/// or only white space would be left.
+fn redact_piece(piece: PieceMut<'_>, treatment: &Treatment) -> bool {
+    let PieceMut::Text(text) = piece else {
+        return false;
+    };
+    let Some(spans) = treatment
+        .redact
+        .values()
+        .map(Option::as_deref)
+        .collect::<Option<Vec<&[Range<usize>]>>>()
+    else {
+        return false;
+    };
+    let spans: Vec<Range<usize>> = spans.concat();
+    match redact(text, &spans).filter(|kept| !kept.trim().is_empty()) {
+        Some(kept) => {
+            *text = kept;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Drop each blocked value from its step. A replace that loses any value, or
+/// a step that keeps none, is dropped whole. Returns the dropped steps, in
+/// ascending order.
+fn drop_blocked_values(plan: &mut Plan, blocked_values: &BTreeSet<PropertyRef>) -> Vec<usize> {
     // @cpt-begin:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-steps
     let mut dropped_steps = Vec::new();
     let steps = std::mem::take(&mut plan.steps);
@@ -365,19 +483,11 @@ fn enforce(mut plan: Plan, verdicts: &[Verdict]) -> AdmittedPlan {
         }
         dropped_steps.push(index);
     }
+    dropped_steps
     // @cpt-end:cpt-cf-construct-algo-admission-enforce:p1:inst-enforce-steps
-
-    blocked.sort();
-    redacted.sort();
-    AdmittedPlan {
-        plan,
-        blocked,
-        redacted,
-        dropped_steps,
-    }
 }
 
-fn value_mut(plan: &mut Plan, at: ValueRef) -> Option<&mut String> {
+fn value_mut(plan: &mut Plan, at: ValueRef) -> Option<&mut Value> {
     plan.steps.get_mut(at.step)?.change.value_mut(at.property)
 }
 

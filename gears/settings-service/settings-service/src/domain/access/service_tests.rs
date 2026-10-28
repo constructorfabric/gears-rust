@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Set, clear, read and list over the resolution harness.
 
 use std::sync::Arc;

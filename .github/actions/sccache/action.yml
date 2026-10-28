@@ -28,6 +28,10 @@ inputs:
     required: false
     default: ""
 
+outputs:
+  enabled:
+    description: A cache server started successfully
+    value: ${{ steps.start.outputs.enabled == 'true' }}
 runs:
   using: composite
   steps:
@@ -50,6 +54,7 @@ runs:
     # Try S3, then the GitHub cache, then plain rustc. The keys stay in this step.
     # Idle timeout 0 keeps the server up. A restarted one would lose these settings.
     - name: Start sccache and set RUSTC_WRAPPER
+      id: start
       shell: bash
       env:
         S3_ENDPOINT: ${{ inputs.s3-endpoint }}
@@ -60,6 +65,7 @@ runs:
         RW_MODE: ${{ github.ref == 'refs/heads/main' && 'READ_WRITE' || 'READ_ONLY' }}
         SCCACHE_IDLE_TIMEOUT: "0"
       run: |
+        echo "SCCACHE_IDLE_TIMEOUT=0" >> "$GITHUB_ENV"
         log="$RUNNER_TEMP/sccache-start.log"
         start() {
           if sccache --start-server > "$log" 2>&1; then
@@ -99,6 +105,7 @@ runs:
 
         if [[ -n "$S3_BUCKET" && -n "$S3_ACCESS_KEY_ID" && -n "$S3_SECRET_ACCESS_KEY" ]] && start_s3; then
           echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
           report "S3 storage (${S3_ENDPOINT:-AWS S3})"
         else
           # The GitHub cache server does not need the S3 keys.
@@ -109,6 +116,7 @@ runs:
               echo "SCCACHE_GHA_ENABLED=true"
               echo "SCCACHE_GHA_RW_MODE=$RW_MODE"
             } >> "$GITHUB_ENV"
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
             report "GitHub Actions cache"
           else
             echo "::warning::sccache did not start, building with plain rustc"

@@ -318,19 +318,18 @@ pub async fn active_on_quota_for_update(
     now: OffsetDateTime,
     wait: RowWait,
 ) -> Result<Vec<lease::Model>, ScopeError> {
-    let holds = lease_hold::Entity::find()
+    // A subquery, not a bound token list: the unreturned holds have no upper bound.
+    let holders = lease_hold::Entity::find()
         .filter(lease_hold::Column::QuotaId.eq(quota_id))
         .filter(lease_hold::Column::ReturnedAt.is_null())
         .secure()
         .scope_with(scope)
-        .all(runner)
-        .await?;
-    if holds.is_empty() {
-        return Ok(Vec::new());
-    }
-    let tokens: Vec<Uuid> = holds.into_iter().map(|hold| hold.lease_token).collect();
+        .into_inner()
+        .select_only()
+        .column(lease_hold::Column::LeaseToken)
+        .into_query();
     let query = lease::Entity::find()
-        .filter(lease::Column::Token.is_in(tokens))
+        .filter(lease::Column::Token.in_subquery(holders))
         .filter(lease::Column::State.eq(STATE_ACTIVE))
         .filter(lease::Column::ExpiryAt.gt(now))
         .order_by(lease::Column::Token, Order::Asc);
@@ -519,21 +518,20 @@ pub async fn has_live_holds(
     period_id: Uuid,
     now: OffsetDateTime,
 ) -> Result<bool, ScopeError> {
-    let holds = lease_hold::Entity::find()
-        .filter(lease_hold::Column::PeriodId.eq(period_id))
-        .filter(lease_hold::Column::ReturnedAt.is_null())
-        .secure()
-        .scope_with(scope)
-        .all(runner)
-        .await?;
-    if holds.is_empty() {
-        return Ok(false);
-    }
-    let tokens: Vec<Uuid> = holds.into_iter().map(|hold| hold.lease_token).collect();
-    let live = lease::Entity::find()
-        .filter(lease::Column::Token.is_in(tokens))
+    // A subquery, not a bound token list: the unreturned holds have no upper bound.
+    let live_leases = lease::Entity::find()
         .filter(lease::Column::State.eq(STATE_ACTIVE))
         .filter(lease::Column::ExpiryAt.gt(now))
+        .secure()
+        .scope_with(scope)
+        .into_inner()
+        .select_only()
+        .column(lease::Column::Token)
+        .into_query();
+    let live = lease_hold::Entity::find()
+        .filter(lease_hold::Column::PeriodId.eq(period_id))
+        .filter(lease_hold::Column::ReturnedAt.is_null())
+        .filter(lease_hold::Column::LeaseToken.in_subquery(live_leases))
         .secure()
         .scope_with(scope)
         .count(runner)

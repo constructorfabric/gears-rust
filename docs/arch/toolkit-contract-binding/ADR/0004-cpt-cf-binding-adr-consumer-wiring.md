@@ -41,7 +41,10 @@ with the OoP bootstrap and the embedded (in-process) runtime.
 * **SDK-crate-only dependency** — the consumer must depend only on the provider's `*-sdk` crate. Loading
   the provider's implementation crate as a process-time stub must not be required.
 * **No static endpoint configuration** — the endpoint of a remote provider is resolved at runtime
-  through `DirectoryService`, not hard-coded in `config.yaml` or source code.
+  through `DirectoryService`, not hard-coded in `config.yaml` or source code. **Amended by
+  `cpt-cf-adr-optional-service-discovery`:** this driver holds for directory-based deployments, but is superseded for
+  the explicit directory-less mode (`discovery: none`), where a static `consumer_wiring.<dep>.endpoint` is the
+  supported resolution mechanism (e.g. a k8s Service URL) rather than a dev/test-only escape hatch.
 * **Transparency across runtime profiles** — in Profile 1 (embedded), the local in-process
   implementation is used without any HTTP hop; in Profile 2/3 (OoP), the generated REST client is
   wired automatically. Gear business logic sees `Arc<dyn BillingApi>` in both cases.
@@ -267,11 +270,16 @@ Known limits of the escape hatch: exactly one address (no list, weights or failo
 the directory if that address is dead, no metadata or version predicate, and it is read once at
 startup with no hot reload.
 
-**The production guard is deferred.** This ADR originally specified that the key's presence in a
-production configuration should be a fatal startup error. The runtime has no deployment-profile or
-environment concept to key that on — `AppConfig` carries no `profile` field — so the guard would
-require a deliberate config-schema change first. Until then the `warn!` on every static-override use
-is the only safety signal.
+**The production guard is deferred, and now superseded for directory-less mode.** This ADR originally specified that
+the key's presence in a production configuration should be a fatal startup error. The runtime has no
+deployment-profile or environment concept to key that on — `AppConfig` carries no `profile` field — so the guard
+would require a deliberate config-schema change first.
+`cpt-cf-adr-optional-service-discovery` resolves the direction rather than adding that guard: under the explicit
+`discovery: none` mode the static `endpoint` is a **supported** production resolution mechanism, so a blanket
+"fatal in production" guard would be wrong. The key remains discouraged (and should still warn) under
+`discovery: directory`, where directory resolution is the intended path. That ADR also owns updating the `warn!`
+text and the "dev/test" / "Not for production use" doc comments on `ConsumerWiring::endpoint` and
+`StaticEndpointResolver` so they distinguish the two modes.
 
 ### Readiness response shape
 

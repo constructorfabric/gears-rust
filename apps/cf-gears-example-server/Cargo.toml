@@ -69,6 +69,14 @@ quota-enforcement = [
 # feature doc comment for what it pulls in).
 magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
+# Orders requires the Event Broker gear (D-200) and the plugins its standalone deployment
+# resolves: the standalone cluster cache and the SQLite event-log backend.
+bss-orders = [
+    "dep:bss_orders",
+    "dep:event_broker",
+    "dep:standalone-cluster-plugin",
+    "dep:sqlite-event-broker-plugin",
+]
 bss-pricing = ["dep:bss_pricing", "bss-products"]
 bss-approvals = ["dep:bss_approvals"]
 # The admission gate links its default engine plugin, policy-engine.
@@ -152,6 +160,10 @@ cluster = { package = "cf-gears-cluster", path = "../../gears/system/cluster/clu
 # Optional BSS Plan & Price Modeling gear
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 bss_products = { package = "cf-gears-bss-products", path = "../../gears/bss/products/products", optional = true }
+bss_orders = { package = "cf-gears-bss-orders", path = "../../gears/bss/orders/orders", optional = true }
+event_broker = { package = "cf-gears-event-broker", path = "../../gears/system/event-broker/event-broker", optional = true }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../gears/system/cluster/plugins/standalone-cluster-plugin", optional = true }
+sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", path = "../../gears/system/event-broker/plugins/sqlite-event-broker-plugin", optional = true }
 bss_approvals = { package = "cf-gears-bss-approvals", path = "../../gears/bss/approvals/approvals", optional = true }
 
 # Optional Admission Control gear

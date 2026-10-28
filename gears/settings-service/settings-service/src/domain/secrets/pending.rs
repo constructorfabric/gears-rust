@@ -1,4 +1,3 @@
-// Created: 2026-09-15 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-stage:p1
 //! A secret staged ahead of the step-up redirect.
 //!

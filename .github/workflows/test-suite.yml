@@ -27,6 +27,7 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: full
   CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
 
 jobs:
   nextest:
@@ -95,9 +96,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         with:
           s3-endpoint: ${{ vars.S3_ENDPOINT }}
@@ -120,3 +123,8 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats

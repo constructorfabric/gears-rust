@@ -2,7 +2,7 @@
 name = "cf-gears-oidc-authn-plugin"
 edition.workspace = true
 license.workspace = true
-version = "0.2.13"
+version = "0.3.0"
 description = "OIDC Authentication Resolver Plugin"
 keywords = ["constructorfabric", "cf-gears"]
 metadata.docs.rs.all-features = true
@@ -21,7 +21,7 @@ authn-resolver-sdk = {
     path = "../../authn-resolver-sdk"
 }
 types-registry-sdk = {
-    package = "cf-gears-types-registry-sdk", version = "0.3",
+    package = "cf-gears-types-registry-sdk", version = "0.4",
     path = "../../../types-registry/types-registry-sdk"
 }
 types-registry = { workspace = true }

@@ -51,9 +51,23 @@ def _violation(r) -> dict:
     return violation
 
 
+def test_a_violation_names_the_decimals_path(api, entries):
+    """D-538: the violation's field is the refused decimal's path under ``price``.
+
+    A tier's path (``price.tiers[1].rate``) is pinned by the gear's numeric boundary suite; the
+    recurring entries here take no tiered model.
+    """
+    v = _violation(_draft(api, entries["per_unit"], {"price": {"rate": "1e3"}}))
+    assert (v["field"], v["reason"]) == ("price.rate", "AMOUNT_INVALID"), v
+    assert "plain decimal text" in v["description"], v
+    v = _violation(_draft(api, entries["per_unit"], {"price": {"rate": "-1"}}))
+    assert (v["field"], v["reason"]) == ("price.rate", "AMOUNT_INVALID"), v
+    assert "rate must not be negative" in v["description"], v
+
+
 def test_a_json_number_is_refused_for_the_price_and_the_fee(api, entries):
     v = _violation(_draft(api, entries["flat"], {"price": {"amount": 30.0}}))
-    assert (v["field"], v["reason"]) == ("price", "AMOUNT_INVALID"), v
+    assert (v["field"], v["reason"]) == ("price.amount", "AMOUNT_INVALID"), v
     assert "never JSON numbers" in v["description"], v
     v = _violation(
         _draft(api, entries["per_unit"], {"price": {"rate": "2.50"}, "min_fee": 1.5})
@@ -75,13 +89,13 @@ def test_a_price_keeps_twelve_places_exactly_and_refuses_a_thirteenth(api, entri
     assert r.status_code == 201, r.text
     assert r.json()["items"][0]["price_json"] == {"rate": "0.000000000001"}, r.text
     v = _violation(_draft(api, entries["flat"], {"price": {"amount": "30.1234567890123"}}))
-    assert (v["field"], v["reason"]) == ("price", "AMOUNT_OUT_OF_RANGE"), v
+    assert (v["field"], v["reason"]) == ("price.amount", "AMOUNT_OUT_OF_RANGE"), v
 
 
 def test_decimal_text_is_plain_and_not_negative(api, entries):
     for amount, words in (("3e1", "no exponent"), ("-1", "must not be negative")):
         v = _violation(_draft(api, entries["flat"], {"price": {"amount": amount}}))
-        assert (v["field"], v["reason"]) == ("price", "AMOUNT_INVALID"), v
+        assert (v["field"], v["reason"]) == ("price.amount", "AMOUNT_INVALID"), v
         assert words in v["description"], v
 
 

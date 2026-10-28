@@ -1,7 +1,7 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! `ValueRepository` over `setting_values`.
 
 use async_trait::async_trait;
+use sea_orm::ExprTrait as _;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 use settings_service_sdk::odata::DeclarationFilterField;
@@ -15,7 +15,9 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::odata::ReviewOrderField;
 use crate::domain::precondition;
-use crate::domain::value::{ReviewRequest, StoredValue, ValueDraft, ValueRepository};
+use crate::domain::value::{
+    DistinctValue, ListedValue, ReviewRequest, StoredValue, ValueDraft, ValueRepository,
+};
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::declaration_repo;
@@ -33,6 +35,22 @@ const REVIEW_LIMIT_CFG: LimitCfg = LimitCfg {
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ValueRepo;
+
+/// One group of the distinct-values read.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct DistinctRow {
+    value: Option<serde_json::Value>,
+    data_classification: String,
+    n: i64,
+}
+
+/// One row of the listing projection.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct ListedRow {
+    tenant_id: Uuid,
+    value: Option<serde_json::Value>,
+    data_classification: String,
+}
 
 /// Converts a stored setting value row to the domain type.
 pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
@@ -145,6 +163,105 @@ impl ValueRepository for ValueRepo {
             .await
             .map_err(db_error)?;
         Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn count_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(0);
+        }
+        // `SELECT COUNT(*)` over the predicate of `find_in_tenants`.
+        ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .count(conn)
+            .await
+            .map_err(db_error)
+    }
+
+    async fn distinct_values_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<DistinctValue>, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `SELECT value, data_classification, COUNT(id) ... GROUP BY value,
+        // data_classification` over the predicate of `find_in_tenants`: the
+        // distinct pairs and their multiplicity, nothing else of a row. The
+        // secret rows (`value IS NULL`) group together per classification.
+        let groups = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(setting_value::Column::Value)
+                    .column(setting_value::Column::DataClassification)
+                    .column_as(Expr::col(setting_value::Column::Id).count(), "n")
+                    .group_by(setting_value::Column::Value)
+                    .group_by(setting_value::Column::DataClassification)
+                    .into_model::<DistinctRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(groups
+            .into_iter()
+            .map(|group| DistinctValue {
+                value: group.value,
+                data_classification: group.data_classification,
+                count: u64::try_from(group.n).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn list_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<ListedValue>, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The predicate of `find_in_tenants`, three columns of it.
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(setting_value::Column::TenantId)
+                    .column(setting_value::Column::Value)
+                    .column(setting_value::Column::DataClassification)
+                    .into_model::<ListedRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ListedValue {
+                tenant_id: row.tenant_id,
+                value: row.value,
+                data_classification: row.data_classification,
+            })
+            .collect())
     }
 
     async fn find_all<C: DBRunner>(

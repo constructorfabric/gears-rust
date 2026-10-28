@@ -1,0 +1,120 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.tasks.task_retrying.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task Engine lifecycle event type 'taskRetrying'. Published when a retryable failure re-enqueues a task to 'scheduled' with a backoff run_after. Derived from the Event Broker base event type; routed to the task_events topic and partitioned by subject (the task ID) for per-task ordering.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+    "partition_key": "/subject",
+    "allowed_subject_types": [
+      "gts.cf.core.tasks.task.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~cf.core.tasks.task_retrying.v1~",
+          "$comment": "Pins the event-type identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "description": "The task.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "resource_refs": {
+              "description": "The task's resource references (PRD cpt-cf-task-engine-fr-resource-refs), carried on task-scoped events so consumers can route per resource without a read-back.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "resource_type": {
+                    "description": "GTS type identifier of the referenced resource.",
+                    "type": "string",
+                    "x-gts-type-ref": "gts.*"
+                  },
+                  "resource_id": {
+                    "description": "Identifier of the referenced resource.",
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  "verified": {
+                    "description": "True only if a creator check of the task type confirmed, at creation, that the creator may act on this resource (PRD cpt-cf-task-engine-fr-resource-refs). False means the reference is the creator's unverified claim; consumers MUST NOT treat it as proof of access.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "resource_type",
+                  "resource_id",
+                  "verified"
+                ]
+              }
+            },
+            "queue": {
+              "description": "The task's current queue at the time of the event, so consumers can route by queue without reading the task. The task type is the event's subject_type.",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
+            "attempt": {
+              "description": "Attempt that failed (the next claim increments the counter).",
+              "type": "integer",
+              "minimum": 1
+            },
+            "run_after": {
+              "description": "When the retry becomes eligible.",
+              "type": "string",
+              "format": "date-time"
+            },
+            "error": {
+              "description": "Classification of the retryable error that triggered the retry. The error `message` and `context` are never published (they may echo payload data); read them from the task via the API.",
+              "type": [
+                "object",
+                "null"
+              ],
+              "additionalProperties": false,
+              "default": null,
+              "properties": {
+                "domain": {
+                  "type": "string"
+                },
+                "code": {
+                  "type": "string"
+                },
+                "fault": {
+                  "description": "Error attribution.",
+                  "type": "string",
+                  "enum": [
+                    "task",
+                    "dependency",
+                    "worker"
+                  ]
+                },
+                "retryable": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "required": [
+            "task_id",
+            "run_after"
+          ]
+        }
+      }
+    }
+  ]
+}

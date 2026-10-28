@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 //! The stamps rows are tagged by: aligned to what the store keeps, and always
 //! moving with the row they replace.
 

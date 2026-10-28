@@ -772,3 +772,98 @@ async fn single_resource_missing_owner_tenant_id_denies() {
     .await;
     assert!(!resp.decision);
 }
+
+#[tokio::test]
+async fn unscoped_capability_check_does_not_emit_unsupported_owner_predicates() {
+    let tenant = Uuid::now_v7();
+    let svc = Service::new(Arc::new(MockTenantResolver::with_tenants(tenant, vec![])));
+    let mut request = make_request(tenant);
+    request.action.name = "create".to_owned();
+    request.context.require_constraints = false;
+    request.context.supported_properties.clear();
+    let result = svc.evaluate(&request).await;
+    assert!(result.decision);
+    assert!(result.context.constraints.is_empty());
+
+    request.action.name = "list".to_owned();
+    let list = svc.evaluate(&request).await;
+    assert!(list.decision);
+    assert!(
+        !list.context.constraints.is_empty(),
+        "a list with the same flags keeps its row fence"
+    );
+
+    request.action.name = "create".to_owned();
+    request.context.supported_properties = vec!["owner_tenant_id".to_owned()];
+    let scoped = svc.evaluate(&request).await;
+    assert!(scoped.decision);
+    assert!(
+        !scoped.context.constraints.is_empty(),
+        "tenant scope must remain constrained"
+    );
+}
+
+#[tokio::test]
+async fn a_single_resource_request_keeps_its_constraints_on_an_unconstrained_check() {
+    let tenant = Uuid::now_v7();
+    let svc = Service::new(Arc::new(MockTenantResolver::with_tenants(tenant, vec![])));
+    let mut request = make_request(tenant);
+    request.action.name = "get".to_owned();
+    request.resource.id = Some(Uuid::now_v7());
+    request.resource.properties.insert(
+        "owner_tenant_id".to_owned(),
+        serde_json::Value::String(tenant.to_string()),
+    );
+    request.context.require_constraints = false;
+    request.context.supported_properties.clear();
+
+    let response = svc.evaluate(&request).await;
+    assert!(response.decision);
+    assert!(
+        !response.context.constraints.is_empty(),
+        "a single-resource request keeps its owner predicate"
+    );
+}
+
+#[tokio::test]
+async fn a_group_selector_keeps_its_constraints_on_an_unconstrained_check() {
+    let tenant = Uuid::now_v7();
+    let svc = Service::new(Arc::new(MockTenantResolver::with_tenants(tenant, vec![])));
+    let in_group: fn(&Predicate) -> bool = |p| matches!(p, Predicate::InGroup(_));
+    let in_subtree: fn(&Predicate) -> bool = |p| matches!(p, Predicate::InGroupSubtree(_));
+    for (property, is_expected) in [("group_ids", in_group), ("ancestor_group_ids", in_subtree)] {
+        let mut request = make_request(tenant);
+        request.action.name = "create".to_owned();
+        request.context.require_constraints = false;
+        request.context.supported_properties.clear();
+        request.context.capabilities = vec![
+            authz_resolver_sdk::Capability::GroupMembership,
+            authz_resolver_sdk::Capability::GroupHierarchy,
+        ];
+        request.resource.properties.insert(
+            property.to_owned(),
+            serde_json::json!([Uuid::now_v7().to_string()]),
+        );
+
+        let response = svc.evaluate(&request).await;
+        assert!(response.decision, "{property}: allowed");
+        let predicates = &response
+            .context
+            .constraints
+            .first()
+            .unwrap_or_else(|| panic!("{property}: the group constraint survives"))
+            .predicates;
+        assert!(
+            predicates.iter().any(is_expected),
+            "{property}: its group predicate survives"
+        );
+    }
+}
+
+#[tokio::test]
+async fn unscoped_capability_check_still_denies_missing_tenant() {
+    let svc = Service::new(Arc::new(MockTenantResolver::empty()));
+    let mut request = make_request_no_tenant();
+    request.context.require_constraints = false;
+    assert!(!svc.evaluate(&request).await.decision);
+}

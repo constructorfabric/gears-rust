@@ -18,18 +18,24 @@ use crate::domain::ChargeProxyService;
 
 const API_TAG: &str = "API Contracts \u{2014} Consumer";
 
-/// Register the consumer's single proxy route on the given router.
+/// Register the consumer's routes on the given router.
 ///
 /// `POST /api-contracts-consumer/v1/charge` forwards to the consumed
-/// `PaymentApi`. The domain service is layered by value into the handler closure
-/// (per request it resolves `Arc<dyn PaymentApi>` from the hub).
+/// `PaymentApi` and is **exposed**: the edge publishes it. The domain service is
+/// layered by value into the handler closure (per request it resolves
+/// `Arc<dyn PaymentApi>` from the hub).
+///
+/// `GET /api-contracts-consumer/v1/status` is **internal** (the default): it
+/// round-trips a value through the cluster cache and is reachable only on this
+/// gear's own listener -- a mixed surface on one gear, which is what the edge's
+/// publication is tested against.
 #[allow(clippy::needless_pass_by_value)]
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<ChargeProxyService>,
 ) -> Router {
-    OperationBuilder::post("/api-contracts-consumer/v1/charge")
+    let router = OperationBuilder::post("/api-contracts-consumer/v1/charge")
         .operation_id("api_contracts_consumer.charge")
         .summary("Charge via the consumed PaymentApi")
         .description(
@@ -50,6 +56,25 @@ pub fn register_routes(
             }
         })
         .json_response_with_schema::<ChargeResponse>(openapi, StatusCode::OK, "")
+        .standard_errors(openapi)
+        .register(router, openapi);
+
+    OperationBuilder::get("/api-contracts-consumer/v1/status")
+        .operation_id("api_contracts_consumer.status")
+        .summary("Round-trip a value through the cluster cache")
+        .tag(API_TAG)
+        .authenticated()
+        .no_license_required()
+        .handler(move |Extension(ctx): Extension<SecurityContext>| {
+            let service = Arc::clone(&service);
+            async move {
+                let version = service.cluster_round_trip(ctx.subject_tenant_id()).await?;
+                Ok::<_, toolkit_canonical_errors::CanonicalError>(Json(
+                    serde_json::json!({"cluster": "ok", "version": version}),
+                ))
+            }
+        })
+        .json_response(StatusCode::OK, "cluster round trip")
         .standard_errors(openapi)
         .register(router, openapi)
 }

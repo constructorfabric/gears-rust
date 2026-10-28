@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-table:p1
 //! `audit_records` — the gear-local audit store (DESIGN.md §4.7).
 //!

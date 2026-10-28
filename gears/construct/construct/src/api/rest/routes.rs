@@ -1,5 +1,6 @@
 use crate::api::rest::types::{ConcreteIntake, ConcreteSettings};
 use crate::api::rest::{dto, handlers};
+use crate::domain::planner::manage::ManageFacts;
 use axum::http::StatusCode;
 use axum::{Extension, Router};
 use std::sync::Arc;
@@ -8,6 +9,8 @@ use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 const SUBJECT_SETTINGS_PATH: &str = "/construct/v1/subjects/{subject_id}/settings";
 const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
+const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
+const SUBJECT_FACTS_TAG: &str = "Subject facts";
 
 struct License;
 
@@ -107,4 +110,37 @@ pub fn register_routes(
     // @cpt-end:cpt-cf-construct-flow-subject-settings-change:p1:inst-change-send
 
     router.layer(Extension(intake)).layer(Extension(settings))
+}
+
+/// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.
+///
+/// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
+pub fn register_manage_route(
+    mut router: Router,
+    openapi: &dyn OpenApiRegistry,
+    manage: Arc<ManageFacts>,
+) -> Router {
+    router = OperationBuilder::post(MANAGE_FACTS_PATH)
+        .operation_id("construct.manage_facts")
+        .summary("Store what the subject told an agent")
+        .description(
+            "Decide how what the subject told an agent changes the subject's profile, store it, and answer what \
+             changed, or why nothing was stored. The recent conversation only shows what the message refers to. \
+             A subject the caller may not act for answers 404.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject: the caller's own subject id")
+        .json_request::<dto::ManageFactsRequest>(openapi, "What the subject said")
+        .handler(handlers::manage_facts)
+        .json_response_with_schema::<dto::ManageFactsResponse>(
+            openapi,
+            StatusCode::OK,
+            "What was stored, or why nothing was",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+    router.layer(Extension(manage))
 }

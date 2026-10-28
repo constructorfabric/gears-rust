@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconciler, run through the SDK contract over an in-memory database.
 //!
 //! Every test goes through `SettingsContributionClient` — the door a gear uses
@@ -21,7 +20,7 @@ use uuid::Uuid;
 use crate::audit::AuditOperation;
 use crate::domain::category::{CategoryKey, CategoryRepository};
 use crate::domain::contribution::{ContributionService, reason};
-use crate::domain::declaration::{Declaration, DeclarationRepository};
+use crate::domain::declaration::{Declaration, DeclarationRepository, DeclarationStatus};
 use crate::domain::value::ValueRepository;
 use crate::infra::contribution_client::ContributionClient;
 use crate::infra::storage::category_repo::CategoryRepo;
@@ -338,7 +337,7 @@ async fn a_fresh_set_registers_every_declaration_and_its_categories() {
         .expect("row");
     assert_eq!(stored.source, "module_contributed");
     assert_eq!(stored.owner_module.as_deref(), Some(MODULE));
-    assert_eq!(stored.status, "active");
+    assert_eq!(stored.status, DeclarationStatus::Active);
     assert_eq!(stored.data_classification, "public");
     assert!(!stored.has_secret_trait);
     assert!(
@@ -602,7 +601,7 @@ async fn retire_then_re_register_revives_the_same_row() {
             .await
             .expect("row")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
 
     // Retiring again counts nothing and is not an error.
@@ -618,7 +617,7 @@ async fn retire_then_re_register_revives_the_same_row() {
         .await
         .expect("row");
     assert_eq!(revived.id, original.id, "revived in place, not re-minted");
-    assert_eq!(revived.status, "active");
+    assert_eq!(revived.status, DeclarationStatus::Active);
     assert!(
         h.reactivated_events()
             .contains(&key("network", "proxy_enabled", 1).to_string()),
@@ -650,7 +649,7 @@ async fn retire_refuses_unknown_keys_and_other_modules_keys() {
             .await
             .expect("row")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -722,14 +721,14 @@ async fn re_registering_a_retired_lower_major_beside_an_active_higher_one_is_a_r
             .await
             .expect("v1")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
     assert_eq!(
         h.stored(&key("network", "listen_port", 2))
             .await
             .expect("v2")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -757,7 +756,7 @@ async fn a_retired_lower_major_stays_retired_when_the_higher_one_is_retired_too(
             .await
             .expect("v1")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
     // The highest major is the one that comes back.
     let result = h.register(vec![v2]).await;
@@ -794,8 +793,11 @@ async fn a_higher_major_carries_every_value_across_and_retires_the_predecessor()
         .stored(&key("network", "listen_port", 2))
         .await
         .expect("v2");
-    assert_eq!(successor.status, "active");
-    assert_eq!(h.stored(&v1).await.expect("v1").status, "retired");
+    assert_eq!(successor.status, DeclarationStatus::Active);
+    assert_eq!(
+        h.stored(&v1).await.expect("v1").status,
+        DeclarationStatus::Retired
+    );
 
     // Every value carried across at the same scope; the failing one flagged
     // with its detail rather than coerced or dropped.
@@ -848,13 +850,16 @@ async fn a_higher_major_over_an_all_retired_path_is_an_ordinary_registration() {
     let result = h.register(vec![v2]).await;
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.registered, 1);
-    assert_eq!(h.stored(&v1).await.expect("v1").status, "retired");
+    assert_eq!(
+        h.stored(&v1).await.expect("v1").status,
+        DeclarationStatus::Retired
+    );
     assert_eq!(
         h.stored(&key("network", "listen_port", 2))
             .await
             .expect("v2")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -885,7 +890,10 @@ async fn reactivating_re_validates_the_retained_values_against_the_type() {
         .await;
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.reactivated, 1);
-    assert_eq!(narrowed.stored(&key_v1).await.expect("v1").status, "active");
+    assert_eq!(
+        narrowed.stored(&key_v1).await.expect("v1").status,
+        DeclarationStatus::Active
+    );
 
     let rows = narrowed.values_of(stored.id).await;
     let ok = rows
@@ -1106,7 +1114,7 @@ async fn another_module_cannot_take_over_a_path_by_shipping_a_higher_major() {
     );
     // The predecessor is untouched: still active, still owned, its value in place.
     let still = h.stored(&v1).await.expect("v1");
-    assert_eq!(still.status, "active");
+    assert_eq!(still.status, DeclarationStatus::Active);
     assert_eq!(still.owner_module.as_deref(), Some(MODULE));
     assert_eq!(h.values_of(predecessor.id).await.len(), 1);
     assert!(
@@ -1204,7 +1212,7 @@ async fn an_upgrade_that_fails_at_its_last_step_leaves_the_predecessor_active_an
 
     // The predecessor: active, its two values where they were.
     let kept = h.stored(&v1).await.expect("v1 is still there");
-    assert_eq!(kept.status, "active");
+    assert_eq!(kept.status, DeclarationStatus::Active);
     assert_eq!(kept.id, predecessor.id);
     let values = h.values_of(predecessor.id).await;
     assert_eq!(values.len(), 2);
@@ -1320,7 +1328,7 @@ impl DeclarationRepository for JournalingDeclarations {
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        status: &str,
+        status: DeclarationStatus,
         expected: Option<time::OffsetDateTime>,
     ) -> Result<(), crate::domain::error::DomainError> {
         DeclarationRepo
@@ -1729,7 +1737,7 @@ async fn a_reactivation_carries_the_new_display_name() {
         .stored(&key("network", "proxy_enabled", 1))
         .await
         .expect("row");
-    assert_eq!(revived.status, "active");
+    assert_eq!(revived.status, DeclarationStatus::Active);
     assert_eq!(
         revived.display_name.as_deref(),
         Some("New label"),

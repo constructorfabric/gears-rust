@@ -164,4 +164,4 @@ The migration `initial_001` **MUST** stay unchanged in the migration chain: it c
 - **Reliability**: A bad config, a missing database provider or a missing AuthZ resolver makes `init` fail, so errors show early. A retryable failure of the AuthZ evaluation is a 503, any other a 500, and neither is an open door.
 - **Rollback**: Each migration has a `down` step; none is tested.
 - **Deviations from platform baselines**: None.
-- **History**: The placeholder (one route, `POST /construct/v1/foundation-notes`, the client operations `create_note` and `get_note`, the note model, its text validation and its table) was retired by Record Intake, Story 5.7.2.
+- **History**: The placeholder (one route, `POST /construct/v1/foundation-notes`, the client operations `create_note` and `get_note`, the note model, its text validation and its table) was retired by Record Intake.

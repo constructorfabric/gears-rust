@@ -147,7 +147,10 @@ fn an_add_and_a_remove_keep_their_confidence_in_a_plan_on_the_profile_version() 
         panic!("an add: {:?}", added.change);
     };
     assert!(is_new_key(key), "{}", key.0);
-    assert_eq!(*properties, [Property::new("skills", r#"{"name":"Rust"}"#)]);
+    assert_eq!(
+        *properties,
+        [Property::new("skills", json!({ "name": "Rust" }))]
+    );
     assert_eq!(
         (added.entity_kind.as_str(), added.confidence),
         ("skill", Some(0.8))

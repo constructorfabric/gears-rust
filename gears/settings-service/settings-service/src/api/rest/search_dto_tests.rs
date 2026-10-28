@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! What a hit looks like on the wire: a scope only where a value is set, a
 //! value only where one matched, and the mask a read would apply.
 
@@ -9,7 +8,7 @@ use uuid::Uuid;
 
 use super::render_hit;
 use crate::domain::category::Category;
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::resolution::MASK_TOKEN;
 use crate::domain::search::MatchedField;
 use crate::domain::search::service::Hit;
@@ -30,7 +29,7 @@ fn declaration(classification: &str) -> Arc<Declaration> {
         category_id: Uuid::from_u128(3),
         scope_class: "cascading".to_owned(),
         mode: "advanced".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,

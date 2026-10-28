@@ -19,7 +19,9 @@ use uuid::Uuid;
 
 use super::record_types::RegistryRecordTypes;
 use crate::domain::error::DomainError;
-use crate::domain::record_intake::{Place, RecordTypes, Refusal, RefusalReason};
+use crate::domain::record_intake::{
+    Place, RecordTypes, Refusal, RefusalReason, TypeTraits, check_type_rules_of,
+};
 use crate::test_support::{
     chat_record, example_records, hub_with_record_types, sdk_record_type_schemas,
 };
@@ -33,9 +35,18 @@ fn types() -> RegistryRecordTypes {
     RegistryRecordTypes::new(hub_with_record_types()).expect("record types")
 }
 
-/// The refusal a check gives, failing the test on any other outcome.
+/// What intake's type check gives for a record: the adapter's checks, then
+/// the rules a generated schema cannot carry, which the domain runs.
+async fn checked(types: &RegistryRecordTypes, record: &Value) -> Result<TypeTraits, DomainError> {
+    let traits = types.check(record).await?;
+    check_type_rules_of(&traits, record)?;
+    Ok(traits)
+}
+
+/// The refusal intake's type check gives, failing the test on any other
+/// outcome.
 async fn refused_by(types: &RegistryRecordTypes, record: &Value) -> Refusal {
-    match types.check(record).await {
+    match checked(types, record).await {
         Err(DomainError::Refused(refusal)) => refusal,
         other => panic!("expected a refusal, got {other:?}"),
     }
@@ -102,6 +113,17 @@ async fn an_unexpected_member_is_named() {
 }
 
 #[tokio::test]
+async fn an_unexpected_member_with_a_slash_or_tilde_is_named_as_one_member() {
+    let mut record = chat();
+    record["a/b~c"] = json!("x");
+
+    let refused = refusal(&record).await;
+
+    assert_eq!(refused.place, Place::pointer("/a~1b~0c"));
+    assert_eq!(refused.rule, "additionalProperties");
+}
+
+#[tokio::test]
 async fn a_missing_payload_member_of_the_derived_type_is_named() {
     let mut record = chat();
     record["payload"].as_object_mut().unwrap().remove("text");
@@ -115,14 +137,283 @@ async fn a_missing_payload_member_of_the_derived_type_is_named() {
 }
 
 #[tokio::test]
-async fn a_type_that_requires_a_subject_refuses_a_record_without_one() {
+async fn a_passing_record_gets_whether_its_type_requires_a_subject() {
+    let types = types();
+    for record in example_records() {
+        let type_id = record["type"].as_str().unwrap().to_owned();
+
+        let rules = types.check(&record).await.expect("the example passes");
+
+        assert_eq!(
+            rules.subject_required(),
+            type_id != construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE,
+            "{type_id}"
+        );
+    }
+}
+
+/// A type registered outside the SDK, deriving from `parent` and stating no
+/// traits of its own, or the given ones.
+fn registered_elsewhere(type_id: &str, parent: &str, traits: Option<Value>) -> GtsTypeSchema {
+    let parent = sdk_record_type_schemas()
+        .into_iter()
+        .find(|schema| schema.type_id.as_ref() == parent)
+        .expect("an SDK type");
+    let mut schema =
+        json!({ "allOf": [{ "$ref": format!("gts://{parent}", parent = parent.type_id) }] });
+    if let Some(traits) = traits {
+        schema["x-gts-traits"] = traits;
+    }
+    GtsTypeSchema::try_new(
+        GtsTypeId::new(type_id),
+        schema,
+        None,
+        Some(Arc::new(parent)),
+    )
+    .expect("a derived type")
+}
+
+async fn rules_for(extra: GtsTypeSchema, record: &Value) -> bool {
+    types_with_one_more(extra)
+        .check(record)
+        .await
+        .expect("the record passes")
+        .subject_required()
+}
+
+#[tokio::test]
+async fn a_type_derived_from_a_person_type_requires_a_subject() {
+    let derived = "gts.cf.connectors.core.record.v1~cf.construct.chat.message.v1~acme.chat.export.message.v1~";
     let mut record = chat();
-    record.as_object_mut().unwrap().remove("subject_id");
+    record["type"] = json!(derived);
 
-    let refused = refusal(&record).await;
+    assert!(rules_for(registered_elsewhere(derived, CHAT, None), &record).await);
+}
 
-    assert_eq!(refused.place, Place::pointer("/subject_id"));
-    assert_eq!(refused.rule, "required");
+#[tokio::test]
+async fn a_type_derived_from_the_course_catalog_inherits_that_no_subject_is_needed() {
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.course.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+
+    assert!(!rules_for(registered_elsewhere(&derived, catalog, None), &record).await);
+}
+
+#[tokio::test]
+async fn a_new_record_type_that_states_no_traits_requires_a_subject() {
+    let new_type = "gts.cf.connectors.core.record.v1~acme.crm.contact.note.v1~";
+    let mut record = chat();
+    record["type"] = json!(new_type);
+
+    let base = construct_sdk::gts::RECORD_BASE_TYPE;
+    assert!(rules_for(registered_elsewhere(new_type, base, None), &record).await);
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_malformed_subject_trait_requires_a_subject_and_is_logged() {
+    // Derived from the catalog, whose `false` must not stand in for the
+    // malformed value.
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.course.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": "no" });
+
+    assert!(
+        rules_for(
+            registered_elsewhere(&derived, catalog, Some(traits)),
+            &record
+        )
+        .await
+    );
+    assert!(logs_contain(
+        "record type declares a trait that is not a boolean"
+    ));
+    assert!(logs_contain(&derived), "the log names the type");
+}
+
+#[tokio::test]
+async fn a_type_derived_from_a_person_type_cannot_turn_the_subject_off() {
+    let derived = format!("{CHAT}acme.chat.export.message.v1~");
+    let mut record = chat();
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": false });
+
+    assert!(rules_for(registered_elsewhere(&derived, CHAT, Some(traits)), &record).await);
+}
+
+#[tokio::test]
+async fn a_type_derived_from_the_course_catalog_can_require_a_subject() {
+    let catalog = construct_sdk::gts::MASTERY_COURSE_CATALOG_TYPE;
+    let derived = format!("{catalog}acme.lms.catalog.enrolment.v1~");
+    let mut record = example(catalog);
+    record["type"] = json!(derived);
+    let traits = json!({ "subject_required": true });
+
+    assert!(
+        rules_for(
+            registered_elsewhere(&derived, catalog, Some(traits)),
+            &record
+        )
+        .await
+    );
+}
+
+/// One valid example record of `type_id`.
+fn example(type_id: &str) -> Value {
+    example_records()
+        .into_iter()
+        .find(|record| record["type"] == type_id)
+        .expect("an example of every derived type")
+}
+
+/// A record type, the member to set (or, with `None`, to remove), and the
+/// rule its place then breaks.
+type BrokenConstraint = (&'static str, &'static str, Option<Value>, &'static str);
+
+/// A chained type id that matches the envelope's pattern but is longer than
+/// its cap of 1024 characters.
+fn long_type_id() -> Value {
+    let segments = "acme.x.y.z.v1~".repeat(80);
+    json!(format!("{CHAT}{segments}"))
+}
+
+#[tokio::test]
+async fn every_generated_constraint_refuses_a_record_that_breaks_it() {
+    use construct_sdk::gts::{
+        ENRICHMENT_FACT_CANDIDATE_TYPE as FACT, MASTERY_COURSE_CATALOG_TYPE as CATALOG,
+        MASTERY_STUDENT_MASTERY_TYPE as MASTERY,
+    };
+    let long = |n: usize| Some(json!("x".repeat(n)));
+    let empty = || Some(json!(""));
+    let extra = || Some(json!(1));
+    let cases: Vec<BrokenConstraint> = vec![
+        // The envelope.
+        (CHAT, "/provenance", long(1025), "maxLength"),
+        (CHAT, "/provenance", empty(), "minLength"),
+        (CHAT, "/version", long(257), "maxLength"),
+        (CHAT, "/type", Some(long_type_id()), "maxLength"),
+        (CHAT, "/subject_id", Some(json!("not a uuid")), "pattern"),
+        // Chat message.
+        (CHAT, "/payload/message_id", empty(), "minLength"),
+        // Fact candidate.
+        (FACT, "/payload/field", Some(json!("hobby")), "enum"),
+        (FACT, "/payload/field", None, "required"),
+        (FACT, "/payload/value", empty(), "minLength"),
+        (FACT, "/payload/value", Some(json!("   ")), "pattern"),
+        (FACT, "/payload/value", Some(json!([])), "minItems"),
+        (FACT, "/payload/value", Some(json!(7)), "type"),
+        (FACT, "/payload/value", None, "required"),
+        (FACT, "/payload/confidence", Some(json!(1.5)), "maximum"),
+        (FACT, "/payload/confidence", Some(json!(-0.1)), "minimum"),
+        (
+            FACT,
+            "/payload/identity_confidence",
+            Some(json!(1.5)),
+            "maximum",
+        ),
+        (
+            FACT,
+            "/payload/identity_confidence",
+            Some(json!(-0.1)),
+            "minimum",
+        ),
+        (FACT, "/payload/identity_confidence", None, "required"),
+        (FACT, "/payload/trust_tier", Some(json!("verified")), "enum"),
+        (FACT, "/payload/evidence", Some(json!("   ")), "pattern"),
+        (FACT, "/payload/rationale", Some(json!("")), "minLength"),
+        (FACT, "/payload/rationale", Some(json!("   ")), "pattern"),
+        (
+            FACT,
+            "/payload/source_url",
+            Some(json!("ftp://x")),
+            "pattern",
+        ),
+        (FACT, "/payload/extra", extra(), "additionalProperties"),
+        // Course catalog.
+        (CATALOG, "/payload/course_id", empty(), "minLength"),
+        (CATALOG, "/payload/course_id", None, "required"),
+        (CATALOG, "/payload/concepts", Some(json!([])), "minItems"),
+        (CATALOG, "/payload/extra", extra(), "additionalProperties"),
+        // Student mastery.
+        (MASTERY, "/payload/model_name", empty(), "minLength"),
+        (MASTERY, "/payload/model_name", None, "required"),
+        (MASTERY, "/payload/model_version", Some(json!(0)), "minimum"),
+        (MASTERY, "/payload/concepts", Some(json!([])), "minItems"),
+        (
+            MASTERY,
+            "/payload/concepts/0/score",
+            Some(json!(1.2)),
+            "maximum",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/score",
+            Some(json!(-0.1)),
+            "minimum",
+        ),
+        (MASTERY, "/payload/extra", extra(), "additionalProperties"),
+        // Items of the payloads' lists.
+        (CATALOG, "/payload/sections/0/title", None, "required"),
+        (CATALOG, "/payload/sections/0/title", empty(), "minLength"),
+        (
+            CATALOG,
+            "/payload/sections/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+        (CATALOG, "/payload/concepts/0/name", None, "required"),
+        (CATALOG, "/payload/concepts/0/name", empty(), "minLength"),
+        (
+            CATALOG,
+            "/payload/concepts/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/signal_count",
+            None,
+            "required",
+        ),
+        (
+            MASTERY,
+            "/payload/concepts/0/extra",
+            extra(),
+            "additionalProperties",
+        ),
+    ];
+    let types = types();
+    for (type_id, pointer, value, rule) in cases {
+        let mut record = example(type_id);
+        let (parent, member) = pointer.rsplit_once('/').expect("a pointer");
+        let target = if parent.is_empty() {
+            record.as_object_mut()
+        } else {
+            record.pointer_mut(parent).and_then(Value::as_object_mut)
+        }
+        .expect("the member's parent is an object");
+        match value {
+            Some(value) => target.insert(member.to_owned(), value),
+            None => target.remove(member),
+        };
+
+        let refused = refused_by(&types, &record).await;
+
+        assert_eq!(
+            refused.reason,
+            RefusalReason::SchemaViolation,
+            "{type_id} {pointer}"
+        );
+        assert_eq!(
+            refused.place,
+            Place::pointer(pointer),
+            "{type_id} {pointer}"
+        );
+        assert_eq!(refused.rule, rule, "{type_id} {pointer}");
+    }
 }
 
 #[tokio::test]
@@ -410,5 +701,302 @@ proptest! {
             .expect("runtime");
         let result = runtime.block_on(types().check(&record));
         prop_assert!(!matches!(result, Err(DomainError::Database(_))));
+    }
+}
+
+/// Every example record, with all its optional payload members present, reads
+/// into its typed envelope and writes back to the same JSON, and passes its
+/// schema, so the Rust types and the generated schemas describe one wire
+/// format. Optional members must be present: `gts-macros` 0.12 reads every
+/// payload member as required and writes an absent one as `null` (see
+/// `construct_sdk::gts`).
+#[tokio::test]
+async fn every_example_reads_into_its_typed_envelope_and_back() {
+    use construct_sdk::gts::{
+        ChatMessageV1, CourseCatalogV1, ENRICHMENT_FACT_CANDIDATE_TYPE, FactCandidateV1,
+        MASTERY_COURSE_CATALOG_TYPE, MASTERY_STUDENT_MASTERY_TYPE, RecordV1, StudentMasteryV1,
+    };
+
+    fn round_trip<P>(record: &Value) -> Value
+    where
+        P: toolkit_gts::GtsSchema,
+        RecordV1<P>: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let typed: RecordV1<P> = serde_json::from_value(record.clone())
+            .unwrap_or_else(|err| panic!("{}: {err}", record["type"]));
+        serde_json::to_value(&typed).expect("writes")
+    }
+
+    let types = types();
+    let examples = example_records();
+    assert_eq!(examples.len(), 4, "one example per derived type");
+    for mut record in examples {
+        let type_id = record["type"].as_str().expect("a type").to_owned();
+        let payload = &mut record["payload"];
+        match type_id.as_str() {
+            ENRICHMENT_FACT_CANDIDATE_TYPE => {
+                payload["rationale"] = json!("Matched by name and institution.");
+            }
+            MASTERY_COURSE_CATALOG_TYPE => {
+                for concept in payload["concepts"].as_array_mut().expect("concepts") {
+                    concept["description"] = json!("A concept of the course.");
+                }
+            }
+            _ => {}
+        }
+        types
+            .check(&record)
+            .await
+            .unwrap_or_else(|err| panic!("{type_id}: {err:?}"));
+
+        let written = match type_id.as_str() {
+            CHAT => round_trip::<ChatMessageV1>(&record),
+            ENRICHMENT_FACT_CANDIDATE_TYPE => round_trip::<FactCandidateV1>(&record),
+            MASTERY_COURSE_CATALOG_TYPE => round_trip::<CourseCatalogV1>(&record),
+            MASTERY_STUDENT_MASTERY_TYPE => round_trip::<StudentMasteryV1>(&record),
+            other => panic!("no typed envelope for {other}"),
+        };
+        assert_eq!(written, record, "{type_id}");
+    }
+}
+
+/// The fact candidate's `skills` example: a list value and an upper-case
+/// `subject_id`, with the digests its identity derivation gives.
+fn skills_candidate() -> Value {
+    json!({
+        "type": construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE,
+        "provenance": "sha256:78c5bf9ec52dfaabfd4a6fe45d1624a28ae09f80d0b6aee0c16df2a8d8871cf6",
+        "version": "sha256:1ffe2ff0a3c0a6aa53627d942d4cf7d7ac25a713633d75b0bcafa5e26ff95dfa",
+        "observed_at": "2026-09-10T07:30:00Z",
+        "subject_id": "5D1F2C3A-8B4E-4C6D-9A1B-2C3D4E5F6A7B",
+        "payload": {
+            "field": "skills",
+            "value": [
+                "Bioinformatics",
+                "Machine Learning",
+                "Statistische Genetik",
+                "Gr\u{f6}\u{df}enausschlusschromatographie"
+            ],
+            "source_url": "https://example.org/people/jane-doe",
+            "confidence": 0.74,
+            "trust_tier": "found",
+            "identity_confidence": 0.91
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_fact_candidate_with_a_list_value_for_a_list_field_passes() {
+    checked(&types(), &skills_candidate())
+        .await
+        .expect("a skills list passes");
+}
+
+/// The rules of the fact candidate that its generated schema cannot carry.
+#[tokio::test]
+async fn the_fact_candidates_rules_beyond_its_schema_refuse_a_record_that_breaks_them() {
+    let fact = construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE;
+    let board = || example(fact);
+    let mut cases: Vec<(&str, Value, &str, &str)> = Vec::new();
+
+    let mut record = skills_candidate();
+    record["payload"]["value"] = json!("Bioinformatics");
+    cases.push(("skills as one string", record, "/payload/value", "type"));
+
+    let mut record = board();
+    record["payload"]["value"] = json!(["Jane Doe serves on the board."]);
+    cases.push(("board as a list", record, "/payload/value", "type"));
+
+    let mut record = board();
+    record["provenance"] = json!("board/whatever");
+    cases.push(("provenance not a digest", record, "/provenance", "pattern"));
+
+    let mut record = board();
+    record["version"] =
+        json!("sha256:F0606B676BE2895716327CE8C55FAA64BFBCD9E6231D2A25F081E6E8BB716E79");
+    cases.push(("version in upper case", record, "/version", "pattern"));
+
+    let mut record = board();
+    record["payload"]["value"] = json!("\u{1c}\u{1d}");
+    cases.push((
+        "value of separators only",
+        record,
+        "/payload/value",
+        "pattern",
+    ));
+
+    let mut record = skills_candidate();
+    record["payload"]["value"][1] = json!("\u{1f}");
+    cases.push((
+        "an item of separators only",
+        record,
+        "/payload/value/1",
+        "pattern",
+    ));
+
+    let mut record = board();
+    record["payload"]["value"] = json!("\u{1c} ");
+    cases.push((
+        "a separator and a space",
+        record,
+        "/payload/value",
+        "pattern",
+    ));
+
+    let mut record = skills_candidate();
+    record["payload"]["value"][2] = json!("\u{1f}\u{2003}\u{1c}");
+    cases.push((
+        "a separator and an em space",
+        record,
+        "/payload/value/2",
+        "pattern",
+    ));
+
+    let types = types();
+    for (label, record, place, rule) in cases {
+        let refused = refused_by(&types, &record).await;
+
+        assert_eq!(refused.reason, RefusalReason::SchemaViolation, "{label}");
+        assert_eq!(refused.place, Place::pointer(place), "{label}");
+        assert_eq!(refused.rule, rule, "{label}");
+        assert_eq!(refused.type_id.as_deref(), Some(fact), "{label}");
+    }
+}
+
+#[tokio::test]
+async fn a_type_derived_from_the_fact_candidate_keeps_its_rules() {
+    let fact = construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE;
+    let derived = format!("{fact}acme.enrich.candidate.fact.v1~");
+    let mut record = skills_candidate();
+    record["type"] = json!(derived);
+    record["payload"]["value"] = json!("Bioinformatics");
+
+    let refused = refused_by(
+        &types_with_one_more(registered_elsewhere(&derived, fact, None)),
+        &record,
+    )
+    .await;
+
+    assert_eq!(refused.place, Place::pointer("/payload/value"));
+    assert_eq!(refused.rule, "type");
+}
+
+#[tokio::test]
+async fn a_list_item_that_is_not_stripped_is_refused_at_the_item() {
+    let mut record = skills_candidate();
+    record["payload"]["value"][0] = json!(" Bioinformatics");
+
+    let refused = refusal(&record).await;
+
+    assert_eq!(refused.place, Place::pointer("/payload/value/0"));
+    assert_eq!(refused.rule, "pattern");
+}
+
+#[tokio::test]
+async fn a_research_areas_candidate_takes_a_list_and_refuses_one_string() {
+    let types = types();
+    let mut record = skills_candidate();
+    record["payload"]["field"] = json!("research_areas");
+    types
+        .check(&record)
+        .await
+        .expect("a list of research areas passes");
+
+    record["payload"]["value"] = json!("Bioinformatics");
+    let refused = refused_by(&types, &record).await;
+
+    assert_eq!(refused.place, Place::pointer("/payload/value"));
+    assert_eq!(refused.rule, "type");
+}
+
+/// The type's schema runs before the rules it cannot carry: a record that
+/// breaks both is refused for the schema rule.
+#[tokio::test]
+async fn the_schema_is_checked_before_the_type_rules() {
+    let mut record = example(construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE);
+    record["payload"]["value"] = json!("");
+    record["provenance"] = json!("not a digest");
+
+    let refused = refusal(&record).await;
+
+    assert_eq!(refused.place, Place::pointer("/payload/value"));
+    assert_eq!(refused.rule, "minLength");
+}
+
+#[test]
+fn the_list_form_of_a_fact_candidate_reads_into_its_typed_envelope_and_back() {
+    use construct_sdk::gts::{FactCandidateV1, FactValue, RecordV1};
+
+    let mut record = skills_candidate();
+    record["payload"]["evidence"] = json!("Listed on the faculty page.");
+    record["payload"]["rationale"] = json!("Matched by name and institution.");
+    // The envelope writes the canonical form of the subject id.
+    record["subject_id"] = json!("5d1f2c3a-8b4e-4c6d-9a1b-2c3d4e5f6a7b");
+
+    let typed: RecordV1<FactCandidateV1> =
+        serde_json::from_value(record.clone()).expect("a skills list reads");
+
+    assert!(matches!(typed.payload.value, FactValue::List(ref items) if items.len() == 4));
+    assert_eq!(serde_json::to_value(&typed).expect("writes"), record);
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The digest form check agrees with the pattern
+    /// `^sha256:[0-9a-f]{64}$`, on arbitrary text and near misses.
+    #[test]
+    fn the_digest_check_matches_its_pattern(
+        provenance in prop_oneof![
+            "[a-zA-Z0-9:]{0,80}",
+            "sha256:[0-9a-fA-F]{63,65}",
+            "sha256:[0-9a-g]{64}",
+            "(SHA256|sha256|sha512):[0-9a-f]{64}",
+        ]
+    ) {
+        let pattern = jsonschema::validator_for(&json!({
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+        }))
+        .expect("the pattern compiles");
+        let mut record = example(construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE);
+        record["provenance"] = json!(provenance);
+
+        let checked = construct_sdk::gts::check_type_rules(
+            construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE,
+            &record,
+        );
+
+        prop_assert_eq!(checked.is_ok(), pattern.is_valid(&json!(provenance)));
+    }
+
+    /// The type rules never panic, whatever `field` and `value` a candidate
+    /// with valid digests carries, so every case reaches the value checks.
+    #[test]
+    fn the_type_rules_answer_any_field_and_value_without_a_panic(
+        field in any_json(),
+        value in any_json(),
+    ) {
+        let mut record = skills_candidate();
+        record["payload"]["field"] = field;
+        record["payload"]["value"] = value;
+        let _outcome = construct_sdk::gts::check_type_rules(
+            construct_sdk::gts::ENRICHMENT_FACT_CANDIDATE_TYPE,
+            &record,
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_empty_or_non_string_list_item_is_refused_at_the_item() {
+    let types = types();
+    for (item, rule) in [(json!(""), "minLength"), (json!(7), "type")] {
+        let mut record = skills_candidate();
+        record["payload"]["value"][0] = item.clone();
+
+        let refused = refused_by(&types, &record).await;
+
+        assert_eq!(refused.place, Place::pointer("/payload/value/0"), "{item}");
+        assert_eq!(refused.rule, rule, "{item}");
     }
 }

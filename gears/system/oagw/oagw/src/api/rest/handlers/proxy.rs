@@ -230,7 +230,7 @@ async fn proxy(
 
         // Spawn the bidirectional bridge task. It awaits the upgrade
         // (which completes after hyper sends the 101 to the client),
-        // then copies raw bytes between the client and the DuplexStream.
+        // then copies raw bytes between the client and the upstream tunnel.
         let span = tracing::Span::current();
         tokio::spawn(
             async move {
@@ -276,8 +276,8 @@ async fn proxy(
             instance: String::new(),
         })?;
 
-    // This is the Data Plane's own response (relayed from the real upstream,
-    // or synthesized by pingora itself) - never constructed via
+    // This is the Data Plane's own response (relayed from the real
+    // upstream) - never constructed via
     // `CanonicalError`, regardless of `error_source`. `canonical_error_middleware`
     // (layered on this gear's routes) must not rewrite or even read it: doing
     // so would destroy the real error identity (including the

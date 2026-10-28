@@ -1101,6 +1101,10 @@ impl HostRuntime {
                 return Some(endpoint);
             }
 
+            if hub.serves_no_endpoint() {
+                tracing::debug!("gRPC hub binds no endpoint");
+                return None;
+            }
             if start.elapsed() > MAX_WAIT {
                 tracing::warn!("Timed out waiting for gRPC hub to bind");
                 return None;
@@ -1178,12 +1182,11 @@ impl HostRuntime {
 
         let instance_id = self.instance_id.to_string();
         for gear in rest_gears {
-            // The directory keys instances by (gear, instance_id) and replaces
-            // wholesale. grpc-hub may have already registered this same
-            // (gear, instance_id) with gRPC services during the start phase, so
-            // carry the grpc services and version forward instead of clobbering
-            // them to empty — adding the REST endpoint must augment, not
-            // replace, the entry.
+            // The directory keys instances by (gear, instance_id). grpc-hub
+            // registers this same (gear, instance_id) with its gRPC services, in
+            // the start phase or later on a retry; the store keeps them when this
+            // registration carries none (`GearInstance::with_metadata_of`).
+            // Carrying them forward also carries the version.
             //
             // Labels are deliberately NOT read-and-rewritten here. Carrying them
             // through would make this a cross-process read-modify-write with no

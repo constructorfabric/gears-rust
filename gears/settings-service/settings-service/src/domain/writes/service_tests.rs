@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The write path over the resolution harness: gates, commit, fallthrough.
 
 use std::sync::Arc;
@@ -19,6 +18,7 @@ use super::{
 use super::{ImpactPage, ImpactReport};
 use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
+use crate::domain::declaration::DeclarationStatus;
 use crate::domain::error::DomainError;
 use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
 use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
@@ -523,7 +523,13 @@ async fn a_write_gated_before_a_retire_is_refused_at_commit_and_lands_nowhere() 
         use crate::domain::declaration::DeclarationRepository;
         let conn = h.base.db.conn().expect("connection");
         DeclarationRepo
-            .set_status(&conn, &AccessScope::allow_all(), id, "retired", None)
+            .set_status(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                DeclarationStatus::Retired,
+                None,
+            )
             .await
             .expect("retired");
     }

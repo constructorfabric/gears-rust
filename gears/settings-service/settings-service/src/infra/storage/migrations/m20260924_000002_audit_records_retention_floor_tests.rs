@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 //! The retention floor the trigger enforces.
 
 /// The migration's own source, read at compile time.
