@@ -1275,6 +1275,7 @@ impl From<IssueReaction> for IssueReactionDto {
 /// GitHub-shaped deployment.
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
+#[schema(as = GithubMirrorDeploymentDto)]
 pub struct DeploymentDto {
     pub id: i64,
     #[serde(rename = "ref")]
