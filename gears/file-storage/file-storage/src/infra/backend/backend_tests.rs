@@ -63,19 +63,40 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     assert!(!backend.exists("contract/delete").await.unwrap());
 
     assert!(!backend.exists("contract/never-existed").await.unwrap());
+    assert_missing_object_errors(backend, "contract/never-existed").await;
+}
+
+/// Reading an object that was never written is an error on every read path.
+async fn assert_missing_object_errors(backend: &dyn StorageBackend, path: &str) {
+    assert!(backend.get(path).await.is_err());
+    assert!(backend.get_stream(path).await.is_err());
+}
+
+/// A stream crossing `max_size` mid-way is rejected by `put_stream` and nothing is stored.
+pub async fn assert_put_stream_rejects_oversized_stream(
+    backend: &dyn StorageBackend,
+    path: &str,
+    max_size: u64,
+) {
+    // Three 10-byte chunks: the limit is crossed on the second chunk for any `max_size` < 20.
+    let chunks: Vec<std::io::Result<Bytes>> = (0..3)
+        .map(|_| Ok(Bytes::from_static(b"0123456789")))
+        .collect();
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = backend.put_stream(path, stream, Some(max_size)).await;
+    assert!(
+        result.is_err(),
+        "put_stream must reject a stream exceeding max_size"
+    );
+    assert!(!backend.exists(path).await.unwrap());
+    assert!(backend.get(path).await.is_err());
 }
 
 #[tokio::test]
 async fn in_memory_satisfies_backend_contract() {
     let b = InMemoryBackend::new("mem");
     assert_backend_contract(&b).await;
-}
-
-#[tokio::test]
-async fn in_memory_get_missing_errors() {
-    let b = InMemoryBackend::new("mem");
-    assert!(b.get("nope").await.is_err());
-    assert!(!b.exists("nope").await.unwrap());
 }
 
 #[tokio::test]
@@ -269,31 +290,13 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// A stream crossing `max_size` mid-way is rejected and leaves no file at the target.
+/// A stream crossing `max_size` mid-way is rejected and leaves no file or tmp file behind.
 #[tokio::test]
 async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    // Three 10-byte chunks against max_size 15: the limit is crossed on the second chunk.
-    let chunks: Vec<std::io::Result<Bytes>> = vec![
-        Ok(Bytes::from_static(b"0123456789")),
-        Ok(Bytes::from_static(b"0123456789")),
-        Ok(Bytes::from_static(b"0123456789")),
-    ];
-    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
-
-    let result = b.put_stream("fid/vid", stream, Some(15)).await;
-    assert!(
-        result.is_err(),
-        "put_stream must reject a stream exceeding max_size"
-    );
-
-    let target = root.join("fid").join("vid");
-    assert!(
-        !target.exists(),
-        "no destination file should be left behind after a rejected stream"
-    );
+    assert_put_stream_rejects_oversized_stream(&b, "fid/vid", 15).await;
 
     let parent = root.join("fid");
     if let Ok(mut entries) = tokio::fs::read_dir(&parent).await {
@@ -367,12 +370,213 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
+/// A second `publish_exclusive` to one path reports `created: false` and keeps the first bytes.
+async fn assert_publish_exclusive_rejects_second_write(backend: &dyn StorageBackend) {
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = backend
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+    assert_eq!(
+        backend.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first")
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = backend
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+    // The rejected attempt's measured bytes/digest are still reported (for idempotency checks).
+    assert_eq!(
+        outcome2.bytes_written,
+        "second-different-bytes".len() as u64
+    );
+
+    assert_eq!(
+        backend.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+}
+
 #[tokio::test]
-async fn local_fs_get_stream_missing_errors() {
+async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
     let root = unique_root();
-    let b = LocalFsBackend::new("fs", &root);
-    assert!(b.get_stream("nope/nope").await.is_err());
+    assert_publish_exclusive_rejects_second_write(&LocalFsBackend::new("fs", &root)).await;
     drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// `InMemoryBackend` counterpart; its check-then-insert is atomic under one lock guard.
+#[tokio::test]
+async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
+    assert_publish_exclusive_rejects_second_write(&InMemoryBackend::new("mem")).await;
+}
+
+/// Two barrier-released `publish_exclusive` racers on one path: exactly one `created: true`,
+/// and the stored object is one payload in full, never a torn mix. Repeated to hit the overlap.
+async fn assert_publish_exclusive_concurrent_racers_never_mix(
+    make_backend: impl Fn() -> Arc<dyn StorageBackend>,
+) {
+    const SIZE: usize = 64 * 1024;
+    const ITERATIONS: u32 = 20;
+
+    for iteration in 0..ITERATIONS {
+        let backend = make_backend();
+        let path = format!("fid/vid-{iteration}");
+
+        let payload_a = Bytes::from(vec![0xAAu8; SIZE]);
+        let payload_b = Bytes::from(vec![0xBBu8; SIZE]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let task = |payload: Bytes,
+                    backend: Arc<dyn StorageBackend>,
+                    path: String,
+                    barrier: Arc<tokio::sync::Barrier>| async move {
+            let len = payload.len() as u64;
+            let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                Box::pin(stream::once(async move { Ok(payload) }));
+            // Rendezvous so both calls start as close to simultaneously as possible.
+            barrier.wait().await;
+            backend.publish_exclusive(&path, stream, Some(len)).await
+        };
+
+        let handle_a = tokio::spawn(task(
+            payload_a.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+        let handle_b = tokio::spawn(task(
+            payload_b.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+
+        let outcome_a = handle_a
+            .await
+            .expect("racer A task must not panic")
+            .expect("racer A's publish_exclusive must not error");
+        let outcome_b = handle_b
+            .await
+            .expect("racer B task must not panic")
+            .expect("racer B's publish_exclusive must not error");
+
+        assert_ne!(
+            outcome_a.created, outcome_b.created,
+            "iteration {iteration}: exactly one racer must report created:true and the \
+             other created:false, got ({}, {})",
+            outcome_a.created, outcome_b.created
+        );
+
+        let got = backend.get(&path).await.unwrap();
+        assert!(
+            got == payload_a || got == payload_b,
+            "iteration {iteration}: the stored object must equal exactly one racer's full \
+             payload, never a mix of both"
+        );
+        if outcome_a.created {
+            assert_eq!(
+                got, payload_a,
+                "iteration {iteration}: racer A reported created:true but the stored \
+                 object does not match its payload"
+            );
+        } else {
+            assert_eq!(
+                got, payload_b,
+                "iteration {iteration}: racer B reported created:true but the stored \
+                 object does not match its payload"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_fs_publish_exclusive_concurrent_racers_never_mix() {
+    let root = unique_root();
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(LocalFsBackend::new("fs", &root)) as Arc<dyn StorageBackend>
+    })
+    .await;
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+#[tokio::test]
+async fn in_memory_publish_exclusive_concurrent_racers_never_mix() {
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(InMemoryBackend::new("mem")) as Arc<dyn StorageBackend>
+    })
+    .await;
+}
+
+/// A chunk-level I/O error surfaces as `DomainError::Backend` and nothing is published.
+#[tokio::test]
+async fn in_memory_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"good-chunk-1")),
+        Err(std::io::Error::other("simulated stream failure")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, None).await;
+    match result {
+        Ok(_) => panic!("a stream that errors partway through must not be published successfully"),
+        Err(DomainError::Backend { backend_id, .. }) => {
+            assert_eq!(
+                backend_id, "mem",
+                "the backend error must be attributed to the failing backend's id"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Backend, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a publish_exclusive call whose stream errors must not leave a partial object behind"
+    );
+}
+
+/// `max_size` is enforced as chunks arrive: `DomainError::Validation` and nothing published.
+#[tokio::test]
+async fn in_memory_publish_exclusive_enforces_max_size_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"0123456789")),
+        Ok(Bytes::from_static(b"0123456789")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let result = b.publish_exclusive("fid/vid", stream, Some(15)).await;
+    match result {
+        Ok(_) => panic!("a stream exceeding max_size must be rejected, not published"),
+        Err(DomainError::Validation { field, .. }) => {
+            assert_eq!(
+                field, "size",
+                "the rejection must be attributed to the size field"
+            );
+        }
+        Err(e) => panic!("expected a DomainError::Validation, got {e:?}"),
+    }
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a rejected publish_exclusive must not leave a partial object behind"
+    );
 }
 
 #[tokio::test]

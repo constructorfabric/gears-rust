@@ -96,25 +96,18 @@ fn resolve_disjoint_mime_types_gives_empty_intersection() {
 }
 
 #[test]
-fn resolve_takes_smallest_global_size_limit() {
-    let tenant = body_with_size(100 * 1024 * 1024); // 100 MB
-    let user = body_with_size(10 * 1024 * 1024); // 10 MB
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    assert_eq!(ep.max_bytes, Some(10 * 1024 * 1024));
-}
-
-#[test]
-fn resolve_size_limit_none_plus_some_returns_some() {
-    let tenant = PolicyBody::default(); // unlimited
-    let user = body_with_size(50 * 1024 * 1024);
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    assert_eq!(ep.max_bytes, Some(50 * 1024 * 1024));
-}
-
-#[test]
-fn resolve_both_size_limits_none_returns_none() {
-    let ep = PolicyResolver::resolve(Some(&body_unrestricted()), Some(&body_unrestricted()));
-    assert!(ep.max_bytes.is_none());
+fn resolve_global_size_limit_takes_the_smallest_present_value() {
+    const MB: u64 = 1024 * 1024;
+    // (tenant, user) -> effective limit; an absent limit is unlimited and never wins.
+    for (tenant, user, expected) in [
+        (Some(100 * MB), Some(10 * MB), Some(10 * MB)),
+        (None, Some(50 * MB), Some(50 * MB)),
+        (None, None, None),
+    ] {
+        let body = |max: Option<u64>| max.map_or_else(PolicyBody::default, body_with_size);
+        let ep = PolicyResolver::resolve(Some(&body(tenant)), Some(&body(user)));
+        assert_eq!(ep.max_bytes, expected, "tenant={tenant:?} user={user:?}");
+    }
 }
 
 #[test]
@@ -283,61 +276,32 @@ fn retention_rule_body_serde_round_trip() {
 }
 
 #[test]
-fn empty_policy_body_serializes_to_valid_json() {
-    let body = PolicyBody::default();
-    let json = serde_json::to_string(&body).expect("serialize");
-    let parsed: serde_json::Value = serde_json::from_str(&json).expect("must be valid JSON");
-    assert!(parsed.is_object());
+fn mime_allowed_matches_exact_and_subtype_wildcards_only() {
+    // (mime, allowed pattern, expected). A stored pattern without `/` (e.g. "image") must not
+    // act as a wildcard for `image/...`.
+    for (mime, pattern, expected) in [
+        ("image/jpeg", "image/jpeg", true),
+        ("image/jpeg", "image/*", true),
+        ("video/mp4", "image/*", false),
+        ("image/jpeg", "image", false),
+        ("text/plain", "text", false),
+    ] {
+        assert_eq!(
+            PolicyResolver::mime_allowed(mime, &[pattern.to_owned()]),
+            expected,
+            "{mime} against {pattern}"
+        );
+    }
 }
 
 #[test]
-fn mime_allowed_exact_match() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/jpeg".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_subtype() {
-    assert!(PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image/*".to_owned()]
-    ));
-}
-
-#[test]
-fn mime_allowed_wildcard_does_not_match_different_type() {
-    assert!(!PolicyResolver::mime_allowed(
-        "video/mp4",
-        &["image/*".to_owned()]
-    ));
-}
-
-/// A stored pattern without `/` (e.g. `"image"`) must not act as a wildcard for `image/...`.
-#[test]
-fn mime_allowed_malformed_pattern_without_slash_never_matches_as_wildcard() {
-    assert!(!PolicyResolver::mime_allowed(
-        "image/jpeg",
-        &["image".to_owned()]
-    ));
-    assert!(!PolicyResolver::mime_allowed(
-        "text/plain",
-        &["text".to_owned()]
-    ));
-}
-
-#[test]
-fn policy_scope_parse_roundtrip() {
+fn scope_parse_and_as_str_round_trip() {
     assert_eq!(PolicyScope::parse("tenant"), Some(PolicyScope::Tenant));
     assert_eq!(PolicyScope::parse("user"), Some(PolicyScope::User));
     assert_eq!(PolicyScope::parse("unknown"), None);
     assert_eq!(PolicyScope::Tenant.as_str(), "tenant");
     assert_eq!(PolicyScope::User.as_str(), "user");
-}
 
-#[test]
-fn retention_scope_parse_roundtrip() {
     assert_eq!(
         RetentionScope::parse("tenant"),
         Some(RetentionScope::Tenant)

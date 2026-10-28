@@ -26,7 +26,7 @@ use file_storage::infra::storage::Store;
 use file_storage_sdk::{OwnerFilter, OwnerKind};
 
 mod common;
-use common::{GTS, StackBuilder, body_json, ctx};
+use common::{GTS, StackBuilder, body_json, ctx, new_file};
 
 const BASE: &str = "/api/file-storage/v1";
 
@@ -144,6 +144,26 @@ fn create_file_router(h: &Harness) -> Router {
         .layer(axum::Extension(Arc::clone(&h.msvc)))
 }
 
+fn presign_router(h: &Harness) -> Router {
+    Router::new()
+        .route(
+            &format!("{BASE}/files/{{id}}/versions"),
+            post(handlers::presign_version),
+        )
+        .layer(axum::Extension(h.subject.clone()))
+        .layer(axum::Extension(Arc::clone(&h.svc)))
+}
+
+fn initiate_router(h: &Harness) -> Router {
+    Router::new()
+        .route(
+            &format!("{BASE}/files/{{id}}/multipart"),
+            post(handlers::initiate_multipart),
+        )
+        .layer(axum::Extension(h.subject.clone()))
+        .layer(axum::Extension(Arc::clone(&h.msvc)))
+}
+
 fn create_body(owner_id: Uuid, extra: &Value) -> Value {
     let mut body = json!({
         "owner_kind": "user",
@@ -190,6 +210,71 @@ async fn post_create(h: &Harness, owner_id: Uuid, extra: &Value) -> axum::respon
         ))
         .await
         .expect("dispatch")
+}
+
+#[tokio::test]
+async fn create_file_multipart_intent_bind_auto_plans_multipart_response() {
+    let h = build_harness().await;
+    let owner_id = Uuid::now_v7();
+    let router = create_file_router(&h);
+
+    let body = create_body(
+        owner_id,
+        &json!({
+            "multipart": { "declared_size": MULTI_PART_DECLARED_SIZE },
+            "bind": "auto",
+        }),
+    );
+    let resp = router
+        .oneshot(post_req(format!("{BASE}/files"), &body))
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let location = resp
+        .headers()
+        .get(axum::http::header::LOCATION)
+        .expect("Location header on 201")
+        .to_str()
+        .expect("valid header")
+        .to_owned();
+
+    let json_body = body_json(resp).await;
+    let file_id: Uuid = json_body["file_id"]
+        .as_str()
+        .expect("file_id string")
+        .parse()
+        .expect("valid uuid");
+    assert!(
+        location.ends_with(&file_id.to_string()),
+        "Location must point at the new file: {location}"
+    );
+
+    // Single-part `upload_url` must be entirely absent (not null) — the multipart plan is the only
+    // upload path in this response.
+    assert!(
+        json_body.get("upload_url").is_none(),
+        "upload_url must be omitted on a multipart-plan response, got: {json_body}"
+    );
+    let plan = &json_body["multipart"];
+    assert!(plan.is_object(), "multipart plan must be present");
+    let parts = plan["parts"].as_array().expect("parts array");
+    assert_eq!(parts.len(), 3, "declared_size plans to exactly 3 parts");
+    assert!(plan["upload_id"].is_string());
+
+    // The plan's own version_id must match the ticket's version_id.
+    assert_eq!(json_body["version_id"], plan["version_id"]);
+
+    // The file row exists but carries no bound content yet — only `complete` binds it, matching the
+    // merged create+plan flow's whole point (no orphan single-part pending version).
+    let (file, _meta) = h
+        .svc
+        .get_file_with_metadata(&h.subject, file_id)
+        .await
+        .expect("file exists");
+    assert_eq!(
+        file.content_id, None,
+        "a composite create must not pre-bind any content"
+    );
 }
 
 /// Whether the `fs-token` in `upload_url` carries the `bind_on_finalize` claim.
@@ -506,5 +591,119 @@ async fn composite_create_checks_quota_once_for_the_declared_size() {
     assert_eq!(
         *quota.requested.lock().expect("lock"),
         vec![MULTI_PART_DECLARED_SIZE]
+    );
+}
+
+/// Paths that must return a single-part `upload_url` and no multipart plan: a tiny declared_size
+/// collapses to exactly one part at the default min part size (the ">= 2 parts" gate must NOT take
+/// the multipart branch -- the documented single-part fallback), and so does the ordinary create.
+#[tokio::test]
+async fn create_file_single_part_paths_return_upload_url_without_multipart_plan() {
+    for (row, extra) in [
+        (
+            "one-part multipart intent falls back",
+            json!({ "multipart": { "declared_size": 100_u64 } }),
+        ),
+        ("no multipart block", json!({})),
+    ] {
+        let h = build_harness().await;
+        let resp = post_create(&h, Uuid::now_v7(), &extra).await;
+        assert_eq!(resp.status(), StatusCode::CREATED, "{row}");
+
+        let json_body = body_json(resp).await;
+        assert!(
+            json_body.get("multipart").is_none(),
+            "{row}: must carry no multipart plan, got: {json_body}"
+        );
+        assert!(
+            json_body["upload_url"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "{row}: must carry a signed single-part upload_url"
+        );
+        assert!(json_body["version_id"].is_string(), "{row}");
+    }
+}
+
+#[tokio::test]
+async fn presign_version_returns_upload_url_without_multipart_field() {
+    let h = build_harness().await;
+    // An auto-bind file: its own create ticket carries the bind claim, a presigned version must not.
+    let ticket = h
+        .svc
+        .create_file(&h.subject, new_file("doc.bin"), None, true)
+        .await
+        .expect("create_file");
+    assert!(
+        bind_claim(&h, &ticket.upload_url),
+        "create_file(auto) carries the claim"
+    );
+
+    let uri = format!("{BASE}/files/{}/versions", ticket.file_id);
+    let resp = presign_router(&h)
+        .oneshot(post_req(uri, &json!({})))
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json_body = body_json(resp).await;
+    assert_eq!(json_body["file_id"], ticket.file_id.to_string());
+    assert_ne!(
+        json_body["version_id"],
+        ticket.version_id.to_string(),
+        "presign_version must mint a NEW version, not replay the first one"
+    );
+    let upload_url = json_body["upload_url"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .expect("presign_version must always carry a single-part upload_url");
+    assert!(
+        !bind_claim(&h, upload_url),
+        "presign_version must never auto-bind"
+    );
+    assert!(
+        json_body.get("multipart").is_none(),
+        "presign_version never returns a multipart plan"
+    );
+}
+
+#[tokio::test]
+async fn initiate_multipart_standalone_never_sets_auto_bind() {
+    let h = build_harness().await;
+    let file_id = h
+        .svc
+        .create_file(&h.subject, new_file("doc.bin"), None, false)
+        .await
+        .expect("create_file")
+        .file_id;
+
+    let router = initiate_router(&h);
+    let uri = format!("{BASE}/files/{file_id}/multipart");
+    let body = json!({
+        "declared_mime": "application/octet-stream",
+        "declared_size": MULTI_PART_DECLARED_SIZE,
+    });
+    let resp = router
+        .oneshot(post_req(uri, &body))
+        .await
+        .expect("dispatch");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json_body = body_json(resp).await;
+    let upload_id: Uuid = json_body["upload_id"]
+        .as_str()
+        .expect("upload_id string")
+        .parse()
+        .expect("valid uuid");
+
+    let session = h
+        .multipart_store
+        .get_multipart_upload(upload_id)
+        .await
+        .expect("query session")
+        .expect("session exists");
+    assert!(
+        !session.auto_bind,
+        "standalone initiate_multipart must never record auto_bind=true"
     );
 }

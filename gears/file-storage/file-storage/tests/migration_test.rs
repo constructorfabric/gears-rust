@@ -11,6 +11,7 @@ const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 const FILE: &str = "00000000-0000-0000-0000-0000000000c1";
 const VERSION: &str = "00000000-0000-0000-0000-0000000000d1";
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+const UPLOAD: &str = "00000000-0000-0000-0000-0000000000f2";
 const HASH32: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 fn stmt(db: &DatabaseConnection, sql: impl Into<String>) -> Statement {
@@ -65,7 +66,7 @@ async fn count(db: &DatabaseConnection, sql: &str) -> i64 {
 }
 
 #[tokio::test]
-async fn migration_creates_all_three_tables() {
+async fn migration_up_down_up_roundtrip() {
     let db = migrated_db().await;
     for table in ["files", "file_versions", "files_custom_metadata"] {
         let probe = db
@@ -76,11 +77,6 @@ async fn migration_creates_all_three_tables() {
             "table {table} must exist after up: {probe:?}"
         );
     }
-}
-
-#[tokio::test]
-async fn migration_up_down_up_roundtrip() {
-    let db = migrated_db().await;
 
     Migrator::down(&db, None).await.expect("roll back");
     let gone = db
@@ -93,6 +89,273 @@ async fn migration_up_down_up_roundtrip() {
         .execute_raw(stmt(&db, "SELECT * FROM files LIMIT 0"))
         .await;
     assert!(back.is_ok(), "files must exist again after re-up: {back:?}");
+}
+
+async fn index_exists(db: &DatabaseConnection, name: &str) -> bool {
+    count(
+        db,
+        &format!(
+            "SELECT COUNT(*) AS c FROM sqlite_master WHERE type = 'index' AND name = '{name}'"
+        ),
+    )
+    .await
+        == 1
+}
+
+/// Whether `SELECT <cols> FROM <table>` plans, i.e. every column exists.
+async fn columns_exist(db: &DatabaseConnection, table: &str, cols: &str) -> bool {
+    db.execute_raw(stmt(db, format!("SELECT {cols} FROM {table} LIMIT 0")))
+        .await
+        .is_ok()
+}
+
+const UPLOAD_FLOW_MULTIPART_COLS: [&str; 6] = [
+    "auto_bind",
+    "lease_until",
+    "lease_owner",
+    "complete_result",
+    "backend_id",
+    "backend_path",
+];
+
+/// A `multipart_uploads` row in `state` (`declared_size` bytes in `part_size` parts).
+async fn insert_session(db: &DatabaseConnection, state: &str, declared_size: u32, part_size: u32) {
+    db.execute_raw(stmt(
+        db,
+        format!(
+            "INSERT INTO multipart_uploads \
+             (upload_id, file_id, version_id, backend_upload_handle, state, declared_mime, \
+              mime_validated, declared_size, part_size, expires_at) \
+             VALUES ('{UPLOAD}', '{FILE}', '{VERSION}', 'handle-1', '{state}', 'text/plain', \
+                     1, {declared_size}, {part_size}, '2999-01-01T00:00:00Z')"
+        ),
+    ))
+    .await
+    .expect("insert multipart session");
+}
+
+async fn insert_part(db: &DatabaseConnection, part_number: u8, size: u32) {
+    db.execute_raw(stmt(
+        db,
+        format!(
+            "INSERT INTO multipart_upload_parts \
+             (upload_id, part_number, backend_etag, part_hash, size) \
+             VALUES ('{UPLOAD}', {part_number}, 'etag-{part_number}', X'{HASH32}', {size})"
+        ),
+    ))
+    .await
+    .expect("insert part");
+}
+
+/// Every migration before upload_flow: the "old" schema, without `bound_on_finalize` etc.
+async fn pre_upload_flow_db() -> DatabaseConnection {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, "PRAGMA foreign_keys = ON;"))
+        .await
+        .expect("enable foreign keys");
+    Migrator::up(&db, Some(8))
+        .await
+        .expect("apply every migration before upload_flow");
+    db
+}
+
+/// One up/down/up run over the last migration (upload_flow): it exists after `up()`, `down()` really
+/// drops its column/index/columns and folds a `completing` session into `aborted` (keeping the
+/// parts and the pre-existing columns), and re-`up()` restores it. Also asserts the `up()` indexes.
+#[tokio::test]
+async fn upload_flow_down_actually_drops_the_new_column_and_index() {
+    let db = migrated_db().await;
+    let mp_cols = UPLOAD_FLOW_MULTIPART_COLS.join(", ");
+
+    assert!(
+        columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must exist after the full up()"
+    );
+    assert!(
+        index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must exist after up()"
+    );
+    assert!(
+        columns_exist(&db, "multipart_uploads", &mp_cols).await,
+        "the six multipart_uploads columns (incl. auto_bind) must exist after the full up()"
+    );
+
+    insert_file(&db, FILE).await;
+    insert_session(&db, "completing", 5, 5).await;
+    insert_part(&db, 1, 5).await;
+
+    // The last migration is upload_flow.
+    Migrator::down(&db, Some(1))
+        .await
+        .expect("roll back upload_flow");
+
+    assert!(
+        !columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must be gone after a real (non-no-op) down()"
+    );
+    assert!(
+        !index_exists(&db, "idempotency_keys_file_idx").await,
+        "idempotency_keys_file_idx must be dropped by down()"
+    );
+    for col in UPLOAD_FLOW_MULTIPART_COLS {
+        assert!(
+            !columns_exist(&db, "multipart_uploads", col).await,
+            "{col} must be gone after a real (non-no-op) down()"
+        );
+    }
+    // The pre-existing multipart_uploads columns and indexes survive the mirrored rebuild.
+    assert!(
+        columns_exist(
+            &db,
+            "multipart_uploads",
+            "declared_size, part_size, mime_validated, created_at, expires_at"
+        )
+        .await,
+        "pre-existing columns must remain"
+    );
+    assert!(index_exists(&db, "multipart_uploads_file_idx").await);
+    assert!(index_exists(&db, "multipart_uploads_expired_idx").await);
+    // The previous migration (listing_indexes) is untouched.
+    assert!(index_exists(&db, "files_owner_listing_v2_idx").await);
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}' \
+                 AND state = 'aborted' AND declared_size = 5 AND part_size = 5"
+            )
+        )
+        .await,
+        1,
+        "a completing session must be folded into aborted by down()"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_upload_parts").await,
+        1,
+        "parts must survive the down() rebuild"
+    );
+    let bad = db
+        .execute_raw(stmt(
+            &db,
+            format!(
+                "UPDATE multipart_uploads SET state = 'completing' WHERE upload_id = '{UPLOAD}'"
+            ),
+        ))
+        .await;
+    assert!(bad.is_err(), "the narrowed CHECK must reject completing");
+
+    Migrator::up(&db, Some(1))
+        .await
+        .expect("re-apply upload_flow");
+    assert!(
+        columns_exist(&db, "file_versions", "bound_on_finalize").await,
+        "bound_on_finalize must exist again after re-up()"
+    );
+    assert!(index_exists(&db, "idempotency_keys_file_idx").await);
+    assert!(
+        columns_exist(&db, "multipart_uploads", &mp_cols).await,
+        "the multipart_uploads columns must exist again after re-up()"
+    );
+}
+
+/// `up()` over the old schema: an existing version backfills `bound_on_finalize = false`, and the
+/// `multipart_uploads` rebuild keeps sessions, parts, indexes and cascades, widening the state
+/// CHECK to admit `completing`.
+#[tokio::test]
+async fn upload_flow_up_backfills_and_preserves_existing_rows() {
+    let db = pre_upload_flow_db().await;
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 1).await;
+    insert_session(&db, "completed", 300, 100).await;
+    insert_part(&db, 1, 100).await;
+    insert_part(&db, 2, 200).await;
+
+    Migrator::up(&db, None)
+        .await
+        .expect("apply the remaining migration (upload_flow)");
+
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM file_versions WHERE version_id = '{VERSION}' \
+                 AND bound_on_finalize = 0"
+            )
+        )
+        .await,
+        1,
+        "a version that existed before this migration must default bound_on_finalize to false"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_upload_parts WHERE upload_id = '{UPLOAD}'"
+            )
+        )
+        .await,
+        2,
+        "both parts must survive the multipart_uploads rebuild"
+    );
+    assert_eq!(
+        count(
+            &db,
+            &format!(
+                "SELECT COUNT(*) AS c FROM multipart_uploads WHERE upload_id = '{UPLOAD}' \
+                 AND state = 'completed' AND mime_validated = 1 AND declared_size = 300 \
+                 AND part_size = 100 AND declared_mime = 'text/plain' \
+                 AND backend_upload_handle = 'handle-1'"
+            )
+        )
+        .await,
+        1,
+        "the session row, with every pre-existing column value, must survive the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_file_idx").await,
+        "multipart_uploads_file_idx must be recreated by the rebuild"
+    );
+    assert!(
+        index_exists(&db, "multipart_uploads_expired_idx").await,
+        "multipart_uploads_expired_idx must be recreated by the rebuild"
+    );
+
+    // The widened state CHECK admits `completing`; an unknown state is still rejected.
+    db.execute_raw(stmt(
+        &db,
+        format!("UPDATE multipart_uploads SET state = 'completing' WHERE upload_id = '{UPLOAD}'"),
+    ))
+    .await
+    .expect("completing must satisfy the widened state CHECK");
+    let bad = db
+        .execute_raw(stmt(
+            &db,
+            format!("UPDATE multipart_uploads SET state = 'bogus' WHERE upload_id = '{UPLOAD}'"),
+        ))
+        .await;
+    assert!(bad.is_err(), "an unknown state must violate the CHECK");
+
+    // The rebuilt FK still cascades: deleting the file removes its sessions and their parts.
+    db.execute_raw(stmt(
+        &db,
+        format!("DELETE FROM files WHERE file_id = '{FILE}'"),
+    ))
+    .await
+    .expect("delete file");
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_uploads").await,
+        0,
+        "the rebuilt multipart_uploads must keep ON DELETE CASCADE from files"
+    );
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_upload_parts").await,
+        0,
+        "parts must cascade with their session"
+    );
 }
 
 #[tokio::test]
@@ -111,37 +374,90 @@ async fn files_accepts_user_and_app_owner_kinds() {
     assert_eq!(count(&db, "SELECT COUNT(*) AS c FROM files").await, 2);
 }
 
+/// Every CHECK constraint on `files` / `file_versions` rejects a violating row; the base file row
+/// exists so a failure is attributable to the CHECK, not the foreign key.
 #[tokio::test]
-async fn files_rejects_invalid_owner_kind() {
+async fn check_constraints_reject_invalid_rows() {
     let db = migrated_db().await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
+    insert_file(&db, FILE).await;
+    let version_columns =
+        "file_id, version_id, mime_type, size, hash_value, backend_id, backend_path";
+    let version_values =
+        format!("'{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', 'local', '/p'");
+    let cases: Vec<(&str, String)> = vec![
+        (
+            "files.owner_kind 'robot'",
             format!(
                 "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type) \
-                 VALUES ('{FILE}', '{TENANT}', 'robot', '{OWNER}', 'a', '{GTS}')"
+                 VALUES ('00000000-0000-0000-0000-0000000000c2', '{TENANT}', 'robot', '{OWNER}', 'a', '{GTS}')"
             ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "owner_kind CHECK must reject 'robot': {res:?}"
-    );
-}
-
-#[tokio::test]
-async fn files_rejects_negative_meta_version() {
-    let db = migrated_db().await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
+        ),
+        (
+            "files.meta_version -1",
             format!(
                 "INSERT INTO files (file_id, tenant_id, owner_kind, owner_id, name, gts_file_type, meta_version) \
-                 VALUES ('{FILE}', '{TENANT}', 'user', '{OWNER}', 'a', '{GTS}', -1)"
+                 VALUES ('00000000-0000-0000-0000-0000000000c2', '{TENANT}', 'user', '{OWNER}', 'a', '{GTS}', -1)"
             ),
-        ))
-        .await;
-    assert!(res.is_err(), "meta_version CHECK must reject -1: {res:?}");
+        ),
+        (
+            "file_versions.size -1",
+            format!(
+                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', -1, X'{HASH32}', 'local', '/p')"
+            ),
+        ),
+        (
+            "file_versions.status 'frozen'",
+            format!(
+                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, status, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', 'frozen', 'local', '/p')"
+            ),
+        ),
+        (
+            "file_versions.hash_algorithm 'BLAKE3' (only SHA-256 is allowed)",
+            format!(
+                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_algorithm, hash_value, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, 'BLAKE3', X'{HASH32}', 'local', '/p')"
+            ),
+        ),
+        (
+            "file_versions.hash_value of 4 bytes",
+            format!(
+                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
+                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'00112233', 'local', '/p')"
+            ),
+        ),
+        (
+            "multipart-composite-sha256 with NULL part_count",
+            format!(
+                "INSERT INTO file_versions ({version_columns}, hash_mode, part_count) \
+                 VALUES ({version_values}, 'multipart-composite-sha256', NULL)"
+            ),
+        ),
+        (
+            "whole-sha256 with a part_count",
+            format!(
+                "INSERT INTO file_versions ({version_columns}, hash_mode, part_count) \
+                 VALUES ({version_values}, 'whole-sha256', 3)"
+            ),
+        ),
+        (
+            "unknown hash_mode",
+            format!(
+                "INSERT INTO file_versions ({version_columns}, hash_mode) \
+                 VALUES ({version_values}, 'blake3-tree')"
+            ),
+        ),
+    ];
+    for (name, sql) in cases {
+        let res = db.execute_raw(stmt(&db, sql)).await;
+        assert!(res.is_err(), "CHECK must reject {name}: {res:?}");
+    }
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM file_versions").await,
+        0,
+        "no rejected row may be stored"
+    );
 }
 
 #[tokio::test]
@@ -169,76 +485,6 @@ async fn file_versions_accepts_valid_row() {
     assert_eq!(
         count(&db, "SELECT COUNT(*) AS c FROM file_versions").await,
         1
-    );
-}
-
-#[tokio::test]
-async fn file_versions_rejects_negative_size() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d1', 'text/plain', -1, X'{HASH32}', 'local', '/p')"
-            ),
-        ))
-        .await;
-    assert!(res.is_err(), "size CHECK must reject -1: {res:?}");
-}
-
-#[tokio::test]
-async fn file_versions_rejects_unknown_status() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, status, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d1', 'text/plain', 0, X'{HASH32}', 'frozen', 'local', '/p')"
-            ),
-        ))
-        .await;
-    assert!(res.is_err(), "status CHECK must reject 'frozen': {res:?}");
-}
-
-#[tokio::test]
-async fn file_versions_rejects_non_sha256_algorithm_in_p1() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_algorithm, hash_value, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d1', 'text/plain', 0, 'BLAKE3', X'{HASH32}', 'local', '/p')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "hash_algorithm CHECK must reject BLAKE3 in P1: {res:?}"
-    );
-}
-
-#[tokio::test]
-async fn file_versions_rejects_wrong_hash_length() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions (file_id, version_id, mime_type, size, hash_value, backend_id, backend_path) \
-                 VALUES ('{FILE}', '00000000-0000-0000-0000-0000000000d1', 'text/plain', 0, X'00112233', 'local', '/p')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "hash_value length CHECK must reject 4 bytes: {res:?}"
     );
 }
 
@@ -355,9 +601,11 @@ async fn idempotency_keys_request_hash_column_exists_with_default() {
     );
 }
 
-/// `policies` ids are `TEXT` in the SQLite DDL, so UUIDs are plain quoted literals.
+/// `policies` ids are `TEXT` in the SQLite DDL, so UUIDs are plain quoted literals. A plain
+/// `UNIQUE` would not catch a duplicate tenant-scope row (NULLs are distinct); hence the partial
+/// index on `scope_owner_id IS NULL`.
 #[tokio::test]
-async fn policies_unique_index_rejects_duplicate_scope_tuple() {
+async fn policies_unique_indexes_reject_duplicates_and_allow_distinct_scopes() {
     let db = migrated_db().await;
     let owner2 = "00000000-0000-0000-0000-0000000000b2";
     db.execute_raw(stmt(
@@ -384,41 +632,30 @@ async fn policies_unique_index_rejects_duplicate_scope_tuple() {
         "duplicate (tenant_id, 'user', scope_owner_id) must violate \
          policies_user_scope_unique_idx: {res:?}"
     );
-}
 
-/// A plain `UNIQUE` would not catch this (NULLs are distinct); hence the partial index on
-/// `scope_owner_id IS NULL`.
-#[tokio::test]
-async fn policies_unique_index_rejects_duplicate_tenant_scope() {
-    let db = migrated_db().await;
-    db.execute_raw(stmt(
-        &db,
-        format!(
-            "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
-             VALUES ('00000000-0000-0000-0000-0000000000e3', '{TENANT}', 'tenant', NULL, '{{}}')"
-        ),
-    ))
-    .await
-    .expect("first tenant-scope policy insert");
-
-    let res = db
-        .execute_raw(stmt(
+    // Tenant-scope duplicates (NULL `scope_owner_id`) are rejected too.
+    let insert_tenant_scope = |policy_id: &'static str| {
+        stmt(
             &db,
             format!(
                 "INSERT INTO policies (policy_id, tenant_id, scope, scope_owner_id, body) \
-                 VALUES ('00000000-0000-0000-0000-0000000000e4', '{TENANT}', 'tenant', NULL, '{{}}')"
+                 VALUES ('{policy_id}', '{TENANT}', 'tenant', NULL, '{{}}')"
             ),
-        ))
+        )
+    };
+    db.execute_raw(insert_tenant_scope("00000000-0000-0000-0000-0000000000e3"))
+        .await
+        .expect("first tenant-scope policy insert");
+    let res = db
+        .execute_raw(insert_tenant_scope("00000000-0000-0000-0000-0000000000e4"))
         .await;
     assert!(
         res.is_err(),
         "duplicate (tenant_id, 'tenant') with NULL scope_owner_id must \
          violate policies_tenant_scope_unique_idx: {res:?}"
     );
-}
 
-#[tokio::test]
-async fn policies_unique_index_allows_distinct_scopes() {
+    // Distinct scopes do not collide across the partial indexes.
     let db = migrated_db().await;
     let tenant2 = "00000000-0000-0000-0000-0000000000a2";
     db.execute_raw(stmt(
@@ -649,94 +886,6 @@ async fn content_hash_modes_backfill_existing_rows_to_whole_sha256() {
         .await,
         0,
         "whole-sha256 versions must have no manifest row"
-    );
-}
-
-#[tokio::test]
-async fn content_hash_modes_rejects_multipart_without_part_count() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
-                 'multipart-composite-sha256', NULL, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "multipart-composite-sha256 with a NULL part_count must violate the presence CHECK"
-    );
-}
-
-#[tokio::test]
-async fn content_hash_modes_rejects_whole_with_part_count() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, part_count, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
-                 'whole-sha256', 3, 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "whole-sha256 with a non-NULL part_count must violate the presence CHECK"
-    );
-}
-
-#[tokio::test]
-async fn content_hash_modes_rejects_unknown_hash_mode() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_value, hash_mode, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, X'{HASH32}', \
-                 'blake3-tree', 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "an unknown hash_mode must be rejected by the CHECK"
-    );
-}
-
-#[tokio::test]
-async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
-    let db = migrated_db().await;
-    insert_file(&db, FILE).await;
-    let res = db
-        .execute_raw(stmt(
-            &db,
-            format!(
-                "INSERT INTO file_versions \
-                 (file_id, version_id, mime_type, size, hash_algorithm, hash_value, \
-                  status, is_current, backend_id, backend_path) \
-                 VALUES ('{FILE}', '{VERSION}', 'text/plain', 0, 'BLAKE3', X'{HASH32}', \
-                 'available', 0, 'local', '/x')"
-            ),
-        ))
-        .await;
-    assert!(
-        res.is_err(),
-        "hash_algorithm CHECK must still reject any non-SHA-256 value"
     );
 }
 

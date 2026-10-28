@@ -7,27 +7,20 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bytes::Bytes;
-use sea_orm_migration::MigratorTrait;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
-use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation};
-use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
-use file_storage::domain::ports::DataPlanePort;
-use file_storage::domain::service::{FileService, ServiceConfig};
-use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-use file_storage::infra::signed_url::{Claims, Issuer};
+use file_storage::domain::service::FileService;
+use file_storage::infra::signed_url::Claims;
 use file_storage::infra::storage::Store;
-use file_storage::infra::storage::migrations::Migrator;
 use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
 
-const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+mod common;
+use common::{StackBuilder, ctx};
 
 async fn build_service() -> (Arc<FileService>, DataPlaneService) {
     let (svc, dp, _store) = build_service_with_page_sizes(50, 1000).await;
@@ -40,67 +33,67 @@ async fn build_service_with_page_sizes(
     default_page_size: u64,
     max_page_size: u64,
 ) -> (Arc<FileService>, DataPlaneService, Store) {
-    // Temp-file DB: the service opens a connection per call, and `sqlite::memory:` gives each
-    // connection its own DB.
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-fs-test-{}.db", Uuid::now_v7().simple()));
-    let dsn = format!("sqlite://{}?mode=rwc", path.display());
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("migrations");
-    let db: Arc<DBProvider<DbError>> = Arc::new(DBProvider::new(db));
-
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size,
-        max_page_size,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        authorizer,
-        cfg,
-        None,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    (svc, dp, store)
-}
-
-fn ctx(tenant: Uuid) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::now_v7())
-        .subject_tenant_id(tenant)
+    let s = StackBuilder::new("service-test")
+        .page_sizes(default_page_size, max_page_size)
         .build()
-        .expect("ctx")
+        .await;
+    (s.svc, s.dp, s.store)
 }
 
 fn new_file() -> NewFile {
     NewFile {
-        owner_kind: OwnerKind::User,
-        owner_id: Uuid::now_v7(),
-        name: "doc.txt".to_owned(),
-        gts_file_type: GTS.to_owned(),
-        mime_type: "text/plain".to_owned(),
         custom_metadata: vec![CustomMetadataEntry {
             key: "tag".to_owned(),
             value: "a".to_owned(),
         }],
+        ..common::new_file_of("doc.txt", "text/plain")
     }
+}
+
+/// A file with `v1` bound and `v2` uploaded but not bound: `(file_id, v1, v2)`.
+async fn file_with_two_versions(
+    svc: &FileService,
+    dp: &DataPlaneService,
+    ctx: &SecurityContext,
+) -> (Uuid, Uuid, Uuid) {
+    let t1 = svc.create_file(ctx, new_file(), None, false).await.unwrap();
+    dp.put_content(
+        ctx,
+        t1.file_id,
+        t1.version_id,
+        "text/plain",
+        Bytes::from_static(b"v1"),
+    )
+    .await
+    .unwrap();
+    svc.bind(ctx, t1.file_id, t1.version_id, None)
+        .await
+        .unwrap();
+
+    let t2 = svc.presign_version(ctx, t1.file_id).await.unwrap();
+    dp.put_content(
+        ctx,
+        t1.file_id,
+        t2.version_id,
+        "text/plain",
+        Bytes::from_static(b"v2"),
+    )
+    .await
+    .unwrap();
+    (t1.file_id, t1.version_id, t2.version_id)
+}
+
+/// Binds `version_id` with the file's current `ETag` as `If-Match`.
+async fn bind_with_current_etag(
+    svc: &FileService,
+    ctx: &SecurityContext,
+    file_id: Uuid,
+    version_id: Uuid,
+) {
+    let cur = svc.get_file(ctx, file_id).await.unwrap();
+    svc.bind(ctx, file_id, version_id, etag::etag_for(&cur).as_deref())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -167,53 +160,31 @@ async fn full_upload_bind_download_lifecycle() {
 
 #[tokio::test]
 async fn bind_with_wrong_if_match_returns_precondition_failed() {
-    let (svc, dp) = build_service().await;
+    let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t1.version_id,
-        "text/plain",
-        Bytes::from_static(b"v1"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, t1.file_id, t1.version_id, None)
-        .await
-        .unwrap();
+    let (file_id, _v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
 
-    let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        "text/plain",
-        Bytes::from_static(b"v2"),
-    )
-    .await
-    .unwrap();
+    let audit_before = store.list_audit(file_id).await.unwrap().len();
     let err = svc
-        .bind(&ctx, t1.file_id, t2.version_id, Some("\"deadbeef\""))
+        .bind(&ctx, file_id, v2, Some("\"deadbeef\""))
         .await
         .unwrap_err();
     assert!(
         matches!(err, DomainError::PreconditionFailed { .. }),
         "got {err:?}"
     );
+    // The If-Match guard fails before any CAS runs, so no audit row is written.
+    assert_eq!(
+        store.list_audit(file_id).await.unwrap().len(),
+        audit_before,
+        "a rejected bind must not write an audit row"
+    );
 
-    let current = svc.get_file(&ctx, t1.file_id).await.unwrap();
+    let current = svc.get_file(&ctx, file_id).await.unwrap();
     let etag = etag::etag_for(&current).unwrap();
-    let bound = svc
-        .bind(&ctx, t1.file_id, t2.version_id, Some(&etag))
-        .await
-        .unwrap();
-    assert_eq!(bound.content_id, Some(t2.version_id));
+    let bound = svc.bind(&ctx, file_id, v2, Some(&etag)).await.unwrap();
+    assert_eq!(bound.content_id, Some(v2));
 }
-
 #[tokio::test]
 async fn tenant_isolation_hides_other_tenants_files() {
     let (svc, _dp) = build_service().await;
@@ -298,66 +269,12 @@ async fn update_metadata_merges_and_bumps_meta_version() {
 async fn restore_prior_version_rebinds_pointer() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let t1 = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t1.version_id,
-        "text/plain",
-        Bytes::from_static(b"v1"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, t1.file_id, t1.version_id, None)
-        .await
-        .unwrap();
+    let (file_id, v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
+    bind_with_current_etag(&svc, &ctx, file_id, v2).await;
 
-    let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        "text/plain",
-        Bytes::from_static(b"v2"),
-    )
-    .await
-    .unwrap();
-    let cur = svc.get_file(&ctx, t1.file_id).await.unwrap();
-    svc.bind(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        etag::etag_for(&cur).as_deref(),
-    )
-    .await
-    .unwrap();
-
-    let restored = svc
-        .restore_version(&ctx, t1.file_id, t1.version_id)
-        .await
-        .unwrap();
-    assert_eq!(restored.content_id, Some(t1.version_id));
+    let restored = svc.restore_version(&ctx, file_id, v1).await.unwrap();
+    assert_eq!(restored.content_id, Some(v1));
 }
-
-#[tokio::test]
-async fn delete_file_then_get_returns_not_found() {
-    let (svc, _dp) = build_service().await;
-    let ctx = ctx(Uuid::now_v7());
-    let t = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    svc.delete_file(&ctx, t.file_id, Some("*")).await.unwrap();
-    let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
-    assert!(
-        matches!(err, DomainError::FileNotFound { .. }),
-        "got {err:?}"
-    );
-}
-
 #[tokio::test]
 async fn download_url_pending_version_is_rejected() {
     let (svc, _dp) = build_service().await;
@@ -542,60 +459,23 @@ async fn list_versions_caps_at_max_page_size() {
 async fn delete_current_version_is_rejected() {
     let (svc, dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
+    let (file_id, v1, _v2) = file_with_two_versions(&svc, &dp, &ctx).await;
 
-    let t1 = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t1.version_id,
-        "text/plain",
-        Bytes::from_static(b"v1"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, t1.file_id, t1.version_id, None)
-        .await
-        .unwrap();
-
-    let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        "text/plain",
-        Bytes::from_static(b"v2"),
-    )
-    .await
-    .unwrap();
-
-    let err = svc
-        .delete_version(&ctx, t1.file_id, t1.version_id)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            DomainError::Conflict { .. } | DomainError::VersionNotFound { .. }
-        ),
-        "expected Conflict or VersionNotFound, got {err:?}"
-    );
+    let err = svc.delete_version(&ctx, file_id, v1).await.unwrap_err();
+    assert!(matches!(err, DomainError::Conflict { .. }), "got {err:?}");
 
     let versions = svc
-        .list_versions(&ctx, t1.file_id, None, None)
+        .list_versions(&ctx, file_id, None, None)
         .await
         .unwrap()
         .items;
     assert!(
-        versions.iter().any(|v| v.version_id == t1.version_id),
+        versions.iter().any(|v| v.version_id == v1),
         "current version must survive the rejected delete"
     );
-    let file = svc.get_file(&ctx, t1.file_id).await.unwrap();
-    assert_eq!(file.content_id, Some(t1.version_id));
+    let file = svc.get_file(&ctx, file_id).await.unwrap();
+    assert_eq!(file.content_id, Some(v1));
 }
-
 /// Reproduces a stale "is current?" snapshot: a concurrent `bind` promotes the version after the
 /// check. Driven via the store directly; the DB-level guard must refuse the delete.
 #[tokio::test]
@@ -603,45 +483,11 @@ async fn delete_version_then_bind_cannot_dangle() {
     let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
     let ctx = ctx(Uuid::now_v7());
 
-    let t1 = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t1.version_id,
-        "text/plain",
-        Bytes::from_static(b"v1"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, t1.file_id, t1.version_id, None)
-        .await
-        .unwrap();
-
-    let t2 = svc.presign_version(&ctx, t1.file_id).await.unwrap();
-    dp.put_content(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        "text/plain",
-        Bytes::from_static(b"v2"),
-    )
-    .await
-    .unwrap();
-    let pre_bind = store.get_version(t1.file_id, t2.version_id).await.unwrap();
+    let (file_id, _v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
+    let pre_bind = store.get_version(file_id, v2).await.unwrap();
     assert_eq!(pre_bind.map(|v| v.is_current), Some(false));
 
-    let cur = svc.get_file(&ctx, t1.file_id).await.unwrap();
-    svc.bind(
-        &ctx,
-        t1.file_id,
-        t2.version_id,
-        etag::etag_for(&cur).as_deref(),
-    )
-    .await
-    .unwrap();
+    bind_with_current_etag(&svc, &ctx, file_id, v2).await;
 
     // Delete via the store, bypassing the service's fresh pre-check; the
     // `is_current = false` guard must refuse it.
@@ -649,22 +495,19 @@ async fn delete_version_then_bind_cannot_dangle() {
         ctx.subject_tenant_id(),
         "user",
         ctx.subject_id(),
-        Some(t1.file_id),
+        Some(file_id),
         AuditOperation::DeleteVersion,
-        serde_json::json!({ "version_id": t2.version_id }),
+        serde_json::json!({ "version_id": v2 }),
     );
-    let removed = store
-        .delete_version(t1.file_id, t2.version_id, audit)
-        .await
-        .unwrap();
+    let removed = store.delete_version(file_id, v2, audit).await.unwrap();
     assert!(
         !removed,
         "guarded delete of the (now-current) version must not remove the row"
     );
 
-    let file = svc.get_file(&ctx, t1.file_id).await.unwrap();
-    assert_eq!(file.content_id, Some(t2.version_id));
-    let still_there = store.get_version(t1.file_id, t2.version_id).await.unwrap();
+    let file = svc.get_file(&ctx, file_id).await.unwrap();
+    assert_eq!(file.content_id, Some(v2));
+    let still_there = store.get_version(file_id, v2).await.unwrap();
     assert!(
         still_there.is_some(),
         "content_id must never dangle at a deleted version"

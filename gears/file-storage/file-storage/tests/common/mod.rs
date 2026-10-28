@@ -1,25 +1,29 @@
-//! Scaffolding shared by the integration tests: temp-file SQLite, a [`StackBuilder`] that wires a
+//! Scaffolding shared by the integration tests: temp-file `SQLite`, a [`StackBuilder`] that wires a
 //! `FileService`, `MultipartService`, `PolicyService`, `DataPlaneService` and `CleanupEngine`
 //! over one store, and small request/part/claims/SQL helpers.
 
 #![allow(dead_code, clippy::expect_used, clippy::unwrap_used)]
 
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use axum::response::Response;
 use bytes::Bytes;
+use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
 use serde_json::Value;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
 use toolkit_gts::gts_id;
-use toolkit_security::SecurityContext;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer};
+use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer, actions};
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
+use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::{
     CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPlan,
 };
@@ -27,16 +31,19 @@ use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy_service::PolicyService;
 use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
 use file_storage::domain::service::{FileService, ServiceConfig};
-use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
+use file_storage::infra::backend::{
+    BackendCapabilities, BackendRegistry, InMemoryBackend, MultipartCompletionPart, StorageBackend,
+};
+use file_storage::infra::content::hash_mode::Manifest;
 use file_storage::infra::external_clients::{QuotaClient, UsageReporter};
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{NewFile, OwnerKind};
+use file_storage_sdk::{ByteRange, NewFile, OwnerKind};
 
 pub const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
-/// A unique temp-file SQLite DB (a bare `sqlite::memory:` gives each pooled connection its own DB),
+/// A unique temp-file `SQLite` DB (a bare `sqlite::memory:` gives each pooled connection its own DB),
 /// fully migrated. Returns the DSN too, for tests that tamper through a second connection.
 pub async fn build_db_with_dsn(tag: &str) -> (Arc<DBProvider<DbError>>, String) {
     let mut path = std::env::temp_dir();
@@ -52,6 +59,10 @@ pub async fn build_db_with_dsn(tag: &str) -> (Arc<DBProvider<DbError>>, String) 
         .await
         .expect("migrations");
     (Arc::new(DBProvider::new(db)), dsn)
+}
+
+pub async fn build_db(tag: &str) -> Arc<DBProvider<DbError>> {
+    build_db_with_dsn(tag).await.0
 }
 
 /// A context for `tenant` with a fresh random subject.
@@ -143,9 +154,202 @@ pub fn put_claims(
     }
 }
 
-/// A `Uuid` column value as a SQLite BLOB literal (`Uuid` columns are 16-byte BLOBs).
+/// A `Uuid` column value as a `SQLite` BLOB literal (`Uuid` columns are 16-byte BLOBs).
 pub fn uuid_blob(id: Uuid) -> String {
     format!("X'{}'", hex_encode(id.as_bytes()))
+}
+
+/// Number of rows in `files`, read through a second connection to `dsn`.
+pub async fn count_files_rows(dsn: &str) -> i64 {
+    let conn = Database::connect(dsn).await.expect("raw connect");
+    let row = conn
+        .query_one_raw(Statement::from_string(
+            conn.get_database_backend(),
+            "SELECT COUNT(*) AS c FROM files".to_owned(),
+        ))
+        .await
+        .expect("count query")
+        .expect("one row");
+    row.try_get::<i64>("", "c").expect("i64 column c")
+}
+
+/// Grants every action inside the caller's tenant, except as configured:
+/// - [`ScopedTestAuthorizer::admin_gated`]: `ADMIN_POLICY` is granted only after `set_admin(true)`;
+/// - `deny_write_for_file` / `deny_write_for_subject`: `WRITE` is denied for that file / subject.
+#[derive(Default)]
+pub struct ScopedTestAuthorizer {
+    admin_gated: bool,
+    is_admin: AtomicBool,
+    deny_write_for_file: Mutex<Option<Uuid>>,
+    deny_write_for_subject: Mutex<Option<Uuid>>,
+}
+
+impl ScopedTestAuthorizer {
+    /// Grants every action within the caller's tenant.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Like [`Self::new`], but `ADMIN_POLICY` needs `set_admin(true)`.
+    #[must_use]
+    pub fn admin_gated() -> Self {
+        Self {
+            admin_gated: true,
+            ..Self::default()
+        }
+    }
+
+    pub fn set_admin(&self, admin: bool) {
+        self.is_admin.store(admin, Ordering::SeqCst);
+    }
+
+    /// Mark `file_id` as `WRITE`-denied.
+    pub fn deny_write_for_file(&self, file_id: Uuid) {
+        *self.deny_write_for_file.lock().expect("lock poisoned") = Some(file_id);
+    }
+
+    /// Mark `subject_id` as `WRITE`-denied.
+    pub fn deny_write_for_subject(&self, subject_id: Uuid) {
+        *self.deny_write_for_subject.lock().expect("lock poisoned") = Some(subject_id);
+    }
+}
+
+#[async_trait]
+impl Authorizer for ScopedTestAuthorizer {
+    async fn authorize(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+        _gts_file_type: &str,
+        file_id: Option<Uuid>,
+    ) -> Result<AccessScope, DomainError> {
+        if self.admin_gated && action == actions::ADMIN_POLICY {
+            return if self.is_admin.load(Ordering::SeqCst) {
+                Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
+            } else {
+                Err(DomainError::Forbidden)
+            };
+        }
+
+        if action == actions::WRITE {
+            if let Some(denied) = *self.deny_write_for_file.lock().expect("lock poisoned")
+                && Some(denied) == file_id
+            {
+                return Err(DomainError::Forbidden);
+            }
+            if let Some(denied) = *self.deny_write_for_subject.lock().expect("lock poisoned")
+                && denied == ctx.subject_id()
+            {
+                return Err(DomainError::Forbidden);
+            }
+        }
+
+        Ok(AccessScope::for_tenant(ctx.subject_tenant_id()))
+    }
+}
+
+/// Backend decorator counting calls; every method delegates to `inner`.
+/// - `reads`: whole-object reads (`get` / `get_stream`); a bounded `get_range` is not one;
+/// - `complete_calls`: `complete_multipart` calls.
+pub struct CountingBackend {
+    inner: Arc<dyn StorageBackend>,
+    pub reads: AtomicUsize,
+    pub complete_calls: AtomicUsize,
+}
+
+impl CountingBackend {
+    pub fn new(inner: Arc<dyn StorageBackend>) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            reads: AtomicUsize::new(0),
+            complete_calls: AtomicUsize::new(0),
+        })
+    }
+
+    pub fn reads(&self) -> usize {
+        self.reads.load(Ordering::SeqCst)
+    }
+
+    pub fn complete_calls(&self) -> usize {
+        self.complete_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageBackend for CountingBackend {
+    fn id(&self) -> &str {
+        self.inner.id()
+    }
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+    async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
+        self.inner.put(path, bytes).await
+    }
+    async fn get(&self, path: &str) -> Result<Bytes, DomainError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(path).await
+    }
+    async fn get_stream(
+        &self,
+        path: &str,
+    ) -> Result<futures::stream::BoxStream<'_, std::io::Result<Bytes>>, DomainError> {
+        self.reads.fetch_add(1, Ordering::SeqCst);
+        self.inner.get_stream(path).await
+    }
+    async fn get_range(&self, path: &str, range: ByteRange) -> Result<Bytes, DomainError> {
+        self.inner.get_range(path, range).await
+    }
+    async fn size(&self, path: &str) -> Result<u64, DomainError> {
+        self.inner.size(path).await
+    }
+    async fn delete(&self, path: &str) -> Result<(), DomainError> {
+        self.inner.delete(path).await
+    }
+    async fn exists(&self, path: &str) -> Result<bool, DomainError> {
+        self.inner.exists(path).await
+    }
+    async fn initiate_multipart(&self, path: &str) -> Result<String, DomainError> {
+        self.inner.initiate_multipart(path).await
+    }
+    async fn upload_part(
+        &self,
+        path: &str,
+        upload_handle: &str,
+        part_number: u32,
+        part_offset: u64,
+        data: Bytes,
+    ) -> Result<(String, Vec<u8>), DomainError> {
+        self.inner
+            .upload_part(path, upload_handle, part_number, part_offset, data)
+            .await
+    }
+    async fn complete_multipart(
+        &self,
+        path: &str,
+        upload_handle: &str,
+        parts: &[MultipartCompletionPart],
+    ) -> Result<(Manifest, [u8; 32]), DomainError> {
+        self.complete_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner
+            .complete_multipart(path, upload_handle, parts)
+            .await
+    }
+    async fn abort_multipart(&self, path: &str, upload_handle: &str) -> Result<(), DomainError> {
+        self.inner.abort_multipart(path, upload_handle).await
+    }
+    async fn list_paths(&self) -> Result<Vec<String>, DomainError> {
+        self.inner.list_paths().await
+    }
 }
 
 /// Every service over one fresh store: `FileService`, `MultipartService`, `PolicyService`,
@@ -168,7 +372,36 @@ pub struct Stack {
     pub cfg: ServiceConfig,
 }
 
-impl Stack {}
+impl Stack {
+    /// A `MultipartService` over a caller-supplied store (e.g. a fault-injecting wrapper of
+    /// `multipart_store`), sharing this stack's backends, authorizer and issuer.
+    pub fn multipart_service_over(&self, store: Arc<dyn MultipartStore>) -> MultipartService {
+        MultipartService::new(
+            store,
+            self.backends.clone(),
+            Arc::clone(&self.authorizer),
+            None,
+            Arc::clone(&self.issuer),
+            self.cfg.sidecar_base_url.clone(),
+            self.cfg.default_url_ttl_secs,
+        )
+    }
+
+    /// A `CleanupEngine` over a caller-supplied store, sharing this stack's backends.
+    pub fn cleanup_engine_over(
+        &self,
+        store: Arc<dyn CleanupStore>,
+        grace_secs: u64,
+    ) -> CleanupEngine {
+        CleanupEngine::new(
+            store,
+            self.backends.clone(),
+            CleanupConfig {
+                orphan_grace_secs: grace_secs,
+            },
+        )
+    }
+}
 
 type BackendSet = (Vec<Arc<dyn StorageBackend>>, String);
 type MsvcTweak = Box<dyn FnOnce(MultipartService) -> MultipartService>;
@@ -204,9 +437,26 @@ impl StackBuilder {
         }
     }
 
-    /// Share one `Issuer` (so tests can mint tokens the services' verifier accepts).
-    pub fn issuer(mut self, issuer: Arc<Issuer>) -> Self {
-        self.issuer = Some(issuer);
+    /// Reuse an already migrated DB (and its DSN) instead of creating a fresh one.
+    pub fn db(mut self, db: Arc<DBProvider<DbError>>, dsn: &str) -> Self {
+        self.db = Some((db, dsn.to_owned()));
+        self
+    }
+
+    /// A single backend, which is also the registry default.
+    pub fn backend(self, backend: Arc<dyn StorageBackend>) -> Self {
+        let id = backend.id().to_owned();
+        self.backends(vec![backend], &id)
+    }
+
+    /// The backend set and the registry's default backend id; `Stack::backend` is the first one.
+    pub fn backends(mut self, backends: Vec<Arc<dyn StorageBackend>>, default_id: &str) -> Self {
+        self.backends = Some((backends, default_id.to_owned()));
+        self
+    }
+
+    pub fn authorizer(mut self, authorizer: Arc<dyn Authorizer>) -> Self {
+        self.authorizer = Some(authorizer);
         self
     }
 
@@ -216,14 +466,44 @@ impl StackBuilder {
         self
     }
 
-    /// Usage reporter for both services.
+    /// Usage reporter shared by `FileService`, `MultipartService` and `CleanupEngine`.
     pub fn usage_reporter(mut self, reporter: Arc<dyn UsageReporter>) -> Self {
         self.usage_reporter = Some(reporter);
         self
     }
 
+    /// Share one `Issuer` (so tests can mint tokens the services' verifier accepts).
+    pub fn issuer(mut self, issuer: Arc<Issuer>) -> Self {
+        self.issuer = Some(issuer);
+        self
+    }
+
+    /// The whole `ServiceConfig`; `default_url_ttl_secs` / `sidecar_base_url` also drive the
+    /// `MultipartService`, the page sizes also drive the `PolicyService`.
+    pub fn config(mut self, cfg: ServiceConfig) -> Self {
+        self.cfg = cfg;
+        self
+    }
+
+    pub fn page_sizes(mut self, default_page_size: u64, max_page_size: u64) -> Self {
+        self.cfg.default_page_size = default_page_size;
+        self.cfg.max_page_size = max_page_size;
+        self
+    }
+
+    pub fn idempotency_ttl_secs(mut self, secs: u64) -> Self {
+        self.cfg.idempotency_ttl_secs = secs;
+        self
+    }
+
     pub fn url_ttl_secs(mut self, secs: i64) -> Self {
         self.cfg.default_url_ttl_secs = secs;
+        self
+    }
+
+    /// `CleanupEngine` orphan grace window (default one day).
+    pub fn grace_secs(mut self, secs: u64) -> Self {
+        self.grace_secs = secs;
         self
     }
 
@@ -426,6 +706,55 @@ pub async fn session_with_part(
         .expect("initiate");
     put_part(store, backend, &plan, file_id, 1, Bytes::from_static(data)).await;
     plan
+}
+
+/// Two in-memory backends, `"mem"` (the registry default) and `"alt"`.
+pub fn mem_and_alt_backends() -> (Arc<dyn StorageBackend>, Arc<dyn StorageBackend>) {
+    (
+        Arc::new(InMemoryBackend::new("mem")),
+        Arc::new(InMemoryBackend::new("alt")),
+    )
+}
+
+/// A multipart upload opened straight on a backend, for a version that has no row.
+pub struct RawUpload {
+    pub version_id: Uuid,
+    pub backend_path: String,
+    pub handle: String,
+}
+
+/// Opens a multipart upload for `file_id` on `backend` under a fresh version id.
+pub async fn start_raw_upload(backend: &Arc<dyn StorageBackend>, file_id: Uuid) -> RawUpload {
+    let version_id = Uuid::now_v7();
+    let backend_path = backend_path(file_id, version_id);
+    let handle = backend
+        .initiate_multipart(&backend_path)
+        .await
+        .expect("initiate multipart on the backend");
+    RawUpload {
+        version_id,
+        backend_path,
+        handle,
+    }
+}
+
+/// Asserts the upload's handle was aborted: a live handle would still accept another part.
+pub async fn assert_raw_upload_aborted(backend: &Arc<dyn StorageBackend>, upload: &RawUpload) {
+    let after = backend
+        .upload_part(
+            &upload.backend_path,
+            &upload.handle,
+            1,
+            0,
+            Bytes::from_static(b"x"),
+        )
+        .await;
+    assert!(
+        after.is_err(),
+        "the multipart handle on backend `{}` must have been aborted, but it is still live: \
+         {after:?}",
+        backend.id()
+    );
 }
 
 /// Test-only unwrap of a complete outcome, for single-completer tests.

@@ -10,11 +10,6 @@ fn sha256_known_vectors() {
 }
 
 #[test]
-fn sha256_digest_is_32_bytes() {
-    assert_eq!(sha256(b"anything").len(), 32);
-}
-
-#[test]
 fn streaming_hasher_matches_oneshot() {
     let mut h = Hasher::new();
     h.update(b"ab");
