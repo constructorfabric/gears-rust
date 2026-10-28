@@ -20,52 +20,37 @@ fn owner(kind: file_storage_sdk::OwnerKind, id: Uuid) -> OwnerFilter {
 }
 
 #[test]
-fn clamp_limit_zero_is_rejected() {
+fn clamp_limit_applies_default_and_ceiling_and_rejects_zero() {
     let err = clamp_limit(Some(0), 25, 200).expect_err("limit=0 must be rejected");
     assert!(matches!(err, ODataError::InvalidLimit));
+
+    // (requested, default, max) -> effective limit. A misconfigured default above max must
+    // still not escape the ceiling.
+    for (requested, default, max, expected) in [
+        (None, 25, 200, 25),
+        (Some(9999), 25, 200, 200),
+        (Some(50), 25, 200, 50),
+        (None, 500, 200, 200),
+    ] {
+        assert_eq!(
+            clamp_limit(requested, default, max).unwrap(),
+            expected,
+            "requested={requested:?} default={default} max={max}"
+        );
+    }
 }
 
 #[test]
-fn clamp_limit_none_falls_back_to_default() {
-    assert_eq!(clamp_limit(None, 25, 200).unwrap(), 25);
-}
-
-#[test]
-fn clamp_limit_above_max_is_clamped_down() {
-    assert_eq!(clamp_limit(Some(9999), 25, 200).unwrap(), 200);
-}
-
-#[test]
-fn clamp_limit_within_range_passes_through() {
-    assert_eq!(clamp_limit(Some(50), 25, 200).unwrap(), 50);
-}
-
-#[test]
-fn clamp_limit_default_above_max_is_also_clamped() {
-    // A misconfigured default above max must still not escape the ceiling.
-    assert_eq!(clamp_limit(None, 500, 200).unwrap(), 200);
-}
-
-#[test]
-fn a_cursor_round_trips_its_position() {
+fn a_cursor_round_trips_its_position_and_direction() {
     let created_at = datetime!(2026-09-27 12:00:00 UTC);
     let id = Uuid::now_v7();
-    let token = encode(created_at, id, ID, None, Direction::Forward).expect("encode");
-    let sought = seek(parsed(&token), ID, None).expect("decode");
-    assert_eq!(sought.created_at, created_at);
-    assert_eq!(sought.id, id);
-    assert_eq!(sought.direction, Direction::Forward);
-}
-
-#[test]
-fn a_backward_cursor_round_trips_its_position_and_direction() {
-    let created_at = datetime!(2026-09-27 12:00:00 UTC);
-    let id = Uuid::now_v7();
-    let token = encode(created_at, id, ID, None, Direction::Backward).expect("encode");
-    let sought = seek(parsed(&token), ID, None).expect("decode");
-    assert_eq!(sought.created_at, created_at);
-    assert_eq!(sought.id, id);
-    assert_eq!(sought.direction, Direction::Backward);
+    for direction in [Direction::Forward, Direction::Backward] {
+        let token = encode(created_at, id, ID, None, direction).expect("encode");
+        let sought = seek(parsed(&token), ID, None).expect("decode");
+        assert_eq!(sought.created_at, created_at);
+        assert_eq!(sought.id, id);
+        assert_eq!(sought.direction, direction);
+    }
 }
 
 #[test]
@@ -335,28 +320,82 @@ fn storage_after(token: &str) -> (String, Direction) {
 }
 
 #[test]
-fn page_by_id_first_page_sorts_and_has_only_a_next_cursor() {
-    let page = page_by_id(names(&["c", "a", "d", "b"]), 3, None, String::as_str).expect("page");
-    assert_eq!(ids(&page), ["a", "b", "c"]);
-    assert_eq!(page.page_info.limit, 3);
-    assert!(page.page_info.next_cursor.is_some());
-    assert!(page.page_info.prev_cursor.is_none());
-}
-
-#[test]
-fn page_by_id_whole_list_in_one_page_has_no_cursors() {
-    let page = page_by_id(names(&["b", "a"]), 2, None, String::as_str).expect("page");
-    assert_eq!(ids(&page), ["a", "b"]);
-    assert!(page.page_info.next_cursor.is_none());
-    assert!(page.page_info.prev_cursor.is_none());
-}
-
-#[test]
-fn page_by_id_empty_list_has_no_cursors() {
-    let page = page_by_id(Vec::<String>::new(), 3, None, String::as_str).expect("page");
-    assert!(page.items.is_empty());
-    assert!(page.page_info.next_cursor.is_none());
-    assert!(page.page_info.prev_cursor.is_none());
+fn page_by_id_pages_and_their_cursors() {
+    let fwd = |id: &str| Some((id.to_owned(), Direction::Forward));
+    let bwd = |id: &str| Some((id.to_owned(), Direction::Backward));
+    // (name, input, limit, after, expected items, has next_cursor, has prev_cursor)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(
+        &str,
+        &[&str],
+        u64,
+        Option<(String, Direction)>,
+        &[&str],
+        bool,
+        bool,
+    )> = vec![
+        (
+            "first page sorts",
+            &["c", "a", "d", "b"],
+            3,
+            None,
+            &["a", "b", "c"],
+            true,
+            false,
+        ),
+        (
+            "whole list in one page",
+            &["b", "a"],
+            2,
+            None,
+            &["a", "b"],
+            false,
+            false,
+        ),
+        ("empty list", &[], 3, None, &[], false, false),
+        (
+            "forward past the end",
+            &["a", "b"],
+            2,
+            fwd("z"),
+            &[],
+            false,
+            false,
+        ),
+        (
+            "backward keeps the items nearest the cursor, ascending",
+            &["a", "b", "c", "d", "e"],
+            2,
+            bwd("e"),
+            &["c", "d"],
+            true,
+            true,
+        ),
+        (
+            "backward page reaching the start",
+            &["a", "b", "c", "d"],
+            5,
+            bwd("c"),
+            &["a", "b"],
+            true,
+            false,
+        ),
+    ];
+    for (name, input, limit, after, expected, has_next, has_prev) in cases {
+        let page = page_by_id(names(input), limit, after, String::as_str).expect("page");
+        assert_eq!(ids(&page), expected, "{name}");
+        assert_eq!(page.page_info.limit, limit, "{name}: limit");
+        assert_eq!(
+            page.page_info.next_cursor.is_some(),
+            has_next,
+            "{name}: next"
+        );
+        assert_eq!(
+            page.page_info.prev_cursor.is_some(),
+            has_prev,
+            "{name}: prev"
+        );
+    }
 }
 
 #[test]
@@ -384,16 +423,6 @@ fn page_by_id_forward_walk_covers_every_item_and_ends_without_next_cursor() {
 }
 
 #[test]
-fn page_by_id_backward_page_keeps_the_items_nearest_the_cursor_in_ascending_order() {
-    let all = names(&["a", "b", "c", "d", "e"]);
-    let after = Some(("e".to_owned(), Direction::Backward));
-    let page = page_by_id(all, 2, after, String::as_str).expect("page");
-    assert_eq!(ids(&page), ["c", "d"]);
-    assert!(page.page_info.prev_cursor.is_some(), "a, b remain");
-    assert!(page.page_info.next_cursor.is_some(), "e lies after");
-}
-
-#[test]
 fn page_by_id_backward_walk_reaches_the_start_without_prev_cursor() {
     let all = ["a", "b", "c", "d", "e"];
     let mut after = Some(("e".to_owned(), Direction::Backward));
@@ -414,91 +443,47 @@ fn page_by_id_backward_walk_reaches_the_start_without_prev_cursor() {
 }
 
 #[test]
-fn page_by_id_backward_page_that_reaches_the_start_has_no_prev_cursor() {
-    let after = Some(("c".to_owned(), Direction::Backward));
-    let page = page_by_id(names(&["a", "b", "c", "d"]), 5, after, String::as_str).expect("page");
-    assert_eq!(ids(&page), ["a", "b"]);
-    assert!(page.page_info.prev_cursor.is_none());
-    assert!(page.page_info.next_cursor.is_some());
-}
-
-#[test]
-fn page_by_id_forward_page_past_the_end_is_empty_without_cursors() {
-    let after = Some(("z".to_owned(), Direction::Forward));
-    let page = page_by_id(names(&["a", "b"]), 2, after, String::as_str).expect("page");
-    assert!(page.items.is_empty());
-    assert!(page.page_info.next_cursor.is_none());
-    assert!(page.page_info.prev_cursor.is_none());
-}
-
-#[test]
-fn page_by_id_cursors_round_trip_through_storage_seek() {
-    let page = page_by_id(names(&["a", "b", "c"]), 1, None, String::as_str).expect("page");
-    let next = page.page_info.next_cursor.expect("more forward");
-    let (id, direction) = storage_seek(parsed(&next)).expect("storage_seek");
-    assert_eq!((id.as_str(), direction), ("a", Direction::Forward));
-
-    let page = page_by_id(
-        names(&["a", "b", "c"]),
-        1,
-        Some(("b".to_owned(), Direction::Forward)),
-        String::as_str,
-    )
-    .expect("page");
-    let prev = page.page_info.prev_cursor.expect("a cursor was supplied");
-    let (id, direction) = storage_seek(parsed(&prev)).expect("storage_seek");
-    assert_eq!((id.as_str(), direction), ("c", Direction::Backward));
-}
-
-#[test]
-fn storage_seek_rejects_a_cursor_carrying_a_binding() {
-    let cursor = CursorV1 {
-        k: vec!["a".to_owned()],
+fn storage_seek_rejects_malformed_cursors() {
+    let storages_cursor = |k: &[&str], f: Option<&str>, d: &str| CursorV1 {
+        k: k.iter().map(|s| (*s).to_owned()).collect(),
         o: SortDir::Asc,
         s: storages_order().to_signed_tokens(),
-        f: Some("abc".to_owned()),
-        d: FORWARD.to_owned(),
+        f: f.map(str::to_owned),
+        d: d.to_owned(),
     };
-    let err = storage_seek(cursor).expect_err("storages cursors carry no binding");
-    assert!(matches!(err, ODataError::FilterMismatch), "got {err:?}");
-}
-
-#[test]
-fn storage_seek_rejects_a_cursor_with_two_keys() {
-    let cursor = CursorV1 {
-        k: vec!["a".to_owned(), "b".to_owned()],
-        o: SortDir::Asc,
-        s: storages_order().to_signed_tokens(),
-        f: None,
-        d: FORWARD.to_owned(),
-    };
-    let err = storage_seek(cursor).expect_err("must name exactly one key");
-    assert!(matches!(err, ODataError::CursorInvalidKeys), "got {err:?}");
-}
-
-#[test]
-fn storage_seek_rejects_an_unrecognized_direction() {
-    let cursor = CursorV1 {
-        k: vec!["a".to_owned()],
-        o: SortDir::Asc,
-        s: storages_order().to_signed_tokens(),
-        f: None,
-        d: "sideways".to_owned(),
-    };
-    let err = storage_seek(cursor).expect_err("direction must be fwd or bwd");
-    assert!(matches!(err, ODataError::InvalidCursor), "got {err:?}");
-}
-
-#[test]
-fn storage_seek_rejects_a_cursor_of_another_listing() {
-    let token = encode(
-        datetime!(2026-09-27 12:00:00 UTC),
-        Uuid::now_v7(),
-        FILES_ID_FIELD,
-        None,
-        Direction::Forward,
-    )
-    .expect("encode");
-    let err = storage_seek(parsed(&token)).expect_err("a /files cursor must not resume /storages");
-    assert!(matches!(err, ODataError::OrderMismatch), "got {err:?}");
+    let other_listing = parsed(
+        &encode(
+            datetime!(2026-09-27 12:00:00 UTC),
+            Uuid::now_v7(),
+            FILES_ID_FIELD,
+            None,
+            Direction::Forward,
+        )
+        .expect("encode"),
+    );
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, CursorV1, fn(&ODataError) -> bool)> = vec![
+        (
+            "carries a binding",
+            storages_cursor(&["a"], Some("abc"), FORWARD),
+            |e| matches!(e, ODataError::FilterMismatch),
+        ),
+        (
+            "two keys",
+            storages_cursor(&["a", "b"], None, FORWARD),
+            |e| matches!(e, ODataError::CursorInvalidKeys),
+        ),
+        (
+            "unrecognized direction",
+            storages_cursor(&["a"], None, "sideways"),
+            |e| matches!(e, ODataError::InvalidCursor),
+        ),
+        ("cursor of another listing", other_listing, |e| {
+            matches!(e, ODataError::OrderMismatch)
+        }),
+    ];
+    for (name, cursor, is_expected) in cases {
+        let err = storage_seek(cursor).expect_err(name);
+        assert!(is_expected(&err), "{name}: got {err:?}");
+    }
 }

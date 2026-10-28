@@ -49,36 +49,90 @@ fn lifetime_is_clamped_to_max_ttl() {
 }
 
 #[test]
-fn expired_token_is_rejected() {
-    let issuer = Issuer::generate(3600).unwrap();
-    let verifier = issuer.verifier();
-    let claims = sample_claims(Op::Get, now().unix_timestamp() + 10);
-    let token = issuer.issue(claims, now()).unwrap();
-
-    let later = now() + time::Duration::seconds(20);
-    let err = verifier.verify(&token, later).unwrap_err();
-    assert!(
-        matches!(err, DomainError::TokenInvalid { .. }),
-        "got {err:?}"
-    );
-}
-
-#[test]
 fn expiry_is_exclusive_at_the_boundary() {
     let issuer = Issuer::generate(3600).unwrap();
     let verifier = issuer.verifier();
     let exp = now().unix_timestamp() + 60;
     let token = issuer.issue(sample_claims(Op::Get, exp), now()).unwrap();
 
-    let at_exp = OffsetDateTime::from_unix_timestamp(exp).unwrap();
+    // (offset from exp, accepted): valid one second before exp, rejected at exp and after.
+    // A zero grace window must behave exactly like strict `verify`.
+    for (offset, accepted) in [(-1, true), (0, false), (30, false)] {
+        let at = OffsetDateTime::from_unix_timestamp(exp + offset).unwrap();
+        let strict = verifier.verify(&token, at);
+        let graceless = verifier.verify_with_grace(&token, at, time::Duration::ZERO);
+        assert_eq!(strict.is_ok(), accepted, "verify at exp{offset:+}");
+        assert_eq!(graceless.is_ok(), accepted, "zero grace at exp{offset:+}");
+        if accepted {
+            assert_eq!(strict.unwrap(), graceless.unwrap());
+        } else {
+            assert!(matches!(
+                strict.unwrap_err(),
+                DomainError::TokenInvalid { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn verify_with_grace_accepts_a_token_expired_within_the_grace_window() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let exp = now().unix_timestamp() + 60;
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
+
+    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 30).unwrap();
     assert!(
-        verifier.verify(&token, at_exp).is_err(),
-        "token must be rejected at now == exp"
+        verifier
+            .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
+            .is_ok(),
+        "a token expired within the grace window must be accepted"
     );
-    let just_before = OffsetDateTime::from_unix_timestamp(exp - 1).unwrap();
+}
+
+#[test]
+fn verify_with_grace_rejects_a_token_expired_beyond_the_grace_window() {
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let exp = now().unix_timestamp() + 60;
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
+
+    // 90s past exp with a 60s grace: rejected with the same message `verify` uses.
+    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 90).unwrap();
+    let err = verifier
+        .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
+        .unwrap_err();
     assert!(
-        verifier.verify(&token, just_before).is_ok(),
-        "token must still be valid one second before exp"
+        matches!(err, DomainError::TokenInvalid { .. }),
+        "got {err:?}"
+    );
+    assert!(
+        err.to_string().contains("token expired"),
+        "grace expiry must surface the same message as strict `verify`, got {err}"
+    );
+}
+
+#[test]
+fn verify_with_grace_does_not_weaken_signature_verification() {
+    // Grace only loosens the `exp` deadline, never the signature check.
+    let issuer = Issuer::generate(3600).unwrap();
+    let verifier = issuer.verifier();
+    let token = issuer
+        .issue(sample_claims(Op::Put, now().unix_timestamp() + 60), now())
+        .unwrap();
+
+    let (payload, sig) = token.split_once('.').unwrap();
+    let mut p = payload.to_owned();
+    let last = p.pop().unwrap();
+    p.push(if last == 'A' { 'B' } else { 'A' });
+    let tampered = format!("{p}.{sig}");
+
+    let err = verifier
+        .verify_with_grace(&tampered, now(), time::Duration::seconds(3600))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("signature"),
+        "a huge grace must not accept a tampered payload, got {err}"
     );
 }
 

@@ -11,7 +11,9 @@ use tempfile::TempDir;
 use super::{S3Backend, StatusCode, conflict_message};
 use crate::domain::error::DomainError;
 use crate::infra::backend::StorageBackend;
-use crate::infra::backend::backend_tests::assert_backend_contract;
+use crate::infra::backend::backend_tests::{
+    assert_backend_contract, assert_put_stream_rejects_oversized_stream,
+};
 use crate::infra::content::hash;
 
 const TEST_ACCESS_KEY: &str = "test-access-key";
@@ -54,34 +56,36 @@ async fn start_s3s_fs() -> (SocketAddr, TempDir) {
     (local_addr, dir)
 }
 
-/// `S3Backend` over a fresh `s3s-fs` server; the bucket dir is pre-created (not auto-created).
-async fn make_backend(addr: SocketAddr, dir: &TempDir, bucket: &str) -> S3Backend {
-    tokio::fs::create_dir_all(dir.path().join(bucket))
+fn unique_bucket() -> String {
+    format!("test-{}", uuid::Uuid::now_v7())
+}
+
+/// A fresh server plus a backend on a fresh bucket; keep the `TempDir` alive for the test.
+async fn fixture() -> (S3Backend, TempDir, String) {
+    let (addr, dir) = start_s3s_fs().await;
+    let bucket = unique_bucket();
+    // The bucket dir is pre-created: `s3s-fs` does not auto-create buckets.
+    tokio::fs::create_dir_all(dir.path().join(&bucket))
         .await
         .expect("pre-create s3s-fs bucket directory");
     let endpoint: url::Url = format!("http://{addr}")
         .parse()
         .expect("valid endpoint url");
-    S3Backend::new(
+    let backend = S3Backend::new(
         "s3-test",
         endpoint,
         "us-east-1",
-        bucket,
+        &bucket,
         TEST_ACCESS_KEY,
         TEST_SECRET_KEY,
     )
-    .expect("construct S3Backend")
-}
-
-fn unique_bucket() -> String {
-    format!("test-{}", uuid::Uuid::now_v7())
+    .expect("construct S3Backend");
+    (backend, dir, bucket)
 }
 
 #[tokio::test]
 async fn s3_backend_put_get_round_trip() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, dir, bucket) = fixture().await;
 
     assert_backend_contract(&backend).await;
 
@@ -97,9 +101,7 @@ async fn s3_backend_put_get_round_trip() {
 async fn s3_backend_get_stream_reassembles_large_object() {
     use futures::StreamExt;
 
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, _dir, _bucket) = fixture().await;
 
     let payload: Vec<u8> = (0..300_000)
         .map(|i| u8::try_from(i % 256).unwrap())
@@ -118,19 +120,8 @@ async fn s3_backend_get_stream_reassembles_large_object() {
 }
 
 #[tokio::test]
-async fn s3_backend_get_stream_missing_object_errors() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
-
-    assert!(backend.get_stream("nope/nope").await.is_err());
-}
-
-#[tokio::test]
 async fn s3_backend_get_range_returns_native_partial_content() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, _dir, _bucket) = fixture().await;
 
     backend
         .put("range-obj", Bytes::from_static(b"0123456789abcdef"))
@@ -157,42 +148,8 @@ async fn s3_backend_get_range_returns_native_partial_content() {
 }
 
 #[tokio::test]
-async fn s3_backend_delete_is_idempotent() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
-
-    backend
-        .put("to-delete", Bytes::from_static(b"gone soon"))
-        .await
-        .unwrap();
-    backend.delete("to-delete").await.unwrap();
-    // Second delete on an already-missing key: S3's DeleteObject returns a
-    // success status regardless, so this must still be `Ok`.
-    backend.delete("to-delete").await.unwrap();
-    assert!(!backend.exists("to-delete").await.unwrap());
-}
-
-#[tokio::test]
-async fn s3_backend_exists_distinguishes_missing_from_error() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
-
-    assert!(!backend.exists("never-uploaded").await.unwrap());
-
-    backend
-        .put("now-present", Bytes::from_static(b"x"))
-        .await
-        .unwrap();
-    assert!(backend.exists("now-present").await.unwrap());
-}
-
-#[tokio::test]
 async fn s3_is_ready_ok_against_s3s_fs() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, _dir, _bucket) = fixture().await;
 
     backend
         .is_ready()
@@ -290,7 +247,7 @@ fn s3_error_classifies_transient_and_permanent_statuses() {
 }
 
 /// `is_ready` must fail when the bucket does not exist: `NoSuchBucket` from `ListObjectsV2`
-/// is distinguishable from an absent key (unlike `HeadObject`). Bypasses `make_backend`.
+/// is distinguishable from an absent key (unlike `HeadObject`). Bypasses `fixture`.
 #[tokio::test]
 async fn s3_is_ready_err_against_missing_bucket() {
     let (addr, _dir) = start_s3s_fs().await;
@@ -315,12 +272,9 @@ async fn s3_is_ready_err_against_missing_bucket() {
 
 #[tokio::test]
 async fn s3_backend_list_paths_paginates_across_continuation_token() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
+    let (backend, _dir, _bucket) = fixture().await;
     // Page size 2 over 5 objects forces at least 3 `ListObjectsV2` pages.
-    let backend = make_backend(addr, &dir, &bucket)
-        .await
-        .with_list_page_size(2);
+    let backend = backend.with_list_page_size(2);
 
     let mut expected: Vec<String> = Vec::new();
     for i in 0..5 {
@@ -340,9 +294,7 @@ async fn s3_backend_list_paths_paginates_across_continuation_token() {
 
 #[tokio::test]
 async fn s3_backend_multipart_initiate_upload_complete_round_trip() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, dir, bucket) = fixture().await;
 
     // S3 minimum part size is 5 MiB except the last; distinct patterns detect mis-ordering.
     let part_size = 5 * 1024 * 1024;
@@ -429,9 +381,7 @@ async fn s3_backend_multipart_initiate_upload_complete_round_trip() {
 
 #[tokio::test]
 async fn s3_backend_multipart_abort_discards_parts() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, _dir, _bucket) = fixture().await;
 
     let path = "multipart/aborted";
     let upload_handle = backend.initiate_multipart(path).await.unwrap();
@@ -489,10 +439,8 @@ fn chunk_stream(chunks: Vec<Bytes>) -> BoxStream<'static, std::io::Result<Bytes>
 
 #[tokio::test]
 async fn s3_backend_put_stream_small_uses_single_put() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
     // Default multipart threshold (8 MiB): this stream stays below it, so a single `PutObject`.
-    let backend = make_backend(addr, &dir, &bucket).await;
+    let (backend, dir, bucket) = fixture().await;
 
     let chunk_bytes: Vec<&'static [u8]> = vec![b"small ", b"stream ", b"payload"];
     let concatenated: Vec<u8> = chunk_bytes.concat();
@@ -520,13 +468,10 @@ async fn s3_backend_put_stream_small_uses_single_put() {
 
 #[tokio::test]
 async fn s3_backend_put_stream_large_uses_multipart() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
+    let (backend, _dir, _bucket) = fixture().await;
     // Low threshold so a multi-MiB stream crosses it with full 5 MiB parts.
     let part_size: u64 = 5 * 1024 * 1024;
-    let backend = make_backend(addr, &dir, &bucket)
-        .await
-        .with_multipart_threshold_bytes(part_size);
+    let backend = backend.with_multipart_threshold_bytes(part_size);
 
     // 11 MiB in 1 MiB chunks: two 5 MiB parts plus a 1 MiB tail.
     let chunk_size = 1024 * 1024;
@@ -555,33 +500,12 @@ async fn s3_backend_put_stream_large_uses_multipart() {
 
 #[tokio::test]
 async fn s3_backend_put_stream_enforces_max_size_mid_stream() {
-    let (addr, dir) = start_s3s_fs().await;
-    let bucket = unique_bucket();
     // Threshold 8 bytes: the first 10-byte chunk starts multipart, the second exceeds
     // `max_size`, so an already-initiated session must be aborted.
-    let backend = make_backend(addr, &dir, &bucket)
-        .await
-        .with_multipart_threshold_bytes(8);
+    let (backend, _dir, _bucket) = fixture().await;
+    let backend = backend.with_multipart_threshold_bytes(8);
 
-    let chunks: Vec<Bytes> = vec![
-        Bytes::from_static(b"0123456789"),
-        Bytes::from_static(b"0123456789"),
-        Bytes::from_static(b"0123456789"),
-    ];
-
-    let path = "put-stream/rejected";
-    let result = backend
-        .put_stream(path, chunk_stream(chunks), Some(15))
-        .await;
-
-    assert!(
-        result.is_err(),
-        "put_stream must reject a stream exceeding max_size"
-    );
-
-    // Nothing may be left behind: no object, and the multipart session was aborted.
-    assert!(!backend.exists(path).await.unwrap());
-    assert!(backend.get(path).await.is_err());
+    assert_put_stream_rejects_oversized_stream(&backend, "put-stream/rejected", 15).await;
 }
 
 /// One-shot mock S3: answers the first request with `status` and `body`.
@@ -690,3 +614,64 @@ async fn s3_transport_err_builder_error_is_permanent() {
         DomainError::Backend { .. }
     ));
 }
+
+/// A second `publish_exclusive` to one path reports `created = false` and keeps the first
+/// bytes, on both the single-`PutObject` and the multipart path (`If-None-Match: *` on each).
+#[tokio::test]
+async fn s3_backend_publish_exclusive_rejects_overwrite() {
+    const MIB: usize = 1024 * 1024;
+    // (name, multipart threshold, chunk size, chunk count): the default 8 MiB threshold keeps the
+    // small payload on a single PUT; the 5 MiB one sends 11 MiB through multipart.
+    let cases = [
+        ("single-put", None, 8, 1),
+        ("multipart", Some(5 * MIB as u64), MIB, 11),
+    ];
+    for (name, threshold, chunk_size, num_chunks) in cases {
+        let (backend, _dir, _bucket) = fixture().await;
+        let backend = match threshold {
+            Some(t) => backend.with_multipart_threshold_bytes(t),
+            None => backend,
+        };
+        let payload = |byte_of: fn(u8) -> u8| -> Vec<Bytes> {
+            (0..num_chunks)
+                .map(|i| Bytes::from(vec![byte_of(i); chunk_size]))
+                .collect()
+        };
+        let first = payload(|i| b'a' + i);
+        let second = payload(|i| b'z' - i);
+        let first_concat: Vec<u8> = first.iter().flat_map(|c| c.to_vec()).collect();
+        let path = format!("publish-exclusive/{name}");
+
+        let outcome = backend
+            .publish_exclusive(&path, chunk_stream(first), None)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: first publish_exclusive must succeed: {e:?}"));
+        assert!(outcome.created, "{name}: first publish must create");
+        assert_eq!(outcome.bytes_written, first_concat.len() as u64, "{name}");
+        assert_eq!(
+            outcome.digest,
+            hash::digest_to_array(hash::sha256(&first_concat)),
+            "{name}"
+        );
+
+        // A replay must return `Ok(created = false)`, not an error, and the multipart session
+        // it opened is aborted.
+        let outcome2 = backend
+            .publish_exclusive(&path, chunk_stream(second), None)
+            .await
+            .unwrap_or_else(|e| panic!("{name}: second publish must be Ok(created=false): {e:?}"));
+        assert!(!outcome2.created, "{name}: second publish must not create");
+        assert_eq!(outcome2.bytes_written, first_concat.len() as u64, "{name}");
+
+        let got = backend.get(&path).await.unwrap();
+        assert_eq!(
+            got.as_ref(),
+            first_concat.as_slice(),
+            "{name}: the original bytes must survive the rejected overwrite"
+        );
+    }
+}
+
+// No concurrent-racer test here: `s3s-fs` checks `If-None-Match: *` with a plain `exists()` then
+// writes, so concurrent publishes can both win. That is a test-double limitation, not
+// `S3Backend`'s; the conditional header is covered sequentially by the tests above.

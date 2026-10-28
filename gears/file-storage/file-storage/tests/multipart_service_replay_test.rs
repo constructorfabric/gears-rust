@@ -1,28 +1,38 @@
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use sea_orm::{ConnectionTrait, Database, Statement};
-use toolkit_security::SecurityContext;
+use async_trait::async_trait;
+use bytes::Bytes;
+use sea_orm::{ConnectionTrait, Database, Statement, TransactionTrait};
+use time::OffsetDateTime;
+use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use file_storage::domain::audit::{AuditEntry, AuditOperation};
+use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
+use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
 use file_storage::domain::multipart::{
-    BindState, CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPlan,
+    BindState, CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPart, MultipartPlan,
+    MultipartUploadSession,
 };
 use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::MultipartStore;
+use file_storage::domain::policy::{PolicyScope, StoredPolicy};
+use file_storage::domain::ports::{
+    AutoBindOnFinalize, DataPlanePort, FinalizeMultipartOutcome, FinalizeVersionOutcome,
+    MultipartFinishSnapshot, MultipartStore,
+};
 use file_storage::domain::service::FileService;
 use file_storage::infra::backend::StorageBackend;
 use file_storage::infra::content::hash_mode::HashMode;
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
-use file_storage_sdk::VersionStatus;
+use file_storage_sdk::{File, FileVersion, VersionStatus};
 
 mod common;
-use common::{CompleteOutcomeExt, ctx, new_file, new_file_for, uuid_blob};
+use common::{CompleteOutcomeExt, StackBuilder, ctx, new_file, new_file_for, put_part, uuid_blob};
 
 struct Env {
     svc: Arc<FileService>,
@@ -103,6 +113,25 @@ impl Env {
     async fn complete(&self, file_id: Uuid, upload_id: Uuid) -> CompletedMultipartUpload {
         self.try_complete(file_id, upload_id, None).await.unwrap()
     }
+
+    /// File A auto-bound via session A (`AAAAA`), then manual session B (`BBBBB`) completed and
+    /// explicitly rebound over it: the file now points at B, A's session is a historical `Bound`.
+    async fn bound_a_then_rebound_to_b(
+        &self,
+    ) -> (Uuid, MultipartPlan, CompletedMultipartUpload, MultipartPlan) {
+        let (file_id, plan_a) = self.session_with_part(b"AAAAA", true).await;
+        let completed_a = self.complete(file_id, plan_a.upload_id).await;
+        assert_eq!(completed_a.bind_state, BindState::Bound);
+
+        let plan_b = self.add_session_with_part(file_id, b"BBBBB", false).await;
+        let completed_b = self.complete(file_id, plan_b.upload_id).await;
+        assert_eq!(completed_b.bind_state, BindState::Manual);
+        self.svc
+            .bind(&self.ctx, file_id, plan_b.version_id, Some("*"))
+            .await
+            .expect("rebind to version B");
+        (file_id, plan_a, completed_a, plan_b)
+    }
 }
 
 /// Run one raw-SQL statement against an independent connection to `dsn` and assert it hit exactly
@@ -135,6 +164,322 @@ async fn null_complete_result(dsn: &str, upload_id: Uuid) {
         ),
     )
     .await;
+}
+
+async fn set_hash_mode_bypassing_check(dsn: &str, version_id: Uuid, value: &str) {
+    let conn = Database::connect(dsn).await.expect("raw connect");
+    let backend = conn.get_database_backend();
+    let txn = conn.begin().await.expect("begin txn");
+    txn.execute_raw(Statement::from_string(
+        backend,
+        "PRAGMA ignore_check_constraints = ON;".to_owned(),
+    ))
+    .await
+    .expect("disable CHECK enforcement for this connection");
+    let res = txn
+        .execute_raw(Statement::from_string(
+            backend,
+            format!(
+                "UPDATE file_versions SET hash_mode = '{value}' WHERE version_id = {}",
+                uuid_blob(version_id)
+            ),
+        ))
+        .await
+        .expect("tamper hash_mode");
+    assert_eq!(
+        res.rows_affected(),
+        1,
+        "tamper UPDATE must hit exactly the one row the test prepared"
+    );
+    txn.commit().await.expect("commit tamper txn");
+}
+
+async fn tamper_session_to_completed_out_from_under(dsn: &str, upload_id: Uuid) {
+    exec_expect_one_row(
+        dsn,
+        "session_completed_out_from_under",
+        &format!(
+            "UPDATE multipart_uploads SET state = 'completed', complete_result = NULL, \
+             lease_owner = NULL, lease_until = NULL WHERE upload_id = {} AND state = 'completing'",
+            uuid_blob(upload_id)
+        ),
+    )
+    .await;
+}
+
+async fn tamper_rebind_content(dsn: &str, file_id: Uuid, new_content_id: Uuid) {
+    exec_expect_one_row(
+        dsn,
+        "rebind_content",
+        &format!(
+            "UPDATE files SET content_id = {} WHERE file_id = {}",
+            uuid_blob(new_content_id),
+            uuid_blob(file_id)
+        ),
+    )
+    .await;
+}
+
+struct SessionCasRaceStore {
+    inner: Arc<dyn MultipartStore>,
+    dsn: String,
+    rebind_content_id: Uuid,
+    armed: AtomicBool,
+}
+
+#[async_trait]
+impl MultipartStore for SessionCasRaceStore {
+    async fn require_file(&self, scope: &AccessScope, file_id: Uuid) -> Result<File, DomainError> {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            tamper_rebind_content(&self.dsn, file_id, self.rebind_content_id).await;
+        }
+        self.inner.require_file(scope, file_id).await
+    }
+
+    async fn get_policy(
+        &self,
+        scope: &AccessScope,
+        tenant_id: Uuid,
+        policy_scope: &PolicyScope,
+        scope_owner_id: Option<Uuid>,
+    ) -> Result<Option<StoredPolicy>, DomainError> {
+        self.inner
+            .get_policy(scope, tenant_id, policy_scope, scope_owner_id)
+            .await
+    }
+
+    async fn insert_pending_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        mime_type: &str,
+        backend_id: &str,
+        backend_path: &str,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .insert_pending_version(
+                file_id,
+                version_id,
+                mime_type,
+                backend_id,
+                backend_path,
+                now,
+            )
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn create_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        file_id: Uuid,
+        version_id: Uuid,
+        backend_upload_handle: &str,
+        backend_id: &str,
+        backend_path: &str,
+        declared_mime: &str,
+        declared_size: u64,
+        part_size: u64,
+        auto_bind: bool,
+        expires_at: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .create_multipart_upload(
+                upload_id,
+                file_id,
+                version_id,
+                backend_upload_handle,
+                backend_id,
+                backend_path,
+                declared_mime,
+                declared_size,
+                part_size,
+                auto_bind,
+                expires_at,
+                now,
+            )
+            .await
+    }
+
+    async fn get_multipart_upload(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Option<MultipartUploadSession>, DomainError> {
+        self.inner.get_multipart_upload(upload_id).await
+    }
+
+    async fn get_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> Result<Option<FileVersion>, DomainError> {
+        self.inner.get_version(file_id, version_id).await
+    }
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError> {
+        self.inner.get_version_manifest(version_id).await
+    }
+
+    async fn upsert_multipart_part(
+        &self,
+        upload_id: Uuid,
+        part_number: i32,
+        backend_etag: &str,
+        part_hash: Vec<u8>,
+        size: i64,
+        now: OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        self.inner
+            .upsert_multipart_part(upload_id, part_number, backend_etag, part_hash, size, now)
+            .await
+    }
+
+    async fn list_multipart_parts(
+        &self,
+        upload_id: Uuid,
+    ) -> Result<Vec<MultipartPart>, DomainError> {
+        self.inner.list_multipart_parts(upload_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        size: i64,
+        hash_value: Vec<u8>,
+        hash_mode: HashMode,
+        part_count: Option<i32>,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError> {
+        self.inner
+            .finalize_version(
+                file_id,
+                version_id,
+                size,
+                hash_value,
+                hash_mode,
+                part_count,
+                manifest,
+                validated_mime,
+                audit,
+                auto_bind,
+            )
+            .await
+    }
+
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError> {
+        tamper_session_to_completed_out_from_under(&self.dsn, finish.upload_id).await;
+        self.armed.store(true, Ordering::SeqCst);
+        self.inner
+            .finalize_multipart_version(
+                file_id,
+                manifest,
+                validated_mime,
+                finalize_audit,
+                auto_bind,
+                finish,
+            )
+            .await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .complete_multipart_upload(upload_id, lease_owner, result_json, audit)
+            .await
+    }
+
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .acquire_multipart_complete_lease(upload_id, owner, lease_until, now)
+            .await
+    }
+
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .release_multipart_complete_lease(upload_id, owner)
+            .await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        upload_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.abort_multipart_upload(upload_id, audit).await
+    }
+
+    async fn delete_version(
+        &self,
+        file_id: Uuid,
+        version_id: Uuid,
+        audit: AuditEntry,
+    ) -> Result<bool, DomainError> {
+        self.inner.delete_version(file_id, version_id, audit).await
+    }
+
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
+    ) -> Result<bool, DomainError> {
+        self.inner
+            .delete_orphan_file_with_event(file_id, audit, event)
+            .await
+    }
+}
+
+#[tokio::test]
+async fn complete_multipart_upload_unknown_upload_id_is_not_found() {
+    let env = build_env().await;
+    let file_id = env
+        .svc
+        .create_file(&env.ctx, new_file("upload.bin"), None, false)
+        .await
+        .unwrap()
+        .file_id;
+
+    let bogus_upload_id = Uuid::now_v7();
+    let err = env
+        .try_complete(file_id, bogus_upload_id, None)
+        .await
+        .expect_err("an unknown upload_id must never succeed");
+    match err {
+        DomainError::MultipartUploadNotFound { upload_id } => {
+            assert_eq!(upload_id, bogus_upload_id);
+        }
+        other => panic!("expected MultipartUploadNotFound, got {other:?}"),
+    }
 }
 
 /// With the snapshot wiped, `replay_completed` rebuilds the result from the version row: every
@@ -198,6 +543,249 @@ async fn replay_completed_fallback_of_a_manual_session_stays_manual_after_manual
     assert_eq!(replay.bind_state, BindState::Manual);
     assert_eq!(replay.etag, None);
     assert_eq!(replay.current_etag, None);
+}
+
+/// Snapshot wiped AND the version row mutated: each row must fail with its own error.
+#[tokio::test]
+async fn replay_completed_fallback_errors_on_unusable_version_row() {
+    enum Tamper {
+        DeleteRow,
+        MarkPending,
+        BogusHashMode,
+    }
+    for (row, tamper) in [
+        ("version row is gone", Tamper::DeleteRow),
+        ("version not available", Tamper::MarkPending),
+        ("unrecognized hash mode", Tamper::BogusHashMode),
+    ] {
+        let env = build_env().await;
+        let (file_id, plan) = env.session_with_part(b"AAAAA", false).await;
+        env.complete(file_id, plan.upload_id).await;
+
+        null_complete_result(&env.dsn, plan.upload_id).await;
+        let version = uuid_blob(plan.version_id);
+        match tamper {
+            Tamper::DeleteRow => {
+                exec_expect_one_row(
+                    &env.dsn,
+                    "delete_version_row",
+                    &format!("DELETE FROM file_versions WHERE version_id = {version}"),
+                )
+                .await;
+            }
+            Tamper::MarkPending => {
+                exec_expect_one_row(
+                    &env.dsn,
+                    "mark_version_pending",
+                    &format!(
+                        "UPDATE file_versions SET status = 'pending' WHERE version_id = {version}"
+                    ),
+                )
+                .await;
+            }
+            Tamper::BogusHashMode => {
+                set_hash_mode_bypassing_check(&env.dsn, plan.version_id, "bogus-mode").await;
+            }
+        }
+
+        let err = env
+            .try_complete(file_id, plan.upload_id, None)
+            .await
+            .expect_err(&format!("{row}: replay must fail"));
+        match (tamper, err) {
+            (
+                Tamper::DeleteRow,
+                DomainError::VersionNotFound {
+                    file_id: f,
+                    version_id: v,
+                },
+            ) => {
+                assert_eq!(f, file_id, "{row}");
+                assert_eq!(v, plan.version_id, "{row}");
+            }
+            (
+                Tamper::MarkPending,
+                DomainError::MultipartUploadNotInProgress { upload_id, state },
+            ) => {
+                assert_eq!(upload_id, plan.upload_id, "{row}");
+                assert_eq!(
+                    state, "completed",
+                    "{row}: reported state is the SESSION's own state"
+                );
+            }
+            (Tamper::BogusHashMode, DomainError::Database { .. }) => {}
+            (_, other) => panic!("{row}: unexpected error {other:?}"),
+        }
+    }
+}
+
+/// A session completed (and auto-bound) before the file was rebound to another version: a bind won
+/// at finalize is sticky, so both the persisted snapshot and the version-row fallback (snapshot
+/// wiped, `bound_on_finalize` read from the version) keep reporting `Bound` with the original ETag.
+#[tokio::test]
+async fn replay_after_a_later_rebind_keeps_reporting_the_won_bind() {
+    let env = build_env().await;
+    let (file_id, plan_a, completed_a, _plan_b) = env.bound_a_then_rebound_to_b().await;
+    let original_etag = completed_a
+        .etag
+        .clone()
+        .expect("a Bound completion must carry an etag");
+
+    let from_snapshot = env
+        .try_complete(file_id, plan_a.upload_id, None)
+        .await
+        .expect("idempotent re-complete after a later rebind must still succeed");
+    assert_eq!(from_snapshot.bind_state, BindState::Bound);
+    assert_eq!(
+        from_snapshot.etag.as_deref(),
+        Some(original_etag.as_str()),
+        "the snapshot must report the ORIGINAL etag, not one derived from B's current bind"
+    );
+    assert_eq!(from_snapshot.version_id, plan_a.version_id);
+
+    null_complete_result(&env.dsn, plan_a.upload_id).await;
+    let from_row = env
+        .try_complete(file_id, plan_a.upload_id, None)
+        .await
+        .expect("fallback replay after an external rebind must still succeed");
+    assert_eq!(from_row.bind_state, BindState::Bound);
+    assert_eq!(from_row.etag.as_deref(), Some(original_etag.as_str()));
+    assert_eq!(from_row.current_etag, None);
+}
+
+#[tokio::test]
+async fn complete_reports_transaction_bind_outcome_when_own_session_cas_is_lost() {
+    let stack = StackBuilder::new("mp-replay").build().await;
+    let raced_store: Arc<dyn MultipartStore> = Arc::new(SessionCasRaceStore {
+        inner: Arc::clone(&stack.multipart_store),
+        dsn: stack.dsn.clone(),
+        // Stands in for "some other, unrelated version" -- never dereferenced as a real row, only
+        // ever compared against by `bind_state_for` on the (buggy) fallback path.
+        rebind_content_id: Uuid::now_v7(),
+        armed: AtomicBool::new(false),
+    });
+    let msvc = Arc::new(
+        stack
+            .multipart_service_over(Arc::clone(&raced_store))
+            .with_complete_lease_secs(90),
+    );
+    let (svc, backend, real_multipart_store) = (
+        Arc::clone(&stack.svc),
+        Arc::clone(&stack.backend),
+        Arc::clone(&stack.multipart_store),
+    );
+    let ctx = ctx(Uuid::now_v7());
+    let file_id = svc
+        .create_file(&ctx, new_file("upload.bin"), None, false)
+        .await
+        .unwrap()
+        .file_id;
+
+    // auto_bind: the finalize's own auto-bind CAS is what must win authoritatively.
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, file_id, "application/octet-stream", 13, None, true)
+        .await
+        .unwrap();
+    put_part(
+        &real_multipart_store,
+        &backend,
+        &plan,
+        file_id,
+        1,
+        Bytes::from_static(b"Hello, World!"),
+    )
+    .await;
+
+    let completed = msvc
+        .complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .expect("finalize won its own CAS -- session_completed==false must still succeed")
+        .unwrap_completed();
+
+    assert_eq!(
+        completed.bind_state,
+        BindState::Bound,
+        "must report THIS transaction's own auto-bind decision, not a live recompute"
+    );
+    assert_eq!(
+        completed.etag.as_deref(),
+        Some(etag::content_etag(file_id, plan.version_id).as_str()),
+        "must carry this version's own content etag"
+    );
+    assert_eq!(completed.current_etag, None);
+
+    let file = svc.get_file(&ctx, file_id).await.expect("file");
+    assert_eq!(
+        file.content_id,
+        Some(plan.version_id),
+        "the file must really be bound to this version -- the rebind tamper never fired"
+    );
+}
+
+#[tokio::test]
+async fn replay_completed_snapshot_404s_when_its_composite_version_is_deleted() {
+    let env = build_env().await;
+    let file_id = env
+        .svc
+        .create_file(&env.ctx, new_file("upload.bin"), None, false)
+        .await
+        .unwrap()
+        .file_id;
+
+    let part_size = 5 * 1024 * 1024usize;
+    let part1 = vec![b'a'; part_size];
+    let part2 = vec![b'b'; 4096];
+    let declared_size = (part1.len() + part2.len()) as u64;
+    let plan = env
+        .msvc
+        .initiate_multipart_upload(
+            &env.ctx,
+            file_id,
+            "application/octet-stream",
+            declared_size,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+    for (n, part) in [(1, part1), (2, part2)] {
+        put_part(
+            &env.multipart_store,
+            &env.backend,
+            &plan,
+            file_id,
+            n,
+            Bytes::from(part),
+        )
+        .await;
+    }
+
+    env.complete(file_id, plan.upload_id).await;
+    exec_expect_one_row(
+        &env.dsn,
+        "delete_version_row",
+        &format!(
+            "DELETE FROM file_versions WHERE version_id = {}",
+            uuid_blob(plan.version_id)
+        ),
+    )
+    .await;
+
+    // The persisted snapshot is still there, but its version is gone -- must 404, never a response with `manifest: null`.
+    let err = env
+        .try_complete(file_id, plan.upload_id, None)
+        .await
+        .expect_err("replay of a completed session whose version was since deleted must fail");
+    match err {
+        DomainError::VersionNotFound {
+            file_id: f,
+            version_id: v,
+        } => {
+            assert_eq!(f, file_id);
+            assert_eq!(v, plan.version_id);
+        }
+        other => panic!("expected VersionNotFound, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -462,6 +1050,69 @@ async fn legacy_idempotency_ticket_without_auto_bind_replays_manual() {
         assert!(
             !claims.bind_on_finalize,
             "a legacy ticket is replayed in manual mode"
+        );
+    }
+}
+
+/// FS-06: `complete` replays a `completed` session before it evaluates `If-Match`, so an honest
+/// retry gets the persisted result whether it carries the now-stale precondition (F4) or none (the
+/// negative control).
+#[tokio::test]
+async fn fs06_completed_retry_replays_with_or_without_stale_if_match() {
+    let env = build_env().await;
+    let dp = DataPlaneService::new(Arc::clone(&env.svc) as Arc<dyn DataPlanePort>);
+
+    let ticket = env
+        .svc
+        .create_file(&env.ctx, new_file("drift.bin"), None, false)
+        .await
+        .expect("create_file");
+    dp.put_content(
+        &env.ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(b"initial content"),
+    )
+    .await
+    .expect("put_content");
+    let bound = env
+        .svc
+        .bind(&env.ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .expect("bind initial content");
+    let etag_of_initial_content = etag::etag_for(&bound).expect("bound file must have an etag");
+
+    let plan = env
+        .add_session_with_part(ticket.file_id, b"0123456789", true)
+        .await;
+    let completed_first = env
+        .try_complete(
+            ticket.file_id,
+            plan.upload_id,
+            Some(&etag_of_initial_content),
+        )
+        .await
+        .expect("first complete: If-Match matches the initial content pointer");
+    assert_eq!(completed_first.bind_state, BindState::Bound);
+
+    // The first complete moved the file's ETag, so the first row's If-Match is now stale.
+    for (row, if_match) in [
+        (
+            "retry with stale If-Match",
+            Some(etag_of_initial_content.as_str()),
+        ),
+        ("retry without If-Match", None),
+    ] {
+        let retry = env
+            .try_complete(ticket.file_id, plan.upload_id, if_match)
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{row}: a retry against an already-Completed session must replay: {e:?}")
+            });
+        assert_eq!(
+            retry.version_id, completed_first.version_id,
+            "{row}: the replayed result must match the original completion"
         );
     }
 }

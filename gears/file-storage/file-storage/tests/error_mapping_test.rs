@@ -153,36 +153,6 @@ fn error_domain_error_maps_to_expected_http_status() {
     }
 }
 
-/// Route declarations in `routes.rs` checked against the same status constants (hand-synced).
-#[test]
-fn declared_routes_match_the_pinned_status_table() {
-    let precondition_failed_expected = expected_status(&DomainError::PreconditionFailed {
-        message: "x".into(),
-    });
-    let multipart_not_supported_expected = expected_status(&DomainError::MultipartNotSupported {
-        backend_id: "x".into(),
-    });
-
-    let declared_routes: Vec<(&str, u16)> = vec![
-        // POST /files/{id}/bind: If-Match/CAS precondition failure.
-        ("file_storage.bind", precondition_failed_expected),
-        // DELETE /files/{id}: If-Match required, mismatch/absent.
-        ("file_storage.delete_file", precondition_failed_expected),
-        // POST /files/{id}/multipart: MultipartNotSupported (no variant maps to 422).
-        (
-            "file_storage.initiate_multipart",
-            multipart_not_supported_expected,
-        ),
-    ];
-
-    for (operation_id, declared_status) in declared_routes {
-        assert_eq!(
-            declared_status, 400,
-            "{operation_id}'s declared route status must be 400 per the 2.5 fix"
-        );
-    }
-}
-
 /// A transient backend failure is a `503` carrying `Retry-After: 5` on the wire.
 #[test]
 fn backend_unavailable_maps_to_503_with_retry_after() {

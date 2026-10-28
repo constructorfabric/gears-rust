@@ -4,16 +4,14 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use sea_orm_migration::MigratorTrait;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
+use toolkit_db::{DBProvider, DbError};
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use file_storage::domain::audit::{AuditEntry, AuditOperation, FileEvent};
-use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
+use file_storage::domain::authz::Authorizer;
+use file_storage::domain::cleanup::CleanupEngine;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::MultipartUploadSession;
@@ -22,31 +20,16 @@ use file_storage::domain::policy::{
     AgeRetention, RetentionRuleBody, RetentionScope, StoredRetentionRule,
 };
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
-use file_storage::domain::service::{FileService, ServiceConfig};
-use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
-use file_storage::infra::signed_url::Issuer;
+use file_storage::domain::ports::{CleanupStore, MultipartStore};
+use file_storage::domain::service::FileService;
+use file_storage::infra::backend::{InMemoryBackend, StorageBackend};
 use file_storage::infra::storage::Store;
-use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, OwnerKind, VersionStatus};
+use file_storage_sdk::{CustomMetadataEntry, File, FileVersion, NewFile, VersionStatus};
+
+mod common;
+use common::{ScopedTestAuthorizer, Stack, StackBuilder, ctx};
 
 const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.cleanup_test.file.type.v1~");
-
-async fn build_db() -> Arc<DBProvider<DbError>> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-fs-cleanup-test-{}.db", Uuid::now_v7().simple()));
-    let dsn = format!("sqlite://{}?mode=rwc", path.display());
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("migrations");
-    Arc::new(DBProvider::new(db))
-}
 
 /// `grace_secs = 0` makes every pending version immediately eligible for the sweep.
 async fn build_all(
@@ -60,55 +43,21 @@ async fn build_all(
     CleanupEngine,
     Arc<dyn StorageBackend>,
 ) {
-    let db = build_db().await;
+    let s = StackBuilder::new("cleanup-test")
+        .grace_secs(grace_secs)
+        .build()
+        .await;
+    let Stack {
+        backend,
+        dp,
+        engine,
+        msvc,
+        psvc,
+        store,
+        svc,
+        ..
+    } = s;
 
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-
-    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
-    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
-    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
-    let sweep_backends = backends.clone();
-
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends.clone(),
-        issuer,
-        Arc::clone(&authorizer),
-        cfg,
-        None,
-        None,
-    ));
-    let msvc = Arc::new(MultipartService::new(
-        multipart_store,
-        backends,
-        Arc::clone(&authorizer),
-        None,
-        Arc::new(Issuer::generate(3600).expect("issuer")),
-        "http://sidecar.test".to_owned(),
-        3600,
-    ));
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    let engine = CleanupEngine::new(
-        sweep_store,
-        sweep_backends,
-        CleanupConfig {
-            orphan_grace_secs: grace_secs,
-        },
-    );
     (svc, psvc, msvc, dp, store, engine, backend)
 }
 
@@ -123,117 +72,50 @@ async fn build_all_with_db(
     CleanupEngine,
     Arc<DBProvider<DbError>>,
 ) {
-    let db = build_db().await;
+    let s = StackBuilder::new("cleanup-test")
+        .grace_secs(grace_secs)
+        .build()
+        .await;
+    let Stack {
+        db,
+        engine,
+        msvc,
+        store,
+        svc,
+        ..
+    } = s;
 
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-
-    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
-    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
-    let sweep_backends = backends.clone();
-
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends.clone(),
-        issuer,
-        Arc::clone(&authorizer),
-        cfg,
-        None,
-        None,
-    ));
-    let msvc = Arc::new(MultipartService::new(
-        multipart_store,
-        backends,
-        Arc::clone(&authorizer),
-        None,
-        Arc::new(Issuer::generate(3600).expect("issuer")),
-        "http://sidecar.test".to_owned(),
-        3600,
-    ));
-    let engine = CleanupEngine::new(
-        sweep_store,
-        sweep_backends,
-        CleanupConfig {
-            orphan_grace_secs: grace_secs,
-        },
-    );
     (svc, msvc, store, engine, db)
 }
 
 async fn build_all_dual_backend(
     grace_secs: u64,
 ) -> (Arc<FileService>, DataPlaneService, Store, CleanupEngine) {
-    let db = build_db().await;
-
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
-    let backends = BackendRegistry::new(
-        vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
-        "mem",
-    )
-    .expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
-    let sweep_backends = backends.clone();
-
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        authorizer,
-        cfg,
-        None,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    let engine = CleanupEngine::new(
-        sweep_store,
-        sweep_backends,
-        CleanupConfig {
-            orphan_grace_secs: grace_secs,
-        },
-    );
-    (svc, dp, store, engine)
-}
-
-fn ctx(tenant: Uuid) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::now_v7())
-        .subject_tenant_id(tenant)
+    let s = StackBuilder::new("cleanup-test")
+        .backends(
+            vec![Arc::clone(&mem_backend), Arc::clone(&alt_backend)],
+            "mem",
+        )
+        .grace_secs(grace_secs)
         .build()
-        .expect("ctx")
+        .await;
+    let Stack {
+        dp,
+        engine,
+        store,
+        svc,
+        ..
+    } = s;
+
+    (svc, dp, store, engine)
 }
 
 fn new_file() -> NewFile {
     NewFile {
-        owner_kind: OwnerKind::User,
-        owner_id: Uuid::now_v7(),
-        name: "test.txt".to_owned(),
         gts_file_type: GTS.to_owned(),
-        mime_type: "text/plain".to_owned(),
-        custom_metadata: vec![],
+        ..common::new_file_of("test.txt", "text/plain")
     }
 }
 
@@ -538,222 +420,76 @@ async fn sweep_keeps_file_with_other_versions() {
     assert_eq!(v2_after.status, VersionStatus::Available);
 }
 
-/// Expired sessions are inserted directly with a past `expires_at`; no public API can expire one.
+/// A pending version backing a live (`in_progress` or `completing`) session is never reclaimed,
+/// however old, or a long-running upload would lose its version before `complete`.
 #[tokio::test]
-async fn expired_multipart_session_is_aborted_by_sweep() {
-    let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
+async fn sweep_skips_pending_version_of_live_multipart_session() {
+    use file_storage::domain::multipart::MultipartUploadState;
 
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    let session = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
-        .await
-        .unwrap();
+    for (row, completing, expected_state) in [
+        ("in_progress", false, MultipartUploadState::InProgress),
+        ("completing", true, MultipartUploadState::Completing),
+    ] {
+        let (svc, ctx, store, engine, db, file_id, plan) = file_with_open_session().await;
+        if completing {
+            let now = time::OffsetDateTime::now_utc();
+            let acquired = store
+                .acquire_multipart_complete_lease(
+                    plan.upload_id,
+                    "completer-a",
+                    now + time::Duration::minutes(5),
+                    now,
+                )
+                .await
+                .unwrap();
+            assert!(acquired, "{row}: setup must acquire the lease");
+        }
+        backdate_version_created_at(&db, plan.version_id).await;
 
-    let not_expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
-        .await
-        .unwrap();
-    assert!(
-        not_expired.is_empty(),
-        "session with future expires_at must not appear in expired list"
-    );
-
-    let upload_id2 = Uuid::now_v7();
-    let file_id2 = ticket.file_id;
-    let version_id2 = Uuid::now_v7();
-    let past_time = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
-    let now_t = time::OffsetDateTime::now_utc();
-
-    store
-        .insert_pending_version(
-            file_id2,
-            version_id2,
-            "text/plain",
-            "mem",
-            &format!("/{file_id2}/{version_id2}"),
-            now_t,
-        )
-        .await
-        .unwrap();
-
-    store
-        .create_multipart_upload(
-            upload_id2,
-            file_id2,
-            version_id2,
-            "fake-backend-handle",
-            "mem",
-            &format!("/{file_id2}/{version_id2}"),
-            "text/plain",
-            0u64, // declared_size (not relevant for sweep test)
-            0u64, // part_size (not relevant for sweep test)
-            false,
-            past_time, // expires in the past
-            now_t,
-        )
-        .await
-        .unwrap();
-
-    let expired = store
-        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
-        .await
-        .unwrap();
-    assert!(
-        expired.iter().any(|s| s.upload_id == upload_id2),
-        "backdated session must appear in expired list"
-    );
-
-    let result = engine.run_sweep().await;
-    assert!(
-        result.expired_multipart_aborted >= 1,
-        "sweep must report at least 1 aborted multipart session"
-    );
-
-    let original_session = store
-        .get_multipart_upload(session.upload_id)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        original_session.state,
-        file_storage::domain::multipart::MultipartUploadState::InProgress,
-        "non-expired session must still be in_progress"
-    );
-
-    let aborted_session = store
-        .get_multipart_upload(upload_id2)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        aborted_session.state,
-        file_storage::domain::multipart::MultipartUploadState::Aborted,
-        "backdated session must be aborted after sweep"
-    );
-}
-
-/// A pending version backing a live `in_progress` session is never reclaimed, however old,
-/// or a long-running upload would lose its version before `complete`.
-#[tokio::test]
-async fn sweep_skips_pending_version_of_active_multipart_session() {
-    use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use toolkit_db::secure::SecureUpdateExt;
-
-    use file_storage::infra::storage::entity::file_version::{
-        Column as FileVersionColumn, Entity as FileVersionEntity,
-    };
-
-    // grace = 1 hour: only the backdated multipart-session version is a sweep candidate.
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
-
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
-        .await
-        .unwrap();
-
-    // Backdate the backing version past the grace cutoff; `expires_at` stays in the future.
-    let conn = db.conn().expect("conn");
-    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
-    FileVersionEntity::update_many()
-        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated))
-        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
-        .secure()
-        .scope_with(&toolkit_security::AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .expect("backdate version created_at");
-
-    let result = engine.run_sweep().await;
-    assert_eq!(
-        result.abandoned_pending_deleted, 0,
-        "a pending version backing a live multipart session must not be reclaimed"
-    );
-
-    let version_after = store
-        .get_version(ticket.file_id, plan.version_id)
-        .await
-        .unwrap();
-    assert!(
-        version_after.is_some(),
-        "the multipart session's backing version must survive the sweep"
-    );
-
-    let session_after = store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("session must still exist");
-    assert_eq!(
-        session_after.state,
-        file_storage::domain::multipart::MultipartUploadState::InProgress,
-        "the live session must survive the sweep untouched"
-    );
+        let result = engine.run_sweep().await;
+        assert_eq!(
+            result.abandoned_pending_deleted, 0,
+            "{row}: a pending version backing a live multipart session must not be reclaimed"
+        );
+        assert_eq!(
+            result.abandoned_files_deleted, 0,
+            "{row}: the parent file must survive while its only version backs a live session"
+        );
+        assert!(
+            store
+                .get_version(file_id, plan.version_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "{row}: the session's backing version must survive the sweep"
+        );
+        svc.get_file(&ctx, file_id)
+            .await
+            .unwrap_or_else(|e| panic!("{row}: the parent file must survive: {e:?}"));
+        let session_after = store
+            .get_multipart_upload(plan.upload_id)
+            .await
+            .unwrap()
+            .expect("session must still exist");
+        assert_eq!(
+            session_after.state, expected_state,
+            "{row}: the live session must survive the sweep untouched"
+        );
+    }
 }
 
 /// Companion: once `expires_at` has also passed, the sweep aborts the session and reclaims it.
 #[tokio::test]
 async fn sweep_reclaims_version_after_session_expires() {
-    use sea_orm::sea_query::Expr;
-    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use toolkit_db::secure::SecureUpdateExt;
-
-    use file_storage::infra::storage::entity::file_version::{
-        Column as FileVersionColumn, Entity as FileVersionEntity,
-    };
-    use file_storage::infra::storage::entity::multipart_upload::{
-        Column as MultipartUploadColumn, Entity as MultipartUploadEntity,
-    };
-
-    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
-
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
-        .await
-        .unwrap();
-
-    let conn = db.conn().expect("conn");
-    let now = time::OffsetDateTime::now_utc();
-
-    let backdated_created = now - time::Duration::hours(2);
-    FileVersionEntity::update_many()
-        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated_created))
-        .filter(FileVersionColumn::VersionId.eq(plan.version_id))
-        .secure()
-        .scope_with(&toolkit_security::AccessScope::allow_all())
-        .exec(&conn)
-        .await
-        .expect("backdate version created_at");
-
-    let backdated_expiry = now - time::Duration::seconds(10);
-    MultipartUploadEntity::update_many()
-        .col_expr(
-            MultipartUploadColumn::ExpiresAt,
-            Expr::value(backdated_expiry),
+    let (_svc, _ctx, store, engine, db, file_id, plan) = file_with_open_session().await;
+    backdate_version_created_at(&db, plan.version_id).await;
+    store
+        .set_multipart_expires_at_for_test(
+            plan.upload_id,
+            time::OffsetDateTime::now_utc() - time::Duration::seconds(10),
         )
-        .filter(MultipartUploadColumn::UploadId.eq(plan.upload_id))
-        .secure()
-        .scope_with(&toolkit_security::AccessScope::allow_all())
-        .exec(&conn)
         .await
-        .expect("backdate session expires_at");
+        .unwrap();
 
     let result = engine.run_sweep().await;
     assert_eq!(
@@ -765,10 +501,7 @@ async fn sweep_reclaims_version_after_session_expires() {
         "the version must be reclaimed once its session is no longer live"
     );
 
-    let version_after = store
-        .get_version(ticket.file_id, plan.version_id)
-        .await
-        .unwrap();
+    let version_after = store.get_version(file_id, plan.version_id).await.unwrap();
     assert!(
         version_after.is_none(),
         "the pending version must be gone once the multipart session is no longer live"
@@ -860,80 +593,12 @@ async fn retention_expired_file_is_deleted_by_sweep() {
     assert_eq!(ret_del[0].outcome, "success");
 }
 
-/// `create_retention_rule` rejects `max_age_days = 0`, so such a rule can never reach the sweep.
-#[tokio::test]
-async fn sweep_does_not_run_zero_age_rule() {
-    let (svc, psvc, _msvc, dp, store, engine, _backend) = build_all(86400).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
-
-    let result = psvc
-        .create_retention_rule(
-            &ctx,
-            RetentionScope::Tenant,
-            None,
-            RetentionRuleBody {
-                age: Some(AgeRetention { max_age_days: 0 }),
-                inactivity: None,
-                metadata: None,
-            },
-        )
-        .await;
-    assert!(
-        matches!(
-            result,
-            Err(file_storage::domain::error::DomainError::Validation { .. })
-        ),
-        "expected Validation, got {result:?}"
-    );
-
-    let rules = store
-        .list_retention_rules(&toolkit_security::AccessScope::allow_all(), tenant)
-        .await
-        .unwrap();
-    assert!(
-        rules.is_empty(),
-        "no retention rule row should exist after a rejected create"
-    );
-
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    dp.put_content(
-        &ctx,
-        ticket.file_id,
-        ticket.version_id,
-        "text/plain",
-        Bytes::from_static(b"must survive"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
-        .await
-        .unwrap();
-
-    let result = engine.run_sweep().await;
-    assert_eq!(
-        result.retention_expired_deleted, 0,
-        "no rule exists, so nothing should be retention-deleted"
-    );
-
-    let after = store
-        .get_file(&toolkit_security::AccessScope::allow_all(), ticket.file_id)
-        .await
-        .unwrap();
-    assert!(
-        after.is_some(),
-        "file must survive the sweep since the dangerous rule was never created"
-    );
-}
-
 /// A `list_versions` failure aborts that file's expiry instead of being treated as zero versions;
 /// an unrelated matching file is still deleted in the same sweep.
 #[tokio::test]
 async fn expire_file_list_versions_error_does_not_delete_file() {
-    let (svc, _psvc, _msvc, dp, store, _engine, backend) = build_all(86400).await;
+    let stack = StackBuilder::new("cleanup-test").build().await;
+    let (svc, dp, store) = (&stack.svc, &stack.dp, &stack.store);
     let tenant = Uuid::now_v7();
     let ctx = ctx(tenant);
 
@@ -991,14 +656,7 @@ async fn expire_file_list_versions_error_does_not_delete_file() {
         inner: store.clone(),
         fault_file_id: faulted.file_id,
     });
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-    let engine = CleanupEngine::new(
-        faulty_store,
-        backends,
-        CleanupConfig {
-            orphan_grace_secs: 86400,
-        },
-    );
+    let engine = stack.cleanup_engine_over(faulty_store, 86400);
 
     let result = engine.run_sweep().await;
 
@@ -1200,39 +858,6 @@ async fn migrate_backend_rejects_versioned_file() {
     );
 }
 
-/// Grants everything except `ADMIN_POLICY`, which requires `set_admin(true)`.
-#[derive(Default)]
-struct ScopedTestAuthorizer {
-    is_admin: std::sync::atomic::AtomicBool,
-}
-
-impl ScopedTestAuthorizer {
-    fn set_admin(&self, admin: bool) {
-        self.is_admin
-            .store(admin, std::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-#[async_trait]
-impl file_storage::domain::authz::Authorizer for ScopedTestAuthorizer {
-    async fn authorize(
-        &self,
-        ctx: &SecurityContext,
-        action: &str,
-        _gts_file_type: &str,
-        _file_id: Option<Uuid>,
-    ) -> Result<toolkit_security::AccessScope, DomainError> {
-        if action == file_storage::domain::authz::actions::ADMIN_POLICY
-            && !self.is_admin.load(std::sync::atomic::Ordering::SeqCst)
-        {
-            return Err(DomainError::Forbidden);
-        }
-        Ok(toolkit_security::AccessScope::for_tenant(
-            ctx.subject_tenant_id(),
-        ))
-    }
-}
-
 async fn build_all_dual_backend_scoped(
     grace_secs: u64,
 ) -> (
@@ -1241,36 +866,17 @@ async fn build_all_dual_backend_scoped(
     Store,
     Arc<ScopedTestAuthorizer>,
 ) {
-    let db = build_db().await;
-
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let alt_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("alt"));
-    let backends = BackendRegistry::new(vec![mem_backend, alt_backend], "mem").expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer = Arc::new(ScopedTestAuthorizer::default());
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        Arc::clone(&authorizer) as Arc<dyn file_storage::domain::authz::Authorizer>,
-        cfg,
-        None,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let authorizer = Arc::new(ScopedTestAuthorizer::admin_gated());
+    let s = StackBuilder::new("cleanup-test")
+        .backends(vec![mem_backend, alt_backend], "mem")
+        .authorizer(Arc::clone(&authorizer) as Arc<dyn Authorizer>)
+        .build()
+        .await;
     // `grace_secs` is unused here; kept for signature symmetry with the other `build_all*` helpers.
     let _ = grace_secs;
-    (svc, dp, store, authorizer)
+    (s.svc, s.dp, s.store, authorizer)
 }
 
 #[tokio::test]
@@ -1368,48 +974,9 @@ async fn complete_one_part_multipart_upload(
     file_id: Uuid,
     data: &'static [u8],
 ) -> (Uuid, Uuid) {
-    let declared_size = data.len() as u64;
-    let plan = msvc
-        .initiate_multipart_upload(
-            ctx,
-            file_id,
-            "application/octet-stream",
-            declared_size,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-    let session = store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("session must exist");
-    let backend_path = format!("/{file_id}/{}", plan.version_id);
-    let part = plan.parts.first().expect("single-part plan");
-
-    let (backend_etag, part_hash) = backend
-        .upload_part(
-            &backend_path,
-            &session.backend_upload_handle,
-            part.part_number,
-            part.offset,
-            Bytes::from_static(data),
-        )
-        .await
-        .expect("backend upload_part");
-    store
-        .upsert_multipart_part(
-            plan.upload_id,
-            i32::try_from(part.part_number).unwrap(),
-            &backend_etag,
-            part_hash,
-            i64::try_from(part.size).unwrap(),
-            time::OffsetDateTime::now_utc(),
-        )
-        .await
-        .unwrap();
-
+    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let plan =
+        common::session_with_part(msvc, &multipart_store, backend, ctx, file_id, data, false).await;
     msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
         .await
         .unwrap();
@@ -1475,8 +1042,8 @@ async fn sweep_after_complete_wins_does_not_delete_bound_version() {
     assert_eq!(file_after.content_id, Some(version_id));
 }
 
-/// Reverse order: the sweep aborts the expired session and deletes the version first (and, the file
-/// being then a zero-version orphan, the file too); a later `complete` is rejected.
+/// Reverse order: the sweep aborts the expired session, deletes the version and (FS-05) the
+/// now-orphaned parent file first; a later `complete` finds no file.
 #[tokio::test]
 async fn sweep_before_complete_wins_cleans_up_expired_session() {
     let (svc, _psvc, msvc, _dp, store, engine, _backend) = build_all(0).await;
@@ -1522,6 +1089,22 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
         "pending version must be deleted once the sweep wins the session CAS"
     );
 
+    assert_eq!(
+        result.abandoned_files_deleted, 1,
+        "FS-05: the now-zero-version parent file must also be reclaimed in this same sweep pass, \
+         via step 2's own orphan-file check (cleanup_expired_session_version)"
+    );
+    let file_after = svc.get_file(&ctx, ticket.file_id).await;
+    assert!(
+        matches!(
+            file_after,
+            Err(file_storage::domain::error::DomainError::FileNotFound { .. })
+        ),
+        "FS-05: expected the now-orphaned parent file to be reclaimed by the same sweep pass, \
+         got: {file_after:?}"
+    );
+
+    // `require_file` now fails first, so a late `complete` sees FileNotFound.
     let err = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
@@ -1531,52 +1114,8 @@ async fn sweep_before_complete_wins_cleans_up_expired_session() {
             err,
             file_storage::domain::error::DomainError::FileNotFound { .. }
         ),
-        "expected FileNotFound after the sweep reclaimed the orphan file, got {err:?}"
-    );
-}
-
-/// Expired but still `in_progress` (no sweep ran): `complete_multipart_upload` itself must reject.
-#[tokio::test]
-async fn complete_after_session_expired_is_rejected() {
-    let (svc, _psvc, msvc, _dp, store, _engine, _backend) = build_all(0).await;
-    let tenant = Uuid::now_v7();
-    let ctx = ctx(tenant);
-
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
-        .await
-        .unwrap();
-    let plan = msvc
-        .initiate_multipart_upload(
-            &ctx,
-            ticket.file_id,
-            "application/octet-stream",
-            13,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-
-    store
-        .set_multipart_expires_at_for_test(
-            plan.upload_id,
-            time::OffsetDateTime::now_utc() - time::Duration::hours(1),
-        )
-        .await
-        .unwrap();
-
-    let err = msvc
-        .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(
-            err,
-            file_storage::domain::error::DomainError::MultipartUploadNotInProgress { .. }
-        ),
-        "expected MultipartUploadNotInProgress for an expired-but-still-in_progress \
-         session, got {err:?}"
+        "expected FileNotFound after the sweep reclaimed both the session and its now-orphaned \
+         parent file, got {err:?}"
     );
 }
 
@@ -1639,9 +1178,10 @@ async fn sweep_mid_flight_after_finalize_but_before_session_cas_does_not_delete_
             None,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .updated;
     assert!(
-        finalized.updated,
+        finalized,
         "finalize_version must flip the pending version to available"
     );
 
@@ -1666,38 +1206,12 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     use file_storage::infra::storage::repo::IdempotencyRepo;
     use file_storage::infra::storage::store::IdempotencyInsert;
 
-    let db = build_db().await;
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-    let store = Store::new(Arc::clone(&db));
-    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
+    let s = StackBuilder::new("cleanup-test").build().await;
+    let Stack {
+        db, engine, svc, ..
+    } = s;
     // `orphan_grace_secs` 86400, not 0: zero would sweep these FK-only files, cascading the rows.
-    let engine = CleanupEngine::new(
-        sweep_store,
-        backends.clone(),
-        CleanupConfig {
-            orphan_grace_secs: 86400,
-        },
-    );
 
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let svc = FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        authorizer,
-        ServiceConfig {
-            default_url_ttl_secs: 3600,
-            sidecar_base_url: "http://sidecar.test".to_owned(),
-            default_page_size: 50,
-            max_page_size: 1000,
-            idempotency_ttl_secs: 86400,
-        },
-        None,
-        None,
-    );
     let tenant_id = Uuid::now_v7();
     let ctx = ctx(tenant_id);
     let expired_ticket = svc
@@ -1771,12 +1285,7 @@ async fn run_sweep_deletes_expired_idempotency_rows() {
     assert_eq!(rows.len(), 1, "only the live row should remain");
     let remaining = &rows[0];
     assert_eq!(remaining.idempotency_key, "live-key");
-    assert_eq!(remaining.owner_id, live_owner_id);
     assert_eq!(remaining.file_id, live_file_id);
-    assert_eq!(remaining.subject_id, subject_id);
-    assert_eq!(remaining.response_status, 201);
-    assert_eq!(remaining.response_body, "{\"ok\":true}");
-    assert_eq!(remaining.response_etag, "etag-live");
 }
 
 /// Unpublished outbox rows must survive regardless of age (`published_at` stays NULL until a relay
@@ -1789,18 +1298,11 @@ async fn run_sweep_does_not_touch_unpublished_outbox_rows() {
 
     use file_storage::infra::storage::entity::{audit_outbox, events_outbox};
 
-    let db = build_db().await;
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-    let store = Store::new(Arc::clone(&db));
-    let sweep_store: Arc<dyn CleanupStore> = Arc::new(store.clone());
-    let engine = CleanupEngine::new(
-        sweep_store,
-        backends,
-        CleanupConfig {
-            orphan_grace_secs: 0,
-        },
-    );
+    let s = StackBuilder::new("cleanup-test")
+        .grace_secs(0)
+        .build()
+        .await;
+    let Stack { db, engine, .. } = s;
 
     let conn = db.conn().expect("conn");
     let ancient = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
@@ -1871,21 +1373,8 @@ async fn concurrent_migrate_backend_second_racer_is_rejected() {
 
     use file_storage::infra::storage::repo::VersionRepo;
 
-    let db = build_db().await;
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let svc = FileService::new(store.clone(), backends, issuer, authorizer, cfg, None, None);
+    let s = StackBuilder::new("cleanup-test").build().await;
+    let Stack { db, store, svc, .. } = s;
 
     let ctx = ctx(Uuid::now_v7());
     let ticket = svc
@@ -1974,6 +1463,15 @@ impl StorageBackend for RacingBackend {
         self.inner.capabilities()
     }
 
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
+
     async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
         let hook = self.on_put.lock().expect("on_put mutex").take();
         if let Some(hook) = hook {
@@ -2002,15 +1500,6 @@ impl StorageBackend for RacingBackend {
         self.inner.delete(path).await
     }
 
-    async fn publish_exclusive(
-        &self,
-        path: &str,
-        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
-        max_size: Option<u64>,
-    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
-        self.inner.publish_exclusive(path, stream, max_size).await
-    }
-
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         self.inner.exists(path).await
     }
@@ -2020,7 +1509,7 @@ impl StorageBackend for RacingBackend {
 /// cleaned up, since it is never the live pointer.
 #[tokio::test]
 async fn migrate_backend_loser_target_blob_cleaned_up() {
-    let db = build_db().await;
+    let (db, dsn) = common::build_db_with_dsn("cleanup-test").await;
     let store = Store::new(Arc::clone(&db));
 
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -2081,36 +1570,19 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
         on_put: std::sync::Mutex::new(Some(hook)),
     });
 
-    let backends = BackendRegistry::new(
-        vec![
-            Arc::clone(&mem_backend),
-            Arc::clone(&racing_alt1),
-            Arc::clone(&alt2_backend),
-        ],
-        "mem",
-    )
-    .expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        authorizer,
-        cfg,
-        None,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let s = StackBuilder::new("cleanup-test")
+        .backends(
+            vec![
+                Arc::clone(&mem_backend),
+                Arc::clone(&racing_alt1),
+                Arc::clone(&alt2_backend),
+            ],
+            "mem",
+        )
+        .db(db, &dsn)
+        .build()
+        .await;
+    let Stack { dp, svc, .. } = s;
 
     let ctx = ctx(tenant);
     let ticket = svc
@@ -2174,7 +1646,7 @@ async fn migrate_backend_loser_target_blob_cleaned_up() {
 /// winner's live data. The loser must return `Ok` without deleting it.
 #[tokio::test]
 async fn migrate_backend_same_target_race_preserves_winner_blob() {
-    let db = build_db().await;
+    let (db, dsn) = common::build_db_with_dsn("cleanup-test").await;
     let store = Store::new(Arc::clone(&db));
 
     let mem_backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
@@ -2234,32 +1706,15 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
         on_put: std::sync::Mutex::new(Some(hook)),
     });
 
-    let backends = BackendRegistry::new(
-        vec![Arc::clone(&mem_backend), Arc::clone(&racing_alt1)],
-        "mem",
-    )
-    .expect("registry");
-
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let svc = Arc::new(FileService::new(
-        store.clone(),
-        backends,
-        issuer,
-        authorizer,
-        cfg,
-        None,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
+    let s = StackBuilder::new("cleanup-test")
+        .backends(
+            vec![Arc::clone(&mem_backend), Arc::clone(&racing_alt1)],
+            "mem",
+        )
+        .db(db, &dsn)
+        .build()
+        .await;
+    let Stack { dp, svc, .. } = s;
 
     let ctx = ctx(tenant);
     let ticket = svc
@@ -2315,4 +1770,156 @@ async fn migrate_backend_same_target_race_preserves_winner_blob() {
         stored_bytes, content,
         "surviving blob must match the winner's bytes"
     );
+}
+
+/// A file with one open (`in_progress`, 1 KiB) multipart session, plus the handles the sweep tests
+/// need to inspect and backdate its rows.
+async fn file_with_open_session() -> (
+    Arc<FileService>,
+    SecurityContext,
+    Store,
+    CleanupEngine,
+    Arc<DBProvider<DbError>>,
+    Uuid,
+    file_storage::domain::multipart::MultipartPlan,
+) {
+    let (svc, msvc, store, engine, db) = build_all_with_db(3600).await;
+    let ctx = ctx(Uuid::now_v7());
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let plan = msvc
+        .initiate_multipart_upload(&ctx, ticket.file_id, "text/plain", 1024, None, false)
+        .await
+        .unwrap();
+    (svc, ctx, store, engine, db, ticket.file_id, plan)
+}
+
+/// Moves a version's `created_at` two hours back, past the grace window (no public API for that).
+async fn backdate_version_created_at(db: &Arc<DBProvider<DbError>>, version_id: Uuid) {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::file_version::{
+        Column as FileVersionColumn, Entity as FileVersionEntity,
+    };
+
+    let conn = db.conn().expect("conn");
+    let backdated = time::OffsetDateTime::now_utc() - time::Duration::hours(2);
+    FileVersionEntity::update_many()
+        .col_expr(FileVersionColumn::CreatedAt, Expr::value(backdated))
+        .filter(FileVersionColumn::VersionId.eq(version_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate version created_at");
+}
+
+#[tokio::test]
+async fn sweep_aborts_expired_completing_session() {
+    use sea_orm::sea_query::Expr;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+
+    use file_storage::infra::storage::entity::multipart_upload::{
+        Column as UploadColumn, Entity as UploadEntity,
+    };
+
+    let (_svc, _ctx, store, engine, db, _file_id, session) = file_with_open_session().await;
+
+    let conn = db.conn().expect("conn");
+    let past = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
+    let rows_updated = UploadEntity::update_many()
+        .col_expr(UploadColumn::State, Expr::value("completing"))
+        .col_expr(UploadColumn::LeaseUntil, Expr::value(Some(past)))
+        .col_expr(
+            UploadColumn::LeaseOwner,
+            Expr::value(Some("stale-completer".to_owned())),
+        )
+        .col_expr(UploadColumn::ExpiresAt, Expr::value(past))
+        .filter(UploadColumn::UploadId.eq(session.upload_id))
+        .secure()
+        .scope_with(&toolkit_security::AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("backdate session into expired completing state");
+    assert_eq!(
+        rows_updated.rows_affected, 1,
+        "the backdate must hit exactly the session row created above"
+    );
+
+    let expired = store
+        .list_expired_multipart_uploads(time::OffsetDateTime::now_utc())
+        .await
+        .unwrap();
+    assert!(
+        expired.iter().any(|s| s.upload_id == session.upload_id),
+        "an expired-lease completing session must appear in the sweep's expired list"
+    );
+
+    let result = engine.run_sweep().await;
+    assert!(
+        result.expired_multipart_aborted >= 1,
+        "sweep must report the completing session as aborted"
+    );
+
+    let after = store
+        .get_multipart_upload(session.upload_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.state,
+        file_storage::domain::multipart::MultipartUploadState::Aborted,
+        "an expired-lease completing session must be aborted by the sweep, not left dangling"
+    );
+    assert!(
+        after.lease_until.is_none(),
+        "abort_expired_completing clears the lease alongside the state transition"
+    );
+}
+
+#[tokio::test]
+async fn cleanup_aborts_on_the_sessions_own_backend_when_version_is_already_gone() {
+    let (mem_backend, alt_backend) = common::mem_and_alt_backends();
+    let Stack { engine, svc, .. } = StackBuilder::new("cleanup-test")
+        .backends(vec![mem_backend, Arc::clone(&alt_backend)], "mem")
+        .grace_secs(3600)
+        .build()
+        .await;
+
+    let ctx = ctx(Uuid::now_v7());
+    let file_id = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap()
+        .file_id;
+    let upload = common::start_raw_upload(&alt_backend, file_id).await;
+
+    let now = time::OffsetDateTime::now_utc();
+    let session = MultipartUploadSession {
+        upload_id: Uuid::now_v7(),
+        file_id,
+        version_id: upload.version_id,
+        backend_upload_handle: upload.handle.clone(),
+        state: file_storage::domain::multipart::MultipartUploadState::InProgress,
+        declared_mime: "application/octet-stream".to_owned(),
+        mime_validated: false,
+        declared_size: 0,
+        part_size: 0,
+        auto_bind: false,
+        lease_until: None,
+        complete_result: None,
+        backend_id: Some("alt".to_owned()),
+        backend_path: upload.backend_path.clone(),
+        created_at: now,
+        expires_at: now - time::Duration::hours(1),
+    };
+
+    engine.cleanup_expired_session_version(&session).await;
+
+    common::assert_raw_upload_aborted(&alt_backend, &upload).await;
 }

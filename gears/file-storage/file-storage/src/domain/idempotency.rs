@@ -106,20 +106,18 @@ mod tests {
     }
 
     #[test]
-    fn compute_request_hash_differs_on_owner_id() {
-        let owner_a = Uuid::from_u128(1);
-        let owner_b = Uuid::from_u128(2);
-        let h_a = compute_request_hash("user", owner_a, "n", "gts", "mime", &[]);
-        let h_b = compute_request_hash("user", owner_b, "n", "gts", "mime", &[]);
-        assert_ne!(h_a, h_b, "owner_id must be covered by the hash");
-    }
-
-    #[test]
-    fn compute_request_hash_differs_on_metadata_value() {
-        let meta_a = vec![("k".to_owned(), "v1".to_owned())];
-        let meta_b = vec![("k".to_owned(), "v2".to_owned())];
-        let h_a = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta_a);
-        let h_b = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta_b);
-        assert_ne!(h_a, h_b, "metadata values must be covered by the hash");
+    fn compute_request_hash_covers_owner_id_and_metadata_value() {
+        let meta = |value: &str| vec![("k".to_owned(), value.to_owned())];
+        let base =
+            compute_request_hash("user", Uuid::from_u128(1), "n", "gts", "mime", &meta("v1"));
+        let other_owner =
+            compute_request_hash("user", Uuid::from_u128(2), "n", "gts", "mime", &meta("v1"));
+        let other_value =
+            compute_request_hash("user", Uuid::from_u128(1), "n", "gts", "mime", &meta("v2"));
+        assert_ne!(base, other_owner, "owner_id must be covered by the hash");
+        assert_ne!(
+            base, other_value,
+            "metadata values must be covered by the hash"
+        );
     }
 }
