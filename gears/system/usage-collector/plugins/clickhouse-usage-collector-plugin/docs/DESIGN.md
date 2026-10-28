@@ -23,6 +23,7 @@
   - [Observability](#observability)
   - [Security](#security)
   - [Deferred (post-v1)](#deferred-post-v1)
+  - [Sharded cluster topology](#sharded-cluster-topology)
   - [Testing Architecture](#testing-architecture)
 - [5. Traceability](#5-traceability)
 
@@ -403,7 +404,6 @@ All series in this plugin live under the `uc_clickhouse_*` metric namespace (dis
 
 - **Schema evolution beyond the v1 shape** (e.g. adding a column to `usage_records` or `usage_type_catalog` after initial release): the mechanism exists — append a step to the migration runner ([§3.2](#32-component-model)) — but no such change is designed here. Each one still needs its own compatibility and rollout plan (rolling restarts mix old and new instances), tracked in PRD.md §13.
 - Cross-replica read/write pool splitting remains deferred per PRD.md §4.2. (Multi-shard distributed-table topology is supported opt-in; see [Sharded cluster topology](#sharded-cluster-topology).)
-- Plugin-run provisioning of the cluster schema: in cluster mode the DDL is operator-owned and only validated at startup.
 - **Orphan-reference reconciliation worker**: `uc_clickhouse_orphaned_reference_detected_total` is registered and is incremented by `delete_usage_type`'s post-delete sweep (`sweep_orphaned_records`). The periodic background scan that would additionally reconcile orphans independent of a `delete_usage_type` call is deferred. See [§4 Observability](#observability) and [Feature 0006 §5](features/0006-cpt-cf-uc-ch-plugin-feature-observability.md) for the deferred rationale.
 
 ### Sharded cluster topology
