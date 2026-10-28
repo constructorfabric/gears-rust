@@ -1952,7 +1952,36 @@ All errors follow RFC 9457 Problem Details (`application/problem+json`) using th
 | `gts.cf.core.events.subject_type.v1~` | producers | consumers | — (subject types owned by other modules) |
 | `gts.cf.core.events.consumer_group.v1~` | — | consumers (named groups; explicit grant required) | group creators (POST `/v1/consumer-groups`) and `types_registry` upserts |
 
-Wildcards in the resource pattern are supported on every cell above.
+Wildcards are supported in granted resource patterns.
+
+**PEP checks** use the resource's GTS id:
+
+| Operation | Action | PEP resource type | Resource property |
+|---|---|---|---|
+| Publish | `produce` | Event type | `event_type_id` |
+| JOIN a topic | `consume` | Topic id | `topic_id` |
+| JOIN an exact event-type interest | `consume` | Event type | `event_type_id` |
+| JOIN a wildcard interest | `consume` | `gts.cf.core.events.event.v1~` | `event_type_id` (the pattern) |
+| Deliver a matching event | `consume` | Event type | `event_type_id` |
+| JOIN, get or list a named group | `consume` | Group id | `consumer_group_id` |
+| Delete a named group | `manage` | Group id | `consumer_group_id` |
+| Create a group | `define` | `gts.cf.core.events.consumer_group.v1~` | — |
+
+Wildcard interests use the event base type because a wildcard pattern is not a
+valid GTS id. They currently require a grant covering the whole event family.
+Checking whether a narrower grant covers the requested pattern is not yet
+implemented. Tenant scope is checked separately on `gts.cf.core.events.request.v1~`.
+
+Before authorization, publishing a type outside the event family returns
+`404 EventTypeNotFound`. A JOIN pattern that neither covers nor is covered by
+the event family returns `400 BadTypePattern`.
+
+Delivery checks `consume` for each matching event using the stream caller's
+security context, including derived types matched by a parent selector.
+Denied events count as examined but are not delivered. If evaluation returns an error,
+the stream closes with `teardown`; the current batch is neither emitted nor
+reported as progress, so it can be replayed. Decisions are not cached: each
+matching event requires one PEP evaluation.
 
 **Subject_type is enforced on two independent dimensions**:
 1. **Authorization** (the `subject_type:produce` / `subject_type:consume` permission above) — *capability*: can the principal write or read events whose subject is of this type?

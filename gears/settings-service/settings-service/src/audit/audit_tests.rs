@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The record: images, masking, the shared resource id and the horizon.
 
 use settings_service_sdk::SettingKey;

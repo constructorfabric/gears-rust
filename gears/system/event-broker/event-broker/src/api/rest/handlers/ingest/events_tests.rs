@@ -758,6 +758,59 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
 }
 
 #[tokio::test]
+async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let recorder = Arc::clone(&asked);
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((req.action.name.clone(), req.resource.resource_type.clone()));
+                false
+            },
+        })))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": Uuid::new_v4(),
+            "source": "test-publish_checks_produce_on_the_events_own_type",
+            "subject": "s-publish_checks_produce_on_the_events_own_type",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(202);
+    let produce: Vec<String> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(action, resource)| {
+            action == "produce" && resource != "gts.cf.core.events.request.v1~"
+        })
+        .map(|(_, resource)| resource.clone())
+        .collect();
+    assert_eq!(produce, ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"]);
+}
+
+#[tokio::test]
 async fn publish_succeeds_when_produce_permission_and_tenant_checks_both_pass() {
     let allowed_tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()

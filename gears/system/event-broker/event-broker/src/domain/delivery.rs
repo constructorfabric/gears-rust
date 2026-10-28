@@ -30,8 +30,8 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::authz::{
-    CONSUMER_GROUP_RESOURCE, EVENT_TYPE_RESOURCE, TOPIC_RESOURCE, tenant_authorized,
-    with_forbidden_code,
+    CONSUMER_GROUP_FAMILY_RESOURCE, consumer_group_resource, event_type_interest_resource,
+    tenant_authorized, topic_resource, with_forbidden_code,
 };
 use crate::domain::backend::BackendResolver;
 use crate::domain::consumer_group_coordinator::{ConsumerGroupCoordinator, TopicInterest};
@@ -40,7 +40,7 @@ pub use event_broker_sdk::api::Position;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::{Interest, Sequence, Subscription};
 use crate::domain::notify::DeliveryNotifier;
-use crate::domain::streaming::filter::{EventFilter, InterestFilter};
+use crate::domain::streaming::filter::{AuthorizedInterestFilter, EventFilter};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::domain::streaming::progress::ProgressConfig;
 use crate::domain::streaming::read::{MaxBytes, MaxEvents, ReadLimit};
@@ -361,7 +361,7 @@ where
     }
 
     /// Checks `action` (`"define"`/`"consume"`/`"manage"`) against
-    /// `CONSUMER_GROUP_RESOURCE` for `group_id` via PEP - the permission
+    /// the named group's own id (`consumer_group_resource`) via PEP - the permission
     /// half of the Consumer Group Lifecycle authorization split (`Named`
     /// groups; `Anonymous` groups use `tenant_authorized` instead).
     ///
@@ -378,7 +378,7 @@ where
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &CONSUMER_GROUP_RESOURCE,
+                &consumer_group_resource(group_id),
                 action,
                 None,
                 &AccessRequest::new()
@@ -448,7 +448,7 @@ where
             self.policy_enforcer
                 .access_scope_with(
                     ctx,
-                    &TOPIC_RESOURCE,
+                    &topic_resource(&interest.topic),
                     "consume",
                     None,
                     &AccessRequest::new()
@@ -460,10 +460,11 @@ where
 
             for pattern in &interest.types {
                 let pattern_str = pattern.pattern();
+                let interest_resource = event_type_interest_resource(pattern)?;
                 self.policy_enforcer
                     .access_scope_with(
                         ctx,
-                        &EVENT_TYPE_RESOURCE,
+                        &interest_resource,
                         "consume",
                         None,
                         &AccessRequest::new()
@@ -625,8 +626,11 @@ where
             })?;
 
         // Compiled per open, not per event.
-        let filter: Arc<dyn EventFilter> =
-            Arc::new(InterestFilter::compile(&subscription.interests));
+        let filter: Arc<dyn EventFilter> = Arc::new(AuthorizedInterestFilter::new(
+            &subscription.interests,
+            self.policy_enforcer.clone(),
+            ctx.clone(),
+        ));
 
         // Subscribing takes the membership handle with it: the session holds
         // both, so dropping the stream both stops reading and reports the
@@ -836,7 +840,7 @@ where
         self.policy_enforcer
             .access_scope_with(
                 ctx,
-                &CONSUMER_GROUP_RESOURCE,
+                &CONSUMER_GROUP_FAMILY_RESOURCE,
                 "define",
                 None,
                 &AccessRequest::new().require_constraints(false),

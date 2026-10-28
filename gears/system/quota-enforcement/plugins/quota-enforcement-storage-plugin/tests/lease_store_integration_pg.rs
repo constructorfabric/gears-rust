@@ -386,6 +386,39 @@ impl PgHarness {
              FROM generate_series(1, {count}) AS n",
             tenant = tenant().as_uuid(),
         );
+        self.psql_inserts(&sql, count).await;
+    }
+
+    /// `count` expired leases, each with an unreturned hold on `quota`, as a
+    /// paused sweeper leaves them. A `period` row is created first when given.
+    async fn seed_unreturned_holds(&self, quota: QuotaId, period: Option<Uuid>, count: u32) {
+        let tenant = tenant().as_uuid();
+        let quota = quota.as_uuid();
+        let period_sql = period.map_or_else(String::new, |period| {
+            format!(
+                "INSERT INTO qe_quota_consumption_counters (period_id, quota_id, tenant_id, \
+                 period_start, period_end, consumed, is_settled, record_version, created_at, \
+                 updated_at) VALUES ('{period}', '{quota}', '{tenant}', \
+                 now() - interval '2 days', now() - interval '1 day', 0, false, 1, now(), now()); "
+            )
+        });
+        let period_value = period.map_or_else(|| "NULL".to_owned(), |period| format!("'{period}'"));
+        let sql = format!(
+            "{period_sql}WITH leases AS (INSERT INTO qe_leases (token, tenant_id, metric, \
+             subject_key, attribution_hash, idem_key, state, reserved_amount, acquired_at, \
+             expiry_at, record_version, created_at, updated_at) \
+             SELECT gen_random_uuid(), '{tenant}', '{METRIC_TOKENS}', '\\x00', '\\x00', \
+             'backlog-' || n, 'active', 1, now() - interval '2 hours', \
+             now() - interval '1 hour', 1, now(), now() \
+             FROM generate_series(1, {count}) AS n RETURNING token) \
+             INSERT INTO qe_lease_holds (lease_token, quota_id, tenant_id, held_amount, \
+             period_id) SELECT token, '{quota}', '{tenant}', 1, {period_value} FROM leases"
+        );
+        self.psql_inserts(&sql, count).await;
+    }
+
+    /// Run `sql` through `psql` in the container and check it inserted `count` rows.
+    async fn psql_inserts(&self, sql: &str, count: u32) {
         let args = [
             "psql",
             "-v",
@@ -395,7 +428,7 @@ impl PgHarness {
             "-d",
             "app",
             "-c",
-            &sql,
+            sql,
         ];
         let mut output = self
             .container
@@ -814,5 +847,40 @@ async fn an_expired_backlog_beyond_one_statement_of_parameters_does_not_block_a_
 
     h.held(&["u1"], 10, "a1").await;
     assert_eq!(h.consumed("u1", id).await, 10);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_live_hold_check_survives_a_backlog_beyond_one_statement_of_parameters() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    let period = Uuid::now_v7();
+    h.seed_unreturned_holds(id, Some(period), 70_000).await;
+
+    let conn = h.db.conn().expect("conn");
+    let live = lease_repo::has_live_holds(&conn, &scope(), period, h.now())
+        .await
+        .expect("the check runs");
+    assert!(!live, "every seeded lease has expired");
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_deactivation_lookup_survives_a_backlog_beyond_one_statement_of_parameters() {
+    let h = PgHarness::up().await;
+    let id = h.quota("u1", Some(100)).await;
+    h.seed_unreturned_holds(id, None, 70_000).await;
+
+    let conn = h.db.conn().expect("conn");
+    let holders = lease_repo::active_on_quota_for_update(
+        &conn,
+        &scope(),
+        id.as_uuid(),
+        h.now(),
+        lease_repo::RowWait::Wait,
+    )
+    .await
+    .expect("the lookup runs");
+    assert!(holders.is_empty(), "every seeded lease has expired");
     h.down().await;
 }

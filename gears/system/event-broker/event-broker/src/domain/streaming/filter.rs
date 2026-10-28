@@ -1,6 +1,6 @@
 //! Whether an event belongs to a subscription.
 //!
-//! Three predicates and no more: the event's topic equals the interest's topic,
+//! The subscription predicates: the event's topic equals the interest's topic,
 //! its type matches one of the interest's GTS patterns, and its tenant is within
 //! the interest's scope. An interest may also carry a `FilterSpec`, but the
 //! expression language, the engine contract and the evaluation semantics belong
@@ -9,18 +9,95 @@
 //! Compiled once at stream open. Type patterns are already validated
 //! `GtsIdPattern`s (the wildcard grammar is enforced when a pattern is
 //! constructed), so a malformed pattern never reaches a subscription.
+//! Production delivery additionally checks consume permission on each concrete
+//! event type; selector matching alone is not an authorization decision.
 
 use std::collections::HashMap;
+
+use async_trait::async_trait;
+use authz_resolver_sdk::{AccessRequest, EnforcerError, PolicyEnforcer};
 use toolkit::domain_model;
+use toolkit_security::SecurityContext;
 
 use gts::{GtsId, GtsIdPattern};
 use uuid::Uuid;
 
+use crate::domain::authz::event_type_resource;
+use crate::domain::error::DomainError;
 use crate::domain::model::{Event, FilterSpec, Interest};
 
 /// Whether one event is wanted.
+#[async_trait]
 pub trait EventFilter: Send + Sync {
     fn matches(&self, event: &Event) -> bool;
+
+    /// Applies the filter, including asynchronous authorization when configured.
+    ///
+    /// # Errors
+    /// Returns an authorization evaluation error if permission cannot be
+    /// established. Delivery must terminate rather than skip unread events.
+    async fn allows(&self, event: &Event) -> Result<bool, DomainError> {
+        Ok(self.matches(event))
+    }
+}
+
+/// Combines subscription matching with a point decision on the delivered type.
+/// A bare GTS selector includes descendants, but a grant on that selector's
+/// root need not include them. Never infer a descendant's permission from JOIN.
+#[domain_model]
+pub struct AuthorizedInterestFilter {
+    interests: InterestFilter,
+    policy_enforcer: PolicyEnforcer,
+    ctx: SecurityContext,
+}
+
+impl AuthorizedInterestFilter {
+    /// Captures the stream caller so each matching event is checked as that
+    /// principal. Decisions are not cached across events: revocation and deny
+    /// rules must remain effective for an already-open stream.
+    #[must_use]
+    pub fn new(
+        interests: &[Interest],
+        policy_enforcer: PolicyEnforcer,
+        ctx: SecurityContext,
+    ) -> Self {
+        Self {
+            interests: InterestFilter::compile(interests),
+            policy_enforcer,
+            ctx,
+        }
+    }
+}
+
+#[async_trait]
+impl EventFilter for AuthorizedInterestFilter {
+    fn matches(&self, event: &Event) -> bool {
+        self.interests.matches(event)
+    }
+
+    async fn allows(&self, event: &Event) -> Result<bool, DomainError> {
+        if !self.matches(event) {
+            return Ok(false);
+        }
+        let resource = event_type_resource(&event.r#type)?;
+        match self
+            .policy_enforcer
+            .access_scope_with(
+                &self.ctx,
+                &resource,
+                "consume",
+                None,
+                &AccessRequest::new()
+                    .resource_property("event_type_id", event.r#type.as_ref())
+                    .require_constraints(false),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(EnforcerError::Denied { .. }) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 /// One interest, compiled.

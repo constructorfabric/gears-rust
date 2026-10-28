@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Declaration read handlers.
 //!
 //! Each obtains its `AccessScope` from the enforcement point before it touches

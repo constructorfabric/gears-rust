@@ -1507,7 +1507,8 @@ in-flight leases and to bound row growth between sweeper runs.
 
 The system **MUST** provide a batch debit operation that submits multiple debit items targeting potentially different
 metrics in a single call. The batch **MUST** carry an envelope idempotency key; replay of the same envelope key returns
-the original outcome without modifying counters a second time. Each item **MUST** also carry its own idempotency key for
+the original outcome without modifying counters a second time, as long as the batch is within the current maximum
+batch size. Each item **MUST** also carry its own idempotency key for
 individual identification.
 
 Every batch item **MUST** carry a positive integer `amount > 0`. The batch **MUST** be rejected with an actionable

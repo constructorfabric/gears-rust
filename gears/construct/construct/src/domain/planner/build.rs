@@ -62,11 +62,8 @@ impl PlanDraft<'_> {
     }
 }
 
-/// A property as a plan stores it: a text value as it is, any other value as its JSON.
+/// A property as a plan stores it: the value as JSON, as the node stores it, so
+/// the checks see its text pieces and a redaction keeps it valid JSON.
 fn stored(name: String, value: Value) -> Property {
-    let value = match value {
-        Value::String(text) => text,
-        other => other.to_string(),
-    };
     Property { name, value }
 }

@@ -371,7 +371,8 @@ pub fn router(state: Arc<AuthoringState>, openapi: &dyn OpenApiRegistry) -> Rout
              deployment's currency_scales config adds (iso false). The list is sorted by code and \
              is the same for every tenant; the settings' currencies limit only which currency a \
              new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved \
-             with (D-531). A caller without config read gets 403.",
+             with (D-531). Any authenticated caller reads the table: it holds no tenant data, so no \
+             permission is asked.",
         )
         .tag("Pricing")
         .authenticated()
@@ -2595,22 +2596,12 @@ async fn put_settings(
 }
 async fn list_currencies(
     Extension(state): Extension<Arc<AuthoringState>>,
-    Extension(enforcer): Extension<PolicyEnforcer>,
     ctx: Option<Extension<SecurityContext>>,
 ) -> Result<Response, CanonicalError> {
-    let ctx = require_authenticated(ctx)?;
-    // D-537: the table belongs to the deployment, not to a tenant, so only the permission is
-    // checked.
-    authz::access_scope(
-        &enforcer,
-        &ctx,
-        &resource_types::CONFIG,
-        actions::READ,
-        None,
-        None,
-    )
-    .await
-    .map_err(authz_failure)?;
+    // D-537: the table belongs to the deployment and holds no tenant data (the ISO 4217 codes
+    // and the deployment's config), so an authenticated caller reads it without a permission:
+    // the PDP is not asked, and a price author without config read still learns a scale.
+    require_authenticated(ctx)?;
     let items = state.currency_scales.known().iter().map(Into::into);
     let body = PricingCurrencyTable {
         items: items.collect(),

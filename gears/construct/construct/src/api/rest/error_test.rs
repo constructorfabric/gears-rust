@@ -157,8 +157,6 @@ fn unavailable_maps_to_503_without_leaking_detail() {
     assert!(!visible_text(&problem).contains("10.0.0.7"));
 }
 
-const SETTINGS_RESOURCE_TYPE: &str = gts_id!("cf.construct.subject.settings.v1~");
-
 #[test]
 fn settings_errors_about_the_request_name_the_settings_resource() {
     use crate::api::rest::error::for_settings;
@@ -175,7 +173,7 @@ fn settings_errors_about_the_request_name_the_settings_resource() {
                 .context
                 .get("resource_type")
                 .and_then(|v| v.as_str()),
-            Some(SETTINGS_RESOURCE_TYPE),
+            Some(crate::domain::subject_settings::SUBJECT_SETTINGS_TYPE),
             "{label}"
         );
         assert!(!visible_text(&problem).contains("may not read"), "{label}");
@@ -191,4 +189,82 @@ fn settings_failures_of_the_gear_map_as_everywhere_else() {
 
     assert_eq!(unavailable.status, Some(503));
     assert_eq!(internal.status, Some(500));
+}
+
+/// A scope refusal with distinct ids, and the ids, none of which may reach the
+/// answer.
+fn out_of_scope() -> (DomainError, [uuid::Uuid; 4]) {
+    use crate::domain::settings_scope::{ScopeRefusal, SettingsOutOfScope};
+
+    let ids = [
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+        uuid::Uuid::new_v4(),
+    ];
+    let error = DomainError::OutOfScope(SettingsOutOfScope {
+        caller: ids[0],
+        caller_tenant: ids[1],
+        tenant_id: ids[2],
+        subject_id: ids[3],
+        refusal: ScopeRefusal::NotCovered,
+    });
+    (error, ids)
+}
+
+fn assert_access_denied_without(problem: &Problem, resource_type: &str, ids: &[uuid::Uuid]) {
+    assert_eq!(problem.status, Some(403));
+    assert_eq!(
+        problem.context.get("reason").and_then(|v| v.as_str()),
+        Some("ACCESS_DENIED"),
+    );
+    assert_eq!(
+        problem
+            .context
+            .get("resource_type")
+            .and_then(|v| v.as_str()),
+        Some(resource_type),
+    );
+    let text = visible_text(problem);
+    for id in ids {
+        assert!(!text.contains(&id.to_string()), "{id} in {text}");
+    }
+}
+
+#[test]
+fn an_out_of_scope_settings_route_error_is_403_on_the_settings_resource_without_its_ids() {
+    use crate::api::rest::error::for_settings;
+
+    let (error, ids) = out_of_scope();
+    let problem = Problem::from(for_settings(error));
+
+    assert_access_denied_without(
+        &problem,
+        crate::domain::subject_settings::SUBJECT_SETTINGS_TYPE,
+        &ids,
+    );
+}
+
+#[test]
+fn an_out_of_scope_error_on_the_record_path_is_403_without_its_ids() {
+    let (on_route, ids) = out_of_scope();
+    let (in_process, other_ids) = out_of_scope();
+
+    assert_access_denied_without(&rest(on_route), RECORD_RESOURCE_TYPE, &ids);
+    assert_access_denied_without(&wire(in_process), RECORD_RESOURCE_TYPE, &other_ids);
+}
+
+#[test]
+fn an_out_of_scope_error_on_the_facts_route_answers_as_no_such_subject() {
+    use crate::api::rest::error::for_facts;
+
+    let (error, ids) = out_of_scope();
+    let subject_id = ids[3];
+    let problem = Problem::from(for_facts(error, subject_id));
+
+    assert_eq!(problem.status, Some(404));
+    let text = visible_text(&problem);
+    for id in &ids[..3] {
+        assert!(!text.contains(&id.to_string()), "{id} in {text}");
+    }
 }

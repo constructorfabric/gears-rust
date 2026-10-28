@@ -281,7 +281,8 @@ impl LeaderRuntime {
     }
 
     /// Guarded replace claiming a free/lapsed Lease as `holder` (§4.1). `Ok(true)` on
-    /// a won claim; a `409` is a lost race (`Ok(false)`). Bumps `leaseTransitions` and
+    /// a won claim; a `409`, or the Lease deleted since the read, is a lost race
+    /// (`Ok(false)`). Bumps `leaseTransitions` and
     /// stamps a fresh `acquireTime` when leadership actually changes hands, matching
     /// [`ElectionTask::guarded_claim`].
     async fn guarded_join(
@@ -341,7 +342,8 @@ impl LeaderRuntime {
                 .await?;
             match replaced {
                 Replaced::Applied(_) => return Ok(()),
-                Replaced::Conflict => {}
+                // Re-read and decide again.
+                Replaced::Conflict | Replaced::Gone => {}
             }
         }
         Err(holder_write_exhausted(&token.name))
@@ -377,7 +379,8 @@ impl LeaderRuntime {
                 .await?;
             match replaced {
                 Replaced::Applied(_) => return Ok(()),
-                Replaced::Conflict => {}
+                // Re-read and decide again.
+                Replaced::Conflict | Replaced::Gone => {}
             }
         }
         Err(holder_write_exhausted(&token.name))
@@ -824,8 +827,8 @@ impl ElectionTask {
                 });
                 Ok(RenewOutcome::Renewed)
             }
-            // A 409: someone else wrote the Lease, so the claim is gone now (§4.2).
-            Ok(Replaced::Conflict) => Ok(RenewOutcome::Conflict),
+            // Someone else wrote or deleted the Lease: the claim is lost (§4.2).
+            Ok(Replaced::Conflict | Replaced::Gone) => Ok(RenewOutcome::Conflict),
             Err(err) if err.is_retryable() => Ok(RenewOutcome::Retryable),
             Err(err) => Err(err),
         }
@@ -938,7 +941,8 @@ impl ElectionTask {
             .emit_error("elect", &self.coordination_name, &replaced);
         match replaced? {
             Replaced::Applied(applied) => self.became_leader(*applied, ttl, issued_at),
-            Replaced::Conflict => self.set_follower(),
+            // Lost the race or the Lease was deleted: follow; the next tick re-reads.
+            Replaced::Conflict | Replaced::Gone => self.set_follower(),
         }
         Ok(())
     }
@@ -1113,8 +1117,8 @@ impl ElectionTask {
             )
             .await?;
         match replaced {
-            // Applied, or a 409 that classified as AlreadyReleased: the claim is gone.
-            Replaced::Applied(_) | Replaced::Conflict => Ok(()),
+            // Applied, already released, or deleted: the claim is gone either way.
+            Replaced::Applied(_) | Replaced::Conflict | Replaced::Gone => Ok(()),
         }
     }
 

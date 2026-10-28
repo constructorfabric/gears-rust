@@ -1,6 +1,6 @@
 # gears.mk: shared make rules for projects built on the gears framework.
 #
-# Version: 1.0.0
+# Version: 1.1.0
 # Source:  https://github.com/constructorfabric/gears-rust/blob/main/.gears-dna/gears.mk
 #
 # Do not edit a copy of this file. To update it, replace it with a newer version
@@ -16,7 +16,7 @@
 # for the targets and their parameters. Guide: .gears-dna/docs/GEARS_MK.md in the source.
 
 ifndef GEARS_MK_VERSION
-GEARS_MK_VERSION := 1.0.0
+GEARS_MK_VERSION := 1.1.0
 # This file, as make found it (help reads it first).
 GEARS_MK_FILE := $(lastword $(MAKEFILE_LIST))
 
@@ -31,6 +31,9 @@ PYTHON_BOOTSTRAP ?= $(shell command -v python3 2>/dev/null || command -v python 
 DENY_MIN_VERSION ?= 0.20.0
 NEXTEST_MIN_VERSION ?= 0.9.143
 CARGO_GEARS_VERSION ?= 0.0.8
+# Tools the CI runner already installed, e.g. `nextest`. When set,
+# `install-tools` only checks that cargo-<tool> exists for each and installs nothing.
+CI_PREINSTALLED_TOOLS ?=
 
 # CI sets NEXTEST_PROFILE=ci (see .config/nextest.toml) and JUNIT_DIR=<dir>;
 # locally both stay inert and nextest behaves as before.
@@ -706,6 +709,9 @@ lint:
 	RUSTFLAGS="-D warnings" cargo check $(if $(GEAR),$(GEAR_PKGS),--workspace) --all-targets --all-features
 
 install-tools:
+ifneq ($(strip $(CI_PREINSTALLED_TOOLS)),)
+	$(foreach tool,$(CI_PREINSTALLED_TOOLS),$(call check_tool,cargo-$(tool))$(newline))
+else
 	$(call print_target_banner)
 	@cargo gears tools check-version cargo-gears '>=$(CARGO_GEARS_VERSION)' >/dev/null 2>&1 \
 	|| (echo "Installing cargo-gears >= $(CARGO_GEARS_VERSION)..." && cargo install --locked cargo-gears@$(CARGO_GEARS_VERSION))
@@ -713,6 +719,7 @@ install-tools:
 	|| (echo "Installing cargo-nextest >= $(NEXTEST_MIN_VERSION)..." && cargo install --locked cargo-nextest)
 	@cargo gears tools check-version cargo-deny '>=$(DENY_MIN_VERSION)' >/dev/null 2>&1 \
 	|| (echo "Installing cargo-deny >= $(DENY_MIN_VERSION)..." && cargo install --locked cargo-deny)
+endif
 
 # Run architecture lints via cargo-gears (see Gears.toml for configuration).
 dylint:

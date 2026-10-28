@@ -16,7 +16,7 @@
   - [Plugin Chain Execution](#plugin-chain-execution)
   - [Header Transformation](#header-transformation)
   - [Body Validation](#body-validation)
-  - [Pingora In-Memory Bridge](#pingora-in-memory-bridge)
+  - [Upstream Forwarding](#upstream-forwarding)
   - [Error Source Classification](#error-source-classification)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
@@ -27,7 +27,7 @@
   - [Implement Header Transformation](#implement-header-transformation)
   - [Implement Body Validation](#implement-body-validation)
   - [Implement Error Source Distinction](#implement-error-source-distinction)
-  - [Implement Pingora Proxy Engine](#implement-pingora-proxy-engine)
+  - [Implement Upstream Proxy Engine](#implement-upstream-proxy-engine)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Additional Context](#7-additional-context)
   - [Performance Considerations](#performance-considerations)
@@ -45,7 +45,7 @@
 
 ### 1.1 Overview
 
-Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain, forward HTTP request via Pingora in-memory bridge, transform response, and return with error source distinction.
+Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain, forward HTTP request through the `toolkit-http-proxy` upstream engine, transform response, and return with error source distinction.
 
 ### 1.2 Purpose
 
@@ -92,8 +92,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 - Body validation fails (400 ValidationError or 413 PayloadTooLarge)
 - Upstream returns error response (502 DownstreamError passthrough)
 - Upstream connection or request times out (504 ConnectionTimeout / RequestTimeout)
-- WebSocket upgrade requested (501 ProtocolError — not supported by unidirectional bridge)
-- Pingora-level protocol error (502 ProtocolError — e.g. HTTP/2 downgrade failure)
+- Upstream rejects a WebSocket upgrade (502 ProtocolError — no `101 Switching Protocols`)
+- Upstream HTTP/2 protocol error (502 ProtocolError)
 - X-OAGW-Target-Host missing for multi-endpoint common-suffix upstream (400 MissingTargetHost)
 - X-OAGW-Target-Host format invalid (400 InvalidTargetHost)
 - X-OAGW-Target-Host does not match any configured endpoint (400 UnknownTargetHost)
@@ -135,17 +135,17 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 23. [x] - `p1` - **IF** `X-OAGW-Target-Host` present AND value does not match any configured endpoint host - `inst-proxy-23`
     1. [x] - `p1` - **RETURN** 400 UnknownTargetHost with `X-OAGW-Error-Source: gateway` - `inst-proxy-23a`
 24. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
-    1. [x] - `p1` - **RETURN** 501 ProtocolError with `X-OAGW-Error-Source: gateway` (WebSocket requires bidirectional tunnel; current bridge is unidirectional) - `inst-proxy-24a`
+    1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
 25. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
-26. [x] - `p1` - Serialize request into in-memory duplex stream and forward to Pingora `ProxyHttp` engine via `cpt-cf-oagw-algo-pingora-bridge` - `inst-proxy-26`
-27. [x] - `p1` - **IF** Pingora reports upstream connection failure (refused, DNS, TLS) via `fail_to_proxy` - `inst-proxy-27`
-    1. [x] - `p1` - Map Pingora `ErrorType` to `DomainError` and write RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
-    2. [x] - `p1` - **RETURN** 502 DownstreamError with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
-28. [x] - `p1` - **IF** connection or request timeout (Pingora `ConnectTimedout`, `ReadTimedout`, `WriteTimedout`) - `inst-proxy-28`
+26. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
+27. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
+    1. [x] - `p1` - Map the engine error kind to `DomainError`; the REST layer writes the RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
+    2. [x] - `p1` - **RETURN** 502 DownstreamError (503 LinkUnavailable for no route) with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
+28. [x] - `p1` - **IF** connection or request timeout (connect timeout, response-head or body read timeout) - `inst-proxy-28`
     1. [x] - `p1` - **RETURN** 504 ConnectionTimeout or RequestTimeout via `cpt-cf-oagw-algo-error-source-classification` - `inst-proxy-28a`
-29. [x] - `p1` - **IF** Pingora reports HTTP/2 error (`H2Error`, `H2Downgrade`) - `inst-proxy-29`
+29. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
     1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
-30. [x] - `p1` - Parse upstream response from duplex stream read half - `inst-proxy-30`
+30. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
 31. [x] - `p1` - **IF** upstream returns error response - `inst-proxy-31`
     1. [x] - `p1` - Execute transform plugins: `on_error` phase - `inst-proxy-31a`
     2. [x] - `p1` - **RETURN** upstream response as-is with `X-OAGW-Error-Source: upstream` - `inst-proxy-31b`
@@ -270,28 +270,26 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
    1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (abort read) - `inst-body-3a`
 4. [x] - `p1` - **RETURN** validation passed - `inst-body-4`
 
-### Pingora In-Memory Bridge
+### Upstream Forwarding
 
-- [x] `p1` - **ID**: `cpt-cf-oagw-algo-pingora-bridge`
+- [x] `p1` - **ID**: `cpt-cf-oagw-algo-upstream-forwarding`
 
-**Input**: Serialized HTTP/1.1 request (headers + body), selected endpoint
+**Input**: Outbound request (method, URL, headers, body), selected endpoint
 
-**Output**: Upstream HTTP response or Pingora error
+**Output**: Upstream HTTP response (head + streaming body) or engine error
 
 **Steps**:
-1. [x] - `p1` - Inject internal metadata headers (`x-oagw-internal-*`) for Pingora endpoint selection into outbound headers - `inst-bridge-1`
-2. [x] - `p1` - Create in-memory `tokio::io::duplex` stream pair (write half, read half) - `inst-bridge-2`
-3. [x] - `p1` - Serialize HTTP/1.1 request headers (including internal metadata) into write half - `inst-bridge-3`
-4. [x] - `p1` - **IF** request has body AND Content-Length known - `inst-bridge-4`
-   1. [x] - `p1` - Write full body with Content-Length framing - `inst-bridge-4a`
-5. [x] - `p1` - **ELSE IF** request has streaming body - `inst-bridge-5`
-   1. [x] - `p1` - Write headers only, then stream body chunks; body boundary is `Connection: close` (EOF on write-half shutdown) - `inst-bridge-5a`
-6. [x] - `p1` - Feed duplex read half to Pingora `http_proxy_service_with_name` as client session - `inst-bridge-6`
-7. [x] - `p1` - Pingora `ProxyHttp` implementation resolves `HttpPeer` from internal headers, connects to upstream, forwards request, streams response back into duplex write half - `inst-bridge-7`
-8. [x] - `p1` - **IF** Pingora encounters upstream error - `inst-bridge-8`
-   1. [x] - `p1` - `fail_to_proxy` converts `pingora_core::ErrorType` → `DomainError` → RFC 9457 `Problem` and writes directly to session - `inst-bridge-8a`
-9. [x] - `p1` - Parse HTTP/1.1 response from duplex read half (status, headers, body) - `inst-bridge-9`
-10. [x] - `p1` - **RETURN** parsed `http::Response<Body>` - `inst-bridge-10`
+1. [x] - `p1` - Build the engine target: the load balancer's pre-resolved address, or resolve the endpoint host (retries 100/500/2500 ms) and take the first address the SSRF policy allows - `inst-fwd-1`
+2. [x] - `p1` - Choose transport and protocol policy: TLS for `https`/`wss`/`wt`, HTTP/1.1 only for `wss`, cleartext HTTP/1.1 for `http` - `inst-fwd-2`
+3. [x] - `p1` - **IF** request body is buffered - `inst-fwd-3`
+   1. [x] - `p1` - Send it with `Content-Length` framing derived by the engine - `inst-fwd-3a`
+4. [x] - `p1` - **ELSE IF** request body is streaming - `inst-fwd-4`
+   1. [x] - `p1` - Forward chunks as they arrive, enforcing `max_body_size`; on breach or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge or 502 DownstreamError - `inst-fwd-4a`
+5. [x] - `p1` - Engine reuses a pooled connection or connects (ALPN `h2`/`http/1.1` for TLS), rewrites framing and hop-by-hop headers, and sends the request; the engine sends it again at most once, on another connection, only in the cases of ADR-0019 (a request that never left, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`, and for idempotent methods a stale keep-alive connection or a graceful `GOAWAY`) - `inst-fwd-5`
+6. [x] - `p1` - **IF** the engine fails - `inst-fwd-6`
+   1. [x] - `p1` - Map the engine error kind to `DomainError` (see [ADR-0019](../ADR/0019-upstream-proxy-engine.md)) - `inst-fwd-6a`
+7. [x] - `p1` - Strip every `x-oagw-*` header from the upstream response head - `inst-fwd-7`
+8. [x] - `p1` - **RETURN** response head and streaming body - `inst-fwd-8`
 
 ### Error Source Classification
 
@@ -322,7 +320,7 @@ Not applicable. The proxy engine is a stateless request-response flow — each p
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-proxy-execution`
 
-The system **MUST** implement `DataPlaneService::proxy_request(...)` that orchestrates the full proxy flow: alias resolution, route matching, body validation, plugin chain execution, HTTP forwarding via the Pingora in-memory bridge, and response transformation. No upstream response caching per `cpt-cf-oagw-principle-no-cache`. Pingora's stale pooled-connection reconnect (re-establishing a connection that was closed server-side before request bytes are sent) is permitted; all other failures **MUST** be returned immediately without additional application-layer retries per `cpt-cf-oagw-principle-no-retry`.
+The system **MUST** implement `DataPlaneService::proxy_request(...)` that orchestrates the full proxy flow: alias resolution, route matching, body validation, plugin chain execution, HTTP forwarding through the upstream proxy engine, and response transformation. No upstream response caching per `cpt-cf-oagw-principle-no-cache`. The engine's single connection-level resend in the cases listed in ADR-0019 is permitted; all other failures **MUST** be returned immediately without additional application-layer retries per `cpt-cf-oagw-principle-no-retry`.
 
 **Implements**:
 - `cpt-cf-oagw-flow-proxy-request`
@@ -407,19 +405,19 @@ The system **MUST** set `X-OAGW-Error-Source: gateway` on all gateway-originated
 **Touches**:
 - API: `{METHOD} /api/oagw/v1/proxy/{alias}/{path}`
 
-### Implement Pingora Proxy Engine
+### Implement Upstream Proxy Engine
 
-- [x] `p1` - **ID**: `cpt-cf-oagw-dod-pingora-proxy`
+- [x] `p1` - **ID**: `cpt-cf-oagw-dod-upstream-proxy-engine`
 
-The system **MUST** use Pingora (`pingora-proxy`, `pingora-load-balancing`) as the upstream HTTP engine, connected via an in-memory `tokio::io::duplex` bridge (`cpt-cf-oagw-algo-pingora-bridge`). Pingora manages connection pooling, TLS termination, and health checks internally. Multi-endpoint upstreams **MUST** distribute requests via `LoadBalancer<RoundRobin>` with `TcpHealthCheck` (10s interval). When `X-OAGW-Target-Host` header is present, the system **MUST** select the matching endpoint explicitly (no round-robin). All endpoints in a pool **MUST** have identical protocol, scheme, and port. `X-OAGW-Target-Host` **MUST** be validated: required for multi-endpoint common-suffix upstreams (400 MissingTargetHost); format must be hostname or IP without port/path/special chars (400 InvalidTargetHost); value must match a configured endpoint (400 UnknownTargetHost). Non-timeout upstream connection failures (refused, DNS, TLS) **MUST** return 502 DownstreamError. WebSocket `Upgrade` requests **MUST** be rejected with 501 ProtocolError before reaching the bridge (the duplex bridge is unidirectional and cannot support the bidirectional tunnel WebSocket requires).
+The system **MUST** forward upstream traffic through the `toolkit-http-proxy` engine (`cpt-cf-oagw-algo-upstream-forwarding`, [ADR-0019](../ADR/0019-upstream-proxy-engine.md)). The engine manages connection pooling, ALPN, FIPS-hardened TLS and outbound framing. Multi-endpoint upstreams **MUST** distribute requests round-robin over healthy backends, with TCP health checks every 10 s and DNS refresh every 30 s; every resolved address **MUST** pass the SSRF policy. When `X-OAGW-Target-Host` header is present, the system **MUST** select the matching endpoint explicitly (no round-robin). All endpoints in a pool **MUST** have identical protocol, scheme, and port. `X-OAGW-Target-Host` **MUST** be validated: required for multi-endpoint common-suffix upstreams (400 MissingTargetHost); format must be hostname or IP without port/path/special chars (400 InvalidTargetHost); value must match a configured endpoint (400 UnknownTargetHost). Non-timeout upstream connection failures (refused, DNS, TLS) **MUST** return 502 DownstreamError. WebSocket upgrades **MUST** be tunnelled on a dedicated connection only after the upstream answered `101 Switching Protocols`; any other answer **MUST** return 502 ProtocolError.
 
-The endpoint selector caches each upstream's load-balancer pool by upstream ID. It **MUST** rebuild a cached pool whenever the endpoints passed for that upstream differ from the cached list, so a replica serves updated endpoints after another replica writes the change to the shared database. Explicit invalidation by the local management handlers and the SDK remains as a fast path; correctness **MUST NOT** depend on it. A pool not selected for 10 minutes **MUST** be dropped, so pools of upstreams deleted through other replicas do not keep their DNS and health-check task running; dropping a pool **MUST** stop that task.
+The endpoint selector caches each upstream's backend pool by upstream ID. It **MUST** rebuild a cached pool whenever the endpoints passed for that upstream differ from the cached list, so a replica serves updated endpoints after another replica writes the change to the shared database. Explicit invalidation by the local management handlers and the SDK remains as a fast path; correctness **MUST NOT** depend on it. A pool not selected for 10 minutes **MUST** be dropped, so pools of upstreams deleted through other replicas do not keep their DNS and health-check task running; dropping a pool **MUST** stop that task.
 
-Pingora-level errors are handled by the `fail_to_proxy` callback, which **MUST** convert `pingora_core::ErrorType` variants into `DomainError`, then use the canonical `DomainError` → RFC 9457 `Problem` pipeline. The response **MUST** include `X-OAGW-Error-Source: gateway` and `Content-Type: application/problem+json`.
+Engine errors **MUST** be converted into `DomainError` and returned through the canonical `DomainError` → RFC 9457 `Problem` pipeline. The response **MUST** include `X-OAGW-Error-Source: gateway` and `Content-Type: application/problem+json`. Upstream responses **MUST** lose every `x-oagw-*` header before error-source classification, so an upstream cannot claim to be the gateway.
 
 **Implements**:
 - `cpt-cf-oagw-flow-proxy-request`
-- `cpt-cf-oagw-algo-pingora-bridge`
+- `cpt-cf-oagw-algo-upstream-forwarding`
 
 **Touches**:
 - Entities: `ServerConfig`, `Endpoint`
@@ -459,16 +457,16 @@ Pingora-level errors are handled by the `fail_to_proxy` callback, which **MUST**
 - [x] `X-OAGW-Target-Host` value not matching any configured endpoint returns 400 UnknownTargetHost
 - [x] Upstream connection failures (refused, DNS, TLS) return 502 DownstreamError with `X-OAGW-Error-Source: gateway`
 - [x] No credentials appear in logs, error messages, or API responses
-- [x] Application layer does not add retries; only Pingora's built-in connection-level retry (up to 1 retry on reusable connections) is permitted
-- [x] WebSocket upgrade requests (`Upgrade: websocket`) are rejected with 501 ProtocolError and `X-OAGW-Error-Source: gateway`
-- [x] Pingora `fail_to_proxy` errors produce RFC 9457 Problem Details body with GTS type identifiers and `X-OAGW-Error-Source: gateway`
-- [x] When `X-OAGW-Error-Source` is absent (normal upstream response after `upstream_response_filter` strips `x-oagw-*` headers), `ErrorSource` defaults to `Upstream`; Pingora-generated error responses (`fail_to_proxy`) always set `X-OAGW-Error-Source: gateway` explicitly
+- [x] Application layer does not add retries; only the engine's single connection-level resend (ADR-0019) is permitted
+- [x] WebSocket upgrade requests (`Upgrade: websocket`) are tunnelled only after the upstream answers `101`; a rejected upgrade returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
+- [x] Upstream engine errors produce RFC 9457 Problem Details body with GTS type identifiers and `X-OAGW-Error-Source: gateway`
+- [x] Upstream responses lose every `x-oagw-*` header, so `ErrorSource` defaults to `Upstream` for them; gateway-generated error responses always set `X-OAGW-Error-Source: gateway` explicitly
 
 ## 7. Additional Context
 
 ### Performance Considerations
 
-The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. With a database configured, configuration lookup costs three queries per request whatever the tenant depth (the upstreams with their plugin rows, the candidate routes, and the winning route with its path, method and plugin rows; two more only for a request that raced a configuration write); there is no config cache yet (DESIGN §4.1). Pingora manages upstream connection pooling and TLS session reuse internally, with `TcpHealthCheck` at 10s intervals to avoid routing to unhealthy backends. The in-memory duplex bridge (`tokio::io::duplex`) avoids network overhead between the application layer and Pingora — serialization/deserialization is the only cost. Body validation checks Content-Length before buffering to reject oversized payloads early. For streaming bodies (e.g. SSE uploads), `Connection: close` framing avoids buffering the full body; Pingora reads until the write half shuts down (EOF).
+The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. With a database configured, configuration lookup costs three queries per request whatever the tenant depth (the upstreams with their plugin rows, the candidate routes, and the winning route with its path, method and plugin rows; two more only for a request that raced a configuration write); there is no config cache yet (DESIGN §4.1). The upstream engine pools connections (HTTP/2 multiplexed, HTTP/1.1 keep-alive) and reuses TLS sessions, with TCP health checks at 10s intervals to avoid routing to unhealthy backends. Requests go straight from the pipeline to the engine — no serialization, pipe or spawned task per request. Body validation checks Content-Length before buffering to reject oversized payloads early. Streaming bodies (e.g. SSE uploads) are forwarded chunk by chunk without buffering the full body.
 
 ### Security Considerations
 
@@ -484,7 +482,7 @@ Credential isolation is enforced by resolving secrets from `cred_store` at reque
 - **States section**: Not applicable — proxy engine is a stateless request-response flow. Circuit breaker state management belongs to `cpt-cf-oagw-feature-rate-limiting`.
 - **Multi-tenant hierarchy merge**: Out of scope — hierarchical config override and sharing mode merge strategies belong to cpt-cf-oagw-feature-tenant-hierarchy.
 - **Rate limiting enforcement**: Out of scope — rate limiting and circuit breaker during proxy flow belong to `cpt-cf-oagw-feature-rate-limiting`.
-- **SSE/WebTransport streaming**: Out of scope — streaming protocol support belongs to `cpt-cf-oagw-feature-streaming`. **WebSocket upgrade requests are explicitly rejected** with 501 ProtocolError in this feature because the unidirectional duplex bridge cannot support the bidirectional tunnel WebSocket requires.
+- **SSE/WebTransport streaming**: Out of scope — streaming protocol support belongs to `cpt-cf-oagw-feature-streaming`. WebSocket upgrades are tunnelled through the engine's upgrade path (step `inst-proxy-24`); the WebSocket relay itself belongs to the streaming feature.
 - **Metrics and audit logging**: Out of scope — Prometheus metrics, structured logging, and CORS handling belong to `cpt-cf-oagw-feature-observability`.
 - **UX/Accessibility**: Not applicable — OAGW is a backend API gear with no user interface.
 - **Compliance/Privacy**: OAGW does not handle PII directly. Credential isolation via `cred_store` references covers data protection. No additional regulatory compliance beyond standard platform requirements.

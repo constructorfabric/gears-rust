@@ -1,4 +1,3 @@
-// Created: 2026-09-24 by Virtuozzo International GmbH
 //! The clock the repositories stamp rows with.
 //!
 //! Every state tag this service hands out is a row timestamp — `updated_at`,

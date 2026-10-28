@@ -79,7 +79,7 @@ The following crates are **legitimately transitively pulled** by upstream depend
 
 | Crate (currently in graph) | Pulled by (representative upstream) | Cleanup approach |
 |---|---|---|
-| `ring` 0.17 | `pingora-rustls` / `ureq` | Migrate JWT verify to a FIPS-friendly backend |
+| `ring` 0.17 | `sqlx-core` (rustls `ring` feature) / `ureq` (Pingora removed, [ADR toolkit/0004](../../../adrs/toolkit/0004-toolkit-http-proxy-engine.md)) | Migrate JWT verify to a FIPS-friendly backend |
 | `aws-lc-rs` 1.x (non-FIPS) | rustls's default features | Use `rustls/fips` exclusively on Linux; macOS/Windows already excluded via shim — but the non-FIPS crate is pulled into the same binary by Cargo feature unification |
 | `chacha20` 0.10 | `rand` ecosystem | Reroute `rand`'s ChaCha-based DRBG through our provider, or switch to a SecRandom-based source |
 | `md-5`, `sha1`, `blake2`, `blake3`, `aes`, `hmac`, `hkdf`, `pbkdf2`, `rsa`, `p256`, `p384`, `k256` (if added in future) | TBD audit | Replace upstream call sites with our `rustls::crypto::*` impls or remove the upstream |

@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! REST surface.
 
 /// The `If-Match` tag a mutation presents, read the same way on every
@@ -55,6 +54,7 @@ pub mod declaration_routes;
 pub mod dto;
 pub mod handlers;
 pub mod page_dto;
+pub mod revival_handlers;
 pub mod routes;
 pub mod search_dto;
 pub mod search_handlers;
@@ -141,6 +141,10 @@ mod access_surface_tests;
 #[cfg(test)]
 #[path = "declaration_surface_tests.rs"]
 mod declaration_surface_tests;
+
+#[cfg(test)]
+#[path = "revival_surface_tests.rs"]
+mod revival_surface_tests;
 
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]

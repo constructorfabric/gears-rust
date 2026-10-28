@@ -2995,7 +2995,7 @@ pub fn empty_engine_config() -> Value {
 
 /// Engine identifier of the policy the fixtures seed. Deliberately not
 /// `most-restrictive-wins`: that engine's plan invariant is checked inside
-/// [`EvaluationOutcome::validate`] and would constrain what a scripted
+/// [`crate::engine::EvaluationOutcome::validate`] and would constrain what a scripted
 /// evaluator may return.
 pub const TEST_ENGINE_ID: &str = "test-engine";
 

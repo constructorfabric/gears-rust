@@ -1,4 +1,3 @@
-// Created: 2026-09-15 by Virtuozzo International GmbH
 //! The `pending_secrets` table.
 
 use sea_orm::entity::prelude::*;

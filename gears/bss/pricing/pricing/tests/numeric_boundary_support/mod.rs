@@ -95,6 +95,13 @@ fn draft(price: Value, min_fee: Option<&str>, from: &str) -> Value {
 }
 
 /// The code of a refusal: a conflict's reason, or a 400's first violation.
+/// The field a 400's first violation names.
+fn field_of(body: &Value) -> String {
+    body["context"]["field_violations"][0]["field"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned()
+}
 fn code_of(body: &Value) -> String {
     let context = &body["context"];
     context["reason"]
@@ -332,10 +339,13 @@ impl Entries {
 
 /// One refused draft: its entry, price and `min_fee`, the code it is refused with, and a fragment
 /// of the refusal's text.
+/// `(entry, price, min_fee, code, what the text says, the violation's field)`: the field is the
+/// refused decimal's path (D-538).
 type Refusal = (
     Uuid,
     Value,
     Option<&'static str>,
+    &'static str,
     &'static str,
     &'static str,
 );
@@ -355,6 +365,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.rate",
         ),
         (
             e.flat,
@@ -362,6 +373,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.amount",
         ),
         (
             e.package,
@@ -369,6 +381,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.package_size",
         ),
         (
             e.package,
@@ -376,6 +389,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.package_price",
         ),
         (
             e.volume,
@@ -383,6 +397,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.tiers[0].up_to",
         ),
         (
             e.graduated,
@@ -390,6 +405,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "JSON strings",
+            "price.tiers[1].rate",
         ),
         // One place past the rate bound.
         (
@@ -398,6 +414,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "12 fractional places",
+            "price.rate",
         ),
         (
             e.flat,
@@ -405,6 +422,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "12 fractional places",
+            "price.amount",
         ),
         (
             e.package,
@@ -412,6 +430,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "12 fractional places",
+            "price.package_price",
         ),
         (
             e.graduated,
@@ -419,6 +438,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "12 fractional places",
+            "price.tiers[1].rate",
         ),
         // A 29th digit, or a 29th fractional place of a quantity or threshold.
         (
@@ -427,6 +447,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "28 digits",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -434,6 +455,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "28 digits",
+            "price.rate",
         ),
         (
             e.package,
@@ -441,6 +463,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "28 digits",
+            "price.package_size",
         ),
         (
             e.package,
@@ -448,6 +471,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "28 fractional places",
+            "price.package_size",
         ),
         (
             e.volume,
@@ -455,6 +479,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_OUT_OF_RANGE",
             "28 digits",
+            "price.tiers[0].up_to",
         ),
         // Text that is not plain decimal text: exponent, sign, whitespace, separator, leading zero,
         // a missing digit.
@@ -464,6 +489,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -471,6 +497,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -478,6 +505,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -485,6 +513,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -492,6 +521,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -499,6 +529,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -506,6 +537,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -513,6 +545,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -520,6 +553,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -527,6 +561,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.per_unit,
@@ -534,6 +569,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.rate",
         ),
         (
             e.flat,
@@ -541,6 +577,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.amount",
         ),
         (
             e.package,
@@ -548,6 +585,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.package_size",
         ),
         (
             e.volume,
@@ -555,6 +593,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "plain decimal text",
+            "price.tiers[0].up_to",
         ),
         // A sign is refused and named.
         (
@@ -563,6 +602,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "rate must not be negative",
+            "price.rate",
         ),
         (
             e.package,
@@ -570,6 +610,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             None,
             "AMOUNT_INVALID",
             "package_size must be above zero",
+            "price.package_size",
         ),
         // A minimum fee off the EUR increment is refused, never rounded.
         (
@@ -578,6 +619,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             Some("12.341"),
             "MIN_FEE_INVALID",
             "a multiple of the increment",
+            "min_fee",
         ),
         (
             e.per_unit,
@@ -585,6 +627,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             Some("-1"),
             "MIN_FEE_INVALID",
             "must not be negative",
+            "min_fee",
         ),
         (
             e.per_unit,
@@ -592,6 +635,7 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             Some("1e1"),
             "MIN_FEE_INVALID",
             "plain decimal text",
+            "min_fee",
         ),
         (
             e.per_unit,
@@ -599,22 +643,23 @@ fn refusals(e: &Entries) -> Vec<Refusal> {
             Some("10000000000000000000000000000"),
             "MIN_FEE_INVALID",
             "28 digits",
+            "min_fee",
         ),
     ]
 }
 
-/// Every refused draft and book create, in order: `(case, status, code, the text says its cause)`,
-/// and the answers each should give.
+/// Every refused draft and book create, in order: `(case, status, code, the text says its cause,
+/// the field the violation names)`, and the answers each should give.
 async fn refuse_all(
     f: &p::Fixture,
     e: &Entries,
 ) -> (
-    Vec<(usize, u16, String, bool)>,
-    Vec<(usize, u16, String, bool)>,
+    Vec<(usize, u16, String, bool, String)>,
+    Vec<(usize, u16, String, bool, String)>,
 ) {
     let mut answers = Vec::new();
     let mut expected = Vec::new();
-    for (n, (entry, price, min_fee, code, says)) in refusals(e).into_iter().enumerate() {
+    for (n, (entry, price, min_fee, code, says, field)) in refusals(e).into_iter().enumerate() {
         let (status, body) = create(
             f,
             &f.app,
@@ -623,8 +668,14 @@ async fn refuse_all(
             &format!("refused-{n}"),
         )
         .await;
-        answers.push((n, status, code_of(&body), body.to_string().contains(says)));
-        expected.push((n, 400, code.to_owned(), true));
+        answers.push((
+            n,
+            status,
+            code_of(&body),
+            body.to_string().contains(says),
+            field_of(&body),
+        ));
+        expected.push((n, 400, code.to_owned(), true, field.to_owned()));
     }
     // Unknown or malformed currencies at book create.
     for (n, currency) in ["ZZZ", "XTA", "eur", "EURO", "XAU"].into_iter().enumerate() {
@@ -637,8 +688,14 @@ async fn refuse_all(
                 Some(&format!("bad-book-{n}")),
             )
             .await;
-        answers.push((100 + n, status, code_of(&body), true));
-        expected.push((100 + n, 400, "BOOK_CURRENCY_INVALID".to_owned(), true));
+        answers.push((100 + n, status, code_of(&body), true, field_of(&body)));
+        expected.push((
+            100 + n,
+            400,
+            "BOOK_CURRENCY_INVALID".to_owned(),
+            true,
+            "book".to_owned(),
+        ));
     }
     (answers, expected)
 }

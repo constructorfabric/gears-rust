@@ -620,7 +620,7 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// # Replay and retention
     ///
     /// A replay returns `NoOp` with the stored [`crate::Decision`], retention
-    /// deadline, and an empty [`MutationResult`].
+    /// deadline, and an empty [`crate::MutationResult`].
     ///
     /// Fresh outcomes are recorded except [`crate::NO_APPLICABLE_QUOTA`], which
     /// must be re-evaluated after provisioning changes.

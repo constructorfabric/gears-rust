@@ -322,7 +322,7 @@ impl RestApiCapability for EventBrokerModule {
     /// both construct their services against).
     ///
     /// Resolves `EventBrokerCluster` once and attaches it (plus a shared
-    /// Pingora connector) via `Extension` after registration, matching the
+    /// upstream client) via `Extension` after registration, matching the
     /// "attach service once after all routes are registered" convention
     /// (`docs/toolkit_unified_system/04_rest_operation_builder.md`).
     fn register_rest(
@@ -429,7 +429,7 @@ impl RestApiCapability for EventBrokerModule {
         }
         let router = routes::register_dispatcher_routes(router, openapi);
         let directory: Arc<dyn DirectoryClient> = ctx.client_hub().get::<dyn DirectoryClient>()?;
-        let state = Arc::new(DispatcherState::new(directory));
+        let state = Arc::new(DispatcherState::new(directory)?);
         Ok(router.layer(Extension(state)))
     }
 

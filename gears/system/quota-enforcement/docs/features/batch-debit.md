@@ -111,7 +111,8 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
 **Error Scenarios**:
 - Any item with `amount <= 0`: envelope-level `INVALID_AMOUNT` naming the offending item index, regardless of `mode`;
   nothing is persisted
-- Batch larger than the operator-configured maximum: `BULK_TOO_LARGE` before any item is evaluated
+- Batch larger than the operator-configured maximum: `BULK_TOO_LARGE` before any PDP call or idempotency lookup, a
+  replay included
 - An item with a blank idempotency key, or two items sharing one: envelope-level `InvalidArgument`
   (`IDEMPOTENCY_KEY_REQUIRED` naming the item index, or `BATCH_ITEM_KEY_DUPLICATE`) before any lookup; nothing is
   persisted. Distinct items that name the same subject and metric are not duplicates: each is evaluated against the
@@ -126,12 +127,12 @@ Realises `cpt-cf-quota-enforcement-seq-batch-debit`.
 1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/operations/batch-debit` with a `BatchDebitRequest` carrying the envelope idempotency key, the required `mode` field, and the items; each item carries caller-supplied attribution, one operation-level metadata object, an optional resource, a positive integer `amount`, and its own idempotency key for individual identification (`cpt-cf-quota-enforcement-fr-batch-debit`); foundation admission (`cpt-cf-quota-enforcement-flow-authorized-admission`) and per-item ingress validation (`cpt-cf-quota-enforcement-flow-ingress-validation`, which covers each batch item) have already run - `inst-bde-request`
 2. [x] - `p1` - **IF** any item carries `amount <= 0` or a blank or duplicated item idempotency key, or the envelope is empty or names more than one tenant - `inst-bde-amount-if`
    1. [x] - `p1` - **RETURN** an envelope-level canonical `InvalidArgument` (`INVALID_AMOUNT` or `IDEMPOTENCY_KEY_REQUIRED` naming the offending item index, `BATCH_ITEM_KEY_DUPLICATE`, `BATCH_EMPTY`, or `BATCH_TENANT_MIXED`), regardless of `mode`, before idempotency lookup or any other pipeline step; no envelope or per-item idempotency record is persisted, no operation-log entry is written, no counter is mutated - `inst-bde-amount`
-3. [x] - `p1` - Consume each item's PDP-authorized, catalogue-mapped subject set via `cpt-cf-quota-enforcement-algo-subject-resolution` (projection-contracts feature; consumed, never re-specified), mirroring the canonical pipeline (`cpt-cf-quota-enforcement-algo-evaluation-pipeline`), which maps subjects before its idempotency lookup; canonicalize the sorted, deduplicated union of all item sets into the envelope's `IdempotencySubjectKey` per `cpt-cf-quota-enforcement-fr-idempotency` - `inst-bde-resolve`
-4. [x] - `p1` - DB: `lookup_idempotency(scope)` with the envelope's typed `IdempotencyScope`; on an exact replay **RETURN** the stored `BatchDecision` verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay` (consumption-operations feature), which this feature consumes unchanged for its operation type; this replay short-circuit takes precedence over the `mode` and size checks, so an exact replay returns the stored outcome even after an operator lowers the maximum batch size (PRD §5.7 replay guarantee); a divergent payload returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) - `inst-bde-idem`
-5. [x] - `p1` - **IF** `mode = independent` - `inst-bde-mode-if`
+3. [x] - `p1` - **IF** the item count exceeds the operator-configurable maximum batch size (default 100 items per batch) - `inst-bde-size-if`
+   1. [x] - `p1` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`) before any PDP call, idempotency lookup, or item evaluation, because admission costs one PDP call per item; a replay is checked too, so after an operator lowers the maximum, a retry of a larger committed batch gets `BULK_TOO_LARGE` instead of its stored outcome (section 7) - `inst-bde-size`
+4. [x] - `p1` - Consume each item's PDP-authorized, catalogue-mapped subject set via `cpt-cf-quota-enforcement-algo-subject-resolution` (projection-contracts feature; consumed, never re-specified), mirroring the canonical pipeline (`cpt-cf-quota-enforcement-algo-evaluation-pipeline`), which maps subjects before its idempotency lookup; canonicalize the sorted, deduplicated union of all item sets into the envelope's `IdempotencySubjectKey` per `cpt-cf-quota-enforcement-fr-idempotency` - `inst-bde-resolve`
+5. [x] - `p1` - DB: `lookup_idempotency(scope)` with the envelope's typed `IdempotencyScope`; on an exact replay **RETURN** the stored `BatchDecision` verbatim per `cpt-cf-quota-enforcement-algo-idempotency-replay` (consumption-operations feature), which this feature consumes unchanged for its operation type; this replay short-circuit takes precedence over the `mode` check, while the size check has already run before admission; a divergent payload returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) - `inst-bde-idem`
+6. [x] - `p1` - **IF** `mode = independent` - `inst-bde-mode-if`
    1. [x] - `p1` - **RETURN** `NOT_YET_IMPLEMENTED` (`DomainError::NotYetImplemented`, canonical `Unimplemented`, 501); partial-success bulk semantics are deferred to P2 per PRD §5.7 - `inst-bde-mode`
-6. [x] - `p1` - **IF** the item count exceeds the operator-configurable maximum batch size (default 100 items per batch) - `inst-bde-size-if`
-   1. [x] - `p1` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`) before any item is evaluated - `inst-bde-size`
 7. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-batch-envelope-evaluation` under the batch-level evaluation timeout - `inst-bde-envelope`
 8. [x] - `p1` - **IF** the envelope outcome is `Denied` - `inst-bde-denied-if`
    1. [x] - `p1` - **RETURN** the batch-level `Denied` verdict as an HTTP 200 `BatchDecision` body with per-item statuses included for diagnostic purposes only and every counter unchanged; `Denied` is a deterministic over-cap signal, so a retry is futile until a credit or period rollover (PRD §5.7) - `inst-bde-denied`
@@ -183,7 +184,7 @@ no new persisted state is introduced.
 **Initial State**: Validating
 
 **Transitions**:
-1. [x] - `p1` - **FROM** Validating **TO** Evaluating **WHEN** the amount validation passes, the envelope idempotency lookup misses, and the `mode` and size checks pass; an exact replay short-circuits to the stored `BatchDecision` without entering Evaluating - `inst-best-enter`
+1. [x] - `p1` - **FROM** Validating **TO** Evaluating **WHEN** the amount and size checks pass, the envelope idempotency lookup misses, and the `mode` check passes; an exact replay short-circuits to the stored `BatchDecision` without entering Evaluating - `inst-best-enter`
 2. [x] - `p1` - **FROM** Evaluating **TO** Applied **WHEN** every item evaluates to `Allowed` within the batch-level timeout; the union of per-item `debit_plan`s, the envelope idempotency record, the operation-log entry, and the outbox events commit in one transaction (I11) - `inst-best-applied`
 3. [x] - `p1` - **FROM** Evaluating **TO** DeniedRecorded **WHEN** any item evaluates to `Denied` within the batch-level timeout; the transaction commits through `apply_batch_debit` with an empty union, so no counter moves and only the envelope idempotency record (the `Denied` `BatchDecision`) persists - `inst-best-denied`
 4. [x] - `p1` - **FROM** Evaluating **TO** RolledBack **WHEN** any item fails with a canonical error or the batch-level timeout fires; the transaction rolls back, no counter mutation survives, and no envelope idempotency record persists - `inst-best-rollback`
@@ -203,7 +204,7 @@ DESIGN service surface; see the section 7 note on the DECOMPOSITION sharer list)
 `QuotaEnforcementClientV1::batch_debit(req: BatchDebitRequest)` returning `BatchDecision`. The `mode` field is
 required; `mode = independent` **MUST** be rejected with `NOT_YET_IMPLEMENTED` (canonical `Unimplemented`, 501) until
 the P2 mode ships. Batches over the operator-configurable maximum size (default 100 items) **MUST** be rejected with
-`BULK_TOO_LARGE` before any item is evaluated. If any item carries `amount <= 0`, the envelope **MUST** be rejected
+`BULK_TOO_LARGE` before any PDP call or idempotency lookup. If any item carries `amount <= 0`, the envelope **MUST** be rejected
 with an envelope-level `INVALID_AMOUNT` naming the offending item index, regardless of `mode`, before idempotency
 lookup or any other pipeline step, persisting nothing. The response **MUST** carry the batch-level outcome plus the
 per-item array preserving submission order; a `BatchDecision` and a `Problem` are mutually exclusive, and
@@ -292,8 +293,8 @@ the envelope, with no counter mutations, and a retry under the same envelope key
 - [ ] Any item with `amount <= 0` fails the envelope with `INVALID_AMOUNT` naming the offending item index, regardless
   of `mode`, before idempotency lookup: no envelope or per-item idempotency record, no operation-log entry, no counter
   change
-- [ ] A batch over the maximum size (default 100, operator-configurable) fails with `BULK_TOO_LARGE` before any item
-  is evaluated; `mode = independent` fails with `NOT_YET_IMPLEMENTED` (501)
+- [ ] A batch over the maximum size (default 100, operator-configurable) fails with `BULK_TOO_LARGE` before any PDP
+  call, a replay included; `mode = independent` fails with `NOT_YET_IMPLEMENTED` (501)
 - [ ] An exact replay of a committed envelope returns the stored `BatchDecision` verbatim without re-invoking the
   Engine and without a second counter effect; a divergent payload under the same envelope scope fails with
   `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched
@@ -348,8 +349,11 @@ the envelope, with no counter mutations, and a retry under the same envelope key
     here.
 - **Deliberately unpinned behavior**: PRD §5.7 pins ordering only for `INVALID_AMOUNT`: it fires before any item
   evaluation and before the idempotency lookup. The timing of the size and `mode` checks is this document's
-  implementation choice, constrained so that replay is not affected: they run after the replay short-circuit and
-  before any item evaluation. The PRD also does not state whether items after the first failing item are still
+  implementation choice. The size check runs before admission, so an oversized batch costs no PDP call. The trade-off:
+  after an operator lowers the maximum batch size, a retry of a larger batch committed within the idempotency
+  retention gets `BULK_TOO_LARGE` instead of its stored outcome, and a caller that then splits it under new keys
+  debits it twice. Lower the limit only when no larger batch is still being retried. The `mode` check runs after the
+  replay short-circuit. The PRD also does not state whether items after the first failing item are still
   evaluated for diagnostics; that choice is left to the implementation, and no test may depend on it.
 - **No NFR ownership**: the DECOMPOSITION NFR allocation assigns the hot-path NFRs to the consumption-operations
   feature; this feature adds no NFR promise. The worst-case batch latency bound follows from

@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use axum::extract::Request;
 use axum::response::Response;
-use pingora_core::connectors::http::v1::Connector;
 use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit::directory::{DirectoryClient, DirectoryNotFound};
 use toolkit_canonical_errors::Http;
+use toolkit_http_proxy::{ProxyClient, ProxyClientConfig};
 
 use super::proxy_client;
 use crate::api::rest::error::EventBrokerResourceError;
@@ -30,27 +30,43 @@ const IDLE_READ_TIMEOUT: Duration = Duration::from_mins(1);
 const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shared state every dispatcher handler needs: the resolved
-/// `DirectoryClient` and a pooled Pingora HTTP/1 connector. Attached once
+/// `DirectoryClient` and a pooled HTTP/1 upstream client. Attached once
 /// via `Extension<Arc<DispatcherState>>` after all dispatcher routes are
 /// registered (design.md D7).
 pub struct DispatcherState {
     directory: Arc<dyn DirectoryClient>,
-    connector: Connector,
-    connect_timeout: Duration,
-    idle_timeout: Duration,
+    client: ProxyClient,
     max_request_body_bytes: usize,
 }
 
+/// Build the pooled client: `connect_timeout` bounds the TCP connect,
+/// `idle_timeout` the response head and every body read (design.md D9).
+///
+/// # Errors
+/// When the engine cannot build its TLS configuration (e.g. no crypto
+/// provider installed in a FIPS build). The dispatcher only speaks cleartext
+/// HTTP/1, but the engine builds its TLS configuration up front.
+fn build_client(
+    connect_timeout: Duration,
+    idle_timeout: Duration,
+) -> Result<ProxyClient, toolkit_http_proxy::ProxyError> {
+    let mut cfg = ProxyClientConfig::default();
+    cfg.connect_timeout = connect_timeout;
+    cfg.read_timeout = Some(idle_timeout);
+    ProxyClient::new(cfg)
+}
+
 impl DispatcherState {
-    #[must_use]
-    pub fn new(directory: Arc<dyn DirectoryClient>) -> Self {
-        Self {
+    /// # Errors
+    /// When the pooled upstream client cannot be built (see `build_client`).
+    pub fn new(
+        directory: Arc<dyn DirectoryClient>,
+    ) -> Result<Self, toolkit_http_proxy::ProxyError> {
+        Ok(Self {
             directory,
-            connector: Connector::new(None),
-            connect_timeout: UPSTREAM_CONNECT_TIMEOUT,
-            idle_timeout: IDLE_READ_TIMEOUT,
+            client: build_client(UPSTREAM_CONNECT_TIMEOUT, IDLE_READ_TIMEOUT)?,
             max_request_body_bytes: MAX_REQUEST_BODY_BYTES,
-        }
+        })
     }
 
     /// Overrides the upstream connect timeout - test-only, so the
@@ -58,7 +74,12 @@ impl DispatcherState {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
-        self.connect_timeout = connect_timeout;
+        let idle_timeout = self
+            .client
+            .config()
+            .read_timeout
+            .unwrap_or(IDLE_READ_TIMEOUT);
+        self.client = build_client(connect_timeout, idle_timeout).expect("test client");
         self
     }
 
@@ -68,7 +89,8 @@ impl DispatcherState {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
-        self.idle_timeout = idle_timeout;
+        let connect_timeout = self.client.config().connect_timeout;
+        self.client = build_client(connect_timeout, idle_timeout).expect("test client");
         self
     }
 
@@ -147,10 +169,8 @@ pub async fn forward(
 
     proxy_client::proxy(
         &endpoint.uri,
-        &state.connector,
+        &state.client,
         req,
-        state.connect_timeout,
-        state.idle_timeout,
         state.max_request_body_bytes,
     )
     .await

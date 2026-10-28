@@ -63,7 +63,11 @@ fn an_admission_drop_is_logged_in_the_record_drop_shape_without_content() {
     assert!(logs_contain("event=\"record_dropped\""));
     assert!(logs_contain("stage=\"admission\""));
     assert!(logs_contain("reason=\"personalization_off\""));
-    assert!(logs_contain("provenance=chat_engine/thread-42/msg-7"));
+    assert!(logs_contain("record_key="));
+    assert!(
+        !logs_contain("chat_engine/thread-42/msg-7"),
+        "no provenance"
+    );
     assert!(!logs_contain(SECRET), "no content");
 }
 

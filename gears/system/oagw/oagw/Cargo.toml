@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-oagw"
 description = "OAGW module - discovers and routes to plugins"
-version = "0.5.5"
+version = "0.6.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,8 +18,9 @@ path = "src/lib.rs"
 
 [features]
 # FIPS-140-3: compile TLS deps with FIPS-approved cipher suites only
-fips = ["toolkit-http/fips"]
+fips = ["toolkit-http/fips", "toolkit-http-proxy/fips"]
 test-utils = [
+    "toolkit-http-proxy/test-utils",
     "axum/ws",
     "credstore-sdk/test-util",
     "toolkit/bootstrap",
@@ -36,7 +37,7 @@ mysql = ["toolkit-db/mysql"]
 integration = ["mysql"]
 
 [dependencies]
-oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.15", features = ["axum"] }
+oagw-sdk = { path = "../oagw-sdk", package="cf-gears-oagw-sdk", version = "0.5.16", features = ["axum"] }
 toolkit = { workspace = true }
 toolkit-auth = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum"] }
@@ -83,19 +84,16 @@ sea-orm-migration = { workspace = true }
 time = { workspace = true }
 # DP deps
 form_urlencoded = "1"
-pingora-memory-cache = "0.8"
+lru = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
 tokio-retry = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-# Pingora proxy engine
-pingora-proxy = { version = "0.8", features = ["rustls"] }
-pingora-core = { version = "0.8", features = ["rustls"] }
-pingora-load-balancing = { version = "0.8", features = ["rustls"] }
-pingora-http = { version = "0.8.1" }
-httparse = "1"
+# Upstream proxy engine (ADR-0019)
+toolkit-http-proxy = { workspace = true }
+http-body-util = { workspace = true }
 # test-utils optional deps
 async-stream = { workspace = true, optional = true }
 tower = { workspace = true, features = ["util"], optional = true }
@@ -124,3 +122,7 @@ toolkit-db = { workspace = true, features = ["sqlite", "pg", "test-support"] }
 testcontainers = { workspace = true }
 test-containers = { workspace = true }
 tracing-test = { workspace = true }
+
+[[bench]]
+name = "proxy_roundtrip"
+harness = false

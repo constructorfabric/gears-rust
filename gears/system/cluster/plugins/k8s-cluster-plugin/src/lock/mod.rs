@@ -437,7 +437,12 @@ impl LockRuntime {
                 guarded::replace(&api, object.as_str(), &lease, CallSite::LockAcquire),
             )
             .await?;
-        Ok(matches!(replaced, Replaced::Applied(_)))
+        match replaced {
+            Replaced::Applied(_) => Ok(true),
+            Replaced::Conflict => Ok(false),
+            // The reaper deleted the Lease after our read (§5.5): create it instead.
+            Replaced::Gone => self.create_claim(coordination_name, token, ttl).await,
+        }
     }
 }
 
@@ -491,7 +496,8 @@ async fn renew_holder(
             .await?;
         match replaced {
             Replaced::Applied(_) => return Ok(()),
-            Replaced::Conflict => {}
+            // Re-read and decide again.
+            Replaced::Conflict | Replaced::Gone => {}
         }
     }
     Err(holder_write_exhausted(name))
@@ -538,7 +544,8 @@ async fn release_holder(
             .await?;
         match replaced {
             Replaced::Applied(_) => return Ok(()),
-            Replaced::Conflict => {}
+            // Re-read and decide again.
+            Replaced::Conflict | Replaced::Gone => {}
         }
     }
     Err(holder_write_exhausted(name))

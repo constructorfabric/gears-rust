@@ -1,10 +1,11 @@
 //! The atomic batch debit: several debits of one logical operation, admitted
 //! or refused as a whole.
 //!
-//! The gear validates the envelope, admits every item on its own attribution,
-//! derives the envelope's idempotency scope from the union of the items'
-//! subject sets, and answers a replay before the `mode` and size checks, so a
-//! stored outcome survives a lowered size limit. Evaluation, the batch timer
+//! The gear validates the envelope and its size, admits every item on its own
+//! attribution, derives the envelope's idempotency scope from the union of the
+//! items' subject sets, and answers a replay before the `mode` check. The size
+//! check comes before admission, so an oversized batch costs no PDP call, and
+//! a lowered size limit applies to replays too. Evaluation, the batch timer
 //! and the all-or-nothing write belong to the storage transaction.
 //!
 //! The batch path feeds no `operation`-labelled series: the feature claims no
@@ -82,6 +83,18 @@ impl Operations<'_> {
         let (tenant, amounts) = self.validate_batch(&request)?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-amount
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-amount-if
+        // Before admission: every item costs a PDP call.
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size-if
+        // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size
+        if request.items.len() > self.batch.max_items {
+            self.metrics.record_denial(DenialReason::InvalidArgument);
+            return Err(DomainError::BulkTooLarge {
+                items: request.items.len(),
+                max: self.batch.max_items,
+            });
+        }
+        // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size
+        // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-request
         let payload_hash = digest(&BatchPayload {
             mode: request.mode,
@@ -111,17 +124,6 @@ impl Operations<'_> {
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode
         // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-mode-if
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size-if
-        // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size
-        if request.items.len() > self.batch.max_items {
-            self.metrics.record_denial(DenialReason::InvalidArgument);
-            return Err(DomainError::BulkTooLarge {
-                items: request.items.len(),
-                max: self.batch.max_items,
-            });
-        }
-        // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size
-        // @cpt-end:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-size-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-batch-debit:p1:inst-bde-envelope
         let decisions = self
             .run_batch(

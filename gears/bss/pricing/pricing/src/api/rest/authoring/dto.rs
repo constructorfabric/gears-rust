@@ -1712,6 +1712,10 @@ pub struct PricingApprovalUnitDto {
     #[serde(with = "time::serde::rfc3339::option")]
     pub decided_at: Option<time::OffsetDateTime>,
     pub decided_note: Option<String>,
+    /// The content the review reads, as stored at submit. Each price of a prices snapshot, in
+    /// `before` and `after`, carries its `currency` and `currency_scale` (D-539), so a review
+    /// renders its money from the unit alone; `book { id, code, name, currency }` is put beside
+    /// each book id at read (D-516).
     pub snapshot: serde_json::Value,
     pub decisions: Vec<PricingDecisionDto>,
     pub impact: Option<serde_json::Value>,

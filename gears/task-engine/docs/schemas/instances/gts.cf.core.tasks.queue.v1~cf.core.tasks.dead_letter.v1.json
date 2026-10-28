@@ -1,0 +1,5 @@
+{
+  "id": "gts.cf.core.tasks.queue.v1~cf.core.tasks.dead_letter.v1",
+  "description": "Terminal dead-letter queue. Tasks that exhaust retries or exceed their lifetime on a queue with this queue configured as its dead_letter_queue are parked here for inspection and manual re-enqueue (PRD cpt-cf-task-engine-fr-dead-letter). It is never dispatched and declares no dispatch settings.",
+  "kind": "dead_letter"
+}

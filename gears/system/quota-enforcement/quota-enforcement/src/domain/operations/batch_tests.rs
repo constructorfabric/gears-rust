@@ -347,7 +347,24 @@ async fn independent_mode_is_not_yet_implemented_but_a_stored_key_answers_first(
 }
 
 #[tokio::test]
-async fn a_stored_batch_replays_after_the_size_limit_was_lowered() {
+async fn an_oversized_batch_is_refused_before_any_pdp_call() {
+    let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
+    let h = Harness::with_pdp(pdp.clone()).await;
+    h.quota(Some(100)).await;
+    let mut operations = h.operations();
+    operations.batch.max_items = 1;
+
+    let error = operations
+        .batch_debit(&ctx(), batch(vec![item(5, "i1"), item(5, "i2")], "b1"))
+        .await
+        .expect_err("too large");
+
+    assert_eq!(error, DomainError::BulkTooLarge { items: 2, max: 1 });
+    assert_eq!(pdp.calls(), 0);
+}
+
+#[tokio::test]
+async fn a_lowered_size_limit_also_refuses_the_replay_of_a_larger_batch() {
     let h = Harness::new().await;
     let id = h.quota(Some(100)).await;
     let request = batch(vec![item(5, "i1"), item(5, "i2")], "b1");
@@ -356,22 +373,17 @@ async fn a_stored_batch_replays_after_the_size_limit_was_lowered() {
         .batch_debit(&ctx(), request.clone())
         .await
         .expect("batch");
+    assert_eq!(first.result, BatchResult::Allowed);
 
     let mut lowered = h.operations();
     lowered.batch.max_items = 1;
-    let replay = lowered.batch_debit(&ctx(), request).await.expect("replay");
-    let fresh = lowered
-        .batch_debit(&ctx(), batch(vec![item(5, "i1"), item(5, "i2")], "b2"))
+    let replay = lowered
+        .batch_debit(&ctx(), request)
         .await
-        .expect_err("too large");
+        .expect_err("the limit applies before the replay");
 
-    assert_eq!(replay, first);
-    assert_eq!(
-        fresh,
-        DomainError::BulkTooLarge { items: 2, max: 1 },
-        "a new key meets the lowered limit"
-    );
-    assert_eq!(h.consumed(id), 10);
+    assert_eq!(replay, DomainError::BulkTooLarge { items: 2, max: 1 });
+    assert_eq!(h.consumed(id), 10, "the original batch stays applied once");
 }
 
 // --- the timeout --------------------------------------------------------------

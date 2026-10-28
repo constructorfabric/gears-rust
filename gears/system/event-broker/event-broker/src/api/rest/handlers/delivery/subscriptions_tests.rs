@@ -819,6 +819,71 @@ async fn join_rejected_for_missing_topic_consume_permission_returns_403() {
 }
 
 #[tokio::test]
+async fn join_checks_consume_on_the_concrete_topic_and_types() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let recorder = Arc::clone(&asked);
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((req.action.name.clone(), req.resource.resource_type.clone()));
+                false
+            },
+        })))
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    asked.lock().unwrap().clear();
+
+    let resp = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "test-agent",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "tenant_id": Uuid::new_v4(),
+                "types": [
+                    "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                    "gts.cf.core.events.event.v1~x.eb.t1.*",
+                ],
+            }],
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(201);
+    let consume: Vec<String> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(action, resource)| {
+            action == "consume" && resource != "gts.cf.core.events.request.v1~"
+        })
+        .map(|(_, resource)| resource.clone())
+        .collect();
+    assert_eq!(
+        consume,
+        [
+            // The topic itself, then the exact type as itself, then the
+            // wildcard on the event base type (a pattern is not a GTS id).
+            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+            "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "gts.cf.core.events.event.v1~",
+        ]
+    );
+}
+
+#[tokio::test]
 async fn join_rejected_for_missing_event_type_consume_permission_returns_403_naming_the_offending_type()
  {
     let harness = EventBrokerHarness::builder()

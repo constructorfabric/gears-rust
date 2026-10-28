@@ -8,7 +8,7 @@ sidebar:
 
 Constructor Fabric Gears combines **Rust as a language** with a **secure, modular XaaS framework**. Rust moves many defects into compile-time checks; Gears adds the platform layer around Rust: tenancy, authorization, consistent APIs, lifecycle, observability, extension points, and governance.
 
-For the longer rationale, see [WHY_GEARS.md](https://github.com/constructorfabric/gears-rust/blob/main/docs/WHY_GEARS.md).
+For the longer rationale, see [WHY_GEARS.md](https://github.com/constructorfabric/gears-rust/blob/main/docs/WHY_GEARS.md) (for technical decision-makers) and [WHY_RUST.md](https://github.com/constructorfabric/gears-rust/blob/main/docs/WHY_RUST.md) (a technical comparison with Go and C#).
 
 ## Why Rust
 

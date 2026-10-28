@@ -1,0 +1,63 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.tasks.worker_blacklisted.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task Engine lifecycle event type 'workerBlacklisted'. Published when a worker is blacklisted on a queue after crossing the consecutive-failure threshold (PRD cpt-cf-task-engine-fr-worker-blacklist). Subject is the queue the worker is blacklisted on (subject_type gts.cf.core.tasks.queue.v1~); the worker identity (`subject_id`, `worker_id`) is carried in data.worker_subject and data.worker. Derived from the Event Broker base event type; routed to the task_events topic and partitioned by subject (the queue ID) for per-queue ordering.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+    "partition_key": "/subject",
+    "allowed_subject_types": [
+      "gts.cf.core.tasks.queue.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~cf.core.tasks.worker_blacklisted.v1~",
+          "$comment": "Pins the event-type identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "worker": {
+              "description": "Blacklisted worker (`worker_id`). Worker ID sent by the worker on claim (PRD §5.6 Worker identity). Together with the subject field it forms the worker identity.",
+              "type": "string",
+              "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+            },
+            "worker_subject": {
+              "description": "Principal (`subject_id`) of the blacklisted worker.",
+              "type": "string",
+              "maxLength": 256
+            },
+            "queue": {
+              "description": "Queue the worker is blacklisted on (also the event subject).",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "failure_count": {
+              "description": "Consecutive failures that triggered the blacklisting.",
+              "type": "integer",
+              "minimum": 1
+            },
+            "until": {
+              "description": "When the blacklisting expires.",
+              "type": "string",
+              "format": "date-time"
+            }
+          },
+          "required": [
+            "worker",
+            "worker_subject",
+            "queue"
+          ]
+        }
+      }
+    }
+  ]
+}

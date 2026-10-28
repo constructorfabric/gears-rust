@@ -3,6 +3,7 @@ use toolkit_db::DbError;
 use toolkit_macros::domain_model;
 
 use super::refusal::Refusal;
+use super::settings_scope::SettingsOutOfScope;
 
 #[domain_model]
 #[derive(Debug, thiserror::Error)]
@@ -12,6 +13,12 @@ pub enum DomainError {
 
     #[error("Access forbidden: {0}")]
     Forbidden(String),
+
+    /// The caller's policy scope leaves the subject's settings out, on a read
+    /// or a write. Answered like `Forbidden`; kept apart so callers and the
+    /// log can tell it from a policy denial.
+    #[error("Access forbidden: {0}")]
+    OutOfScope(SettingsOutOfScope),
 
     #[error("Service unavailable: {0}")]
     Unavailable(String),

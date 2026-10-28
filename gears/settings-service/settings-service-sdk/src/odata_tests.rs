@@ -1,4 +1,3 @@
-// Created: 2026-10-14 by Virtuozzo International GmbH
 //! Tests for the declared `OData` surfaces of the SDK.
 
 use toolkit_odata::filter::{FieldKind, FilterField};

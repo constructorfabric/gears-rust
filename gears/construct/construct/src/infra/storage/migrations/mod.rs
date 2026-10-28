@@ -3,6 +3,7 @@ use sea_orm_migration::prelude::*;
 pub mod initial_001;
 pub mod m002_subject_settings;
 pub mod m003_record_ids;
+pub mod m004_record_ids_key_only;
 
 pub struct Migrator;
 
@@ -16,6 +17,7 @@ impl MigratorTrait for Migrator {
             Box::new(initial_001::Migration),
             Box::new(m002_subject_settings::Migration),
             Box::new(m003_record_ids::Migration),
+            Box::new(m004_record_ids_key_only::Migration),
         ]
     }
 }

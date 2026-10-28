@@ -285,6 +285,13 @@ pub async fn restricted_config(ns: &NamespaceGuard, verbs: &[&str]) -> K8sCluste
 to `kube::Config::from_kubeconfig`. The k3s container needs privileged mode
 (the module handles it), which is the one CI requirement beyond a Docker daemon.
 
+The image is pinned to `rancher/k3s:v1.37.1-k3s1` rather than the module's default
+(v1.28), because the API server's answers differ across versions: from 1.34 a
+guarded `PUT` on a custom resource deleted since the read is a `404`, where 1.33
+and earlier answer `409` (DESIGN §10). `K8S-CACHE-018`/`019` exercise that `404`
+only on 1.34 or later. Set `K8S_PLUGIN_K3S_TAG` to run the suite against another
+k3s tag, e.g. `v1.33.5-k3s1` for the `409` path.
+
 **Why k3s rather than kind or envtest.** k3s is a `testcontainers-modules` image,
 so it composes with the same fixture pattern every other cluster plugin uses and
 needs no host tooling — where `kind` needs the `kind` binary and its own docker
@@ -321,6 +328,8 @@ These mirror the conformance scenarios (§3) with assertions on the actual
 | `K8S-CACHE-015` | `scan_prefix` paginates, filters, and excludes expired | 1200 entries under one prefix returned across three pages with no request carrying `limit > 500`; entries under a different prefix excluded; expired-but-not-yet-swept entries excluded; and the returned keys are **original** keys, not mapped object names. Also asserts a real `LIST` is issued rather than the watcher's in-memory index being consulted (DESIGN §6.4) |
 | `K8S-CACHE-016` | A missing CRD is a config error, not a missing key | With the CRD deleted from a running cluster, a cache `get` returns `InvalidConfig` naming `deploy/crd.yaml` — **not** `Ok(None)`, which would silently report every key as absent. The one runtime path DESIGN §10 adds specifically because the startup canary cannot cover a CRD removed later |
 | `K8S-CACHE-017` | `cache_watch: false` declares no watch and refuses one | With the watcher off, `features().watch` and `prefix_watch` are both `false`, and `watch`/`watch_prefix` return `Unsupported` with the **canonical** `feature: "watch"` / `"prefix_watch"` — the shape `CasBasedLeaderElectionBackend::elect` matches exactly to degrade to its renewal timer. A live-but-silent channel, or a non-canonical string, hangs a direct consumer and kills leader election under `cache: k8s` + `cache_watch: false` + omitted `leader_election` (DESIGN §6.3) |
+| `K8S-CACHE-018` | `put` racing `delete` upserts | 8 writers `put` one key while 2 tasks loop `delete` on it; no `put` returns a non-retryable error. The pinned k3s (v1.37, §4.1) answers this race with the `404` of a custom resource deleted since the read; the unit tests in `cache::vanished_object_tests` replay it deterministically. Run with `K8S_PLUGIN_K3S_TAG` set to a ≤ 1.33 tag for the `409` path (DESIGN §6.1, §10) |
+| `K8S-CACHE-019` | `compare_and_swap` racing `delete` conflicts | Same setup with `get` → `compare_and_swap` (or `put_if_absent` when absent): a lost CAS is `CasConflict`, never a non-retryable error (DESIGN §6.1, §10) |
 
 ### 4.3 Leader Election Integration Scenarios
 

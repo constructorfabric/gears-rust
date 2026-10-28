@@ -68,14 +68,8 @@ use testcontainers_modules::{mysql::Mysql, postgres::Postgres, redis::Redis};
 /// Tag of the official `postgres` image. The workspace floor.
 pub const POSTGRES_TAG: &str = "18-alpine";
 
-/// Tag of the `postgres` image for the future graph-storage gear, which needs
-/// `SQL/PGQ` (`GRAPH_TABLE`) — `PostgreSQL` 19 only.
-///
-/// Reserved: nothing consumes this yet. Pre-`GA`, so it names a beta build;
-/// replace it with `19-alpine` once `PostgreSQL` 19 ships (expected
-/// September/October 2026, see `docs/arch/secure-orm/ADR/0002`). Beta tags are
-/// routinely withdrawn from Docker Hub after `GA`, which is why
-/// [`graph_lane_required()`] defaults to `false`.
+/// Tag of the `postgres` image for `toolkit-db`'s `SQL/PGQ` suite. A beta on
+/// purpose: 19 GA ships without `SQL/PGQ` (gears-rust #5343).
 pub const POSTGRES_GRAPH_TAG: &str = "19beta3-alpine";
 
 /// Tag of the official `mysql` image.
@@ -248,8 +242,7 @@ pub fn postgres_tagged(fallback: &str) -> ContainerRequest<Postgres> {
     ContainerRequest::from(Postgres::default()).with_tag(tag)
 }
 
-/// A `PostgreSQL` 19 container request, for the graph-storage gear's `SQL/PGQ`
-/// suite. Reserved — nothing consumes it yet; see [`POSTGRES_GRAPH_TAG`].
+/// A `PostgreSQL` 19 beta container request; see [`POSTGRES_GRAPH_TAG`].
 pub fn postgres_graph() -> ContainerRequest<Postgres> {
     ContainerRequest::from(Postgres::default()).with_tag(postgres_graph_tag())
 }
@@ -289,13 +282,12 @@ pub fn clickhouse() -> GenericImage {
     GenericImage::new(CLICKHOUSE_IMAGE.to_owned(), clickhouse_tag())
 }
 
-/// Whether an unavailable `PostgreSQL` 19 image must fail the run rather than
-/// skip it.
+/// Whether an unavailable `PostgreSQL` 19 beta image must fail the run rather
+/// than skip it.
 ///
-/// Defaults to `false` while the image is pre-`GA`: the tag can disappear from
-/// Docker Hub at `GA`, and no lane should go red for that. `CI` sets
-/// `GEARS_TEST_PG_GRAPH_REQUIRED=1` once the lane is meant to be mandatory —
-/// the same shape as `RG_PG_REQUIRE_DOCKER` in resource-group's smoke test.
+/// Off by default: the beta tags can disappear from Docker Hub, and `CI` does
+/// not set it (gears-rust #5343). Set `GEARS_TEST_PG_GRAPH_REQUIRED=1` for a
+/// run that must exercise the `SQL/PGQ` suite.
 #[must_use]
 pub fn graph_lane_required() -> bool {
     flag_from(env_override(ENV_GRAPH_LANE_REQUIRED))
@@ -632,6 +624,22 @@ mod tests {
                 ("TIMESCALEDB_IMAGE", TIMESCALEDB_IMAGE),
                 ("TIMESCALEDB_TAG", TIMESCALEDB_TAG),
                 ("ENV_TIMESCALEDB_TAG", ENV_TIMESCALEDB_TAG),
+            ],
+            "PostgreSQL majors",
+        );
+    }
+
+    /// Same contract for the plain `PostgreSQL` image the Rust integration
+    /// suites run (`postgres()`): a self-managed `PostgreSQL` E2E
+    /// lane must exercise the same major, or its migrations and role grants are
+    /// validated against one server and run against another.
+    #[test]
+    fn e2e_sidecar_pins_the_same_postgres_image() {
+        assert_sidecar_pins(
+            &[
+                ("POSTGRES_IMAGE", "postgres"),
+                ("POSTGRES_TAG", POSTGRES_TAG),
+                ("ENV_POSTGRES_TAG", ENV_POSTGRES_TAG),
             ],
             "PostgreSQL majors",
         );

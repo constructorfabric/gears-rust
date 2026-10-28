@@ -1,0 +1,71 @@
+[package]
+name = "cf-gears-toolkit-http-proxy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ToolKit upstream proxy engine: pooled HTTP/1.1 and HTTP/2 client over rustls with ALPN, load balancing and health checks"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "cf-gears-toolkit"]
+categories = ["web-programming", "network-programming"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "toolkit_http_proxy"
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# FIPS-140-3: every TLS `ClientConfig` comes from `toolkit-http`, which fails
+# closed without an installed FIPS provider and asserts `ClientConfig::fips()`.
+fips = ["toolkit-http/fips"]
+# Test helpers: a certificate verifier that accepts any server certificate.
+# It refuses to build under `fips`.
+test-utils = []
+
+[dependencies]
+toolkit-http = { workspace = true }
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+dashmap = { workspace = true }
+foldhash = { workspace = true }
+futures-util = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
+parking_lot = { workspace = true }
+pin-project-lite = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+sync_wrapper = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "time", "rt", "sync", "macros"] }
+tokio-rustls = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+cf-gears-toolkit-http-proxy = { path = ".", features = ["test-utils"] }
+hyper = { workspace = true, features = ["server", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["server", "server-auto", "http1", "http2", "tokio"] }
+proptest = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
+# FIPS test builds install the platform provider `toolkit-http` uses (see
+# tests/support): corecrypto on macOS (empty lib elsewhere), CNG on Windows.
+rustls-corecrypto-provider = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dev-dependencies]
+rustls-cng-crypto = { workspace = true }
+
+[[bench]]
+name = "client"
+harness = false

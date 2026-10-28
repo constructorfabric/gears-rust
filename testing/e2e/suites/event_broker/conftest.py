@@ -245,7 +245,7 @@ def pytest_collection_modifyitems(items):
 def _patch_config(config_text: str, env: GearTestEnv) -> str:
     config_text = config_text.replace(
         'home_dir: "~/.cf-gears-event-broker"',
-        f'home_dir: "{_TEMP_HOME}"',
+        f'home_dir: "{Path(_TEMP_HOME).as_posix()}"',
     )
     # The storage backend opens its own database, and the committed config
     # points it at the real home directory. Redirect it into this session's
@@ -253,7 +253,7 @@ def _patch_config(config_text: str, env: GearTestEnv) -> str:
     # shared with the last run and with the restart test's own server.
     config_text = config_text.replace(
         'path: "~/.cf-gears-event-broker/event-broker/event_log.db"',
-        f'path: "{_TEMP_HOME}/event-broker/event_log.db"',
+        f'path: "{Path(_TEMP_HOME).as_posix()}/event-broker/event_log.db"',
     )
     config_text = config_text.replace(
         'bind_addr: "127.0.0.1:8080"',
