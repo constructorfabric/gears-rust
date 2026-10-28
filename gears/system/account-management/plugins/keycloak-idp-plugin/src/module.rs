@@ -6,10 +6,13 @@ use account_management_sdk::IdpPluginSpecV1;
 use account_management_sdk::idp::IdpPluginClient;
 use async_trait::async_trait;
 use credstore_sdk::SecretRef;
+use tokio_util::sync::CancellationToken;
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
 use toolkit::{Gear, context::GearCtx};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
+};
 
 use crate::config::{KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe};
 use crate::domain::credstore::{CredStoreReader, CredStoreWriter};
@@ -28,20 +31,14 @@ use crate::idp_impl::KeycloakIdpPlugin;
 use crate::infra::kc_http::ReqwestKcTransport;
 use crate::infra::metrics::build_default_adapter;
 
-// `account-management-sdk` is a Rust SDK dep (Cargo.toml); the plugin
-// publishes a `PluginV1<IdpPluginSpecV1>` instance to types-registry
-// at init and registers `Arc<dyn IdpPluginClient>` in ClientHub under
-// `register_scoped(scope = gts_id)`. AM's `Gear::init` resolves it
-// via `choose_plugin_instance` + `get_scoped` against the configured
-// `idp.vendor` (default `"cf"`, deploys override to `"keycloak"` to
-// pick this plugin).
+// Publishes `PluginV1<IdpPluginSpecV1>` in init, awaits admission, then binds
+// the scoped `IdpPluginClient`. Set AM's `idp.vendor` to `"keycloak"` to select it.
+// No runtime dependency on account-management: the host may omit AM.
 //
-// NO toolkit runtime `deps` entry for `account-management` because
-// the host process may legitimately not load that module (e.g. this
-// dev/PoC build) and the plugin must still install. `types-registry`
-// IS declared as a dep because the catalogue publish is a hard
-// prerequisite of the AM-side scoped resolution.
-#[toolkit::gear(name = "keycloak-idp-plugin", deps = [types_registry, credstore])]
+// The host must link a database-backed types-registry. Its system-gear init
+// runs first without a `deps` edge; a missing registry fails boot.
+// Remote publication is deferred to T41/T42.
+#[toolkit::gear(name = "keycloak-idp-plugin", deps = [credstore])]
 #[derive(Default)]
 pub struct KeycloakIdpPluginGear;
 
@@ -222,49 +219,21 @@ impl Gear for KeycloakIdpPluginGear {
         )
         .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
 
-        // Publish to types-registry. Idempotent restart: treat
-        // `AlreadyExists` as success ONLY when the stored spec
-        // matches our current serialised instance — otherwise fail
-        // immediately so a stale catalogue entry surfaces as an
-        // operator-actionable error rather than a silent drift.
-        // Mirrors the pattern in `static-idp-plugin` and the AM-
-        // owned TR plugin in `account-management::module`.
+        // Publish to types-registry; the backend is registered only once the
+        // instance is admitted (or found up to date).
         let registry = ctx
             .client_hub()
-            .get::<dyn TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get TypesRegistryClient: {e}"))?;
-        let results = registry
-            .register(vec![instance_json.clone()])
-            .await
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: types-registry register: {e}"))?;
-        for result in &results {
-            if let RegisterResult::Err { error, .. } = result {
-                if matches!(
-                    error,
-                    toolkit::api::canonical_prelude::CanonicalError::AlreadyExists { .. }
-                ) {
-                    let existing =
-                        registry
-                            .get_instance(instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "keycloak-idp-plugin: verify existing instance: {e}"
-                                )
-                            })?;
-                    if existing.object != instance_json {
-                        return Err(anyhow::anyhow!(
-                            "keycloak-idp-plugin: instance `{instance_id}` already registered \
-                             with a different spec — refusing to silently drift",
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "keycloak-idp-plugin: types-registry registration failed: {error}"
-                    ));
-                }
-            }
-        }
+            .get::<dyn PlatformTypesRegistryApi>()
+            .map_err(|e| {
+                anyhow::anyhow!("keycloak-idp-plugin: get PlatformTypesRegistryApi: {e}")
+            })?;
+        publish_instance(
+            registry.as_ref(),
+            instance_id.as_ref(),
+            instance_json,
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         let plugin = Arc::new(KeycloakIdpPlugin {
             tenant_facade,
@@ -391,6 +360,26 @@ async fn pre_warm_bootstrap_admin_with_retry(
     Err(anyhow::anyhow!(
         "keycloak-idp-plugin: bootstrap admin pre-warm bailed after {attempts_used}/{max_attempts} attempt(s) ({backoff:?} backoff between attempts); last error: {final_err}"
     ))
+}
+
+/// Reconcile this plugin's instance and wait for its admission.
+///
+/// # Errors
+/// A refused or unsettled admission, naming the instance and its outcome;
+/// the deadline or cancellation.
+async fn publish_instance(
+    registry: &dyn PlatformTypesRegistryApi,
+    instance_id: &str,
+    instance_json: serde_json::Value,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    let publisher = PublisherContext {
+        name: KeycloakIdpPluginGear::MODULE_NAME.to_owned(),
+        version: env!("CARGO_PKG_VERSION").parse()?,
+    };
+    let gts_id = GtsId::try_new(instance_id)?;
+    publish_startup_entities(registry, &publisher, &[(gts_id, instance_json)], cancel).await?;
+    Ok(())
 }
 
 #[cfg(test)]

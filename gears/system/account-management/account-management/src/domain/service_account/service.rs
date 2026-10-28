@@ -83,7 +83,7 @@ use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::ResourceType;
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::TypesRegistryApi;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -187,7 +187,7 @@ pub struct ServiceAccountService {
     /// Resolves a tenant's chained `tenant_type` for the plugin-facing
     /// context; an outage surfaces as `ServiceUnavailable` rather than
     /// leaking an `Option` through the contract.
-    types_registry: Arc<dyn TypesRegistryClient>,
+    types_registry: Arc<dyn TypesRegistryApi>,
     /// PEP gate run before any tenant read or `IdP` round trip.
     enforcer: PolicyEnforcer,
 }
@@ -198,7 +198,7 @@ impl ServiceAccountService {
     pub const fn new(
         tenant_repo: Arc<dyn TenantRepo>,
         idp: Arc<dyn IdpPluginClient>,
-        types_registry: Arc<dyn TypesRegistryClient>,
+        types_registry: Arc<dyn TypesRegistryApi>,
         enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
@@ -259,7 +259,7 @@ impl ServiceAccountService {
         let actor = ctx.subject_id();
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-provision:p1:inst-flow-sa-provision-authorize
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-provision:p1:inst-flow-sa-provision-resolve-tenant
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-provision:p1:inst-flow-sa-provision-resolve-tenant
 
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-provision:p1:inst-flow-sa-provision-bound-inputs
@@ -335,7 +335,7 @@ impl ServiceAccountService {
         let scope = self.authorize(ctx, pep::actions::LIST, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-list:p1:inst-flow-sa-list-authorize
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-list:p1:inst-flow-sa-list-resolve-tenant
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-list:p1:inst-flow-sa-list-resolve-tenant
         // @cpt-end:cpt-cf-account-management-dod-service-accounts-authenticated-tenant-scoped-invocation:p1:inst-dod-sa-authenticated-tenant-scoped-invocation-list
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-list:p1:inst-flow-sa-list-invoke-contract
@@ -394,7 +394,7 @@ impl ServiceAccountService {
         let actor = ctx.subject_id();
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-rotate:p1:inst-flow-sa-rotate-authorize
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-rotate:p1:inst-flow-sa-rotate-resolve-tenant
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-rotate:p1:inst-flow-sa-rotate-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-rotate:p1:inst-flow-sa-rotate-invoke-contract
         let req = IdpRotateServiceAccountSecretRequest::new(
@@ -464,7 +464,7 @@ impl ServiceAccountService {
         let actor = ctx.subject_id();
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-revoke:p1:inst-flow-sa-revoke-authorize
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-revoke:p1:inst-flow-sa-revoke-resolve-tenant
-        let tenant_context = self.resolve_active_tenant(&scope, tenant_id).await?;
+        let tenant_context = self.resolve_active_tenant(ctx, &scope, tenant_id).await?;
         // @cpt-end:cpt-cf-account-management-flow-service-accounts-revoke:p1:inst-flow-sa-revoke-resolve-tenant
         // @cpt-begin:cpt-cf-account-management-flow-service-accounts-revoke:p1:inst-flow-sa-revoke-invoke-contract
         let req =
@@ -541,12 +541,14 @@ impl ServiceAccountService {
     /// pass-through so both surfaces cannot drift apart.
     async fn resolve_active_tenant(
         &self,
+        ctx: &SecurityContext,
         scope: &AccessScope,
         tenant_id: Uuid,
     ) -> Result<TenantContext, DomainError> {
         crate::domain::tenant::resolve::resolve_active_tenant(
             &*self.tenant_repo,
             &*self.types_registry,
+            ctx,
             scope,
             tenant_id,
         )

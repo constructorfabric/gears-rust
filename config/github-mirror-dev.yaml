@@ -141,6 +141,12 @@ gears:
       default_page_size: 5
       max_page_size: 100
 
+  types-registry:
+    # The tenant-resolver plugins publish through the database-backed registry API.
+    database:
+      server: "sqlite_users"
+      file: "types_registry.db"
+
   tenant-resolver:
     config:
       vendor: "constructorfabric"

@@ -346,6 +346,12 @@ impl DomainError {
             Self::AlreadyResolved => "already_resolved",
             Self::Conflict { .. } => "conflict",
             Self::FeatureDisabled { .. } => "feature_disabled",
+            Self::RegistryRefusedCaller(refusal) => match refusal {
+                toolkit_canonical_errors::CanonicalError::Unauthenticated { .. } => {
+                    "unauthenticated"
+                }
+                _ => "permission_denied",
+            },
             Self::CrossTenantDenied { .. } => "cross_tenant_denied",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::IdpUnavailable { .. } => "idp_unavailable",
@@ -401,6 +407,10 @@ impl DomainError {
             | Self::Aborted { .. }
             | Self::ServiceAccountAmbiguous { .. }
             | Self::MetadataVersionMismatch { .. } => 409,
+            Self::RegistryRefusedCaller(refusal) => match refusal {
+                toolkit_canonical_errors::CanonicalError::Unauthenticated { .. } => 401,
+                _ => 403,
+            },
             Self::CrossTenantDenied { .. } => 403,
             Self::ServiceUnavailable { .. } | Self::IdpUnavailable { .. } => 503,
             Self::UnsupportedOperation { .. } => 501,

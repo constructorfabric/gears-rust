@@ -22,13 +22,14 @@ toolkit.workspace = true
 toolkit-macros.workspace = true
 toolkit-gts.workspace = true
 toolkit-security.workspace = true
+tokio-util.workspace = true
 toolkit-odata.workspace = true
 account-management-sdk.workspace = true
 credstore-sdk = { workspace = true }
 types-registry-sdk.workspace = true
-# Full gear crates for the `deps = [types_registry, credstore]` gear-macro arg
-# (force-linked via the macro's `::types_registry` / `::credstore` re-exports).
-types-registry = { workspace = true }
+# Full gear crate for the `deps = [credstore]` gear-macro arg (force-linked via
+# the macro's `::credstore` re-export). The registry is not linked: see the
+# local-only startup contract in `src/module.rs`.
 credstore = { workspace = true }
 reqwest = { workspace = true, features = ["form", "json", "rustls"] }
 serde.workspace = true
@@ -53,6 +54,7 @@ regex.workspace = true
 rand.workspace = true
 
 [dev-dependencies]
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tracing-subscriber = { workspace = true, features = ["registry"] }
 serde-saphyr = { workspace = true }

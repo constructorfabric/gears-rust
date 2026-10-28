@@ -11,6 +11,11 @@
 //! contract from AM's local DB to avoid a cross-gear read fan-out. Trade-off:
 //! AM-internal `Provisioning` rows are filtered server-side before crossing the
 //! TR boundary.
+//!
+//! The host must link a database-backed types-registry. Its system-gear init
+//! publishes both APIs before AM, without a `deps` edge; a missing API fails boot.
+//! AM admits its configured root type and enabled TR plugin before publishing
+//! `AccountManagementClient` for dependent gears' init. Remote publication remains T41/T42.
 
 use std::sync::{Arc, OnceLock};
 
@@ -62,7 +67,7 @@ use crate::tr_plugin::PluginImpl as TrPluginImpl;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
-use types_registry_sdk::RegisterResult;
+use types_registry_sdk::publish_startup_entities;
 
 type ConcreteService = TenantService<TenantRepoImpl>;
 
@@ -78,7 +83,7 @@ struct BootstrapParams {
     idp_required: bool,
     repo: Arc<TenantRepoImpl>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi>,
 }
 
 // Conversion lifecycle knobs (`approval_ttl`, `resolved_retention`,
@@ -90,7 +95,7 @@ struct BootstrapParams {
 
 #[toolkit::gear(
     name = "account-management",
-    deps = [authz_resolver, types_registry, resource_group, tenant_resolver],
+    deps = [authz_resolver, resource_group, tenant_resolver],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
@@ -120,7 +125,7 @@ pub struct AccountManagementGear {
     /// [`Self::service`] so SDK consumers and the REST surface for
     /// `/tenants/{id}/metadata` can drive the list / get / put /
     /// delete / resolve flows without re-discovering the resolved
-    /// `TypesRegistryClient`. Wired during [`Gear::init`]; remains
+    /// `TypesRegistryApi`. Wired during [`Gear::init`]; remains
     /// unset until init runs.
     metadata_service: OnceLock<Arc<MetadataService>>,
     /// Hooks registered before [`Gear::init`] has set up the service.
@@ -620,71 +625,30 @@ impl Gear for AccountManagementGear {
 
         let repo = Arc::new(TenantRepoImpl::new(Arc::clone(&db)));
 
-        // Resolve the IdP provider plugin from ClientHub. The single
-        // plugin instance now carries both tenant lifecycle (provision /
-        // deprovision tenant) and user lifecycle (provision / deprovision
-        // / list users) per the combined `IdpPluginClient`
-        // contract. The resolution policy is config-gated by
-        // `idp.required`:
-        //   * `idp.required = true`  → fail-closed at init when the
-        //                              plugin is missing (production
-        //                              posture for deployments that
-        //                              integrate with an external IdP).
-        //   * `idp.required = false` → fall back to `NoopIdpProvider`
-        //                              (dev / test, or AM-only
-        //                              deployments without external
-        //                              user store). Both `create_tenant`
-        //                              and user-ops then return
-        //                              `UnsupportedOperation` at
-        //                              runtime if the saga reaches the
-        //                              IdP step.
-        //
-        // The user-ops REST surface is deferred until
-        // `gears-rust#1813`; gating it with a separate
-        // `idp.user_operations_required` knob can land alongside the
-        // REST surface if deployments need to opt in independently.
-        // FEATURE 2.3 (tenant-type-enforcement) — hard-resolve the
-        // GTS Types Registry client. types-registry is declared in
-        // `deps` so the runtime guarantees init ordering, and AM
-        // genuinely cannot function without it: every Tenant DTO
-        // returned to API consumers carries a `tenant_type` field
-        // sourced from the registry, tenant-type enforcement
-        // (parent/child pairing admission) is the registry's
-        // dedicated job, AND the IdP plugin is now selected via
-        // `choose_plugin_instance` over types-registry-published
-        // `PluginV1<IdpPluginSpecV1>` instances (the vendor-based
-        // resolve below — symmetric with AuthN Resolver). A missing
-        // client would degrade these into null `tenant_type` fields
-        // and admit-everything pairings, which is contract-broken
-        // rather than degraded — so we fail closed at init instead
-        // of binding an inert fallback in production. (Tests construct
-        // the service directly with `inert_tenant_type_checker()`
-        // and bypass this init path.)
-        //
-        // The resolved client is reused for three purposes:
-        //   * the type-compatibility barrier
-        //     ([`GtsTenantTypeChecker`])
-        //   * the `tenant_type_uuid` → chained-id lookup that lowers
-        //     `TenantModel` into the public
-        //     [`account_management_sdk::Tenant`] shape on every
-        //     service-layer CRUD return value.
-        //   * the `IdpPluginSpecV1` instance enumeration used by the
-        //     vendor-based plugin selection block immediately below.
-        let types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient> = ctx
+        // Both registry APIs are required; a missing database-backed local registry
+        // fails init rather than disabling type checks or falling back to legacy.
+        // Request reads use `request_registry` with each caller's context (P33).
+        // Bootstrap, publication, retention and the reaper use `platform_registry`.
+        // Process-wide IdP selection and TR hierarchy reads are named platform
+        // exceptions; see `tr_plugin::plugin_impl`.
+        let request_registry: Arc<dyn types_registry_sdk::TypesRegistryApi> = ctx
             .client_hub()
-            .get::<dyn types_registry_sdk::TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryClient: {e}"))?;
+            .get::<dyn types_registry_sdk::TypesRegistryApi>()
+            .map_err(|e| anyhow::anyhow!("failed to get TypesRegistryApi: {e}"))?;
+        let platform_registry: Arc<dyn types_registry_sdk::PlatformTypesRegistryApi> = ctx
+            .client_hub()
+            .get::<dyn types_registry_sdk::PlatformTypesRegistryApi>()
+            .map_err(|e| anyhow::anyhow!("failed to get PlatformTypesRegistryApi: {e}"))?;
 
         // The root-type contract is registered independently from the optional
-        // bootstrap saga and its `strict` policy. At this point Types Registry
-        // is still in configuration mode: registration stages the AM-owned
-        // document, and its system `post_init` validates the complete catalogue
-        // before stateful gears (including AM bootstrap) start.
+        // bootstrap saga and its `strict` policy: AM reconciles it into the
+        // database-backed registry and waits for its admission, so bootstrap
+        // reads an admitted root.
         if let Some(root_cfg) = root_type.as_ref() {
             // `tenant_type_uuid` is the durable create-once binding between an
             // existing root row and its configured GTS contract. Reject drift
-            // before mutating the process-local catalogue and before non-strict
-            // bootstrap policy can suppress it.
+            // before any registry write and before non-strict bootstrap policy
+            // can suppress it.
             let root_scope = toolkit_db::secure::AccessScope::allow_all();
             let existing_root = tokio::select! {
                 () = ctx.cancellation_token().cancelled() => {
@@ -714,24 +678,23 @@ impl Gear for AccountManagementGear {
                 )?;
             }
 
-            register_root_type(types_registry.as_ref(), root_cfg)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "account-management root tenant type registration failed: {error}"
-                    )
-                })?;
+            register_root_type(
+                platform_registry.as_ref(),
+                root_cfg,
+                ctx.cancellation_token(),
+            )
+            .await?;
 
             info!(
                 target: "am.root_tenant_type",
                 root_tenant_type = %root_cfg.gts_id,
-                "root tenant type registered for Types Registry startup validation"
+                "root tenant type admitted by Types Registry"
             );
         }
 
         info!("types-registry client resolved from client hub; enabling GTS tenant-type checker");
         let tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync> =
-            Arc::new(GtsTenantTypeChecker::new(types_registry.clone()));
+            Arc::new(GtsTenantTypeChecker::new(Arc::clone(&request_registry)));
 
         // IdP provider plugin — lazy vendor-based selection.
         //
@@ -785,7 +748,7 @@ impl Gear for AccountManagementGear {
         // @cpt-begin:cpt-cf-account-management-algo-idp-user-operations-contract-idp-contract-invocation:p1:inst-algo-ici-resolve-plugin
         let idp: Arc<dyn IdpPluginClient> = Arc::new(LazyIdpProvider::new(
             ctx.client_hub(),
-            Arc::clone(&types_registry),
+            Arc::clone(&platform_registry),
             cfg.idp.vendor.clone(),
             cfg.idp.required,
         ));
@@ -922,7 +885,7 @@ impl Gear for AccountManagementGear {
                     idp_required: cfg.idp.required,
                     repo: Arc::clone(&repo),
                     idp: Arc::clone(&idp),
-                    types_registry: Arc::clone(&types_registry),
+                    types_registry: Arc::clone(&platform_registry),
                 });
             }
         }
@@ -961,55 +924,19 @@ impl Gear for AccountManagementGear {
             enforcer,
             cfg,
         );
-        service = service.with_types_registry(Arc::clone(&types_registry));
+        service = service.with_types_registry(
+            Arc::clone(&request_registry),
+            Arc::clone(&platform_registry),
+        );
 
-        // Tenant Resolver Plugin (in-process, AM-co-located).
+        // The TR plugin is opt-in (`cfg.tr_plugin.enabled`, default false), so an
+        // incidental AM dependency cannot become the sole resolver candidate.
+        // It shares AM's DB and platform registry client (DESIGN §1.1).
         //
-        // **Opt-in**: gated by `cfg.tr_plugin.enabled`. While the
-        // plugin is still in build-out the default is `false` so a
-        // deploy that incidentally pulls AM into its binary does NOT
-        // register the plugin in either types-registry or
-        // `ClientHub` — without that gate, an AM-only binary would
-        // be the sole candidate under the configured vendor and the
-        // gateway's `choose_plugin_instance` would pick AM regardless
-        // of `priority`.
-        //
-        // Runs BEFORE `self.service.set(...)` below: TR-plugin GTS
-        // registration involves a network round-trip to
-        // types-registry and is fallible (serialization, registry
-        // contract violation, transient unavailability). Publishing
-        // AM's `service` to its `OnceLock` first would leave the
-        // gear half-initialized and non-retriable on TR-plugin
-        // failure (the `OnceLock` would already be taken). Doing TR
-        // registration first preserves the "init() either fully
-        // succeeds or fully fails" contract.
-        //
-        // The plugin owns no state of its own; it borrows AM's `Db`
-        // and the already-resolved `TypesRegistryClient`.
-        // Registration order (when enabled):
-        //   1. Build `PluginImpl` from the shared deps.
-        //   2. Register a `PluginV1<TenantResolverPluginSpecV1>`
-        //      instance in types-registry (with idempotent
-        //      `AlreadyExists` spec verification).
-        //   3. **Only after** types-registry succeeds, bind the
-        //      plugin under a scoped `ClientHub` entry keyed by its
-        //      GTS instance id, matching the pattern in
-        //      `static-tr-plugin` and `rg-tr-plugin`.
-        // Step 3 follows step 2 so a registry failure cannot leave
-        // a stale `ClientHub` entry behind on a fail-closed init.
-        // The discovery race that could occur in the gap (gateway
-        // observes the registered instance but the bound client is
-        // not yet in the hub) is not reachable at init time —
-        // toolkit's init phase is sequential and the TR gateway
-        // resolves plugins lazily on the first user request, after
-        // every dep has finished initializing.
-        //
-        // Co-location rationale (DESIGN §1.1): the plugin's
-        // correctness depends on AM-writer invariants beyond the
-        // two-table schema (transactional `(tenants, tenant_closure)`
-        // maintenance, barrier materialization over
-        // `(ancestor, descendant]`, provisioning lifecycle), which a
-        // standalone crate could not validate at runtime.
+        // Reconcile and await admission before binding the scoped client or setting
+        // `self.service`: a publication failure must leave init retryable, without
+        // a partial OnceLock or hub entry. Equal restarts submit nothing.
+        // Sequential init and lazy selection prevent discovery before binding.
         if tr_plugin_enabled {
             // `tr_plugin` is enabled — emit a startup audit warning to
             // make the in-process Tenant Resolver plugin visible in
@@ -1030,7 +957,7 @@ impl Gear for AccountManagementGear {
             let hierarchy_read_adapter = Arc::new(TenantHierarchyReadAdapter::new(Arc::clone(&db)));
             let tr_plugin = Arc::new(TrPluginImpl::new(
                 hierarchy_read_adapter,
-                Arc::clone(&types_registry),
+                Arc::clone(&platform_registry),
             ));
             let tr_instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
                 "cf.builtin.account_management_tenant_resolver.plugin.v1",
@@ -1055,37 +982,19 @@ impl Gear for AccountManagementGear {
             };
             let tr_instance_json = serde_json::to_value(&tr_instance)
                 .map_err(|e| anyhow::anyhow!("tr-plugin: serialize instance failed: {e}"))?;
-            let tr_results = types_registry
-                .register(vec![tr_instance_json.clone()])
-                .await?;
-            // Idempotent restart: treat `AlreadyExists` as success only
-            // when the stored spec matches our current serialized
-            // instance; fail otherwise so a stale registration under
-            // the same ID surfaces immediately.
-            for result in &tr_results {
-                if let RegisterResult::Err { error, .. } = result {
-                    if matches!(
-                        error,
-                        toolkit_canonical_errors::CanonicalError::AlreadyExists { .. }
-                    ) {
-                        let existing = types_registry
-                            .get_instance(tr_instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                            anyhow::anyhow!("tr-plugin: verify existing instance: {e}")
-                        })?;
-                        if existing.object != tr_instance_json {
-                            return Err(anyhow::anyhow!(
-                                "tr-plugin: instance already registered with a different spec"
-                            ));
-                        }
-                    } else {
-                        return Err(anyhow::anyhow!("tr-plugin: registration failed: {error}"));
-                    }
-                }
-            }
-            // Only after types-registry has accepted the instance
-            // (or confirmed an idempotent restart) do we publish the
+            let tr_gts_id = types_registry_sdk::GtsId::try_new(tr_instance_id.as_ref())?;
+            publish_startup_entities(
+                platform_registry.as_ref(),
+                &types_registry_sdk::PublisherContext {
+                    name: Self::MODULE_NAME.to_owned(),
+                    version: env!("CARGO_PKG_VERSION").parse()?,
+                },
+                &[(tr_gts_id, tr_instance_json)],
+                ctx.cancellation_token(),
+            )
+            .await?;
+            // Only after types-registry has admitted the instance
+            // (or found it up to date) do we publish the
             // scoped client to the hub. A failure above returns Err
             // before we reach this point, leaving `ClientHub`
             // untouched.
@@ -1148,7 +1057,7 @@ impl Gear for AccountManagementGear {
             UserService::new(
                 Arc::clone(&repo) as Arc<dyn TenantRepo>,
                 Arc::clone(&idp),
-                Arc::clone(&types_registry),
+                Arc::clone(&request_registry),
                 user_enforcer,
             )
             // Wire RG-membership cleanup so `delete_user` removes
@@ -1166,7 +1075,7 @@ impl Gear for AccountManagementGear {
         );
 
         // Build the service-account domain service. Shares the same
-        // `TenantRepoImpl` + `TypesRegistryClient` the user service uses
+        // `TenantRepoImpl` + request registry client the user service uses
         // for the tenant guard, and the same resolved `IdpPluginClient`
         // — machine identities are a separate PEP resource type, not a
         // separate provider. Holds no storage handles: like the user
@@ -1175,35 +1084,17 @@ impl Gear for AccountManagementGear {
         let service_account_service = Arc::new(ServiceAccountService::new(
             Arc::clone(&repo) as Arc<dyn TenantRepo>,
             Arc::clone(&idp),
-            Arc::clone(&types_registry),
+            Arc::clone(&request_registry),
             service_account_enforcer,
         ));
 
-        // Build the tenant-metadata domain service.
-        //
-        // Three dependencies (per
-        // `domain::metadata::service::MetadataService::new`):
-        // * `Arc<dyn MetadataRepo>` — production `MetadataRepoImpl`
-        //   over the shared `AmDbProvider`.
-        // * `Arc<dyn TenantRepo>` — the same `TenantRepoImpl` already
-        //   built earlier in `init`; the resolve walk-up consults it
-        //   on every ancestor hop.
-        // * `Arc<dyn MetadataSchemaRegistry>` — the new
-        //   `GtsMetadataSchemaRegistry` adapter wrapping the resolved
-        //   `TypesRegistryClient`. Reads `inheritance_policy` from
-        //   `effective_traits()["inheritance_policy"]`; missing /
-        //   non-`"inherit"` values collapse to the documented
-        //   `override_only` default per FEATURE §3.1.
-        //
-        // The `idp.required` policy DOES NOT apply here: the metadata
-        // subsystem depends on `TypesRegistryClient` (already
-        // hard-required up-stream when `types-registry` was resolved),
-        // so the service is always built. There is no fall-back stub
-        // in production — tests construct `MetadataService::new`
-        // directly with a `StubMetadataSchemaRegistry`.
+        // Metadata always uses the request registry, independently of `idp.required`.
+        // The production adapter reads effective `inheritance_policy` for each caller;
+        // only "inherit" overrides the default "override_only" (FEATURE §3.1).
         let metadata_repo: Arc<dyn MetadataRepo> = Arc::new(MetadataRepoImpl::new(Arc::clone(&db)));
-        let schema_registry: Arc<dyn MetadataSchemaRegistry> =
-            Arc::new(GtsMetadataSchemaRegistry::new(Arc::clone(&types_registry)));
+        let schema_registry: Arc<dyn MetadataSchemaRegistry> = Arc::new(
+            GtsMetadataSchemaRegistry::new(Arc::clone(&request_registry)),
+        );
         let metadata_service = Arc::new(
             MetadataService::new(
                 metadata_repo,

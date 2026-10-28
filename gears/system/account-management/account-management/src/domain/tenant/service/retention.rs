@@ -30,7 +30,7 @@ use crate::domain::tenant::retention::{
     HardDeleteEligibility, HardDeleteOutcome, HardDeleteResult, TenantRetentionRow,
 };
 
-use super::TenantService;
+use super::{CallerOrigin, TenantService};
 
 impl<R: TenantRepo> TenantService<R> {
     /// Implements FEATURE `Hard-Delete Cleanup Sweep`.
@@ -405,7 +405,10 @@ impl<R: TenantRepo> TenantService<R> {
         // no-op". Without this propagation the variant docstring
         // (`reported only after a successful teardown and counts
         // toward is_cleaned`) would be unreachable.
-        let tenant_context = match self.load_tenant_context(row.id).await {
+        let tenant_context = match self
+            .load_tenant_context(CallerOrigin::Background, row.id)
+            .await
+        {
             Ok(ctx) => ctx,
             Err(err) => {
                 // Could not assemble the context (registry blip or

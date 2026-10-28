@@ -4,36 +4,44 @@ use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverPluginClient, AuthNResolverPluginSpecV1};
+use tokio_util::sync::CancellationToken;
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
+use toolkit::client_hub::{ClientHub, ClientScope};
 use toolkit::context::GearCtx;
+use toolkit::contracts::SystemCapability;
 use toolkit::gts::PluginV1;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
+};
 
 use crate::config::StaticAuthNPluginConfig;
 use crate::domain::Service;
 
-/// Static `AuthN` resolver plugin gear.
+/// Static token-to-identity `AuthN` plugin.
 ///
-/// Provides token-to-identity mapping from configuration.
-///
-/// **Plugin registration pattern:**
-/// - Gateway registers the plugin schema (GTS type definition)
-/// - This plugin registers its instance (implementation metadata)
-/// - This plugin registers its scoped client (implementation in `ClientHub`)
-#[toolkit::gear(
-    name = "static-authn-plugin",
-    deps = [types_registry]
-)]
+/// The schema comes from `toolkit-gts` inventory. After proxy wiring, `post_init`
+/// publishes the instance through consumed `PlatformTypesRegistryApi`, awaits
+/// admission, then binds its scoped client. Failure leaves no client and fails boot.
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::gear(name = "static-authn-plugin", capabilities = [system])]
 pub struct StaticAuthNPlugin {
-    service: OnceLock<Arc<Service>>,
+    pending: OnceLock<Publication>,
+}
+
+/// What `init` prepares and `post_init` publishes.
+struct Publication {
+    hub: Arc<ClientHub>,
+    cancel: CancellationToken,
+    instance_id: GtsId,
+    instance: serde_json::Value,
+    service: Arc<Service>,
 }
 
 impl Default for StaticAuthNPlugin {
     fn default() -> Self {
         Self {
-            service: OnceLock::new(),
+            pending: OnceLock::new(),
         }
     }
 }
@@ -60,33 +68,62 @@ impl Gear for StaticAuthNPlugin {
         );
 
         // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) =
-            PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
-                "cf.builtin.static_authn_resolver.plugin.v1",
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
+        let (instance_id, instance) = PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
+            "cf.builtin.static_authn_resolver.plugin.v1",
+            cfg.vendor.clone(),
+            cfg.priority,
+        )?;
 
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
-        // Create service from config
-        let service = Arc::new(Service::from_config(&cfg));
-        self.service
-            .set(service.clone())
+        let publication = Publication {
+            hub: ctx.client_hub(),
+            cancel: ctx.cancellation_token().clone(),
+            instance_id: GtsId::try_new(instance_id.as_ref())?,
+            instance,
+            service: Arc::new(Service::from_config(&cfg)),
+        };
+        self.pending
+            .set(publication)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-
-        // Register scoped client in ClientHub
-        let api: Arc<dyn AuthNResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn AuthNResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
         Ok(())
     }
 }
+
+#[async_trait]
+impl SystemCapability for StaticAuthNPlugin {
+    /// Publish the instance, then bind the client: after proxy wiring, so the registry's
+    /// platform API is in the hub wherever the registry runs.
+    async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
+        let p = self
+            .pending
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))?;
+
+        let registry = p.hub.get::<dyn PlatformTypesRegistryApi>().map_err(|e| {
+            anyhow::anyhow!("static-authn-plugin: no PlatformTypesRegistryApi to publish to: {e}")
+        })?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &PublisherContext {
+                name: Self::MODULE_NAME.to_owned(),
+                version: env!("CARGO_PKG_VERSION").parse()?,
+            },
+            &[(p.instance_id.clone(), p.instance.clone())],
+            &p.cancel,
+        )
+        .await?;
+
+        // Register scoped client in ClientHub, only past admission.
+        let api: Arc<dyn AuthNResolverPluginClient> = Arc::clone(&p.service) as _;
+        p.hub.register_scoped::<dyn AuthNResolverPluginClient>(
+            ClientScope::gts_id(p.instance_id.as_ref()),
+            api,
+        );
+
+        info!(instance_id = %p.instance_id, "static AuthN plugin published and bound");
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;

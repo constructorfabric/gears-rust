@@ -1,32 +1,9 @@
-//! Unit tests for [`super::validate_new_user_payload_via_gts`] and
-//! [`super::validate_tenant_name_via_gts`].
+//! Payload and tenant-name validation tests; see `gts_validation.rs` for the
+//! failure contract. Covers missing schemas, registry failures, property
+//! constraints and caller propagation.
 //!
-//! Pin the documented failure-mode arms (mirrors the production
-//! gear doc on `gts_validation.rs`):
-//!
-//! 1. Schema not registered (`CanonicalError::NotFound`):
-//!    * `validate_new_user_payload_via_gts` →
-//!      `DomainError::ServiceUnavailable` (fail-closed — no
-//!      AM-side storage gate for users, so the boundary helper
-//!      MUST be authoritative on `format` / `pattern` rules).
-//!    * `validate_tenant_name_via_gts` → `Ok(())` (DB CHECK +
-//!      bootstrap-before-catalog ordering remain authoritative).
-//! 2. Other `CanonicalError` (transport / availability) →
-//!    `DomainError::ServiceUnavailable`.
-//! 3. Schema returned but `jsonschema::validator_for` rejects it
-//!    (catalog drift) → `DomainError::Internal` — schema published
-//!    by the deploy bundle is not a valid JSON Schema; operator
-//!    action required. Exercised implicitly by the production
-//!    `Internal` arm in the helpers.
-//! 4. Schema returned + instance fails validation →
-//!    `DomainError::Validation` (HTTP 400 — the client can retry
-//!    with a corrected payload).
-//! 5. Schema returned + valid instance → `Ok(())` (happy path).
-//!
-//! `MockTypesRegistryClient::with_type_schemas` is the seam used to
-//! pin the registered-schema path; it pre-links the chain so
-//! `effective_properties()` returns the merged property map the
-//! helper validates against.
+//! `MockTypesRegistry` materializes `resolved_schema` from schema documents
+//! with `gts-rust`, as admission does.
 
 #![allow(
     clippy::expect_used,
@@ -35,17 +12,17 @@
     reason = "test helpers"
 )]
 
+use std::sync::Arc;
+
 use account_management_sdk::IdpNewUser;
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeId, GtsTypeSchema, RegisterResult, TypesRegistryClient,
-};
-use uuid::Uuid;
+use toolkit_gts::gts_uri;
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 
 use crate::domain::error::DomainError;
+use crate::domain::types_registry_reader::TypesRegistryReader;
+use crate::infra::types_registry::test_helpers::{CallerSpy, Tampered, assert_only_caller, caller};
 
 // ---- helpers -------------------------------------------------------
 
@@ -53,144 +30,82 @@ fn user_payload(username: &str) -> IdpNewUser {
     IdpNewUser::new(username.to_owned())
 }
 
-fn user_schema_with_username_max(max_chars: usize) -> GtsTypeSchema {
-    let body = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "username"],
-        "properties": {
-            "id": { "type": "string", "format": "uuid" },
-            "username": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": max_chars,
-            },
-            "email": { "type": "string", "format": "email" },
-            "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
-        },
+fn schema_doc(type_id: &str, body: &Value) -> Value {
+    let mut doc = json!({
+        "$id": gts_uri!(type_id),
+        "$schema": "http://json-schema.org/draft-07/schema#",
     });
-    GtsTypeSchema::try_new(GtsTypeId::new(super::USER_TYPE_ID), body, None, None)
-        .expect("synthetic user schema is valid")
+    doc.as_object_mut()
+        .expect("object")
+        .extend(body.as_object().expect("object").clone());
+    doc
 }
 
-fn tenant_schema_with_name_max(max_chars: usize) -> GtsTypeSchema {
-    let body = json!({
-        "type": "object",
-        "additionalProperties": true,
-        "required": ["id", "name"],
-        "properties": {
-            "id": { "type": "string", "format": "uuid" },
-            "name": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": max_chars,
-            },
-            "parent_id": { "type": ["string", "null"], "format": "uuid" },
-        },
-    });
-    GtsTypeSchema::try_new(GtsTypeId::new(super::TENANT_TYPE_ID), body, None, None)
-        .expect("synthetic tenant schema is valid")
+fn registry_with_user_schema(max_chars: usize) -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        super::USER_TYPE_ID,
+        schema_doc(
+            super::USER_TYPE_ID,
+            &json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["id", "username"],
+                "properties": {
+                    "id": { "type": "string", "format": "uuid" },
+                    "username": { "type": "string", "minLength": 1, "maxLength": max_chars },
+                    "email": { "type": "string", "format": "email" },
+                    "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+                },
+            }),
+        ),
+    );
+    registry
 }
 
-/// Registry stub: every read returns `ServiceUnavailable`. Used to
-/// pin the transport-error arm of the GTS-validation helper without
-/// reaching for the heavier `MockTypesRegistryClient` (which always
-/// returns `CanonicalError::NotFound` for unknown ids and offers no
-/// inject-error seam).
-///
-/// Methods that the helper does not exercise return empty / not-found
-/// to keep the impl narrow; a full `TypesRegistryClient` mock lives in
-/// `types-registry-sdk::testing`.
-#[derive(Debug, Default)]
-struct UnavailableRegistry;
-
-fn unavailable() -> CanonicalError {
-    // Model the scenario under test directly: a temporarily unavailable
-    // registry. The production helper short-circuits only `NotFound` and
-    // routes every other canonical category (this one included) to its
-    // `ServiceUnavailable` arm.
-    CanonicalError::service_unavailable()
-        .with_detail("registry transport down (test stub)")
-        .create()
+fn registry_with_tenant_schema(max_chars: usize) -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        super::TENANT_TYPE_ID,
+        schema_doc(
+            super::TENANT_TYPE_ID,
+            &json!({
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["id", "name"],
+                "properties": {
+                    "id": { "type": "string", "format": "uuid" },
+                    "name": { "type": "string", "minLength": 1, "maxLength": max_chars },
+                    "parent_id": { "type": ["string", "null"], "format": "uuid" },
+                },
+            }),
+        ),
+    );
+    registry
 }
 
-#[async_trait]
-impl TypesRegistryClient for UnavailableRegistry {
-    async fn register(&self, _entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn register_type_schemas(
-        &self,
-        _schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_type_schemas(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        std::collections::HashMap::new()
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        std::collections::HashMap::new()
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: types_registry_sdk::TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        Ok(Vec::new())
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        Err(unavailable())
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> std::collections::HashMap<String, Result<GtsInstance, CanonicalError>> {
-        std::collections::HashMap::new()
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _ids: Vec<Uuid>,
-    ) -> std::collections::HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        std::collections::HashMap::new()
-    }
-    async fn list_instances(
-        &self,
-        _query: types_registry_sdk::InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        Ok(Vec::new())
-    }
+/// A registry whose every call fails as temporarily unavailable. The
+/// helpers short-circuit only `NotFound`; every other category routes
+/// to their `ServiceUnavailable` arm.
+fn unavailable_registry() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.inject(
+        Fault::on(Call::BatchGet).fail(
+            CanonicalError::service_unavailable()
+                .with_detail("registry transport down (test stub)")
+                .create(),
+        ),
+    );
+    registry
 }
 
 // ---- validate_new_user_payload_via_gts ----------------------------
 
 #[tokio::test]
 async fn user_payload_schema_not_registered_surfaces_service_unavailable() {
-    let registry = MockTypesRegistryClient::new();
+    let registry = MockTypesRegistry::new();
     let payload = user_payload("alice");
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err(
             "schema-not-found MUST fail closed: provision_user has no AM-side \
@@ -211,20 +126,18 @@ async fn user_payload_schema_not_registered_surfaces_service_unavailable() {
 
 #[tokio::test]
 async fn user_payload_valid_username_passes_registered_schema() {
-    let registry =
-        MockTypesRegistryClient::new().with_type_schemas([user_schema_with_username_max(255)]);
+    let registry = registry_with_user_schema(255);
     let payload = user_payload("alice");
-    super::validate_new_user_payload_via_gts(&payload, &registry)
+    super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect("valid username passes the registered schema");
 }
 
 #[tokio::test]
 async fn user_payload_oversized_username_rejects_with_validation() {
-    let registry =
-        MockTypesRegistryClient::new().with_type_schemas([user_schema_with_username_max(255)]);
+    let registry = registry_with_user_schema(255);
     let payload = user_payload(&"x".repeat(256));
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err("oversize username must be rejected by the registered schema");
     match err {
@@ -240,9 +153,9 @@ async fn user_payload_oversized_username_rejects_with_validation() {
 
 #[tokio::test]
 async fn user_payload_registry_transport_error_surfaces_as_service_unavailable() {
-    let registry = UnavailableRegistry;
+    let registry = unavailable_registry();
     let payload = user_payload("alice");
-    let err = super::validate_new_user_payload_via_gts(&payload, &registry)
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
         .await
         .expect_err("registry transport error must surface");
     assert!(
@@ -255,29 +168,30 @@ async fn user_payload_registry_transport_error_surfaces_as_service_unavailable()
 
 #[tokio::test]
 async fn tenant_name_schema_not_registered_short_circuits_to_ok() {
-    let registry = MockTypesRegistryClient::new();
-    super::validate_tenant_name_via_gts("acme", &registry)
+    let registry = MockTypesRegistry::new();
+    super::validate_tenant_name_via_gts("acme", TypesRegistryReader::caller(&registry, &caller(1)))
         .await
         .expect("schema-not-found short-circuits to Ok");
 }
 
 #[tokio::test]
 async fn tenant_name_valid_passes_registered_schema() {
-    let registry =
-        MockTypesRegistryClient::new().with_type_schemas([tenant_schema_with_name_max(255)]);
-    super::validate_tenant_name_via_gts("acme", &registry)
+    let registry = registry_with_tenant_schema(255);
+    super::validate_tenant_name_via_gts("acme", TypesRegistryReader::caller(&registry, &caller(1)))
         .await
         .expect("valid name passes the registered schema");
 }
 
 #[tokio::test]
 async fn tenant_name_oversized_rejects_with_validation() {
-    let registry =
-        MockTypesRegistryClient::new().with_type_schemas([tenant_schema_with_name_max(255)]);
+    let registry = registry_with_tenant_schema(255);
     let oversized = "x".repeat(256);
-    let err = super::validate_tenant_name_via_gts(&oversized, &registry)
-        .await
-        .expect_err("oversize name must be rejected");
+    let err = super::validate_tenant_name_via_gts(
+        &oversized,
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("oversize name must be rejected");
     match err {
         DomainError::Validation { detail } => {
             assert!(
@@ -291,22 +205,346 @@ async fn tenant_name_oversized_rejects_with_validation() {
 
 #[tokio::test]
 async fn tenant_name_empty_rejects_with_validation() {
-    let registry =
-        MockTypesRegistryClient::new().with_type_schemas([tenant_schema_with_name_max(255)]);
-    let err = super::validate_tenant_name_via_gts("", &registry)
-        .await
-        .expect_err("empty name must be rejected");
+    let registry = registry_with_tenant_schema(255);
+    let err =
+        super::validate_tenant_name_via_gts("", TypesRegistryReader::caller(&registry, &caller(1)))
+            .await
+            .expect_err("empty name must be rejected");
     assert!(matches!(err, DomainError::Validation { .. }));
 }
 
 #[tokio::test]
 async fn tenant_name_registry_transport_error_surfaces_as_service_unavailable() {
-    let registry = UnavailableRegistry;
-    let err = super::validate_tenant_name_via_gts("acme", &registry)
-        .await
-        .expect_err("registry transport error must surface");
+    let registry = unavailable_registry();
+    let err = super::validate_tenant_name_via_gts(
+        "acme",
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("registry transport error must surface");
     assert!(
         matches!(err, DomainError::ServiceUnavailable { .. }),
         "expected ServiceUnavailable, got {err:?}"
     );
+}
+
+/// Every schema read of a request is classified alike: an outage is a
+/// retryable 503, the registry's refusal of the caller stays its 401 / 403,
+/// anything else is internal. AM's own platform read during bootstrap holds
+/// no caller credential to refuse, so a refusal there is internal.
+#[tokio::test]
+async fn a_failed_schema_read_is_classified_at_the_boundary() {
+    use crate::infra::types_registry::test_helpers::{at_the_boundary, outages, refusals};
+
+    let expected = outages()
+        .into_iter()
+        .map(|error| (error, 503, 503))
+        .chain(
+            refusals()
+                .into_iter()
+                .map(|(error, status)| (error, status, 500)),
+        )
+        .chain([(
+            CanonicalError::internal("registry exploded").create(),
+            500,
+            500,
+        )]);
+    for (error, for_caller, for_platform) in expected {
+        let registry = MockTypesRegistry::new();
+        registry.inject(Fault::on(Call::BatchGet).fail(error.clone()));
+        let ctx = caller(1);
+
+        let user =
+            super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &ctx)
+                .await
+                .expect_err("user payload read failed");
+        let name = super::validate_tenant_name_via_gts(
+            "acme",
+            TypesRegistryReader::caller(&registry, &ctx),
+        )
+        .await
+        .expect_err("tenant name read failed");
+        for err in [user, name] {
+            let (category, status) = at_the_boundary(err);
+            assert_eq!(status, Some(for_caller), "{error:?} -> {category}");
+            if for_caller != 503 && for_caller != 500 {
+                assert_eq!(category, error.gts_type(), "{error:?}");
+            }
+        }
+
+        let platform =
+            super::validate_tenant_name_via_gts("acme", TypesRegistryReader::Platform(&registry))
+                .await
+                .expect_err("platform read failed");
+        assert_eq!(at_the_boundary(platform).1, Some(for_platform), "{error:?}");
+    }
+}
+
+// ---- materialized schema ------------------------------------------
+
+#[tokio::test]
+async fn user_payload_honours_properties_inherited_through_a_reference() {
+    // The user schema takes `username` from a referenced schema; the
+    // registry inlines the reference into `resolved_schema`.
+    let fields = "gts.cf.test.am.user_fields.v1~";
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        fields,
+        schema_doc(
+            fields,
+            &json!({
+                "type": "object",
+                "properties": {
+                    "username": { "type": "string", "minLength": 1, "maxLength": 8 },
+                    "email": { "type": "string", "format": "email" },
+                    "display_name": { "type": "string" },
+                },
+            }),
+        ),
+    );
+    registry.seed(
+        super::USER_TYPE_ID,
+        schema_doc(
+            super::USER_TYPE_ID,
+            &json!({
+                "type": "object",
+                "allOf": [{ "$ref": gts_uri!(fields) }],
+                "properties": { "id": { "type": "string", "format": "uuid" } },
+            }),
+        ),
+    );
+
+    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
+        .await
+        .expect("an inherited bound admits a short username");
+    let err = super::validate_new_user_payload_via_gts(
+        &user_payload("alexandria"),
+        &registry,
+        &caller(1),
+    )
+    .await
+    .expect_err("the inherited maxLength applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn user_payload_validates_against_the_published_user_schema() {
+    let registry = MockTypesRegistry::new();
+    registry.seed_inventory();
+    let payload = user_payload(&"x".repeat(256));
+
+    let err = super::validate_new_user_payload_via_gts(&payload, &registry, &caller(1))
+        .await
+        .expect_err("the published schema's username bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_snapshot_without_the_selected_resolved_schema_is_internal() {
+    let registry = Arc::new(registry_with_user_schema(255));
+    let tampered = Tampered::without_documents(registry);
+
+    let err =
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), &tampered, &caller(1))
+            .await
+            .expect_err("an incomplete projection is a contract break");
+    assert!(matches!(err, DomainError::Internal { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn a_deleted_user_schema_fails_closed_as_unregistered() {
+    let registry = registry_with_user_schema(255);
+    let content = registry.content(super::USER_TYPE_ID).expect("seeded");
+    registry.seed_entity(Seed::new(super::USER_TYPE_ID, content).deleted());
+
+    let err =
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
+            .await
+            .expect_err("a tombstone is not a registered schema");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "got {err:?}"
+    );
+}
+
+// ---- conjunctive property constraints ------------------------------
+
+fn seed_user_with(registry: &MockTypesRegistry, body: &Value) {
+    registry.seed(super::USER_TYPE_ID, schema_doc(super::USER_TYPE_ID, body));
+}
+
+#[tokio::test]
+async fn an_inline_all_of_bound_applies_beside_the_own_property() {
+    let registry = MockTypesRegistry::new();
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "properties": { "username": { "type": "string", "maxLength": 255 } },
+            "allOf": [{ "properties": { "username": { "type": "string", "maxLength": 8 } } }],
+        }),
+    );
+
+    let err = super::validate_new_user_payload_via_gts(
+        &user_payload("alexandria"),
+        &registry,
+        &caller(1),
+    )
+    .await
+    .expect_err("the tighter allOf bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+    super::validate_new_user_payload_via_gts(&user_payload("alice"), &registry, &caller(1))
+        .await
+        .expect("both bounds admit a short name");
+}
+
+#[tokio::test]
+async fn bounds_from_two_all_of_members_both_apply() {
+    let registry = MockTypesRegistry::new();
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "allOf": [
+                { "properties": { "username": { "type": "string", "minLength": 3 } } },
+                { "properties": { "username": { "type": "string", "maxLength": 8 } } },
+            ],
+        }),
+    );
+
+    for (name, ok) in [("al", false), ("alice", true), ("alexandria", false)] {
+        let result =
+            super::validate_new_user_payload_via_gts(&user_payload(name), &registry, &caller(1))
+                .await;
+        assert_eq!(result.is_ok(), ok, "{name}: {result:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_referenced_bound_applies_beside_the_own_property_on_patch() {
+    let fields = "gts.cf.test.am.user_bounds.v1~";
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        fields,
+        schema_doc(
+            fields,
+            &json!({
+                "type": "object",
+                "properties": { "username": { "type": "string", "maxLength": 8 } },
+            }),
+        ),
+    );
+    seed_user_with(
+        &registry,
+        &json!({
+            "type": "object",
+            "allOf": [{ "$ref": gts_uri!(fields) }],
+            "properties": { "username": { "type": "string", "maxLength": 255 } },
+        }),
+    );
+    let patch = account_management_sdk::IdpUserPatch::new().with_username("alexandria");
+
+    let err = super::validate_user_patch_via_gts(&patch, &registry, &caller(1))
+        .await
+        .expect_err("the referenced bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+#[tokio::test]
+async fn an_inline_bound_applies_to_the_tenant_name() {
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        super::TENANT_TYPE_ID,
+        schema_doc(
+            super::TENANT_TYPE_ID,
+            &json!({
+                "type": "object",
+                "properties": { "name": { "type": "string", "maxLength": 255 } },
+                "allOf": [{ "properties": { "name": { "type": "string", "maxLength": 4 } } }],
+            }),
+        ),
+    );
+
+    let err = super::validate_tenant_name_via_gts(
+        "acme-corp",
+        TypesRegistryReader::caller(&registry, &caller(1)),
+    )
+    .await
+    .expect_err("the inline bound applies");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+}
+
+// ---- who the schema is read for (P33) -----------------------------
+
+/// Two requests through one shared registry: each read names its own
+/// caller, and neither reaches the platform API.
+#[tokio::test]
+async fn user_payload_and_patch_read_for_each_request_caller() {
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_user_schema(255)));
+    let patch = account_management_sdk::IdpUserPatch::new().with_username("bob");
+
+    for n in [1, 2] {
+        let ctx = caller(n);
+        super::validate_new_user_payload_via_gts(&user_payload("alice"), spy.as_ref(), &ctx)
+            .await
+            .expect("valid payload");
+        super::validate_user_patch_via_gts(&patch, spy.as_ref(), &ctx)
+            .await
+            .expect("valid patch");
+        assert_only_caller(&spy.callers(), &ctx);
+        assert_eq!(spy.callers().len(), 2, "one schema read per helper");
+        spy.clear();
+    }
+}
+
+#[tokio::test]
+async fn tenant_name_reads_for_each_request_caller() {
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_tenant_schema(255)));
+    for n in [1, 2] {
+        let ctx = caller(n);
+        super::validate_tenant_name_via_gts(
+            "acme",
+            TypesRegistryReader::caller(spy.as_ref(), &ctx),
+        )
+        .await
+        .expect("valid name");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+}
+
+/// A tenant-API failure is the request's answer: it is not retried on
+/// the platform API, which the spy would refuse.
+#[tokio::test]
+async fn a_failed_request_read_does_not_fall_back_to_the_platform_api() {
+    let spy = CallerSpy::for_requests(Arc::new(unavailable_registry()));
+    let ctx = caller(1);
+    let err = super::validate_tenant_name_via_gts(
+        "acme",
+        TypesRegistryReader::caller(spy.as_ref(), &ctx),
+    )
+    .await
+    .expect_err("registry down");
+    assert!(
+        matches!(err, DomainError::ServiceUnavailable { .. }),
+        "got {err:?}"
+    );
+    assert_only_caller(&spy.callers(), &ctx);
+    assert_eq!(spy.platform_reads(), 0);
+}
+
+/// The bootstrap saga has no request: its root-name check reads through
+/// the platform API and never the tenant API.
+#[tokio::test]
+async fn the_platform_tenant_name_check_reads_only_the_platform_api() {
+    let spy = CallerSpy::for_platform(Arc::new(registry_with_tenant_schema(4)));
+    let err = super::validate_tenant_name_via_gts(
+        "acme-corp",
+        TypesRegistryReader::Platform(spy.as_ref()),
+    )
+    .await
+    .expect_err("the platform read still applies the bound");
+    assert!(matches!(err, DomainError::Validation { .. }), "got {err:?}");
+    assert_eq!(spy.platform_reads(), 1);
+    assert!(spy.callers().is_empty());
 }

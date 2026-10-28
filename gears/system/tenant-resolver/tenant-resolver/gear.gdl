@@ -4,12 +4,17 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the tenant resolver.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system), colocated_deps
-# (types-registry). Mirrors authn-resolver exactly, including the `vendor`
-# selector defaulting to `constructorfabric`.
+# Projected from #[toolkit::gear]: id, runtime_caps (system). Mirrors
+# authn-resolver exactly, including the `vendor` selector defaulting to
+# `constructorfabric`.
+
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
 
 gear(
-    deps = ["types-registry"],
+    deps = [],
+    # The plugin catalogue is consumed, not linked: local beside the registry, REST with
+    # the platform token otherwise.
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/tenant-resolver/tenant-resolver"),
     maturity = "preview",
     implementation = "in-progress",

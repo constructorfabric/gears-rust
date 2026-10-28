@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverPluginClient, AuthZResolverPluginSpecV1};
 use tenant_resolver_sdk::TenantResolverClient;
@@ -10,7 +11,9 @@ use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
+};
 
 use crate::config::TrAuthZPluginConfig;
 use crate::domain::Service;
@@ -19,10 +22,11 @@ use crate::domain::Service;
 ///
 /// Resolves tenant hierarchy via `TenantResolverClient` instead of
 /// accessing Resource Group directly.
-#[toolkit::gear(
-    name = "tr-authz-plugin",
-    deps = [types_registry, tenant_resolver]
-)]
+///
+/// `init` reconciles through the host-linked database registry's local platform API
+/// and binds only after admission; failure leaves nothing bound. The registry's
+/// system-gear init runs first without a `deps` edge. Remote support is T41/T42.
+#[toolkit::gear(name = "tr-authz-plugin", deps = [tenant_resolver])]
 pub struct TrAuthZPlugin {
     service: OnceLock<Arc<Service>>,
 }
@@ -38,16 +42,15 @@ impl Default for TrAuthZPlugin {
 #[async_trait]
 impl Gear for TrAuthZPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        if self.service.get().is_some() {
+            anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
+        }
+
         let cfg: TrAuthZPluginConfig = ctx.config_or_default()?;
         info!(
             vendor = %cfg.vendor,
             priority = cfg.priority,
             "Loaded TR AuthZ plugin configuration"
-        );
-
-        // Generate plugin instance ID
-        let instance_id = AuthZResolverPluginSpecV1::gts_make_instance_id(
-            "cf.builtin.tr_authz_resolver.plugin.v1",
         );
 
         // Resolve Tenant Resolver client from ClientHub first — if it's not
@@ -56,18 +59,37 @@ impl Gear for TrAuthZPlugin {
         let tr: Arc<dyn TenantResolverClient> =
             ctx.client_hub().get::<dyn TenantResolverClient>()?;
 
-        // Register plugin instance in types-registry
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let instance = PluginV1::<AuthZResolverPluginSpecV1> {
-            id: instance_id.clone(),
-            vendor: cfg.vendor.clone(),
-            priority: cfg.priority,
-            properties: AuthZResolverPluginSpecV1,
-        };
-        let instance_json = serde_json::to_value(&instance)?;
+        // Build registration payload and instance id for this plugin.
+        let (instance_id, instance_json) =
+            PluginV1::<AuthZResolverPluginSpecV1>::build_registration(
+                "cf.builtin.tr_authz_resolver.plugin.v1",
+                cfg.vendor.clone(),
+                cfg.priority,
+            )?;
 
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
+        // Publish to types-registry; the backend is registered only once the instance is admitted.
+        let registry = ctx
+            .client_hub()
+            .get::<dyn PlatformTypesRegistryApi>()
+            .with_context(|| {
+                format!(
+                    "{}: no PlatformTypesRegistryApi to publish to; a database-backed \
+                     types-registry must run in this process",
+                    Self::MODULE_NAME
+                )
+            })?;
+        let publisher = PublisherContext {
+            name: Self::MODULE_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").parse()?,
+        };
+        let gts_id = GtsId::try_new(instance_id.as_ref())?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &publisher,
+            &[(gts_id, instance_json)],
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         // Create service with TR dependency
         let service = Arc::new(Service::new(tr));
@@ -87,3 +109,8 @@ impl Gear for TrAuthZPlugin {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

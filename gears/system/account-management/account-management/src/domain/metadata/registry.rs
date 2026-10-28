@@ -1,57 +1,23 @@
-//! Types-registry integration port for tenant metadata schemas.
+//! Types Registry port for tenant metadata schemas.
 //!
-//! [`MetadataSchemaRegistry`] is the read-only abstraction the
-//! [`crate::domain::metadata::service::MetadataService`] uses to look
-//! up GTS-registry state on every per-schema operation. Three
-//! responsibilities:
+//! [`MetadataSchemaRegistry`] supplies schema existence, inheritance policy
+//! (default `override_only`) and UUID-to-public-ID lookup for list responses.
+//! Unknown schemas and missing entries share [`DomainError::MetadataEntryNotFound`]
+//! with `resource_type = gts.cf.core.am.tenant_metadata.v1~`; check existence
+//! before database access. Storage retains only `schema_uuid`, not `type_id`
+//! (FEATURE §2 step 4, `dod-tenant-metadata-schema-registration-and-uuid-derivation`).
 //!
-//! 1. *Existence* — surface unknown schemas as
-//!    [`DomainError::MetadataEntryNotFound`] BEFORE any DB read or
-//!    write. AM no longer distinguishes "schema unknown to registry"
-//!    from "entry absent for this tenant" on the wire — both
-//!    collapse into a single 404 with `resource_type =
-//!    gts.cf.core.am.tenant_metadata.v1~`.
-//! 2. *Inheritance policy* — resolve the schema's `inheritance_policy`
-//!    trait (from `x-gts-traits`, default `override_only`). The
-//!    walk-up algorithm consumes this to decide whether to walk
-//!    `parent_id` ancestors or short-circuit to an empty result.
-//! 3. *Reverse hydration* — map the storage-side `schema_uuid` (PK
-//!    component) back onto its public chained `type_id` string for
-//!    list responses per FEATURE §2 step 4. The list flow needs this
-//!    because `dbtable-tenant-metadata` MUST NOT retain the public
-//!    `type_id` per `dod-tenant-metadata-schema-registration-and-uuid-derivation`.
+//! [`StubMetadataSchemaRegistry`] uses seeded policies and deterministic
+//! [`gts::GtsId::to_uuid`] lookup in tests; `GtsMetadataSchemaRegistry` uses
+//! `types_registry_sdk::TypesRegistryApi` in production.
 //!
-//! Two implementations exist:
+//! Every method reads for the supplied [`SecurityContext`] and retains no
+//! caller context (P33). Implementations must not cache across calls.
 //!
-//! * [`StubMetadataSchemaRegistry`] — in-memory test fake. Mirrors
-//!   [`crate::domain::tenant_type::checker::InertTenantTypeChecker`]
-//!   in shape but accepts pre-seeded `(type_id, InheritancePolicy)`
-//!   pairs so per-schema policy can be scripted from service-level
-//!   unit tests. Reverse lookup uses the same map keyed by the
-//!   deterministic `UUIDv5` derivation via upstream
-//!   [`gts::GtsId::to_uuid`].
-//! * `GtsMetadataSchemaRegistry` — the production implementation
-//!   backed by `types_registry_sdk::TypesRegistryClient`.
-//!
-//! # Schema-id type contract
-//!
-//! All forward methods accept `&gts::GtsTypeId` — the platform-standard
-//! marker for "this string is a GTS schema id". Callers
-//! (`MetadataService`) parse + validate via
-//! [`crate::domain::metadata::type_id::ParsedTypeId::parse`]
-//! BEFORE invoking the registry, then hand off the typed view via
-//! [`crate::domain::metadata::type_id::ParsedTypeId::as_gts`], so by
-//! the time the trait method runs the id is guaranteed to be a
-//! well-formed AM tenant-metadata schema id. Reverse methods return
-//! [`gts::GtsTypeId`] directly — the consumer (typically the list-flow
-//! projection) lowers it to `String` for the SDK wire shape only at the
-//! `MetadataEntry` boundary.
-//!
-//! # Determinism contract
-//!
-//! Like [`crate::domain::tenant_type::checker::TenantTypeChecker`], the
-//! registry MUST NOT cache results across calls — every invocation
-//! re-resolves so trait updates take effect immediately.
+//! Forward methods take `&gts::GtsTypeId`, already validated as an AM metadata
+//! schema by [`crate::domain::metadata::type_id::ParsedTypeId::parse`] and
+//! exposed through `ParsedTypeId::as_gts`. Reverse methods return the typed ID;
+//! convert to `String` only at the `MetadataEntry` boundary.
 
 #![allow(
     dead_code,
@@ -66,6 +32,7 @@ use gts::{GtsId, GtsTypeId};
 use parking_lot::Mutex;
 use serde_json::Value;
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -134,6 +101,7 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// projection.
     async fn resolve_inheritance_policy(
         &self,
+        ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<InheritancePolicy, DomainError>;
 
@@ -150,31 +118,28 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     /// `Internal` rather than surfacing the UUID through a public
     /// envelope; this variant lets the registry stay schema-typed even
     /// when the row-level caller knows better.
-    async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsTypeId, DomainError>;
+    async fn resolve_id_by_uuid(
+        &self,
+        ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError>;
 
-    /// Batch reverse-lookup for the LIST flow: resolve a slice of
-    /// `schema_uuid` values to their public chained ids in a single
-    /// round-trip. The returned map contains an entry only for
-    /// uuids that ARE registered — the caller surfaces
-    /// [`DomainError::MetadataEntryNotFound`] (or, in the LIST flow,
-    /// `Internal`) for any row whose `schema_uuid` is missing from
-    /// the map, so a single unregistered row does not poison the
-    /// whole page.
+    /// Resolve UUIDs to public chained IDs for list hydration, omitting unknown UUIDs.
+    /// The caller handles missing entries per row (`MetadataEntryNotFound` or
+    /// `Internal` for LIST), preserving the rest of the page.
     ///
-    /// Default impl is N round-trips per page; production adapter
-    /// overrides to a single registry call to amortise per-page.
+    /// The default makes one request per UUID under `ctx`; production batches them.
     ///
     /// # Errors
-    ///
-    /// * [`DomainError::ServiceUnavailable`] — registry transport
-    ///   failure (uniform with the single-row variant).
+    /// [`DomainError::ServiceUnavailable`] on registry transport failure.
     async fn resolve_ids_by_uuid(
         &self,
+        ctx: &SecurityContext,
         schema_uuids: &[Uuid],
     ) -> Result<HashMap<Uuid, GtsTypeId>, DomainError> {
         let mut out = HashMap::with_capacity(schema_uuids.len());
         for &uuid in schema_uuids {
-            match self.resolve_id_by_uuid(uuid).await {
+            match self.resolve_id_by_uuid(ctx, uuid).await {
                 Ok(id) => {
                     out.insert(uuid, id);
                 }
@@ -207,7 +172,12 @@ pub trait MetadataSchemaRegistry: Send + Sync {
     ///   required).
     /// * [`DomainError::Validation`] — `value` violates the schema;
     ///   the PUT handler maps this to HTTP 400 `code=validation`.
-    async fn validate_value(&self, type_id: &GtsTypeId, value: &Value) -> Result<(), DomainError>;
+    async fn validate_value(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        value: &Value,
+    ) -> Result<(), DomainError>;
 }
 
 /// Compute the deterministic `schema_uuid` for an already-validated
@@ -325,6 +295,7 @@ impl Default for StubMetadataSchemaRegistry {
 impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
     async fn resolve_inheritance_policy(
         &self,
+        _ctx: &SecurityContext,
         type_id: &GtsTypeId,
     ) -> Result<InheritancePolicy, DomainError> {
         let state = self.inner.lock();
@@ -338,7 +309,11 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
             })
     }
 
-    async fn resolve_id_by_uuid(&self, schema_uuid: Uuid) -> Result<GtsTypeId, DomainError> {
+    async fn resolve_id_by_uuid(
+        &self,
+        _ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError> {
         let state = self.inner.lock();
         state
             .by_uuid
@@ -350,7 +325,12 @@ impl MetadataSchemaRegistry for StubMetadataSchemaRegistry {
             })
     }
 
-    async fn validate_value(&self, type_id: &GtsTypeId, _value: &Value) -> Result<(), DomainError> {
+    async fn validate_value(
+        &self,
+        _ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        _value: &Value,
+    ) -> Result<(), DomainError> {
         let state = self.inner.lock();
         // Existence gate first — keeps the stub honest about the
         // unified-404 contract: validate_value against an unregistered

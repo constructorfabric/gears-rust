@@ -1,89 +1,48 @@
-//! GTS-runtime payload validation.
+//! GTS payload validation against AM's registered resource schemas.
 //!
-//! AM resource shapes (`tenant`, `user`) are pinned by JSON Schemas
-//! published under `gears/system/account-management/docs/schemas/`
-//! and registered in the GTS Types Registry at deployment time. This
-//! gear is the single AM-side seam that fetches a resolved schema
-//! from `TypesRegistryClient` and runs `jsonschema::validator_for`
-//! against the supplied field values — adapting the
-//! `cf-resource-group::domain::validation::validate_metadata_via_gts`
-//! pattern to AM's needs with one deliberate divergence: AM maps a
-//! non-not-found `CanonicalError` to
-//! [`DomainError::ServiceUnavailable`] (HTTP 503) rather than
-//! `DomainError::validation` (HTTP 400). A registry outage is an
-//! infrastructure event, not a payload problem, and the 503 envelope
-//! lets clients distinguish "your input is bad" from "our dependency
-//! is sick" without reading the detail string.
+//! Schemas under `gears/system/account-management/docs/schemas/` describe read
+//! models with server-assigned fields. Validate payload properties individually
+//! with `jsonschema::validator_for` so create requests need no synthetic IDs.
+//! Services must use these schema bounds; additional business rules, such as
+//! rejecting all-whitespace usernames, stay in the service layer.
 //!
-//! Unlike the resource-group helper, AM validates per-property
-//! (`username`, `name`, etc.) rather than against the full instance
-//! schema. The published `gts.cf.core.am.user.v1~` and
-//! `gts.cf.core.am.tenant.v1~` schemas describe the resource as
-//! seen on read (with required identifiers like `id`), but the
-//! create-payload shapes deliberately omit those server-assigned
-//! fields. Validating per-property keeps the structural bounds
-//! authoritative without forcing synthetic `id` placeholders that
-//! couple the helper to the schema's `required` list.
+//! User validation reads through `TypesRegistryApi` under the request's
+//! `SecurityContext`. The tenant-name check also serves bootstrap and takes
+//! [`TypesRegistryReader`] to distinguish request and platform reads (P33).
 //!
-//! Service layers MUST call into this gear instead of hardcoding
-//! length / format constants at the call site so the schema files
-//! remain the single source of truth. AM business rules that are
-//! *wider* than the JSON Schema (e.g. "username MUST not be
-//! all-whitespace" — which the schema's `minLength: 1` does not
-//! reject) stay in the service layer; this gear only enforces the
-//! structural contract.
+//! # Missing schemas and failures
 //!
-//! # Behaviour when a schema is not registered
+//! - Missing user schema: [`DomainError::ServiceUnavailable`] (503). AM stores
+//!   no users, so accepting without schema validation would bypass format and
+//!   pattern rules. Seed the catalog before provisioning users.
+//! - Missing tenant-name schema: `Ok(())`; the database enforces
+//!   `CHECK (length(name) BETWEEN 1 AND 255)`, including during bootstrap.
+//! - Other registry errors: [`TypesRegistryReader::failure`] maps outages to
+//!   503, refusals of the request caller to 401/403, and all others (including
+//!   platform credential refusals) to [`DomainError::Internal`].
+//! - Invalid registered schema: [`DomainError::Internal`] (catalog drift).
+//! - Invalid payload: [`DomainError::Validation`] (400).
 //!
-//! The two AM-owned schemas diverge intentionally:
+//! The host must link a database-backed types-registry; as a system gear it
+//! initializes before AM without a `deps` edge.
 //!
-//! * **User schema (`gts.cf.core.am.user.v1~`)** — fail-closed.
-//!   AM does NOT persist users
-//!   (`cpt-cf-account-management-constraint-no-user-storage`), so a
-//!   missing schema would otherwise collapse the boundary to
-//!   length-only caps and silently disable `format: email` / future
-//!   `pattern` rules. The same payload would be accepted before
-//!   catalog registration and rejected after — a deployment cliff.
-//!   The helper returns
-//!   [`DomainError::ServiceUnavailable`] instead, so
-//!   `provision_user` is unavailable until the operator seeds the
-//!   catalog. The dependency is declared in `gear.rs::deps`; treat
-//!   schema-missing as a degraded-dependency signal rather than a
-//!   silent passthrough.
-//! * **Tenant name schema (`gts.cf.core.am.tenant.v1~`)** —
-//!   short-circuits to `Ok(())`. The DB `CHECK (length(name) BETWEEN
-//!   1 AND 255)` constraint is the last-line guard and bootstrap
-//!   must succeed before the catalog is seeded.
-//!
-//! Failures fall into four categories (the types-registry client returns
-//! [`CanonicalError`](toolkit_canonical_errors::CanonicalError) per ADR 0005):
-//! * `validate_new_user_payload_via_gts` + `CanonicalError::NotFound` →
-//!   [`DomainError::ServiceUnavailable`] (fail-closed, see above).
-//! * `validate_tenant_name_via_gts` + `CanonicalError::NotFound` → `Ok(())`
-//!   (DB CHECK + bootstrap-before-catalog ordering).
-//! * Any other `CanonicalError` (transport / availability) →
-//!   [`DomainError::ServiceUnavailable`] for both helpers.
-//! * Schema returned but `jsonschema::validator_for` rejects it →
-//!   [`DomainError::Internal`] (catalog drift — operator action
-//!   required).
-//! * Instance fails validation against the schema →
-//!   [`DomainError::Validation`] (HTTP 400 — the client can retry
-//!   with a corrected payload).
-//!
-//! # Plugin-private metadata is opaque to AM
-//!
-//! AM treats plugin metadata as a fully opaque blob persisted in
-//! `tenant_idp_metadata` and echoed back on every subsequent `IdP`
-//! call. The plugin owns the shape (input and output) end-to-end;
-//! AM does not interpret it.
+//! Plugin-private metadata remains opaque: AM stores it in `tenant_idp_metadata`
+//! and returns it unchanged on subsequent `IdP` calls.
+
+use std::collections::BTreeMap;
 
 use account_management_sdk::{IdpNewUser, IdpUserPatch};
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::SecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, GtsTypeId, LifecycleStatus, Projection, ReadOptions,
+    TypesRegistryApi,
+};
 
 use crate::domain::error::DomainError;
+use crate::domain::types_registry_reader::TypesRegistryReader;
 
 /// GTS type id of the Account Management user resource. Pinned to the
 /// same string the published JSON Schema declares as its `$id`.
@@ -121,9 +80,11 @@ pub(crate) const TENANT_TYPE_ID: &str = gts_id!("cf.core.am.tenant.v1~");
 /// See gear-level docs.
 pub async fn validate_new_user_payload_via_gts(
     payload: &IdpNewUser,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
+    let reader = TypesRegistryReader::caller(types_registry, ctx);
+    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, reader).await? else {
         // Fail-closed: the user schema MUST be registered before
         // `provision_user` is exposed. Falling back to length-only
         // checks would silently disable `format: email` (and any
@@ -191,9 +152,11 @@ pub async fn validate_new_user_payload_via_gts(
 /// See gear-level docs.
 pub async fn validate_user_patch_via_gts(
     patch: &IdpUserPatch,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, types_registry).await? else {
+    let reader = TypesRegistryReader::caller(types_registry, ctx);
+    let Some(properties) = lookup_effective_properties(USER_TYPE_ID, reader).await? else {
         return Err(DomainError::service_unavailable(format!(
             "user patch validation requires `{USER_TYPE_ID}` to be registered \
              in the Types Registry; update_user is unavailable until the \
@@ -231,15 +194,17 @@ pub async fn validate_user_patch_via_gts(
 /// registered `gts.cf.core.am.tenant.v1~` (`minLength: 1, maxLength:
 /// 255`).
 ///
+/// `reader` names the caller: the request's context for create / update,
+/// the platform API for the bootstrap saga's root name only.
+///
 /// # Errors
 ///
 /// See gear-level docs.
 pub async fn validate_tenant_name_via_gts(
     name: &str,
-    types_registry: &dyn TypesRegistryClient,
+    reader: TypesRegistryReader<'_>,
 ) -> Result<(), DomainError> {
-    let Some(properties) = lookup_effective_properties(TENANT_TYPE_ID, types_registry).await?
-    else {
+    let Some(properties) = lookup_effective_properties(TENANT_TYPE_ID, reader).await? else {
         return Ok(());
     };
     validate_property_value(
@@ -256,14 +221,58 @@ pub async fn validate_tenant_name_via_gts(
 /// contract on other registry errors.
 async fn lookup_effective_properties(
     type_id: &'static str,
-    types_registry: &dyn TypesRegistryClient,
-) -> Result<Option<std::collections::BTreeMap<String, Value>>, DomainError> {
-    match types_registry.get_type_schema(type_id).await {
-        Ok(schema) => Ok(Some(schema.effective_properties())),
+    reader: TypesRegistryReader<'_>,
+) -> Result<Option<BTreeMap<String, Vec<Value>>>, DomainError> {
+    let projection = Projection::Select(FieldSelection::with(&[EntityField::ResolvedSchema]));
+    match reader
+        .get_type_schema(
+            &GtsTypeId::new(type_id),
+            ReadOptions {
+                projection,
+                ..ReadOptions::default()
+            },
+        )
+        .await
+    {
+        // A deleted schema is no longer registered for new payloads.
+        Ok(schema) if schema.lifecycle_status != LifecycleStatus::Active => Ok(None),
+        Ok(schema) => {
+            let resolved = schema.resolved_schema.ok_or_else(|| {
+                DomainError::internal(format!(
+                    "types-registry answered `{type_id}` without the selected resolved_schema"
+                ))
+            })?;
+            Ok(Some(effective_properties(&resolved)))
+        }
         Err(CanonicalError::NotFound { .. }) => Ok(None),
-        Err(err) => Err(DomainError::service_unavailable(format!(
-            "GTS type schema lookup failed for `{type_id}`: {err}"
-        ))),
+        Err(err) => Err(reader.failure(
+            err,
+            format_args!("GTS type schema lookup failed for `{type_id}`"),
+        )),
+    }
+}
+
+/// Every sub-schema a registry-resolved schema declares for each property.
+/// References are inlined at admission, so the `allOf` members carry the
+/// inherited declarations. The branches of a schema are conjunctive: a
+/// property declared at several places must satisfy all of them, so none
+/// overrides another.
+fn effective_properties(schema: &Value) -> BTreeMap<String, Vec<Value>> {
+    let mut out: BTreeMap<String, Vec<Value>> = BTreeMap::new();
+    collect_properties(schema, &mut out);
+    out
+}
+
+fn collect_properties(schema: &Value, out: &mut BTreeMap<String, Vec<Value>>) {
+    if let Some(own) = schema.get("properties").and_then(Value::as_object) {
+        for (key, value) in own {
+            out.entry(key.clone()).or_default().push(value.clone());
+        }
+    }
+    if let Some(members) = schema.get("allOf").and_then(Value::as_array) {
+        for member in members {
+            collect_properties(member, out);
+        }
     }
 }
 
@@ -283,9 +292,9 @@ fn validate_property_value(
     type_id: &'static str,
     field_name: &str,
     field_value: &Value,
-    properties: &std::collections::BTreeMap<String, Value>,
+    properties: &BTreeMap<String, Vec<Value>>,
 ) -> Result<(), DomainError> {
-    let Some(field_schema) = properties.get(field_name) else {
+    let Some(field_schemas) = properties.get(field_name) else {
         return Err(DomainError::Internal {
             diagnostic: format!(
                 "GTS schema `{type_id}` does not declare property `{field_name}` (catalog drift: \
@@ -296,8 +305,12 @@ fn validate_property_value(
             cause: None,
         });
     };
+    let field_schema = match field_schemas.as_slice() {
+        [single] => std::borrow::Cow::Borrowed(single),
+        several => std::borrow::Cow::Owned(serde_json::json!({ "allOf": several })),
+    };
     let validator =
-        jsonschema::validator_for(field_schema).map_err(|err| DomainError::Internal {
+        jsonschema::validator_for(&field_schema).map_err(|err| DomainError::Internal {
             diagnostic: format!(
                 "GTS schema `{type_id}` property `{field_name}` is not a valid JSON Schema \
              (catalog drift): {err}"

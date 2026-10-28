@@ -351,6 +351,84 @@ async def test_metadata_lifecycle_via_real_schema_registry(
         assert resolved["value"] == payload
 
 
+# ── S5b: a database-registered schema constrains metadata values ────────
+
+
+async def test_metadata_value_validated_by_a_database_registered_schema(
+    am_base_url, am_headers, create_tenant, create_metadata_schema,
+):
+    """Seam: registry database API -> AM validation, UUID hydration, policy.
+
+    The schema exists only in the registry's database (registered here
+    through its REST API), constrains the payload, and AM consumes it:
+    a malformed value is refused, a conforming one is stored and listed
+    back under the chained id hydrated from its schema UUID, and a
+    changed inheritance policy converges on rerun.
+    """
+    type_id = "gts.cf.core.am.tenant_metadata.v1~x.e2etest.am.tier.v1~"
+    await create_metadata_schema(
+        type_id,
+        inheritance_policy="override_only",
+        payload_schema={
+            "type": "object",
+            "required": ["tier"],
+            "properties": {"tier": {"type": "string", "enum": ["gold", "silver"]}},
+        },
+    )
+    parent = await create_tenant("s5bparent")
+    child = await create_tenant("s5bchild", parent_id=parent["id"])
+
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        for malformed in ({"tier": "bronze"}, {"tier": 3}, {}):
+            r = await c.put(
+                _metadata_entry(am_base_url, parent["id"], type_id),
+                headers=am_headers,
+                json=malformed,
+            )
+            assert r.status_code == 400, (
+                f"malformed {malformed}: {r.status_code} {r.text}"
+            )
+
+        r = await c.put(
+            _metadata_entry(am_base_url, parent["id"], type_id),
+            headers=am_headers,
+            json={"tier": "gold"},
+        )
+        assert r.status_code == 200, f"PUT metadata: {r.status_code} {r.text}"
+
+        r = await c.get(_metadata(am_base_url, parent["id"]), headers=am_headers)
+        assert r.status_code == 200, f"list metadata: {r.status_code} {r.text}"
+        listed = {item["type_id"]: item["value"] for item in r.json()["items"]}
+        assert listed.get(type_id) == {"tier": "gold"}, r.json()
+
+        # override_only: the child does not inherit the parent's value.
+        r = await c.get(
+            _metadata_resolved(am_base_url, child["id"], type_id),
+            headers=am_headers,
+        )
+        assert r.status_code == 200, f"resolve: {r.status_code} {r.text}"
+        assert r.json()["resolved"] is False, r.json()
+
+    # The rerun updates the stored schema rather than keeping the old policy.
+    await create_metadata_schema(
+        type_id,
+        inheritance_policy="inherit",
+        payload_schema={
+            "type": "object",
+            "required": ["tier"],
+            "properties": {"tier": {"type": "string", "enum": ["gold", "silver"]}},
+        },
+    )
+    async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as c:
+        r = await c.get(
+            _metadata_resolved(am_base_url, child["id"], type_id),
+            headers=am_headers,
+        )
+        assert r.status_code == 200, f"resolve: {r.status_code} {r.text}"
+        resolved = r.json()
+        assert resolved["resolved"] is True and resolved["value"] == {"tier": "gold"}, resolved
+
+
 # ── S6: distinct 404 codes preserved through serialisation ─────────────
 
 

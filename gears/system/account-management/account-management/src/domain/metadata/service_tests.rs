@@ -1753,3 +1753,94 @@ async fn resolve_accepts_suspended_tenant_per_feature_spec() {
         .expect("own row present");
     assert_eq!(entry.value, json!({"theme": "own"}));
 }
+
+// ---- who registry reads are made for (P33) -------------------------
+
+/// Records the caller of every schema-registry call, answering from a
+/// stub that relies on the port's default batch reverse lookup.
+struct RecordingRegistry {
+    inner: StubMetadataSchemaRegistry,
+    seen: parking_lot::Mutex<Vec<SecurityContext>>,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::metadata::registry::MetadataSchemaRegistry for RecordingRegistry {
+    async fn resolve_inheritance_policy(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+    ) -> Result<InheritancePolicy, DomainError> {
+        self.seen.lock().push(ctx.clone());
+        self.inner.resolve_inheritance_policy(ctx, type_id).await
+    }
+
+    async fn resolve_id_by_uuid(
+        &self,
+        ctx: &SecurityContext,
+        schema_uuid: Uuid,
+    ) -> Result<GtsTypeId, DomainError> {
+        self.seen.lock().push(ctx.clone());
+        self.inner.resolve_id_by_uuid(ctx, schema_uuid).await
+    }
+
+    async fn validate_value(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+        value: &Value,
+    ) -> Result<(), DomainError> {
+        self.seen.lock().push(ctx.clone());
+        self.inner.validate_value(ctx, type_id, value).await
+    }
+}
+
+/// Two callers drive every metadata flow through one shared service:
+/// every schema-registry call — existence, validation, inheritance and
+/// list hydration — is made for exactly the caller of the flow.
+#[tokio::test]
+async fn every_schema_read_names_the_requests_caller() {
+    use crate::infra::types_registry::test_helpers::{assert_only_caller, caller_in};
+
+    let md_repo = Arc::new(FakeMetadataRepo::new());
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tid = Uuid::from_u128(0x1);
+    seed_tenant(&tenants, tid, None, TenantStatus::Active, false, "root");
+    let registry = Arc::new(RecordingRegistry {
+        inner: StubMetadataSchemaRegistry::with_seed(vec![(
+            schema_a(),
+            InheritancePolicy::Inherit,
+        )]),
+        seen: parking_lot::Mutex::new(Vec::new()),
+    });
+    let svc = MetadataService::new(md_repo, tenants, registry.clone(), mock_enforcer())
+        .with_now_fn(Arc::new(fixed_now));
+
+    for n in [1, 2] {
+        let ctx = caller_in(n, ctx_subject_root());
+        svc.upsert_metadata(
+            &ctx,
+            tid,
+            account_management_sdk::UpsertMetadataRequest::new(
+                schema_a(),
+                json!({"theme": "dark"}),
+            ),
+        )
+        .await
+        .expect("upsert");
+        svc.get_metadata(&ctx, tid, schema_a()).await.expect("get");
+        svc.list_metadata(&ctx, tid, &first_page())
+            .await
+            .expect("list");
+        svc.resolve_metadata(&ctx, tid, schema_a())
+            .await
+            .expect("resolve");
+        svc.delete_metadata(&ctx, tid, schema_a())
+            .await
+            .expect("delete");
+        let seen: Vec<SecurityContext> = registry.seen.lock().drain(..).collect();
+        // upsert: policy + validation; get, resolve, delete: policy;
+        // list: one reverse lookup through the default batch.
+        assert_eq!(seen.len(), 6);
+        assert_only_caller(&seen, &ctx);
+    }
+}

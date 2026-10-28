@@ -414,6 +414,13 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
 
+            // ---- Unauthenticated (HTTP 401) / PermissionDenied (HTTP 403) ----
+            //
+            // The registry's own refusal of the request's caller, as it
+            // answered it: `caller_registry_failure` builds this variant
+            // from those two categories only.
+            DomainError::RegistryRefusedCaller(refusal) => refusal,
+
             // ---- PermissionDenied (HTTP 403) ----
             //
             // Single funnel for every cross-tenant denial (PDP enforcer +

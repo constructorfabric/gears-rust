@@ -22,8 +22,8 @@ workspace = true
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.38", path = "../authn-resolver-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../types-registry/types-registry-sdk" }
-types-registry = { workspace = true }
+# Plugin discovery via `consumes`: local registry or resolving REST client.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../types-registry/types-registry-sdk", features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -33,6 +33,8 @@ toolkit-security = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
+# Bounds a cold plugin selection (`DISCOVERY_BUDGET`).
+tokio = { workspace = true, features = ["time"] }
 
 # Error handling and serialization
 anyhow = { workspace = true }
@@ -45,3 +47,9 @@ inventory = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
+
+[dev-dependencies]
+# `gts_id!` for the registry error scope the selection tests fail with.
+toolkit-gts = { workspace = true }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../types-registry/types-registry-sdk", features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

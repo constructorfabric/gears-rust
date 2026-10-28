@@ -20,8 +20,8 @@ workspace = true
 [dependencies]
 # Local dependencies
 tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.6", path = "../../tenant-resolver-sdk" }
+# Publishes in `init` through the host-linked registry's local platform API.
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../../types-registry/types-registry-sdk" }
-types-registry = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -48,3 +48,6 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-util = { workspace = true }
+serde_json = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["test-util"] }

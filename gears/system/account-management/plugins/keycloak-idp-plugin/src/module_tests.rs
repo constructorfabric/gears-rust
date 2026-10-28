@@ -245,3 +245,96 @@ async fn pre_warm_exhausts_budget_on_persistent_transient() {
         "error message must surface the underlying status, got: {msg}",
     );
 }
+
+// ---- types-registry publication ----
+
+mod publication {
+    use std::sync::Arc;
+
+    use account_management_sdk::IdpPluginSpecV1;
+    use tokio_util::sync::CancellationToken;
+    use toolkit::gts::PluginV1;
+    use types_registry_sdk::AdmissionFailureReason;
+    use types_registry_sdk::testing_platform::{Call, MockTypesRegistry};
+
+    use super::super::publish_instance;
+
+    fn instance(priority: i16) -> (String, serde_json::Value) {
+        let (id, content) = PluginV1::<IdpPluginSpecV1>::build_registration(
+            "cf.builtin.keycloak_idp.plugin.v1",
+            "cf",
+            priority,
+        )
+        .expect("plugin instance serializes");
+        (id.as_ref().to_owned(), content)
+    }
+
+    #[tokio::test]
+    async fn publishes_an_absent_instance() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, content) = instance(10);
+
+        publish_instance(
+            registry.as_ref(),
+            &id,
+            content.clone(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("published");
+
+        assert_eq!(registry.content(&id), Some(content));
+    }
+
+    #[tokio::test]
+    async fn an_equal_restart_submits_nothing_and_a_change_updates() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, content) = instance(10);
+        registry.seed(&id, content.clone());
+
+        publish_instance(registry.as_ref(), &id, content, &CancellationToken::new())
+            .await
+            .expect("up to date");
+        assert_eq!(registry.calls(Call::Register), 0);
+
+        let (_, changed) = instance(20);
+        publish_instance(
+            registry.as_ref(),
+            &id,
+            changed.clone(),
+            &CancellationToken::new(),
+        )
+        .await
+        .expect("updated");
+        assert_eq!(registry.content(&id), Some(changed));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_instance_and_its_outcome() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, content) = instance(10);
+        registry.reject(&id, AdmissionFailureReason::InvalidValue);
+
+        let error = publish_instance(registry.as_ref(), &id, content, &CancellationToken::new())
+            .await
+            .expect_err("refused");
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&id) && text.contains("invalid_value"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_fails_publication() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, content) = instance(10);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        publish_instance(registry.as_ref(), &id, content, &cancel)
+            .await
+            .expect_err("cancelled");
+    }
+}

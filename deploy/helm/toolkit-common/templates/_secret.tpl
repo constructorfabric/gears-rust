@@ -1,6 +1,18 @@
-{{/* Optional Secrets rendered from values.secrets[] (opt-in via a secrets.yaml wrapper). */}}
+{{/* PostgreSQL credentials and optional values.secrets[] (opt-in via a secrets.yaml wrapper). */}}
 {{- define "toolkit-common.secrets" -}}
 {{- $root := . -}}
+{{- with .Values.postgres }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "toolkit-common.fullname" $root }}-postgres
+  labels:
+    {{- include "toolkit-common.labels" $root | nindent 4 }}
+type: Opaque
+stringData:
+  pg-password: {{ .password | quote }}
+{{- end }}
 {{- range .Values.secrets | default list }}
 {{- if .stringData }}
 ---

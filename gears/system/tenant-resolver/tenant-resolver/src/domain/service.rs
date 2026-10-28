@@ -12,17 +12,24 @@ use tenant_resolver_sdk::{
     TenantResolverPluginSpecV1,
 };
 use toolkit::client_hub::{ClientHub, ClientScope};
-use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
+use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance};
 use toolkit::telemetry::ThrottledLog;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
-use toolkit_security::SecurityContext;
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
 use tracing::info;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+};
 
 use super::error::DomainError;
 
 /// Throttle interval for unavailable plugin warnings.
 const UNAVAILABLE_LOG_THROTTLE: Duration = Duration::from_secs(10);
+
+/// Bounds cold catalogue listing and concurrent selection waits, including REST
+/// page retries. Expiry returns a retryable registry outage without caching.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 
 /// Tenant resolver service.
 ///
@@ -59,7 +66,7 @@ impl Service {
 
     /// Lazily resolves and returns the plugin client.
     async fn get_plugin(&self) -> Result<Arc<dyn TenantResolverPluginClient>, DomainError> {
-        let instance_id = self.selector.get_or_init(|| self.resolve_plugin()).await?;
+        let instance_id = bounded(self.selector.get_or_init(|| self.resolve_plugin())).await?;
         let scope = ClientScope::gts_id(instance_id.as_ref());
 
         if let Some(client) = self
@@ -89,18 +96,33 @@ impl Service {
 
         let registry = self
             .hub
-            .get::<dyn TypesRegistryClient>()
+            .get::<dyn PlatformTypesRegistryApi>()
             .map_err(|e| DomainError::TypesRegistryUnavailable(e.to_string()))?;
 
-        let plugin_type_id = TenantResolverPluginSpecV1::gts_type_id().clone();
-
+        let plugin_type_id = TenantResolverPluginSpecV1::gts_type_id();
+        let pattern = GtsIdPattern::try_new(plugin_type_id.as_ref())
+            .map_err(|e| DomainError::Internal(format!("plugin discovery pattern: {e}")))?;
+        // The helper follows every page and fails on any page's error, so selection never
+        // runs over a truncated listing.
         let instances = registry
-            .list_instances(InstanceQuery::new().with_pattern(format!("{plugin_type_id}*")))
-            .await?;
+            .list_instances(
+                &PlatformSecurityContext::outbound_marker(),
+                ListEntitiesRequest::matching(pattern),
+            )
+            .await
+            .map_err(registry_failure)?;
 
-        let gts_id = choose_plugin_instance::<TenantResolverPluginSpecV1>(
+        // The database keeps the instances of plugins that earlier boots published, also after
+        // a plugin is disabled; choose among those whose plugin is registered in this process.
+        let gts_id = choose_registered_plugin_instance::<
+            TenantResolverPluginSpecV1,
+            dyn TenantResolverPluginClient,
+        >(
+            &self.hub,
             &self.vendor,
-            instances.iter().map(|e| (e.id.as_ref(), &e.object)),
+            instances
+                .iter()
+                .map(|instance| (instance.id.as_ref(), instance.content.as_ref())),
         )?;
         info!(plugin_gts_id = %gts_id, "Selected tenant resolver plugin instance");
 
@@ -224,3 +246,36 @@ impl Service {
             .map_err(DomainError::from)
     }
 }
+
+/// `selection` within [`DISCOVERY_BUDGET`]; on expiry it is dropped, which caches nothing.
+async fn bounded<F>(selection: F) -> Result<Arc<str>, DomainError>
+where
+    F: Future<Output = Result<Arc<str>, DomainError>>,
+{
+    tokio::time::timeout(DISCOVERY_BUDGET, selection)
+        .await
+        .unwrap_or_else(|_| {
+            Err(DomainError::TypesRegistryUnavailable(format!(
+                "plugin discovery did not finish within {DISCOVERY_BUDGET:?}"
+            )))
+        })
+}
+
+/// Registry availability failures map to retryable `TypesRegistryUnavailable` (503);
+/// malformed pages, credential refusals and contract faults remain internal.
+fn registry_failure(error: CanonicalError) -> DomainError {
+    match error {
+        CanonicalError::ServiceUnavailable { .. }
+        | CanonicalError::DeadlineExceeded { .. }
+        | CanonicalError::ResourceExhausted { .. }
+        | CanonicalError::Aborted { .. } => {
+            DomainError::TypesRegistryUnavailable(error.to_string())
+        }
+        other => DomainError::from(other),
+    }
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_tests.rs"]
+mod service_tests;

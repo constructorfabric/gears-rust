@@ -6,6 +6,10 @@ features:
   - static-authn
   - static-authz
 launcher: e2e-launcher
+env:
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Keep test databases separate from development data and older seed revisions.
+clean_home: true
 config_gears:
   - account-management
   # AM declares resource-group a hard dependency (user groups, the

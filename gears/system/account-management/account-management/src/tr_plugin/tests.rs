@@ -4,11 +4,9 @@
 //! `TenantHierarchyReadPort` backed by two `HashMap`s) and exercises
 //! `PluginImpl` through the `TenantResolverPluginClient` trait.
 //!
-//! The two registry stubs (`TestRegistry { fail: false/true }`) cover
-//! every call-site the plugin makes against `TypesRegistryClient`:
-//! `get_type_schema_by_uuid` (single) and `get_type_schemas_by_uuid`
-//! (batch). All other trait methods panic — if the plugin ever calls
-//! them unexpectedly the test fails loudly.
+//! The registry stubs (`TestRegistry::{ok, fail, unavailable}`) cover
+//! every read the plugin makes by UUID, single and batch: a known type,
+//! an unknown one and a failed read.
 
 #![allow(
     clippy::expect_used,
@@ -29,10 +27,8 @@ use tenant_resolver_sdk::{
 use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::make_test_type_schema;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
+use types_registry_sdk::PlatformTypesRegistryApi;
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry, Seed};
 use uuid::Uuid;
 
 use super::PluginImpl;
@@ -41,6 +37,7 @@ use crate::domain::tenant::hierarchy_read_port::{
     BarrierMode as PortBarrierMode, StatusFilter, TenantHierarchyReadPort,
 };
 use crate::domain::tenant::model::{TenantModel, TenantStatus};
+use crate::infra::types_registry::test_helpers::ConstantTypeRegistry;
 
 // ── Status constants (domain enum aliases, replacing the i16 SMALLINTs) ──
 
@@ -53,125 +50,27 @@ const DELETED: TenantStatus = TenantStatus::Deleted;
 
 const TEST_TYPE_ID: &str = gts_id!("cf.core.test.tenant.v1~");
 
-/// Dual-mode stub: when `fail=false` it returns a fixed `GtsTypeSchema` for
-/// any UUID; when `fail=true` every lookup returns `CanonicalError::NotFound`.
-struct TestRegistry {
-    fail: bool,
-}
+/// Dual-mode registry: `ok` answers [`TEST_TYPE_ID`] for any UUID; `fail`
+/// knows no tenant type, so every lookup is absent.
+struct TestRegistry;
 
 impl TestRegistry {
-    fn ok() -> Arc<dyn TypesRegistryClient> {
-        Arc::new(Self { fail: false })
+    fn ok() -> Arc<dyn PlatformTypesRegistryApi> {
+        Arc::new(ConstantTypeRegistry(TEST_TYPE_ID))
     }
 
-    fn fail() -> Arc<dyn TypesRegistryClient> {
-        Arc::new(Self { fail: true })
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for TestRegistry {
-    async fn get_type_schema_by_uuid(
-        &self,
-        _uuid: Uuid,
-    ) -> std::result::Result<GtsTypeSchema, CanonicalError> {
-        if self.fail {
-            Err(types_registry_sdk::testing::not_found("test"))
-        } else {
-            Ok(make_test_type_schema(TEST_TYPE_ID))
-        }
+    fn fail() -> Arc<dyn PlatformTypesRegistryApi> {
+        Arc::new(MockTypesRegistry::new())
     }
 
-    async fn get_type_schemas_by_uuid(
-        &self,
-        uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, std::result::Result<GtsTypeSchema, CanonicalError>> {
-        uuids
-            .into_iter()
-            .map(|u| {
-                let res = if self.fail {
-                    Err(types_registry_sdk::testing::not_found("test"))
-                } else {
-                    Ok(make_test_type_schema(TEST_TYPE_ID))
-                };
-                (u, res)
-            })
-            .collect()
-    }
-
-    async fn register(
-        &self,
-        _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
-        unimplemented!("tr_plugin does not call register")
-    }
-
-    async fn register_type_schemas(
-        &self,
-        _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
-        unimplemented!("tr_plugin does not call register_type_schemas")
-    }
-
-    async fn get_type_schema(&self, _: &str) -> std::result::Result<GtsTypeSchema, CanonicalError> {
-        unimplemented!("tr_plugin does not call get_type_schema by string id")
-    }
-
-    async fn get_type_schemas(
-        &self,
-        _: Vec<String>,
-    ) -> HashMap<String, std::result::Result<GtsTypeSchema, CanonicalError>> {
-        unimplemented!("tr_plugin does not call get_type_schemas by string ids")
-    }
-
-    async fn list_type_schemas(
-        &self,
-        _: TypeSchemaQuery,
-    ) -> std::result::Result<Vec<GtsTypeSchema>, CanonicalError> {
-        unimplemented!("tr_plugin does not call list_type_schemas")
-    }
-
-    async fn register_instances(
-        &self,
-        _: Vec<serde_json::Value>,
-    ) -> std::result::Result<Vec<RegisterResult>, CanonicalError> {
-        unimplemented!("tr_plugin does not call register_instances")
-    }
-
-    async fn get_instance(&self, _: &str) -> std::result::Result<GtsInstance, CanonicalError> {
-        unimplemented!("tr_plugin does not call get_instance")
-    }
-
-    async fn get_instance_by_uuid(
-        &self,
-        _: Uuid,
-    ) -> std::result::Result<GtsInstance, CanonicalError> {
-        unimplemented!("tr_plugin does not call get_instance_by_uuid")
-    }
-
-    async fn get_instances(
-        &self,
-        _: Vec<String>,
-    ) -> HashMap<String, std::result::Result<GtsInstance, CanonicalError>> {
-        unimplemented!("tr_plugin does not call get_instances")
-    }
-
-    async fn get_instances_by_uuid(
-        &self,
-        _: Vec<Uuid>,
-    ) -> HashMap<Uuid, std::result::Result<GtsInstance, CanonicalError>> {
-        unimplemented!("tr_plugin does not call get_instances_by_uuid")
-    }
-
-    async fn list_instances(
-        &self,
-        _: InstanceQuery,
-    ) -> std::result::Result<Vec<GtsInstance>, CanonicalError> {
-        unimplemented!("tr_plugin does not call list_instances")
+    /// Every read fails as the registry being unavailable.
+    fn unavailable() -> Arc<dyn PlatformTypesRegistryApi> {
+        let registry = MockTypesRegistry::new();
+        registry
+            .inject(Fault::on(Call::BatchGet).fail(CanonicalError::service_unavailable().create()));
+        Arc::new(registry)
     }
 }
-
-// ── In-memory FakePort ────────────────────────────────────────────────────
 
 /// In-memory `TenantHierarchyReadPort` for unit-testing `PluginImpl`
 /// without touching `SeaORM`. Rows live in two `HashMap`s wrapped in
@@ -1445,9 +1344,61 @@ async fn registry_fail_get_descendants_yields_internal() {
 }
 
 #[tokio::test]
+async fn a_failed_registry_read_yields_internal_for_single_and_batch_hydration() {
+    let port = setup();
+    let root = seed_root(&port, ACTIVE);
+    let port_dyn: Arc<dyn TenantHierarchyReadPort> = Arc::clone(&port) as _;
+    let plugin = PluginImpl::new(port_dyn, TestRegistry::unavailable());
+
+    let err = plugin.get_tenant(&ctx(), TenantId(root)).await.unwrap_err();
+    assert!(
+        matches!(err, TenantResolverError::Internal(_)),
+        "got {err:?}"
+    );
+    let err = plugin
+        .get_tenants(&ctx(), &[TenantId(root)], &GetTenantsOptions::default())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, TenantResolverError::Internal(_)),
+        "got {err:?}"
+    );
+}
+
+/// A tenant whose type was deleted keeps its identifier on single and
+/// batch hydration; only an unknown UUID fails the call.
+#[tokio::test]
+async fn a_deleted_tenant_type_hydrates_on_single_and_batch_reads() {
+    let port = setup();
+    let root = seed_root(&port, ACTIVE);
+    let type_uuid = types_registry_sdk::GtsId::try_new(TEST_TYPE_ID)
+        .expect("valid id")
+        .to_uuid();
+    port.rows
+        .lock()
+        .unwrap()
+        .get_mut(&root)
+        .expect("seeded")
+        .tenant_type_uuid = type_uuid;
+    let registry = MockTypesRegistry::new();
+    registry.seed_entity(Seed::new(TEST_TYPE_ID, serde_json::json!({})).deleted());
+    let port_dyn: Arc<dyn TenantHierarchyReadPort> = Arc::clone(&port) as _;
+    let plugin = PluginImpl::new(port_dyn, Arc::new(registry));
+
+    let info = plugin.get_tenant(&ctx(), TenantId(root)).await.unwrap();
+    assert_eq!(info.tenant_type.as_deref(), Some(TEST_TYPE_ID));
+    let infos = plugin
+        .get_tenants(&ctx(), &[TenantId(root)], &GetTenantsOptions::default())
+        .await
+        .unwrap();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].tenant_type.as_deref(), Some(TEST_TYPE_ID));
+}
+
+#[tokio::test]
 async fn is_ancestor_not_affected_by_registry_failure() {
     // `is_ancestor` probes `tenants` for visibility and `tenant_closure` for
-    // the edge — it never calls TypesRegistryClient. A failing registry must
+    // the edge — it never calls the registry. A failing registry must
     // not affect the result.
     let port = setup();
     let (root, child) = seed_two_level(&port, ACTIVE, ACTIVE);

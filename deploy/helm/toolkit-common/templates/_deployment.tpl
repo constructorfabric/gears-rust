@@ -79,6 +79,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.postgres }}
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "toolkit-common.fullname" . }}-postgres
+                  key: pg-password
+            {{- end }}
             {{- if $otel.enabled }}
             - name: APP__OPENTELEMETRY__EXPORTER__KIND
               value: {{ default "otlp_grpc" $otel.exporterKind | quote }}

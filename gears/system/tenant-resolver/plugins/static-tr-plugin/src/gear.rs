@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::Gear;
@@ -9,7 +10,9 @@ use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
+};
 
 use crate::config::StaticTrPluginConfig;
 use crate::domain::Service;
@@ -22,10 +25,12 @@ use crate::domain::Service;
 /// - Gateway registers the plugin schema (GTS type definition)
 /// - This plugin registers its instance (implementation metadata)
 /// - This plugin registers its scoped client (implementation in `ClientHub`)
-#[toolkit::gear(
-    name = "static-tr-plugin",
-    deps = [types_registry]
-)]
+///
+/// `init` publishes through local `PlatformTypesRegistryApi` and awaits admission
+/// before binding the scoped client. The host must link a database-backed registry;
+/// its system-gear init runs first without a `deps` edge. Missing registry or failed
+/// publication fails boot without binding. Remote publication remains T41/T42.
+#[toolkit::gear(name = "static-tr-plugin")]
 pub struct StaticTrPlugin {
     service: OnceLock<Arc<Service>>,
 }
@@ -64,10 +69,29 @@ impl Gear for StaticTrPlugin {
                 cfg.priority,
             )?;
 
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
+        // Publish to types-registry; the backend is registered only once the instance is admitted.
+        let registry = ctx
+            .client_hub()
+            .get::<dyn PlatformTypesRegistryApi>()
+            .with_context(|| {
+                format!(
+                    "{}: no PlatformTypesRegistryApi to publish to; a database-backed \
+                     types-registry must run in this process",
+                    Self::MODULE_NAME
+                )
+            })?;
+        let publisher = PublisherContext {
+            name: Self::MODULE_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").parse()?,
+        };
+        let gts_id = GtsId::try_new(instance_id.as_ref())?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &publisher,
+            &[(gts_id, instance_json)],
+            ctx.cancellation_token(),
+        )
+        .await?;
 
         self.service
             .set(service.clone())
@@ -85,3 +109,8 @@ impl Gear for StaticTrPlugin {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

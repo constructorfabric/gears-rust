@@ -21,6 +21,11 @@ auth_disabled = true
 [gears.tenant-resolver.config]
 vendor = "constructorfabric"
 
+# The tenant-resolver plugins publish through the database-backed registry API.
+[gears.types-registry.database]
+server = "sqlite"
+file = "types_registry.db"
+
 [gears.credstore.database]
 server = "sqlite"
 file = "credstore.db"

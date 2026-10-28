@@ -22,11 +22,18 @@ oop_http:
   advertise_uri: "http://127.0.0.1:9092"
   allow_loopback_advertise: true
 
+database:
+  servers:
+    sqlite:
+      engine: "sqlite"
+      params:
+        busy_timeout: "5000"
+
 gears:
   api-contracts:
     config: {}
 
-  # Embedded tenant-plane authn stack (in-memory; no DB).
+  # Embedded tenant-plane authn stack, over the registry database below.
   authn-resolver:
     config:
       vendor: "constructorfabric"
@@ -37,5 +44,9 @@ gears:
       priority: 100
       mode: accept_all
 
+  # Database-backed catalogue for AuthN plugin publication and selection.
   types-registry:
+    database:
+      server: "sqlite"
+      file: "types_registry.db"
     config: {}

@@ -25,8 +25,8 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.0
     "rest-client",
     "rest-server",
 ] }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../types-registry/types-registry-sdk" }
-types-registry = { workspace = true }
+# Plugin discovery via `consumes`: local registry or resolving REST client.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../types-registry/types-registry-sdk", features = ["rest-client"] }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -36,6 +36,8 @@ toolkit-security = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }
+# Bounds a cold plugin selection (`DISCOVERY_BUDGET`).
+tokio = { workspace = true, features = ["time"] }
 
 # Error handling and serialization
 anyhow = { workspace = true }
@@ -55,7 +57,10 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 # Async test harness + supporting types for the gear/local-client unit tests.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tokio-util = { workspace = true }
 uuid = { workspace = true }
 toolkit-gts = { workspace = true }
+parking_lot = { workspace = true }
+# The in-memory platform registry the selection tests run against.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../types-registry/types-registry-sdk", features = ["test-util"] }

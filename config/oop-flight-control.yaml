@@ -15,6 +15,13 @@ logging:
     file: "logs/oop-flight-control.log"
     file_level: info
 
+database:
+  servers:
+    sqlite:
+      engine: "sqlite"
+      params:
+        busy_timeout: "5000"
+
 gears:
   api-gateway:
     config:
@@ -52,5 +59,9 @@ gears:
       priority: 100
       mode: accept_all
 
+  # Database-backed catalogue for AuthN plugin publication and selection.
   types-registry:
+    database:
+      server: "sqlite"
+      file: "types_registry.db"
     config: {}

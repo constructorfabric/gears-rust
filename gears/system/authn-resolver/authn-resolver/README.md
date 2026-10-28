@@ -31,6 +31,23 @@ AuthNResolverPluginClient  (SDK trait, scoped by GTS instance ID)
 Plugin implementation  (validates tokens, returns SecurityContext)
 ```
 
+## Plugin catalogue
+
+The resolver and its plugins `#[toolkit::consumes]` the registry's `PlatformTypesRegistryApi`;
+none of them depends on the registry gear crate or declares it in `deps`.
+
+- System plugins build in `init`; after proxy wiring, `post_init` reconciles
+  `PluginV1<AuthNResolverPluginSpecV1>`, awaits admission and binds the scoped
+  `AuthNResolverPluginClient`. Refused, pending, cancelled or unreachable
+  publication fails boot without a client.
+- First authentication lists all platform catalogue pages, retains locally bound
+  clients and selects by vendor/lowest priority. Failures are uncached; legacy
+  is never consulted.
+- Hosts linking plugins need `gears.types-registry.database`; resolver-only
+  `auth_disabled` hosts remain unchanged.
+- Schemas come from the registry process's `toolkit-gts` inventory. Publication
+  to another process is not covered yet.
+
 ## Usage
 
 The primary consumer is the API Gateway's authentication middleware:

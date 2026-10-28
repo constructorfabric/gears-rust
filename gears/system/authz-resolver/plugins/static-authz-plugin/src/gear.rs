@@ -2,6 +2,7 @@
 
 use std::sync::{Arc, OnceLock};
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverPluginClient, AuthZResolverPluginSpecV1};
 use toolkit::Gear;
@@ -9,16 +10,27 @@ use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
+use types_registry_sdk::{
+    GtsId, PlatformTypesRegistryApi, PublisherContext, publish_startup_entities,
+};
 
 use crate::config::StaticAuthZPluginConfig;
 use crate::domain::Service;
 
 /// Static `AuthZ` resolver plugin gear.
-#[toolkit::gear(
-    name = "static-authz-plugin",
-    deps = [types_registry]
-)]
+///
+/// **Plugin registration pattern:**
+/// - The plugin schema reaches the registry through the `toolkit-gts` inventory
+/// - `init` reconciles this plugin's instance into the registry's platform catalogue and
+///   waits for its admission
+/// - Only then is the scoped client registered in `ClientHub`, so authz-resolver can
+///   select it; a failed publication fails boot and leaves no client behind
+///
+/// `init` publishes through local `PlatformTypesRegistryApi` and awaits admission
+/// before binding the scoped client. The host must link a database-backed registry;
+/// its system-gear init runs first without a `deps` edge. Missing registry or failed
+/// publication fails boot without binding. Remote publication remains T41/T42.
+#[toolkit::gear(name = "static-authz-plugin")]
 pub struct StaticAuthZPlugin {
     service: OnceLock<Arc<Service>>,
 }
@@ -34,6 +46,10 @@ impl Default for StaticAuthZPlugin {
 #[async_trait]
 impl Gear for StaticAuthZPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        if self.service.get().is_some() {
+            anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
+        }
+
         let cfg: StaticAuthZPluginConfig = ctx.config_or_default()?;
         info!(
             vendor = %cfg.vendor,
@@ -49,12 +65,30 @@ impl Gear for StaticAuthZPlugin {
                 cfg.priority,
             )?;
 
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
+        // Publish to types-registry; the backend is registered only once the instance is admitted.
+        let registry = ctx
+            .client_hub()
+            .get::<dyn PlatformTypesRegistryApi>()
+            .with_context(|| {
+                format!(
+                    "{}: no PlatformTypesRegistryApi to publish to; a database-backed \
+                     types-registry must run in this process",
+                    Self::MODULE_NAME
+                )
+            })?;
+        let publisher = PublisherContext {
+            name: Self::MODULE_NAME.to_owned(),
+            version: env!("CARGO_PKG_VERSION").parse()?,
+        };
+        let gts_id = GtsId::try_new(instance_id.as_ref())?;
+        publish_startup_entities(
+            registry.as_ref(),
+            &publisher,
+            &[(gts_id, instance_json)],
+            ctx.cancellation_token(),
+        )
+        .await?;
 
-        // Create service
         let service = Arc::new(Service::new());
         self.service
             .set(service.clone())
@@ -72,3 +106,8 @@ impl Gear for StaticAuthZPlugin {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

@@ -22,4 +22,4 @@ gears:
 
 - **`tenant-resolver-sdk`** — `TenantResolverClient` trait for tenant hierarchy queries
 - **`authz-resolver-sdk`** — `AuthZResolverPluginClient` trait, predicate types
-- **`types-registry-sdk`** — GTS plugin instance registration
+- **`types-registry-sdk`** — GTS plugin instance publication into the platform catalogue (`PlatformTypesRegistryApi`) of the types-registry linked into the same process; the host must link a database-backed registry

@@ -19,6 +19,8 @@ from typing import Optional
 import httpx
 import pytest
 
+from ..types_registry.helpers import PLATFORM_API, RECEIPT, get_entity, submit_and_poll
+
 REQUEST_TIMEOUT = 5.0  # per-request hard timeout for all E2E calls
 
 
@@ -195,9 +197,8 @@ def _child_conversion(base: str, tid: str, rid: str) -> str:
     return f"{base}/account-management/v1/tenants/{tid}/child-conversions/{rid}"
 
 
-def _types(base: str) -> str:
-    """Types-registry batch-register endpoint — used to register metadata schemas."""
-    return f"{base}/types-registry/v1/entities"
+# The registry's tenant read API; registration is a platform call (`PLATFORM_API`).
+TYPES_REGISTRY_API = "types-registry/v2"
 
 
 # ── Factory fixtures ────────────────────────────────────────────────────
@@ -263,58 +264,72 @@ def create_tenant(am_base_url, am_headers):
 
 
 @pytest.fixture
-def create_metadata_schema(am_base_url, am_headers):
+def create_metadata_schema(am_base_url, am_headers, platform_headers):
     """Factory fixture: register a metadata GTS schema in the types-registry.
 
-    Returns the chained ``type_id`` (a string). Idempotent on the wire
-    -- the types-registry batch endpoint always returns 200 with a
-    per-item result; an already-registered entity surfaces as
-    ``status=error`` with an "Entity already exists" message which the
-    factory treats as success so suites can re-run without manual
-    cleanup.
+    Returns the chained ``type_id`` (a string). Registers through the
+    registry's platform API with the internal token alone, and reads with the
+    tenant bearer, from the database catalogue AM reads: the current document
+    is read and compared, an absent one is created and a differing one is
+    updated under its ``expected_resource_version``, then the operation is
+    polled and its item outcome checked -- ``completed`` alone is not
+    success. A concurrent writer's conflict re-reads; any other refusal
+    fails the fixture, so a rerun with another ``inheritance_policy``
+    converges instead of silently keeping the old one.
     """
 
     async def _register(
         type_id: str = DEFAULT_METADATA_SCHEMA_ID,
         inheritance_policy: str = "inherit",
+        payload_schema: Optional[dict] = None,
     ) -> str:
-        payload = {
-            "entities": [
-                {
-                    "$id": f"gts://{type_id}",
-                    "$schema": "http://json-schema.org/draft-07/schema#",
-                    "allOf": [{"$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"}],
-                    "description": "E2E test metadata schema",
-                    "type": "object",
-                    "x-gts-traits": {
-                        "inheritance_policy": inheritance_policy,
-                    },
-                }
-            ]
+        content = {
+            "$id": f"gts://{type_id}",
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "allOf": [{"$ref": "gts://gts.cf.core.am.tenant_metadata.v1~"}],
+            "description": "E2E test metadata schema",
+            "type": "object",
+            "x-gts-traits": {
+                "inheritance_policy": inheritance_policy,
+            },
         }
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                _types(am_base_url),
-                headers=am_headers,
-                json=payload,
-            )
-            assert resp.status_code == 200, (
-                f"types-registry register status {resp.status_code} "
-                f"for '{type_id}': {resp.text}"
-            )
-            results = resp.json().get("results") or []
-            assert results, (
-                f"types-registry returned no results for '{type_id}': "
-                f"{resp.text}"
-            )
-            outcome = results[0]
-            if outcome.get("status") == "ok":
-                return type_id
-            err = (outcome.get("error") or "").lower()
-            assert "already exists" in err, (
-                f"Failed to register schema '{type_id}': {outcome}"
-            )
-            return type_id
+        if payload_schema is not None:
+            content["properties"] = {"payload": payload_schema}
+        base = am_base_url.rstrip("/") + "/"
+        async with httpx.AsyncClient(
+            base_url=base, headers=platform_headers, timeout=10.0
+        ) as platform, httpx.AsyncClient(
+            base_url=base, headers=am_headers, timeout=10.0
+        ) as client:
+            for _attempt in range(3):
+                current = await get_entity(
+                    client, TYPES_REGISTRY_API, type_id, select="origin,content"
+                )
+                if current.status_code == 200:
+                    entity = current.json()
+                    if entity["lifecycle_status"] == "active" and entity["content"] == content:
+                        return type_id
+                    expected = entity["origin"]["resource_version"]
+                else:
+                    assert current.status_code == 404, (
+                        f"types-registry read of '{type_id}': "
+                        f"{current.status_code} {current.text}"
+                    )
+                    expected = None
+                candidate = {"gts_id": type_id, "content": content}
+                if expected is not None:
+                    candidate["expected_resource_version"] = expected
+                operation = await submit_and_poll(
+                    platform, PLATFORM_API, [candidate], RECEIPT
+                )
+                [item] = operation["items"]
+                if item["status"] in ("succeeded", "unchanged"):
+                    return type_id
+                reason = (item.get("error") or {}).get("reason")
+                assert reason in ("already_exists", "precondition_failed"), (
+                    f"Failed to register schema '{type_id}': {item}"
+                )
+            raise AssertionError(f"schema '{type_id}' did not converge: {item}")
 
     return _register
 

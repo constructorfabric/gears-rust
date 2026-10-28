@@ -1320,6 +1320,7 @@ struct AlwaysReject;
 impl TenantTypeChecker for AlwaysReject {
     async fn check_parent_child(
         &self,
+        _ctx: &SecurityContext,
         _parent_type: Uuid,
         _child_type: Uuid,
     ) -> Result<(), DomainError> {
@@ -3969,4 +3970,82 @@ async fn max_listing_top_defaults_to_platform_cap_and_honours_override() {
 
     let svc_capped = make_service(conv, tenants, fixed_now()).with_listing_max_top(25);
     assert_eq!(svc_capped.max_listing_top(), 25);
+}
+
+// ---- who registry reads are made for (P33) -------------------------
+
+/// Records the caller of every type check and admits the pairing.
+#[derive(Default)]
+struct RecordingChecker(std::sync::Mutex<Vec<SecurityContext>>);
+
+#[async_trait]
+impl TenantTypeChecker for RecordingChecker {
+    async fn check_parent_child(
+        &self,
+        ctx: &SecurityContext,
+        _parent_type: Uuid,
+        _child_type: Uuid,
+    ) -> Result<(), DomainError> {
+        self.0.lock().expect("lock").push(ctx.clone());
+        Ok(())
+    }
+}
+
+/// The child's actor requests, the parent's actor approves: the type
+/// re-check at approval is made for the approver's own complete
+/// context, never the requester's.
+#[tokio::test]
+async fn approve_checks_the_type_pairing_for_the_approver() {
+    use crate::infra::types_registry::test_helpers::{assert_only_caller, caller_in};
+
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let parent = Uuid::from_u128(0x2400);
+    let child = Uuid::from_u128(0x2401);
+    seed_tenant(&tenants, parent, None, TenantStatus::Active, false, "root");
+    seed_tenant(
+        &tenants,
+        child,
+        Some(parent),
+        TenantStatus::Active,
+        false,
+        "c",
+    );
+    seed_closure(&tenants, parent, parent, 0);
+    seed_closure(&tenants, child, child, 0);
+    seed_closure(&tenants, parent, child, 0);
+    let conv = Arc::new(FakeConversionRepo::new().with_tenant_repo(Arc::clone(&tenants)));
+    let checker = Arc::new(RecordingChecker::default());
+    let svc = make_service_with_checker(conv, Arc::clone(&tenants), checker.clone(), fixed_now());
+    let requester = caller_in(1, ctx_subject_root());
+    let approver = caller_in(2, ctx_subject_root());
+
+    let pending = svc
+        .request_conversion(
+            &requester,
+            RequestConversionInput {
+                tenant_id: child,
+                caller: ConversionCaller::child(child),
+                target_mode: TargetMode::SelfManaged,
+                comment: None,
+            },
+        )
+        .await
+        .expect("child-side request");
+    checker.0.lock().expect("lock").clear();
+
+    let resolved = svc
+        .approve(
+            &approver,
+            pending.id,
+            ConversionCaller::parent(parent),
+            None,
+        )
+        .await
+        .expect("parent-side approval");
+
+    assert_eq!(resolved.status, ConversionStatus::Approved);
+    assert_eq!(resolved.approved_by, Some(approver.subject_id()));
+    let seen: Vec<SecurityContext> = checker.0.lock().expect("lock").drain(..).collect();
+    assert_eq!(seen.len(), 1, "one type check at approval");
+    assert_only_caller(&seen, &approver);
 }

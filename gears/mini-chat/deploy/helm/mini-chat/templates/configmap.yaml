@@ -113,6 +113,11 @@ data:
           vendor: "constructorfabric"
           priority: 100
 
+      types-registry:
+        # The tenant-resolver plugins publish through the database-backed registry API.
+        database:
+          server: "pg_mini_chat"
+
       tenant-resolver:
         config:
           vendor: "constructorfabric"

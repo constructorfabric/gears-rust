@@ -21,8 +21,8 @@ workspace = true
 toolkit-canonical-errors = { workspace = true }
 # Local dependencies
 account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.8.0", path = "../../account-management-sdk" }
+# Publishes in `init` through the host-linked registry's local platform API.
 types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../../../types-registry/types-registry-sdk" }
-types-registry = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }
@@ -58,6 +58,8 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
+tokio-util = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
 # `IdpTenantContext::new` requires a `GtsSchemaId`; the test scaffolding
 # in `domain::client::pagination_tests` builds a sample context per
 # request. Dev-only so the runtime crate stays free of the dependency.

@@ -20,21 +20,19 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 /// 1. Discovers plugin instances via types-registry
 /// 2. Routes requests to the selected plugin based on vendor configuration
 ///
-/// The `AuthZResolverPluginSpecV1` schema itself reaches `types-registry`
-/// automatically via the `toolkit-gts` link-time inventory — no per-init
-/// registration is needed. Plugin discovery is lazy: happens on first API
-/// call after types-registry is ready.
+/// The registry is consumed, not linked: `PlatformTypesRegistryApi` is the registry's own
+/// local client where the registry runs in this process, and its resolving REST client
+/// otherwise. The `AuthZResolverPluginSpecV1` schema reaches the registry through the
+/// `toolkit-gts` inventory it seeds from. Plugin discovery is lazy: it happens on the
+/// first evaluation, never in `init`, so no registry call waits on this gear's phase.
 ///
 /// `AuthZResolverApi` is exposed as a `#[toolkit::contract]`: `provides`
 /// auto-wires the local impl into `ClientHub`, and the `rest` capability hosts
 /// the contract's REST projection (`/authz-resolver/v1/evaluate`, an internal
 /// tenant-plane authenticated route that is not edge-exposed) so out-of-process
 /// PEPs can reach the PDP over HTTP via directory resolution.
-#[toolkit::gear(
-    name = "authz-resolver",
-    deps = [types_registry],
-    capabilities = [system, rest]
-)]
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::gear(name = "authz-resolver", capabilities = [system, rest])]
 #[toolkit::provides(
     contract = authz_resolver_sdk::AuthZResolverApi,
     local = Self::build_local,

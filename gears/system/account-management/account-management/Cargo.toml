@@ -50,8 +50,8 @@ resource-group-sdk = { workspace = true }
 resource-group = { workspace = true }
 tenant-resolver-sdk = { workspace = true }
 tenant-resolver = { workspace = true }
+# Request and platform APIs from the host-linked database registry, initialized first.
 types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
 gts = { workspace = true }
 
 uuid = { workspace = true, features = ["v4", "serde"] }
@@ -100,12 +100,17 @@ integration = []
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
+# The real database-backed registry the gear tests boot beside this gear.
+types-registry = { workspace = true }
+# `tests/host_runtime_order_test.rs`: the gears' databases under a real `HostRuntime`.
+figment = { workspace = true }
 # In-process `Router::oneshot` HTTP harness for the REST integration
 # suite (`tests/api_*_test.rs`). Mirrors the resource-group gear's
 # wiring.
 tower = { workspace = true }
 http-body-util = { workspace = true }
 proptest = "1.5"
+tempfile = { workspace = true }
 # The users route driven against the real static IdP plugin
 # (`tests/api_users_test.rs`): what the route admits is what the plugin
 # must be able to evaluate.

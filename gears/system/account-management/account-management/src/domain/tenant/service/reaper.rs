@@ -47,7 +47,7 @@ use crate::domain::system_actor::for_provisioning_reaper;
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::retention::ReaperResult;
 
-use super::TenantService;
+use super::{CallerOrigin, TenantService};
 
 /// Compensation-arm classification for a single reaper row. Lets
 /// the per-row body in `reap_stuck_provisioning` decide whether to
@@ -324,7 +324,10 @@ impl<R: TenantRepo> TenantService<R> {
         reason = "IdpDeprovisionFailure is #[non_exhaustive]; the wildcard guards against future SDK variants"
     )]
     async fn classify_deprovision(&self, tenant_id: uuid::Uuid) -> ReaperOutcome {
-        let tenant_context = match self.load_tenant_context(tenant_id).await {
+        let tenant_context = match self
+            .load_tenant_context(CallerOrigin::Background, tenant_id)
+            .await
+        {
             Ok(ctx) => ctx,
             Err(err) => {
                 // Could not assemble the context — typically a

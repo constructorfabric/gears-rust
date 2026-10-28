@@ -26,6 +26,13 @@ Tenant is resolved from `TenantContext.root_id` first, then falls back to `subje
 
 This ensures that the Secure ORM receives the tenant scope it needs for queries, while denying access when no valid tenant can be determined.
 
+## Registration
+
+`init` publishes `cf.builtin.static_authz_resolver.plugin.v1`, awaits admission,
+then binds the client. The host must link types-registry with
+`gears.types-registry.database` or boot fails. See the authz-resolver README,
+*Plugin catalogue*.
+
 ## Configuration
 
 ```yaml

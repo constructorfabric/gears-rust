@@ -109,6 +109,20 @@ Plugins implement [`AuthZResolverPluginClient`](authz-resolver-sdk/src/plugin_ap
 Gears include one plugin out of the box:
 - [`static_authz_plugin`](plugins/static-authz-plugin/) — Tenant-scoped plugin for development and testing (denies access when no valid tenant is resolved)
 
+## Plugin catalogue
+
+The resolver `#[toolkit::consumes]` the registry's `PlatformTypesRegistryApi`; neither it nor
+its plugins depend on the registry gear crate or declare it in `deps`.
+
+- First evaluation lists all platform catalogue pages, keeps locally bound scoped
+  `AuthZResolverPluginClient`s and selects by vendor/lowest priority. Failures are
+  uncached and yield PEP `EvaluationFailed`; legacy is never consulted.
+- Ordinary `static-authz-plugin` and `tr-authz-plugin` gears reconcile
+  `PluginV1<AuthZResolverPluginSpecV1>` in `init`, await admission, then bind.
+  Refused, pending or cancelled publication fails boot without a client.
+- The host must link `types-registry` with `gears.types-registry.database`.
+  Its system-gear init runs first. Remote publication remains T41/T42.
+
 ## Configuration
 
 ### AuthZ Resolver Gear
@@ -155,7 +169,7 @@ let response = authz.evaluate(ctx.clone(), EvaluationRequest {
 - AuthZEN-based `evaluate` API
 - `PolicyEnforcer` with `access_scope` for one-step PEP flow
 - PEP compiler with fail-closed constraint compilation
-- Plugin discovery via types-registry
+- Plugin discovery over the types-registry platform catalogue (see [Plugin catalogue](#plugin-catalogue))
 - Static dev plugin with tenant scoping (denies on nil/missing tenant)
 - ClientHub registration for in-process consumption
 

@@ -147,8 +147,8 @@ gears:
       server: "sqlite_users"
       file: "types_registry.db"
     config:
-      # AM registers the platform-root tenant type through the process-local
-      # Types Registry client during startup. This customer type remains
+      # AM reconciles the platform-root tenant type into the database during
+      # its init. This customer type remains
       # deployment-owned E2E data used by the AM suite for children under the
       # platform root. It allows nesting under either the platform root or
       # another customer so the suite can build multi-level hierarchies for
@@ -169,15 +169,20 @@ gears:
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.platform.v1~"
               - "gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~"
             idp_provisioning: false
-      # Types-registry suite settings, kept here rather than in its manifest so
-      # the shared `make e2e-local` server has them too. Force lets TR-REG-903
-      # waive a compatibility failure; the suite's `force-disabled` profile
-      # turns it off for TR-REG-902. Vendor `acme` is open only in the suite's
-      # own namespace (TR-REG-904); every other region stays closed.
+      # Suite settings, kept here rather than in their manifests so the shared
+      # `make e2e-local` server has them too. Force lets TR-REG-903 waive a
+      # compatibility failure; the types-registry suite's `force-disabled`
+      # profile turns it off for TR-REG-902. Vendor `acme` is open only in that
+      # suite's own namespace (TR-REG-904); every other region stays closed.
       allow_compatibility_force: true
       registration_policy:
         "gts.acme.e2e.*":
           allowed_vendors: [acme]
+        # The account-management suite registers its metadata schema
+        # `gts.cf.core.am.tenant_metadata.v1~x.e2etest.am.meta.v1~` through the
+        # database API; vendor `x` is open in that namespace only.
+        "gts.cf.core.am.tenant_metadata.v1~x.e2etest.*":
+          allowed_vendors: [x]
 
   static-tr-plugin:
     config:

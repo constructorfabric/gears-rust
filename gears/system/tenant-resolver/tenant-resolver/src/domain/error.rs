@@ -102,9 +102,12 @@ impl From<DomainError> for TenantResolverError {
                 tenant_id: tenant_resolver_sdk::TenantId(tenant_id),
             },
             DomainError::Unauthorized => Self::Unauthorized,
-            DomainError::TypesRegistryUnavailable(reason) | DomainError::Internal(reason) => {
-                Self::Internal(reason)
+            // A registry outage is retryable, like a plugin's; the selection's own
+            // classification already left every non-availability failure `Internal`.
+            DomainError::TypesRegistryUnavailable(reason) => {
+                Self::ServiceUnavailable(format!("types registry is not available: {reason}"))
             }
+            DomainError::Internal(reason) => Self::Internal(reason),
         }
     }
 }

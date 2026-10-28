@@ -8,8 +8,11 @@ gdl_version = "1.0"
 # point is declared by `implements`; this plugin's vendor and priority are read
 # from source.
 
+# `init` requires a host-linked, database-backed types-registry (system gear, initialized
+# first). No `deps` or `consumes`; missing registry fails boot. Remote support: T41/T42.
+
 gear(
-    deps = ["resource-group", "types-registry"],
+    deps = ["resource-group"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/tenant-resolver/plugins/rg-tr-plugin"),
     maturity = "preview",
     name = "Resource-Group Tenant Resolver Plugin",

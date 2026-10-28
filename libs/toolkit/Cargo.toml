@@ -219,3 +219,5 @@ serial_test = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+# `gts_type_schema` plugin specs in unit tests.
+schemars = { workspace = true }

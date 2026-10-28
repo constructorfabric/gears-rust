@@ -18,15 +18,13 @@ use crate::domain::{Service, TenantResolverLocalClient};
 /// 1. Discovers plugin instances via types-registry
 /// 2. Routes requests to the selected plugin based on vendor configuration
 ///
-/// The `TenantResolverPluginSpecV1` schema itself reaches `types-registry`
-/// automatically via the `toolkit-gts` link-time inventory — no per-init
-/// registration is needed. Plugin discovery is lazy: happens on first API
-/// call after types-registry is ready.
-#[toolkit::gear(
-    name = "tenant-resolver",
-    deps = [types_registry],
-    capabilities = [system]
-)]
+/// The registry is consumed, not linked: `PlatformTypesRegistryApi` is the registry's own
+/// local client where the registry runs in this process, and its resolving REST client
+/// otherwise. The `TenantResolverPluginSpecV1` schema reaches the registry through the
+/// `toolkit-gts` inventory it seeds from. Plugin discovery is lazy: it happens on the
+/// first API call, never in `init`.
+#[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
+#[toolkit::gear(name = "tenant-resolver", capabilities = [system])]
 pub(crate) struct TenantResolver {
     service: OnceLock<Arc<Service>>,
 }

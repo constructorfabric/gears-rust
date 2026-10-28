@@ -22,6 +22,13 @@ logging:
     max_backups: 3
     max_size_mb: 10
 
+database:
+  servers:
+    sqlite:
+      engine: "sqlite"
+      params:
+        busy_timeout: "5000"
+
 gears:
   api-gateway:
     config:
@@ -60,3 +67,10 @@ gears:
       vendor: "constructorfabric"
       priority: 100
       mode: accept_all
+
+  # Database-backed catalogue for AuthN plugin publication and selection.
+  types-registry:
+    database:
+      server: "sqlite"
+      file: "types_registry.db"
+    config: {}

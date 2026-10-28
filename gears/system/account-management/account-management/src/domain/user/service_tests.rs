@@ -25,7 +25,7 @@
 )]
 
 use std::sync::Arc;
-use toolkit_gts::gts_id;
+use toolkit_gts::{gts_id, gts_uri};
 
 use account_management_sdk::{
     IdpNewUser, IdpUser, IdpUserFilterField, IdpUserPagination, IdpUserPatch, ListUsersQuery,
@@ -33,8 +33,7 @@ use account_management_sdk::{
 use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
+use types_registry_sdk::testing_platform::{MockTypesRegistry, Seed};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -46,10 +45,10 @@ use crate::domain::user::test_support::{FakeIdpUserProvisioner, FakeUserOutcome}
 const USER_SCHEMA: &str = gts_id!("cf.core.am.user.v1~");
 
 /// Canonical chained `tenant_type` every seeded tenant carries. The
-/// matching `GtsTypeSchema` is pre-registered in [`make_service`]'s
-/// `MockTypesRegistryClient` so `UserService::resolve_active_tenant`
+/// matching Type Schema is pre-registered in [`make_service`]'s
+/// `MockTypesRegistry` so `UserService::resolve_active_tenant`
 /// can resolve the typed `GtsTypeId` via
-/// `get_type_schema_by_uuid` (mandatory after the IdP-metadata
+/// `resolve_type_id` (mandatory after the IdP-metadata
 /// isolation refactor — a missing schema now surfaces as
 /// `ServiceUnavailable` instead of `Option::None`). Tests that need
 /// a specific failure shape override the registry stub.
@@ -61,19 +60,12 @@ fn test_tenant_type_uuid() -> Uuid {
         .to_uuid()
 }
 
-/// Minimal `GtsTypeSchema` matching [`TEST_TENANT_TYPE_ID`]. The body
-/// is an empty object — `resolve_active_tenant` only reads `type_id`
-/// off the result, so the schema content does not affect any tests.
-/// Derived chains require a parent reference; we build one
-/// recursively up to the base.
-fn test_tenant_type_schema() -> GtsTypeSchema {
-    fn build(type_id: &str) -> GtsTypeSchema {
-        let parent = GtsTypeSchema::derive_parent_type_id(type_id)
-            .map(|p| std::sync::Arc::new(build(p.as_ref())));
-        GtsTypeSchema::try_new(GtsTypeId::new(type_id), json!({}), None, parent)
-            .expect("synthetic tenant_type schema is valid")
-    }
-    build(TEST_TENANT_TYPE_ID)
+/// A registry holding [`TEST_TENANT_TYPE_ID`]. `resolve_active_tenant`
+/// only reads the identifier, so the content does not affect any tests.
+fn registry_with_test_tenant_type() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(TEST_TENANT_TYPE_ID, json!({ "type": "object" }));
+    registry
 }
 
 // ---- helpers -------------------------------------------------------
@@ -111,20 +103,23 @@ fn ctx_for(root: Uuid) -> SecurityContext {
         .expect("ctx")
 }
 
-fn user_schema() -> GtsTypeSchema {
-    let body = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "username"],
-        "properties": {
-            "id": { "type": "string", "format": "uuid" },
-            "username": { "type": "string", "minLength": 1, "maxLength": 255 },
-            "email": { "type": "string", "format": "email" },
-            "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
-        },
-    });
-    GtsTypeSchema::try_new(GtsTypeId::new(USER_SCHEMA), body, None, None)
-        .expect("synthetic user schema is valid")
+fn seed_user_schema(registry: &MockTypesRegistry) {
+    registry.seed(
+        USER_SCHEMA,
+        json!({
+            "$id": gts_uri!(USER_SCHEMA),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "username"],
+            "properties": {
+                "id": { "type": "string", "format": "uuid" },
+                "username": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "email": { "type": "string", "format": "email" },
+                "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+            },
+        }),
+    );
 }
 
 fn make_service(tenants: Arc<FakeTenantRepo>, idp: Arc<FakeIdpUserProvisioner>) -> UserService {
@@ -140,10 +135,8 @@ fn make_service(tenants: Arc<FakeTenantRepo>, idp: Arc<FakeIdpUserProvisioner>) 
     // (`create_user_without_registered_user_schema_returns_service_unavailable`)
     // pins the fail-closed behaviour with a registry that omits the
     // user schema.
-    let types_registry = Arc::new(
-        MockTypesRegistryClient::new()
-            .with_type_schemas([test_tenant_type_schema(), user_schema()]),
-    );
+    let types_registry = Arc::new(registry_with_test_tenant_type());
+    seed_user_schema(&types_registry);
     UserService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
@@ -156,8 +149,7 @@ fn make_service_without_user_schema(
     // fail-closed arm. Drives the
     // `create_user_without_registered_user_schema_returns_service_unavailable`
     // service-layer contract test.
-    let types_registry =
-        Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+    let types_registry = Arc::new(registry_with_test_tenant_type());
     UserService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
@@ -235,6 +227,28 @@ async fn create_user_happy_path_returns_projection() {
     let calls = idp.create_calls_snapshot();
     assert_eq!(calls[0].0, tenant_id, "tenant scope is forwarded");
     assert_eq!(calls[0].1, "alice");
+}
+
+/// A tenant whose type was deleted keeps its identifier: the request
+/// read resolves the tombstone and the `IdP` is called as usual.
+#[tokio::test]
+async fn create_user_under_a_tenant_of_a_deleted_type_resolves_its_type() {
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x1);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let types_registry = Arc::new(MockTypesRegistry::new());
+    types_registry
+        .seed_entity(Seed::new(TEST_TENANT_TYPE_ID, json!({ "type": "object" })).deleted());
+    seed_user_schema(&types_registry);
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    idp.set_create_projection(IdpUser::new(Uuid::from_u128(0xABCD), "alice"));
+    let svc = UserService::new(tenants, idp.clone(), types_registry, mock_enforcer());
+
+    svc.create_user(&ctx(), tenant_id, payload("alice"))
+        .await
+        .expect("a deleted tenant type still resolves");
+
+    assert_eq!(idp.create_call_count(), 1);
 }
 
 /// Mirror of [`create_user_happy_path_returns_projection`] with
@@ -1547,8 +1561,7 @@ mod cleanup {
         // through `delete_user` fails with the fixed
         // `ServiceUnavailable { detail: "tenant type resolution is temporarily
         // unavailable" }` before the RG-cleanup path ever runs.
-        let types_registry =
-            Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+        let types_registry = Arc::new(registry_with_test_tenant_type());
         let rg: Arc<dyn ResourceGroupClient + Send + Sync> = rg;
         UserService::new(tenants, idp, types_registry, mock_enforcer())
             .with_rg_membership_cleanup(rg)
@@ -1774,4 +1787,50 @@ mod cleanup {
             other => panic!("expected ServiceUnavailable, got {other:?}"),
         }
     }
+}
+
+// ---- who registry reads are made for (P33) --------------------
+
+/// Two callers through one shared service: the tenant guard's
+/// `tenant_type` read and the payload / patch schema reads are made for
+/// exactly the caller of each flow, and none reaches the platform API.
+#[tokio::test]
+async fn every_registry_read_names_the_requests_caller() {
+    use crate::infra::types_registry::test_helpers::{CallerSpy, assert_only_caller, caller_in};
+
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x70);
+    seed_tenant(&tenants, tenant_id, None, TenantStatus::Active, "acme");
+    let idp = Arc::new(FakeIdpUserProvisioner::new());
+    let user_id = Uuid::from_u128(0xF00D);
+    idp.set_create_projection(IdpUser::new(user_id, "alice"));
+    idp.set_update_projection(IdpUser::new(user_id, "alice"));
+    idp.set_list_items(vec![IdpUser::new(user_id, "alice")]);
+    let registry = Arc::new(registry_with_test_tenant_type());
+    seed_user_schema(&registry);
+    let spy = CallerSpy::for_requests(registry);
+    let svc = UserService::new(tenants, idp, spy.clone(), mock_enforcer());
+
+    for n in [1, 2] {
+        let ctx = caller_in(n, ctx_subject_root());
+        svc.create_user(&ctx, tenant_id, payload("alice"))
+            .await
+            .expect("create");
+        svc.update_user(&ctx, tenant_id, user_id, email_patch("new@example.com"))
+            .await
+            .expect("update");
+        svc.list_users(&ctx, tenant_id, ListUsersQuery::new(pagination()))
+            .await
+            .expect("list");
+        svc.get_user(&ctx, tenant_id, user_id).await.expect("get");
+        svc.delete_user(&ctx, tenant_id, user_id)
+            .await
+            .expect("delete");
+        // create and update: the tenant guard and the schema; list, get
+        // and delete: the tenant guard.
+        assert_eq!(spy.callers().len(), 7);
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+    assert_eq!(spy.platform_reads(), 0);
 }

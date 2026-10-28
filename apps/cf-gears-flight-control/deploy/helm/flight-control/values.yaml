@@ -86,6 +86,15 @@ nodeSelector: {}
 affinity: {}
 tolerations: []
 
+# External PostgreSQL for the embedded types-registry.
+# The database and user must already exist; the password is stored in a Secret.
+postgres:
+  host: "postgres.default.svc.cluster.local"
+  port: 5432
+  database: "flight_control"
+  user: "flight_control"
+  password: "REPLACE_ME"
+
 config:
   mountPath: /app/config/flight-control.yaml
   fileName: flight-control.yaml
@@ -145,5 +154,7 @@ config:
         config: {}
 
       types-registry:
+        database:
+          server: "postgres"
         config: {}
 

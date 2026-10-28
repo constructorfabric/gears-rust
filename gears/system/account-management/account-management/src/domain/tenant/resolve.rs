@@ -13,9 +13,10 @@
 //! 2. Reject a miss with [`DomainError::NotFound`] and a non-`Active`
 //!    status with [`DomainError::Validation`] — before any provider
 //!    round-trip.
-//! 3. Resolve the chained `tenant_type` mandatorily; a Types Registry
-//!    outage is a [`DomainError::ServiceUnavailable`], not an `Option`
-//!    leaking through the plugin contract.
+//! 3. Resolve the chained `tenant_type` mandatorily, for the request's
+//!    caller (P33); a Types Registry outage is a
+//!    [`DomainError::ServiceUnavailable`], not an `Option` leaking
+//!    through the plugin contract.
 //! 4. Replay the plugin's own opaque per-tenant `metadata`.
 //!
 //! It lives here as one free function rather than as a private method
@@ -23,8 +24,8 @@
 //! check it once: a second copy is a second thing to keep in step.
 
 use account_management_sdk::gts::TENANT_RESOURCE_TYPE;
-use toolkit_security::AccessScope;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::{AccessScope, SecurityContext};
+use types_registry_sdk::{TypesRegistryApi, TypesRegistryApiExt};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -39,7 +40,7 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 /// the [`TenantContext`] forwarded to the `IdP` plugin.
 ///
 /// `tenant_type` on the returned context is mandatory: AM resolves the
-/// chained GTS identifier via [`TypesRegistryClient`] and surfaces an
+/// chained GTS identifier via [`TypesRegistryApi`] and surfaces an
 /// outage as [`DomainError::service_unavailable`] rather than leaking an
 /// `Option` through the plugin contract — plugins may route on the type
 /// (Keycloak realm name, Zitadel organization selection, vendor-side org
@@ -47,6 +48,10 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 /// `tenant_idp_metadata` (whatever the plugin returned at
 /// `provision_tenant` time and AM persisted via `activate_tenant`) so
 /// every `IdP` call receives the plugin's own per-tenant state inline.
+///
+/// `ctx` is the request's caller, for whom the tenant type is read;
+/// `scope` is the PDP row filter compiled for that caller, which bounds
+/// the tenant reads and names no registry caller.
 ///
 /// # Errors
 ///
@@ -58,7 +63,8 @@ const TENANT_TYPE_RESOLUTION_UNAVAILABLE: &str =
 ///   transport failure.
 pub(crate) async fn resolve_active_tenant(
     tenant_repo: &dyn TenantRepo,
-    types_registry: &dyn TypesRegistryClient,
+    types_registry: &dyn TypesRegistryApi,
+    ctx: &SecurityContext,
     scope: &AccessScope,
     tenant_id: Uuid,
 ) -> Result<TenantContext, DomainError> {
@@ -80,13 +86,14 @@ pub(crate) async fn resolve_active_tenant(
         });
     }
 
-    // `get_type_schema_by_uuid` returns the typed `GtsTypeId` directly
-    // so no string round-trip is needed.
+    // `resolve_type_id` returns the typed `GtsTypeId` directly so no
+    // string round-trip is needed; an unknown type is as fatal as a
+    // failed read.
     let tenant_type = match types_registry
-        .get_type_schema_by_uuid(tenant.tenant_type_uuid)
+        .resolve_type_id(ctx, tenant.tenant_type_uuid)
         .await
     {
-        Ok(schema) => schema.type_id,
+        Ok(type_id) => type_id,
         Err(err) => {
             tracing::warn!(
                 target: "am.tenant.resolve",

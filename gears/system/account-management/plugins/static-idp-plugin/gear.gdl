@@ -9,8 +9,11 @@ gdl_version = "1.0"
 # stacks. The point is declared by `implements`; vendor and priority are read from
 # source.
 
+# `init` requires a host-linked, database-backed types-registry (system gear, initialized
+# first). No `deps` or `consumes`; missing registry fails boot. Remote support: T41/T42.
+
 gear(
-    deps = ["types-registry"],
+    deps = [],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/account-management/plugins/static-idp-plugin"),
     maturity = "preview",
     name = "Static IdP Plugin",

@@ -1,51 +1,20 @@
-//! Lazy `IdpPluginClient` wrapper that defers vendor-based plugin
-//! selection to first call.
+//! Lazy vendor/priority selection of an [`IdpPluginClient`].
 //!
-//! AM's `Gear::init` runs during toolkit's *config* phase. At that
-//! point the types-registry catalogue is still in its private
-//! staging buffer — `list_instances` returns 0 for runtime-registered
-//! plugin instances even when the plugin's `register()` succeeded
-//! earlier in the same init pass. The catalogue only commits to
-//! *ready* mode after every gear's `init()` resolves (see
-//! `types-registry/src/gear.rs::post_init::switch_to_ready`),
-//! which is strictly after AM's init returns.
+//! Concrete `IdP` plugins may initialize after AM, so eager selection would race
+//! their publication. [`LazyIdpProvider`] forwards calls to the first successful
+//! selection cached by [`toolkit::plugins::GtsPluginSelector`]; failures are
+//! not cached. List every catalogue page and keep only instances with a scoped
+//! client in this process, excluding advertisements retained from earlier boots.
 //!
-//! To respect the established
-//! `cpt-cf-account-management-fr-idp-vendor-selection` contract
-//! (vendor + priority via the shared `choose_plugin_instance` flow)
-//! AM holds a [`LazyIdpProvider`] instead of an `Arc<dyn
-//! IdpPluginClient>` resolved eagerly at init. The wrapper implements
-//! [`IdpPluginClient`] itself and forwards each call to the
-//! catalogue-resolved underlying plugin (resolved + cached on the
-//! first call that needs it). This mirrors
-//! `authn-resolver/src/domain/service.rs`'s `GtsPluginSelector`
-//! pattern.
+//! With `cfg.idp.required = true`, selection failures map to the operation's
+//! unavailable variant (`IdpProvisionFailure::CleanFailure`,
+//! `IdpDeprovisionFailure::Retryable`, `IdpUserOperationFailure::Unavailable`),
+//! preserving saga compensation and 503 responses. With `required = false`,
+//! delegate to [`NoopIdpProvider`], which returns `UnsupportedOperation`.
 //!
-//! Semantics:
-//!
-//! * Resolution is performed at most once on the happy path
-//!   ([`toolkit::plugins::GtsPluginSelector`] caches the resolved
-//!   `gts_id`).
-//! * Resolution failure is **not** cached — a subsequent call after
-//!   the catalogue settles still succeeds.
-//! * When the plugin cannot be resolved at all and
-//!   `cfg.idp.required = true`, the wrapper surfaces the
-//!   category-appropriate "unavailable" variant per `IdP`-side trait
-//!   (`IdpProvisionFailure::CleanFailure`, `IdpDeprovisionFailure::
-//!   Retryable`, `IdpUserOperationFailure::Unavailable`) so the saga
-//!   compensates and the wire surface stays `503` /
-//!   `service_unavailable` — distinct from the permanent
-//!   `UnsupportedOperation` shape that the `required = false`
-//!   fallback produces.
-//! * When `required = false`, every method delegates to
-//!   [`NoopIdpProvider`] — preserving the pre-existing dev / test
-//!   "boot without `IdP`" behaviour.
-//!
-//! Plugins MUST register via
-//! `ClientHub::register_scoped::<dyn IdpPluginClient>(ClientScope::
-//! gts_id(&instance_id))` keyed on the same `instance_id` they
-//! publish to types-registry — that's the scope key
-//! [`LazyIdpProvider::resolve`] uses for the `try_get_scoped` lookup.
+//! Plugins must use `ClientHub::register_scoped::<dyn IdpPluginClient>` with
+//! `ClientScope::gts_id(&instance_id)` matching their published instance
+//! (`cpt-cf-account-management-fr-idp-vendor-selection`).
 
 use std::sync::Arc;
 
@@ -63,17 +32,19 @@ use account_management_sdk::{
 use async_trait::async_trait;
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
-use toolkit::plugins::{GtsPluginSelector, choose_plugin_instance};
+use toolkit::plugins::{GtsPluginSelector, choose_registered_plugin_instance};
 use toolkit_odata::Page;
-use toolkit_security::SecurityContext;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use toolkit_security::{PlatformSecurityContext, SecurityContext};
+use types_registry_sdk::{
+    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+};
 
 use crate::infra::idp::NoopIdpProvider;
 
 /// Lazy `IdP` plugin resolver — see gear docs for the contract.
 pub struct LazyIdpProvider {
     hub: Arc<ClientHub>,
-    registry: Arc<dyn TypesRegistryClient>,
+    registry: Arc<dyn PlatformTypesRegistryApi>,
     vendor: String,
     /// Mirrors `AccountManagementConfig::idp.required`. Determines
     /// the failure category emitted when the catalogue + scoped
@@ -101,7 +72,7 @@ impl LazyIdpProvider {
     #[must_use]
     pub fn new(
         hub: Arc<ClientHub>,
-        registry: Arc<dyn TypesRegistryClient>,
+        registry: Arc<dyn PlatformTypesRegistryApi>,
         vendor: String,
         required: bool,
     ) -> Self {
@@ -127,22 +98,29 @@ impl LazyIdpProvider {
     /// `cfg.idp.required`.
     async fn resolve(&self) -> Option<Arc<dyn IdpPluginClient>> {
         // `get_or_init` caches only successful `Ok` returns — a
-        // pre-ready catalogue snapshot that yields no candidates
-        // surfaces as `Err` and the next call retries from scratch.
+        // listing with no running candidate surfaces as `Err` and the
+        // next call retries from scratch.
         let gts_id: Arc<str> = self
             .selector
             .get_or_init(|| async {
                 let plugin_type_id = IdpPluginSpecV1::gts_type_id();
+                let query =
+                    ListEntitiesRequest::matching(GtsIdPattern::try_new(plugin_type_id.as_ref())?);
+                // List every page or fail. Selection is process-wide and cached, so use the
+                // platform API (P33), independent of whichever caller triggers it first.
                 let instances = self
                     .registry
-                    .list_instances(InstanceQuery::new().with_pattern(format!("{plugin_type_id}*")))
+                    .list_instances(&PlatformSecurityContext::outbound_marker(), query)
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("types-registry list_instances<IdpPluginSpecV1>: {e}")
                     })?;
-                choose_plugin_instance::<IdpPluginSpecV1>(
+                choose_registered_plugin_instance::<IdpPluginSpecV1, dyn IdpPluginClient>(
+                    &self.hub,
                     &self.vendor,
-                    instances.iter().map(|e| (e.id.as_ref(), &e.object)),
+                    instances
+                        .iter()
+                        .map(|instance| (instance.id.as_ref(), instance.content.as_ref())),
                 )
                 .map_err(|e| anyhow::anyhow!("choose_plugin_instance<IdpPluginSpecV1>: {e}"))
             })
