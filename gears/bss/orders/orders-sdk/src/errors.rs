@@ -148,10 +148,11 @@ pub struct RefusalDiagnostics {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Vec<BlockedOverlap>>,
     /// Every composite-gate refusal of a submit or amendment (the gate's catalog, axis, contract,
-    /// overlap, date and pin reasons): the complete authorized gate report, whose primary
-    /// blocking result is this refusal itself (DESIGN L5093, D-229). Absent from an Orders that
-    /// predates D-229 and from every non-gate refusal. Boxed so the report does not grow every
-    /// [`OrdersError`] (clippy `result_large_err`).
+    /// overlap, date and pin reasons) and the step-17.5 `order-in-flight-for-key` claim refusal:
+    /// the complete authorized gate report, whose primary blocking result is this refusal itself
+    /// (DESIGN L5093, D-229 as amended by D-236 item 4). Absent from an Orders that predates
+    /// D-229 (or, for `order-in-flight-for-key`, D-236 item 4) and from every non-gate refusal.
+    /// Boxed so the report does not grow every [`OrdersError`] (clippy `result_large_err`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assessment: Option<Box<GateReport>>,
 }

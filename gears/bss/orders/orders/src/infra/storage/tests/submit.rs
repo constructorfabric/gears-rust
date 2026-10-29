@@ -1703,7 +1703,7 @@ async fn a_single_oversized_pin_refuses_purchase_capacity_exceeded() {
 
 /// D-179/D-188 step 17: a second order of the same payer, resource and overlap key submitted
 /// while the first holds its claim is refused `order-in-flight-for-key`, naming the visible
-/// holder; no version is appended for it.
+/// holder and carrying the rebuilt gate report (D-236 item 4); no version is appended for it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_concurrent_claim_refuses_order_in_flight_for_key_with_no_version() {
@@ -1724,12 +1724,35 @@ async fn a_concurrent_claim_refuses_order_in_flight_for_key_with_no_version() {
         refused.response.body()["context"]["data"]["blocked"][0]["conflicting_order_id"],
         json!(s(holder.order.order_id))
     );
-    // D-229 item 2: the step-17 conflict is not the composite gate's refusal: no report member.
+    // D-229 as amended by D-236 item 4: the step-17 refusal carries the rebuilt predicate-9
+    // report in the Problem body, the same value the snapshot keeps.
+    let report = &refused.response.body()["context"]["data"]["assessment"];
+    assert!(report.is_object(), "{refused:?}");
+    assert_eq!(Some(report), refused.response.assessment.as_ref());
     assert!(
-        refused.response.body()["context"]["data"]
-            .get("assessment")
-            .is_none()
+        report["failures"]
+            .as_array()
+            .expect("failures")
+            .iter()
+            .any(|f| f["reason"] == "order-in-flight-for-key"),
+        "{report}"
     );
+    match crate::api::local_client::sdk_result::<Value>(refused.clone()) {
+        Err(OrdersError::Settled {
+            reason,
+            diagnostics,
+        }) => {
+            assert_eq!(reason, Reason::OrderInFlightForKey);
+            assert!(diagnostics.assessment.is_some(), "{diagnostics:?}");
+        }
+        other => panic!("not the settled collision refusal: {other:?}"),
+    }
+    // The same key replays the identical snapshot, body report included.
+    let replay = submit(&f, &buyer(), &contender, "m26-claim-2")
+        .await
+        .unwrap();
+    assert!(replay.replayed, "{replay:?}");
+    assert_eq!(replay.response, refused.response);
     let order = contender.order.order_id;
     assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
     assert_eq!(attempt_status(&f, order).await, json!("refused"));
