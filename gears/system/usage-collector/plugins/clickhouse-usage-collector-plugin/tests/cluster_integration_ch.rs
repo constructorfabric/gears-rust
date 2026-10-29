@@ -37,11 +37,11 @@ use uuid::Uuid;
 use toolkit_odata::{ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use usage_collector_sdk::{AggregationOp, AggregationSpec, UsageCollectorPluginError};
 
-use clickhouse_usage_collector_plugin::config::{ClickHouseClusterConfig, ClickHousePluginConfig};
+use clickhouse_usage_collector_plugin::config::ClickHousePluginConfig;
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
 use clickhouse_usage_collector_plugin::infra::storage::migrator::{
-    MIGRATIONS_TRACKER, MigrationOptions, render_ddl, run_migrations,
+    MIGRATIONS_TRACKER, MigrationOptions, migration_client, render_ddl, run_migrations,
 };
 use clickhouse_usage_collector_plugin::infra::storage::pool::{
     build_client, validate_cluster_schema,
@@ -239,21 +239,23 @@ fn config(c: &Cluster, extra: &str) -> ClickHousePluginConfig {
     cfg
 }
 
-/// Run the migrations `Gear::init` runs for `cfg`.
+/// Run the migrations `Gear::init` runs for `cfg`: on a cluster, through the
+/// migration client and under the migration budget.
 async fn migrate(
     client: &clickhouse::Client,
     cfg: &ClickHousePluginConfig,
 ) -> anyhow::Result<Vec<&'static str>> {
-    let cluster = cfg.cluster.as_ref();
     let opts = MigrationOptions {
         retention_period_secs: cfg.retention_period_secs,
-        statement_timeout_secs: cluster.map(|c| c.migration_statement_timeout_secs),
     };
-    let deadline = cluster.map_or(
-        common::TEST_REQUEST_TIMEOUT,
-        ClickHouseClusterConfig::migration_deadline,
-    );
-    run_migrations(client, &Topology::from_config(cfg), opts, deadline).await
+    let topology = Topology::from_config(cfg);
+    match cfg.cluster.as_ref() {
+        Some(cluster) => {
+            let client = migration_client(client, cluster.migration_statement_timeout_secs);
+            run_migrations(&client, &topology, opts, cluster.migration_deadline()).await
+        }
+        None => run_migrations(client, &topology, opts, common::TEST_REQUEST_TIMEOUT).await,
+    }
 }
 
 /// The plugin's own client for `cfg`, as `Gear::init` builds it.
