@@ -1069,13 +1069,29 @@ async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
     let tenant = tenant_on(&stand).await;
     let scope = AccessScope::for_tenant(tenant);
     let ctx = conformance::ctx(tenant, &scope, None);
+    let mut ontology = conformance::ontology_batch();
+    ontology.push(conformance::other_thing_type());
     stand
         .store
-        .register_types(&ctx, conformance::ontology_batch())
+        .register_types(&ctx, ontology)
         .await
         .expect("ontology registers");
-    let nodes = (0..400)
-        .map(|i| conformance::node(&format!("n{i}"), "n"))
+    // The listed type is a fifth of the tenant and interleaved with another
+    // in key order (`n1` < `n1-x0` < ... < `n10`), which is what a listing
+    // of one type among several looks like. With one type alone, walking
+    // the tenant's key index and filtering on the type *is* the type's key
+    // order, the two plans cost the same, and which one the planner picks
+    // turned on how the rows happened to be laid out on disk -- ingest
+    // writing in key order was enough to flip it.
+    let nodes: Vec<_> = (0..400)
+        .flat_map(|i| {
+            std::iter::once(conformance::node(&format!("n{i}"), "n")).chain((0..4).map(move |j| {
+                graph_storage_sdk::models::NodeSpec {
+                    type_id: conformance::OTHER_THING.to_owned(),
+                    ..conformance::node(&format!("n{i}-x{j}"), "other")
+                }
+            }))
+        })
         .collect();
     let edges = (0..400)
         .map(|i| conformance::edge(&format!("n{i}"), &format!("n{}", (i * 7 + 1) % 400)))
@@ -2256,6 +2272,20 @@ async fn a_hop_reports_and_filters_discriminators() {
     conformance::a_hop_reports_and_filters_discriminators(
         stand.store.as_ref(),
         &stand.engine,
+        tenant,
+    )
+    .await;
+}
+
+/// Real row locks, so the runtime needs threads for the writers to overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_batches_all_land() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    conformance::overlapping_batches_all_land(
+        std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
         tenant,
     )
     .await;

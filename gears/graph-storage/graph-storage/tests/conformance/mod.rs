@@ -5444,7 +5444,7 @@ pub async fn an_edge_type_evolves_over_its_own_rows(store: &dyn GraphStoreV1, te
 pub const OTHER_THING: &str =
     "gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~acme.gs._.other_thing.v1~";
 
-fn other_thing_type() -> TypeRegistration {
+pub fn other_thing_type() -> TypeRegistration {
     TypeRegistration {
         type_id: OTHER_THING.to_owned(),
         schema: serde_json::json!({
@@ -5498,6 +5498,10 @@ pub async fn a_same_key_ingest_may_not_change_the_type(store: &dyn GraphStoreV1,
 /// `options.report_per_item` answers with one outcome per item of the batch,
 /// in batch order — the convergence-observability lever DESIGN § 3.3 names,
 /// and off by default so a producer that only wants the counts pays nothing.
+///
+/// Batch order, not write order: a store may write in key order (the
+/// built-in one does, so overlapping batches cannot deadlock), and the
+/// batches below are deliberately not in key order.
 pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, tenant: Uuid) {
     use graph_storage_sdk::models::ItemOutcome as O;
 
@@ -5525,9 +5529,9 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
     // the batch, so it shows in the counts and not in the list.
     let mut told = batch(
         vec![
+            node("pi-c", "c"),
             node("pi-a", "a"),
             node("pi-b", "b, renamed"),
-            node("pi-c", "c"),
         ],
         vec![edge("pi-a", "pi-b"), edge("pi-b", "pi-d")],
     );
@@ -5537,7 +5541,7 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
         .expect("reported batch commits");
     assert_eq!(
         first.per_item_nodes.as_deref(),
-        Some(&[O::Unchanged, O::Updated, O::Inserted][..])
+        Some(&[O::Inserted, O::Unchanged, O::Updated][..])
     );
     assert_eq!(
         first.per_item_edges.as_deref(),
@@ -5565,6 +5569,41 @@ pub async fn per_item_outcomes_follow_the_batch_order(store: &dyn GraphStoreV1, 
     assert_eq!(
         again.per_item_edges.as_deref(),
         Some(&[O::Unchanged, O::Unchanged][..])
+    );
+
+    // Edges stored under a derived key, so their key order is unrelated to
+    // the request's: existing and new ones alternate, and a list replayed in
+    // any other order than the request's breaks the alternation.
+    let ring = |n: usize| -> Vec<EdgeSpec> {
+        (0..n)
+            .map(|i| edge(&format!("pi-r{i}"), &format!("pi-r{}", (i + 1) % n)))
+            .collect()
+    };
+    ingest_batch(store, &ctx, batch(Vec::new(), ring(6)))
+        .await
+        .expect("the existing edges commit");
+    let mut mixed = batch(Vec::new(), Vec::new());
+    for (old, new) in ring(6).into_iter().zip(
+        ring(7)
+            .into_iter()
+            .skip(6)
+            .chain((0..5).map(|i| edge(&format!("pi-r{i}"), &format!("pi-r{}", i + 2)))),
+    ) {
+        mixed.edges.push(old);
+        mixed.edges.push(new);
+    }
+    mixed.options.report_per_item = true;
+    let interleaved = ingest_batch(store, &ctx, mixed)
+        .await
+        .expect("the interleaved batch commits");
+    assert_eq!(
+        interleaved.per_item_edges.as_deref(),
+        Some(
+            &(0..6)
+                .flat_map(|_| [O::Unchanged, O::Inserted])
+                .collect::<Vec<_>>()[..]
+        ),
+        "the edge outcomes are in the order the batch listed them"
     );
 
     // Materialization is the fourth node outcome, and it is per item too.
@@ -7378,4 +7417,92 @@ pub async fn a_read_returns_the_version_a_write_compares_against(
         .await
         .expect("the edge reads");
     assert_eq!(edge.envelope.version, None, "an edge carries no version");
+}
+
+/// Batches that overlap on keys, written at once, all land (gears-rust
+/// #5042).
+///
+/// Studio's ordinary shape: two syncs of one repository, a sync and a manual
+/// edit, two backend replicas. Each writer upserts its own random subset of
+/// one shared key pool, in its own order, with edges between the keys it
+/// names -- some of them to keys no batch has written yet, which become
+/// phantoms. Row locks taken in request order made two such batches lock the
+/// same rows in opposite orders, and the server broke the cycle by killing
+/// one: most of these batches came back `SERIALIZATION`. A store whose writes
+/// lock rows in one canonical order has no cycle to break, so every batch
+/// commits and the only waiting is behind a lock, never a retry.
+pub async fn overlapping_batches_all_land(store: std::sync::Arc<dyn GraphStoreV1>, tenant: Uuid) {
+    const KEYS: usize = 40;
+    const WRITERS: usize = 6;
+    const ROUNDS: usize = 4;
+    const PER_BATCH: usize = 16;
+
+    let scope = AccessScope::for_tenant(tenant);
+    let reader = ctx(tenant, &scope, None);
+    store
+        .register_types(&reader, ontology_batch())
+        .await
+        .expect("the ontology registers");
+
+    // A deterministic shuffle per writer and round: a fixed seed is a
+    // reproducible failure, and a different order per writer is the point.
+    let pick = |writer: usize, round: usize| -> Vec<usize> {
+        let mut keys: Vec<usize> = (0..KEYS).collect();
+        let mut state = (writer * 7_919 + round * 104_729 + 1) as u64;
+        for i in (1..keys.len()).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let j = usize::try_from(state >> 33).expect("fits") % (i + 1);
+            keys.swap(i, j);
+        }
+        keys.truncate(PER_BATCH);
+        keys
+    };
+
+    for round in 0..ROUNDS {
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        // Collected on purpose: every writer must be spawned before any is
+        // awaited, or the first waits at the gate for writers never started.
+        #[expect(
+            clippy::needless_collect,
+            reason = "spawning lazily would deadlock the barrier"
+        )]
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|writer| {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                let keys = pick(writer, round);
+                tokio::spawn(async move {
+                    let scope = AccessScope::for_tenant(tenant);
+                    let ctx = ctx(tenant, &scope, None);
+                    let name = |k: usize| format!("pool-{k}");
+                    let nodes = keys
+                        .iter()
+                        .map(|&k| node(&name(k), &format!("w{writer} r{round}")))
+                        .collect();
+                    // A chain in the writer's own order, plus one edge to a
+                    // key outside the pool, which is a phantom until a node
+                    // of that key is written -- by nobody, here.
+                    let mut edges: Vec<EdgeSpec> = keys
+                        .windows(2)
+                        .map(|pair| edge(&name(pair[0]), &name(pair[1])))
+                        .collect();
+                    edges.push(edge(&name(keys[0]), &format!("far-{}", keys[1] % 8)));
+                    gate.wait().await;
+                    ingest_batch(store.as_ref(), &ctx, batch(nodes, edges)).await
+                })
+            })
+            .collect();
+        for (writer, task) in writers.into_iter().enumerate() {
+            task.await
+                .expect("the writer task does not panic")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "round {round}, writer {writer}: overlapping batches must not abort \
+                         each other: {error}"
+                    )
+                });
+        }
+    }
 }

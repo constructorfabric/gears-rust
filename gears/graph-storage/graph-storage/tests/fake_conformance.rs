@@ -703,3 +703,13 @@ async fn a_hop_reports_and_filters_discriminators() {
     conformance::a_hop_reports_and_filters_discriminators(store.as_ref(), &engine, Uuid::now_v7())
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn overlapping_batches_all_land() {
+    conformance::overlapping_batches_all_land(
+        std::sync::Arc::new(store())
+            as std::sync::Arc<dyn graph_storage_sdk::plugin_api::GraphStoreV1>,
+        Uuid::now_v7(),
+    )
+    .await;
+}
