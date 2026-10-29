@@ -14,10 +14,11 @@
 //! and slice input resolution outside any transaction → one READ COMMITTED transaction:
 //! aggregate lock and authorization-fact recheck → authoritative registry gate (aggregate before
 //! registry) → state/version/draft-revision precedence → guards in registration order →
-//! stored-target check → step-17 claims → version append → child documents → aggregate write →
-//! sealed audit → the row's one event → settlement → commit. Business refusals commit as
-//! settled outcomes; every other failure aborts everything. A lost commit acknowledgement is
-//! reported as unknown, never as a rollback.
+//! stored-target check → step-17 claims → version append → child documents → gate diagnostics
+//! → aggregate write → sealed audit → the row's one event → settlement → commit. Business
+//! refusals commit as settled outcomes, a composite-gate or overlap refusal writing its gate
+//! diagnostics before refusal settlement (M2-2); every other failure aborts everything. A lost
+//! commit acknowledgement is reported as unknown, never as a rollback.
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,7 +72,9 @@ use crate::infra::storage::scoped::{self, AuthorizedLock, AuthorizedRead, Privat
 pub mod documents;
 pub mod errors;
 
-pub use documents::{ChildDocuments, DocumentWriter, EventSpec};
+pub use documents::{
+    ChildDocuments, DiagnosticsContribution, DiagnosticsSettled, DocumentWriter, EventSpec,
+};
 pub use errors::{Abort, EngineError, FaultPoint};
 
 /// Transaction attempts for transient contention (deadlock/serialization) before giving up.
@@ -101,9 +104,14 @@ pub struct Prepared {
     pub admin_changes: Vec<AdminChange>,
     /// The reached gate assessment snapshot stored with the response (S3 owns its contents).
     pub assessment: Option<Value>,
+    /// The gate's diagnostic run, written by the engine on a composite-gate refusal, an
+    /// overlap conflict and an admission, inside the transaction before settlement (M2-2).
+    pub diagnostics: Option<Arc<dyn DiagnosticsContribution>>,
     /// The server-reserved line identity a line insertion returns (02 *Author Line* step 6); it
     /// is part of the settled response, so a same-key replay returns the same identity.
     pub line_id: Option<Uuid>,
+    /// Frozen commercial assessment identity returned on successful submit.
+    pub assessment_id: Option<Uuid>,
 }
 impl Prepared {
     /// A contribution with no inputs, guards, documents or event.
@@ -118,7 +126,9 @@ impl Prepared {
             event: None,
             admin_changes: Vec::new(),
             assessment: None,
+            diagnostics: None,
             line_id: None,
+            assessment_id: None,
         }
     }
 }
@@ -180,6 +190,16 @@ pub struct TransitionRequest {
     pub correlation_id: Option<Uuid>,
     /// The presented D-188/D-198 owner on a durable continuation.
     pub execution: Option<ExecutionOwner>,
+}
+
+impl TransitionRequest {
+    /// The same request presenting `owner`, the D-188/D-198 execution it continues (the final
+    /// commit of a reserved commercial attempt). Every fingerprint input is unchanged.
+    #[must_use]
+    pub fn with_execution(mut self, owner: ExecutionOwner) -> Self {
+        self.execution = Some(owner);
+        self
+    }
 }
 
 /// A create request (D-105): no target and no expected version.
@@ -611,7 +631,8 @@ impl Engine {
                     .await;
             }
             Probe::Existing(frozen) => Some(frozen),
-            Probe::Miss => None,
+            // The authoritative gate refuses the mismatch with its evidence.
+            Probe::Mismatch | Probe::Miss => None,
         };
         let disclosure = self.disclosure(caller, request.trigger).await?;
         let view = match self
@@ -774,21 +795,137 @@ impl Engine {
     // -----------------------------------------------------------------------------------------
     // D-188 / D-198 specialized preparation subflows
 
+    /// D-188 "frozen inputs are loaded before any fresh assessment" (E2): what the head of
+    /// [`Self::transition`] does for a submit or amendment key (authorization with denial
+    /// evidence, the fingerprint over the authorized facts, the read-only registry probe), so a
+    /// same-key retry finds its settled outcome or its reserved attempt before the slice assesses
+    /// anything.
+    ///
+    /// - a matching settled record is disclosed after the current-authority recheck and returned
+    ///   as [`Recovery::Replay`]; nothing is resolved or written;
+    /// - a matching unresolved commercial attempt is resumed through the authoritative gate
+    ///   under the aggregate lock ([`Self::prepare_durable`] with a recovery start): a lapsed
+    ///   lease is reclaimed with a rotated owner and fence (the only write besides evidence), a
+    ///   live one answers the unsettled `still-processing`, and the attempt's frozen inputs are
+    ///   returned unchanged as [`Recovery::Existing`]. No candidate is allocated and no attempt
+    ///   is created: a key the gate finds without a linked execution rolls back and is
+    ///   [`Recovery::Miss`];
+    /// - a live record of the key under another fingerprint goes to the same authoritative
+    ///   gate, which answers the unsettled `idempotency-mismatch` with its resolved evidence:
+    ///   the caller never assesses a request its key already refuses;
+    /// - anything else (no record, an expired record) is [`Recovery::Miss`]: the caller assesses
+    ///   and reserves, and [`Self::prepare_durable`]'s own recovery stays the race backstop.
+    ///
+    /// # Errors
+    /// As [`Self::prepare_commercial_attempt`]; a trigger other than submit or amendment is an
+    /// integration failure.
+    pub async fn recover_commercial_attempt(
+        &self,
+        caller: &Caller,
+        request: &TransitionRequest,
+    ) -> Result<Recovery, EngineError> {
+        if !matches!(request.trigger, Trigger::Submit | Trigger::Amendment) {
+            return Err(EngineError::Integration);
+        }
+        let inner = &self.inner;
+        let action = action_for(request.trigger).ok_or(EngineError::Integration)?;
+        check_axis_change(request)?;
+        let actor = classify(&inner.identities, caller.ctx())?;
+        let key = registry_key(caller, request.trigger, &request.idempotency_key)?;
+        let prefetch = scoped::prefetch(&inner.db, request.order_id)
+            .await
+            .map_err(|e| errors::prefetch_failure(request.trigger.token(), &e))?;
+        let target = match inner.pep.authorize_target(caller, action, &prefetch).await {
+            Ok(target) => target,
+            Err(failure) => {
+                return Err(self
+                    .record_denial(
+                        caller,
+                        &actor,
+                        request.trigger,
+                        Some(request.order_id),
+                        &key,
+                        request,
+                        failure,
+                    )
+                    .await);
+            }
+        };
+        check_actor_rule(
+            &inner.registries.table,
+            request.trigger,
+            decision_class(&inner.identities, caller.ctx()),
+        )?;
+        let fingerprint = fingerprint(request, target.facts().arrangement())?;
+        match self
+            .probe(
+                &key,
+                &fingerprint,
+                Some((request.order_id, &target)),
+                AbortContext::of(request),
+            )
+            .await?
+        {
+            Probe::Replay(replay) => Ok(Recovery::Replay(Box::new(
+                self.disclose(
+                    caller,
+                    ReplayTarget::Order {
+                        action,
+                        prefetch: &prefetch,
+                    },
+                    replay,
+                )
+                .await?,
+            ))),
+            // A mismatch is answered by the authoritative gate under the lock, with its
+            // resolved evidence (`idempotency-mismatch`), before the slice assesses anything.
+            Probe::Existing(Frozen::Commercial(_)) | Probe::Mismatch => {
+                match self
+                    .prepare_durable(caller, request, DurableStart::Recover)
+                    .await?
+                {
+                    Durable::Prepared(PreparedExecution::Execution(execution)) => {
+                        Ok(Recovery::Existing(execution))
+                    }
+                    Durable::Prepared(PreparedExecution::Settled(outcome)) => {
+                        Ok(Recovery::Replay(outcome))
+                    }
+                    Durable::Nothing => Ok(Recovery::Miss),
+                }
+            }
+            // A receiver control under a commercial key is a contract defect.
+            Probe::Existing(Frozen::Control(_)) => Err(EngineError::Integration),
+            Probe::Miss => Ok(Recovery::Miss),
+        }
+    }
+
     /// D-188 step 2: authorize, then durably claim/fence ownership and reserve the candidate in
     /// a short committed transaction before the first Pricing command. Only submit and
     /// amendment use it. A recovered execution is returned with its frozen inputs unchanged.
     ///
+    /// `line_requests` builds the canonical per-line Pricing requests from the candidate the
+    /// transaction allocates (each request carries it as its order version); it runs once, inside
+    /// that transaction, and only for a new execution. Its failure aborts the transaction, so no
+    /// candidate, attempt or marker link survives it.
+    ///
+    /// A new submit execution first rechecks, under the same aggregate lock, that the submit is
+    /// admissible from the locked state and that the locked draft revision is both the caller's
+    /// `expected_draft_revision` and the attempt's `prepared_draft_revision` (E1): a draft edit
+    /// that landed after the slice's read answers the same unsettled refusal the ordinary path
+    /// decides (`version-conflict`, `precondition-failed` or `not-admissible`) and the whole
+    /// transaction rolls back, so no candidate is allocated and no attempt or claim survives.
+    ///
     /// # Errors
     /// Unsettled refusals (authorization, mismatch, still-processing, changed facts, and lost
     /// access as the non-disclosing `order-not-found`, exactly as the ordinary paths; D-114,
-    /// D-141) and infrastructure outcomes. A settled replay is returned as
-    /// [`PreparedExecution::Settled`].
+    /// D-141) and infrastructure outcomes; a failed `line_requests` is an integration failure. A
+    /// settled replay is returned as [`PreparedExecution::Settled`].
     pub async fn prepare_commercial_attempt(
         &self,
         caller: &Caller,
         request: &TransitionRequest,
         inputs: AttemptInputs,
-        line_requests: Value,
+        line_requests: impl FnOnce(i32) -> Result<Value, PrepareError> + Send + 'static,
     ) -> Result<PreparedExecution, EngineError> {
         if !matches!(request.trigger, Trigger::Submit | Trigger::Amendment) {
             return Err(EngineError::Integration);
@@ -796,9 +933,59 @@ impl Engine {
         self.prepare_durable(
             caller,
             request,
-            DurableStart::Commercial(inputs, line_requests),
+            DurableStart::Commercial(inputs, Box::new(line_requests)),
         )
-        .await
+        .await?
+        .prepared()
+    }
+
+    /// D-188 step 3's recorder (submit/amendment phase B): authorizes `request`'s target once,
+    /// with denial evidence, and returns the handle that records each returned per-line Pricing
+    /// result in its own short transaction under the aggregate lock and the attempt's fence
+    /// ([`ReceiptRecorder::record`]). Nothing is written here.
+    ///
+    /// # Errors
+    /// Unsettled authorization refusals and outages, as [`Self::transition`]; a trigger other
+    /// than submit or amendment is an integration failure.
+    pub async fn receipt_recorder(
+        &self,
+        caller: &Caller,
+        request: &TransitionRequest,
+    ) -> Result<ReceiptRecorder, EngineError> {
+        if !matches!(request.trigger, Trigger::Submit | Trigger::Amendment) {
+            return Err(EngineError::Integration);
+        }
+        let inner = &self.inner;
+        let action = action_for(request.trigger).ok_or(EngineError::Integration)?;
+        let actor = classify(&inner.identities, caller.ctx())?;
+        let key = registry_key(caller, request.trigger, &request.idempotency_key)?;
+        let prefetch = scoped::prefetch(&inner.db, request.order_id)
+            .await
+            .map_err(|e| errors::prefetch_failure(request.trigger.token(), &e))?;
+        let target = match inner.pep.authorize_target(caller, action, &prefetch).await {
+            Ok(target) => target,
+            Err(failure) => {
+                return Err(self
+                    .record_denial(
+                        caller,
+                        &actor,
+                        request.trigger,
+                        Some(request.order_id),
+                        &key,
+                        request,
+                        failure,
+                    )
+                    .await);
+            }
+        };
+        Ok(ReceiptRecorder {
+            engine: self.clone(),
+            caller: caller.clone(),
+            actor,
+            key,
+            request: request.clone(),
+            target,
+        })
     }
 
     /// D-198 step 1: persist owned receiver-control intent (pending pointer blocks new grants)
@@ -823,7 +1010,8 @@ impl Engine {
             return Err(EngineError::Integration);
         }
         self.prepare_durable(caller, request, DurableStart::Control(inputs))
-            .await
+            .await?
+            .prepared()
     }
 
     async fn prepare_durable(
@@ -831,7 +1019,7 @@ impl Engine {
         caller: &Caller,
         request: &TransitionRequest,
         start: DurableStart,
-    ) -> Result<PreparedExecution, EngineError> {
+    ) -> Result<Durable, EngineError> {
         let inner = &self.inner;
         let action = action_for(request.trigger).ok_or(EngineError::Integration)?;
         check_axis_change(request)?;
@@ -887,6 +1075,9 @@ impl Engine {
         let expected_version = i32::from(request.expected_version);
         let (tgt, k, f, p) = (target.clone(), key.clone(), fingerprint.clone(), principal);
         let (who, trigger, correlation) = (caller.clone(), request.trigger, request.correlation_id);
+        let client_revision = request.expected_draft_revision.map(i64::from);
+        let order_id = request.order_id;
+        let engine = Arc::clone(&self.inner);
         let outcome = inner
             .db
             // The body runs once (`FnOnce`), so the durable start moves in by value.
@@ -946,12 +1137,50 @@ impl Engine {
                         ))));
                     }
                     let (execution, frozen) = match start {
+                        // E2: a recovery never starts an execution; the fresh claim rolls back.
+                        DurableStart::Recover => return Err(Abort::NothingToResume),
                         DurableStart::Commercial(inputs, lines) => {
-                            let (execution, attempt) =
-                                reg::begin_commercial_attempt(owned, &mut locked, inputs, |_| {
-                                    lines
-                                })
-                                .await?;
+                            // E1: the draft revision and admissibility under this lock.
+                            if trigger == Trigger::Submit {
+                                let revisions = DraftRevisions::Draft {
+                                    client: client_revision,
+                                    prepared: inputs.prepared_draft_revision.ok_or(
+                                        Abort::Integration("submit without a draft revision"),
+                                    )?,
+                                };
+                                if let Err(refusal) = transition::admit(
+                                    &engine.registries.table,
+                                    trigger,
+                                    &aggregate_facts(locked.row())?,
+                                    expected_version,
+                                    revisions,
+                                )? {
+                                    return Err(Abort::UnreservedRefusal(refusal.reason()));
+                                }
+                            }
+                            // A failed snapshot aborts before the attempt insert; the
+                            // rollback releases the candidate and the fresh claim.
+                            let (execution, attempt) = reg::begin_commercial_attempt(
+                                owned,
+                                &mut locked,
+                                inputs,
+                                |candidate| {
+                                    lines(candidate).map_err(|error| {
+                                        tracing::error!(
+                                            target: "orders.engine",
+                                            trigger = trigger.token(),
+                                            order_id = %order_id,
+                                            correlation_id =
+                                                correlation.map(tracing::field::display),
+                                            candidate,
+                                            error = ?error,
+                                            "commercial line requests"
+                                        );
+                                        Abort::Integration("commercial line requests")
+                                    })
+                                },
+                            )
+                            .await?;
                             (execution, Frozen::Commercial(attempt))
                         }
                         DurableStart::Control(inputs) => {
@@ -965,7 +1194,9 @@ impl Engine {
             })
             .await;
         match outcome {
-            Ok(DurableOutcome::Execution(execution)) => Ok(PreparedExecution::Execution(execution)),
+            Ok(DurableOutcome::Execution(execution)) => {
+                Ok(Durable::Prepared(PreparedExecution::Execution(execution)))
+            }
             Ok(DurableOutcome::Replay(replay)) => self
                 .disclose(
                     caller,
@@ -976,11 +1207,14 @@ impl Engine {
                     *replay,
                 )
                 .await
-                .map(|outcome| PreparedExecution::Settled(Box::new(outcome))),
+                .map(|outcome| Durable::Prepared(PreparedExecution::Settled(Box::new(outcome)))),
             Ok(DurableOutcome::Refused(reason)) => Err(EngineError::Refused(reason)),
-            Ok(DurableOutcome::Conflict(reason)) => Err(self
-                .record_late_conflict(caller, &actor, request, &key, reason)
-                .await),
+            Ok(DurableOutcome::Conflict(reason)) | Err(Abort::UnreservedRefusal(reason)) => {
+                Err(self
+                    .record_late_conflict(caller, &actor, request, &key, reason)
+                    .await)
+            }
+            Err(Abort::NothingToResume) => Ok(Durable::Nothing),
             Err(abort) => Err(log_abort(&abort, false, AbortContext::of(request))),
         }
     }
@@ -1314,9 +1548,144 @@ pub enum PreparedExecution {
     Settled(Box<EngineOutcome>),
 }
 
+/// The D-188 step-3 receipt recorder of one authorized submit/amendment request
+/// ([`Engine::receipt_recorder`]).
+pub struct ReceiptRecorder {
+    engine: Engine,
+    caller: Caller,
+    actor: AuditActor,
+    key: RegistryKey,
+    request: TransitionRequest,
+    target: TargetAuthorization,
+}
+impl std::fmt::Debug for ReceiptRecorder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiptRecorder")
+            .field("order_id", &self.request.order_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What one receipt record found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReceiptOutcome {
+    /// Recorded, or the identical first result was already recorded (a lost-reply retry).
+    Recorded(reg::Recorded),
+    /// The execution's fence moved (a reclaim by a later retry, or a settled key): this owner
+    /// stops and writes nothing more.
+    StaleOwner,
+}
+
+impl ReceiptRecorder {
+    /// Record `result` as `line_key`'s first result on `execution`'s attempt: one short
+    /// transaction that locks the authorized aggregate, verifies the exact owner and fence,
+    /// appends the result and renews the owner's lease on the marker and the attempt to
+    /// `now + lease` (`reg::record_receipt`). A different first result is never rewritten.
+    ///
+    /// # Errors
+    /// Changed authorization facts and lost access as the unsettled refusals of the ordinary
+    /// paths (with unresolved evidence); a conflicting first result, or a `line_key` that is not
+    /// one of the attempt's frozen lines, is an integration failure; store failures.
+    pub async fn record(
+        &self,
+        execution: &DurableExecution,
+        line_key: &str,
+        result: Value,
+    ) -> Result<ReceiptOutcome, EngineError> {
+        let target = self.target.clone();
+        let execution = execution.clone();
+        let line_key = line_key.to_owned();
+        let (expected_version, trigger) = (
+            i32::from(self.request.expected_version),
+            self.request.trigger,
+        );
+        let lease = self.engine.inner.lease;
+        let outcome = self
+            .engine
+            .inner
+            .db
+            .transaction_ref_mapped_with_config(transition_tx_config(), move |tx| {
+                Box::pin(async move {
+                    let locked = match scoped::lock_authorized(tx, &target).await? {
+                        AuthorizedLock::Locked(locked) => *locked,
+                        AuthorizedLock::Stale { current_version } => {
+                            return Ok(Err(transition::stale_refusal(
+                                Some(expected_version),
+                                current_version,
+                                trigger,
+                            )));
+                        }
+                        AuthorizedLock::AccessLost => return Ok(Err(Reason::OrderNotFound)),
+                    };
+                    Ok::<_, Abort>(Ok(
+                        match reg::record_receipt(&locked, &execution, &line_key, result, lease)
+                            .await
+                        {
+                            Ok(recorded) => ReceiptOutcome::Recorded(recorded),
+                            Err(reg::RegistryError::StaleOwner) => ReceiptOutcome::StaleOwner,
+                            Err(reg::RegistryError::FirstResultConflict) => {
+                                return Err(Abort::Integration(
+                                    "a different first receipt result is already recorded",
+                                ));
+                            }
+                            Err(reg::RegistryError::UnfrozenLine) => {
+                                return Err(Abort::Integration(
+                                    "a receipt for a line the attempt did not freeze",
+                                ));
+                            }
+                            Err(error) => return Err(error.into()),
+                        },
+                    ))
+                })
+            })
+            .await;
+        match outcome {
+            Ok(Ok(outcome)) => Ok(outcome),
+            Ok(Err(reason)) => Err(self
+                .engine
+                .record_late_conflict(&self.caller, &self.actor, &self.request, &self.key, reason)
+                .await),
+            Err(abort) => Err(log_abort(&abort, false, AbortContext::of(&self.request))),
+        }
+    }
+}
+
+/// What [`Engine::recover_commercial_attempt`] found for a submit or amendment key (E2).
+#[derive(Debug)]
+pub enum Recovery {
+    /// The key's settled outcome, disclosed after the current-authority recheck; boxed like
+    /// `Existing`, so the enum stays small.
+    Replay(Box<EngineOutcome>),
+    /// The key's unresolved commercial attempt under a live fence, with its frozen inputs.
+    Existing(Box<(DurableExecution, Frozen)>),
+    /// No settled outcome and no attempt: the slice assesses and reserves.
+    Miss,
+}
+
+/// [`Engine::prepare_durable`]'s answer: the execution or settled replay, or nothing to resume.
+enum Durable {
+    Prepared(PreparedExecution),
+    /// A recovery start found no linked execution (only [`DurableStart::Recover`]).
+    Nothing,
+}
+impl Durable {
+    /// A starting preparation always yields an execution or a replay.
+    fn prepared(self) -> Result<PreparedExecution, EngineError> {
+        match self {
+            Self::Prepared(prepared) => Ok(prepared),
+            Self::Nothing => Err(EngineError::Integration),
+        }
+    }
+}
+
+/// Builds a commercial attempt's canonical line requests from its allocated candidate.
+type LineRequests = Box<dyn FnOnce(i32) -> Result<Value, PrepareError> + Send>;
+
 enum DurableStart {
-    Commercial(AttemptInputs, Value),
+    Commercial(AttemptInputs, LineRequests),
     Control(ControlInputs),
+    /// Resume an existing execution only (E2); a key without one rolls back.
+    Recover,
 }
 enum DurableOutcome {
     Execution(Box<(DurableExecution, Frozen)>),
@@ -1703,6 +2072,7 @@ fn success_response(
     after: &AggregateFacts,
     line_id: Option<Uuid>,
     assessment: Option<Value>,
+    assessment_id: Option<Uuid>,
 ) -> Result<StoredResponse, Abort> {
     let body = TransitionResult {
         order_id: after.order_id,
@@ -1714,6 +2084,7 @@ fn success_response(
             .map_err(|_| Abort::Integration("draft revision"))?,
         request_audit_id: None,
         line_id,
+        assessment_id,
     };
     let headers = BTreeMap::from([("etag".to_owned(), format!("\"{}\"", after.current_version))]);
     Ok(StoredResponse::new(
@@ -1955,6 +2326,7 @@ async fn create_aggregate<'a>(
 fn created_view(row: &order::Model) -> Result<OrderView, Abort> {
     let category = Category::parse(&row.category).ok_or(Abort::Integration("category"))?;
     Ok(OrderView {
+        resolved_totals: None,
         order: OrderHeader {
             order_id: row.order_id,
             order_number: row.order_number.clone(),
@@ -2125,9 +2497,10 @@ async fn existing_body<'a>(
                 transition::EngineRefusal::ResumeTargetMissing => json!({}),
             };
             let refusal = Refusal {
+                overlap_conflict: None,
                 reason: refusal.reason(),
                 data,
-                assessment: false,
+                reach: GateReach::NotReached,
             };
             return Box::pin(refuse_settled(inner, a, &mut locked, settle, t, refusal)).await;
         }
@@ -2137,10 +2510,17 @@ async fn existing_body<'a>(
         | Decision::Unevaluable {
             reason, assessment, ..
         } => {
+            // D-229: a composite-gate refusal (the only guard whose `assessment` is set) carries
+            // the authorized gate report in `context.data`; every other guard carries none.
             let refusal = Refusal {
+                overlap_conflict: None,
                 reason,
                 data: json!({}),
-                assessment,
+                reach: if assessment {
+                    GateReach::Reported
+                } else {
+                    GateReach::NotReached
+                },
             };
             return Box::pin(refuse_settled(inner, a, &mut locked, settle, t, refusal)).await;
         }
@@ -2208,12 +2588,27 @@ async fn refuse_unsettled<'a>(
     Ok(TxOutcome::Unsettled(reason))
 }
 
-/// A business refusal: its registered reason, permitted Problem context and whether the gate
-/// assessment was reached.
+/// How far a refused attempt got through the composite gate (M2-2, D-229).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GateReach {
+    /// An engine-only or non-gate guard refusal: no diagnostics, no report.
+    NotReached,
+    /// The gate assessment was reached but did not refuse (the step-17 overlap conflict): the
+    /// run's diagnostics are written and the snapshot keeps the report, but
+    /// `context.data.assessment` stays absent.
+    Assessed,
+    /// The composite gate itself refused: diagnostics are written and `context.data.assessment`
+    /// carries the authorized gate report (D-229 item 2).
+    Reported,
+}
+
+/// A business refusal: its registered reason, permitted Problem context, and how far it got
+/// through the composite gate (D-229).
 struct Refusal {
+    overlap_conflict: Option<crate::domain::overlap::OverlapConflict>,
     reason: Reason,
     data: Value,
-    assessment: bool,
+    reach: GateReach,
 }
 
 /// An owned business refusal: resolved audit (with the D-201 force-request observation where
@@ -2226,13 +2621,30 @@ async fn refuse_settled<'a>(
     t: OffsetDateTime,
     refusal: Refusal,
 ) -> Result<TxOutcome, Abort> {
+    check_refusal_owner(settle.durable.as_ref(), a)?;
     let Refusal {
         reason,
         mut data,
-        assessment,
+        reach,
+        overlap_conflict,
     } = refusal;
+    let assessed = reach != GateReach::NotReached;
     let tx = locked.transaction();
     let audit_id = Uuid::new_v4();
+    // M2-2: a reached assessment (composite gate, overlap conflict) persists its diagnostic run
+    // before the refusal audit and settlement; engine-only refusals never write one.
+    if assessed {
+        step_diagnostics(
+            a,
+            tx,
+            a.order_id,
+            None,
+            audit_id,
+            t,
+            overlap_conflict.as_ref(),
+        )
+        .await?;
+    }
     let sealed = evidence(&a.caller, a.actor, &a.key, a.correlation_id, t)?.resolved_refusal(
         audit_id,
         AuditTrigger::Public(a.trigger),
@@ -2247,15 +2659,24 @@ async fn refuse_settled<'a>(
     {
         map.insert("request_audit_id".to_owned(), json!(audit_id));
     }
-    let response = refusal_response(
-        reason,
-        data,
-        if assessment {
-            a.prepared.assessment.clone()
-        } else {
-            None
-        },
-    )?;
+    let reached = if let (Some(conflict), Some(diagnostics)) =
+        (overlap_conflict.as_ref(), a.prepared.diagnostics.as_ref())
+    {
+        diagnostics.collision_report(conflict)?
+    } else if assessed {
+        a.prepared.assessment.clone()
+    } else {
+        None
+    };
+    // D-229: the report is part of the stored Problem, so the first answer and every same-key
+    // replay carry it in `context.data.assessment`.
+    if reach == GateReach::Reported
+        && let Some(gate_report) = &reached
+        && let Some(map) = data.as_object_mut()
+    {
+        map.insert("assessment".to_owned(), gate_report.clone());
+    }
+    let response = refusal_response(reason, data, reached)?;
     settle
         .settle(
             locked,
@@ -2297,10 +2718,7 @@ async fn admit<'a>(
     let after = post_facts(a, facts, &effects, t)?;
     let before_audit = locked.audit_facts()?;
     let post = post_model(locked.row(), &after);
-    let write_scope = a.proposed.as_ref().map_or_else(
-        || a.target.access_scope().clone(),
-        |p| p.access_scope().clone(),
-    );
+    let write_scope = write_scope(a);
     // Step 17 (every row): terminal release, untouched, or replacement; before any version or
     // document write, and nothing takes a claim afterwards.
     if let Some(conflict) = step_claims(a, locked, row, &effects, &post, &write_scope).await? {
@@ -2325,6 +2743,12 @@ async fn admit<'a>(
             .await?;
     }
     fault(inner, FaultPoint::Documents, tx).await?;
+    // M2-2: the gate's diagnostic run names the version this transition admits (the appended
+    // candidate, else the locked current version), after the version append its FK needs.
+    let admitted = effects
+        .version
+        .map_or(locked.row().current_version, |step| step.candidate);
+    step_diagnostics(a, tx, facts.order_id, Some(admitted), audit_id, t, None).await?;
     step_aggregate(a, locked, post, &write_scope).await?;
     fault(inner, FaultPoint::Aggregate, tx).await?;
     let audit_id = step_audit(
@@ -2346,6 +2770,7 @@ async fn admit<'a>(
         &after,
         a.prepared.line_id,
         a.prepared.assessment.clone(),
+        a.prepared.assessment_id,
     )?;
     settle
         .settle(
@@ -2367,6 +2792,46 @@ async fn admit<'a>(
     }))
 }
 
+/// The current-order write scope: the authorized proposal's when the arrangement changes, the
+/// target's otherwise.
+fn write_scope(a: &Attempt) -> toolkit_security::AccessScope {
+    a.proposed.as_ref().map_or_else(
+        || a.target.access_scope().clone(),
+        |p| p.access_scope().clone(),
+    )
+}
+
+/// M2-2: the slice's gate diagnostic run, if any, on the transition's transaction. A write
+/// failure aborts the attempt like any other storage failure. The subject identity and the
+/// subject-tenant scope come only from the caller's `SecurityContext` (DESIGN
+/// `#contract-03-3-7`), never from the slice.
+async fn step_diagnostics(
+    a: &Attempt,
+    tx: &DbTx<'_>,
+    order_id: Uuid,
+    version: Option<i32>,
+    audit_id: Uuid,
+    t: OffsetDateTime,
+    overlap_conflict: Option<&crate::domain::overlap::OverlapConflict>,
+) -> Result<(), Abort> {
+    if let Some(diagnostics) = &a.prepared.diagnostics {
+        let ctx = a.caller.ctx();
+        let subject_tenant_id = ctx.subject_tenant_id();
+        let settled = DiagnosticsSettled {
+            overlap_conflict: overlap_conflict.cloned(),
+            order_id,
+            version,
+            audit_id,
+            transition_time: t,
+            subject_tenant_id,
+            subject_id: ctx.subject_id().to_string(),
+        };
+        let scope = toolkit_security::AccessScope::for_tenant(subject_tenant_id);
+        diagnostics.write(tx, &scope, &settled).await?;
+    }
+    Ok(())
+}
+
 /// The settled step-17.5 refusal: blocked tuples name a conflicting order only where the
 /// caller's read scope can see it (D-179); the reached assessment rides along.
 fn conflict_refusal(conflict: &crate::domain::overlap::OverlapConflict) -> Refusal {
@@ -2381,9 +2846,10 @@ fn conflict_refusal(conflict: &crate::domain::overlap::OverlapConflict) -> Refus
         })
         .collect();
     Refusal {
+        overlap_conflict: Some(conflict.clone()),
         reason: crate::domain::overlap::OverlapConflict::REASON,
         data: json!({ "blocked": blocked }),
-        assessment: true,
+        reach: GateReach::Assessed,
     }
 }
 
@@ -2419,6 +2885,30 @@ async fn step_aggregate<'a>(
         None => locked.replace(write_scope, post).await?,
     }
     Ok(())
+}
+
+/// E3: a refusal never settles over a recovered commercial attempt unless the preparation is the
+/// attempt's own commercial one (its `Version` contribution names the reserved candidate). A
+/// non-commercial preparation (submit's pre-reservation refusal path) that meets a reclaimed
+/// `prepared`/`running` attempt would otherwise mark it refused and burn its candidate on an
+/// assessment the attempt never froze; it fails closed instead, writing nothing.
+fn check_refusal_owner(
+    durable: Option<&(DurableExecution, Frozen)>,
+    a: &Attempt,
+) -> Result<(), Abort> {
+    match durable {
+        Some((_, frozen @ Frozen::Commercial(attempt))) if frozen.is_unresolved() => {
+            match &a.prepared.aggregate {
+                AggregateContribution::Version(v) if v.candidate == attempt.candidate_version => {
+                    Ok(())
+                }
+                _ => Err(Abort::Integration(
+                    "a refusal over a recovered commercial attempt from a non-commercial preparation",
+                )),
+            }
+        }
+        _ => Ok(()),
+    }
 }
 
 /// D-188/D-198 are specialized subflows of exactly their rows, never blanket exceptions.

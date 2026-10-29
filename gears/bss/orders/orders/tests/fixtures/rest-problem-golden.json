@@ -1,5 +1,5 @@
 {
-  "_comment": "REST Problem bytes captured from the pre-D-219 SDK encoder (53091e0d5). D-219 moved the encoder into the gear REST layer; tests/rest_problems.rs proves the wire unchanged.",
+  "_comment": "REST Problem bytes captured from the pre-D-219 SDK encoder (53091e0d5). D-219 moved the encoder into the gear REST layer; tests/rest_problems.rs proves the wire unchanged. D-228 added the two payer-relationship-unconfirmed entries after the capture, written from its catalog row in the shape of the captured FailedPrecondition/400 entries (not-admissible, tenant-axis-immutable). D-229 added one settled payer-relationship-unconfirmed entry carrying the optional `assessment` gate report member, written by hand in the shape of the captured settled entries (sorted keys, the outer Problem unchanged). M3C adds billing-terms-unsupported in the same FailedPrecondition/400 shapes.",
   "boundary_refusals": [
     {
       "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"not-admissible\",\"context\":{\"data\":{}},\"error_code\":\"NOT_ADMISSIBLE\",\"error_domain\":\"orders.v1\"}",
@@ -74,6 +74,11 @@
     {
       "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\",\"title\":\"Invalid argument\",\"status\":400,\"detail\":\"axis-invalid\",\"context\":{\"data\":{}},\"error_code\":\"AXIS_INVALID\",\"error_domain\":\"orders.v1\"}",
       "reason": "axis-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"payer-relationship-unconfirmed\",\"context\":{\"data\":{}},\"error_code\":\"PAYER_RELATIONSHIP_UNCONFIRMED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "payer-relationship-unconfirmed",
       "status": 400
     },
     {
@@ -450,6 +455,11 @@
       "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~\",\"title\":\"Service unavailable\",\"status\":503,\"detail\":\"read-store-unavailable\",\"context\":{\"data\":{}},\"error_code\":\"READ_STORE_UNAVAILABLE\",\"error_domain\":\"orders.v1\"}",
       "reason": "read-store-unavailable",
       "status": 503
+    },
+    {
+      "body": "{\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\",\"title\":\"Failed precondition\",\"status\":400,\"detail\":\"billing-terms-unsupported\",\"context\":{\"data\":{}},\"error_code\":\"BILLING_TERMS_UNSUPPORTED\",\"error_domain\":\"orders.v1\"}",
+      "reason": "billing-terms-unsupported",
+      "status": 400
     }
   ],
   "infrastructure": [
@@ -588,6 +598,57 @@
       "body": "{\"context\":{\"data\":{}},\"detail\":\"axis-invalid\",\"error_code\":\"AXIS_INVALID\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Invalid argument\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~\"}",
       "data": {},
       "reason": "axis-invalid",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"payer-relationship-unconfirmed\",\"error_code\":\"PAYER_RELATIONSHIP_UNCONFIRMED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "payer-relationship-unconfirmed",
+      "status": 400
+    },
+    {
+      "body": "{\"context\":{\"data\":{\"assessment\":{\"assessment_id\":\"0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10\",\"failures\":[{\"predicate\":\"orders.axis-validity\",\"reason\":\"payer-relationship-unconfirmed\"},{\"line_id\":\"6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11\",\"predicate\":\"orders.overlap-uniqueness\",\"reason\":\"overlap-cardinality-exceeded\"}],\"mapping_version\":\"orders-gate-mapping/1\",\"outcomes\":[{\"applicability\":\"required\",\"has_catalog_selection\":false,\"predicate\":\"orders.axis-validity\",\"reason\":\"payer-relationship-unconfirmed\",\"verdict\":\"failed\"},{\"applicability\":\"required\",\"has_catalog_selection\":false,\"predicate\":\"orders.contract-active\",\"verdict\":\"passed\"},{\"applicability\":\"required\",\"has_catalog_selection\":false,\"line_id\":\"6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11\",\"predicate\":\"orders.overlap-uniqueness\",\"reason\":\"overlap-cardinality-exceeded\",\"verdict\":\"failed\"}]}}},\"detail\":\"payer-relationship-unconfirmed\",\"error_code\":\"PAYER_RELATIONSHIP_UNCONFIRMED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {
+        "assessment": {
+          "assessment_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10",
+          "failures": [
+            {
+              "predicate": "orders.axis-validity",
+              "reason": "payer-relationship-unconfirmed"
+            },
+            {
+              "line_id": "6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11",
+              "predicate": "orders.overlap-uniqueness",
+              "reason": "overlap-cardinality-exceeded"
+            }
+          ],
+          "mapping_version": "orders-gate-mapping/1",
+          "outcomes": [
+            {
+              "applicability": "required",
+              "has_catalog_selection": false,
+              "predicate": "orders.axis-validity",
+              "reason": "payer-relationship-unconfirmed",
+              "verdict": "failed"
+            },
+            {
+              "applicability": "required",
+              "has_catalog_selection": false,
+              "predicate": "orders.contract-active",
+              "verdict": "passed"
+            },
+            {
+              "applicability": "required",
+              "has_catalog_selection": false,
+              "line_id": "6f1c1f5e-1d1a-4c43-9d8e-2b7d2e7f0a11",
+              "predicate": "orders.overlap-uniqueness",
+              "reason": "overlap-cardinality-exceeded",
+              "verdict": "failed"
+            }
+          ]
+        }
+      },
+      "reason": "payer-relationship-unconfirmed",
       "status": 400
     },
     {
@@ -1052,6 +1113,12 @@
       "data": {},
       "reason": "read-store-unavailable",
       "status": 503
+    },
+    {
+      "body": "{\"context\":{\"data\":{}},\"detail\":\"billing-terms-unsupported\",\"error_code\":\"BILLING_TERMS_UNSUPPORTED\",\"error_domain\":\"orders.v1\",\"status\":400,\"title\":\"Failed precondition\",\"type\":\"gts://gts.cf.core.errors.err.v1~cf.core.err.failed_precondition.v1~\"}",
+      "data": {},
+      "reason": "billing-terms-unsupported",
+      "status": 400
     }
   ]
 }

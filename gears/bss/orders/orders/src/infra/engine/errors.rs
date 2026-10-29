@@ -8,6 +8,8 @@ use toolkit_db::secure::ScopeError;
 
 pub use crate::domain::error::EngineError;
 
+use bss_orders_sdk::catalog::Reason;
+
 use crate::domain::audit::AuditError;
 use crate::domain::contributions::ContributionError;
 use crate::domain::idempotency::RegistryRuleError;
@@ -81,6 +83,18 @@ pub enum Abort {
     /// A required later-package capability is not delivered on this path.
     #[error("engine capability not delivered: {0}")]
     NotDelivered(&'static str),
+    /// A D-188 durable preparation withdrawn because of the unsettled precedence refusal found
+    /// under the reservation lock (a stale draft revision or an inadmissible submit, E1). It
+    /// leaves nothing behind, its registry claim included, and is not an infrastructure
+    /// failure: the caller records the refusal's unresolved evidence after the rollback, and
+    /// nothing is logged as an abort.
+    #[error("durable preparation withdrawn")]
+    UnreservedRefusal(Reason),
+    /// A D-188 recovery that found no execution to resume (E2). It leaves nothing behind, its
+    /// fresh registry claim included, and the caller answers "nothing to resume" without
+    /// logging an abort.
+    #[error("durable recovery found nothing to resume")]
+    NothingToResume,
     /// A failure injected at the named persistence boundary (tests only).
     #[error("injected fault at {0:?}")]
     #[cfg_attr(
@@ -125,6 +139,11 @@ pub fn terminate(abort: &Abort, body_completed: bool) -> EngineError {
     }
     match abort {
         Abort::NotDelivered(capability) => EngineError::NotDelivered(capability),
+        Abort::UnreservedRefusal(reason) => EngineError::Refused(*reason),
+        Abort::NothingToResume => EngineError::Integration,
+        Abort::Registry(RegistryError::CandidateExhausted) => {
+            EngineError::VersionAllocationExhausted
+        }
         Abort::Integration(_)
         | Abort::Decision(_)
         | Abort::Contribution(_)
@@ -500,6 +519,24 @@ pub mod tests {
         // Any other server error before COMMIT stays an unexpected persistence failure.
         let denied = Abort::Store(ScopeError::Db(driver_error("42501", "lock timeout")));
         assert_eq!(terminate(&denied, false), EngineError::Internal);
+    }
+
+    #[test]
+    fn nothing_to_resume_is_integration_and_unreserved_refusal_is_refused() {
+        // E1: the precedence refusal found under the reservation lock answers as that refusal.
+        let refusal = Abort::UnreservedRefusal(Reason::VersionConflict);
+        assert_eq!(
+            terminate(&refusal, false),
+            EngineError::Refused(Reason::VersionConflict)
+        );
+        // E2: a recovery that found nothing to resume reaching the mapper is a contract defect.
+        assert_eq!(
+            terminate(&Abort::NothingToResume, false),
+            EngineError::Integration
+        );
+        // Neither carries a database error for the contention classifier.
+        assert!(refusal.db_err().is_none());
+        assert!(Abort::NothingToResume.db_err().is_none());
     }
 
     #[test]

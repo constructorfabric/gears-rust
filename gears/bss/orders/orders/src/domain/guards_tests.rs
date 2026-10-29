@@ -176,7 +176,7 @@ fn every_row_has_its_contract_guard_order() {
 }
 
 #[test]
-fn every_reason_has_one_owner_and_inputs_are_declared_per_row() {
+fn engine_reasons_have_only_the_documented_gate_exception_and_inputs_are_declared_per_row() {
     let (table, r) = registry();
     // Every row's inputs come only from its guards; the gate carries the commercial ports.
     assert!(r.row_inputs(RowId::of(1)).is_empty());
@@ -186,10 +186,14 @@ fn every_reason_has_one_owner_and_inputs_are_declared_per_row() {
         r.row_inputs(RowId::of(11)),
         [InputPort::AcceptanceRequirement].into_iter().collect()
     );
-    // Guards never return engine reasons.
+    // M3C Q-A: only the composite gate also owns order-in-flight-for-key.
+    // The engine still owns the authoritative claim collision.
     for row in table.rows() {
         for guard in r.row_guards(row.id) {
-            assert!(guard.reasons.iter().all(|x| !ENGINE_REASONS.contains(x)));
+            assert!(guard.reasons.iter().all(|x| {
+                !ENGINE_REASONS.contains(x)
+                    || (guard.name == GATE_COMPOSITE && *x == Reason::OrderInFlightForKey)
+            }));
         }
     }
 }
@@ -214,6 +218,13 @@ fn invalid_registrations_fail_startup() {
     assert_eq!(
         compile_with(|d| d[0].reasons = &["version-conflict"]).unwrap_err(),
         GuardRegistryError::EngineReason("capture.draft-line-membership", Reason::VersionConflict)
+    );
+    assert_eq!(
+        compile_with(|d| d[0].reasons = &["order-in-flight-for-key"]).unwrap_err(),
+        GuardRegistryError::EngineReason(
+            "capture.draft-line-membership",
+            Reason::OrderInFlightForKey
+        )
     );
     assert_eq!(
         compile_with(|d| d[0].reasons = &[]).unwrap_err(),

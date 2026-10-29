@@ -9,10 +9,8 @@
 use std::sync::Arc;
 
 use bss_orders_sdk::catalog::OrderState;
-#[cfg(orders_event_broker_test_support)]
 use tenant_resolver_sdk::{TenantInfo, TenantResolverClient, TenantResolverError, TenantStatus};
 use time::OffsetDateTime;
-#[cfg(orders_event_broker_test_support)]
 use toolkit_security::SecurityContext;
 use types_registry::config::TypesRegistryConfig;
 use types_registry::domain::legacy_local_client::TypesRegistryLocalClient;
@@ -282,11 +280,8 @@ pub fn encoded_max_events(order: Uuid) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// The platform tenant resolver's root answer (input double; `None` is an outage). Compiled only
-/// with its #5381-dependent callers (D-229).
-#[cfg(orders_event_broker_test_support)]
+/// The platform tenant resolver's root answer (input double; `None` is an outage).
 pub struct Root(pub Option<TenantInfo>);
-#[cfg(orders_event_broker_test_support)]
 pub fn root(id: u128, parent: Option<u128>) -> Arc<dyn TenantResolverClient> {
     Arc::new(Root(Some(TenantInfo {
         id: tenant_resolver_sdk::TenantId(u(id)),
@@ -297,7 +292,6 @@ pub fn root(id: u128, parent: Option<u128>) -> Arc<dyn TenantResolverClient> {
         self_managed: false,
     })))
 }
-#[cfg(orders_event_broker_test_support)]
 #[async_trait::async_trait]
 impl TenantResolverClient for Root {
     async fn get_tenant(
@@ -349,3 +343,6 @@ impl TenantResolverClient for Root {
         Err(TenantResolverError::Internal("unused".into()))
     }
 }
+
+pub mod broker;
+pub mod faults;

@@ -73,6 +73,10 @@ pub fn all() -> Vec<Box<dyn MigrationTrait>> {
             "m20261007_000010_orders_runtime_history",
             include_str!("10_runtime_history.sql"),
         ),
+        (
+            "m20261027_000011_orders_item_keys",
+            include_str!("11_item_keys.sql"),
+        ),
     ] {
         migrations.push(Box::new(SqlMigration { name, sql }));
     }

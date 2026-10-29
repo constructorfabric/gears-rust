@@ -239,6 +239,7 @@ mod claims;
 mod constraints;
 mod executions;
 mod idempotency;
+mod inflight;
 mod maintenance;
 #[path = "migrations.rs"]
 mod migration_tests;
@@ -247,20 +248,41 @@ mod repositories;
 mod roles;
 mod workers;
 
-// D-229 (temporary, until #5381 merges): every test in these five modules runs over the shared
-// `events::Env`, whose broker loads the Orders contract through #5381's
-// `with_types_registry_client` and wraps it in #5381's `FaultInjectingBroker`; `capture::T` and
-// `engine::T` (used by `reads`, `throttling` and part of `dates`) are built on it. Nothing in them
-// compiles without #5381, so they are gated as modules rather than item by item.
-#[cfg(orders_event_broker_test_support)]
 mod capture;
 mod dates;
-#[cfg(orders_event_broker_test_support)]
 mod engine;
-#[cfg(orders_event_broker_test_support)]
 mod events;
 mod platform;
-#[cfg(orders_event_broker_test_support)]
 mod reads;
-#[cfg(orders_event_broker_test_support)]
+#[cfg(feature = "gate-dev-stubs")]
+mod submit;
 mod throttling;
+
+/// A linked commercial attempt for storage-only fixtures. The pin payload itself is opaque
+/// to SQL; schema-2 receipt validity is exercised by the real submit preparation tests.
+async fn pinned_fixture_attempt(pg: &Pg, order: u128, version: i32) -> anyhow::Result<Uuid> {
+    let attempt = u(order * 10_000 + u128::try_from(version)?);
+    // Multiple lines on one version share its immutable execution and settlement evidence.
+    if pg
+        .scalar(&format!(
+            "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE attempt_id='{attempt}'"
+        ))
+        .await?
+        != 0
+    {
+        return Ok(attempt);
+    }
+    // These storage fixtures seed a committed version directly. Its attempt still needs the
+    // same registry identity, ownership fence and originating committed audit as production.
+    // Insert the linked records in one transaction so deferred execution checks see both sides.
+    pg.sql(&format!(
+        "BEGIN; \
+         INSERT INTO bss_orders__transition_audit(audit_id,hash_version,audit_tenant_id,subject_tenant_id,resource_tenant_id,order_id,requested_order_ref,sequence,prev_hash,entry_hash,from_state,to_state,trigger,outcome,actor,actor_class,reason,idempotency_key,version,created_at) \
+         SELECT '{attempt}',3,audit_tenant_id,resource_tenant_id,resource_tenant_id,order_id,order_id,{version},decode(repeat('00',32),'hex'),decode(repeat('01',32),'hex'),'draft','draft','amendment','committed','{actor}','user','amendment','{attempt}',{version},now() FROM bss_orders__order WHERE order_id='{order_id}'; \
+         INSERT INTO bss_orders__commercial_attempt(attempt_id,order_id,candidate_version,previous_committed_version,idempotency_execution_id,operation,principal_scope,request_fingerprint,proposed_arrangement,authorization_fact_fingerprint,original_principal,line_requests,date_policy_basis,commercial_subject_id,commercial_subject_type,commercial_subject_tenant_id,status,owner_token,fencing_generation,receipt_results,created_at,terminal_at) VALUES('{attempt}','{order_id}',{version},1,'{attempt}','amendment','fixture','fixture','{{}}','fixture','{{}}','{{}}','{{}}','{actor}','user','{tenant}','committed','{attempt}',0,'{{}}',now(),now()); \
+         INSERT INTO bss_orders__idempotency(operation,principal_scope,idempotency_key,order_id,request_fingerprint,status,execution_id,attempt_id,owner_token,fencing_generation,outcome,audit_id,settled_response,created_at,expires_at) VALUES('amendment','fixture','{attempt}','{order_id}','fixture','settled','{attempt}','{attempt}','{attempt}',0,'success','{attempt}','{{\"formatVersion\":1}}',now(),now()+interval '1 day'); \
+         COMMIT",
+        order_id = u(order), actor = u(40), tenant = u(10)
+    )).await?;
+    Ok(attempt)
+}

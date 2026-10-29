@@ -16,6 +16,7 @@ use uuid::Uuid;
 pub mod audit;
 pub mod children;
 pub mod discovery;
+pub mod gate_outcome;
 pub mod idempotency;
 pub mod private;
 pub mod privilege;
@@ -224,5 +225,6 @@ pub trait TransactionRunner: DBRunner + transaction_seal::Sealed {}
 impl TransactionRunner for toolkit_db::DbTx<'_> {}
 impl TransactionRunner for toolkit_db::secure::SecureTx<'_> {}
 pub mod claims;
+pub mod inflight;
 pub mod read;
 pub mod retention;

@@ -84,7 +84,7 @@ pub(super) async fn replace_in<T: TransactionRunner>(
             resource_tenant_id: proposed.resource_tenant_id,
         },
         keys(ks),
-    )?;
+    );
     let directive =
         ClaimDirective::for_transition(Trigger::Amendment, OrderState::Submitted, Some(proposal))?;
     let disclosure = AccessScope::for_resources(disclose.iter().map(|n| u(*n)).collect());
@@ -375,7 +375,6 @@ async fn contract_violations_abort_instead_of_refusing() -> anyhow::Result<()> {
                         },
                         keys(&owned(&["k2"])),
                     )
-                    .unwrap()
                 };
                 let authority = |version| ProposalAuthority {
                     proposed: &proposed,
@@ -421,13 +420,20 @@ async fn contract_violations_abort_instead_of_refusing() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
+#[expect(
+    clippy::too_many_lines,
+    reason = "One ordered refusal scenario across several committed transactions, as in idempotency.rs"
+)]
 async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_back()
 -> anyhow::Result<()> {
     use super::audit::{ctx, evidence};
+    use crate::domain::gate::predicates::PredicateId;
+    use crate::domain::gate::vector::{Applicability, Outcome, OutcomeKey, Vector, Verdict};
     use crate::domain::idempotency::{
         DraftRevisionInput, FingerprintAxes, FingerprintInput, FingerprintTarget, LeaseDuration,
         PrincipalScope, RegistryKey, RegistryOperation, Settlement, StoredResponse,
     };
+    use crate::infra::engine::documents::{DiagnosticsContribution, DiagnosticsSettled};
     use crate::infra::storage::repo::idempotency::{
         self as reg, Durability, Gate, GateRequest, GateTarget, ReplayOutcome,
     };
@@ -467,12 +473,12 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
         .unwrap();
         (k, f)
     };
-    let response = || {
+    let response = |report| {
         StoredResponse::new(
             409,
             serde_json::json!({"reason": "order-in-flight-for-key"}),
             std::collections::BTreeMap::new(),
-            None,
+            Some(report),
         )
         .unwrap()
     };
@@ -507,7 +513,7 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
                             resource_tenant_id: u(10),
                         },
                         keys(&owned_keys(&["a", "b", "m"])),
-                    )?;
+                    );
                     let directive = ClaimDirective::for_transition(
                         Trigger::Amendment,
                         OrderState::Submitted,
@@ -528,8 +534,72 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
                     if fail == 1 {
                         anyhow::bail!("injected failure after provisional release");
                     }
+                    let line_keys: std::collections::BTreeMap<_, _> = [
+                        (
+                            u(1001),
+                            ["a".to_owned()]
+                                .into_iter()
+                                .collect::<std::collections::BTreeSet<_>>(),
+                        ),
+                        (
+                            u(1002),
+                            ["b".to_owned()]
+                                .into_iter()
+                                .collect::<std::collections::BTreeSet<_>>(),
+                        ),
+                        (
+                            u(1003),
+                            ["m".to_owned()]
+                                .into_iter()
+                                .collect::<std::collections::BTreeSet<_>>(),
+                        ),
+                    ]
+                    .into_iter()
+                    .collect();
+                    let run = crate::infra::gate::writer::GateRun {
+                        overlap_keys: line_keys.clone(),
+                        run_id: Uuid::new_v4(),
+                        resource_tenant_id: u(10),
+                        seller_tenant_id: u(20),
+                        payer_tenant_id: u(30),
+                        correlation_id: None,
+                        evaluated_at: time::OffsetDateTime::now_utc(),
+                        vector: Vector::build(
+                            line_keys
+                                .keys()
+                                .map(|line| Outcome {
+                                    key: OutcomeKey {
+                                        predicate: PredicateId::InFlightPerKey,
+                                        line_id: Some(*line),
+                                        item_id: None,
+                                        selection: bss_orders_sdk::gate_report::CatalogSelection::NotSelected,
+                                    },
+                                    verdict: Verdict::Passed,
+                                    reason: None,
+                                    applicability: Applicability::Required,
+                                    producer_results: vec![],
+                                    upstream_detail: None,
+                                })
+                                .collect(),
+                        )?,
+                    };
+                    let report = run.collision_report(&conflict)?.unwrap();
+                    assert_eq!(report["failures"][0]["line_id"], serde_json::json!(u(1003)));
+                    assert_eq!(report["failures"][0]["reason"], "order-in-flight-for-key");
+                    let audit_id = Uuid::new_v4();
+                    let settled = DiagnosticsSettled {
+                        overlap_conflict: Some(conflict.clone()),
+                        order_id: u(1),
+                        version: None,
+                        audit_id,
+                        transition_time: time::OffsetDateTime::now_utc(),
+                        subject_tenant_id: u(10),
+                        subject_id: u(40).to_string(),
+                    };
+                    run.write(tx, &AccessScope::for_tenant(u(10)), &settled)
+                        .await?;
                     let sealed = evidence(40).resolved_refusal(
-                        Uuid::new_v4(),
+                        audit_id,
                         AuditTrigger::Public(Trigger::Amendment),
                         &locked.audit_facts()?,
                         OverlapConflict::REASON,
@@ -542,13 +612,22 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
                         .settle(Settlement::Refused {
                             reason: OverlapConflict::REASON,
                             audit_id: sealed.row().audit_id,
-                            response: response(),
+                            response: response(report.clone()),
                         })
                         .await?;
                     if fail == 3 {
                         anyhow::bail!("injected failure after settlement");
                     }
-                    anyhow::Ok(Ok((conflict, sealed.row().audit_id, settled.audit_id)))
+                    assert_eq!(
+                        settled.settled_response.as_ref().unwrap()["assessment"],
+                        report
+                    );
+                    anyhow::Ok(Ok((
+                        conflict,
+                        sealed.row().audit_id,
+                        settled.audit_id,
+                        settled.settled_response.unwrap(),
+                    )))
                 })
             })
             .await
@@ -560,7 +639,7 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
         // Provisional inserts, their release, audit and settlement all vanish together.
         assert_eq!(baseline(&pg).await?, start, "failure point {fail}");
     }
-    let (c, audit_id, settled_audit) = attempt("amend-1", 0).await?.unwrap();
+    let (c, audit_id, settled_audit, snapshot) = attempt("amend-1", 0).await?.unwrap();
     assert_eq!(settled_audit, Some(audit_id));
     assert_eq!(c.provisional_released.len(), 1);
     // No phantom version, pointer move, line, total or event contribution.
@@ -580,7 +659,7 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
         .await?,
         1
     );
-    for table in ["order_line", "resolved_total", "gate_outcome"] {
+    for table in ["order_line", "resolved_total"] {
         assert_eq!(
             pg.scalar(&format!("SELECT count(*) AS n FROM bss_orders__{table}"))
                 .await?,
@@ -595,6 +674,8 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
         .await?,
         1
     );
+    assert_eq!(pg.scalar("SELECT count(*) AS n FROM bss_orders__gate_outcome WHERE predicate='orders.in-flight-per-key' AND verdict='failed' AND reason='order-in-flight-for-key'").await?, 1);
+    assert_eq!(pg.scalar("SELECT count(*) AS n FROM bss_orders__gate_outcome WHERE predicate='orders.in-flight-per-key' AND verdict='passed'").await?, 2);
     // Prior claims intact; the provisional b is released history, not a live reservation.
     assert_eq!(live(&pg, 1).await?, vec![(u(30), "a".to_owned())]);
     // Same-key replay returns the settled refusal without touching claims.
@@ -607,6 +688,11 @@ async fn refusal_settles_and_audits_without_phantom_version_and_failures_roll_ba
         ReplayOutcome::Refused("order-in-flight-for-key".into())
     );
     assert_eq!(replay.audit_id, Some(audit_id));
+    assert_eq!(
+        serde_json::to_value(&replay.response)?,
+        snapshot,
+        "collision report and complete stored snapshot replay exactly"
+    );
     assert_eq!(
         pg.scalar("SELECT count(*) AS n FROM bss_orders__inflight_overlap_claim")
             .await?,

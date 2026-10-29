@@ -319,6 +319,42 @@ impl FingerprintInput<'_> {
     }
 }
 
+/// Authorization-fact fingerprint profile v1 domain tag (D-188 attempt inputs; DESIGN
+/// *Persistence and ownership*: "authorization-fact fingerprint").
+const AUTHORIZATION_FACTS_TAG: &str = "VHP-BSS-ORDERS-AUTHORIZATION-FACTS-v1";
+/// Stored authorization-fact fingerprint prefix; a future profile must use a different one.
+const AUTHORIZATION_FACTS_PREFIX: &str = "af1:";
+
+/// The authorization-fact fingerprint a D-188 attempt freezes: SHA-256 over the tagged canonical
+/// document of the order and the authorized tenant axes it was prepared under, the same
+/// canonical form and provider as the request fingerprint. A recovery or a commit of the attempt
+/// compares it with the facts it rechecks under the aggregate lock; a moved axis never matches.
+///
+/// # Errors
+/// [`RegistryRuleError::NonCanonical`] only if the document cannot be written.
+pub fn authorization_fact_fingerprint(
+    order_id: Uuid,
+    axes: &FingerprintAxes,
+) -> Result<String, RegistryRuleError> {
+    use std::fmt::Write;
+    let document = serde_json::json!({
+        "order_id": order_id.to_string(),
+        "seller_tenant_id": axes.seller_tenant_id.to_string(),
+        "resource_tenant_id": axes.resource_tenant_id.to_string(),
+        "payer_tenant_id": axes.payer_tenant_id.to_string(),
+    });
+    let mut preimage = AUTHORIZATION_FACTS_TAG.as_bytes().to_vec();
+    preimage.push(0x1f);
+    preimage.extend(canonical(&document)?.as_bytes());
+    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &preimage);
+    let mut hex = String::with_capacity(AUTHORIZATION_FACTS_PREFIX.len() + 64);
+    hex.push_str(AUTHORIZATION_FACTS_PREFIX);
+    for byte in digest.as_ref() {
+        write!(hex, "{byte:02x}").map_err(|_| RegistryRuleError::NonCanonical)?;
+    }
+    Ok(hex)
+}
+
 /// D-201 internal SDK `IdempotentWrite` operation identifier (not a REST catalog route).
 pub const REPLACE_FULFILLMENT_GRANT_OPERATION: &str = "replace_fulfillment_grant";
 

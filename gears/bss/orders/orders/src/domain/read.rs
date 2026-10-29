@@ -129,6 +129,8 @@ struct Token {
     f: String,
     o: String,
     k: Position,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    r: Option<i32>,
 }
 
 /// The normalized-filter hash the order-list token binds to: SHA-256 over the canonical JSON
@@ -172,6 +174,17 @@ pub fn encode_cursor(
     binding: CursorBinding<'_>,
     position: Position,
 ) -> Result<Cursor, ReadRuleError> {
+    encode_cursor_version(binding, position, None)
+}
+
+/// A line continuation is bound to its commercial version as well as its position.
+/// # Errors
+/// A token that cannot be encoded.
+pub fn encode_cursor_version(
+    binding: CursorBinding<'_>,
+    position: Position,
+    version: Option<i32>,
+) -> Result<Cursor, ReadRuleError> {
     let token = Token {
         v: CURSOR_VERSION,
         c: binding.collection,
@@ -181,6 +194,7 @@ pub fn encode_cursor(
         f: binding.filters_hash.to_owned(),
         o: binding.collection.sort().to_owned(),
         k: position,
+        r: version,
     };
     let raw = serde_json::to_vec(&token).map_err(|_| ReadRuleError::CursorInvalid)?;
     Cursor::try_from(URL_SAFE_NO_PAD.encode(raw)).map_err(|_| ReadRuleError::CursorInvalid)
@@ -196,6 +210,30 @@ pub fn decode_cursor(
     cursor: &Cursor,
     binding: CursorBinding<'_>,
 ) -> Result<Position, ReadRuleError> {
+    decode_cursor_bound(cursor, binding).map(|decoded| decoded.position)
+}
+
+/// A validated continuation token: where to continue and the commercial version it is bound to.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodedCursor {
+    /// The position to continue strictly after.
+    pub position: Position,
+    /// The version binding, read from the same validated decode; `None` for an order-list
+    /// token. A token without a binding is not a line token; the line path refuses it
+    /// (`cursor-invalid`).
+    pub version: Option<i32>,
+}
+
+/// [`decode_cursor`] that also returns the token's version binding, so a caller never decodes
+/// the token a second time without validation.
+///
+/// # Errors
+/// `CursorInvalid`.
+pub fn decode_cursor_bound(
+    cursor: &Cursor,
+    binding: CursorBinding<'_>,
+) -> Result<DecodedCursor, ReadRuleError> {
     let invalid = ReadRuleError::CursorInvalid;
     let raw = URL_SAFE_NO_PAD
         .decode(cursor.as_str())
@@ -214,7 +252,10 @@ pub fn decode_cursor(
     // Precision: the instant must be representable exactly. Its failure is `cursor-invalid`
     // like every other one (D-139), not the internal `Precision`.
     token.k.instant().map_err(|_| invalid)?;
-    Ok(token.k)
+    Ok(DecodedCursor {
+        position: token.k,
+        version: token.r,
+    })
 }
 
 /// The scoped query fetches at most `page_size + 1` rows (08 §2.2).

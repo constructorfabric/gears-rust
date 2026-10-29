@@ -1,16 +1,15 @@
 //! Early S6-01/S6-04 on real PostgreSQL: the authorized draft reads through the shared read
-//! service (REST and local SDK), the policy fake (S2-03, D-227) with a recording PDP for the
+//! service (REST and local SDK), the real rules PDP (S2-03) with a recording PDP for the
 //! hidden/missing call pattern, outage and changed-facts cases, scoped keyset SQL pages, and
 //! the `orders_read_access_log` served/refused decision table over the restricted runtime role.
 //! Draft orders are authored through the S2-09 capture service and the S2-04 engine.
 use super::capture::{
-    BUYER, T, buyer, create, create_meta, http, line, new_order, result, view, write,
+    BUYER, T, buyer, create, create_meta, http, key, line, new_order, result, view, write,
 };
 use super::*;
 use crate::api::local_client::LocalOrdersClient;
-use crate::authz::Action;
 use crate::authz::test_pdp::{
-    FakePdp, Grant, ScriptedPdp, allow, deny, eq, is_in, path, service, user, with_proof,
+    RulesProvider, ScriptedPdp, allow, deny, eq, is_in, path, service, user, with_proof,
 };
 use crate::domain::read::ProofDenial;
 use crate::domain::read::{AccessOutcome, Collection, CursorBinding, Position};
@@ -27,6 +26,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
 /// Same-tenant reader whose only path is its own resource tenant (provably confined).
 const CONFINED: (u128, u128) = (110, 10);
 /// Seller operator on seller tenant 20 (direct cross-tenant read, no proof).
@@ -46,42 +46,71 @@ const PROOF: &str = "proof-ok";
 fn s(id: Uuid) -> String {
     id.to_string()
 }
-fn rule(subject: u128, actions: &[Action], property: &str, values: &[Uuid]) -> Grant {
-    Grant::new(u(subject), actions).path([(property, values.to_vec())])
+fn rule(id: &str, subject: u128, actions: &[&str], property: &str, values: &[Uuid]) -> Value {
+    json!({"id": id, "subject": {"id": s(u(subject))}, "resource_type": ORDER_RT,
+        "actions": actions,
+        "paths": [{"predicates": [{"property": property,
+            "values": values.iter().map(|v| s(*v)).collect::<Vec<_>>()}]}]})
 }
-/// The read policy fake (D-227); `workflow_ids` are the explicit finite order IDs of the
-/// service principal.
-fn policy(workflow_ids: &[Uuid]) -> Arc<FakePdp> {
-    use Action::{
-        OrderCreate as Create, OrderEdit as Edit, OrderHold as Hold, OrderRead as Read,
-        OrderResume as Resume, OrderWrite as Write,
-    };
-    let mut grants = vec![
+/// The read policy; `workflow_ids` are the explicit finite order IDs of the service principal.
+fn policy(workflow_ids: &[Uuid]) -> Value {
+    let buyer = rule(
+        "buyer",
+        BUYER.0,
+        &["create", "write", "edit", "read"],
+        "resource_tenant_id",
+        &[u(10), u(11)],
+    );
+    let mut partner = rule(
+        "partner-delegated",
+        PARTNER.0,
+        &["read"],
+        "resource_tenant_id",
+        &[u(10)],
+    );
+    partner["delegation"] = json!({"proof_property": "delegation_proof_ref", "accepted": [PROOF]});
+    let mut rules = vec![
+        buyer,
         rule(
-            BUYER.0,
-            &[Create, Write, Edit, Read],
+            "confined",
+            CONFINED.0,
+            &["read"],
             "resource_tenant_id",
-            &[u(10), u(11)],
+            &[u(10)],
         ),
-        rule(CONFINED.0, &[Read], "resource_tenant_id", &[u(10)]),
         rule(
+            "seller",
             SELLER.0,
-            &[Read, Hold, Resume],
+            &["read", "hold", "resume"],
             "seller_tenant_id",
             &[u(20)],
         ),
-        rule(PAYER.0, &[Read], "payer_tenant_id", &[u(30)]),
-        rule(OTHER_SELLER.0, &[Read], "seller_tenant_id", &[u(21)]),
-        rule(PARTNER.0, &[Read], "resource_tenant_id", &[u(10)]).delegated(),
+        rule(
+            "payer-reader",
+            PAYER.0,
+            &["read"],
+            "payer_tenant_id",
+            &[u(30)],
+        ),
+        rule(
+            "other-seller",
+            OTHER_SELLER.0,
+            &["read"],
+            "seller_tenant_id",
+            &[u(21)],
+        ),
+        partner,
     ];
-    // The service principal's grant exists only with a finite explicit order set (08 §4.3).
+    // The service principal's rule exists only with a finite explicit order set (08 §4.3).
     if !workflow_ids.is_empty() {
-        grants.push(Grant::new(u(WORKFLOW.0), &[Read]).path([
-            ("id", workflow_ids.to_vec()),
-            ("seller_tenant_id", vec![u(20)]),
-        ]));
+        rules.push(json!({"id": "workflow", "subject": {"id": s(u(WORKFLOW.0))},
+            "resource_type": ORDER_RT, "actions": ["read"],
+            "paths": [{"predicates": [
+                {"property": "id", "values": workflow_ids.iter().map(|v| s(*v)).collect::<Vec<_>>()},
+                {"property": "seller_tenant_id", "values": [s(u(20))]}]}]}));
     }
-    FakePdp::new(grants, &[PROOF])
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s6-01-draft",
+        "rules": rules})
 }
 
 struct R {
@@ -95,7 +124,7 @@ struct R {
 impl R {
     async fn new() -> Self {
         let t = T::new().await;
-        let provider = policy(&[]);
+        let provider = RulesProvider::from_policy(policy(&[]));
         let capture = Arc::new(T::service_with(t.engine(provider.clone()), 200));
         let reads = Arc::new(t.reads_with(provider));
         Self {
@@ -108,12 +137,13 @@ impl R {
     fn reads_with(&self, api: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> ReadService {
         self.t.reads_with(api)
     }
-    /// The policy fake with recording signals, so the §3.8 instruments can be asserted.
+    /// The real rules PDP with recording signals, so the §3.8 instruments can be asserted.
     fn reads_recording(&self) -> (Arc<RecordingSignals>, ReadService) {
         let signals = Arc::new(RecordingSignals::default());
-        let reads = self
-            .t
-            .reads_with_signals(policy(&[]), Arc::clone(&signals) as Arc<dyn ReadSignals>);
+        let reads = self.t.reads_with_signals(
+            RulesProvider::from_policy(policy(&[])),
+            Arc::clone(&signals) as Arc<dyn ReadSignals>,
+        );
         (signals, reads)
     }
     /// The database wall clock, which every evidence timestamp must come from (OL-2).
@@ -1001,7 +1031,7 @@ async fn service_principals_read_only_their_finite_order_ids() {
     // service decision without a finite ID path fails closed as integration.
     let visible = created[0];
     let workflow = service(WORKFLOW.0, WORKFLOW.1);
-    let rules = r.reads_with(policy(&[visible, created[1]]));
+    let rules = r.reads_with(RulesProvider::from_policy(policy(&[visible, created[1]])));
     r.clear_logs().await;
     let wf_page = rules.list(&workflow, &list_all()).await.unwrap();
     assert_eq!(
@@ -1185,9 +1215,9 @@ fn mounted_router(r: &R) -> axum::Router {
         .layer(axum::Extension(buyer().ctx().clone()))
 }
 
-/// The mounted read routes on the wire (in-process router over real PostgreSQL): strong `ETag`,
-/// `snake_case` bodies, query validation precedence with problem+json refusals and no access-log
-/// rows, the masked 404, the proof header carrier and page walking.
+/// The mounted read routes on the wire (in-process router over real PostgreSQL, not the S2-12
+/// live E2E): strong `ETag`, `snake_case` bodies, query validation precedence with problem+json
+/// refusals and no access-log rows, the masked 404, the proof header carrier and page walking.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_mounted_read_routes_carry_etag_pages_and_problems_on_the_wire() {
@@ -1426,7 +1456,7 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
     r.t.env
         .pg
         .sql(&format!(
-            "UPDATE bss_orders__order SET state='submitted' WHERE order_id='{id}'"
+            "UPDATE bss_orders__order SET state='cancelled' WHERE order_id='{id}'"
         ))
         .await
         .unwrap();
@@ -1442,7 +1472,7 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         .list(buyer().ctx(), list_all(), meta(None))
         .await
         .unwrap();
-    assert_eq!(summaries.items[0].order.state, OrderState::Submitted);
+    assert_eq!(summaries.items[0].order.state, OrderState::Cancelled);
     assert_eq!(summaries.items[0].draft_revision, None);
     let before = r.log_count().await;
     assert!(matches!(
@@ -1456,6 +1486,52 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         before,
         "nothing disclosed, nothing logged"
     );
+}
+
+/// Preview and submit are undelivered outside the development delivery: the SDK client answers
+/// `Unavailable` before any authorization, so the PDP is never asked (08 §3.5). Docker/PG tier.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sdk_preview_and_submit_are_unavailable_when_undelivered() {
+    use bss_orders_sdk::models::{CallMeta, DraftRevision, OrderVersion};
+    use bss_orders_sdk::preview::PreviewBasket;
+    let r = R::new().await;
+    let pdp = ScriptedPdp::new(|_| None);
+    let client = LocalOrdersClient::new(
+        Arc::new(T::service_with(r.t.engine(pdp.clone()), 200)),
+        Arc::new(r.reads_with(pdp.clone())),
+    );
+    let line = json!({
+        "plan_id": u(1), "plan_revision_id": u(2),
+        "selected_items": [{"item_id": u(3), "quantity": "1"}],
+        "currency": "EUR", "term_duration": {"kind": "rolling"}, "billing_cycle": "month",
+    });
+    let basket: PreviewBasket = serde_json::from_value(json!({
+        "resource_tenant_id": u(10), "payer_tenant_id": u(30), "seller_tenant_id": u(20),
+        "lines": [line],
+    }))
+    .unwrap();
+    let error = client
+        .preview(buyer().ctx(), basket, meta(None))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OrdersError::Unavailable), "{error:?}");
+    let error = client
+        .submit(
+            buyer().ctx(),
+            u(99),
+            DraftRevision::try_from(0).unwrap(),
+            CallMeta {
+                expected_version: OrderVersion::try_from(1).unwrap(),
+                idempotency_key: key("u-1"),
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OrdersError::Unavailable), "{error:?}");
+    assert!(pdp.requests.lock().is_empty(), "{:?}", pdp.calls());
 }
 
 /// 08 §3.6 *Prefetch and authorized snapshot* and *Read One Order* step 3: a row that leaves
@@ -1543,7 +1619,7 @@ async fn undelivered_compositions_answer_the_documented_unavailable_problem_on_t
     r.t.env
         .pg
         .sql(&format!(
-            "UPDATE bss_orders__order SET state='submitted' WHERE order_id='{id}'"
+            "UPDATE bss_orders__order SET state='cancelled' WHERE order_id='{id}'"
         ))
         .await
         .unwrap();
@@ -1572,7 +1648,7 @@ async fn undelivered_compositions_answer_the_documented_unavailable_problem_on_t
     let list = http(&router, "GET", "/bss-orders/v1/orders", &[], None).await;
     assert_eq!(list.0, 200, "{:?}", list.2);
     assert_eq!(list.2["items"][0]["order"]["order_id"], json!(s(id)));
-    assert_eq!(list.2["items"][0]["order"]["state"], json!("submitted"));
+    assert_eq!(list.2["items"][0]["order"]["state"], json!("cancelled"));
     assert_eq!(list.2["items"][0]["current_version"], json!(1));
     assert!(list.2["items"][0].get("draft_revision").is_none());
 }

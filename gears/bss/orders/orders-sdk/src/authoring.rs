@@ -20,6 +20,8 @@ pub struct AuthoringInvalid(pub &'static str);
 
 /// Line quantity per selected item bound (`models.json` `selected_bindings_per_line`).
 pub const MAX_SELECTED_ITEMS: usize = 1_000;
+/// Submit admission bound across all selected items in the order (D-158).
+pub const MAX_CONSUMED_ITEMS_PER_ORDER: usize = 200;
 /// Administrative text caps in Unicode scalar values (S1-02 selection; Pricing caps precedent).
 pub const EXTERNAL_REFERENCE_MAX: usize = 256;
 pub const DISPLAY_LABEL_MAX: usize = 200;
@@ -600,22 +602,36 @@ impl AddLine {
     /// # Errors
     /// `request-invalid` input.
     pub fn validate(&self) -> Result<(), AuthoringInvalid> {
-        validate_items(&self.selected_items)?;
-        if let Some(term) = &self.term_duration {
-            term.validate()?;
-        }
-        validate_dates([
-            (
-                self.contract_effective_date.as_ref(),
-                "contract_effective_date",
-            ),
-            (
-                self.service_activation_date.as_ref(),
-                "service_activation_date",
-            ),
-            (self.acceptance_due_date.as_ref(), "acceptance_due_date"),
-        ])
+        validate_line_parts(
+            &self.selected_items,
+            self.term_duration.as_ref(),
+            [
+                (
+                    self.contract_effective_date.as_ref(),
+                    "contract_effective_date",
+                ),
+                (
+                    self.service_activation_date.as_ref(),
+                    "service_activation_date",
+                ),
+                (self.acceptance_due_date.as_ref(), "acceptance_due_date"),
+            ],
+        )
     }
+}
+
+/// The structural rules of an authored line, over borrowed parts so a preview line validates
+/// exactly as an [`AddLine`] without being cloned into one (02 §3.3).
+pub(crate) fn validate_line_parts(
+    items: &[SelectedItem],
+    term: Option<&AuthoredTerm>,
+    dates: [(Option<&CalendarDate>, &'static str); 3],
+) -> Result<(), AuthoringInvalid> {
+    validate_items(items)?;
+    if let Some(term) = term {
+        term.validate()?;
+    }
+    validate_dates(dates)
 }
 
 /// Selected items: bounded count, positive quantities (by type) and bounded dimension values.
@@ -694,11 +710,14 @@ pub struct VersionSummary {
     pub created_at: OffsetDateTime,
 }
 
-/// A draft working line as authored (no pin, total or resolved dates exist in draft).
+/// Authored line fields, with immutable commercial evidence on a submitted read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 // Part of a stored response (`OrderView`): unknown fields are tolerated for replay across
 // builds, as on `OrderView`.
 pub struct DraftLine {
+    /// Present only on immutable committed lines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<crate::reads::CommittedLine>,
     pub line_id: Uuid,
     pub plan_id: Uuid,
     pub plan_revision_id: Uuid,
@@ -719,6 +738,9 @@ pub struct DraftLine {
 // registry for its whole window, so a body written by a newer build must still decode on an older
 // replica during a rolling update or after a rollback (forward compatibility).
 pub struct OrderView {
+    /// Stored totals of the current committed version; absent on drafts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_totals: Option<Vec<crate::reads::CommittedTotal>>,
     pub order: OrderHeader,
     pub version: VersionSummary,
     pub lines: Vec<DraftLine>,

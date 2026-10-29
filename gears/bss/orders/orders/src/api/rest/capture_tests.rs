@@ -220,10 +220,12 @@ fn openapi_mirrors_are_pinned_to_the_sdk_wire() {
         version: OrderVersion::try_from(1).unwrap(),
         draft_revision: Some(DraftRevision::try_from(3).unwrap()),
         request_audit_id: None,
+        assessment_id: Some(Uuid::from_u128(42)),
         line_id: Some(Uuid::from_u128(5)),
     });
     let line = sample_line();
     pinned::<dto::OrdersOrderView>(&OrderView {
+        resolved_totals: None,
         order: OrderHeader {
             order_id: Uuid::from_u128(1),
             order_number: "ORD-1".into(),
@@ -243,6 +245,7 @@ fn openapi_mirrors_are_pinned_to_the_sdk_wire() {
             created_at: t0,
         },
         lines: vec![DraftLine {
+            committed: None,
             line_id: Uuid::from_u128(9),
             plan_id: line.plan_id,
             plan_revision_id: line.plan_revision_id,
@@ -263,6 +266,7 @@ fn openapi_mirrors_are_pinned_to_the_sdk_wire() {
         version: OrderVersion::try_from(1).unwrap(),
         draft_revision: Some(DraftRevision::try_from(0).unwrap()),
         request_audit_id: None,
+        assessment_id: Some(Uuid::from_u128(42)),
         line_id: None,
     })
     .unwrap();
@@ -319,6 +323,8 @@ fn openapi_mirror_schemas_name_exactly_the_sdk_wire_fields() {
     mirrors::<dto::OrdersSelectedItem, SelectedItem>(&[]);
     // Responses.
     mirrors::<dto::OrdersTransitionResult, TransitionResult>(&[]);
+    mirrors::<dto::OrdersPreviewResult, bss_orders_sdk::preview::PreviewResult>(&[]);
+    mirrors::<dto::OrdersResolvedTotal, bss_orders_sdk::preview::ResolvedTotalView>(&[]);
     mirrors::<dto::OrdersOrderView, OrderView>(&[]);
     mirrors::<dto::OrdersOrderHeader, OrderHeader>(&[]);
     mirrors::<dto::OrdersVersionSummary, VersionSummary>(&[]);
@@ -436,4 +442,47 @@ fn stored_outcomes_render_verbatim_with_semantic_headers() {
         super::super::error::ApiError::from(OrdersError::Refused(Reason::ExpectedVersionRequired))
             .into_response();
     assert_eq!(out.status().as_u16(), 428);
+}
+
+/// PostgreSQL JSONB may reorder nested object keys. The first and replayed outcomes
+/// must render identical bytes even when `serde_json/preserve_order` is unified by the host.
+#[tokio::test]
+async fn stored_outcome_bytes_do_not_depend_on_json_object_key_order() {
+    let first: Value = serde_json::from_str(
+        r#"{"order_id":"o1","state":"submitted","context":{"data":{"current_version":2,"draft_revision":1}},"lines":[{"line_id":"l1","version":2}]}"#,
+    )
+    .unwrap();
+    let replay: Value = serde_json::from_str(
+        r#"{"state":"submitted","order_id":"o1","lines":[{"version":2,"line_id":"l1"}],"context":{"data":{"draft_revision":1,"current_version":2}}}"#,
+    )
+    .unwrap();
+    assert_eq!(first, replay);
+    for status in [200, 409] {
+        let response = |body| {
+            StoredResponse::new(status, body, std::collections::BTreeMap::default(), None).unwrap()
+        };
+        let settled = |body, replayed| Settled {
+            response: response(body),
+            outcome: if status == 200 {
+                SettledOutcome::Committed
+            } else {
+                SettledOutcome::Refused(Some(Reason::VersionConflict))
+            },
+            order_id: Some(Uuid::nil()),
+            replayed,
+        };
+        let first = render(settled(first.clone(), false));
+        let replay = render(settled(replay.clone(), true));
+        assert_eq!(first.status(), replay.status());
+        assert_eq!(replay.headers()["idempotency-replayed"], "true");
+        assert_eq!(
+            axum::body::to_bytes(first.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            axum::body::to_bytes(replay.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+            "status {status}"
+        );
+    }
 }

@@ -7,53 +7,33 @@
 //! test supplies the version contribution and binds every other row-4 guard as passing, exactly
 //! as the engine suite does; the date guard, the composite gate's date failures and the
 //! admitted line rows are the S2-10 implementation.
+use super::engine::{T, buyer, create, fixed, key, prepared, request, reserve_with_dates};
 use super::*;
 use crate::config::{DatePolicyConfig, DatePolicyOverrideConfig, DatePolicySwitches};
 use crate::domain::dates::{
-    DateField, PLATFORM_DEFAULT_POLICY_ID, PolicyFault, PolicyScope, SuppliedDates,
+    DateBasis, DateField, DateSource, PLATFORM_DEFAULT_POLICY_ID, PolicyFault, PolicyScope,
+    SuppliedDates, utc_date,
 };
-use crate::infra::dates::{
-    DatePolicyPlan, DatePreparer, PolicyStoreError, PreparationClock, PrepareDatesError, install,
-    promote, verify_platform_default,
-};
-// D-229: imports used only by the #5381-dependent admission section below.
-#[cfg(orders_event_broker_test_support)]
-use super::engine::{T, buyer, create, fixed, key, prepared, request, reserve_with_dates};
-#[cfg(orders_event_broker_test_support)]
-use crate::domain::dates::{DateBasis, DateSource, utc_date};
-#[cfg(orders_event_broker_test_support)]
 use crate::domain::guards::GATE_COMPOSITE;
-#[cfg(orders_event_broker_test_support)]
 use crate::domain::transition::{GuardSubject, GuardVerdict};
-#[cfg(orders_event_broker_test_support)]
 use crate::infra::capture::{CaptureService, CaptureSettings, WriteMeta};
-#[cfg(orders_event_broker_test_support)]
 use crate::infra::dates::{
-    AdmittedLineError, admitted_line, supplied_from_admitted, supplied_from_draft,
+    AdmittedLineError, DatePolicyPlan, DatePreparer, PolicyStoreError, PreparationClock,
+    PrepareDatesError, admitted_line, install, promote, supplied_from_admitted,
+    supplied_from_draft, verify_platform_default,
 };
-#[cfg(orders_event_broker_test_support)]
 use crate::infra::engine::{ChildDocuments, DocumentWriter, OutcomeKind, Prepared};
-#[cfg(orders_event_broker_test_support)]
 use arc_swap::ArcSwapOption;
-#[cfg(orders_event_broker_test_support)]
 use async_trait::async_trait;
-#[cfg(orders_event_broker_test_support)]
 use bss_orders_sdk::authoring::{
     AddLine, AuthoredTerm, BillingCycle, CalendarDate, Currency, SelectedItem,
 };
-#[cfg(orders_event_broker_test_support)]
 use bss_orders_sdk::catalog::{OrderState as S, Reason, Trigger};
-#[cfg(orders_event_broker_test_support)]
 use bss_orders_sdk::models::{CallMeta, DraftRevision, OrderVersion};
-#[cfg(orders_event_broker_test_support)]
 use serde_json::{Value, json};
-#[cfg(orders_event_broker_test_support)]
 use std::sync::Arc;
-#[cfg(orders_event_broker_test_support)]
 use time::macros::date;
-#[cfg(orders_event_broker_test_support)]
 use toolkit_db::secure::ScopeError;
-#[cfg(orders_event_broker_test_support)]
 use toolkit_security::AccessScope;
 
 const TENANT: u128 = 10;
@@ -353,11 +333,7 @@ async fn preparation_snapshots_the_effective_row_and_the_database_utc_date() -> 
 
 // ------------------------------------------------------------------------------------------
 // Admission through the engine (row 4)
-//
-// D-229 (temporary, until #5381 merges): this section runs over `engine::T`, built on the
-// #5381-dependent `events::Env`, so each item is compiled out without the feature.
 
-#[cfg(orders_event_broker_test_support)]
 fn write(text: &str, revision: i64) -> WriteMeta {
     WriteMeta {
         call: CallMeta {
@@ -369,7 +345,6 @@ fn write(text: &str, revision: i64) -> WriteMeta {
         expected_draft_revision: Some(DraftRevision::try_from(revision).unwrap()),
     }
 }
-#[cfg(orders_event_broker_test_support)]
 fn add_line(dates: [Option<time::Date>; 3], term: AuthoredTerm) -> AddLine {
     AddLine {
         plan_id: u(200),
@@ -389,26 +364,32 @@ fn add_line(dates: [Option<time::Date>; 3], term: AuthoredTerm) -> AddLine {
 }
 
 /// Writes every admitted line from its draft line and the frozen basis.
-#[cfg(orders_event_broker_test_support)]
 struct AdmitLines {
+    attempt_id: Uuid,
     drafts: Vec<entity::draft_content::Model>,
     basis: Arc<DateBasis>,
     version: i32,
 }
-#[cfg(orders_event_broker_test_support)]
 #[async_trait]
 impl DocumentWriter for AdmitLines {
     async fn write(&self, docs: &ChildDocuments<'_, '_>) -> Result<(), ScopeError> {
+        let mut rows = Vec::new();
         for draft in &self.drafts {
-            let row = admitted_line(draft, u(TENANT), self.version, &self.basis)
+            let mut row = admitted_line(draft, u(TENANT), self.version, &self.basis)
                 .map_err(|_| ScopeError::Invalid("unresolved line"))?;
-            docs.insert_order_line(row).await?;
+            // Date-policy fixture: the real reserved attempt owns every admitted row.
+            // Commercial receipt verification is exercised by the submit suite.
+            row.commercial_attempt_id = Some(self.attempt_id);
+            row.pricing_acceptance_id = Some(draft.line_id);
+            row.pricing_request_digest = Some("00".repeat(32));
+            row.pricing_terms_digest = Some("00".repeat(32));
+            row.order_pin = Some(json!({"schema_version": 2}));
+            rows.push(row);
         }
-        Ok(())
+        docs.insert_order_lines(rows).await
     }
 }
 
-#[cfg(orders_event_broker_test_support)]
 struct Draft {
     order: Uuid,
     lines: Vec<entity::draft_content::Model>,
@@ -416,7 +397,6 @@ struct Draft {
 
 /// A draft with two authored lines through the real capture service: one fully dated with a
 /// calendar term, one with no dates and a 12-period term.
-#[cfg(orders_event_broker_test_support)]
 async fn authored_draft(t: &T, text: &str) -> Draft {
     let engine = t.engine(&[]);
     let order = create(t, &engine, &format!("{text}-create")).await;
@@ -466,7 +446,6 @@ async fn authored_draft(t: &T, text: &str) -> Draft {
     Draft { order, lines }
 }
 
-#[cfg(orders_event_broker_test_support)]
 async fn basis(t: &T, draft: &Draft, clock: PreparationClock) -> DateBasis {
     DatePreparer::new(t.env.db.clone(), clock)
         .prepare(
@@ -482,7 +461,6 @@ async fn basis(t: &T, draft: &Draft, clock: PreparationClock) -> DateBasis {
 
 /// Submit `draft` with `basis` bound to `capture.date-basis` and the composite gate refusing
 /// exactly when the basis reports missing required dates (03 §4.2 predicate 8).
-#[cfg(orders_event_broker_test_support)]
 async fn submit(
     t: &T,
     draft: &Draft,
@@ -506,7 +484,11 @@ async fn submit(
                 GuardVerdict::Fail(Reason::DateCascadeInvalid)
             }
         });
+    let attempt_id = serde_json::from_value(t.json(&format!(
+        "SELECT to_jsonb(attempt_id) AS j FROM bss_orders__commercial_attempt WHERE order_id='{}' AND candidate_version={candidate}", draft.order
+    )).await).unwrap();
     p.documents = Some(Arc::new(AdmitLines {
+        attempt_id,
         drafts: draft.lines.clone(),
         basis: shared,
         version: candidate,
@@ -514,7 +496,6 @@ async fn submit(
     engine.transition(&buyer(), req, &fixed(p)).await.unwrap()
 }
 
-#[cfg(orders_event_broker_test_support)]
 async fn order_lines(t: &T, order: Uuid) -> Vec<entity::order_line::Model> {
     let mut lines = repo::children::order_line_for_order(
         &t.env.db.conn().unwrap(),
@@ -531,7 +512,6 @@ async fn order_lines(t: &T, order: Uuid) -> Vec<entity::order_line::Model> {
 /// Admission stores three resolved dates and the identical snapshot, copies the authored term
 /// verbatim, writes no acceptance from the due date, and survives a later policy promotion and
 /// later reads unchanged. The attempt's frozen basis restores exactly.
-#[cfg(orders_event_broker_test_support)]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn admission_persists_the_resolved_triple_and_snapshot_immutably() {
@@ -552,6 +532,36 @@ async fn admission_persists_the_resolved_triple_and_snapshot_immutably() {
     };
     let lines = order_lines(&t, draft.order).await;
     assert_eq!(lines.len(), 2);
+    // Every admitted row needs its commercial links and pin, even with a NULL overlap key.
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.order_pin.is_some() && l.overlap_scope_key.is_none())
+    );
+    for column in [
+        "commercial_attempt_id",
+        "pricing_acceptance_id",
+        "pricing_request_digest",
+        "pricing_terms_digest",
+        "order_pin",
+    ] {
+        // CHECK runs before uniqueness: reusing the source row isolates this constraint.
+        let error = t.env.pg.raw.execute_unprepared(&format!(
+            "INSERT INTO bss_orders__order_line SELECT (jsonb_populate_record(NULL::bss_orders__order_line, to_jsonb(l) || jsonb_build_object('{column}', NULL))).* FROM bss_orders__order_line l WHERE order_id='{}' LIMIT 1", draft.order
+        )).await.unwrap_err();
+        assert!(
+            error.to_string().contains("ck_bss_orders__order_line__2"),
+            "{column}: {error}"
+        );
+    }
+    // The old CHECK admitted an entirely unpinned row; explicitly reject that branch.
+    let error = t.env.pg.raw.execute_unprepared(&format!(
+        "INSERT INTO bss_orders__order_line SELECT (jsonb_populate_record(NULL::bss_orders__order_line, to_jsonb(l) - ARRAY['commercial_attempt_id','pricing_acceptance_id','pricing_request_digest','pricing_terms_digest','order_pin']::text[])).* FROM bss_orders__order_line l WHERE order_id='{}' LIMIT 1", draft.order
+    )).await.unwrap_err();
+    assert!(
+        error.to_string().contains("ck_bss_orders__order_line__2"),
+        "{error}"
+    );
     let today = basis.proposed_utc_date.0;
     let (dated, undated) = (&lines[0], &lines[1]);
     assert_eq!(
@@ -693,7 +703,6 @@ async fn admission_persists_the_resolved_triple_and_snapshot_immutably() {
 }
 
 /// The admitted-line CHECK (D-207 item 3, D-208): the exact refused and allowed shapes.
-#[cfg(orders_event_broker_test_support)]
 async fn check_shapes(t: &T, order: Uuid, state: &Value) {
     // The schema refuses an admitted line without all three dates or with a malformed snapshot.
     let extra = u(9_001);
@@ -706,8 +715,8 @@ async fn check_shapes(t: &T, order: Uuid, state: &Value) {
         .unwrap();
     let insert = |sa: &str, ad: &str, snapshot: &Value| {
         format!(
-            "INSERT INTO bss_orders__order_line(order_id,version,line_id,plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_duration,term_kind,authored_term,billing_cycle,date_policy_switch_state) \
-             SELECT order_id,version,'{extra}',plan_id,plan_revision_id,selected_items,currency,contract_effective_date,{sa},{ad},term_duration,term_kind,authored_term,billing_cycle,'{snapshot}'::jsonb FROM bss_orders__order_line WHERE order_id='{order}' LIMIT 1"
+            "INSERT INTO bss_orders__order_line(order_id,version,line_id,plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_duration,term_kind,authored_term,billing_cycle,date_policy_switch_state,commercial_attempt_id,pricing_acceptance_id,pricing_request_digest,pricing_terms_digest,order_pin,overlap_scope_key) \
+             SELECT order_id,version,'{extra}',plan_id,plan_revision_id,selected_items,currency,contract_effective_date,{sa},{ad},term_duration,term_kind,authored_term,billing_cycle,'{snapshot}'::jsonb,commercial_attempt_id,pricing_acceptance_id,pricing_request_digest,pricing_terms_digest,order_pin,overlap_scope_key FROM bss_orders__order_line WHERE order_id='{order}' LIMIT 1"
         )
     };
     let mut tampered = Vec::new();
@@ -792,7 +801,6 @@ async fn check_shapes(t: &T, order: Uuid, state: &Value) {
 }
 
 /// Admitted lines, versions past 1 and resolved totals of `order`.
-#[cfg(orders_event_broker_test_support)]
 async fn no_admission(t: &T, order: Uuid) -> i64 {
     t.n(&format!(
         "SELECT (SELECT count(*) FROM bss_orders__order_line WHERE order_id='{order}') + (SELECT count(*) FROM bss_orders__order_version WHERE order_id='{order}' AND version>1) + (SELECT count(*) FROM bss_orders__resolved_total WHERE order_id='{order}') AS n"
@@ -803,7 +811,6 @@ async fn no_admission(t: &T, order: Uuid) -> i64 {
 /// Injected clock across UTC midnight: the basis was prepared on the previous UTC day, so the
 /// engine's transition timestamp refuses `date-cascade-invalid` with no admitted version, line
 /// or snapshot; the same key replays the refusal; a fresh attempt re-resolves and commits.
-#[cfg(orders_event_broker_test_support)]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_utc_day_rollover_refuses_without_admission_and_a_fresh_attempt_commits() {
@@ -895,7 +902,6 @@ async fn a_utc_day_rollover_refuses_without_admission_and_a_fresh_attempt_commit
 
 /// A policy-required date left unauthored fails the gate even though a default is available,
 /// and the refusal stores no admission snapshot.
-#[cfg(orders_event_broker_test_support)]
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_required_unauthored_date_refuses_at_the_gate_without_admission() {

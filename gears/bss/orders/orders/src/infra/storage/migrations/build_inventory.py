@@ -48,6 +48,8 @@ for f in files:
     c=re.fullmatch(r'(\w+) (char\(3\)|\w+)( NOT NULL)?(.*)',line)
     assert c,line
     n,ty,required,extra=c.groups();t['columns'].append(dict(name=n,type=ty,nullable=not bool(required),extra=extra.strip()))
+  for a in re.finditer(r'ALTER TABLE '+full+r' ADD COLUMN (\w+) (\w+)( NOT NULL)?;',sql):
+   n,ty,required=a.groups();t['columns'].append(dict(name=n,type=ty,nullable=not bool(required),extra=''))
   for a in re.finditer(r'ALTER TABLE '+full+r' (ADD CONSTRAINT (\w+) (.*?));',sql,re.S):t['constraints'][a[2]]=' '.join(a[3].split())
   for a in re.finditer(r'ALTER TABLE '+full+r' DROP CONSTRAINT (\w+);',sql):t['constraints'].pop(a[1],None)
   for i in re.finditer(r'CREATE (UNIQUE )?INDEX (\w+) ON '+full+r' (.*?);',sql):t['indexes'][i[2]]=(i[1] or '')+i[3]

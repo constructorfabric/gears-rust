@@ -303,8 +303,7 @@ impl TxEvents {
     }
 
     /// Test-only: skip Orders' own contract and size admission to prove the platform's checks.
-    /// Its only caller is the #5381-dependent events suite (D-229).
-    #[cfg(all(test, orders_event_broker_test_support))]
+    #[cfg(test)]
     pub(crate) async fn enqueue_unchecked<T: TransactionRunner + Sync, K: EventKind>(
         &self,
         locked: &LockedOrder<'_, T>,

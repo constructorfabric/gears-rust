@@ -24,6 +24,11 @@ use bss_orders_sdk::authoring::{
     Currency, DraftLine, HeaderPatch, LinePatch, OrderHeader, OrderView, Quantity, SelectedItem,
     VersionSummary,
 };
+use bss_orders_sdk::gate_report::GateReport;
+use bss_orders_sdk::preview::{
+    DiscountView, ExactMoneyView, MoneyView, PinOutcomeView, PreviewBasket, PreviewLine,
+    PreviewResult,
+};
 use bss_orders_sdk::reads::{LinePage, OrderPage, OrderSummary, PageInfo};
 use serde::Deserialize as _;
 use uuid::Uuid;
@@ -324,10 +329,14 @@ pub struct OrdersLinePatch {
 }
 
 /// Submit carries only its independent draft revision; actor/version/key are not body fields.
-/// Not mounted yet (S3-12 delivers the submit route); the boundary fixtures decode it.
-#[derive(Debug, serde::Deserialize)]
+/// Mounted only in the development delivery beside Preview (M3b, D-234:
+/// [`super::gate::submit_router`]); the boundary fixtures decode it too.
+#[toolkit_macros::api_dto(request)]
+#[derive(Debug)]
 #[serde(deny_unknown_fields)]
 pub struct SubmitBody {
+    /// The draft revision the caller assessed; a nonnegative signed bigint.
+    #[schema(value_type = i64, minimum = 0)]
     pub expected_draft_revision: bss_orders_sdk::models::DraftRevision,
 }
 
@@ -466,6 +475,9 @@ pub struct OrdersTransitionResult {
     /// The server-reserved identity of an inserted line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_id: Option<Uuid>,
+    /// The frozen commercial assessment of a successful submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_id: Option<Uuid>,
 }
 
 /// The order header at its current version.
@@ -498,6 +510,8 @@ pub struct OrdersVersionSummary {
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
 pub struct OrdersDraftLine {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub committed: Option<OrdersCommittedLine>,
     pub line_id: Uuid,
     pub plan_id: Uuid,
     pub plan_revision_id: Uuid,
@@ -514,6 +528,8 @@ pub struct OrdersDraftLine {
 #[toolkit_macros::api_dto(request, response)]
 #[serde(deny_unknown_fields)]
 pub struct OrdersOrderView {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_totals: Option<Vec<OrdersCommittedTotal>>,
     pub order: OrdersOrderHeader,
     pub version: OrdersVersionSummary,
     pub lines: Vec<OrdersDraftLine>,
@@ -668,6 +684,10 @@ impl TryFrom<DraftLine> for OrdersDraftLine {
     type Error = ResponseUnencodable;
     fn try_from(line: DraftLine) -> Result<Self, Self::Error> {
         Ok(Self {
+            committed: line
+                .committed
+                .map(OrdersCommittedLine::try_from)
+                .transpose()?,
             line_id: line.line_id,
             plan_id: line.plan_id,
             plan_revision_id: line.plan_revision_id,
@@ -703,6 +723,9 @@ impl TryFrom<OrderView> for OrdersOrderView {
     type Error = ResponseUnencodable;
     fn try_from(view: OrderView) -> Result<Self, Self::Error> {
         Ok(Self {
+            resolved_totals: view
+                .resolved_totals
+                .map(|rows| rows.into_iter().map(Into::into).collect()),
             order: view.order.try_into()?,
             version: view.version.try_into()?,
             lines: lines(view.lines)?,
@@ -755,5 +778,452 @@ impl TryFrom<LinePage> for OrdersLinePage {
             current_version: page.current_version.into(),
             draft_revision: page.draft_revision.map(i64::from),
         })
+    }
+}
+
+// Preview (S3-11; development build only, M2-1): the request body and the served response.
+
+/// One line to assess: the shape of [`OrdersAddLine`] without the draft revision; term and cycle
+/// optional (their absence withholds the TCV, D-125).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersPreviewLine {
+    pub plan_id: Uuid,
+    pub plan_revision_id: Uuid,
+    pub selected_items: Vec<OrdersSelectedItem>,
+    pub currency: String,
+    #[serde(default)]
+    pub contract_effective_date: Option<String>,
+    #[serde(default)]
+    pub service_activation_date: Option<String>,
+    #[serde(default)]
+    pub acceptance_due_date: Option<String>,
+    #[serde(default)]
+    pub term_duration: Option<OrdersAuthoredTerm>,
+    #[serde(default, deserialize_with = "cycle")]
+    pub billing_cycle: Option<String>,
+}
+
+/// The basket to assess (at most 200 lines). Nothing is stored except the run's diagnostics.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersPreviewBasket {
+    pub resource_tenant_id: Uuid,
+    pub payer_tenant_id: Uuid,
+    pub seller_tenant_id: Uuid,
+    #[serde(default)]
+    pub contract_id: Option<Uuid>,
+    pub lines: Vec<OrdersPreviewLine>,
+}
+
+impl TryFrom<OrdersPreviewLine> for PreviewLine {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersPreviewLine) -> Result<Self, Self::Error> {
+        Ok(Self {
+            plan_id: body.plan_id,
+            plan_revision_id: body.plan_revision_id,
+            selected_items: items(body.selected_items)?,
+            currency: Currency::try_from(body.currency)?,
+            contract_effective_date: date(body.contract_effective_date, "contract_effective_date")?,
+            service_activation_date: date(body.service_activation_date, "service_activation_date")?,
+            acceptance_due_date: date(body.acceptance_due_date, "acceptance_due_date")?,
+            term_duration: body.term_duration.map(AuthoredTerm::from),
+            billing_cycle: billing_cycle(body.billing_cycle)?,
+        })
+    }
+}
+
+impl TryFrom<OrdersPreviewBasket> for PreviewBasket {
+    type Error = AuthoringInvalid;
+    fn try_from(body: OrdersPreviewBasket) -> Result<Self, Self::Error> {
+        Ok(Self {
+            resource_tenant_id: body.resource_tenant_id,
+            payer_tenant_id: body.payer_tenant_id,
+            seller_tenant_id: body.seller_tenant_id,
+            contract_id: body.contract_id,
+            lines: body
+                .lines
+                .into_iter()
+                .map(PreviewLine::try_from)
+                .collect::<Result<_, _>>()?,
+        })
+    }
+}
+
+/// One outcome of the gate report: the public fields only, every enum as its stored token.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersGateOutcome {
+    pub predicate: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<Uuid>,
+    pub has_catalog_selection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_scope_key: Option<String>,
+    pub verdict: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub applicability: String,
+}
+
+/// One entry of the failure list.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersGateFailure {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_id: Option<Uuid>,
+    pub reason: String,
+    pub predicate: String,
+}
+
+/// The authorized gate report of one run.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersGateReport {
+    pub assessment_id: Uuid,
+    pub mapping_version: String,
+    pub outcomes: Vec<OrdersGateOutcome>,
+    pub failures: Vec<OrdersGateFailure>,
+}
+
+/// A line's pin outcome; `reason` is the public reason token.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum OrdersPinOutcome {
+    Composed,
+    Unresolvable { reason: String },
+    Unevaluable { reason: String },
+}
+
+/// The result for one basket line; `deferral` is the line's service activation date when it
+/// differs from the run's date.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersPreviewLineResult {
+    pub line_id: Uuid,
+    pub pin: OrdersPinOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferral: Option<String>,
+}
+
+/// An exact fraction of the currency's major unit, both parts canonical integer text, verbatim.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersExactMoney {
+    pub numerator: String,
+    pub denominator: String,
+    pub currency: String,
+    pub currency_scale: u8,
+}
+
+/// A money value: the exact fraction and the producer's display text, both verbatim.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersMoney {
+    pub exact: OrdersExactMoney,
+    pub display: String,
+}
+
+/// The discount of a resolved total.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(tag = "kind", deny_unknown_fields)]
+pub enum OrdersDiscount {
+    Available {
+        exact: OrdersExactMoney,
+        display: String,
+    },
+    Unavailable,
+}
+
+/// The resolved total, every amount verbatim.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersResolvedTotal {
+    pub currency: String,
+    pub currency_scale: u8,
+    pub gross: OrdersMoney,
+    pub net: OrdersMoney,
+    pub discount: OrdersDiscount,
+    pub usage_flagged: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exclusions: Option<serde_json::Value>,
+}
+
+/// The indicative tax of one line.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersLineTax {
+    pub line_id: Uuid,
+    pub tax: OrdersMoney,
+}
+
+/// The indicative (nonbinding, unstored) tax.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersIndicativeTax {
+    pub per_line: Vec<OrdersLineTax>,
+    pub total: OrdersMoney,
+    pub explicit_no_tax: bool,
+}
+
+/// Why and for which lines the TCV is withheld (`preview-term-or-cycle-missing`, D-125).
+#[allow(
+    unknown_lints,
+    de0803_api_snake_case,
+    reason = "`lineIds` is the registered wire name of the annotation (models.json, D-125)"
+)]
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersTcvWithheld {
+    pub reason: String,
+    #[serde(rename = "lineIds")]
+    pub line_ids: Vec<Uuid>,
+}
+
+/// The Preview assessment. `tcv` is absent and `tcvWithheld` present exactly when a line lacks
+/// term or cycle (D-125); there is no approval verdict, deadline or quote validity, by design.
+#[allow(
+    unknown_lints,
+    de0803_api_snake_case,
+    reason = "`tcvWithheld` is the registered wire name of the annotation (models.json, D-125)"
+)]
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersPreviewResult {
+    pub assessment_id: Uuid,
+    pub assessment: OrdersGateReport,
+    pub lines: Vec<OrdersPreviewLineResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_total: Option<OrdersResolvedTotal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indicative_tax: Option<OrdersIndicativeTax>,
+    /// RFC 3339 instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_fulfillment_time: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcv: Option<OrdersMoney>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tcv_basis: Option<String>,
+    #[serde(
+        default,
+        rename = "tcvWithheld",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub tcv_withheld: Option<OrdersTcvWithheld>,
+}
+
+fn exact_money(e: ExactMoneyView) -> OrdersExactMoney {
+    OrdersExactMoney {
+        numerator: e.numerator,
+        denominator: e.denominator,
+        currency: e.currency,
+        currency_scale: e.currency_scale,
+    }
+}
+
+fn money(m: MoneyView) -> OrdersMoney {
+    OrdersMoney {
+        exact: exact_money(m.exact),
+        display: m.display,
+    }
+}
+
+impl TryFrom<GateReport> for OrdersGateReport {
+    type Error = ResponseUnencodable;
+    fn try_from(report: GateReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            assessment_id: report.assessment_id,
+            mapping_version: report.mapping_version,
+            outcomes: report
+                .outcomes
+                .into_iter()
+                .map(|o| {
+                    let (has_catalog_selection, catalog_scope_key) = o.selection.into_parts();
+                    Ok(OrdersGateOutcome {
+                        predicate: o.predicate,
+                        line_id: o.line_id,
+                        item_id: o.item_id,
+                        has_catalog_selection,
+                        catalog_scope_key,
+                        verdict: o.verdict,
+                        reason: spelled_opt(o.reason.as_ref(), "reason")?,
+                        applicability: o.applicability,
+                    })
+                })
+                .collect::<Result<_, ResponseUnencodable>>()?,
+            failures: report
+                .failures
+                .into_iter()
+                .map(|f| {
+                    Ok(OrdersGateFailure {
+                        line_id: f.line_id,
+                        reason: spelled(&f.reason, "reason")?,
+                        predicate: f.predicate,
+                    })
+                })
+                .collect::<Result<_, ResponseUnencodable>>()?,
+        })
+    }
+}
+
+impl TryFrom<PreviewResult> for OrdersPreviewResult {
+    type Error = ResponseUnencodable;
+    fn try_from(result: PreviewResult) -> Result<Self, Self::Error> {
+        let lines = result
+            .lines
+            .into_iter()
+            .map(|l| {
+                let pin = match l.pin {
+                    PinOutcomeView::Composed => OrdersPinOutcome::Composed,
+                    PinOutcomeView::Unresolvable { reason } => {
+                        OrdersPinOutcome::Unresolvable { reason }
+                    }
+                    PinOutcomeView::Unevaluable { reason } => {
+                        OrdersPinOutcome::Unevaluable { reason }
+                    }
+                    // The gear never builds a kind this build does not know.
+                    _ => return Err(ResponseUnencodable("pin")),
+                };
+                Ok(OrdersPreviewLineResult {
+                    line_id: l.line_id,
+                    pin,
+                    deferral: spelled_opt(l.deferral.as_ref(), "deferral")?,
+                })
+            })
+            .collect::<Result<_, ResponseUnencodable>>()?;
+        let resolved_total = result
+            .resolved_total
+            .map(|t| {
+                let discount = match t.discount {
+                    DiscountView::Available(m) => OrdersDiscount::Available {
+                        exact: exact_money(m.exact),
+                        display: m.display,
+                    },
+                    DiscountView::Unavailable => OrdersDiscount::Unavailable,
+                    _ => return Err(ResponseUnencodable("discount")),
+                };
+                Ok(OrdersResolvedTotal {
+                    currency: t.currency,
+                    currency_scale: t.currency_scale,
+                    gross: money(t.gross),
+                    net: money(t.net),
+                    discount,
+                    usage_flagged: t.usage_flagged,
+                    exclusions: t.exclusions,
+                })
+            })
+            .transpose()?;
+        let expected_fulfillment_time = result
+            .expected_fulfillment_time
+            .map(|t| {
+                t.format(&time::format_description::well_known::Rfc3339)
+                    .map_err(|_| ResponseUnencodable("expected_fulfillment_time"))
+            })
+            .transpose()?;
+        Ok(Self {
+            assessment_id: result.assessment_id,
+            assessment: result.assessment.try_into()?,
+            lines,
+            resolved_total,
+            indicative_tax: result.indicative_tax.map(|t| OrdersIndicativeTax {
+                per_line: t
+                    .per_line
+                    .into_iter()
+                    .map(|l| OrdersLineTax {
+                        line_id: l.line_id,
+                        tax: money(l.tax),
+                    })
+                    .collect(),
+                total: money(t.total),
+                explicit_no_tax: t.explicit_no_tax,
+            }),
+            expected_fulfillment_time,
+            tcv: result.tcv.map(money),
+            tcv_basis: result.tcv_basis,
+            tcv_withheld: result.tcv_withheld.map(|w| OrdersTcvWithheld {
+                reason: w.reason,
+                line_ids: w.line_ids,
+            }),
+        })
+    }
+}
+
+/// Frozen, codec-validated Pricing receipt and assessment (schema version 2).
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersCommittedLine {
+    pub commercial_attempt_id: Uuid,
+    /// Schema-2 `OrderPin`, including frozen price bindings and billing terms.
+    pub order_pin: serde_json::Value,
+}
+impl TryFrom<bss_orders_sdk::reads::CommittedLine> for OrdersCommittedLine {
+    type Error = ResponseUnencodable;
+    fn try_from(line: bss_orders_sdk::reads::CommittedLine) -> Result<Self, Self::Error> {
+        Ok(Self {
+            commercial_attempt_id: line.commercial_attempt_id,
+            order_pin: serde_json::to_value(line.order_pin)
+                .map_err(|_| ResponseUnencodable("order_pin"))?,
+        })
+    }
+}
+/// Persisted producer totals; exact and display amounts are decimal strings.
+#[toolkit_macros::api_dto(request, response)]
+#[serde(deny_unknown_fields)]
+pub struct OrdersCommittedTotal {
+    pub scope: String,
+    pub line_id: Uuid,
+    pub currency: String,
+    pub assessment_id: Uuid,
+    pub currency_scale: u8,
+    pub exclusions: serde_json::Value,
+    pub item_breakdown: serde_json::Value,
+    pub recurring_by_cycle: serde_json::Value,
+    pub amount_status: String,
+    pub amount_basis: String,
+    pub period_evidence: serde_json::Value,
+    pub gross_exact: Option<String>,
+    pub gross_display: Option<String>,
+    pub net_exact: Option<String>,
+    pub net_display: Option<String>,
+    pub discount_status: String,
+    pub discount_exact: Option<String>,
+    pub discount_display: Option<String>,
+    pub promotion_ref: Option<String>,
+    pub charge_kind: String,
+    pub tcv_exact: Option<String>,
+    pub tcv_display: Option<String>,
+    pub tcv_basis: Option<String>,
+    pub tcv_evidence: Option<serde_json::Value>,
+}
+impl From<bss_orders_sdk::reads::CommittedTotal> for OrdersCommittedTotal {
+    fn from(row: bss_orders_sdk::reads::CommittedTotal) -> Self {
+        Self {
+            scope: row.scope,
+            line_id: row.line_id,
+            currency: row.currency,
+            assessment_id: row.assessment_id,
+            currency_scale: row.currency_scale,
+            exclusions: row.exclusions,
+            item_breakdown: row.item_breakdown,
+            recurring_by_cycle: row.recurring_by_cycle,
+            amount_status: row.amount_status,
+            amount_basis: row.amount_basis,
+            period_evidence: row.period_evidence,
+            gross_exact: row.gross_exact,
+            gross_display: row.gross_display,
+            net_exact: row.net_exact,
+            net_display: row.net_display,
+            discount_status: row.discount_status,
+            discount_exact: row.discount_exact,
+            discount_display: row.discount_display,
+            promotion_ref: row.promotion_ref,
+            charge_kind: row.charge_kind,
+            tcv_exact: row.tcv_exact,
+            tcv_display: row.tcv_display,
+            tcv_basis: row.tcv_basis,
+            tcv_evidence: row.tcv_evidence,
+        }
     }
 }

@@ -10,6 +10,8 @@ pub mod dates;
 pub mod error;
 /// The closed fulfillment failure reasons shared by the audit rule and the event contract.
 pub mod failure;
+/// The shared gate assessment's pure core (Stage 3, D-227).
+pub mod gate;
 pub mod idempotency;
 pub mod overlap;
 /// Read surfaces (early S6-01/S6-04): page bounds, cursor codec and the access-log decision.

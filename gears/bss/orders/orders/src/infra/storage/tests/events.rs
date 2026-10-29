@@ -3,8 +3,8 @@
 //! loaded from the real `types-registry` commit of the Orders contract.
 //!
 //! Test doubles are limited to the two inputs the platform does not ship locally: the broker's
-//! PDP (scripted grants: the gear-local policy fake, D-227, models Orders' own resources only)
-//! and the tenant resolver's root answer. Transport and
+//! PDP (scripted grants; the bundled rules provider cannot express the broker's
+//! property-less event-type check) and the tenant resolver's root answer. Transport and
 //! rate-limit faults are injected at the producer's `EventBrokerApi` client boundary around the
 //! real broker.
 use super::*;
@@ -12,6 +12,10 @@ use crate::authz::test_pdp::{ScriptedPdp, allow, deny};
 use crate::infra::broker::{self, BindFailure, BoundProducer, ProducerSettings};
 use crate::infra::events::payload::{
     LineRef, OrderCancelled, OrderHeld, OrderResumed, OrderSubmitted,
+};
+use crate::infra::events::test_support::broker::EventBrokerHarness;
+use crate::infra::events::test_support::faults::{
+    DeliveredOutcome, DeliveredPublish, FaultInjectingBroker, TransientFault,
 };
 use crate::infra::events::test_support::{Root, root};
 use crate::infra::events::test_support::{encoded_max_events, max_events, registry_client};
@@ -21,9 +25,6 @@ use crate::infra::events::{
 use crate::infra::storage::repo::TransactionRunner;
 use crate::infra::storage::repo::audit as writer;
 use bss_orders_sdk::catalog::{OrderState, Trigger};
-use event_broker::test_support::{
-    DeliveredOutcome, DeliveredPublish, EventBrokerHarness, FaultInjectingBroker, TransientFault,
-};
 use event_broker_sdk::{EventBrokerApi, Sequence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -64,6 +65,18 @@ fn grants(granted: Arc<AtomicBool>) -> Arc<ScriptedPdp> {
                         .get("event_type_id")
                         .and_then(serde_json::Value::as_str)
                         .is_some_and(|t| t.starts_with(events::EVENT_BASE))
+            }
+            // Event Broker authorizes publish on the concrete event-type id (#5383); it also
+            // sends that id as `event_type_id`, which must name this same type (DESIGN §3.3).
+            t if t.starts_with(events::EVENT_BASE) => {
+                producer
+                    && produce
+                    && request
+                        .resource
+                        .properties
+                        .get("event_type_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(t)
             }
             "gts.cf.core.events.request.v1~" => {
                 producer

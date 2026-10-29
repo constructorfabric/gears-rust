@@ -38,6 +38,32 @@ fn config() -> Value {
 }
 /// A test-only 32-byte audit minimization key (D-204).
 const TEST_KEY: &str = "unit-test-key-0123456789abcdefgh";
+/// The checked-in E2E gear block with its secret reference replaced by the test key, as the
+/// launcher's `ORDERS_AUDIT_MINIMIZATION_KEY` would resolve it. The reference itself is asserted
+/// so a literal key can never be committed to the fragment.
+fn e2e_block() -> Value {
+    let text = include_str!("../../../config/e2e-orders.yaml");
+    let parsed: std::collections::HashMap<String, Value> = serde_saphyr::from_str(text).unwrap();
+    let mut block = parsed["bss-orders"]["config"].clone();
+    assert_eq!(
+        block["audit_minimization"]["key"],
+        json!("${ORDERS_AUDIT_MINIMIZATION_KEY}"),
+        "the E2E key is a secret reference, never a literal"
+    );
+    block["audit_minimization"]["key"] = json!(TEST_KEY);
+    // The class connections are secret references too (S2-11); the launcher exports them.
+    for class in ["retention", "maintenance", "verifier", "checkpoint"] {
+        assert_eq!(
+            block["maintenance"]["connections"][class],
+            json!(format!("${{ORDERS_{}_DSN}}", class.to_uppercase())),
+            "the E2E {class} DSN is a secret reference, never a literal"
+        );
+        block["maintenance"]["connections"][class] = json!(format!(
+            "postgres://e2e_{class}:redacted@127.0.0.1:5432/postgres"
+        ));
+    }
+    block
+}
 /// A complete maintenance block with every class connection, for config tests.
 fn maintenance_block() -> Value {
     json!({
@@ -252,29 +278,88 @@ fn service_principal_identities_are_required_and_fail_closed() {
     }
 }
 
-/// A gear block with distinct maintenance, service and producer identities parses, validates
-/// and classifies them: the maintenance actor is `system`, each configured principal `service`,
-/// and every other subject, including a lookalike subject ID in another tenant, `user` (D-115).
+/// The E2E fragment pairs Orders' declared partition count with the broker's own setting for
+/// the Orders topic, resolved as the broker does (topic entry, then the instance-less topic-type
+/// entry, then `BUILT_IN_PARTITIONS`). A mismatch silently loses events (`UPSTREAM_REQS` §2.7),
+/// so the declaration and the broker setting must change together.
 #[test]
-fn configured_identities_classify_system_service_and_user_distinctly() {
+fn e2e_fragment_pairs_the_declared_partition_count_with_the_broker_topic() {
+    let text = include_str!("../../../config/e2e-orders.yaml");
+    let parsed: std::collections::HashMap<String, Value> = serde_saphyr::from_str(text).unwrap();
+    let orders = serde_json::from_value::<OrdersConfig>(e2e_block())
+        .unwrap()
+        .producer_settings()
+        .unwrap();
+    let topics: event_broker::config::TopicSettingsMap =
+        serde_json::from_value(parsed["event-broker"]["config"]["topics"].clone()).unwrap();
+    let configured = topics
+        .entries
+        .get(crate::infra::events::TOPIC)
+        .and_then(|entry| entry.partitions)
+        .or_else(|| {
+            topics
+                .entries
+                .get("gts.cf.core.events.topic.v1~")
+                .and_then(|entry| entry.partitions)
+        })
+        .unwrap_or(event_broker::config::BUILT_IN_PARTITIONS);
+    assert_eq!(i64::from(orders.broker_partitions), i64::from(configured));
+}
+
+/// The E2E producer grants name exactly the configured producer principal: an exact unconditional
+/// grant for the concrete submitted event `produce` check and a root-tenant-constrained rule
+/// for the tenant-scope check. The fragment is not a complete policy, so the plugin's required
+/// envelope is supplied here only to validate the grants.
+#[test]
+fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
+    let text = include_str!("../../../config/e2e-orders.yaml");
+    let parsed: std::collections::HashMap<String, Value> = serde_saphyr::from_str(text).unwrap();
+    let orders = serde_json::from_value::<OrdersConfig>(e2e_block())
+        .unwrap()
+        .producer_settings()
+        .unwrap();
+    let mut policy = parsed["bss-orders-test-authz-plugin"]["config"].clone();
+    policy["vendor"] = json!("constructorfabric");
+    policy["priority"] = json!(10);
+    policy["policy_revision"] = json!("orders-e2e-fragment");
+    let policy: bss_orders_test_authz_plugin::config::OrdersTestAuthZPluginConfig =
+        serde_json::from_value(policy).unwrap();
+    policy.validate().unwrap();
+    let [grant] = policy.unconditional_grants.as_slice() else {
+        panic!("exactly one unconditional grant")
+    };
+    assert_eq!(
+        (grant.subject.id, grant.subject.tenant_id),
+        (orders.subject_id, Some(orders.tenant_id))
+    );
+    assert_eq!(
+        (grant.resource_type.as_str(), grant.action.as_str()),
+        (
+            "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~",
+            "produce"
+        )
+    );
+    let [rule] = policy.rules.as_slice() else {
+        panic!("exactly one tenant-scope rule")
+    };
+    assert_eq!(
+        (rule.subject.id, rule.subject.tenant_id),
+        (orders.subject_id, Some(orders.tenant_id))
+    );
+    assert_eq!(
+        rule.resource_type,
+        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE
+    );
+    assert_eq!(rule.actions, ["produce"]);
+    assert_eq!(rule.paths.len(), 1);
+    assert_eq!(rule.paths[0].predicates[0].property, "owner_tenant_id");
+}
+
+/// The checked-in live-E2E gear block parses, validates and classifies distinct identities.
+#[test]
+fn e2e_config_fragment_has_distinct_system_service_and_user_identities() {
     use crate::domain::audit::AuditActorClass;
-    let tenant = "0e0e0000-0000-4000-8000-0000000000aa";
-    let principal = |role: &str, n: &str| json!({"role": role, "subject_id": format!("0e0e0000-0000-4000-8000-000000000{n}"), "tenant_id": tenant});
-    let mut value = config();
-    value["service_principals"] = json!([
-        principal("workflow", "002"),
-        principal("subscriptions", "003"),
-        principal("billing", "004")
-    ]);
-    value["events"]["producer_subject_id"] = json!("0e0e0000-0000-4000-8000-000000000005");
-    value["events"]["producer_tenant_id"] = json!(tenant);
-    value["maintenance"] = json!({
-        "actor_subject_id": "0e0e0000-0000-4000-8000-000000000001",
-        "actor_tenant_id": tenant,
-        "tasks": ["retention_purge"],
-        "connections": {"retention": "postgres://r:secret-r@127.0.0.1:5432/postgres"}
-    });
-    let cfg = serde_json::from_value::<OrdersConfig>(value).unwrap();
+    let cfg = serde_json::from_value::<OrdersConfig>(e2e_block()).unwrap();
     cfg.validate().unwrap();
     let ids = cfg.actor_identities().unwrap();
     let ctx = |s: &str, t: &str| {
@@ -284,6 +369,7 @@ fn configured_identities_classify_system_service_and_user_distinctly() {
             .build()
             .unwrap()
     };
+    let tenant = "0e0e0000-0000-4000-8000-0000000000aa";
     let class = |s: &str, t: &str| ids.classify(&ctx(s, t)).unwrap().class();
     assert_eq!(
         class("0e0e0000-0000-4000-8000-000000000001", tenant),
@@ -765,7 +851,6 @@ async fn unsupported_database_cannot_publish_a_client() -> anyhow::Result<()> {
 /// sink and the transition engine built over it, and reports the producer ready; shutdown
 /// withdraws both and stops the library workers. The gear stays unhealthy overall because no
 /// business operation is delivered.
-#[cfg(orders_event_broker_test_support)] // D-229: `with_types_registry_client` is #5381.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn serve_binds_the_real_producer_and_stops_its_workers() -> anyhow::Result<()> {
@@ -777,7 +862,7 @@ async fn serve_binds_the_real_producer_and_stops_its_workers() -> anyhow::Result
     .await?;
     let gear = Arc::new(BssOrdersGear::default());
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
-    let harness = event_broker::test_support::EventBrokerHarness::builder()
+    let harness = crate::infra::events::test_support::broker::EventBrokerHarness::builder()
         .with_types_registry_client(
             crate::infra::events::test_support::registry_client(),
             &[(crate::infra::events::TOPIC, 4)],
@@ -832,7 +917,6 @@ async fn serve_binds_the_real_producer_and_stops_its_workers() -> anyhow::Result
 /// S2-12 readiness loss (DESIGN §3.8): losing the store makes the running instance **not
 /// ready** (code `orders-store-unavailable`) while its lifecycle task keeps running — traffic
 /// stops without any restart loop — and readiness returns once the store answers again.
-#[cfg(orders_event_broker_test_support)] // D-229: `with_types_registry_client` is #5381.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn store_loss_stops_readiness_without_a_restart_loop() -> anyhow::Result<()> {
@@ -847,7 +931,7 @@ async fn store_loss_stops_readiness_without_a_restart_loop() -> anyhow::Result<(
     .await?;
     let gear = Arc::new(BssOrdersGear::default());
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
-    let harness = event_broker::test_support::EventBrokerHarness::builder()
+    let harness = crate::infra::events::test_support::broker::EventBrokerHarness::builder()
         .with_types_registry_client(
             crate::infra::events::test_support::registry_client(),
             &[(crate::infra::events::TOPIC, 4)],
@@ -914,10 +998,337 @@ async fn store_loss_stops_readiness_without_a_restart_loop() -> anyhow::Result<(
     Ok(())
 }
 
-/// The code binds the D-185 gateway zones by name, and the gear-local edge limiter's settings
-/// default to the baseline when absent and are bounded.
+/// S3-14 composition root at gear boot: every gate port is bound to a real client or its
+/// fail-closed adapter, never a double, and the live manifest names each binding. Missing
+/// providers are the designed state (the gear starts); the Pricing/Products clients bind from
+/// `serve` (here through the same bind call), whatever the boot order; configured commercial
+/// identities without a published `AuthN` resolver refuse startup. The upstream clients are the gate tests'
+/// hand-written doubles, registered in the hub as their gears would publish them.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn boot_binds_the_gate_ports_and_names_every_missing_provider() -> anyhow::Result<()> {
+    use crate::domain::gate::ports::Unavailable;
+    use crate::domain::gate::ports::{Delivery, GatePort};
+    use crate::domain::gate::pricing_map::{LineCatalogRequest, ReadFailure};
+    use crate::infra::gate::budget::RunBudget;
+    use crate::infra::gate::pricing_read::CatalogReads;
+    use crate::infra::gate::readiness::{AuthorityState, PortState};
+    use crate::infra::gate::tests::doubles::{FakePricing, FakeProducts, FakeResolver};
+    let (_container, port) = pg_container::start_postgres().await?;
+    let db = toolkit_db::connect_db(
+        &format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
+        toolkit_db::ConnectOpts::default(),
+    )
+    .await?;
+    toolkit_db::migration_runner::run_migrations_for_testing(
+        &db,
+        BssOrdersGear::default().migrations(),
+    )
+    .await?;
+    let with_catalog = |hub: &toolkit::ClientHub| {
+        hub.register::<dyn bss_pricing_sdk::read::PricingReadV1>(Arc::new(FakePricing::new(
+            bss_pricing_sdk::read::RevisionRef {
+                plan_id: Uuid::from_u128(1),
+                revision_id: Uuid::from_u128(2),
+                revision_no: 1,
+            },
+            Vec::new(),
+        )));
+        hub.register::<dyn bss_products_sdk::api::ProductsClient>(
+            Arc::new(FakeProducts::default()),
+        );
+    };
+    let mut with_identities = config();
+    with_identities["gate"] = json!({"commercial_identities": [{
+        "seller_tenant_id": "00000000-0000-0000-0000-000000005e11",
+        "client_id": "orders-gate",
+        "client_secret": "fixture"
+    }]});
+    let boot = |cfg: Value, hub: Arc<toolkit::ClientHub>| {
+        let ctx = context(Some(cfg), hub).with_db(toolkit_db::DBProvider::new(db.clone()));
+        async move {
+            let gear = BssOrdersGear::default();
+            gear.init(&ctx).await?;
+            anyhow::Ok(gear)
+        }
+    };
+
+    let bind = |gear: &BssOrdersGear| {
+        BssOrdersGear::bind_gate_catalog(&gear.runtime.load_full().expect("initialized"))
+    };
+
+    // (1) No Pricing/Products client: the gear starts; the catalog ports name the missing
+    // client and every other port its D-227 package and upstream ask.
+    let gear = boot(config(), dependencies("complete")).await?;
+    assert!(!bind(&gear), "nothing to bind without the clients");
+    let gate = gear.gate_readiness().expect("init binds the gate manifest");
+    assert_eq!(gate.ports.len(), GatePort::ALL.len());
+    for (entry, port) in gate.ports.iter().zip(GatePort::ALL) {
+        assert_eq!(entry.token, port.token());
+        match port.delivery() {
+            Delivery::Available => assert_eq!(entry.state, PortState::MissingClient),
+            Delivery::Missing { package, upreq } => {
+                assert_eq!(entry.state, PortState::ProviderMissing { package, upreq });
+            }
+        }
+    }
+    assert_eq!(gate.authority, AuthorityState::NotProvisioned);
+    assert_eq!(
+        serde_json::to_value(&gate)?["ports"][0]["state"],
+        json!("unavailable (missing client)")
+    );
+    // The bound catalog adapter answers `Missing` without calling anything.
+    let answer = gear
+        .runtime
+        .load_full()
+        .expect("initialized")
+        .gate
+        .catalog
+        .read_line(
+            Uuid::from_u128(0x5e11),
+            &LineCatalogRequest {
+                line_id: Uuid::from_u128(1),
+                plan_id: Uuid::from_u128(2),
+                revision_id: Uuid::from_u128(3),
+                items: Vec::new(),
+            },
+            time::macros::date!(2026 - 10 - 22),
+            &RunBudget::new(),
+            &tokio_util::sync::CancellationToken::new(),
+        )
+        .await;
+    assert_eq!(
+        answer.current,
+        Err(ReadFailure::Unavailable(Unavailable::Missing))
+    );
+
+    // (2) Both clients published after Orders' init (no dependency edge orders them), no
+    // commercial identity: unbound at init, bound over `NotProvisioned` once `serve` binds.
+    let hub = dependencies("complete");
+    let gear = boot(config(), Arc::clone(&hub)).await?;
+    let gate = gear.gate_readiness().expect("init binds the gate manifest");
+    assert_eq!(
+        gate.port(GatePort::Resolve).map(|p| p.state),
+        Some(PortState::MissingClient)
+    );
+    with_catalog(&hub);
+    assert!(bind(&gear), "serve binds the published clients");
+    let gate = gear.gate_readiness().expect("init binds the gate manifest");
+    for port in [
+        GatePort::CurrentRevision,
+        GatePort::Resolve,
+        GatePort::SkuRead,
+    ] {
+        assert_eq!(gate.port(port).map(|p| p.state), Some(PortState::Bound));
+    }
+    assert_eq!(gate.authority, AuthorityState::NotProvisioned);
+    assert_eq!(
+        serde_json::to_value(&gate)?["authority"],
+        json!("not provisioned")
+    );
+
+    // (3) Identities configured, no AuthN resolver published: init refuses and publishes nothing.
+    let hub = dependencies("complete");
+    with_catalog(&hub);
+    let error = boot(with_identities.clone(), Arc::clone(&hub))
+        .await
+        .err()
+        .expect("configured identities without a resolver refuse startup")
+        .to_string();
+    assert!(error.contains("commercial_identities"), "{error}");
+    assert!(!error.contains("fixture"), "{error}");
+    assert!(hub.get::<dyn OrdersV1>().is_err());
+
+    // (4) Identities configured and a resolver published: the authority is bound, exchanging
+    // per read (the SDK carries no token expiry).
+    let hub = dependencies("complete");
+    with_catalog(&hub);
+    hub.register::<dyn authn_resolver_sdk::AuthNResolverClient>(Arc::new(FakeResolver::new(
+        Uuid::from_u128(0x0bd5),
+        Uuid::from_u128(0x40e),
+    )));
+    let gear = boot(with_identities, hub).await?;
+    let gate = gear.gate_readiness().expect("init binds the gate manifest");
+    assert_eq!(gate.authority, AuthorityState::Bound);
+    assert_eq!(
+        serde_json::to_value(&gate)?["authority"],
+        json!("bound (uncached exchange per read)")
+    );
+    Ok(())
+}
+
+/// M3b (D-234): the development delivery mounts `POST /bss-orders/v1/orders/{orderId}/submit`
+/// beside Preview, outside the production census, and the route keeps the authoring routes'
+/// boundary order (edge limiter, `If-Match`, key, body, then the service): without `If-Match` it
+/// is 428 before anything else, a missing key and a refused body are `request-invalid` in that
+/// order, and only a complete request reaches the shared submit service, which answers
+/// unavailable before `serve` binds the engine (no write before readiness) without asking the
+/// PDP (this host's resolver panics if asked). The not-found answer of a bound engine needs the
+/// Event Broker test harness, whose current API the in-crate harness calls do not match (the
+/// known lib-test errors); the SDK path's mapping is pinned by `tests/rest_problems.rs`.
+/// In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
+#[cfg(feature = "gate-dev-stubs")]
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn dev_build_mounts_the_submit_route() -> anyhow::Result<()> {
+    use bss_orders_sdk::catalog::Reason;
+    let (_container, port) = pg_container::start_postgres().await?;
+    let db = toolkit_db::connect_db(
+        &format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres"),
+        toolkit_db::ConnectOpts::default(),
+    )
+    .await?;
+    let gear = BssOrdersGear::default();
+    toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
+    // A per-run copy of the shipped example fixture, as the e2e suite writes its own.
+    let fixture = std::env::temp_dir().join(format!(
+        "bss-orders-dev-stubs-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    std::fs::write(
+        &fixture,
+        include_str!("../../../config/gate-dev-stubs.example.json"),
+    )?;
+    let mut cfg = config();
+    cfg["gate"] = json!({"dev_stubs": true, "dev_stub_fixture": fixture});
+    let ctx = context(Some(cfg), dependencies("complete")).with_db(toolkit_db::DBProvider::new(db));
+    let booted = gear.init(&ctx).await;
+    std::fs::remove_file(&fixture)?;
+    booted?;
+
+    let openapi = toolkit::api::OpenApiRegistryImpl::new();
+    let router = gear.register_rest(&ctx, axum::Router::new(), &openapi)?;
+    // The dev build's document gains the Preview and submit paths; the census stays the eight.
+    let document =
+        serde_json::to_value(openapi.build_openapi(&toolkit::api::OpenApiInfo::default())?)?;
+    let submit_route = crate::api::rest::wire::route("submit").unwrap();
+    let submit_doc = &document["paths"][submit_route.path]["post"];
+    assert_eq!(submit_doc["operationId"], json!("bss_orders.submit"));
+    assert_eq!(submit_doc["requestBody"]["required"], json!(true));
+    assert!(document["paths"]["/bss-orders/v1/orders/preview"]["post"].is_object());
+    assert!(!crate::api::rest::DELIVERED_OPERATIONS.contains(&"submit"));
+    let spec = openapi
+        .operation_specs
+        .iter()
+        .find(|spec| spec.value().path == submit_route.path)
+        .expect("submit is registered");
+    let spec = spec.value();
+    assert_eq!(spec.auth, toolkit::api::RouteAuth::Authenticated);
+    assert_eq!(
+        spec.throttling
+            .as_ref()
+            .and_then(|t| t.rate_limit_zone.as_deref()),
+        Some(crate::api::rest::throttle::CALLER_WRITE_ZONE)
+    );
+
+    let caller = SecurityContext::builder()
+        .subject_id(Uuid::from_u128(1))
+        .subject_tenant_id(Uuid::from_u128(2))
+        .subject_type(toolkit_gts::gts_id!("cf.core.security.subject_user.v1~"))
+        .build()?;
+    let path = submit_route
+        .path
+        .replace("{orderId}", &Uuid::from_u128(3).to_string());
+    let send = |headers: &[(&str, &str)], body: &'static str| {
+        let mut request =
+            axum::http::Request::post(&path).header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request.body(axum::body::Body::from(body)).unwrap();
+        tower::ServiceExt::oneshot(
+            router.clone().layer(axum::Extension(caller.clone())),
+            request,
+        )
+    };
+    let expect = |error: bss_orders_sdk::OrdersError| {
+        let problem = crate::api::rest::problem(error);
+        (problem.status, problem.problem_type, problem.context)
+    };
+    let answered = |status: axum::http::StatusCode, bytes: &[u8]| {
+        let problem: toolkit_canonical_errors::Problem = serde_json::from_slice(bytes).unwrap();
+        (Some(status.as_u16()), problem.problem_type, problem.context)
+    };
+    let valid = r#"{"expected_draft_revision":0}"#;
+    let if_match = ("if-match", "\"1\"");
+    let key = ("idempotency-key", "k-submit");
+    // One over the 512-character bound of a delegation proof reference.
+    let too_long = "x".repeat(513);
+    // The key is checked before the service (case 2) and the body before the service (case 3);
+    // key-versus-body order is not observable over HTTP, since both answer `request-invalid`.
+    for (headers, body, error) in [
+        // No headers at all: 428 first, so If-Match is checked before everything else.
+        (
+            &[][..],
+            valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::ExpectedVersionRequired),
+        ),
+        // If-Match and a valid body, no key: the key is enforced before the service.
+        (
+            &[if_match][..],
+            valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A malformed delegation proof reference with a valid key and body.
+        (
+            &[if_match, key, ("x-delegation-proof-ref", too_long.as_str())][..],
+            valid,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // Both headers, an unknown member: the body is refused before the service.
+        (
+            &[if_match, key][..],
+            r#"{"expected_draft_revision":0,"x":1}"#,
+            bss_orders_sdk::OrdersError::Refused(Reason::RequestInvalid),
+        ),
+        // A complete request reaches the shared submit service: unavailable before `serve`.
+        (
+            &[if_match, key][..],
+            valid,
+            bss_orders_sdk::OrdersError::Unavailable,
+        ),
+    ] {
+        let response = send(headers, body).await?;
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        assert_eq!(
+            answered(status, &bytes),
+            expect(error),
+            "{headers:?} {body}"
+        );
+    }
+    Ok(())
+}
+
+/// The E2E fragment's gateway zones are the D-185 bindings the code mounts: enforced,
+/// identity-keyed, 429 with an automatic `Retry-After`, 3/s with burst 20 for callers (≤ 200 per
+/// 60 s) and 50/s with burst 100 for the workflow principal; the gateway accepts the block.
 #[test]
-fn throttle_zone_bindings_and_edge_limiter_settings_are_bounded() {
+fn e2e_fragment_gateway_zones_match_the_d185_bindings() {
+    let text = include_str!("../../../config/e2e-orders.yaml");
+    let parsed: std::collections::HashMap<String, Value> = serde_saphyr::from_str(text).unwrap();
+    let mut gateway = parsed["api-gateway"]["config"].clone();
+    gateway["bind_addr"] = json!("127.0.0.1:0");
+    let gateway: api_gateway::ApiGatewayConfig = serde_json::from_value(gateway).unwrap();
+    gateway.validate_throttling().unwrap();
+    let zone = |name: &str| serde_json::to_value(&gateway.rate_limit_zones[name]).unwrap();
+    let caller = zone(crate::api::rest::throttle::CALLER_WRITE_ZONE);
+    assert_eq!(caller["rate_limit"], json!("3/s"));
+    assert_eq!(caller["burst_limit"], json!(20));
+    let workflow = zone(crate::api::rest::throttle::WORKFLOW_WRITE_ZONE);
+    assert_eq!(workflow["rate_limit"], json!("50/s"));
+    assert_eq!(workflow["burst_limit"], json!(100));
+    for zone in [&caller, &workflow] {
+        assert_eq!(zone["response_status_code"], json!(429));
+        assert_eq!(zone["response_retry_after"], json!("auto"));
+        assert_eq!(zone["key"]["type"], json!("identity"));
+        assert!(zone["max_keys"].as_u64().unwrap() > 0);
+    }
+    assert_eq!(gateway.rate_limit_zones.len(), 2);
+    // The code binds exactly those zones.
     assert_eq!(
         crate::api::rest::throttle::caller_write_throttling()
             .rate_limit_zone
@@ -930,8 +1341,8 @@ fn throttle_zone_bindings_and_edge_limiter_settings_are_bounded() {
             .as_deref(),
         Some("rl_orders_workflow_write")
     );
-    // The edge limiter's settings are the baseline when absent and are bounded.
-    let cfg = serde_json::from_value::<OrdersConfig>(config()).unwrap();
+    // The edge limiter's settings parse from the fragment (baseline when absent) and are bounded.
+    let cfg = serde_json::from_value::<OrdersConfig>(e2e_block()).unwrap();
     assert_eq!(
         cfg.throttle_settings().unwrap(),
         crate::api::rest::throttle::ThrottleSettings::default()
@@ -1048,6 +1459,22 @@ fn maintenance_connections_and_schedule_are_validated_and_fail_closed() {
     let mut unknown = value;
     unknown["maintenance"]["schedule"] = json!({"purge_everything": true});
     assert!(serde_json::from_value::<OrdersConfig>(unknown).is_err());
+    // The E2E fragment enables the four Stage 2 workers with their four class connections.
+    let e2e = serde_json::from_value::<OrdersConfig>(e2e_block()).unwrap();
+    e2e.validate().unwrap();
+    assert_eq!(
+        e2e.maintenance_connections()
+            .unwrap()
+            .keys()
+            .copied()
+            .collect::<Vec<_>>(),
+        [
+            RoleClass::Maintenance,
+            RoleClass::Retention,
+            RoleClass::Verifier,
+            RoleClass::Checkpoint
+        ]
+    );
 }
 
 /// S2-11 at boot on real PostgreSQL: the class connections are opened and attested at init
@@ -1174,7 +1601,9 @@ fn bind_backoff_is_fully_jittered_within_the_bound() {
         Duration::from_secs(4),
         BIND_BACKOFF_MAX,
     ] {
-        let draws: Vec<Duration> = (0..64).map(|_| jittered(backoff)).collect();
+        let draws: Vec<Duration> = (0..64)
+            .map(|_| crate::infra::jitter::full_jitter(backoff))
+            .collect();
         assert!(draws.iter().all(|d| *d > Duration::ZERO && *d <= backoff));
         let first = draws[0];
         assert!(draws.iter().any(|d| *d != first), "jitter must vary");

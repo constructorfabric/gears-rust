@@ -1,0 +1,1202 @@
+{
+  "version": 1,
+  "provenance": "Activation re-check (03 §3.6, D-127, D-144): frozen decision vectors Workflow #4787 reproduces; hand-authored from the algorithm text, not generated from the implementation",
+  "vectors": [
+    {
+      "id": "proceed-two-lines",
+      "describe": "every step passes: identity matches the stored market, both keys under their limits, deadlines ahead",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    },
+    {
+      "id": "not-dispatchable-held",
+      "describe": "step 2: the order is on_hold",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "on_hold",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "held"
+      }
+    },
+    {
+      "id": "not-dispatchable-terminal-cancelled",
+      "describe": "step 2: the order is cancelled (terminal)",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "cancelled",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "terminal"
+      }
+    },
+    {
+      "id": "not-dispatchable-superseded",
+      "describe": "step 2: the current version moved past the requested one; carries the observed current version",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "4",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "superseded",
+        "current_version": "4"
+      }
+    },
+    {
+      "id": "defer-identity-outage",
+      "describe": "step 4: the identity port failed; never fabricate a divergence",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "unavailable": "outage"
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "defer",
+        "reason": "identity-party-unavailable"
+      }
+    },
+    {
+      "id": "defer-identity-deadline",
+      "describe": "step 4: the identity port's deadline elapsed",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "unavailable": "deadline"
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "defer",
+        "reason": "identity-party-unavailable"
+      }
+    },
+    {
+      "id": "reject-market-currency",
+      "describe": "step 5: the payer's current currency differs from the frozen market; every line is affected",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "USD",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "market-divergence"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a2",
+            "reason": "market-divergence"
+          }
+        ]
+      }
+    },
+    {
+      "id": "reject-market-region",
+      "describe": "step 5: the payer's current region differs from the frozen market",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "us-east"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "market-divergence"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a2",
+            "reason": "market-divergence"
+          }
+        ]
+      }
+    },
+    {
+      "id": "defer-occupancy-outage",
+      "describe": "step 7: the occupancy port failed; never default the limit",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "unavailable": "outage"
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "defer",
+        "reason": "overlap-presence-unevaluable"
+      }
+    },
+    {
+      "id": "defer-occupancy-key-missing",
+      "describe": "step 7: the answer lacks a stored key; an absent answer is unevaluable, never a default limit",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "defer",
+        "reason": "overlap-presence-unevaluable"
+      }
+    },
+    {
+      "id": "reject-overlap-collision-one-key",
+      "describe": "step 8: vm.basic has 1 active and 2 pending lines against a limit of 2; both its lines collide, the backup.daily line does not",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a3",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "1",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "2",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "overlap-collision"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a3",
+            "reason": "overlap-collision"
+          }
+        ]
+      }
+    },
+    {
+      "id": "proceed-unlimited-limit",
+      "describe": "step 8: an unlimited scope passes whatever its active count",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "500",
+              "count_scope": "per_payer",
+              "max_concurrent_active": null,
+              "provenance": "platform_default"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    },
+    {
+      "id": "proceed-at-the-limit",
+      "describe": "step 8: active + pending == limit is not a collision (strictly greater collides)",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "1",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "3",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    },
+    {
+      "id": "proceed-line-without-overlap-key",
+      "describe": "step 6: a line with no stored overlap key has nothing to re-read and is skipped",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": null,
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": []
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    },
+    {
+      "id": "reject-binding-expired",
+      "describe": "step 9: a deadline equal to now is expired (exclusive) and one in the past is expired; the future and absent deadlines are not",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-26T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-25T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a3",
+              "overlap_scope_key": null,
+              "binding_deadline": null
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "order-binding-expired"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a2",
+            "reason": "order-binding-expired"
+          }
+        ]
+      }
+    },
+    {
+      "id": "proceed-binding-not-yet-expired",
+      "describe": "step 9: a deadline one second after now has not elapsed",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-26T12:00:01Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": null
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    },
+    {
+      "id": "held-wins-over-identity-outage",
+      "describe": "step order: an on_hold order is not-dispatchable even while the identity port is down",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "on_hold",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "unavailable": "outage"
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "held"
+      }
+    },
+    {
+      "id": "market-wins-over-collision",
+      "describe": "step order: a market divergence returns before occupancy is judged; the reject carries market-divergence only",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "USD",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "1",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "5",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "market-divergence"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a2",
+            "reason": "market-divergence"
+          }
+        ]
+      }
+    },
+    {
+      "id": "collision-wins-over-binding-expired",
+      "describe": "step 8 before step 9: vm.basic collides and every binding deadline has also passed; only the collision lines are rejected, with overlap-collision",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-25T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-25T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a3",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-25T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "1",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "2",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "reject",
+        "lines": [
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a1",
+            "reason": "overlap-collision"
+          },
+          {
+            "line_id": "00000000-0000-0000-0000-0000000000a3",
+            "reason": "overlap-collision"
+          }
+        ]
+      }
+    },
+    {
+      "id": "terminal-wins-over-superseded",
+      "describe": "step 2 order: the order is cancelled (terminal) and its current version also moved past the requested one; terminal wins",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "cancelled",
+          "current_version": "4",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "terminal"
+      }
+    },
+    {
+      "id": "held-wins-over-superseded",
+      "describe": "step 2 order: the order is on_hold and its current version also moved past the requested one; held wins",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "on_hold",
+          "current_version": "4",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": "vm.basic",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            },
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a2",
+              "overlap_scope_key": "backup.daily",
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "answered": [
+            {
+              "overlap_scope_key": "vm.basic",
+              "active_count": "0",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "1",
+              "provenance": "catalog"
+            },
+            {
+              "overlap_scope_key": "backup.daily",
+              "active_count": "2",
+              "count_scope": "per_payer",
+              "max_concurrent_active": "5",
+              "provenance": "contract"
+            }
+          ]
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "not-dispatchable",
+        "kind": "held"
+      }
+    },
+    {
+      "id": "proceed-no-keys-occupancy-unavailable",
+      "describe": "step 6 is skipped when no stored line carries an overlap key: no occupancy read is needed, so an unavailable occupancy answer cannot defer",
+      "input": {
+        "requested_version": "3",
+        "stored": {
+          "state": "in_fulfillment",
+          "current_version": "3",
+          "market_currency": "EUR",
+          "market_region": "eu-west",
+          "payer_tenant_id": "00000000-0000-0000-0000-0000000000b0",
+          "lines": [
+            {
+              "line_id": "00000000-0000-0000-0000-0000000000a1",
+              "overlap_scope_key": null,
+              "binding_deadline": "2026-10-27T12:00:00Z"
+            }
+          ]
+        },
+        "identity": {
+          "answered": {
+            "currency": "EUR",
+            "region": "eu-west"
+          }
+        },
+        "occupancy": {
+          "unavailable": "outage"
+        },
+        "now": "2026-10-26T12:00:00Z"
+      },
+      "expect": {
+        "outcome": "proceed"
+      }
+    }
+  ]
+}

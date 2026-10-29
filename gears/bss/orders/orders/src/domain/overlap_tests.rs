@@ -33,7 +33,6 @@ fn proposal(payer: u128, keys: &[&str]) -> ProposedClaims {
         },
         keys.iter().map(|k| key(k)),
     )
-    .unwrap()
 }
 
 #[test]
@@ -113,8 +112,10 @@ fn duplicate_line_keys_offer_one_tuple_in_the_same_order_whatever_the_caller_ord
                 resource_tenant_id: u(10)
             },
             []
-        ),
-        Err(ClaimRuleError::EmptyProposal)
+        )
+        .tuples()
+        .len(),
+        0
     );
 }
 

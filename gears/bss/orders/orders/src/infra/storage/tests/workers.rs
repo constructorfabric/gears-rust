@@ -1872,11 +1872,7 @@ async fn checkpoint_capture_is_withheld_after_a_mismatch_until_the_interval_elap
     assert_eq!(findings(&metrics), 1, "alerted once, not on every tick");
     assert_eq!(checkpoint_rows(&pg).await?, (1, 1));
     // Just short of the interval the capture is still withheld; past it, it is attempted again.
-    clock.advance(
-        interval
-            .checked_sub(Duration::from_secs(1))
-            .expect("the interval is longer than a second"),
-    );
+    clock.advance(interval.checked_sub(Duration::from_secs(1)).unwrap());
     assert_eq!(run!(), PassResult::Completed);
     assert_eq!(results(&metrics)[4..], [CheckpointResult::Withheld]);
     clock.advance(Duration::from_secs(2));

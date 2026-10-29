@@ -1,7 +1,7 @@
-//! S2-03 on real PostgreSQL: the shared PEP, the gear-local policy fake (D-227; a recording PDP
-//! for outage/invalid-response cases) and the authorization-bound storage adapters.
+//! S2-03 on real PostgreSQL: the shared PEP, the real rules provider (and a recording PDP for
+//! outage/invalid-response cases) and the authorization-bound storage adapters.
 use super::*;
-use crate::authz::test_pdp::{FakePdp, Grant, ScriptedPdp, allow, eq, path, pep, service, user};
+use crate::authz::test_pdp::{RulesProvider, ScriptedPdp, allow, eq, path, pep, service, user};
 use crate::authz::{
     Action, Arrangement, ArrangementDelta, AuthzFailure, Caller, Pep, Prefetch, TargetAuthorization,
 };
@@ -10,61 +10,82 @@ use crate::domain::transition::stale_refusal;
 use crate::infra::storage::scoped::{self, AuthorizedLock, AuthorizedRead};
 use bss_orders_sdk::catalog::{Reason, Trigger};
 use serde_json::json;
-use std::sync::Arc;
 
+const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
+
+fn s(n: u128) -> String {
+    u(n).to_string()
+}
 type Predicates<'a> = &'a [(&'a str, &'a [u128])];
-fn rule(subject: u128, actions: &[Action], paths: &[Predicates<'_>]) -> Grant {
-    paths
-        .iter()
-        .fold(Grant::new(u(subject), actions), |grant, p| {
-            grant.path(
-                p.iter()
-                    .map(|(property, values)| (*property, values.iter().map(|v| u(*v)).collect())),
-            )
-        })
+fn rule(id: &str, subject: u128, actions: &[&str], paths: &[Predicates<'_>]) -> serde_json::Value {
+    json!({
+        "id": id,
+        "subject": {"id": s(subject)},
+        "resource_type": ORDER_RT,
+        "actions": actions,
+        "paths": paths.iter().map(|p| json!({"predicates": p.iter().map(|(property, values)| json!({
+            "property": property, "values": values.iter().map(|v| s(*v)).collect::<Vec<_>>()
+        })).collect::<Vec<_>>()})).collect::<Vec<_>>(),
+    })
+}
+fn with(mut rule: serde_json::Value, key: &str, value: serde_json::Value) -> serde_json::Value {
+    rule[key] = value;
+    rule
 }
 
 // Subjects (tenant in parentheses): customer C 102 (10), same-tenant C2 103 (10), partner P
 // 101 (10), delegated-only partner D 109 (60), seller S 104 (20), payer reader R 105 (30),
 // Workflow W 106 (99, service), misconfigured service M 107 (99), member-only U 108 (10),
 // two-path reader T 110 (10).
-fn policy(accepted_proofs: &[&str]) -> Arc<FakePdp> {
-    use Action::{
-        OrderBeginFulfillment as BeginFulfillment, OrderCancel as Cancel, OrderCreate as Create,
-        OrderHold as Hold, OrderRead as Read, OrderResume as Resume, OrderWrite as Write,
-    };
-    let mut grants = vec![
-        // Customer.
+fn policy(accepted_proofs: &[&str]) -> serde_json::Value {
+    let delegation = json!({"proof_property": "delegation_proof_ref", "accepted": accepted_proofs});
+    let mut rules = vec![
         rule(
+            "customer",
             102,
-            &[Create, Write, Read, Cancel],
+            &["create", "write", "read", "cancel"],
             &[&[("resource_tenant_id", &[10])]],
         ),
-        // Customer, read only.
-        rule(103, &[Read], &[&[("resource_tenant_id", &[10])]]),
-        // Partner, direct.
         rule(
+            "customer-read-only",
+            103,
+            &["read"],
+            &[&[("resource_tenant_id", &[10])]],
+        ),
+        rule(
+            "partner-direct",
             101,
-            &[Create, Write, Read],
+            &["create", "write", "read"],
             &[&[("resource_tenant_id", &[10])]],
         ),
         rule(
+            "seller",
             104,
-            &[Read, Hold, Resume, Cancel],
+            &["read", "hold", "resume", "cancel"],
             &[&[("seller_tenant_id", &[20])]],
         ),
-        // Payer reader.
-        rule(105, &[Read], &[&[("payer_tenant_id", &[30])]]),
         rule(
+            "payer-reader",
+            105,
+            &["read"],
+            &[&[("payer_tenant_id", &[30])]],
+        ),
+        rule(
+            "workflow",
             106,
-            &[Read, BeginFulfillment],
+            &["read", "begin_fulfillment"],
             &[&[("id", &[1]), ("seller_tenant_id", &[20])]],
         ),
-        // A service granted on a tenant axis alone.
-        rule(107, &[Read], &[&[("seller_tenant_id", &[20])]]),
         rule(
+            "tenant-only-service",
+            107,
+            &["read"],
+            &[&[("seller_tenant_id", &[20])]],
+        ),
+        rule(
+            "two-complete-paths",
             110,
-            &[Read],
+            &["read"],
             &[
                 &[("resource_tenant_id", &[10]), ("seller_tenant_id", &[20])],
                 &[("resource_tenant_id", &[11]), ("seller_tenant_id", &[21])],
@@ -72,21 +93,31 @@ fn policy(accepted_proofs: &[&str]) -> Arc<FakePdp> {
         ),
     ];
     if !accepted_proofs.is_empty() {
-        // Partner on behalf of tenant 11, and the delegated-only partner.
-        grants.push(rule(101, &[Read, Write], &[&[("resource_tenant_id", &[11])]]).delegated());
-        grants.push(
+        rules.push(with(
             rule(
-                109,
-                &[Create, Read, Write],
+                "partner-delegated",
+                101,
+                &["read", "write"],
                 &[&[("resource_tenant_id", &[11])]],
-            )
-            .delegated(),
-        );
+            ),
+            "delegation",
+            delegation.clone(),
+        ));
+        rules.push(with(
+            rule(
+                "delegated-only",
+                109,
+                &["create", "read", "write"],
+                &[&[("resource_tenant_id", &[11])]],
+            ),
+            "delegation",
+            delegation,
+        ));
     }
-    FakePdp::new(grants, accepted_proofs)
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s2-03-matrix-1", "rules": rules})
 }
 fn rules_pep(accepted_proofs: &[&str]) -> Pep {
-    pep(policy(accepted_proofs))
+    pep(RulesProvider::from_policy(policy(accepted_proofs)))
 }
 fn proof(caller: &Caller, value: &str) -> Caller {
     crate::authz::test_pdp::with_proof(caller, value)
@@ -173,7 +204,7 @@ async fn row(pg: &Pg, id: u128) -> String {
         .unwrap()
 }
 
-/// Actor/axis matrix against the policy fake (D-227) and real PostgreSQL scopes.
+/// Actor/axis matrix against the real rules provider and real PostgreSQL scopes.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn actor_axis_matrix_on_real_provider_and_postgres() -> anyhow::Result<()> {

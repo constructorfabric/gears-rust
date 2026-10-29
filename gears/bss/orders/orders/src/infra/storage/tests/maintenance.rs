@@ -58,6 +58,37 @@ fn maintenance_identity_and_tasks_are_explicit() {
     assert!(unknown.is_err());
 }
 
+/// F01 retention purge: refusals are always audited, so a maintenance block that schedules
+/// workers but omits `retention_purge` is refused at startup. No maintenance block at all stays
+/// the finding-185 warning (no worker scheduled, `orders_workers_scheduled` 0).
+#[test]
+fn maintenance_block_without_retention_purge_is_refused() {
+    let with_tasks = |tasks: serde_json::Value, connections: serde_json::Value| {
+        serde_json::from_value::<crate::config::OrdersConfig>(serde_json::json!({
+            "lock_route": "direct", "idempotency_lease_seconds": 30, "dependency_timeout_ms": 1000,
+            "service_principals": [{"role": "workflow", "subject_id": u(77), "tenant_id": u(1)}],
+            "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1), "broker_partitions": 4},
+            "audit_minimization": {"key_id": "t1", "key": "0123456789abcdef0123456789abcdef"},
+            "maintenance": {
+                "actor_subject_id": u(1), "actor_tenant_id": u(1),
+                "tasks": tasks, "connections": connections
+            }
+        }))
+        .unwrap()
+    };
+    let without = with_tasks(
+        serde_json::json!(["audit_verification"]),
+        serde_json::json!({"verifier": "postgres://v:secret-v@127.0.0.1:5432/postgres"}),
+    );
+    let err = without.validate().unwrap_err().to_string();
+    assert!(err.contains("retention_purge"), "{err}");
+    let with = with_tasks(
+        serde_json::json!(["retention_purge"]),
+        serde_json::json!({"retention": "postgres://r:secret-r@127.0.0.1:5432/postgres"}),
+    );
+    with.validate().unwrap();
+}
+
 /// A write inside the exact discovery transaction fails on PostgreSQL as read-only (D-184).
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

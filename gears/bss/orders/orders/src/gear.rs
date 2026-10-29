@@ -32,14 +32,19 @@ struct OrdersRuntime {
     /// Keyed administrative-text minimizer for audit values (D-204).
     admin_text_key: Arc<crate::domain::audit::AdminTextKey>,
     /// The frozen date-basis preparer (S2-10) for Preview, submit and amendment; none of those
-    /// operations is delivered yet.
+    /// operations is delivered in production (Preview's development delivery holds a clone).
     _dates: crate::infra::dates::DatePreparer,
     /// The explicit positive finite registry lease (Foundation §3.6).
     lease: crate::domain::idempotency::LeaseDuration,
     /// State table, guard registry and field classes compiled and validated at init (§3.4).
     registries: crate::infra::engine::Registries,
+    /// The gate ports (S3-14): real clients or fail-closed adapters, never a double. The
+    /// authority is validated at init; the catalog clients are bound from `serve`. No route, SDK
+    /// method or engine path reads them yet.
+    gate: Arc<crate::infra::gate::GatePorts>,
     /// Event Broker and the tenant resolver publish their clients after Orders' init (the broker
-    /// in its REST phase), so the producer is bound from `serve` through this hub.
+    /// in its REST phase), so the producer is bound from `serve` through this hub; the gate's
+    /// Pricing and Products clients (no dependency edge) are bound from `serve` the same way.
     hub: Arc<toolkit::ClientHub>,
     producer: crate::infra::broker::ProducerSettings,
     dependency_timeout: Duration,
@@ -49,21 +54,14 @@ struct OrdersRuntime {
 /// Upper bound of the producer-binding retry backoff.
 const BIND_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
-/// Full jitter (the cluster SDK `RetryPolicy` with `jitter_factor: 1.0`): the delay is spread
-/// uniformly over `(0, backoff]`, so replicas that started together do not retry the broker and
-/// the tenant resolver in lockstep after an outage (review finding 44). The random bits are the
-/// 48 leading random bits of a v4 UUID, which the gear already generates; no new dependency.
-fn jittered(backoff: Duration) -> Duration {
-    let random = u128::from(uuid::Uuid::new_v4().as_u64_pair().0 >> 16);
-    let nanos = backoff.as_nanos();
-    let cut = (nanos * random) >> 48;
-    Duration::from_nanos(u64::try_from(nanos - cut).unwrap_or(u64::MAX))
-}
-
 /// The Orders gear: mounts the delivered draft authoring and read routes, registers the local SDK
 /// client, binds the managed event producer and starts the configured maintenance workers. No
 /// operation is admitted before the producer is bound (readiness), and none after stop.
-#[toolkit::gear(name = "bss-orders", deps = [authz_resolver, types_registry, tenant_resolver, event_broker], capabilities = [db, rest, stateful], lifecycle(entry = "serve", stop_timeout = "30s"))]
+///
+/// `authn_resolver` is a dependency (D-194): a configured commercial identity must be able to
+/// authenticate at init, and the resolver publishes `AuthNResolverClient` in its own `init`, so
+/// without the edge the init order of the two gears would be arbitrary.
+#[toolkit::gear(name = "bss-orders", deps = [authz_resolver, authn_resolver, types_registry, tenant_resolver, event_broker], capabilities = [db, rest, stateful], lifecycle(entry = "serve", stop_timeout = "30s"))]
 pub struct BssOrdersGear {
     runtime: ArcSwapOption<OrdersRuntime>,
     running: Arc<AtomicBool>,
@@ -87,10 +85,66 @@ pub struct BssOrdersGear {
     scheduled_workers: ArcSwapOption<Vec<crate::infra::workers::WorkerKind>>,
     /// The gear-local per-(caller, order) edge limiter (S2-12, D-185); built at init from the
     /// validated settings, mounted with the authoring routes.
-    limiter: ArcSwapOption<crate::api::rest::throttle::PerOrderLimiter>,
+    limiter: ArcSwapOption<crate::infra::throttle::PerOrderLimiter>,
     /// The store the readiness probe reads (DESIGN §3.8: store unavailability makes the instance
     /// not ready, never restarted); `None` before init and after shutdown.
     store: Arc<ArcSwapOption<toolkit_db::Db>>,
+    /// The gate ports (S3-14), whose live manifest the readiness message reports; never a
+    /// readiness condition. `None` before init and after shutdown.
+    gate: Arc<ArcSwapOption<crate::infra::gate::GatePorts>>,
+    /// The Preview service (S3-11), set at init only in the development delivery (M2-1:
+    /// [`gate_dev_delivery`]); the REST route and the local SDK delegate to it, and in every
+    /// other build it stays `None` (route unmounted, SDK `NotDelivered`).
+    preview: ArcSwapOption<crate::infra::gate::preview::PreviewService>,
+    /// The submit service (S3-12), under the same development-delivery condition as `preview`;
+    /// the REST route (M3b, D-234) and the local SDK delegate to it, `None` in every other build.
+    submit: ArcSwapOption<crate::infra::gate::submit::SubmitService>,
+}
+
+/// Submit's development acceptance double (M2-6): with the `gate-dev-stubs` feature and the stubs
+/// bound, a [`SellabilityStub`](crate::infra::gate::stubs::SellabilityStub) over the fixture's
+/// acceptance policy, accepting on Pricing's own `resolve` read from the hub. `None` otherwise:
+/// phase B then reads Pricing's published `SellabilityV1`, or answers unavailable.
+#[cfg(feature = "gate-dev-stubs")]
+fn dev_acceptance(
+    gate: &crate::infra::gate::GatePorts,
+    hub: Arc<toolkit::ClientHub>,
+) -> Option<Arc<dyn bss_pricing_sdk::acceptance::SellabilityV1>> {
+    use crate::infra::gate::stubs::{HubResolveBindings, SellabilityStub};
+    let fixture = gate.dev_fixture()?;
+    tracing::warn!(
+        target: "orders.gate.dev_stubs",
+        "bss-orders: a development stub issues submit's Pricing acceptance receipts; never a \
+         production binding"
+    );
+    Some(Arc::new(SellabilityStub::new(
+        fixture,
+        Arc::new(HubResolveBindings(hub)),
+    )))
+}
+/// Without the feature there is no development acceptance double.
+#[cfg(not(feature = "gate-dev-stubs"))]
+fn dev_acceptance(
+    _gate: &crate::infra::gate::GatePorts,
+    _hub: Arc<toolkit::ClientHub>,
+) -> Option<Arc<dyn bss_pricing_sdk::acceptance::SellabilityV1>> {
+    None
+}
+
+/// M2-1: the gate's development delivery switch. Both the `gate-dev-stubs` feature and
+/// `gate.dev_stubs = true` are required (validation already refuses the flag without the
+/// feature); only then do Preview and submit (each one's REST route and local SDK method) run
+/// the real service over the development stubs.
+fn gate_dev_delivery(config: &crate::config::GateConfig) -> bool {
+    config.dev_delivery_fixture().is_some()
+}
+
+/// The development delivery, built once: the orchestrator both services share and each flow's
+/// caller limit. Present only for the development delivery, so no flow can be half-built.
+struct DevDelivery {
+    orchestrator: crate::infra::gate::orchestrate::Orchestrator,
+    preview_limit: crate::infra::throttle::CallerLimitSettings,
+    submit_limit: crate::infra::throttle::CallerLimitSettings,
 }
 impl Default for BssOrdersGear {
     fn default() -> Self {
@@ -107,6 +161,9 @@ impl Default for BssOrdersGear {
             scheduled_workers: ArcSwapOption::from(None),
             limiter: ArcSwapOption::from(None),
             store: Arc::new(ArcSwapOption::from(None)),
+            gate: Arc::new(ArcSwapOption::from(None)),
+            preview: ArcSwapOption::from(None),
+            submit: ArcSwapOption::from(None),
         }
     }
 }
@@ -126,6 +183,7 @@ impl BssOrdersGear {
         // no producer; the expiry/auto-void slots report their undelivered bodies. Each pass
         // takes its advisory key on the host connection and stops with this token.
         let workers = self.start_workers(&runtime, &cancel);
+        Self::start_gate(&runtime);
         if let Some(bound) = Box::pin(self.bind_until_ready(&runtime, &cancel)).await {
             self.events.store(Some(Arc::new(bound.sink().clone())));
             self.engine
@@ -167,8 +225,43 @@ impl BssOrdersGear {
         self.producer.store(Arc::new(ProducerReadiness::Stopped));
         self.running.store(false, Ordering::Release);
         self.store.store(None);
+        self.gate.store(None);
         self.runtime.store(None);
         Ok(())
+    }
+
+    /// S3-14: bind the gate's catalog clients here, not at init: every gear's `init` has
+    /// completed before any `serve`, so the binding does not depend on boot order (Pricing and
+    /// Products have no dependency edge to Orders). [`Self::bind_until_ready`] retries it with
+    /// each producer bind attempt. Logs the manifest once; binding never calls a port.
+    fn start_gate(runtime: &OrdersRuntime) {
+        Self::bind_gate_catalog(runtime);
+        let gate = runtime.gate.readiness();
+        tracing::info!(
+            target: "orders.gate",
+            manifest = %serde_json::to_string(&gate).unwrap_or_default(),
+            "bss-orders: {}",
+            gate.summary()
+        );
+    }
+
+    /// Bind the gate's catalog port to the Pricing and Products clients when both are published
+    /// in the hub (a no-op once bound); returns whether it is bound. Logs the manifest when this
+    /// call binds it. No port is called.
+    fn bind_gate_catalog(runtime: &OrdersRuntime) -> bool {
+        let catalog = &runtime.gate.catalog;
+        let was_bound = catalog.is_bound();
+        let bound = catalog.bind_from_hub(&runtime.hub);
+        if bound && !was_bound {
+            let gate = runtime.gate.readiness();
+            tracing::info!(
+                target: "orders.gate",
+                manifest = %serde_json::to_string(&gate).unwrap_or_default(),
+                "bss-orders: gate catalog bound; {}",
+                gate.summary()
+            );
+        }
+        bound
     }
 
     /// Bind the managed producer, retrying with bounded, fully jittered exponential backoff
@@ -207,12 +300,14 @@ impl BssOrdersGear {
                         );
                         self.producer
                             .store(Arc::new(ProducerReadiness::Unavailable(error.failure)));
+                        // The gate's catalog clients join the producer's retry (S3-14).
+                        Self::bind_gate_catalog(runtime);
                     }
                 },
             }
             tokio::select! {
                 () = cancel.cancelled() => return None,
-                () = tokio::time::sleep(jittered(backoff)) => {}
+                () = tokio::time::sleep(crate::infra::jitter::full_jitter(backoff)) => {}
             }
             backoff = (backoff * 2).min(BIND_BACKOFF_MAX);
         }
@@ -274,6 +369,20 @@ impl BssOrdersGear {
         &self.worker_status
     }
 
+    /// The live gate manifest (the gear-boot tests; the readiness check holds its own handle to
+    /// the slot and reports the summary).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the readiness check holds its own handle to the gate slot; only the \
+                      gear-boot tests read the full manifest through the gear"
+        )
+    )]
+    pub(crate) fn gate_readiness(&self) -> Option<crate::infra::gate::readiness::GateReadiness> {
+        self.gate.load().as_ref().map(|gate| gate.readiness())
+    }
+
     /// The workers scheduled by `serve`.
     #[cfg_attr(
         not(test),
@@ -321,12 +430,11 @@ impl BssOrdersGear {
     /// authoring routes and the local SDK enter it through the capture service, which shares
     /// this slot.
     #[cfg_attr(
-        any(not(test), not(orders_event_broker_test_support)),
+        not(test),
         expect(
             dead_code,
             reason = "the capture service and readiness hold their own handles to the engine slot; \
-                      only the lifecycle tests read it through the gear, and those need #5381 \
-                      (D-229)"
+                      only the lifecycle tests read it through the gear"
         )
     )]
     pub(crate) fn engine(&self) -> Option<Arc<crate::infra::engine::Engine>> {
@@ -404,21 +512,69 @@ impl Gear for BssOrdersGear {
         };
         // One identities value backs the PEP's decision class and the engine's audit class.
         let identities = config.actor_identities()?;
+        // S3-14: every gate port bound to its fail-closed adapter; configured commercial
+        // identities without a published AuthN resolver refuse startup. Pricing and Products are
+        // optional (missing providers are the designed state) and bound from `serve`.
+        let budget = Arc::new(crate::infra::gate::budget::Budget::from_config(
+            &config.gate,
+            Arc::new(crate::infra::gate::signals::OtelGateSignals::new()),
+        ));
+        let gate = crate::infra::gate::GatePorts::from_hub(
+            &ctx.client_hub(),
+            &config.gate,
+            Arc::clone(&budget),
+        )
+        .map(Arc::new)?;
+        let dates = crate::infra::dates::DatePreparer::new(
+            db.clone(),
+            crate::infra::dates::PreparationClock::Database,
+        );
+        let pep = crate::authz::Pep::new(Arc::new(enforcer), identities.clone());
+        // S3-11/S3-12 under M2-1: the Preview and submit services over the same PEP, ports,
+        // budget and date preparer, built only for the development delivery.
+        let dev: Option<DevDelivery> = gate_dev_delivery(&config.gate)
+            .then(|| -> anyhow::Result<_> {
+                Ok(DevDelivery {
+                    orchestrator: crate::infra::gate::orchestrate::Orchestrator::new(
+                        Arc::clone(&gate),
+                        budget,
+                        Arc::new(crate::infra::gate::orchestrate::StorageInflightClaims::new(
+                            db.clone(),
+                        )),
+                    ),
+                    preview_limit: config.gate.preview_limit()?,
+                    submit_limit: config.gate.submit_limit()?,
+                })
+            })
+            .transpose()?;
+        let preview = dev.as_ref().map(|dev| {
+            Arc::new(crate::infra::gate::preview::PreviewService::new(
+                pep.clone(),
+                dev.orchestrator.clone(),
+                Arc::new(dates.clone()),
+                Arc::new(crate::infra::gate::preview::StoragePreviewRuns::new(
+                    db.clone(),
+                )),
+                crate::infra::throttle::PerCallerLimiter::new(
+                    crate::infra::throttle::CallerLimiter::Preview,
+                    dev.preview_limit,
+                ),
+            ))
+        });
+        let submit_dates = dates.clone();
         let runtime = Arc::new(OrdersRuntime {
             db: db.clone(),
-            pep: crate::authz::Pep::new(Arc::new(enforcer), identities.clone()),
+            pep,
             maintenance: config.maintenance_authority().map(Arc::new),
             workers,
             worker_settings: config.worker_settings()?,
             worker_metrics: Arc::new(crate::infra::workers::metrics::OtelWorkerMetrics::new()),
             identities,
             admin_text_key: Arc::new(config.admin_text_key()?),
-            _dates: crate::infra::dates::DatePreparer::new(
-                db,
-                crate::infra::dates::PreparationClock::Database,
-            ),
+            _dates: dates,
             lease: config.idempotency_lease()?,
             registries,
+            gate: Arc::clone(&gate),
             hub: ctx.client_hub(),
             producer,
             dependency_timeout,
@@ -432,6 +588,31 @@ impl Gear for BssOrdersGear {
             Arc::clone(&self.read_parts),
             Arc::new(crate::infra::read::OtelReadSignals::new()),
         ));
+        let submit = dev
+            .map(|dev| -> anyhow::Result<_> {
+                Ok(Arc::new(
+                    crate::infra::gate::submit::SubmitService::new(
+                        Arc::clone(&self.engine),
+                        Arc::clone(&reads),
+                        dev.orchestrator,
+                        Arc::new(submit_dates),
+                        gate.catalog.authority(),
+                        crate::infra::throttle::PerCallerLimiter::new(
+                            crate::infra::throttle::CallerLimiter::Submit,
+                            dev.submit_limit,
+                        ),
+                        runtime._config.capture_settings()?.line_cap,
+                    )
+                    .with_acceptance_budget(
+                        crate::infra::gate::budget::AcceptanceBudget::from_config(
+                            &runtime._config.gate,
+                        ),
+                    )
+                    .with_acceptance_hub(ctx.client_hub())
+                    .with_acceptance(dev_acceptance(&gate, ctx.client_hub())),
+                ))
+            })
+            .transpose()?;
         let throttle = runtime._config.throttle_settings()?;
         // DESIGN 02 §3.7/§3.8: the policy channel promotes the configured date-policy rows with
         // the deployment, and startup refuses a missing or invalid platform default. It is the
@@ -453,13 +634,16 @@ impl Gear for BssOrdersGear {
                 crate::api::local_client::LocalOrdersClient::new(
                     Arc::clone(&capture),
                     Arc::clone(&reads),
-                ),
+                )
+                .with_preview(preview.clone())
+                .with_submit(submit.clone()),
             ));
         self.limiter
-            .store(Some(crate::api::rest::throttle::PerOrderLimiter::new(
-                throttle,
-            )));
+            .store(Some(crate::infra::throttle::PerOrderLimiter::new(throttle)));
         self.store.store(Some(Arc::new(runtime.db.clone())));
+        self.gate.store(Some(gate));
+        self.preview.store(preview);
+        self.submit.store(submit);
         self.capture.store(Some(capture));
         self.reads.store(Some(reads));
         self.runtime.store(Some(runtime));
@@ -491,9 +675,25 @@ impl RestApiCapability for BssOrdersGear {
         ) else {
             return Ok(router);
         };
-        Ok(router
-            .merge(crate::api::rest::capture::router(capture, limiter, openapi))
-            .merge(crate::api::rest::read::router(reads, openapi)))
+        let mut router = router
+            .merge(crate::api::rest::capture::router(
+                capture,
+                Arc::clone(&limiter),
+                openapi,
+            ))
+            .merge(crate::api::rest::read::router(reads, openapi));
+        // M2-1: the Preview and submit routes exist only in the development delivery (the
+        // services are set only then); the production surface stays the census. Submit (M3b,
+        // D-234) is an existing-order write and shares the authoring routes' edge limiter.
+        if let Some(preview) = self.preview.load_full() {
+            router = router.merge(crate::api::rest::gate::router(preview, openapi));
+        }
+        if let Some(submit) = self.submit.load_full() {
+            router = router.merge(crate::api::rest::gate::submit_router(
+                submit, limiter, openapi,
+            ));
+        }
+        Ok(router)
     }
     fn healthcheck(&self, _ctx: &GearCtx) -> Option<Arc<dyn Healthcheck>> {
         Some(Arc::new(OrdersReadiness {
@@ -502,6 +702,7 @@ impl RestApiCapability for BssOrdersGear {
             engine: Arc::clone(&self.engine),
             read_parts: Arc::clone(&self.read_parts),
             store: Arc::clone(&self.store),
+            gate: Arc::clone(&self.gate),
         }))
     }
 }
@@ -518,6 +719,9 @@ struct OrdersReadiness {
     engine: Arc<ArcSwapOption<crate::infra::engine::Engine>>,
     read_parts: Arc<ArcSwapOption<crate::infra::read::ReadParts>>,
     store: Arc<ArcSwapOption<toolkit_db::Db>>,
+    /// The gate ports; their live manifest's summary rides the ready message and never decides
+    /// readiness.
+    gate: Arc<ArcSwapOption<crate::infra::gate::GatePorts>>,
 }
 
 /// Bound on the readiness store probe; the gateway's own per-check timeout still applies.
@@ -555,14 +759,22 @@ impl Healthcheck for OrdersReadiness {
         )
         .await;
         match probe {
-            Ok(Ok(_)) => HealthcheckResult {
-                status: toolkit::HealthcheckStatus::Healthy,
-                message: Some(
+            Ok(Ok(_)) => {
+                let mut message =
                     "draft capture and draft reads are ready; later packages answer unavailable"
-                        .to_owned(),
-                ),
-                code: None,
-            },
+                        .to_owned();
+                // S3-14: the gate section. Missing providers are the designed state, so the
+                // manifest is reported, never a readiness condition.
+                if let Some(gate) = self.gate.load_full() {
+                    message.push_str("; ");
+                    message.push_str(&gate.readiness().summary());
+                }
+                HealthcheckResult {
+                    status: toolkit::HealthcheckStatus::Healthy,
+                    message: Some(message),
+                    code: None,
+                }
+            }
             Ok(Err(error)) => {
                 tracing::warn!(target: "orders.readiness", error = %error, "Orders store probe failed");
                 HealthcheckResult::unhealthy(

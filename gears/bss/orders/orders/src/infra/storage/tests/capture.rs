@@ -1,5 +1,5 @@
 //! S2-09 on real PostgreSQL: draft authoring through the shared capture service, the S2-04 engine,
-//! the PEP over the policy fake (S2-03, D-227), the registry (S2-05), the sealed v3 audit writer (S2-06) and the
+//! the real rules PDP (S2-03), the registry (S2-05), the sealed v3 audit writer (S2-06) and the
 //! real Event Broker managed producer (S2-08), over the restricted runtime role.
 //!
 //! No catalog, Pricing, Products or Contracts client exists in this harness: draft authoring must
@@ -7,8 +7,8 @@
 use super::events::Env;
 use super::*;
 use crate::api::local_client::sdk_result;
-use crate::authz::test_pdp::{FakePdp, Grant, ScriptedPdp, pep_with, user, with_proof};
-use crate::authz::{Action, Caller};
+use crate::authz::Caller;
+use crate::authz::test_pdp::{RulesProvider, ScriptedPdp, pep_with, user, with_proof};
 use crate::domain::audit::{ActorIdentities, AdminTextKey, Principal, ServiceRole};
 use crate::domain::idempotency::{LeaseDuration, StoredResponse};
 use crate::infra::broker::BoundProducer;
@@ -27,6 +27,7 @@ use bss_orders_sdk::models::{
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
 pub(super) const BUYER: (u128, u128) = (102, 10);
 /// A seller-role-only principal: no authoring rule names it.
 pub(super) const SELLER_OPERATOR: (u128, u128) = (103, 20);
@@ -34,29 +35,21 @@ pub(super) const SELLER_OPERATOR: (u128, u128) = (103, 20);
 pub(super) fn s(id: Uuid) -> String {
     id.to_string()
 }
-/// The buyer's authoring actions.
-const AUTHORING: &[Action] = &[
-    Action::OrderCreate,
-    Action::OrderWrite,
-    Action::OrderEdit,
-    Action::OrderRead,
-];
-/// The policy fake (D-227). The buyer authors on resource tenants 10/11 (never 12). Which payer
-/// an order names is a business rule checked at submit (D-215), so the policy grants no payer
-/// condition.
-pub(super) fn policy() -> Arc<FakePdp> {
-    FakePdp::new(
-        vec![
-            Grant::new(u(BUYER.0), AUTHORING).path([("resource_tenant_id", vec![u(10), u(11)])]),
-            // Seller operations on the seller's orders: read, hold and resume only (02 §1.3).
-            Grant::new(
-                u(SELLER_OPERATOR.0),
-                &[Action::OrderRead, Action::OrderHold, Action::OrderResume],
-            )
-            .path([("seller_tenant_id", vec![u(20)])]),
-        ],
-        &[],
-    )
+/// The buyer authors on resource tenants 10/11 (never 12). Which payer an order names is a
+/// business rule checked at submit (D-215), so the policy grants no payer condition.
+pub(super) fn policy() -> Value {
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s2-09",
+    "rules": [{
+        "id": "buyer", "subject": {"id": s(u(BUYER.0))}, "resource_type": ORDER_RT,
+        "actions": ["create", "write", "edit", "read"],
+        "paths": [{"predicates": [{"property": "resource_tenant_id",
+            "values": [s(u(10)), s(u(11))]}]}],
+    }, {
+        // Seller operations on the seller's orders: read, hold and resume only (02 §1.3).
+        "id": "seller-ops", "subject": {"id": s(u(SELLER_OPERATOR.0))}, "resource_type": ORDER_RT,
+        "actions": ["read", "hold", "resume"],
+        "paths": [{"predicates": [{"property": "seller_tenant_id", "values": [s(u(20))]}]}],
+    }]})
 }
 pub(super) fn identities() -> ActorIdentities {
     ActorIdentities::new(
@@ -163,11 +156,11 @@ impl T {
         )
     }
     pub(super) fn service(&self) -> CaptureService {
-        Self::service_with(self.engine(policy()), 200)
+        Self::service_with(self.engine(RulesProvider::from_policy(policy())), 200)
     }
     /// The read service over the same database, PDP and identities (early S6-01/S6-04).
     pub(super) fn reads(&self) -> crate::infra::read::ReadService {
-        self.reads_with(policy())
+        self.reads_with(RulesProvider::from_policy(policy()))
     }
     pub(super) fn reads_with(
         &self,
@@ -615,7 +608,7 @@ async fn authoring_keeps_stable_line_identities_and_increments_only_the_draft_re
 #[ignore = "requires Docker (testcontainers)"]
 async fn structural_and_field_refusals_follow_the_declared_precedence() {
     let t = T::new().await;
-    let svc = T::service_with(t.engine(policy()), 2);
+    let svc = T::service_with(t.engine(RulesProvider::from_policy(policy())), 2);
     let id = create(&t, &svc, "c-1").await;
     result(
         svc.add_line(&buyer(), id, line("EUR", None), &write("a-1", 1, Some(0)))
@@ -997,10 +990,19 @@ async fn header_and_axis_edits_are_written_by_the_engine_under_complete_authoriz
     assert_eq!(t.order_row(id).await["payer_tenant_id"], json!(s(u(32))));
 }
 
-/// Resource tenants 10 and 11 granted by separate grants: each decision is constrained to one
+/// Resource tenants 10 and 11 granted by separate rules: each decision is constrained to one
 /// tenant, so no single scope sees the order both before and after the move.
-fn tenant_grant(tenant: u128) -> Grant {
-    Grant::new(u(BUYER.0), AUTHORING).path([("resource_tenant_id", vec![u(tenant)])])
+fn split_tenant_policy() -> Value {
+    let rule = |id: &str, tenant: u128| {
+        json!({
+            "id": id, "subject": {"id": s(u(BUYER.0))}, "resource_type": ORDER_RT,
+            "actions": ["create", "write", "edit", "read"],
+            "paths": [{"predicates": [{"property": "resource_tenant_id",
+                "values": [s(u(tenant))]}]}],
+        })
+    };
+    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "split-tenants",
+        "rules": [rule("tenant-a", 10), rule("tenant-b", 11)]})
 }
 
 #[tokio::test]
@@ -1008,7 +1010,7 @@ fn tenant_grant(tenant: u128) -> Grant {
 async fn a_draft_moves_between_tenants_granted_by_separate_rules() {
     let t = T::new().await;
     let svc = T::service_with(
-        t.engine(FakePdp::new(vec![tenant_grant(10), tenant_grant(11)], &[])),
+        t.engine(RulesProvider::from_policy(split_tenant_policy())),
         200,
     );
     let id = create(&t, &svc, "c-1").await;
@@ -1033,7 +1035,7 @@ async fn a_draft_moves_between_tenants_granted_by_separate_rules() {
     assert_eq!(row["resource_tenant_id"], json!(s(u(11))));
     assert_eq!(row["audit_tenant_id"], json!(s(u(10))));
     assert_eq!(t.audits(id).await, audits + 1);
-    // The order is now edited under the tenant-B grant alone.
+    // The order is now edited under the tenant-B rule alone.
     result(
         svc.patch_order(
             &buyer(),
@@ -1047,8 +1049,10 @@ async fn a_draft_moves_between_tenants_granted_by_separate_rules() {
         .await
         .unwrap(),
     );
-    // Without the tenant-B grant the move is refused and nothing is written.
-    let a_only = T::service_with(t.engine(FakePdp::new(vec![tenant_grant(10)], &[])), 200);
+    // Without the tenant-B rule the move is refused and nothing is written.
+    let only_a = json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "a-only",
+        "rules": [split_tenant_policy()["rules"][0].clone()]});
+    let a_only = T::service_with(t.engine(RulesProvider::from_policy(only_a)), 200);
     let other = create(&t, &a_only, "c-2").await;
     let before = t.order_row(other).await;
     let denied = a_only
@@ -1100,7 +1104,7 @@ async fn location_keeps_the_gateway_prefix_on_create_and_replay() {
     assert_eq!(read.2["order"]["order_id"], json!(id));
 }
 
-/// One in-process HTTP exchange through the mounted router (no TCP listener or host gateway).
+/// One in-process HTTP exchange through the mounted router (not the S2-12 live E2E).
 pub(super) async fn http(
     router: &axum::Router,
     method: &str,
@@ -1598,7 +1602,7 @@ async fn only_draft_mutation_and_amendment_may_propose_an_axis_change() {
     let t = T::new().await;
     let svc = t.service();
     let id = create(&t, &svc, "c-1").await;
-    let engine = t.engine(policy());
+    let engine = t.engine(RulesProvider::from_policy(policy()));
     let (row, registry, audits) = (
         t.order_row(id).await,
         t.registry().await,

@@ -63,7 +63,7 @@ fn holdable_state() -> Value {
 }
 /// Caller text: no control characters other than tab/CR/LF (audit `caller_reason` rule).
 /// Written with `\xHH` escapes: the GTS safe regular-expression profile (gts 0.16, spec
-/// §11.0.1) refuses `\u` escapes, and every excluded code point is at most U+009F (D-230).
+/// §11.0.1) refuses `\u` escapes, and every excluded code point is at most U+009F.
 fn reason() -> Value {
     json!({
         "type": "string", "minLength": 1, "maxLength": MAX_REASON_CHARS,
