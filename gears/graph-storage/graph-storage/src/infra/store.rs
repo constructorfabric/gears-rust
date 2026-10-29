@@ -442,6 +442,15 @@ impl GraphStoreV1 for PgGraphStore {
         reads::project_table(self, ctx, req).await
     }
 
+    async fn count_table(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: ProjectionRequest,
+        max: u64,
+    ) -> Result<graph_storage_sdk::models::NodeCount, GraphStoreError> {
+        reads::count_table(self, ctx, req, max).await
+    }
+
     async fn load_topology(
         &self,
         _ctx: &StoreCtx<'_>,

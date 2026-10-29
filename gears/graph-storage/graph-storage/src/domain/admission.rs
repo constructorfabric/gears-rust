@@ -580,6 +580,41 @@ pub fn bind_listing_to_cursor(
     query.filter_hash = identity;
     Ok(query)
 }
+/// A count of a listing: the projection's bounds, and nothing a page needs.
+///
+/// A count has no pages, so an ordering, a page size, a cursor or a column
+/// selection cannot apply to it; each is refused by name rather than
+/// ignored, so a caller who believes one narrowed the count is told it did
+/// not.
+pub fn admit_count(
+    cfg: &GraphStorageConfig,
+    type_patterns: &[String],
+    query: &toolkit_odata::ODataQuery,
+) -> Result<(), DomainError> {
+    admit_projection(cfg, type_patterns, query)?;
+    let toolkit_odata::ODataQuery {
+        filter: _,
+        order,
+        limit,
+        cursor,
+        filter_hash: _,
+        select,
+    } = query;
+    for (present, option) in [
+        (!order.0.is_empty(), "$orderby"),
+        (limit.is_some(), "$top"),
+        (cursor.is_some(), "cursor"),
+        (select.is_some(), "$select"),
+    ] {
+        if present {
+            return Err(DomainError::invalid(format!(
+                "a count has no pages, so {option} does not apply to it; send the $filter and \
+                 type_pattern of the listing alone"
+            )));
+        }
+    }
+    Ok(())
+}
 
 /// The tabular projection: the type patterns it is narrowed to, and the
 /// `OData` query it is shaped by.

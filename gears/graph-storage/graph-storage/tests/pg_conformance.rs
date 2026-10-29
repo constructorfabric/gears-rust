@@ -2290,3 +2290,49 @@ async fn overlapping_batches_all_land() {
     )
     .await;
 }
+
+pg_case!(
+    a_count_agrees_with_the_listing,
+    conformance::a_count_agrees_with_the_listing
+);
+
+/// A column filter goes through the platform's binding on this store (the
+/// fake answers column filters unfiltered), so its count is asserted here.
+#[tokio::test]
+async fn a_count_applies_a_column_filter_as_the_listing_does() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
+    conformance::ingest_batch(
+        stand.store.as_ref(),
+        &ctx,
+        conformance::batch(
+            vec![
+                conformance::node("col-a", "alpha"),
+                conformance::node("col-b", "beta"),
+                conformance::node("col-c", "alpha"),
+            ],
+            Vec::new(),
+        ),
+    )
+    .await
+    .expect("the batch commits");
+    let counted = stand
+        .store
+        .count_table(
+            &ctx,
+            conformance::projection(&[], "name eq 'alpha'", &[]),
+            100,
+        )
+        .await
+        .expect("the count answers");
+    assert_eq!((counted.count, counted.capped), (2, false));
+}

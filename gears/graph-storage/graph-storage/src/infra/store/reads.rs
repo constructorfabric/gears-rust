@@ -597,13 +597,19 @@ pub async fn node_types(
         .collect())
 }
 
-pub async fn project_table(
-    store: &PgGraphStore,
+/// The scoped, tombstone-free node select a listing reads, narrowed to its
+/// type set, with the payload paths each selected type declares.
+async fn listing_select(
     ctx: &StoreCtx<'_>,
-    req: ProjectionRequest,
-) -> Result<OdataPage<NodeRow>, GraphStoreError> {
-    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
-
+    conn: &impl DBRunner,
+    type_set: Option<&graph_storage_sdk::models::TypeIdSet>,
+) -> Result<
+    (
+        toolkit_db::secure::SecureSelect<node::Entity, toolkit_db::secure::Scoped>,
+        Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>>,
+    ),
+    GraphStoreError,
+> {
     let mut select = node::Entity::find()
         .secure()
         .scope_with(ctx.scope)
@@ -613,13 +619,13 @@ pub async fn project_table(
     // ids narrow the statement, the declarations decide what `$filter` and
     // `$orderby` may name (ADR-0003).
     let mut declared_kinds: Vec<BTreeMap<String, crate::domain::ontology::ScalarKind>> = Vec::new();
-    if let Some(set) = &req.type_set {
+    if let Some(set) = type_set {
         let names: Vec<String> = set.0.iter().cloned().collect();
         let types = gts_type::Entity::find()
             .secure()
             .scope_with(ctx.scope)
             .filter(Condition::all().add(gts_type::Column::GtsTypeId.is_in(names)))
-            .project_all(&conn, |query| {
+            .project_all(conn, |query| {
                 type_traits_columns(query).into_model::<TypeTraits>()
             })
             .await
@@ -631,6 +637,17 @@ pub async fn project_table(
             .collect();
         select = select.filter(Condition::all().add(node::Column::GtsNodeTypeId.is_in(ids)));
     }
+
+    Ok((select, declared_kinds))
+}
+
+pub async fn project_table(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    req: ProjectionRequest,
+) -> Result<OdataPage<NodeRow>, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let (select, declared_kinds) = listing_select(ctx, &conn, req.type_set.as_ref()).await?;
 
     // The listing's identity, and the cursor's claim to continue it. Both
     // paths below mint a cursor from `filter_hash` and compare an incoming
@@ -680,6 +697,60 @@ pub async fn project_table(
     .map_err(map_odata_err)?;
 
     rows_to_page(ctx, &conn, page.items, page.page_info).await
+}
+
+/// How many rows `project_table` lists for `req`, up to `max`.
+///
+/// The same select and the same `$filter` as the listing -- the platform's
+/// column filter or the gear's payload plan, whichever the listing would use
+/// -- so the count cannot disagree with the pages. It reads the matching
+/// rows' ids, at most `max + 1`, rather than `COUNT(*)`: the bound is what
+/// makes its cost a function of configuration rather than of the tenant's
+/// size, and the secure ORM's count drops a `LIMIT`.
+pub async fn count_table(
+    store: &PgGraphStore,
+    ctx: &StoreCtx<'_>,
+    req: ProjectionRequest,
+    max: u64,
+) -> Result<graph_storage_sdk::models::NodeCount, GraphStoreError> {
+    let conn = store.db().conn().map_err(|error| map_db_error(&error))?;
+    let (mut select, declared_kinds) = listing_select(ctx, &conn, req.type_set.as_ref()).await?;
+    let invalid = |what: String| GraphStoreError::InvalidQuery { what };
+
+    if crate::domain::projection::mentions_payload(&req.query) {
+        let admitted = req
+            .type_set
+            .as_ref()
+            .map(|_| crate::domain::projection::admitted_paths(&declared_kinds));
+        let plan = crate::domain::projection::plan(&req.query, admitted.as_ref())
+            .map_err(|error| invalid(error.0))?;
+        if let Some(predicate) = &plan.filter {
+            select = select.filter(crate::infra::store::projection::condition(predicate));
+        }
+    } else if let Some(filter) = &req.query.filter {
+        let node = toolkit_odata::filter::convert_expr_to_filter_node::<Field>(filter)
+            .map_err(|error| invalid(error.to_string()))?;
+        let condition = toolkit_db::odata::sea_orm_filter::filter_node_to_condition::<
+            Field,
+            NodeODataMapper,
+        >(&node)
+        .map_err(invalid)?;
+        select = select.filter(condition);
+    }
+
+    let ids = select
+        .limit(max.saturating_add(1))
+        .project_all(&conn, |query| {
+            node_ident_columns(query).into_model::<NodeIdent>()
+        })
+        .await
+        .map_err(map_scope_err)?;
+    let seen = ids.len() as u64;
+    Ok(graph_storage_sdk::models::NodeCount {
+        count: std::cmp::Ord::min(seen, max),
+        capped: seen > max,
+        revision: observed_revision(ctx, &conn).await?,
+    })
 }
 
 /// The projection when a payload path is named: the shared plan rendered by

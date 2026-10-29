@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
     DeleteOutcome, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page, RegisteredType, SearchRequest,
-    SearchResponse, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
-    TypeRegistrationOptions,
+    NeighborhoodRequest, NodeCount, NodeKey, NodeRow, NodeView, Page, RegisteredType,
+    SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord,
+    TypeRegistration, TypeRegistrationOptions,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -118,6 +118,18 @@ impl GraphStorageClientV1 for GraphStorageLocalClient {
     ) -> Result<toolkit_odata::Page<NodeRow>, CanonicalError> {
         self.services
             .project_nodes(ctx, type_patterns, query)
+            .await
+            .map_err(Into::into)
+    }
+
+    async fn count_nodes(
+        &self,
+        ctx: &SecurityContext,
+        type_patterns: &[String],
+        query: toolkit_odata::ODataQuery,
+    ) -> Result<NodeCount, CanonicalError> {
+        self.services
+            .count_nodes(ctx, type_patterns, query)
             .await
             .map_err(Into::into)
     }

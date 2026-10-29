@@ -2996,4 +2996,17 @@ async fn the_local_client_declares_an_index_path_on_a_registered_type() {
         .await
         .expect("the newly declared path filters at once");
     assert_eq!(page.items.len(), 2, "both requirements match");
+
+    // And the same filter has a total, in-process as over REST.
+    let mut unordered = by_priority();
+    unordered.order = toolkit_odata::ODataOrderBy(Vec::new());
+    let counted = client
+        .count_nodes(&ctx, &patterns, unordered)
+        .await
+        .expect("the count answers in-process");
+    assert_eq!((counted.count, counted.capped), (2, false));
+    client
+        .count_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect_err("a count refuses an ordering it cannot apply");
 }

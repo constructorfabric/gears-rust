@@ -7506,3 +7506,74 @@ pub async fn overlapping_batches_all_land(store: std::sync::Arc<dyn GraphStoreV1
         }
     }
 }
+
+/// A count answers how many rows the listing with the same type set and
+/// `$filter` holds across all its pages, and says when it stopped counting
+/// (gears-rust #5108 point 1, #5529 item 2).
+pub async fn a_count_agrees_with_the_listing(store: &dyn GraphStoreV1, tenant: Uuid) {
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = ctx(tenant, &scope, None);
+    seed_tickets(store, &ctx).await;
+    let count = |filter: &str, max: u64| {
+        let request = projection(&[INDEXED], filter, &[]);
+        let ctx = &ctx;
+        async move {
+            store
+                .count_table(ctx, request, max)
+                .await
+                .expect("the count answers")
+        }
+    };
+
+    let all = count("", 100).await;
+    assert_eq!((all.count, all.capped), (5, false), "every ticket");
+    assert!(
+        all.revision.revision > 0,
+        "the count reports what it observed"
+    );
+
+    let high = count("payload/severity eq 'high'", 100).await;
+    let listed = store
+        .project_table(
+            &ctx,
+            projection(
+                &[INDEXED],
+                "payload/severity eq 'high'",
+                &[("node_key", toolkit_odata::SortDir::Asc)],
+            ),
+        )
+        .await
+        .expect("the listing answers");
+    assert_eq!(
+        high.count,
+        listed.items.len() as u64,
+        "the count is the listing's length"
+    );
+    assert_eq!((high.count, high.capped), (3, false));
+
+    assert_eq!(
+        count("payload/severity eq 'none'", 100).await.count,
+        0,
+        "a filter nothing matches counts zero"
+    );
+
+    let capped = count("payload/severity eq 'high'", 2).await;
+    assert_eq!(
+        (capped.count, capped.capped),
+        (2, true),
+        "past the ceiling the count is the ceiling, and says so"
+    );
+    let exact = count("payload/severity eq 'high'", 3).await;
+    assert_eq!(
+        (exact.count, exact.capped),
+        (3, false),
+        "exactly the ceiling is an exact count"
+    );
+
+    // A tombstoned row is not listed, so it is not counted.
+    store
+        .soft_delete(&ctx, DeleteRequest::Node("t1".to_owned()))
+        .await
+        .expect("the delete commits");
+    assert_eq!(count("payload/severity eq 'high'", 100).await.count, 2);
+}

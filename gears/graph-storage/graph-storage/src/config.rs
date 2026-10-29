@@ -152,6 +152,13 @@ pub struct GraphStorageConfig {
     pub traversal_max_edges_scanned: u64,
     pub search_max_arm_limit: u32,
     pub projection_max_page: u32,
+    /// The most rows a count of a listing counts exactly (`GET /nodes/count`).
+    ///
+    /// Past it the answer is this number with `capped` set, so the cost of a
+    /// count is bounded by configuration rather than by the size of the
+    /// tenant: the count reads the matching rows' ids, at most this many plus
+    /// one.
+    pub projection_count_max: u32,
     /// Absolute deadline for interactive operations, seconds.
     pub deadline_interactive_secs: u64,
     /// Idempotency receipt retention, days.
@@ -231,6 +238,7 @@ impl Default for GraphStorageConfig {
             traversal_max_edges_scanned: 100_000,
             search_max_arm_limit: 50,
             projection_max_page: 200,
+            projection_count_max: 10_000,
             deadline_interactive_secs: 10,
             idempotency_retention_days: 7,
             ontology_max_chain_depth: 3,
@@ -513,6 +521,7 @@ impl GraphStorageConfig {
         );
         check_range!(errors, self, search_max_arm_limit, 1u32, 500u32);
         check_range!(errors, self, projection_max_page, 1u32, 1_000u32);
+        check_range!(errors, self, projection_count_max, 1u32, 1_000_000u32);
         check_range!(errors, self, deadline_interactive_secs, 1u64, 300u64);
         check_range!(errors, self, idempotency_retention_days, 1u32, 365u32);
         check_range!(errors, self, ontology_max_chain_depth, 3u8, 16u8);

@@ -1113,6 +1113,7 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `GET` | `/api/graph-storage/v1/revision` | The tenant's current `(source_epoch, graph_revision)` — the cache-invalidation signal (`fr-revision-signal`) | p1 |
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
+| `GET` | `/api/graph-storage/v1/nodes/count` | How many nodes the projection lists for the same `type_pattern` and `$filter`; exact up to `projection_count_max`, `capped` past it | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
 | `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
@@ -2875,6 +2876,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
+| Rows a listing count counts exactly | `projection_count_max` | 10,000 | 1 – 1,000,000 | Store; past it the count is the ceiling with `capped` |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
 | Per-tenant concurrent ingest batches | `tenant_max_ingest` | 4 | 1 – 64 | Admission |
 | Per-tenant concurrent queries | `tenant_max_queries` | 32 | 1 – 1,024 | Admission |

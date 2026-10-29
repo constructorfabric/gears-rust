@@ -713,3 +713,8 @@ async fn overlapping_batches_all_land() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_count_agrees_with_the_listing() {
+    conformance::a_count_agrees_with_the_listing(&store(), Uuid::now_v7()).await;
+}

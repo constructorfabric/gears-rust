@@ -610,6 +610,15 @@ pub mod without_node_types {
             self.0.project_table(ctx, req).await
         }
 
+        async fn count_table(
+            &self,
+            ctx: &StoreCtx<'_>,
+            req: ProjectionRequest,
+            max: u64,
+        ) -> Result<NodeCount, GraphStoreError> {
+            self.0.count_table(ctx, req, max).await
+        }
+
         async fn load_topology(
             &self,
             ctx: &StoreCtx<'_>,

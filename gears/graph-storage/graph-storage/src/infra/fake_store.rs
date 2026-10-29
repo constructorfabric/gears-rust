@@ -1263,48 +1263,8 @@ impl GraphStoreV1 for FakeGraphStore {
         let Some(tenant) = tenants.get(&ctx.tenant) else {
             return Err(GraphStoreError::NotFound);
         };
-        let (nodes, _, revision) = visible(tenant, ctx);
+        let (selected, revision) = listed(tenant, ctx, &req)?;
         let limit = req.query.limit.unwrap_or(200);
-        let selected: Vec<&FakeNode> = nodes
-            .iter()
-            .filter(|n| !n.deleted)
-            .filter(|n| {
-                req.type_set
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&n.type_id))
-            })
-            .collect();
-
-        // Column-only filter and ordering are the platform's on the real
-        // store, and the fake answers the unfiltered page for them. A payload
-        // path is this gear's own rule, so the fake evaluates the shared plan
-        // -- the admissibility check and the semantics it implies are then
-        // asserted against both implementations (ADR-0003).
-        let selected: Vec<&FakeNode> = if projection::mentions_payload(&req.query) {
-            let admitted = req.type_set.as_ref().map(|set| {
-                let kinds: Vec<BTreeMap<String, ontology::ScalarKind>> = set
-                    .0
-                    .iter()
-                    .map(|type_id| tenant.index_kinds.get(type_id).cloned().unwrap_or_default())
-                    .collect();
-                projection::admitted_paths(&kinds)
-            });
-            let plan = projection::plan(&req.query, admitted.as_ref())
-                .map_err(|error| GraphStoreError::InvalidQuery { what: error.0 })?;
-            if req.query.cursor.is_some() {
-                return Err(GraphStoreError::InvalidQuery {
-                    what: "the in-memory store does not page a payload projection".to_owned(),
-                });
-            }
-            let mut rows: Vec<&FakeNode> = selected
-                .into_iter()
-                .filter(|n| plan.filter.as_ref().is_none_or(|p| eval::holds(p, n)))
-                .collect();
-            rows.sort_by(|a, b| eval::order(&plan, a, b));
-            rows
-        } else {
-            selected
-        };
 
         let items = selected
             .into_iter()
@@ -1332,6 +1292,36 @@ impl GraphStoreV1 for FakeGraphStore {
                 prev_cursor: None,
                 limit,
             },
+        })
+    }
+
+    async fn count_table(
+        &self,
+        ctx: &StoreCtx<'_>,
+        req: ProjectionRequest,
+        max: u64,
+    ) -> Result<graph_storage_sdk::models::NodeCount, GraphStoreError> {
+        let revision_of = |revision| GraphRevision {
+            source_epoch: self.epoch,
+            revision,
+        };
+        if !scope_admits(ctx.scope, ctx.tenant) {
+            return Ok(graph_storage_sdk::models::NodeCount {
+                count: 0,
+                capped: false,
+                revision: revision_of(0),
+            });
+        }
+        let tenants = self.tenants.lock().map_err(|_| poisoned())?;
+        let Some(tenant) = tenants.get(&ctx.tenant) else {
+            return Err(GraphStoreError::NotFound);
+        };
+        let (selected, revision) = listed(tenant, ctx, &req)?;
+        let seen = selected.len() as u64;
+        Ok(graph_storage_sdk::models::NodeCount {
+            count: seen.min(max),
+            capped: seen > max,
+            revision: revision_of(revision),
         })
     }
 
@@ -1397,6 +1387,57 @@ impl GraphStoreV1 for FakeGraphStore {
             })
             .collect())
     }
+}
+
+/// The rows a projection lists, in its order, and the revision it observed:
+/// one selection for the listing and its count, so the two cannot disagree.
+fn listed<'t>(
+    tenant: &'t Tenant,
+    ctx: &StoreCtx<'_>,
+    req: &ProjectionRequest,
+) -> Result<(Vec<&'t FakeNode>, i64), GraphStoreError> {
+    let (nodes, _, revision) = visible(tenant, ctx);
+    let selected: Vec<&FakeNode> = nodes
+        .iter()
+        .filter(|n| !n.deleted)
+        .filter(|n| {
+            req.type_set
+                .as_ref()
+                .is_none_or(|set| set.contains(&n.type_id))
+        })
+        .collect();
+
+    // Column-only filter and ordering are the platform's on the real
+    // store, and the fake answers the unfiltered page for them. A payload
+    // path is this gear's own rule, so the fake evaluates the shared plan
+    // -- the admissibility check and the semantics it implies are then
+    // asserted against both implementations (ADR-0003).
+    let selected: Vec<&FakeNode> = if projection::mentions_payload(&req.query) {
+        let admitted = req.type_set.as_ref().map(|set| {
+            let kinds: Vec<BTreeMap<String, ontology::ScalarKind>> = set
+                .0
+                .iter()
+                .map(|type_id| tenant.index_kinds.get(type_id).cloned().unwrap_or_default())
+                .collect();
+            projection::admitted_paths(&kinds)
+        });
+        let plan = projection::plan(&req.query, admitted.as_ref())
+            .map_err(|error| GraphStoreError::InvalidQuery { what: error.0 })?;
+        if req.query.cursor.is_some() {
+            return Err(GraphStoreError::InvalidQuery {
+                what: "the in-memory store does not page a payload projection".to_owned(),
+            });
+        }
+        let mut rows: Vec<&FakeNode> = selected
+            .into_iter()
+            .filter(|n| plan.filter.as_ref().is_none_or(|p| eval::holds(p, n)))
+            .collect();
+        rows.sort_by(|a, b| eval::order(&plan, a, b));
+        rows
+    } else {
+        selected
+    };
+    Ok((selected, revision))
 }
 
 /// The fake's own engine, so traversal conformance has a second

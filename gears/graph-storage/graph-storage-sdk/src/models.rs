@@ -913,6 +913,20 @@ pub struct EdgeView {
     pub envelope: ElementEnvelope,
 }
 
+/// How many nodes a listing matches: the answer to the projection's
+/// `type_patterns` and `$filter` without its pages.
+///
+/// Exact up to the deployment's `projection_count_max`. Past it `count` is
+/// that ceiling and `capped` is set, so a caller can render "10 000+" rather
+/// than a number the gear did not count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeCount {
+    pub count: u64,
+    pub capped: bool,
+    /// The revision the count observed, as on every projection row.
+    pub revision: GraphRevision,
+}
+
 /// One row of the tabular projection.
 #[derive(Clone, Debug, PartialEq)]
 pub struct NodeRow {

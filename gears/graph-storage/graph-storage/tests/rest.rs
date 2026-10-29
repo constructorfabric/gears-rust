@@ -644,3 +644,40 @@ async fn a_walk_takes_a_direction_and_discriminators_and_reads_name_them() {
         "an edge's envelope carries no version: {edge}"
     );
 }
+
+/// `GET /nodes/count` answers the listing's total, and refuses the options a
+/// count has no use for rather than ignoring them. A node keyed like the
+/// route is still listed (#5108 point 1, #5529 item 2).
+#[tokio::test]
+async fn a_listing_has_a_count_beside_it() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand.post("/ingest", &ingest_body()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let (status, counted) = stand.get("/nodes/count").await;
+    assert_eq!(status, StatusCode::OK, "{counted}");
+    assert_eq!(counted["count"], 2, "{counted}");
+    assert_eq!(counted["capped"], false, "{counted}");
+    assert!(
+        counted["revision"]["revision"].as_i64() > Some(0),
+        "{counted}"
+    );
+
+    let (status, problem) = stand.get("/nodes/count?$orderby=node_key").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a count has no order: {problem}"
+    );
+    let (status, problem) = stand.get("/nodes/count?limit=5").await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "nor a page size: {problem}"
+    );
+
+    // The static segment does not swallow other keys.
+    let (status, node) = stand.get("/nodes/rest-a").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+}

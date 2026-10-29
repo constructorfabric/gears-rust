@@ -549,6 +549,18 @@ pub struct GraphNeighborhoodRequest {
     pub direction: Option<String>,
 }
 
+/// How many nodes a listing matches.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct GraphNodeCountDto {
+    /// Exact when `capped` is false; otherwise the deployment's
+    /// `projection_count_max`, and the listing holds more.
+    pub count: u64,
+    pub capped: bool,
+    /// The revision the count observed.
+    pub revision: GraphRevisionDto,
+}
+
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct GraphEdgeRefDto {
@@ -923,6 +935,16 @@ impl From<m::SearchResponse> for GraphSearchResponseDto {
             hits: value.hits.into_iter().map(Into::into).collect(),
             revision: value.revision.into(),
             truncated: value.truncated.map(truncation_name),
+        }
+    }
+}
+
+impl From<m::NodeCount> for GraphNodeCountDto {
+    fn from(value: m::NodeCount) -> Self {
+        Self {
+            count: value.count,
+            capped: value.capped,
+            revision: value.revision.into(),
         }
     }
 }
