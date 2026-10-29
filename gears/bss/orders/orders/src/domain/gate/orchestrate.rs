@@ -28,7 +28,7 @@ use super::answers::{
     OccupancyObservation, OccupancyQuery, OrderEvaluation, OrderEvaluationRequest, OverlapKey,
     OverlapKeyLine, PayerProfile, PayerProfileQuery, ResolvedTerms, TaxQuery, TermIntentInput,
 };
-use super::assess::{AssessmentInput, BasketLine};
+use super::assess::{AssessmentInput, BasketLine, supported_basket_line};
 use super::commercial::CommercialError;
 use super::ports::{GatePort, PortAnswer, Unavailable};
 use super::pricing_map::{CatalogAnswer, LineCatalogRequest, PinOutcome, map_line};
@@ -313,7 +313,8 @@ pub fn payer_market(identity: &PortAnswer<PayerProfile>) -> Option<Market> {
 }
 
 /// Each line's accepted bindings, from its composed pin (`map_line`); a line whose pin does not
-/// compose has no entry.
+/// compose, or whose request `assess` refuses as unsupported
+/// ([`supported_basket_line`]), has no entry.
 #[must_use]
 pub fn line_bindings(
     basket: &Basket,
@@ -322,7 +323,7 @@ pub fn line_bindings(
     basket
         .lines
         .iter()
-        .filter(|l| l.catalog.line_id == l.line_id)
+        .filter(|l| supported_basket_line(l))
         .filter_map(|l| {
             let answer = catalog.get(&l.line_id)?;
             match map_line(&l.catalog, answer, basket.resolve_date).pin {

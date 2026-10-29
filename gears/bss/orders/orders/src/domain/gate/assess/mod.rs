@@ -393,7 +393,7 @@ fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date
     let id = line.line_id;
     let code = if line.catalog.line_id != id {
         LINE_ID_MISMATCH
-    } else if mixed_quantities(&line.catalog) {
+    } else if !supported_basket_line(line) {
         MIXED_ITEM_QUANTITIES
     } else {
         return map_line(&line.catalog, answer, resolve_date);
@@ -416,6 +416,16 @@ fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date
     }
     mapped.pin = PinOutcome::Unevaluable(r);
     mapped
+}
+
+/// Whether the gate maps this line's catalog request at all: the request names the line itself
+/// and its items state one quantity. The one predicate `assess` and the orchestrator's
+/// [`line_bindings`](crate::domain::gate::orchestrate::line_bindings) share, so a refused line is
+/// never composed, asked for keys, evaluated or read, and a full key answer never holds an entry
+/// `assess` would call foreign (D-242).
+#[must_use]
+pub(crate) fn supported_basket_line(line: &BasketLine) -> bool {
+    line.catalog.line_id == line.line_id && !mixed_quantities(&line.catalog)
 }
 
 /// Whether the line's items state more than one quantity value. Text that does not parse is the

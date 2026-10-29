@@ -24,6 +24,7 @@ use bss_orders::domain::gate::vector::{Operation, ProducerResult, Verdict};
 use bss_orders::domain::guards::InputPort;
 use bss_orders::domain::transition::InputState;
 use bss_orders_sdk::authoring::{AuthoredTerm, BillingCycle};
+use bss_orders_sdk::catalog::Reason;
 use bss_orders_sdk::gate_report::CatalogSelection;
 use bss_pricing_sdk::read::*;
 use bss_pricing_sdk::terms::{BillingTiming, InputSource, InvoiceInputs, Rounding};
@@ -974,6 +975,66 @@ fn a_port_not_asked_is_missing_and_unconfirmed_payer_inputs_are_resolved_by_with
         out.failures
     );
     assert_eq!(out.primary.and_then(|o| o.reason), Some(unconfirmed));
+}
+
+/// D-242 (C6 × B3): a refused purchase shape (items stating different quantities) is never
+/// composed, so the orchestrator never asks a key for it; the full key answer then holds no entry
+/// `assess` calls foreign, and the other keyed line's rows 7/9 report the in-flight read, never
+/// `overlap-key-answer-rejected`.
+#[test]
+fn a_mixed_quantity_line_is_never_asked_a_key_and_leaves_other_lines_read() {
+    let mixed = |item: Uuid, qty: &str| SelectedItem {
+        quantity: qty.into(),
+        ..sel(item, None)
+    };
+    let (l1, l2) = (line_id(1), line_id(2));
+    let b = basket(
+        Operation::Submit,
+        vec![
+            basket_line(1, vec![sel(ITEM, None)], None),
+            basket_line(2, vec![mixed(ITEM, "1"), mixed(ITEM_B, "2")], None),
+        ],
+    );
+    let mut a = answered(&b);
+    // What the shell does: compose, then ask one key per requested line.
+    let bindings = line_bindings(&b, &a.catalog);
+    assert_eq!(bindings.keys().copied().collect::<Vec<_>>(), vec![l1]);
+    let asked: std::collections::BTreeSet<Uuid> = overlap_key_lines(&b, &bindings)
+        .iter()
+        .map(|q| q.line_id)
+        .collect();
+    assert_eq!(asked, [l1].into_iter().collect());
+    let k1 = format!("k{}", l1.as_u128());
+    a.overlap_keys = Some(PortAnswer::Answered(
+        asked
+            .iter()
+            .map(|l| overlap_key(*l, &format!("k{}", l.as_u128())))
+            .collect(),
+    ));
+    a.occupancy = Some(PortAnswer::Answered(vec![occupancy(&k1)]));
+    // l1's key is held by an in-flight order on the same tuple: the read ran, so row 9 fails.
+    a.inflight_same_tuple = [k1].into_iter().collect();
+    let out = assess(&assemble(&b, a)).unwrap();
+    let row = |p: PredicateId, l: Uuid| {
+        out.vector
+            .outcomes()
+            .iter()
+            .find(|o| o.key.predicate == p && o.key.line_id == Some(l))
+            .unwrap_or_else(|| panic!("{p:?} row of {l}"))
+    };
+    let in_flight = row(PredicateId::InFlightPerKey, l1);
+    assert_eq!(
+        (in_flight.verdict, in_flight.reason),
+        (Verdict::Failed, Some(Reason::OrderInFlightForKey)),
+        "{in_flight:#?}"
+    );
+    let unique = row(PredicateId::OverlapUniqueness, l1);
+    assert_eq!(unique.verdict, Verdict::Passed, "{unique:#?}");
+    let refused = row(PredicateId::ReferenceResolution, l2);
+    assert_eq!(
+        (refused.verdict, refused.reason),
+        (Verdict::Failed, Some(Reason::ReferenceUnresolvable))
+    );
 }
 
 #[test]
