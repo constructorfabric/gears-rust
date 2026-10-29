@@ -2,7 +2,7 @@
 
 Record intake for connectors and the profile read for applications and agents. A connector sends one record per request for one tenant; Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity: the planner turns it into a plan, the sensitive-data checks and Admission decide what of it is stored, and the profile writer stores it in graph storage. An application or agent then reads the subject's profile by category.
 
-**Processing runs only with a processing identity and a model configured.** Without them, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `503`.
+**Processing runs only with a processing identity and a model configured.** Without them, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `501`, which a caller does not retry.
 
 **Features:**
 - One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`gts.cf.connectors.core.record.v1~` / `send`) for the named tenant
@@ -41,22 +41,47 @@ The gear is in this repository under `gears/construct`, and it is not built into
    use construct as _;
    ```
 
-3. In `config/quickstart.yaml`, under `gears:`, add the gear's section:
+3. Construct needs graph storage, which needs PostgreSQL 16 or later with the `vector` extension. For a local run, start one in Docker:
+
+   ```bash
+   docker run -d --name graph-storage-pg -e POSTGRES_PASSWORD=graph -e POSTGRES_DB=graph_storage -p 5432:5432 pgvector/pgvector:pg17
+   ```
+
+4. In `config/quickstart.yaml`, under `database.servers:`, add the PostgreSQL server:
 
    ```yaml
+   pg_graph:
+     host: "localhost"
+     port: 5432
+     user: "postgres"
+     password: "graph"
+   ```
+
+   and under `gears:`, add graph storage's and the gear's sections:
+
+   ```yaml
+   graph-storage:
+     database:
+       server: "pg_graph"
+       dbname: "graph_storage"
+     config:
+       embedding_dimension: 384
+       embedding_provider: fake  # local run only; see graph storage's README for onnx or remote
    construct:
      database:
        server: "sqlite_users"
        file: "construct.db"
    ```
 
-4. Start the server:
+   The `fake` provider needs no model files. Its vectors rank nothing, which is fine here: Construct reads and writes facts by key and does not search by vector.
+
+5. Start the server:
 
    ```bash
-   cargo run --bin cf-gears-example-server --no-default-features --features construct,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
+   cargo run --bin cf-gears-example-server --no-default-features --features construct,graph-storage,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
    ```
 
-The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings` and `m003_record_ids`. The types registry is part of every example server, so the record types are there.
+The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids` and `m004_record_ids_key_only`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
 
 ## Configuration
 
