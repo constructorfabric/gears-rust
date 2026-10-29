@@ -48,10 +48,19 @@ use toolkit_security::{AccessScope, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+pub mod usage;
+
 /// A migrated file-backed SQLite database; the directory goes with the value.
 pub struct TestDb {
     pub db: Db,
     _dir: tempfile::TempDir,
+}
+
+impl TestDb {
+    /// A database whose lifetime is tied to `dir` (a PostgreSQL container's, say).
+    pub fn from_parts(db: Db, dir: tempfile::TempDir) -> Self {
+        Self { db, _dir: dir }
+    }
 }
 
 pub async fn migrated_db() -> TestDb {

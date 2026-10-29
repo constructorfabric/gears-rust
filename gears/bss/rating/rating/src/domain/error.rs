@@ -54,6 +54,16 @@ pub enum DomainError {
     /// there is one, is the source.
     #[error("coordination unavailable: {0}")]
     Coordination(String, #[source] Option<Cause>),
+    /// A dependency other than the PDP and the Cluster backend could not answer (the usage feed,
+    /// the meter declaration read); its error, when there is one, is the source. Transient: the
+    /// caller backs off and changes nothing.
+    #[error("{} unavailable: {detail}", .dependency.as_str())]
+    DependencyUnavailable {
+        dependency: Dependency,
+        detail: String,
+        #[source]
+        cause: Option<Cause>,
+    },
     /// A leader's work ended while its instance still led: it returned early or panicked; the
     /// task's `JoinError`, when there is one, is the source.
     #[error("leader work ended: {0}")]
@@ -86,6 +96,9 @@ impl DomainError {
             }
             Self::Database(..) | Self::Transaction(_) => {
                 Some((Dependency::Database, FailureCode::StorageFailed))
+            }
+            Self::DependencyUnavailable { dependency, .. } => {
+                Some((*dependency, FailureCode::Unavailable))
             }
             Self::NotFound { .. }
             | Self::NotQuarantined { .. }

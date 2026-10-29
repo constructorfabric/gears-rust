@@ -56,9 +56,9 @@ impl From<DomainError> for CanonicalError {
             DomainError::Concurrent(detail) => UsageResource::aborted(detail)
                 .with_reason(reason::CONCURRENT_MODIFICATION)
                 .create(),
-            DomainError::AuthzUnavailable(..) | DomainError::Coordination(..) => {
-                dependency_unavailable(&err)
-            }
+            DomainError::AuthzUnavailable(..)
+            | DomainError::Coordination(..)
+            | DomainError::DependencyUnavailable { .. } => dependency_unavailable(&err),
             // Logged where they were found: the detail never reaches the caller.
             DomainError::Database(..) | DomainError::CorruptRow(_) => internal(),
             DomainError::Transaction(_)
