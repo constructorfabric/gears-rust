@@ -314,7 +314,7 @@ pub fn payer_market(identity: &PortAnswer<PayerProfile>) -> Option<Market> {
 
 /// Each line's accepted bindings, from its composed pin (`map_line`); a line whose pin does not
 /// compose, or whose request `assess` refuses as unsupported
-/// ([`supported_basket_line`]), has no entry.
+/// (`assess::supported_basket_line`), has no entry.
 #[must_use]
 pub fn line_bindings(
     basket: &Basket,
