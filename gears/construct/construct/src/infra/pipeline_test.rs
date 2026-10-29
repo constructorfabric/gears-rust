@@ -310,7 +310,7 @@ impl AuthZResolverApi for CategoriesAsked {
         ctx: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
-        if request.resource.resource_type == "construct.profile" {
+        if request.resource.resource_type == crate::domain::profile_read::PROFILE_TYPE {
             self.0.lock().unwrap().push(
                 request
                     .resource

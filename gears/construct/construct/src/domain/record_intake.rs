@@ -19,10 +19,14 @@ use super::plan::{Origin, Plan};
 pub use super::refusal::{Place, Refusal, RefusalReason};
 use super::subject_settings::{SubjectKey, SubjectSettingsRepository, SubjectSettingsService};
 
+/// The GTS type a policy names records by: the connector record base type,
+/// which every record type derives from.
+pub(crate) const RECORD_TYPE: &str = toolkit_gts::gts_id!("cf.connectors.core.record.v1~");
+
 /// Authorization resource type for sending records, scoped by tenant. The
 /// tenant is the one the connector names, not the connector's own.
 pub(crate) const RECORD_RESOURCE: ResourceType =
-    ResourceType::from_static("construct.record", &[pep_properties::OWNER_TENANT_ID]);
+    ResourceType::from_static(RECORD_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 pub(crate) mod actions {
     pub const SEND: &str = "send";
