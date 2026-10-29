@@ -140,9 +140,11 @@ pub struct OverlapKeyLine {
     pub sku_version: i64,
 }
 
-/// The overlap key of one line (#5131 SUB-G1 names; operation proposed).
+/// The overlap key of one line (#5131 SUB-G1 names; operation proposed). Unknown members
+/// refuse (`SUBSCRIPTIONS_CONTRACT.md`): a misspelled `item_key` never decodes as a legacy echo.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OverlapKey {
     /// The order line.
     pub line_id: Uuid,

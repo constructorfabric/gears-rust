@@ -758,3 +758,25 @@ fn total_tokens_match_their_serde_spelling() {
     assert_eq!(TotalScope::from_token(""), None);
     assert_eq!(AmountStatus::from_token("usage"), None);
 }
+
+/// R12 (`SUBSCRIPTIONS_CONTRACT.md`: unknown struct members refuse): a renamed or misspelled member
+/// never decodes, so a misspelled `item_key` is never read as a legacy echo.
+#[test]
+fn overlap_key_refuses_unknown_members() {
+    let key = OverlapKey {
+        item_key: None,
+        line_id: id(1),
+        catalog_subscription_product_key: "k".into(),
+        overlap_scope_key: "s".into(),
+    };
+    let wire = serde_json::to_value(&key).unwrap();
+    assert!(serde_json::from_value::<OverlapKey>(wire.clone()).is_ok());
+    for member in ["item_keys", "itemKey", "extra"] {
+        let mut unknown = wire.clone();
+        unknown[member] = json!({"profile": "item_keys_v1"});
+        assert!(
+            serde_json::from_value::<OverlapKey>(unknown).is_err(),
+            "{member}"
+        );
+    }
+}
