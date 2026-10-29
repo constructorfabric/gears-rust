@@ -1616,6 +1616,7 @@ async fn a_hop_never_leaves_its_tenant() {
                     max_edges_scanned: 1_000,
                 },
                 with_degrees: false,
+                discriminators: None,
             },
         )
         .await
@@ -1661,6 +1662,7 @@ async fn a_stopped_hop_reports_why() {
                     max_edges_scanned: 10,
                 },
                 with_degrees: false,
+                discriminators: None,
             },
         )
         .await
@@ -1725,6 +1727,7 @@ async fn asking_for_degrees_does_not_double_the_hop_edge_budget() {
             max_edges_scanned: 4,
         },
         with_degrees,
+        discriminators: None,
     };
 
     let plain = stand
@@ -1819,6 +1822,7 @@ async fn a_hop_that_hits_its_edge_budget_reports_it() {
             max_edges_scanned,
         },
         with_degrees: false,
+        discriminators: None,
     };
 
     let cut = stand
@@ -1910,6 +1914,7 @@ async fn a_hop_reports_the_reached_nodes_degree_only_when_asked() {
             max_edges_scanned: 1_000,
         },
         with_degrees,
+        discriminators: None,
     };
 
     let silent = stand
@@ -2223,6 +2228,35 @@ async fn two_creators_with_expected_version_zero_do_not_both_win() {
     conformance::two_creators_with_expected_version_zero_do_not_both_win(
         std::sync::Arc::clone(&stand.store) as std::sync::Arc<dyn GraphStoreV1>,
         Uuid::now_v7(),
+    )
+    .await;
+}
+
+pg_case!(
+    a_read_returns_the_version_a_write_compares_against,
+    conformance::a_read_returns_the_version_a_write_compares_against
+);
+
+#[tokio::test]
+async fn a_hop_follows_only_its_direction() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    conformance::a_hop_follows_only_its_direction(stand.store.as_ref(), &stand.engine, tenant)
+        .await;
+}
+
+#[tokio::test]
+async fn a_hop_reports_and_filters_discriminators() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    conformance::a_hop_reports_and_filters_discriminators(
+        stand.store.as_ref(),
+        &stand.engine,
+        tenant,
     )
     .await;
 }

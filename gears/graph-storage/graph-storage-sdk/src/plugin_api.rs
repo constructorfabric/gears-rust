@@ -413,6 +413,10 @@ pub struct ExpandRequest {
     pub direction: Direction,
     /// Per-hop restriction, already resolved to registered types.
     pub edge_types: Option<TypeIdSet>,
+    /// Per-hop restriction on the edge's discriminator: an edge is followed
+    /// only when its discriminator is one of these. `None` follows every
+    /// edge; an edge without a discriminator never matches `Some`.
+    pub discriminators: Option<Vec<String>>,
     /// Per-hop restriction (labels are deferred; engines may answer
     /// `Unsupported`).
     pub labels: Option<LabelFilter>,

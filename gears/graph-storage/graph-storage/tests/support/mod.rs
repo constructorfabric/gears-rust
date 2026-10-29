@@ -246,7 +246,13 @@ impl GraphEngineV1 for HopOverStore {
                 let admitted = req
                     .edge_types
                     .as_ref()
-                    .is_none_or(|set| set.contains(&entry.edge_type_id));
+                    .is_none_or(|set| set.contains(&entry.edge_type_id))
+                    && req.discriminators.as_ref().is_none_or(|wanted| {
+                        entry
+                            .discriminator
+                            .as_ref()
+                            .is_some_and(|value| wanted.contains(value))
+                    });
                 if !wanted || !admitted {
                     continue;
                 }
@@ -260,6 +266,7 @@ impl GraphEngineV1 for HopOverStore {
                     edge_type_id: entry.edge_type_id,
                     src,
                     dst,
+                    discriminator: entry.discriminator,
                 });
                 neighbours.push(entry.neighbor_key);
             }

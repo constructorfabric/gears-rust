@@ -548,3 +548,99 @@ async fn an_existing_identifier_is_a_conflict_by_default_and_updatable_on_reques
         "and how many rows that ground rests on: {updated}"
     );
 }
+
+/// The read-surface fields the domain-model query needs (gears-rust #5239,
+/// #5240, #5529) reach the wire: a direction and a discriminator filter on the
+/// walk, the discriminator on every edge reference, and the node's version in
+/// its envelope.
+#[tokio::test]
+async fn a_walk_takes_a_direction_and_discriminators_and_reads_name_them() {
+    let stand = Stand::new(Harness::allowed());
+    seed(&stand).await;
+    let (status, body) = stand
+        .post(
+            "/ingest",
+            &serde_json::json!({
+                "nodes": [
+                    {"node_key": "dir-a", "type_id": conformance::OWNED},
+                    {"node_key": "dir-b", "type_id": conformance::OWNED}
+                ],
+                "edges": [
+                    {"type_id": conformance::LINK, "src_node_key": "dir-a",
+                     "dst_node_key": "dir-b", "discriminator": "uses"},
+                    {"type_id": conformance::LINK, "src_node_key": "dir-a",
+                     "dst_node_key": "dir-b", "discriminator": "advances"}
+                ]
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let walk = |direction: &str, discriminators: &[&str]| {
+        serde_json::json!({
+            "seeds": ["dir-b"], "depth": 1,
+            "direction": direction, "edge_discriminators": discriminators
+        })
+    };
+    let (status, outgoing) = stand.post("/graph/traverse", &walk("outgoing", &[])).await;
+    assert_eq!(status, StatusCode::OK, "{outgoing}");
+    assert_eq!(
+        outgoing["edges"].as_array().map(Vec::len),
+        Some(0),
+        "{outgoing}"
+    );
+
+    let (status, incoming) = stand
+        .post("/graph/traverse", &walk("incoming", &["uses"]))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{incoming}");
+    assert_eq!(
+        incoming["edges"].as_array().map(Vec::len),
+        Some(1),
+        "{incoming}"
+    );
+    assert_eq!(incoming["edges"][0]["discriminator"], "uses", "{incoming}");
+    assert_eq!(incoming["edges"][0]["src"], "dir-a", "{incoming}");
+
+    let (status, around) = stand
+        .post(
+            "/graph/neighborhood",
+            &serde_json::json!({"root": "dir-b", "depth": 1, "direction": "outgoing"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{around}");
+    assert_eq!(
+        around["nodes"].as_array().map(Vec::len),
+        Some(1),
+        "only the root: {around}"
+    );
+
+    let (status, problem) = stand.post("/graph/traverse", &walk("sideways", &[])).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "an unknown direction is refused: {problem}"
+    );
+
+    let (status, node) = stand.get("/nodes/dir-a").await;
+    assert_eq!(status, StatusCode::OK, "{node}");
+    assert_eq!(node["envelope"]["version"], 1, "{node}");
+    let mut named: Vec<&str> = node["adjacency"]
+        .as_array()
+        .expect("adjacency is a list")
+        .iter()
+        .filter_map(|entry| entry["discriminator"].as_str())
+        .collect();
+    named.sort_unstable();
+    assert_eq!(named, vec!["advances", "uses"], "{node}");
+
+    let edge_key = node["adjacency"][0]["edge_key"]
+        .as_str()
+        .expect("an edge key");
+    let (status, edge) = stand.get(&format!("/edges/{edge_key}")).await;
+    assert_eq!(status, StatusCode::OK, "{edge}");
+    assert!(
+        edge["envelope"].get("version").is_none(),
+        "an edge's envelope carries no version: {edge}"
+    );
+}

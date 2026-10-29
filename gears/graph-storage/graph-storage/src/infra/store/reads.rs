@@ -278,6 +278,7 @@ fn envelope_of_node(model: &node::Model, revision: GraphRevision) -> ElementEnve
             subject_id,
             subject_type: model.deleted_by_subject_type.clone(),
         }),
+        version: Some(model.version),
         graph_revision: revision,
     }
 }
@@ -422,6 +423,7 @@ pub async fn get_node(
                     .get(&neighbour.gts_node_type_id)
                     .cloned()
                     .unwrap_or_else(unknown),
+                discriminator: e.discriminator.clone(),
             });
         }
     }
@@ -457,6 +459,7 @@ fn envelope_of_edge(model: &edge::Model, revision: GraphRevision) -> ElementEnve
             subject_id,
             subject_type: model.deleted_by_subject_type.clone(),
         }),
+        version: None,
         graph_revision: revision,
     }
 }

@@ -1233,6 +1233,7 @@ rejected, so that a document read from the API can be sent back unchanged.
 | `created_at` / `created_by` | yes | yes | first write |
 | `updated_at` / `updated_by` | yes | yes | most recent write |
 | `deleted_at` / `deleted_by` | yes | yes | soft delete; absent on live elements |
+| `version` | yes | absent | the node's stored version, the target of `expected_version` on ingest |
 | `graph_revision` | yes | yes | the revision the read observed |
 
 `created_by`, `updated_by` and `deleted_by` are **subjects**, not users:
@@ -1258,8 +1259,12 @@ element: `GET /edges/{edge_key}`, above. Without it the edge columns were
 written by every ingest path and read by nothing, so a path that forgot one
 would have broken no test — a requirement nothing can observe is a requirement
 nothing checks. Topology references stay what they are: `EdgeRef` in a
-traversal and `AdjacencyEntry` in a node read carry a key, a type and two
-endpoints, and the key is the one the edge read accepts.
+traversal and `AdjacencyEntry` in a node read carry a key, a type, two
+endpoints and the discriminator, and the key is the one the edge read
+accepts. The discriminator is on the reference because the key is opaque: a
+consumer that stores several relations under one edge type (one verb, told
+apart by discriminator) otherwise learns which relation an edge is only by
+reading every edge.
 
 **A search hit is a reference too, by the same rule.** `SearchHit` carries a
 key, a type, a name, the fused score and each arm's rank — what a ranking is
@@ -1543,6 +1548,7 @@ pub struct ExpandRequest {
     pub frontier: Vec<NodeId>,
     pub direction: Direction,          // explicit; there is no "undirected" shorthand
     pub edge_types: Option<TypeIdSet>, // per-hop restriction
+    pub discriminators: Option<Vec<String>>, // per-hop restriction; never matches NULL
     pub labels: Option<LabelFilter>,   // per-hop restriction
     pub budget: HopBudget,             // frontier cap and edges scanned
     pub with_degrees: bool,            // fill `degrees` below; costs a second scoped read

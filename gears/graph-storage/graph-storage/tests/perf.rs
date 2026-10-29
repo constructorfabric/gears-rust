@@ -815,6 +815,7 @@ async fn time_hops(
                                 max_edges_scanned: 50_000,
                             },
                             with_degrees: false,
+                            discriminators: None,
                         },
                     )
                     .await
@@ -849,6 +850,7 @@ async fn time_hops(
                                 max_edges_scanned: 50_000,
                             },
                             with_degrees,
+                            discriminators: None,
                         },
                     )
                     .await

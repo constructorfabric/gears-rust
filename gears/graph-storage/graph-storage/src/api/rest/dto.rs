@@ -293,6 +293,10 @@ pub struct GraphElementEnvelopeDto {
     #[serde(with = "time::serde::rfc3339::option", default)]
     pub deleted_at: Option<time::OffsetDateTime>,
     pub deleted_by: Option<GraphSubjectDto>,
+    /// A node's stored version, the value `expected_version` on ingest
+    /// compares against. Absent on an edge, which carries no version.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<i64>,
     /// The revision the read that produced this element observed.
     pub graph_revision: GraphRevisionDto,
 }
@@ -413,6 +417,9 @@ pub struct GraphAdjacencyEntryDto {
     pub direction: String,
     pub neighbor_key: String,
     pub neighbor_type_id: String,
+    /// Tells parallel edges of one type between one endpoint pair apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
 }
 
 #[derive(Debug)]
@@ -520,6 +527,14 @@ pub struct GraphTraverseRequest {
     #[serde(default)]
     pub node_type_patterns: Vec<String>,
     pub max_nodes: Option<u32>,
+    /// `outgoing`, `incoming` or `either` (the default): which way every hop
+    /// follows an edge from the node it stands on.
+    pub direction: Option<String>,
+    /// Follow only edges whose discriminator is one of these. Empty or
+    /// omitted follows every edge; an edge without a discriminator never
+    /// matches a non-empty list.
+    #[serde(default)]
+    pub edge_discriminators: Vec<String>,
 }
 
 #[derive(Debug)]
@@ -530,6 +545,8 @@ pub struct GraphNeighborhoodRequest {
     pub node_budget: Option<u32>,
     #[serde(default)]
     pub include_phantoms: bool,
+    /// `outgoing`, `incoming` or `either` (the default).
+    pub direction: Option<String>,
 }
 
 #[derive(Debug)]
@@ -539,6 +556,9 @@ pub struct GraphEdgeRefDto {
     pub edge_type_id: String,
     pub src: String,
     pub dst: String,
+    /// Tells parallel edges of one type between one endpoint pair apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub discriminator: Option<String>,
 }
 
 #[derive(Debug)]
@@ -805,6 +825,7 @@ impl From<m::AdjacencyEntry> for GraphAdjacencyEntryDto {
             direction: value.side.as_str().to_owned(),
             neighbor_key: value.neighbor_key,
             neighbor_type_id: value.neighbor_type_id,
+            discriminator: value.discriminator,
         }
     }
 }
@@ -829,6 +850,7 @@ impl From<m::ElementEnvelope> for GraphElementEnvelopeDto {
             updated_by: value.updated_by.into(),
             deleted_at: value.deleted_at,
             deleted_by: value.deleted_by.map(Into::into),
+            version: value.version,
             graph_revision: value.graph_revision.into(),
         }
     }
@@ -912,6 +934,7 @@ impl From<m::EdgeRef> for GraphEdgeRefDto {
             edge_type_id: value.edge_type_id,
             src: value.src,
             dst: value.dst,
+            discriminator: value.discriminator,
         }
     }
 }

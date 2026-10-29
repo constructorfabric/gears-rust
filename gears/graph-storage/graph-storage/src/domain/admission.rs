@@ -385,6 +385,8 @@ pub fn admit_traverse(
         edge_type_patterns,
         node_type_patterns,
         max_nodes,
+        direction: _,
+        edge_discriminators,
     } = request;
     let depth = *depth;
     if seeds.is_empty() {
@@ -431,6 +433,11 @@ pub fn admit_traverse(
     for (index, pattern) in node_type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("node_type_patterns[{index}]"), pattern)?;
     }
+    // Held to the bound ingest holds a discriminator to: a longer value can
+    // match no stored edge, and every one is bound into the edge scan.
+    for (index, discriminator) in edge_discriminators.iter().enumerate() {
+        admit_identifier(cfg, &format!("edge_discriminators[{index}]"), discriminator)?;
+    }
     Ok(())
 }
 
@@ -443,6 +450,7 @@ pub fn admit_neighborhood(
         depth,
         node_budget,
         include_phantoms: _,
+        direction: _,
     } = request;
     let depth = *depth;
     // The same ceiling bounded walks use, and for the same reason: both drive
@@ -808,6 +816,7 @@ mod tests {
             depth,
             node_budget: None,
             include_phantoms: true,
+            direction: None,
         }
     }
 
@@ -938,6 +947,8 @@ mod tests {
             edge_type_patterns: Vec::new(),
             node_type_patterns: Vec::new(),
             max_nodes: None,
+            direction: None,
+            edge_discriminators: Vec::new(),
         };
         for depth in 0..=8u8 {
             assert_eq!(

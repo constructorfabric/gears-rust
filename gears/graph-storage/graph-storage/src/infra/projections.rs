@@ -190,14 +190,16 @@ pub fn endpoint_pair_columns(query: Select<edge::Entity>) -> Select<edge::Entity
 }
 
 /// What one hop needs of an edge: which edge, of which type, between which
-/// two nodes. Read per hop for every live incident edge, so its payload and
-/// audit columns were the widest thing on the traversal hot path.
+/// two nodes, and which of several same-typed relations it is (the
+/// discriminator). Read per hop for every live incident edge, so its payload
+/// and audit columns were the widest thing on the traversal hot path.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EdgeHop {
     pub edge_key: String,
     pub gts_edge_type_id: i32,
     pub src_node_id: i64,
     pub dst_node_id: i64,
+    pub discriminator: Option<String>,
 }
 
 pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
@@ -207,6 +209,7 @@ pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
         .column(edge::Column::GtsEdgeTypeId)
         .column(edge::Column::SrcNodeId)
         .column(edge::Column::DstNodeId)
+        .column(edge::Column::Discriminator)
 }
 
 #[cfg(test)]
@@ -277,11 +280,17 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_hop_reads_four_columns() {
+    fn an_edge_hop_reads_five_columns() {
         holds(
             &rendered(&edge_hop_columns(edge::Entity::find())),
             &WIDE_EDGE,
-            &["edge_key", "gts_edge_type_id", "src_node_id", "dst_node_id"],
+            &[
+                "edge_key",
+                "gts_edge_type_id",
+                "src_node_id",
+                "dst_node_id",
+                "discriminator",
+            ],
         );
     }
 

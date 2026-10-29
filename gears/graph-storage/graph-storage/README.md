@@ -119,9 +119,12 @@ Each is the shipped behaviour, with the contract that fixes it.
   conflict otherwise, including when no node is stored under the key.
   `Some(0)` means "there must be none": two writers claiming one key with it
   get exactly one success, which is how a version number is claimed across
-  replicas without a lock. No read returns the version yet (README § Known
-  limitations), so a read-then-update is last-writer-wins until it does. Edges
-  carry no version: their identity is derived from their endpoints.
+  replicas without a lock. Every node read returns it as `envelope.version`
+  (the node read, the projection row, traversal and neighbourhood
+  hydration), so read → change → write with `expected_version` set to what
+  was read is a compare-and-set that refuses a write someone made in
+  between. Edges carry no version (`envelope.version` is absent): their
+  identity is derived from their endpoints.
 - **Scope replacement removes what carries the scope.** `replace_scope:
   {attribute, value, generation}` removes, after the batch's own writes, the
   nodes of `scope_managed` types whose payload field `attribute` equals

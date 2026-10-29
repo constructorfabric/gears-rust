@@ -117,7 +117,14 @@ impl FakeAudit {
         self.deleted_by = Some(subject.clone());
     }
 
-    fn envelope(&self, key: String, tenant_id: Uuid, revision: GraphRevision) -> ElementEnvelope {
+    /// `version` is the node's stored version, `None` for an edge.
+    fn envelope(
+        &self,
+        key: String,
+        tenant_id: Uuid,
+        version: Option<i64>,
+        revision: GraphRevision,
+    ) -> ElementEnvelope {
         ElementEnvelope {
             tenant_id,
             key,
@@ -127,6 +134,7 @@ impl FakeAudit {
             updated_by: self.updated_by.clone(),
             deleted_at: self.deleted_at,
             deleted_by: self.deleted_by.clone(),
+            version,
             graph_revision: revision,
         }
     }
@@ -1020,6 +1028,7 @@ impl GraphStoreV1 for FakeGraphStore {
                 side,
                 neighbor_key: neighbour.key.clone(),
                 neighbor_type_id: neighbour.type_id.clone(),
+                discriminator: edge.discriminator.clone(),
             });
         }
         Ok(view_of(
@@ -1065,6 +1074,7 @@ impl GraphStoreV1 for FakeGraphStore {
             envelope: edge.audit.envelope(
                 edge.key.clone(),
                 ctx.tenant,
+                None,
                 GraphRevision {
                     source_epoch: self.epoch,
                     revision,
@@ -1303,6 +1313,7 @@ impl GraphStoreV1 for FakeGraphStore {
                 envelope: n.audit.envelope(
                     n.key.clone(),
                     ctx.tenant,
+                    Some(n.version),
                     GraphRevision {
                         source_epoch: self.epoch,
                         revision,
@@ -1459,6 +1470,14 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
             {
                 continue;
             }
+            if let Some(wanted) = &req.discriminators
+                && !edge
+                    .discriminator
+                    .as_ref()
+                    .is_some_and(|value| wanted.contains(value))
+            {
+                continue;
+            }
             let (Some(src), Some(dst)) = (live.get(&edge.src), live.get(&edge.dst)) else {
                 continue;
             };
@@ -1480,6 +1499,7 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
                 edge_type_id: edge.type_id.clone(),
                 src: src.key.clone(),
                 dst: dst.key.clone(),
+                discriminator: edge.discriminator.clone(),
             });
         }
         reached.sort_unstable();
@@ -2013,7 +2033,9 @@ fn view_of(
         labels: Vec::new(),
         adjacency,
         adjacency_truncated: truncated,
-        envelope: node.audit.envelope(node.key.clone(), tenant_id, revision),
+        envelope: node
+            .audit
+            .envelope(node.key.clone(), tenant_id, Some(node.version), revision),
     }
 }
 

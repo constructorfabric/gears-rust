@@ -421,6 +421,16 @@ pub async fn search(
     Ok(Json(response.into()))
 }
 
+/// The SDK owns both directions of this spelling, as for the search mode.
+fn parse_direction(raw: Option<&str>) -> Result<Option<m::Direction>, DomainError> {
+    raw.map(|raw| {
+        raw.parse::<m::Direction>().map_err(|unknown| {
+            DomainError::invalid(format!("{unknown}; expected outgoing, incoming or either"))
+        })
+    })
+    .transpose()
+}
+
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
 pub async fn traverse(
     Extension(ctx): Extension<SecurityContext>,
@@ -436,6 +446,8 @@ pub async fn traverse(
                 edge_type_patterns: request.edge_type_patterns,
                 node_type_patterns: request.node_type_patterns,
                 max_nodes: request.max_nodes,
+                direction: parse_direction(request.direction.as_deref())?,
+                edge_discriminators: request.edge_discriminators,
             },
         )
         .await?;
@@ -456,6 +468,7 @@ pub async fn neighborhood(
                 depth: request.depth,
                 node_budget: request.node_budget,
                 include_phantoms: request.include_phantoms,
+                direction: parse_direction(request.direction.as_deref())?,
             },
         )
         .await?;

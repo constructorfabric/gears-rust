@@ -8,9 +8,9 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::PolicyEnforcer;
 use graph_storage_sdk::models::{
-    DeleteOutcome, DeleteRequest, EdgeKey, EdgeView, GraphRevision, GtsTypeId, IngestOutcome,
-    IngestRequest, ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow, NodeView,
-    OnExisting, Page, ProjectionRequest, RegisteredType, RemainingBudget, SearchMode,
+    DeleteOutcome, DeleteRequest, Direction, EdgeKey, EdgeView, GraphRevision, GtsTypeId,
+    IngestOutcome, IngestRequest, ItemError, ItemFamily, NeighborhoodRequest, NodeKey, NodeRow,
+    NodeView, OnExisting, Page, ProjectionRequest, RegisteredType, RemainingBudget, SearchMode,
     SearchRequest, SearchResponse, TraversalResponse, TraverseRequest, TypeIdSet, TypeKind,
     TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
@@ -994,6 +994,9 @@ impl GraphServices {
             edge_types: self
                 .resolve_patterns(&auth, &request.edge_type_patterns)
                 .await?,
+            direction: request.direction.unwrap_or(Direction::Either),
+            discriminators: (!request.edge_discriminators.is_empty())
+                .then(|| request.edge_discriminators.clone()),
             // A traversal's caller asked for a region and post-processes it,
             // so no node of the region is privileged over another.
             retention: Retention::Reached,
@@ -1024,6 +1027,8 @@ impl GraphServices {
             max_frontier: self.config.traversal_max_frontier,
             max_edges_scanned: self.config.traversal_max_edges_scanned,
             edge_types: None,
+            direction: request.direction.unwrap_or(Direction::Either),
+            discriminators: None,
             // A UI that can draw 200 of a hub's 5 000 neighbours wants the
             // structural core, not 200 arbitrary leaves
             // (`fr-neighborhood-projection`).
