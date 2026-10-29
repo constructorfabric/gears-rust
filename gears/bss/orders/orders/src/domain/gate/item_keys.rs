@@ -138,6 +138,20 @@ pub fn validated_line_keys(
     result
 }
 
+/// The keys the gate reads occupancy and the in-flight lookups for, flattened in line order, or
+/// `None` when the answer is rejected before reads (`SUBSCRIPTIONS_CONTRACT.md` exact coverage: an
+/// omitted, extra, foreign, duplicate, mismatched or conflicting answer): a foreign or extra
+/// entry, or any requested line without a validated collection. The orchestrator reads nothing
+/// on `None`, and `assess` then reports predicates 7 and 9 unevaluable, never passed.
+#[must_use]
+pub fn read_keys(expected: &[OverlapKeyLine], answered: &[OverlapKey]) -> Option<Vec<OverlapKey>> {
+    let kept: Vec<OverlapKey> = validated_line_keys(expected, answered)
+        .into_values()
+        .flatten()
+        .collect();
+    (kept.len() == expected.len()).then_some(kept)
+}
+
 /// Distinct scopes, retaining every item association in the source collection.
 #[must_use]
 pub fn distinct_scopes(keys: &[ItemOverlapKey]) -> BTreeSet<&str> {

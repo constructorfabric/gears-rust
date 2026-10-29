@@ -622,14 +622,8 @@ impl Orchestrator {
                 // No key to ask occupancy about: assessment reads the key port's reason.
                 return Ok((BTreeMap::new(), BTreeSet::new()));
             };
-            let mut kept: Vec<OverlapKey> =
-                crate::domain::gate::item_keys::validated_line_keys(&lines, answered)
-                    .into_values()
-                    .flatten()
-                    .collect();
-            if kept.len() != lines.len() {
-                kept.clear();
-            }
+            let kept: Vec<OverlapKey> =
+                crate::domain::gate::item_keys::read_keys(&lines, answered).unwrap_or_default();
             let queries = occupancy_queries(&kept, &axes);
             occupancy = Some(if queries.is_empty() {
                 PortAnswer::Answered(Vec::new())

@@ -6,7 +6,8 @@
 use bss_orders::domain::gate::{
     answers::{OverlapKey, OverlapKeyLine},
     item_keys::{
-        ClassificationProvenance, ItemOverlapKey, distinct_scopes, valid_text, validated_line_keys,
+        ClassificationProvenance, ItemOverlapKey, distinct_scopes, read_keys, valid_text,
+        validated_line_keys,
     },
 };
 use uuid::Uuid;
@@ -189,4 +190,31 @@ fn duplicate_item_and_dimension_requests_are_omitted() {
         complete(expected[1].clone(), "scope"),
     ];
     assert!(validated_line_keys(&expected, &answers).is_empty());
+}
+
+/// R8: one validation decides both the orchestrator's reads and `assess`'s rows 7 and 9: every
+/// requested line validated gives the flattened keys; an omitted line, an extra or foreign
+/// entry rejects the whole answer; nothing requested reads nothing.
+#[test]
+fn read_keys_admits_only_a_complete_answer() {
+    let expected = vec![request(10), request(11)];
+    let good = vec![
+        complete(expected[0].clone(), "a"),
+        complete(expected[1].clone(), "b"),
+    ];
+    assert_eq!(read_keys(&expected, &good), Some(good.clone()));
+    assert_eq!(read_keys(&expected, &good[..1]), None, "omitted selection");
+    let mut foreign = complete(request(12), "c");
+    foreign.line_id = Uuid::from_u128(9);
+    assert_eq!(
+        read_keys(&expected, &[good.clone(), vec![foreign]].concat()),
+        None,
+        "foreign line"
+    );
+    assert_eq!(
+        read_keys(&expected, &[good.clone(), vec![good[0].clone()]].concat()),
+        None,
+        "extra entry"
+    );
+    assert_eq!(read_keys(&[], &[]), Some(Vec::new()));
 }

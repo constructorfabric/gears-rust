@@ -825,9 +825,10 @@ fn c_overlap_uniqueness_counts_active_proposed_and_in_flight() {
         vr(row(&a.vector, PredicateId::InFlightPerKey, Some(l2))),
         unevaluable(r)
     );
+    // The answer is rejected before reads (R8): l1's valid key was never read.
     assert_eq!(
         vr(row(&a.vector, PredicateId::InFlightPerKey, Some(l1))),
-        PASS
+        unevaluable(r)
     );
 
     // A missing key with occupancy down: rule (b) wins on the row that reads occupancy, the
@@ -1552,6 +1553,9 @@ fn k_failures_are_deduplicated_by_line_and_reason_in_vector_order() {
     // `catalog-predicate-failed`, the reference is unresolvable and the pin carries that reason.
     i.catalog
         .insert(l1, catalog_answer(vec![cell(ITEM_B, Some("x"), true)]));
+    // Only line 2 composes, so only its key is asked and answered (R8: an unasked entry rejects
+    // the answer before reads).
+    i.overlap_keys = PortAnswer::Answered(overlap_keys(l2, &key_of(l2)));
     // Both lines miss required dates.
     i.dates = dates_for(&two_lines(), true);
     i.lines[1].currency = Some("EUR".into());
@@ -2414,8 +2418,10 @@ fn non_recurring_lines_pass_overlap_rows_even_without_overlap_ports() {
     }
 }
 
+/// A keyless line never consumes recurring cardinality; an extraneous key for it is an unasked
+/// entry, so the answer is rejected before reads and no row 7 or 9 passes (R8).
 #[test]
-fn keyless_lines_do_not_consume_recurring_cardinality_even_with_an_extraneous_key() {
+fn keyless_lines_do_not_consume_recurring_cardinality_and_an_extraneous_key_rejects_the_answer() {
     let mut i = base(Operation::Submit);
     let mut c = good_catalog();
     for cell in &mut Arc::make_mut(c.resolved.as_mut().unwrap()).cells {
@@ -2423,16 +2429,32 @@ fn keyless_lines_do_not_consume_recurring_cardinality_even_with_an_extraneous_ke
     }
     i.catalog.insert(line_id(1), c);
     let k = key_of(line_id(2));
+    let unique_l2 = |i: &AssessmentInput| {
+        vr(row(
+            &assess(i).unwrap().vector,
+            PredicateId::OverlapUniqueness,
+            Some(line_id(2)),
+        ))
+    };
+    i.overlap_keys = PortAnswer::Answered(overlap_keys(line_id(2), &k));
+    assert_eq!(unique_l2(&i), (Verdict::Passed, None));
     i.overlap_keys =
         PortAnswer::Answered([overlap_keys(line_id(1), &k), overlap_keys(line_id(2), &k)].concat());
-    let a = assess(&i).unwrap();
+    i.occupancy = PortAnswer::Answered(Vec::new());
+    assert_eq!(
+        unique_l2(&i),
+        (
+            Verdict::Unevaluable,
+            Some(Reason::OverlapPresenceUnevaluable)
+        )
+    );
     assert_eq!(
         vr(row(
-            &a.vector,
-            PredicateId::OverlapUniqueness,
-            Some(line_id(2))
+            &assess(&i).unwrap().vector,
+            PredicateId::InFlightPerKey,
+            Some(line_id(2)),
         )),
-        (Verdict::Passed, None)
+        unevaluable(Reason::OverlapKeyUnresolvable)
     );
 }
 
@@ -3046,5 +3068,73 @@ fn i_a_producer_reason_outside_the_predicates_own_is_invalid_coverage_d195() {
     assert_eq!(
         vr(row(&a.vector, PredicateId::MarketConsistency, Some(l2))),
         unevaluable(Reason::CatalogPredicateUnevaluable)
+    );
+}
+
+/// R8 (`SUBSCRIPTIONS_CONTRACT.md` exact coverage; D-179): a key answer rejected before reads (a
+/// requested line without a validated collection, or a foreign entry) runs neither occupancy nor
+/// the in-flight lookup, so rows 7 and 9 of every keyed line are unevaluable, never passed.
+#[test]
+fn c_a_rejected_key_answer_never_reports_predicate_nine_passed() {
+    let (l1, l2) = (line_id(1), line_id(2));
+    // What the orchestrator hands `assess` after rejecting the answer: nothing was read.
+    let not_read = |mut i: AssessmentInput| {
+        i.occupancy = PortAnswer::Answered(Vec::new());
+        i.inflight_same_tuple.clear();
+        i.inflight_other_orders.clear();
+        i
+    };
+    let rejected = (
+        unevaluable(Reason::OverlapPresenceUnevaluable),
+        unevaluable(Reason::OverlapKeyUnresolvable),
+        Some("overlap-key-answer-rejected".to_owned()),
+    );
+    let rows_of = |i: &AssessmentInput, l| {
+        let a = assess(i).unwrap();
+        let in_flight = row(&a.vector, PredicateId::InFlightPerKey, Some(l));
+        (
+            vr(row(&a.vector, PredicateId::OverlapUniqueness, Some(l))),
+            vr(in_flight),
+            in_flight
+                .upstream_detail
+                .as_ref()
+                .and_then(|d| d.upstream_code.clone()),
+        )
+    };
+
+    // l2 unanswered: l1's valid key is never read; l2 keeps its missing-key rows.
+    let mut i = base(Operation::Submit);
+    i.overlap_keys = PortAnswer::Answered(overlap_keys(l1, &key_of(l1)));
+    let i = not_read(i);
+    assert_eq!(rows_of(&i, l1), rejected);
+    assert_eq!(
+        rows_of(&i, l2),
+        (
+            failed(Reason::OverlapKeyUnresolvable),
+            unevaluable(Reason::OverlapKeyUnresolvable),
+            None
+        )
+    );
+
+    // A foreign entry rejects the whole answer, as the orchestrator does.
+    let mut i = base(Operation::Submit);
+    let mut keys = i.overlap_keys.answered().unwrap().clone();
+    keys.extend(overlap_keys(line_id(99), "foreign"));
+    i.overlap_keys = PortAnswer::Answered(keys);
+    let i = not_read(i);
+    for l in [l1, l2] {
+        assert_eq!(rows_of(&i, l), rejected, "{l}");
+    }
+
+    // An accepted answer still evaluates predicate 9.
+    let mut i = base(Operation::Submit);
+    i.inflight_same_tuple.insert(key_of(l1));
+    assert_eq!(
+        vr(row(
+            &assess(&i).unwrap().vector,
+            PredicateId::InFlightPerKey,
+            Some(l1)
+        )),
+        failed(Reason::OrderInFlightForKey)
     );
 }

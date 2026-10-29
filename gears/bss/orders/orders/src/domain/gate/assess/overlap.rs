@@ -26,7 +26,14 @@ pub(super) struct Overlap<'a> {
     occupancy: BTreeMap<&'a str, Option<&'a Occupancy>>,
     /// Shared whole-batch protected validation, before capacity arithmetic.
     protected: Result<ProtectedBatch, ProtectedInvalid>,
+    /// The orchestrator read occupancy and the in-flight lookups: the key answer passed
+    /// [`read_keys`](crate::domain::gate::item_keys::read_keys), the one validation both share.
+    read: bool,
 }
+
+/// The `upstream_code` of a keyed line's rows 7 and 9 when the key answer was rejected before
+/// reads, so neither occupancy nor the in-flight lookup ran.
+const KEY_ANSWER_REJECTED: &str = "overlap-key-answer-rejected";
 /// The overlap-presence row carrying the protected refusal's Orders-authored token.
 fn presence_unevaluable(cause: ProtectedInvalid) -> Eval {
     unevaluable_with(Reason::OverlapPresenceUnevaluable, cause.token())
@@ -51,6 +58,10 @@ impl<'a> Overlap<'a> {
             .filter(|key| expected.iter().any(|e| e.line_id == key.line_id))
             .cloned()
             .collect();
+        let read = input
+            .overlap_keys
+            .answered()
+            .is_some_and(|all| crate::domain::gate::item_keys::read_keys(&expected, all).is_some());
         let valid = crate::domain::gate::item_keys::validated_line_keys(&expected, &relevant);
         let keys: BTreeMap<Uuid, BTreeSet<String>> = valid
             .into_iter()
@@ -110,6 +121,7 @@ impl<'a> Overlap<'a> {
             proposed,
             occupancy,
             protected,
+            read,
         }
     }
 
@@ -136,6 +148,12 @@ impl<'a> Overlap<'a> {
             let r = Reason::OverlapKeyUnresolvable;
             return (failed(r), unevaluable(r));
         };
+        if !self.read {
+            return (
+                unevaluable_with(Reason::OverlapPresenceUnevaluable, KEY_ANSWER_REJECTED),
+                unevaluable_with(Reason::OverlapKeyUnresolvable, KEY_ANSWER_REJECTED),
+            );
+        }
         let in_flight = if scopes.iter().any(|k| input.inflight_same_tuple.contains(k)) {
             failed(Reason::OrderInFlightForKey)
         } else {
