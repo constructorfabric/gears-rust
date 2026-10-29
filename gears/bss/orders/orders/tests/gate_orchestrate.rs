@@ -1274,10 +1274,20 @@ fn evaluation_scale_boundary_requires_a_coherent_envelope() {
     use bss_orders::domain::gate::orchestrate::verify_evaluation;
     let b = basket(Operation::Preview, two_lines());
     let all = vec![terms(line_id(1)), terms(line_id(2))];
-    let request = evaluation_request(&b, &composed(&b), Some(&all), Some(&market()), None)
+    let base = evaluation_request(&b, &composed(&b), Some(&all), Some(&market()), None)
         .unwrap()
         .unwrap();
     for scale in [28, 29] {
+        // The request's prices are at `scale` too, so only the 28 ceiling decides.
+        let mut request = base.clone();
+        for chain in request
+            .lines
+            .iter_mut()
+            .flat_map(|l| &mut l.items)
+            .flat_map(|i| &mut i.chains)
+        {
+            chain.binding.currency_scale = scale;
+        }
         let mut answer = evaluation(&[line_id(1), line_id(2)]);
         answer.currency_scale = scale;
         for totals in std::iter::once(&mut answer.order_totals)
@@ -1307,6 +1317,30 @@ fn evaluation_scale_boundary_requires_a_coherent_envelope() {
             "scale {scale}"
         );
     }
+}
+
+/// R7 / D-197: Rating answers at the scale of the prices it was asked to evaluate; a USD
+/// evaluation at scale 4 over USD prices at scale 2 is a currency inconsistency.
+#[test]
+fn an_evaluation_at_another_scale_than_the_evaluated_prices_is_malformed() {
+    use bss_orders::domain::gate::orchestrate::verify_evaluation;
+    let b = basket(Operation::Preview, two_lines());
+    let all = vec![terms(line_id(1)), terms(line_id(2))];
+    let request = evaluation_request(&b, &composed(&b), Some(&all), Some(&market()), None)
+        .unwrap()
+        .unwrap();
+    let mut answer = evaluation(&[line_id(1), line_id(2)]);
+    answer.currency_scale = 4;
+    for totals in std::iter::once(&mut answer.order_totals)
+        .chain(answer.lines.iter_mut().map(|line| &mut line.totals))
+    {
+        totals.gross.exact = restated(&totals.gross.exact, "USD", 4);
+        totals.net.exact = restated(&totals.net.exact, "USD", 4);
+    }
+    assert_eq!(
+        verify_evaluation(&request, &answer),
+        Err(Unavailable::Malformed)
+    );
 }
 
 #[test]

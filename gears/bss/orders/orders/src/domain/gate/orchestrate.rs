@@ -752,12 +752,20 @@ pub fn verify_evaluation(
                 super::answers::Availability::Unavailable => true,
             }
     };
+    // D-197, D-216: the answer is at the scale of every price Rating was asked to evaluate.
+    let scale_ok = request
+        .lines
+        .iter()
+        .flat_map(|l| &l.items)
+        .flat_map(|i| &i.chains)
+        .all(|c| c.binding.currency_scale == answer.currency_scale);
     if answer.assessment_id != request.assessment_id
         || wanted.len() != request.lines.len()
         || stated.len() != answer.lines.len()
         || wanted != stated
         || answer.currency != request.market.currency
         || answer.currency_scale > 28
+        || !scale_ok
         || !totals_ok(&answer.order_totals)
         || answer.lines.iter().any(|l| !totals_ok(&l.totals))
         || answer.tcv.as_ref().is_some_and(|t| !money_ok(&t.exact))
