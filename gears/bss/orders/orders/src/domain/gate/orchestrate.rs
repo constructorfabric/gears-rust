@@ -675,7 +675,21 @@ pub fn assemble(basket: &Basket, answers: Answers) -> AssessmentInput {
                         b.kind == ChargeKind::Recurring && b.recurring_period.map(cycle) != expected
                     })
             });
-            (unsupported || mismatch).then_some(l.line_id)
+            // D-193/D-236 (R5): answered terms the submit cannot freeze into a Pricing request
+            // (no snapshot, or a snapshot Pricing cannot express) are unsupported terms, as
+            // Pricing's own MISSING_BILLING_TERMS / UNSUPPORTED_TERMS refusals settle.
+            let unusable_snapshot = answers
+                .billing_terms
+                .as_ref()
+                .and_then(PortAnswer::answered)
+                .and_then(|terms| terms.iter().find(|t| t.line_id == l.line_id))
+                .is_some_and(|terms| {
+                    terms
+                        .snapshot
+                        .as_ref()
+                        .is_none_or(|s| super::commercial::billing_terms(s).is_err())
+                });
+            (unsupported || mismatch || unusable_snapshot).then_some(l.line_id)
         })
         .collect();
     let evaluation = answers.evaluation.unwrap_or_else(|| {

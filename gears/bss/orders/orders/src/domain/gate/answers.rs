@@ -425,8 +425,9 @@ pub struct ResolvedTerms {
     /// Where the terms came from.
     pub provenance: TermsProvenance,
     /// The snapshot's content, when the port states it. The gate checks its cycle against
-    /// evaluation and recurring bindings; submit requires it to freeze a line's Pricing
-    /// request and refuses to reserve without it.
+    /// evaluation and recurring bindings, and refuses `billing-terms-unsupported` for answered
+    /// terms without a snapshot or with one Pricing cannot express (D-236 item 2 as amended by
+    /// D-242); submit freezes the line's Pricing request from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<BillingTermsSnapshot>,
 }

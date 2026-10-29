@@ -259,7 +259,14 @@ fn terms(line: Uuid) -> ResolvedTerms {
         term: EvaluationTerm::FixedPeriods { count: 12 },
         earliest_start: None,
         provenance: TermsProvenance::ExplicitOrder,
-        snapshot: None,
+        snapshot: Some(BillingTermsSnapshot {
+            schema_version: 1,
+            cycle: EvaluationCycle::Month,
+            anchor: TermsAnchor::Calendar,
+            anchor_at: OffsetDateTime::UNIX_EPOCH,
+            timezone: "UTC".into(),
+            source: TermsSnapshotSource::ExplicitOrder,
+        }),
     }
 }
 fn overlap_key(line: Uuid, key: &str) -> OverlapKey {
@@ -1186,6 +1193,57 @@ fn pin_refuses_terms_and_recurring_cycles_that_disagree_with_evaluation() {
                 assert!(result.tcv.is_none());
                 assert!(result.tcv_withheld.is_some());
             }
+        }
+    }
+}
+
+/// R5 (OQ-C1 a, amends D-236 item 2): terms submit cannot freeze into a Pricing request (no
+/// snapshot, another schema, a non-UTC zone, a seller-policy source at version 0) refuse the
+/// pin-composition row `billing-terms-unsupported` on every operation, never a 500 at submit.
+#[test]
+fn a_terms_snapshot_pricing_cannot_express_refuses_billing_terms_unsupported() {
+    for operation in [Operation::Preview, Operation::Submit] {
+        let pin = |a: Answers, b: &Basket| {
+            let out = assess(&assemble(b, a)).unwrap();
+            let row = out
+                .vector
+                .outcomes()
+                .iter()
+                .find(|r| r.key.predicate == PredicateId::PinComposition)
+                .unwrap()
+                .clone();
+            (row.verdict, row.reason)
+        };
+        let b = basket(operation, vec![two_lines().remove(0)]);
+        assert_eq!(
+            pin(answered(&b), &b),
+            (Verdict::Passed, None),
+            "{operation:?} control"
+        );
+        for case in 0..4 {
+            let mut a = answered(&b);
+            let Some(PortAnswer::Answered(terms)) = &mut a.billing_terms else {
+                panic!("answered terms")
+            };
+            match case {
+                0 => terms[0].snapshot = None,
+                1 => terms[0].snapshot.as_mut().unwrap().timezone = "Europe/Berlin".into(),
+                2 => terms[0].snapshot.as_mut().unwrap().schema_version = 2,
+                _ => {
+                    terms[0].snapshot.as_mut().unwrap().source =
+                        TermsSnapshotSource::SellerPolicy {
+                            id: Uuid::from_u128(9),
+                            version: 0,
+                        };
+                }
+            }
+            let (verdict, reason) = pin(a, &b);
+            assert_eq!(verdict, Verdict::Failed, "{operation:?} case {case}");
+            assert_eq!(
+                reason.map(bss_orders_sdk::catalog::Reason::token),
+                Some("billing-terms-unsupported"),
+                "{operation:?} case {case}"
+            );
         }
     }
 }

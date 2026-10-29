@@ -843,7 +843,7 @@ const fn term(t: EvaluationTerm) -> Term {
 
 /// The Pricing projection of a stated snapshot, its digest recomputed; the static member that
 /// Pricing cannot express otherwise.
-fn billing_terms(s: &BillingTermsSnapshot) -> Result<BillingTerms, &'static str> {
+pub(super) fn billing_terms(s: &BillingTermsSnapshot) -> Result<BillingTerms, &'static str> {
     if s.schema_version != 1 {
         return Err("billing terms schema version");
     }
