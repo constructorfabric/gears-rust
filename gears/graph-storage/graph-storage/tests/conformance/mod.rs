@@ -7426,7 +7426,7 @@ pub async fn a_read_returns_the_version_a_write_compares_against(
 /// edit, two backend replicas. Each writer upserts its own random subset of
 /// one shared key pool, in its own order, with edges between the keys it
 /// names -- some of them to keys no batch has written yet, which become
-/// phantoms. Row locks taken in request order made two such batches lock the
+/// phantoms -- and a few new edges every writer declares alike. Row locks taken in request order made two such batches lock the
 /// same rows in opposite orders, and the server broke the cycle by killing
 /// one: most of these batches came back `SERIALIZATION`. A store whose writes
 /// lock rows in one canonical order has no cycle to break, so every batch
@@ -7446,6 +7446,14 @@ pub async fn overlapping_batches_all_land(store: std::sync::Arc<dyn GraphStoreV1
 
     // A deterministic shuffle per writer and round: a fixed seed is a
     // reproducible failure, and a different order per writer is the point.
+    let anchors = std::iter::once("anchor".to_owned())
+        .chain((0..ROUNDS).flat_map(|round| (1..=4).map(move |k| format!("anchor-{round}-{k}"))))
+        .map(|key| node(&key, "anchor"))
+        .collect();
+    ingest_batch(store.as_ref(), &reader, batch(anchors, Vec::new()))
+        .await
+        .expect("the anchors commit");
+
     let pick = |writer: usize, round: usize| -> Vec<usize> {
         let mut keys: Vec<usize> = (0..KEYS).collect();
         let mut state = (writer * 7_919 + round * 104_729 + 1) as u64;
@@ -7501,6 +7509,42 @@ pub async fn overlapping_batches_all_land(store: std::sync::Arc<dyn GraphStoreV1
                     panic!(
                         "round {round}, writer {writer}: overlapping batches must not abort \
                          each other: {error}"
+                    )
+                });
+        }
+    }
+
+    // Edge-only batches: every writer declares the same new edges between
+    // anchors that exist and that no batch writes, so no node lock orders the
+    // writers first and two of them race to insert one new edge key.
+    for round in 0..ROUNDS {
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(WRITERS));
+        #[expect(
+            clippy::needless_collect,
+            reason = "spawning lazily would deadlock the barrier"
+        )]
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|_| {
+                let store = std::sync::Arc::clone(&store);
+                let gate = std::sync::Arc::clone(&gate);
+                let edges = (1..=4)
+                    .map(|k| edge("anchor", &format!("anchor-{round}-{k}")))
+                    .collect();
+                tokio::spawn(async move {
+                    let scope = AccessScope::for_tenant(tenant);
+                    let ctx = ctx(tenant, &scope, None);
+                    gate.wait().await;
+                    ingest_batch(store.as_ref(), &ctx, batch(Vec::new(), edges)).await
+                })
+            })
+            .collect();
+        for (writer, task) in writers.into_iter().enumerate() {
+            task.await
+                .expect("the writer task does not panic")
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "edge round {round}, writer {writer}: one new edge declared by \
+                         several batches must not abort any of them: {error}"
                     )
                 });
         }

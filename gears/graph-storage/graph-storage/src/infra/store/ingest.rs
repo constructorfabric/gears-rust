@@ -1378,16 +1378,18 @@ async fn upsert_edge(
         .await
         .map_err(map_scope_err)?;
 
-    let Some(current) = existing else {
+    let current = if let Some(current) = existing {
+        current
+    } else {
         let active = edge::ActiveModel {
             tenant_id: ActiveValue::Set(tenant),
             id: ActiveValue::NotSet,
-            edge_key: ActiveValue::Set(edge_key),
+            edge_key: ActiveValue::Set(edge_key.clone()),
             gts_edge_type_id: ActiveValue::Set(info.id),
             src_node_id: ActiveValue::Set(src),
             dst_node_id: ActiveValue::Set(dst),
             discriminator: ActiveValue::Set(spec.discriminator.clone()),
-            payload: ActiveValue::Set(payload),
+            payload: ActiveValue::Set(payload.clone()),
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
             deleted_at: ActiveValue::Set(None),
@@ -1400,14 +1402,41 @@ async fn upsert_edge(
             deleted_by_subject_id: ActiveValue::Set(None),
             deleted_by_subject_type: ActiveValue::Set(None),
         };
-        edge::Entity::insert(active)
+        // Two batches declaring one new edge both found no row, and the
+        // second lost a unique violation on `(tenant_id, edge_key)` -- the
+        // edge half of what `insert_node_row` settles for nodes (gears-rust
+        // #5042). `DO NOTHING` waits for the first; this write then lands on
+        // its row through the update below, which also decides ownership
+        // between two declaring scopes exactly as for an edge that existed.
+        let inserted = edge::Entity::insert(active)
             .secure()
             .scope_unchecked(scope)
             .map_err(map_scope_err)?
-            .exec(tx)
+            .on_conflict_raw(
+                OnConflict::columns([edge::Column::TenantId, edge::Column::EdgeKey])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_with_returning(tx)
+            .await;
+        match inserted {
+            Ok(_) => return Ok(ItemOutcome::Inserted),
+            Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => {}
+            Err(error) => return Err(map_scope_err(error)),
+        }
+        edge::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(edge::Column::EdgeKey.eq(edge_key.clone())))
+            .one(tx)
             .await
-            .map_err(map_scope_err)?;
-        return Ok(ItemOutcome::Inserted);
+            .map_err(map_scope_err)?
+            .ok_or_else(|| GraphStoreError::Conflict {
+                reason: format!(
+                    "edge `{edge_key}` was created and removed while this write was being \
+                     prepared; the key is free again, so re-ingest it"
+                ),
+            })?
     };
 
     // Ownership is bookkeeping about who declared the edge, not content a
