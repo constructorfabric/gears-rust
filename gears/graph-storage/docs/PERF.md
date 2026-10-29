@@ -60,9 +60,11 @@ database it costs 0–4%.
 
 ## Running it
 
-From the repository root, on an otherwise idle machine:
+From the repository root, on an otherwise idle machine. In Bash with
+`pipefail`, so a failed run does not exit with `tee`'s success:
 
-```sh
+```bash
+set -o pipefail
 GEARS_GRAPH_PERF=1 \
 GEARS_TEST_PG_GRAPH_IMAGE=pgvector/pgvector:0.8.7-pg18 \
 GEARS_GRAPH_PERF_REPEAT=5 \
@@ -75,7 +77,10 @@ python3 gears/graph-storage/scripts/perf_summary.py perf.log
 
 Seeding takes 13–18 minutes on a laptop; the matrix above adds a few minutes.
 Without `GEARS_GRAPH_PERF_RTT_MS` (or with `0` alone) no container but the
-database is started.
+database is started. A setting that does not parse or is out of range
+(`GEARS_GRAPH_PERF_SCALE` 0.001–10, `_REPEAT` 1–20, `_RTT_MS` 0–100 each,
+at least one) stops the run before it seeds, rather than falling back to a
+default.
 
 Before trusting a run:
 
