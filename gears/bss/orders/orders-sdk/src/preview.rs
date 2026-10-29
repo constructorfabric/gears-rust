@@ -245,12 +245,15 @@ impl TryFrom<PreviewResultWire> for PreviewResult {
     }
 }
 
-/// The pin outcome of one previewed line.
+/// The catalog pin-composition outcome of one previewed line (03 §3: pin outcomes are evaluated
+/// independently). It is not the admission verdict: the line's `orders.pin-composition` row in
+/// `assessment` also folds in the acceptance policy and billing terms, so a `composed` pin can
+/// sit beside an unevaluable or failed row; read the row for what blocks a submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PinOutcomeView {
-    /// The line composed.
+    /// The selected bindings composed into a pin; see the pin-composition row for admission.
     Composed,
     /// The plan revision cannot be resolved.
     Unresolvable {

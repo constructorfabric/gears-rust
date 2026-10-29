@@ -112,8 +112,9 @@ pub fn preview_result(
     result
 }
 
-/// The public view of a line's pin. A line the assessment has no pin for (never the case for a
-/// basket line `assess` saw) is unevaluable as an unresolvable reference.
+/// The public view of a line's catalog pin composition (`Assessment::pins`), independent of the
+/// pin-composition row's policy and terms verdict (Q-D3). A line the assessment has no pin for
+/// (never the case for a basket line `assess` saw) is unevaluable as an unresolvable reference.
 fn pin_view(pin: Option<&PinOutcome>) -> PinOutcomeView {
     match pin {
         Some(PinOutcome::Composed { .. }) => PinOutcomeView::Composed,
