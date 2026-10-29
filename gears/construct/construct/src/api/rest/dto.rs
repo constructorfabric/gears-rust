@@ -6,7 +6,11 @@ use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
+use crate::domain::subject_control::SubjectExport;
 use crate::domain::subject_settings::SubjectSettings;
+use toolkit_odata::SortDir;
+
+use super::pagination::{Listed, Listing, time_key};
 
 /// One connector record, as JSON. Intake checks it against its GTS type, so
 /// the body is taken as it is and not shaped by this DTO.
@@ -300,6 +304,118 @@ impl From<ProfileView> for ProfileDto {
                     facts: group.facts.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
+        }
+    }
+}
+
+/// The fields a subject's facts list filters and orders by. Exists only to
+/// derive [`SubjectFactField`].
+#[derive(toolkit_odata_macros::ODataFilterable)]
+#[allow(dead_code, reason = "only the derived filter field is used")]
+pub struct SubjectFactQuery {
+    /// The fact's id, the graph node key.
+    #[odata(filter(kind = "String"))]
+    pub fact_id: String,
+    /// The fact's category: `identity`, `role`, `skill` or `preference`.
+    #[odata(filter(kind = "String"))]
+    pub entity_kind: String,
+    /// Who the fact came from: `connector`, `agent`, `reviewer` or
+    /// `administrator`.
+    #[odata(filter(kind = "String"))]
+    pub origin: String,
+    /// When the fact was stored.
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub stored_at: OffsetDateTime,
+}
+
+pub use SubjectFactQueryFilterField as SubjectFactField;
+
+/// The subject's facts list: newest first, then by fact id.
+pub const SUBJECT_FACTS_LISTING: Listing<SubjectFactField> = Listing {
+    default_order: &[(SubjectFactField::StoredAt, SortDir::Desc)],
+    tiebreaker: SubjectFactField::FactId,
+};
+
+fn origin_name(origin: OriginKind) -> &'static str {
+    match origin {
+        OriginKind::Connector => "connector",
+        OriginKind::Agent => "agent",
+        OriginKind::Reviewer => "reviewer",
+        OriginKind::Administrator => "administrator",
+    }
+}
+
+impl Listed for StoredFact {
+    type Field = SubjectFactField;
+
+    fn key(&self, field: SubjectFactField) -> Option<String> {
+        Some(match field {
+            SubjectFactField::FactId => self.node_key.0.clone(),
+            SubjectFactField::EntityKind => self.category.name().to_owned(),
+            SubjectFactField::Origin => origin_name(self.origin).to_owned(),
+            SubjectFactField::StoredAt => time_key(self.stored_at.unix_timestamp_nanos()),
+        })
+    }
+}
+
+/// One of the subject's facts: the profile read's fact with its category.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectFactDto {
+    pub entity_kind: EntityKindDto,
+    #[serde(flatten)]
+    pub fact: ProfileFactDto,
+}
+
+impl From<StoredFact> for SubjectFactDto {
+    fn from(fact: StoredFact) -> Self {
+        Self {
+            entity_kind: fact.category.into(),
+            fact: fact.into(),
+        }
+    }
+}
+
+/// A page of the subject's facts, and the version of the profile it was
+/// cut from: a client polls the version to see whether anything changed.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectFactsPageDto {
+    pub items: Vec<SubjectFactDto>,
+    #[schema(value_type = Object)]
+    pub page_info: toolkit_odata::PageInfo,
+    /// The profile's version; none for a subject without a profile.
+    pub version: Option<u64>,
+}
+
+/// All of a subject's data, as the export file holds it.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SubjectExportDto {
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
+    pub exported_at: OffsetDateTime,
+    pub settings: SubjectSettingsDto,
+    pub facts: Vec<SubjectFactDto>,
+}
+
+impl SubjectExportDto {
+    #[must_use]
+    pub fn new(export: SubjectExport, exported_at: OffsetDateTime) -> Self {
+        Self {
+            tenant_id: export.tenant_id,
+            subject_id: export.subject_id,
+            exported_at,
+            settings: SubjectSettingsDto::new(export.subject_id, export.settings),
+            facts: export.facts.into_iter().map(Into::into).collect(),
         }
     }
 }

@@ -22,12 +22,15 @@ use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
-use crate::domain::planner::processing::{Processing, ProcessingContexts, ProcessingPorts};
+use crate::domain::planner::processing::{
+    PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
+};
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
 };
 use crate::domain::sensitive_data::SensitiveDataChecks;
+use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
 use crate::domain::subject_settings::SubjectSettingsReader;
 use crate::infra::admission_events::LogAdmissionEvents;
 use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
@@ -42,6 +45,7 @@ use crate::infra::storage::graph::reader::GraphProfileSource;
 use crate::infra::storage::graph::root::PayloadCounter;
 use crate::infra::storage::graph::types::GraphTypes;
 use crate::infra::storage::graph::writer::{GraphPlanWriter, SoftDelete, WriterPorts};
+use crate::infra::subject_control_events::LogSubjectControlEvents;
 
 /// [`ProcessingContexts`] for a deployment without a processing identity:
 /// Construct has no identity to read or write the profiles as.
@@ -141,6 +145,7 @@ pub struct Pipeline {
     /// The worker to start, none when processing is not configured.
     pub worker: Option<Worker>,
     pub profile: Arc<ProfileReadService>,
+    pub subject_control: Arc<SubjectControlService>,
 }
 
 /// Build the pipeline from the config.
@@ -219,7 +224,7 @@ pub fn assemble(
             contexts: Arc::clone(&contexts),
             events: Arc::new(LogProfileEvents),
         },
-        policy_enforcer,
+        policy_enforcer.clone(),
         // Without an identity the read answers not configured before it
         // checks a category, so the check it would take does not matter.
         match cfg.identity().map(|identity| identity.category_check) {
@@ -228,6 +233,28 @@ pub fn assemble(
         },
     ));
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
+
+    // @cpt-begin:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
+    // The writer stores processing's plans and the subject's deletes, so a
+    // subject deletes its facts also where no model is configured.
+    let writer: Arc<dyn PlanWriter> = Arc::new(GraphPlanWriter::new(WriterPorts {
+        client: Arc::clone(&graph),
+        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
+        version: Arc::new(PayloadCounter),
+        removal: Arc::new(SoftDelete::new(graph)),
+    }));
+    let subject_control = Arc::new(SubjectControlService::new(
+        SubjectControlPorts {
+            profiles: Arc::clone(&reader) as _,
+            writer: Arc::clone(&writer),
+            contexts: Arc::clone(&contexts),
+            settings: Arc::clone(&settings),
+            events: Arc::new(LogSubjectControlEvents),
+        },
+        policy_enforcer,
+        cfg.config().processing.max_reruns,
+    ));
+    // @cpt-end:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
     // No real sensitive-data check exists yet, so processing runs only where
@@ -239,6 +266,7 @@ pub fn assemble(
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
             worker: None,
             profile,
+            subject_control,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -275,12 +303,6 @@ pub fn assemble(
         events: Arc::new(LogAdmissionEvents),
         drops: Arc::clone(&events) as _,
     });
-    let writer = GraphPlanWriter::new(WriterPorts {
-        client: Arc::clone(&graph),
-        types: Arc::new(GraphTypes::new(Arc::clone(&graph))),
-        version: Arc::new(PayloadCounter),
-        removal: Arc::new(SoftDelete::new(graph)),
-    });
     let processing = Arc::new(Processing::new(
         planner,
         checks,
@@ -288,7 +310,7 @@ pub fn assemble(
         ProcessingPorts {
             contexts,
             profiles: reader,
-            writer: Arc::new(writer),
+            writer,
             events: Arc::clone(&events),
         },
         cfg.config().processing.max_reruns,
@@ -304,6 +326,7 @@ pub fn assemble(
             events,
         }),
         profile,
+        subject_control,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }

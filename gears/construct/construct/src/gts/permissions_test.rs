@@ -35,9 +35,19 @@ fn construct_permissions() -> Vec<(String, String, String)> {
 fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
     let expected = [
         (
+            "cf.construct._.facts_delete.v1",
+            "gts.cf.construct.subject.facts.v1~",
+            "delete",
+        ),
+        (
             "cf.construct._.facts_manage.v1",
             "gts.cf.construct.subject.facts.v1~",
             "manage",
+        ),
+        (
+            "cf.construct._.facts_read.v1",
+            "gts.cf.construct.subject.facts.v1~",
+            "read",
         ),
         (
             "cf.construct._.profile_read.v1",
@@ -48,6 +58,11 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
             "cf.construct._.record_send.v1",
             "gts.cf.connectors.core.record.v1~",
             "send",
+        ),
+        (
+            "cf.construct._.subject_export.v1",
+            "gts.cf.construct.subject.facts.v1~",
+            "export",
         ),
         (
             "cf.construct._.subject_settings_get.v1",

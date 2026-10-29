@@ -1,10 +1,14 @@
-use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
+use crate::api::rest::types::{
+    ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
+};
 use crate::api::rest::{dto, handlers};
 use crate::domain::planner::manage::ManageFacts;
 use axum::http::{StatusCode, header};
 use axum::{Extension, Router};
 use std::sync::Arc;
-use toolkit::api::operation_builder::{CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature};
+use toolkit::api::operation_builder::{
+    CORE_GLOBAL_BASE_LICENSE_FEATURE, LicenseFeature, OperationBuilderODataExt as _,
+};
 use toolkit::api::{OpenApiRegistry, OperationBuilder};
 
 const SUBJECT_SETTINGS_PATH: &str = "/construct/v1/subjects/{subject_id}/settings";
@@ -12,6 +16,9 @@ const SUBJECT_SETTINGS_TAG: &str = "Subject settings";
 const MANAGE_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/manage";
 const SUBJECT_FACTS_TAG: &str = "Subject facts";
 const PROFILE_PATH: &str = "/construct/v1/subjects/{subject_id}/profile";
+const SUBJECT_FACTS_PATH: &str = "/construct/v1/subjects/{subject_id}/facts";
+const SUBJECT_FACT_PATH: &str = "/construct/v1/subjects/{subject_id}/facts/{fact_id}";
+const SUBJECT_EXPORT_PATH: &str = "/construct/v1/subjects/{subject_id}/export";
 
 struct License;
 
@@ -159,6 +166,136 @@ pub fn register_routes(
         .layer(Extension(intake))
         .layer(Extension(settings))
         .layer(Extension(profile))
+}
+
+/// Subject Control's routes: the subject's own facts, one fact, its delete,
+/// and the export. Every answer is marked `no-store`.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+pub fn register_subject_control_routes(
+    router: Router,
+    openapi: &dyn OpenApiRegistry,
+    svc: Arc<ConcreteSubjectControl>,
+) -> Router {
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-send
+    let mut subject = OperationBuilder::get(SUBJECT_FACTS_PATH)
+        .operation_id("construct.list_subject_facts")
+        .summary("The subject's own facts")
+        .description(
+            "Every live fact of the caller, in every category, with who it came from. \
+             Owner only: another subject answers 404. Personalization off and an erasure \
+             under way do not hide anything here. Paged: `limit` (default 50, at most 200; \
+             a larger value is cut to 200) and an opaque `cursor`. `$filter` and \
+             `$orderby` over `fact_id`, `entity_kind`, `origin` and `stored_at`; the \
+             default order is `stored_at desc`, and `fact_id` breaks ties. `version` is \
+             the profile's version, to poll for changes.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .query_param_typed("limit", false, "Page size, at most 200", "integer")
+        .query_param("cursor", false, "Cursor of the next page")
+        .with_odata_filter::<dto::SubjectFactField>()
+        .with_odata_orderby::<dto::SubjectFactField>()
+        .handler(handlers::list_subject_facts)
+        .json_response_with_schema::<dto::SubjectFactsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "A page of the subject's facts",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(Router::new(), openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-send
+    subject = OperationBuilder::get(SUBJECT_FACT_PATH)
+        .operation_id("construct.get_subject_fact")
+        .summary("One of the subject's own facts")
+        .description(
+            "One live fact of the caller, by its id. Owner only. Another subject, or a \
+             fact the subject does not have, answers 404.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .handler(handlers::get_subject_fact)
+        .json_response_with_schema::<dto::SubjectFactDto>(openapi, StatusCode::OK, "The fact")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-send
+    subject = OperationBuilder::delete(SUBJECT_FACT_PATH)
+        .operation_id("construct.delete_subject_fact")
+        .summary("Delete one of the subject's own facts")
+        .description(
+            "Soft-deletes one live fact of the caller; it is not served from the next read. \
+             Owner only. Another subject, or a fact the subject does not have, answers 404. \
+             503 when the profile kept changing while the delete was written.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The caller's own subject id")
+        .path_param("fact_id", "The fact's id, as the facts list gives it")
+        .handler(handlers::delete_subject_fact)
+        .no_content_response(StatusCode::NO_CONTENT, "The fact is deleted")
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-send
+
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
+    subject = OperationBuilder::get(SUBJECT_EXPORT_PATH)
+        .operation_id("construct.export_subject")
+        .summary("Export a subject's data")
+        .description(
+            "All of a subject's data in the caller's tenant, as a JSON file: the settings \
+             and every live fact with its origin. For the data protection officer, under \
+             the permission to export a subject's data; without it, 403. A subject \
+             without data in the tenant exports empty, like one with no profile.",
+        )
+        .tag(SUBJECT_FACTS_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("subject_id", "The subject whose data is exported")
+        .handler(handlers::export_subject)
+        .json_response_with_schema::<dto::SubjectExportDto>(
+            openapi,
+            StatusCode::OK,
+            "The subject's data, as an attachment",
+        )
+        .standard_errors(openapi)
+        .error_503(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::NOT_IMPLEMENTED,
+            "The deployment does not provide subject control",
+        )
+        .register(subject, openapi);
+    // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-send
+
+    router.merge(not_stored(subject)).layer(Extension(svc))
 }
 
 /// The synchronous manage-facts route. The gear registers it together with the planner chain it runs on.

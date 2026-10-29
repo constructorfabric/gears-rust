@@ -17,6 +17,7 @@ use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
 use crate::domain::profile::{FactCount, FullProfile, Profile};
 use crate::domain::profile_read::{StoredFact, StoredProfiles};
+use crate::domain::subject_control::{SubjectFacts, SubjectProfiles};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph
@@ -218,24 +219,56 @@ impl StoredProfiles for GraphProfileSource {
             &subject,
         )
         .await?;
-        // A malformed fact is left out here, while the planner's read fails
-        // on it: an application is better served by the rest of the profile,
-        // whereas a plan built on a partial profile could add what is stored.
-        let listed = &stored.root.removals;
-        Ok(stored
-            .facts
-            .iter()
-            .filter(|node| !listed.contains(node.node_key.as_str()))
-            .filter_map(|node| {
-                stored_fact_of(node)
-                    .inspect_err(|defect| {
-                        // Only Construct writes these nodes, so this is a
-                        // defect, not a state a reader should see in silence.
-                        tracing::error!(%defect, "a stored fact cannot be read; it is not served");
-                    })
-                    .ok()
-            })
-            .collect())
+        Ok(served(&stored))
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-stored
+    }
+}
+
+/// The facts a reader is served: every live fact the root does not list for
+/// removal. A malformed fact is left out here, while the planner's read fails
+/// on it: a reader is better served by the rest of the profile, whereas a
+/// plan built on a partial profile could add what is stored.
+fn served(stored: &Stored) -> Vec<StoredFact> {
+    let listed = &stored.root.removals;
+    stored
+        .facts
+        .iter()
+        .filter(|node| !listed.contains(node.node_key.as_str()))
+        .filter_map(|node| {
+            stored_fact_of(node)
+                .inspect_err(|defect| {
+                    // Only Construct writes these nodes, so this is a
+                    // defect, not a state a reader should see in silence.
+                    tracing::error!(%defect, "a stored fact cannot be read; it is not served");
+                })
+                .ok()
+        })
+        .collect()
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+#[async_trait]
+impl SubjectProfiles for GraphProfileSource {
+    #[tracing::instrument(skip_all, fields(tenant_id = %key.tenant_id, subject_id = %key.subject_id))]
+    async fn facts(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<SubjectFacts, DomainError> {
+        // @cpt-begin:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read
+        let subject = subject_in_context(ctx, key)?;
+        let stored = read_stored(
+            self.client.as_ref(),
+            self.version.as_ref(),
+            self.timeout,
+            ctx,
+            &subject,
+        )
+        .await?;
+        Ok(SubjectFacts {
+            version: stored.version,
+            facts: served(&stored),
+        })
+        // @cpt-end:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read
     }
 }

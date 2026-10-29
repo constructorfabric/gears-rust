@@ -82,7 +82,7 @@ fn in_tenant(tenant: Uuid) -> SecurityContext {
 
 #[tracing_test::traced_test]
 #[tokio::test]
-async fn a_record_is_planned_checked_admitted_written_and_read_back() {
+async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject() {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
@@ -135,6 +135,40 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
         .expect("the record is processed");
     cancel.cancel();
     running.await.unwrap();
+
+    // The subject deletes the fact through Subject Control, over the same
+    // writer and graph storage, and the profile read no longer serves it.
+    let owner = crate::test_support::context_of(subject, tenant);
+    let own = pipeline
+        .subject_control
+        .view(&owner, subject)
+        .await
+        .expect("the subject's view");
+    let [stored] = own.facts.as_slice() else {
+        panic!("one fact in the subject's view, got {own:?}");
+    };
+    pipeline
+        .subject_control
+        .delete(&owner, subject, &stored.node_key)
+        .await
+        .expect("the subject deletes its fact");
+    let after = pipeline.profile.read(&reader, None, subject).await.unwrap();
+    assert!(
+        after.categories.is_empty(),
+        "deleted, so not served: {after:?}"
+    );
+    let own_after = pipeline
+        .subject_control
+        .view(&owner, subject)
+        .await
+        .unwrap();
+    assert!(own_after.facts.is_empty(), "{own_after:?}");
+    assert!(
+        own_after.version > own.version,
+        "the delete moved the profile's version on: {:?} then {:?}",
+        own.version,
+        own_after.version
+    );
 
     let [skills] = view.categories.as_slice() else {
         panic!("one category, got {view:?}");

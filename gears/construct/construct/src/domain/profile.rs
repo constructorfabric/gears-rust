@@ -9,7 +9,7 @@ use super::subject_settings::SubjectKey;
 
 /// A category of a person's profile: one person type in graph storage.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Category {
     Identity,
     Role,

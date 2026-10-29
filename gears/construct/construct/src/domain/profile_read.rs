@@ -225,7 +225,7 @@ fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<C
 /// The read asks with constraints required, so the enforcer never answers
 /// with an unconstrained scope; one that does is the platform allowing
 /// everything, and grants every category.
-fn granted(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
+pub(crate) fn granted(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
     if scope.is_unconstrained() {
         return Some(Category::ALL.into_iter().collect());
     }
@@ -242,7 +242,7 @@ fn granted(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
 /// The scope the subject settings are read under: the profile scope's tenant
 /// filters, as the settings rows are scoped by tenant only. An unconstrained
 /// scope stays as it is, since `tenant_only` would turn it into deny-all.
-fn settings_scope(scope: &AccessScope) -> AccessScope {
+pub(crate) fn settings_scope(scope: &AccessScope) -> AccessScope {
     if scope.is_unconstrained() {
         scope.clone()
     } else {
@@ -303,7 +303,7 @@ fn not_visible(err: EnforcerError) -> DomainError {
 /// the same answer. A profile too large to read is the gear's own limit, not
 /// something the reader can change. The read answers with nothing else, so
 /// both transports map one set of errors.
-fn read_failure(err: DomainError) -> DomainError {
+pub(crate) fn read_failure(err: DomainError) -> DomainError {
     match err {
         // Logged once, where the answer is mapped: the message carries the
         // refusal with its ids, which stay out of the answer.
