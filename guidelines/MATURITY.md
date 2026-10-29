@@ -202,7 +202,8 @@ a stricter flow and writes the chosen flow in the maturity card:
 | `design-first` | Yes ¹                 | Required |
 
 ¹ Required at every level for system gears, and for authentication, authorization, tenant
-isolation, and secret management in any gear (see [Design first approach](#design-first-approach-design-first)).
+isolation, and secret management in any gear. ToolKit libraries have no maturity level and always
+follow `design-first` (see [Design first approach](#design-first-approach-design-first)).
 
 **Requirement priority.** The PRD template gives each requirement a priority tier: `p1`, `p2`, `p3`
 and so on. `p1` is the highest tier. The flows differ in how much detail each tier gets, as the
