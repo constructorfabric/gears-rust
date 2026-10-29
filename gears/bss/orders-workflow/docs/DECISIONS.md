@@ -7058,6 +7058,72 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
 **Propagated**: `PRD.md` §3.2, §5.1, §5.3, §6.2, §6.3, §6.4, §6.6, §9.2, §12 (AC 4b, 5d, 5g, 6b, 6d,
 7d, 9b, 22), §13, §14, §15; `UPSTREAM_REQS.md` §4 items 22 and 23.
 
+### D-237 (M) Lifecycle's Stage 3 contract is mirrored: gate refusals decode but never reach this gear's calls, and the re-check adopts the frozen vectors and the occupancy count scope
+
+**Accepted (2026-10-27).** *(mirrors Lifecycle D-228, D-229, D-230, D-231 item 10, D-233 item 9, D-236, D-237 and D-238 on Lifecycle's Stage 3 branch `bss/orders-stage3`; refines D-193, D-208, D-227, D-231)*
+
+**Decision**:
+
+1. **Gate refusals.** Lifecycle registers `payer-relationship-unconfirmed` and
+   `billing-terms-unsupported` (`FailedPrecondition`), lets `order-in-flight-for-key`
+   (`AlreadyExists`) arrive with composite-gate diagnostics, and adds the optional
+   `RefusalDiagnostics.assessment` member (the all-failures `GateReport`). All of them come only
+   from the composite gate of submit, amendment and Preview. None of the operations this gear
+   calls (`reflect_approval`, `begin_fulfillment`, `report_spawn_signal`, `acknowledge`,
+   `workflow_cancel`, `hold`, `resume`, `get`, `get_version`) runs that gate, so no table of
+   `design/03`, `design/04` §3.6, `design/05` or `design/06` §4.9 gains a row. If one ever
+   arrives, it takes the *a 5xx* row through the wildcard arm of D-231. The step operations build
+   against the Lifecycle SDK revision they call and take each newly registered reason in lockstep.
+   An unknown reason inside `assessment` fails the whole diagnostics decode as `Integration`
+   (Lifecycle D-229 item 3), which is again the *a 5xx* row, never success. This gear neither
+   stores nor forwards the report.
+2. **Preview and the submit metadata are not consumed.** `OrdersV1::preview` and its types
+   (`tcvWithheld`, `tcv_basis`, `resolved_total.exclusions`) and the submit result's
+   `assessment_id` belong to the callers of Preview and submit. This gear is started by
+   `OrderSubmitted` and reads the committed version through `get_version`. The approval valuation
+   (D-230, D-235) keeps reading the stored committed figure. A Preview basis or exclusion list is
+   not a substitute for it, and this gear derives no basis from either.
+3. **Re-check conformance.** `re-check-pre-activation` composes Lifecycle's pure re-check decision
+   unchanged (`design/04` §3.6 `inst-rc-compose-lifecycle`). Its conformance set is Lifecycle's
+   frozen `gears/bss/orders/orders/tests/fixtures/activation-recheck-v1.json` (version 1,
+   22 vectors). For every vector this gear produces the same outcome (`proceed`, `reject`,
+   `not-dispatchable`, `defer`) and the same reasons and lines.
+4. **Occupancy answer shape.** Each occupancy row carries the count, `max_concurrent_active`, the
+   limit provenance and `count_scope` (`per_payer` or `full_tuple`). A missing or malformed member
+   is unevaluable: it takes the defer ladder and, once the ladder is spent,
+   `overlap-read-unevaluable`. A limit is never defaulted. An explicit `null` limit means unlimited
+   only as Lifecycle's development mirror, until Subscriptions agrees how unlimited differs from
+   unknown. Under either scope the re-check adds only this order's own pending lines. Counts are
+   never re-bucketed here (D-208).
+5. **Keys per line.** A line may store several overlap keys (Lifecycle D-238, item-key coverage),
+   and the re-check asks for every stored key. A collision on any one key rejects that line. A line
+   with no paid recurring item (one-time-only or usage-only) stores no key and needs no read
+   (Lifecycle D-236 item 6). When no line stores a key, the occupancy step is skipped, so an
+   unavailable occupancy port cannot defer the order.
+6. **Protected capacity is the target, not yet the set.** Lifecycle D-238 adopts Subscriptions
+   PR 5516's protected semantics: three literal counts (active, retained suspended, confirmed-order
+   reservations) on the full `(payer, resource tenant, key)` tuple, with the order's own
+   reservation converted at activation. Its 16 proposed vectors
+   (`activation-recheck-v2.json`) become this gear's conformance set when Subscriptions ratifies
+   that contract. Until then, version 1 is the set, and the `ownBindingRefs` clause of D-227 stays
+   the way this gear names its own reservation. The duties PR 5516 assigns to this gear (carry exact
+   acquisition and attempt identities, recover unknown outcomes, keep fences, deliver
+   acknowledgements) are already slices 05 and 06. No operation is added.
+7. **Cardinality stays advisory at order time** (Lifecycle D-236 item 11). A re-check pass is not
+   an admission guarantee. A later collision is the wave-2 failure that `design/06` §4.8 already
+   maps to `overlap-collision`.
+
+**Rationale**: Lifecycle's Stage 3 branch lists these as the #4787 mirror (its D-231 item 10,
+D-236 item 7, D-237 item 3). Most of it changes nothing this gear calls, so the decision says
+that explicitly instead of adding rows that could never be reached. The re-check is the one place
+the gear consumes the new shapes, so it adopts Lifecycle's frozen vectors rather than restating
+the algorithm.
+
+**Propagated**: `DESIGN.md` §3.4 (Orders Lifecycle row); `design/04-fulfillment-plan.md` §3.6
+(`inst-rc-compose-lifecycle`); `design/05-provisioning-intents.md` (`SUB-O5`);
+`design/06-saga-and-compensation.md` §4.9; `UPSTREAM_REQS.md` §2.1 (`SUB-O5` row and the
+overlap-presence read).
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7415,6 +7481,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-210 | cross-cutting (review findings, 2026-10-12) | `ADR/0011`, `ADR/0012`, `ADR/0013`; `design/01`, `design/08`; `UPSTREAM_REQS.md` §2.9 |
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
 | D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
+| D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
@@ -7625,6 +7692,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-234 | M `OrderFulfillmentAborted` on every unwind with `mode` and `retainedObligations[]` | `design/06` §3.2, §3.6; `design/01` §4.7; `ADR/0008`; `UPSTREAM_REQS.md` §2.4; `PRD.md` §6.4, §6.6, AC 9b; D-227 |
 | D-235 | M Valuation basis and named approver come from the approval policy adapter; seller policy holds five settings (corrects D-229, D-230) | `design/01` §3.7; `design/03` §3.3, §3.6, §3.7; `DESIGN.md` §4.7, §4.8; `PRD.md` §5.3, AC 22 |
 | D-236 | H PRD states this gear's side now and the owners' parts as named assumptions (§14) | `PRD.md`; `UPSTREAM_REQS.md` §4 items 22, 23 |
+| D-237 | M Lifecycle Stage 3 mirrored: gate refusals and `assessment` decode but never reach this gear's calls (*a 5xx* if they do); Preview and `assessment_id` not consumed; re-check conforms to Lifecycle's 22 frozen vectors, requires `count_scope` and the limit, asks every stored key, skips keyless lines; protected v2 vectors are the target | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-208, D-227, D-231 |
 
-Highest decision number used: **D-236**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-237**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

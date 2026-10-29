@@ -1216,7 +1216,10 @@ as below. A permanent failure is not caught by the definition and faults the inv
 no row is left to a builder's choice (decision D-111). The statuses in the rows (503, 409) name how
 Lifecycle's REST surface renders each answer; in process the answer is the typed `OrdersError`, and
 the rows match its variant and reason token, with any variant not listed taking the *a 5xx* row
-(decision D-231).
+(decision D-231). The composite-gate reasons (`payer-relationship-unconfirmed`,
+`billing-terms-unsupported`, and `order-in-flight-for-key` with an `assessment` report) cannot
+answer either call; one that did would take the *a 5xx* row, and so would a diagnostics payload
+that fails to decode (decision D-237).
 
 | Lifecycle answer | When it can arise | `report-outcome` answers |
 |------------------|-------------------|--------------------------|

@@ -101,7 +101,7 @@ answers are agreed here but are not canonical until that PR merges:
 | `SUB-O1` compensation cancel reason | `order_compensation` in a closed, versioned set, outside the early-termination class (`fr-cancel-reasons`) | Sends it on the activated-cancel leg (`design/06` §4.6) |
 | `SUB-O2` order reference and create key | Optional order reference persisted and echoed; caller-derived key from order, version, line and wave | No change: this gear's key also carries kind and wave attempt, which the opaque key admits |
 | `SUB-O3` draft then activate | Kept as an external two-phase contract | No change |
-| `SUB-O5` overlap occupancy | Batched `(activeCount, maxConcurrentActive, provenance)` per payer and key; atomic enforcement at entry into `active` | No change; the resource-tenant dimension of Lifecycle D-179 rides inside the key (see the ask below) |
+| `SUB-O5` overlap occupancy | Batched `(activeCount, maxConcurrentActive, provenance)` per payer and key; atomic enforcement at entry into `active` | The resource-tenant dimension of Lifecycle D-179 rides inside the key (see the ask below); each row must also name its `count_scope`, and a missing limit is unevaluable, never a default (decision D-237) |
 | `SUB-O10` start instant | **Reshaped:** the start is stamped at the `activate` commit and never supplied by the caller | Sends no start instant (`design/05` §2.2); the ask below is withdrawn |
 | `SUB-O11` in-flight signal | **Reshaped:** a same-key resubmit returns the existing request and its status; a different request is rejected `transition_in_flight` | Adopted as the duplicate signal and as the basis of resubmit-then-void |
 | `SUB-O12` withdrawal | A request accepted but not applied is withdrawn and ends `failed` with reason `withdrawn` | Step 3 of the cancellation fence (`design/06` §3.6) |
@@ -118,6 +118,13 @@ answers are agreed here but are not canonical until that PR merges:
 > (`ownBindingRefs`) and exclude the acquisition's own reservation from the occupancy it reports,
 > so a protected purchase is never read as colliding with itself (`design/04` §3.6
 > `inst-rc-compose-lifecycle`). Open on #5131.
+>
+> **Clause added 2026-10-27 (D-237)**: each answered row **MUST** carry `max_concurrent_active` and
+> `count_scope` (`per_payer` or `full_tuple`). A missing member is unevaluable here, never a default
+> limit, and the encoding that tells unlimited from unknown is still to be agreed (Lifecycle
+> D-233 item 9). The target shape is Lifecycle D-238's three counts (active, retained suspended,
+> confirmed-order reservations) on the full tuple, from Subscriptions PR 5516 S-U10; this gear
+> adopts it, with Lifecycle's protected re-check vectors, once Subscriptions ratifies it.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-overlap-presence-read`
 

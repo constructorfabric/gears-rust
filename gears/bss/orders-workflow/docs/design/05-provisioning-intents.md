@@ -1197,7 +1197,8 @@ Related, already-registered asks:
 - `SUB-O5` — overlap occupancy read; adopted in #5131 as a batched `(activeCount,
   maxConcurrentActive, provenance)` per payer and key with atomic enforcement at entry into
   `active`; consumed by slice 04 and inherited by the draft-liveness gate, which fails closed on an
-  unevaluable read.
+  unevaluable read. Each row must also carry `count_scope`; a row missing it or its limit is
+  unevaluable (decision D-237).
 
 **Platform asks this slice depends on** (recorded in `UPSTREAM_REQS.md` §2.9,
 serverless-runtime section): a `wait` whose duration is a runtime expression as a plugin
