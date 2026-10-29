@@ -111,7 +111,7 @@ async fn read_profile_asks_about_the_named_tenant() {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(resource, ..)| resource == "construct.profile")
+        .filter(|(resource, ..)| resource == crate::domain::profile_read::PROFILE_TYPE)
         .map(|(_, _, context, owner)| (*context, owner.clone()))
         .collect();
     assert_eq!(asked, [(Some(tenant), Some(tenant.to_string()))]);

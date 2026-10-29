@@ -5,15 +5,16 @@ Record intake for connectors and the profile read for applications and agents. A
 **Processing runs only with a processing identity and a model configured.** Without them, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `503`.
 
 **Features:**
-- One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`construct.record` / `send`) for the named tenant
+- One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`gts.cf.connectors.core.record.v1~` / `send`) for the named tenant
 - The record is checked against its GTS type and every type it derives from, through the types registry. The connector record types ship in the SDK and are registered when the types registry starts
 - A repeat of a received record identity (tenant, connector, provenance, version) changes nothing; the identity is kept only once processing took the record
 - Records are refused when the connector is off, or when personalization is off or an erasure is under way for the record's subject
 - Errors are RFC 9457 Problem responses
 - The gear supplies its migrations to the runtime, which runs them on boot
-- `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for the subject itself, or a caller the platform lets act for the subject by naming it (`construct.profile` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
+- `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for a caller the platform grants the permission to read profiles (`gts.cf.construct.subject.profile.v1~` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
 - An in-process client, `ConstructClientV1::submit_record` and `read_profile`, runs the same operations
 - The gear needs graph storage in its host
+- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, and read or change one's own personalization settings. The tenant grants each in its policy engine
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 

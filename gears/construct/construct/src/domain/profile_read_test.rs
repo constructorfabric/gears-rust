@@ -260,7 +260,7 @@ async fn the_policy_service_is_asked_about_the_named_tenant_or_the_callers_own()
         .lock()
         .unwrap()
         .iter()
-        .filter(|(resource, ..)| resource == "construct.profile")
+        .filter(|(resource, ..)| resource == crate::domain::profile_read::PROFILE_TYPE)
         .map(|(_, action, context, owner)| (action.clone(), *context, owner.clone()))
         .collect();
     assert_eq!(
@@ -284,17 +284,6 @@ async fn a_category_the_scope_leaves_out_is_not_listed() {
         CategoryCheck::OneCall,
     );
 
-    let view = service
-        .read(
-            &subject_in(Uuid::new_v4(), Uuid::new_v4()),
-            None,
-            Uuid::nil(),
-        )
-        .await;
-    assert!(
-        matches!(view, Err(DomainError::NotVisible(_))),
-        "a tenant-only answer reaches no one else: {view:?}"
-    );
     let subject = Uuid::new_v4();
     let view = service
         .read(&subject_in(Uuid::new_v4(), subject), None, subject)
@@ -582,7 +571,7 @@ impl AuthZResolverApi for TenantClampOnly {
 }
 
 #[tokio::test]
-async fn a_tenant_only_answer_lets_the_subject_read_itself_and_no_one_else() {
+async fn a_tenant_answer_lets_the_caller_read_every_subject_in_that_tenant() {
     let db = inmem_db().await;
     let service = profile_service(
         &db,
@@ -593,26 +582,18 @@ async fn a_tenant_only_answer_lets_the_subject_read_itself_and_no_one_else() {
     );
     let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
 
-    let itself = service
-        .read(&subject_in(tenant, subject), None, subject)
-        .await;
-    let colleague = service.read(&caller_in(tenant), None, subject).await;
-    let outsider = service
-        .read(&caller_in(Uuid::new_v4()), Some(tenant), subject)
-        .await;
-    let itself_elsewhere = service
-        .read(&subject_in(tenant, subject), Some(Uuid::new_v4()), subject)
-        .await;
-
-    assert!(itself.is_ok(), "{itself:?}");
-    for (who, result) in [
-        ("a colleague", colleague),
-        ("a caller naming the tenant", outsider),
-        ("the subject in another tenant", itself_elsewhere),
+    // Reading profiles is a permission of its own: whoever the platform
+    // grants it in the tenant reads any subject there, the subject itself
+    // and an application acting for it alike.
+    for (who, caller) in [
+        ("the subject", subject_in(tenant, subject)),
+        ("an application", caller_in(tenant)),
     ] {
-        assert!(
-            matches!(result, Err(DomainError::NotVisible(_))),
-            "{who}: {result:?}"
+        let view = service.read(&caller, None, subject).await.unwrap();
+        assert_eq!(
+            kinds(&view),
+            [(Category::Identity, 1), (Category::Skill, 2)],
+            "{who}"
         );
     }
 }
@@ -818,54 +799,6 @@ async fn a_grant_the_settings_scope_cannot_cover_is_not_visible_rather_than_forb
     assert!(
         matches!(result, Err(DomainError::NotVisible(_))),
         "{result:?}"
-    );
-}
-
-/// Names the subject on the profile, but answers each category with a
-/// tenant clamp alone.
-struct SubjectOnTheProfileOnly;
-
-#[async_trait]
-impl AuthZResolverApi for SubjectOnTheProfileOnly {
-    async fn evaluate(
-        &self,
-        _ctx: PlatformSecurityContext,
-        request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, CanonicalError> {
-        let tenant = tenant_of(&request);
-        if request.resource.properties.contains_key(CATEGORY_PROPERTY) {
-            return Ok(allowed(vec![tenant_is(tenant)]));
-        }
-        let subject = request.resource.id.expect("the subject is the resource");
-        Ok(allowed(vec![tenant_is(tenant), subject_is(subject)]))
-    }
-}
-
-#[tokio::test]
-async fn per_category_another_caller_needs_each_category_answer_to_name_the_subject() {
-    let db = inmem_db().await;
-    let service = profile_service(
-        &db,
-        Arc::new(SubjectOnTheProfileOnly),
-        facts(),
-        Arc::default(),
-        CategoryCheck::PerCategory,
-    );
-    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
-
-    let agent = service
-        .read(&caller_in(Uuid::new_v4()), Some(tenant), subject)
-        .await
-        .unwrap();
-    let itself = service
-        .read(&subject_in(tenant, subject), None, subject)
-        .await
-        .unwrap();
-
-    assert!(agent.categories.is_empty(), "{agent:?}");
-    assert_eq!(
-        kinds(&itself),
-        [(Category::Identity, 1), (Category::Skill, 2)]
     );
 }
 

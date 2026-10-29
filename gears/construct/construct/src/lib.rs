@@ -16,5 +16,7 @@ pub mod domain;
 #[doc(hidden)]
 pub mod infra;
 
+mod gts;
+
 #[cfg(test)]
 mod test_support;

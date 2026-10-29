@@ -175,7 +175,7 @@ async fn the_named_tenant_reaches_the_policy_request() {
     let asked = resolver.asked.lock().unwrap();
     let (_, action, context, owner) = asked
         .iter()
-        .find(|(resource, ..)| resource == "construct.profile")
+        .find(|(resource, ..)| resource == crate::domain::profile_read::PROFILE_TYPE)
         .expect("the profile resource is asked about");
     assert_eq!(
         (action.as_str(), *context, owner.clone()),
