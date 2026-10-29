@@ -87,17 +87,13 @@ struct Shape {
 
 impl Shape {
     fn from_env() -> Self {
-        let scale = std::env::var("GEARS_GRAPH_PERF_SCALE")
-            .ok()
-            .and_then(|raw| raw.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.001, 10.0);
+        let scale = setting("GEARS_GRAPH_PERF_SCALE", 1.0, 0.001..=10.0);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the scale is clamped to 0.001..=10 above, so both products lie in \
+            reason = "`setting` admits only 0.001..=10, so both products lie in \
                       100..=1_000_000 and are positive -- the cast is lossless over \
-                      exactly the range the clamp allows"
+                      exactly the range it admits"
         )]
         Self {
             nodes: (100_000.0 * scale) as usize,
@@ -256,28 +252,61 @@ fn report(repeat: usize, rtt_ms: f64, backend: &str, scenario: &str, measured: &
     );
 }
 
-fn repeats() -> usize {
-    std::env::var("GEARS_GRAPH_PERF_REPEAT")
+/// A numeric setting from the environment: absent is `default`, anything else
+/// must parse and lie in `range`, or the run stops before it seeds.
+///
+/// Refused rather than replaced by the default, because a typo that fell back
+/// silently would run -- and report -- a matrix nobody asked for, after a
+/// seed that takes a quarter of an hour.
+fn setting<T>(name: &str, default: T, range: std::ops::RangeInclusive<T>) -> T
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    raw.trim()
+        .parse::<T>()
         .ok()
-        .and_then(|raw| raw.parse::<usize>().ok())
-        .unwrap_or(1)
-        .clamp(1, 20)
+        .filter(|value| range.contains(value))
+        .unwrap_or_else(|| {
+            panic!(
+                "{name}: `{raw}` is not a number in {}..={}",
+                range.start(),
+                range.end()
+            )
+        })
+}
+
+fn repeats() -> usize {
+    setting("GEARS_GRAPH_PERF_REPEAT", 1, 1..=20)
 }
 
 /// `GEARS_GRAPH_PERF_RTT_MS`: the round-trip times to add, in milliseconds.
+///
+/// A list that names none (empty, or commas only) is refused: it would seed
+/// the graph, time nothing and pass without a single `RESULT` line.
 fn rtts() -> Vec<f64> {
-    std::env::var("GEARS_GRAPH_PERF_RTT_MS")
-        .unwrap_or_else(|_| "0".to_owned())
+    const NAME: &str = "GEARS_GRAPH_PERF_RTT_MS";
+    let Ok(raw) = std::env::var(NAME) else {
+        return vec![0.0];
+    };
+    let rtts: Vec<f64> = raw
         .split(',')
         .map(str::trim)
-        .filter(|raw| !raw.is_empty())
-        .map(|raw| {
-            raw.parse::<f64>()
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            item.parse::<f64>()
                 .ok()
                 .filter(|ms| (0.0..=100.0).contains(ms))
-                .unwrap_or_else(|| panic!("GEARS_GRAPH_PERF_RTT_MS: `{raw}` is not 0..=100 ms"))
+                .unwrap_or_else(|| panic!("{NAME}: `{item}` is not 0..=100 ms"))
         })
-        .collect()
+        .collect();
+    assert!(
+        !rtts.is_empty(),
+        "{NAME}: `{raw}` names no round-trip time; unset it, or list at least one (e.g. `0`)"
+    );
+    rtts
 }
 
 /// Delay every packet the database container sends by `ms`, which adds `ms`
@@ -288,34 +317,57 @@ fn rtts() -> Vec<f64> {
 /// `iproute2` in the database image. A delay that does not apply fails the
 /// run -- a column labelled "+2 ms" measured at +0 is worse than no column.
 fn set_rtt(container_id: &str, ms: f64) {
-    let netns = format!("container:{container_id}");
-    let mut args = vec![
-        "run".to_owned(),
-        "--rm".to_owned(),
-        "--net".to_owned(),
-        netns,
-        "--cap-add".to_owned(),
-        "NET_ADMIN".to_owned(),
-        "nicolaka/netshoot".to_owned(),
-        "tc".to_owned(),
-        "qdisc".to_owned(),
-    ];
     if ms > 0.0 {
-        args.extend(["replace", "dev", "eth0", "root", "netem", "delay"].map(str::to_owned));
-        args.push(format!("{ms}ms"));
-    } else {
-        // Deleting a qdisc that is not there fails; that is the state wanted.
-        args.extend(["del", "dev", "eth0", "root"].map(str::to_owned));
+        let delay = format!("{ms}ms");
+        let out = tc(
+            container_id,
+            &["replace", "dev", "eth0", "root", "netem", "delay", &delay],
+        );
+        assert!(
+            out.status.success(),
+            "netem did not apply: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
     }
-    let out = std::process::Command::new("docker")
-        .args(&args)
-        .output()
-        .expect("docker runs");
+    // Deleting a qdisc that is not there fails, and that is the state wanted,
+    // so a failed delete alone proves nothing either way. What decides is
+    // whether a delay is still installed: a "+0 ms" column measured over a
+    // leftover delay is the baseline every other column is read against.
+    if tc(container_id, &["del", "dev", "eth0", "root"])
+        .status
+        .success()
+    {
+        return;
+    }
+    let shown = tc(container_id, &["show", "dev", "eth0"]);
+    let qdiscs = String::from_utf8_lossy(&shown.stdout);
     assert!(
-        ms <= 0.0 || out.status.success(),
-        "netem did not apply: {}",
-        String::from_utf8_lossy(&out.stderr)
+        shown.status.success() && !qdiscs.contains("netem"),
+        "netem could not be removed: {qdiscs}{}",
+        String::from_utf8_lossy(&shown.stderr)
     );
+}
+
+/// `tc qdisc <args>` in a helper container joined to the database
+/// container's network namespace.
+fn tc(container_id: &str, args: &[&str]) -> std::process::Output {
+    let netns = format!("container:{container_id}");
+    std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--net",
+            &netns,
+            "--cap-add",
+            "NET_ADMIN",
+            "nicolaka/netshoot",
+            "tc",
+            "qdisc",
+        ])
+        .args(args)
+        .output()
+        .expect("docker runs")
 }
 
 // ---------------------------------------------------------------------------
@@ -545,7 +597,11 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
     let Some(stand) = stand().await else {
         return;
     };
+    // Every setting is read before the seed, which is most of the run's
+    // wall clock: a bad one costs seconds, not a quarter of an hour.
     let shape = Shape::from_env();
+    let rtts = rtts();
+    let repeats = repeats();
     let tenant = Uuid::now_v7();
     let scope = AccessScope::for_tenant(tenant);
     let ctx = conformance::ctx(tenant, &scope, None);
@@ -603,9 +659,8 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         .expect("the root exists")
         .1;
 
-    let rtts = rtts();
     let shaped = rtts.iter().any(|ms| *ms > 0.0);
-    for repeat in 0..repeats() {
+    for repeat in 0..repeats {
         for &rtt in &rtts {
             if shaped {
                 set_rtt(&stand.container_id, rtt);
