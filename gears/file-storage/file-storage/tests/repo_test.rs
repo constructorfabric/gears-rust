@@ -1,41 +1,193 @@
-//! Repo-level tests for `MultipartRepo`: completion-lease fencing and `has_active_for_file`.
-//! Real SQLite DB with the full migration applied.
+//! Repo- and store-level predicates on a real `SQLite` DB with the full migration applied:
+//! version lookups, manifests batching, policy upsert and multipart sessions (lease fencing).
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 
+use sea_orm::{EntityTrait, PaginatorTrait};
 use time::OffsetDateTime;
 use toolkit_db::{DBProvider, DbError};
-use toolkit_gts::gts_id;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use file_storage::domain::multipart::MultipartUploadState;
-use file_storage::infra::storage::repo::{FileRepo, MultipartRepo};
-use file_storage_sdk::{File, OwnerKind};
+use file_storage::domain::policy::{PolicyBody, PolicyScope, SizeLimits};
+use file_storage::infra::storage::Store;
+use file_storage::infra::storage::entity::policy::Entity as PolicyEntity;
+use file_storage::infra::storage::repo::{FileRepo, MultipartRepo, VersionRepo};
+use file_storage_sdk::FileVersion;
 
 mod common;
 
-const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+const TENANT: &str = "00000000-0000-0000-0000-0000000000a1";
+const OWNER: &str = "00000000-0000-0000-0000-0000000000b1";
 
-async fn db() -> Arc<DBProvider<DbError>> {
-    common::build_db("multipart-repo").await
+fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
+    FileVersion {
+        size,
+        ..common::version_row(file_id, version_id)
+    }
 }
 
-fn new_file(file_id: Uuid, tenant_id: Uuid) -> File {
+async fn db() -> Arc<DBProvider<DbError>> {
+    common::build_db("repo").await
+}
+
+/// `get(file_id, version_id)` resolves exactly the target row among many versions of two files,
+/// and never under a foreign `file_id`.
+#[tokio::test]
+async fn version_repo_get_returns_correct_row_among_many() {
+    let db = common::build_db("repo").await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let files = FileRepo::new();
+    let versions = VersionRepo::new();
+
+    let file_a = Uuid::now_v7();
+    let file_b = Uuid::now_v7();
+    let tenant = Uuid::now_v7();
+    files
+        .create(&conn, &scope, &common::file_row(file_a, tenant))
+        .await
+        .expect("create file_a");
+    files
+        .create(&conn, &scope, &common::file_row(file_b, tenant))
+        .await
+        .expect("create file_b");
+
+    // The target lives in file_a; every other row must be excluded by `get`.
+    let mut file_a_versions = Vec::new();
+    for i in 0..5u8 {
+        let vid = Uuid::now_v7();
+        versions
+            .insert(&conn, &scope, &new_version(file_a, vid, i64::from(i) * 10))
+            .await
+            .expect("insert file_a version");
+        file_a_versions.push(vid);
+    }
+    for _ in 0..5u8 {
+        versions
+            .insert(&conn, &scope, &new_version(file_b, Uuid::now_v7(), 999))
+            .await
+            .expect("insert file_b version");
+    }
+    let target = file_a_versions[2];
+
+    let found = versions
+        .get(&conn, &scope, file_a, target)
+        .await
+        .expect("get must not error")
+        .expect("target version must be found");
+    assert_eq!(found.file_id, file_a);
+    assert_eq!(found.version_id, target);
+    assert_eq!(found.size, 20, "must be the i==2 row, not any other");
+
+    let cross = versions
+        .get(&conn, &scope, file_b, target)
+        .await
+        .expect("get must not error");
+    assert!(
+        cross.is_none(),
+        "a version_id belonging to file_a must not resolve under file_b"
+    );
+}
+
+/// `VersionRepo::get_manifests` returns every requested version's manifest even when the id list
+/// spans more than one `max_bind_params_for` chunk (30 000 on `SQLite`, minus
+/// `GET_MANIFESTS_RESERVED_PARAMS`). Only the versions at chunk edges exist; the rest of the list
+/// is ids without a row, which are simply absent from the result.
+#[tokio::test]
+async fn get_manifests_returns_results_from_every_chunk() {
+    const LIST_LEN: usize = 35_000;
+    // The last id of the first chunk, the first of the second, and the very last.
+    const SEEDED_AT: [usize; 4] = [0, 29_983, 29_984, LIST_LEN - 1];
+
+    let db = common::build_db("repo").await;
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let (file_id, _) =
+        common::seed_file_with_versions(&db, Uuid::now_v7(), Uuid::now_v7(), &[]).await;
     let now = OffsetDateTime::now_utc();
-    File {
-        file_id,
-        tenant_id,
-        owner_kind: OwnerKind::User,
-        owner_id: Uuid::now_v7(),
-        name: "upload.bin".to_owned(),
-        gts_file_type: GTS.to_owned(),
-        content_id: None,
-        meta_version: 0,
-        created_at: now,
-        last_modified_at: now,
+
+    let mut version_ids: Vec<Uuid> = (0..LIST_LEN).map(|_| Uuid::now_v7()).collect();
+    for at in SEEDED_AT {
+        version_ids[at] =
+            common::insert_composite_version(&db, file_id, now, &format!("m{at}")).await;
+    }
+
+    let manifests = VersionRepo::new()
+        .get_manifests(&conn, &scope, &version_ids)
+        .await
+        .expect("get_manifests must not error across chunk boundaries");
+
+    assert_eq!(manifests.len(), SEEDED_AT.len(), "{manifests:?}");
+    for at in SEEDED_AT {
+        assert_eq!(
+            manifests.get(&version_ids[at]),
+            Some(&format!("m{at}")),
+            "manifest at list position {at}"
+        );
+    }
+}
+
+fn body_with_max_bytes(max_bytes: u64) -> PolicyBody {
+    PolicyBody {
+        size_limits: SizeLimits {
+            max_bytes: Some(max_bytes),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Two sequential upserts for one scope leave exactly one row carrying the second body, for a
+/// tenant-scope row (no owner) and a user-scope row (`scope_owner_id = Some(..)`).
+#[tokio::test]
+async fn policy_upsert_on_conflict_updates_existing_row_not_duplicates() {
+    let owner_id: Uuid = OWNER.parse().expect("valid uuid");
+    for (policy_scope, scope_owner_id) in [
+        (PolicyScope::Tenant, None),
+        (PolicyScope::User, Some(owner_id)),
+    ] {
+        let (db, dsn) = common::build_db_with_dsn("repo").await;
+        let store = Store::new(db);
+        let scope = AccessScope::allow_all();
+        let tenant_id: Uuid = TENANT.parse().expect("valid uuid");
+        let now = time::OffsetDateTime::now_utc();
+
+        let first_body = body_with_max_bytes(100);
+        let second_body = body_with_max_bytes(200);
+
+        for body in [&first_body, &second_body] {
+            store
+                .upsert_policy(&scope, tenant_id, &policy_scope, scope_owner_id, body, now)
+                .await
+                .expect("upsert must succeed");
+        }
+
+        // Independent raw connection, purely for the row count.
+        let raw = sea_orm::Database::connect(&dsn)
+            .await
+            .expect("second raw connection");
+        let count = PolicyEntity::find()
+            .count(&raw)
+            .await
+            .expect("count policies");
+        assert_eq!(
+            count, 1,
+            "two upserts for the same {policy_scope:?} scope must leave exactly one row, not {count}"
+        );
+
+        let stored = store
+            .get_policy(&scope, tenant_id, &policy_scope, scope_owner_id)
+            .await
+            .expect("get_policy must succeed")
+            .expect("policy row must exist");
+        assert_eq!(
+            stored.body, second_body,
+            "the surviving row must carry the second call's body, not the first's"
+        );
     }
 }
 
@@ -50,7 +202,7 @@ async fn seed_session<C: toolkit_db::secure::DBRunner>(
     let file_id = Uuid::now_v7();
     let tenant_id = Uuid::now_v7();
     files
-        .create(conn, &scope, &new_file(file_id, tenant_id))
+        .create(conn, &scope, &common::file_row(file_id, tenant_id))
         .await
         .expect("create parent file");
 
@@ -247,7 +399,7 @@ async fn has_active_for_file_reflects_session_state() {
                 .create(
                     &conn,
                     &AccessScope::allow_all(),
-                    &new_file(file_id, Uuid::now_v7()),
+                    &common::file_row(file_id, Uuid::now_v7()),
                 )
                 .await
                 .expect("create parent file");

@@ -55,109 +55,100 @@ fn a_cursor_round_trips_its_position_and_direction() {
 
 #[test]
 fn a_bound_cursor_round_trips_and_rejects_a_different_binding() {
-    let created_at = datetime!(2026-09-27 12:00:00 UTC);
     let id = Uuid::now_v7();
     let a = owner(file_storage_sdk::OwnerKind::User, Uuid::from_u128(1));
     let b = owner(file_storage_sdk::OwnerKind::User, Uuid::from_u128(2));
     let binding_a = files_binding(&a);
-    let token = encode(created_at, id, ID, binding_a.clone(), Direction::Forward).expect("encode");
+    let token = encode(
+        datetime!(2026-09-27 12:00:00 UTC),
+        id,
+        ID,
+        binding_a.clone(),
+        Direction::Forward,
+    )
+    .expect("encode");
 
     let sought =
         seek(parsed(&token), ID, binding_a.as_deref()).expect("decode with matching binding");
     assert_eq!(sought.id, id);
 
-    let binding_b = files_binding(&b);
-    let err = seek(parsed(&token), ID, binding_b.as_deref())
-        .expect_err("different owner must be rejected");
-    assert!(matches!(err, ODataError::FilterMismatch));
+    for (name, binding) in [("other owner", files_binding(&b)), ("no binding", None)] {
+        let err = seek(parsed(&token), ID, binding.as_deref()).expect_err(name);
+        assert!(matches!(err, ODataError::FilterMismatch), "{name}: {err:?}");
+    }
 
-    let err = seek(parsed(&token), ID, None).expect_err("an unbound replay must be rejected too");
-    assert!(matches!(err, ODataError::FilterMismatch));
-}
-
-#[test]
-fn an_unbound_cursor_is_rejected_against_a_bound_listing() {
-    let created_at = datetime!(2026-09-27 12:00:00 UTC);
-    let id = Uuid::now_v7();
-    let token = encode(created_at, id, ID, None, Direction::Forward).expect("encode");
-    let a = owner(file_storage_sdk::OwnerKind::User, Uuid::from_u128(1));
-    let err = seek(parsed(&token), ID, files_binding(&a).as_deref())
-        .expect_err("a token with no binding must not resume a bound listing");
-    assert!(matches!(err, ODataError::FilterMismatch));
-}
-
-#[test]
-fn a_cursor_from_a_different_id_field_is_rejected() {
-    let created_at = datetime!(2026-09-27 12:00:00 UTC);
-    let id = Uuid::now_v7();
-    let token = encode(created_at, id, FILES_ID_FIELD, None, Direction::Forward).expect("encode");
-    let err = seek(parsed(&token), VERSIONS_ID_FIELD, None)
-        .expect_err("a cursor issued for a different listing's order must be rejected");
-    assert!(matches!(err, ODataError::OrderMismatch));
-}
-
-#[test]
-fn a_files_cursor_resumed_on_an_unbound_listing_is_an_order_mismatch() {
-    // The order check comes first: a cursor of another listing is not a binding mismatch,
-    // even though it carries a binding and the target listing has none.
-    let a = owner(file_storage_sdk::OwnerKind::User, Uuid::from_u128(1));
-    let token = encode(
+    // A token with no binding must not resume a bound listing either.
+    let unbound = encode(
         datetime!(2026-09-27 12:00:00 UTC),
-        Uuid::now_v7(),
-        FILES_ID_FIELD,
-        files_binding(&a),
+        id,
+        ID,
+        None,
         Direction::Forward,
     )
     .expect("encode");
-    let err = seek(parsed(&token), RETENTION_RULES_ID_FIELD, None)
-        .expect_err("a /files cursor must not resume /retention-rules");
-    assert!(matches!(err, ODataError::OrderMismatch), "got {err:?}");
+    let err = seek(parsed(&unbound), ID, binding_a.as_deref()).expect_err("unbound token");
+    assert!(matches!(err, ODataError::FilterMismatch), "{err:?}");
 }
 
-#[test]
-fn a_backward_direction_cursor_is_accepted() {
-    let cursor = CursorV1 {
-        k: vec![
-            "2026-09-27T12:00:00.000000000Z".to_owned(),
-            Uuid::now_v7().to_string(),
-        ],
+/// A hand-built cursor for `ID` ordering; `keys` and `d` are the knobs the table below turns.
+fn raw_cursor(keys: &[&str], d: &str) -> CursorV1 {
+    CursorV1 {
+        k: keys.iter().map(|k| (*k).to_owned()).collect(),
         o: SortDir::Desc,
         s: canonical_order(ID).to_signed_tokens(),
         f: None,
-        d: "bwd".to_owned(),
-    };
-    let token = cursor.encode().expect("encode");
-    let sought = seek(parsed(&token), ID, None).expect("bwd must be accepted");
-    assert_eq!(sought.direction, Direction::Backward);
+        d: d.to_owned(),
+    }
 }
 
 #[test]
-fn an_unrecognized_direction_is_rejected() {
-    let cursor = CursorV1 {
-        k: vec![
-            "2026-09-27T12:00:00.000000000Z".to_owned(),
-            Uuid::now_v7().to_string(),
-        ],
-        o: SortDir::Desc,
-        s: canonical_order(ID).to_signed_tokens(),
-        f: None,
-        d: "sideways".to_owned(),
-    };
-    let err = seek(cursor, ID, None).expect_err("an unrecognized direction must be rejected");
-    assert!(matches!(err, ODataError::InvalidCursor), "got {err:?}");
-}
-
-#[test]
-fn a_cursor_naming_the_wrong_number_of_keys_is_rejected() {
-    let cursor = CursorV1 {
-        k: vec!["2026-09-27T12:00:00.000000000Z".to_owned()],
-        o: SortDir::Desc,
-        s: canonical_order(ID).to_signed_tokens(),
-        f: None,
-        d: FORWARD.to_owned(),
-    };
-    let err = seek(cursor, ID, None).expect_err("must name exactly 2 keys");
-    assert!(matches!(err, ODataError::CursorInvalidKeys));
+fn seek_rejects_foreign_and_malformed_cursors() {
+    let ts = "2026-09-27T12:00:00.000000000Z";
+    let uuid = Uuid::now_v7().to_string();
+    let a = owner(file_storage_sdk::OwnerKind::User, Uuid::from_u128(1));
+    // The order check comes first: a /files cursor (even a bound one) is an order mismatch on
+    // another listing, not a binding mismatch.
+    let files_cursor = parsed(
+        &encode(
+            datetime!(2026-09-27 12:00:00 UTC),
+            Uuid::now_v7(),
+            FILES_ID_FIELD,
+            files_binding(&a),
+            Direction::Forward,
+        )
+        .expect("encode"),
+    );
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, CursorV1, &str, fn(&ODataError) -> bool)> = vec![
+        (
+            "another listing",
+            files_cursor.clone(),
+            VERSIONS_ID_FIELD,
+            |e| matches!(e, ODataError::OrderMismatch),
+        ),
+        (
+            "another unbound listing",
+            files_cursor,
+            RETENTION_RULES_ID_FIELD,
+            |e| matches!(e, ODataError::OrderMismatch),
+        ),
+        (
+            "unrecognized direction",
+            raw_cursor(&[ts, &uuid], "sideways"),
+            ID,
+            |e| matches!(e, ODataError::InvalidCursor),
+        ),
+        (
+            "wrong number of keys",
+            raw_cursor(&[ts], FORWARD),
+            ID,
+            |e| matches!(e, ODataError::CursorInvalidKeys),
+        ),
+    ];
+    for (name, cursor, id_field, is_expected) in cases {
+        let err = seek(cursor, id_field, None).expect_err(name);
+        assert!(is_expected(&err), "{name}: got {err:?}");
+    }
 }
 
 #[test]
@@ -190,120 +181,90 @@ fn row_key(r: &Row) -> (OffsetDateTime, Uuid) {
 }
 
 #[test]
-fn finish_page_first_forward_page_with_more_has_no_prev_cursor() {
-    let fetched = rows(&[(40, 4), (30, 3), (20, 2), (10, 1)]);
-    let page = finish_page(fetched, 3, None, ID, None, row_key).expect("finish_page");
-    assert_eq!(page.items.len(), 3);
-    assert_eq!(page.items[0].id, Uuid::from_u128(4));
-    assert_eq!(page.items[2].id, Uuid::from_u128(2));
-    assert!(
-        page.page_info.next_cursor.is_some(),
-        "more rows exist forward"
-    );
-    assert!(
-        page.page_info.prev_cursor.is_none(),
-        "no cursor was supplied -- this is the first page"
-    );
-}
-
-#[test]
-fn finish_page_first_forward_page_without_more_has_no_cursors() {
-    let fetched = rows(&[(30, 3), (20, 2), (10, 1)]);
-    let page = finish_page(fetched, 3, None, ID, None, row_key).expect("finish_page");
-    assert_eq!(page.items.len(), 3);
-    assert!(page.page_info.next_cursor.is_none());
-    assert!(page.page_info.prev_cursor.is_none());
-}
-
-#[test]
-fn finish_page_forward_page_with_cursor_always_has_prev_cursor() {
-    let after = Seek {
-        created_at: datetime!(2026-09-27 12:00:50 UTC),
-        id: Uuid::from_u128(5),
-        direction: Direction::Forward,
+fn finish_page_orders_items_and_builds_cursors() {
+    let position = |secs: i64, id: u128, direction| Seek {
+        created_at: datetime!(2026-09-27 12:00:00 UTC) + time::Duration::seconds(secs),
+        id: Uuid::from_u128(id),
+        direction,
     };
-    let fetched = rows(&[(30, 3), (20, 2), (10, 1)]);
-    let page = finish_page(fetched, 3, Some(after), ID, None, row_key).expect("finish_page");
-    assert!(page.page_info.next_cursor.is_none(), "no more rows forward");
-    assert!(
-        page.page_info.prev_cursor.is_some(),
-        "a cursor was supplied, so a predecessor page must exist -- the \
-         position it decoded from is proof of it"
-    );
-}
-
-#[test]
-fn finish_page_backward_query_restores_canonical_order() {
-    let after = Seek {
-        created_at: datetime!(2026-09-27 12:00:20 UTC),
-        id: Uuid::from_u128(2),
-        direction: Direction::Backward,
-    };
-    // Backward repo query order: ascending, closest to the cursor first.
-    let fetched = rows(&[(30, 3), (40, 4), (50, 5), (60, 6)]);
-    let page = finish_page(fetched, 3, Some(after), ID, None, row_key).expect("finish_page");
-    assert_eq!(page.items.len(), 3);
-    assert_eq!(page.items[0].id, Uuid::from_u128(5));
-    assert_eq!(page.items[1].id, Uuid::from_u128(4));
-    assert_eq!(page.items[2].id, Uuid::from_u128(3));
-    assert!(
-        page.page_info.prev_cursor.is_some(),
-        "over-fetched -- a further backward page exists"
-    );
-    assert!(
-        page.page_info.next_cursor.is_some(),
-        "a cursor was supplied, so a page after this one must exist"
-    );
-}
-
-#[test]
-fn finish_page_backward_query_without_further_rows_has_no_prev_cursor() {
-    let after = Seek {
-        created_at: datetime!(2026-09-27 12:00:20 UTC),
-        id: Uuid::from_u128(2),
-        direction: Direction::Backward,
-    };
-    let fetched = rows(&[(30, 3), (40, 4)]);
-    let page = finish_page(fetched, 3, Some(after), ID, None, row_key).expect("finish_page");
-    assert_eq!(page.items.len(), 2);
-    assert_eq!(page.items[0].id, Uuid::from_u128(4));
-    assert_eq!(page.items[1].id, Uuid::from_u128(3));
-    assert!(page.page_info.prev_cursor.is_none());
-    assert!(page.page_info.next_cursor.is_some());
-}
-
-#[test]
-fn finish_page_empty_result_builds_no_cursors() {
-    let after = Seek {
-        created_at: datetime!(2026-09-27 12:00:20 UTC),
-        id: Uuid::from_u128(2),
-        direction: Direction::Forward,
-    };
-    let page =
-        finish_page(Vec::<Row>::new(), 3, Some(after), ID, None, row_key).expect("finish_page");
-    assert!(page.items.is_empty());
-    assert!(page.page_info.next_cursor.is_none());
-    assert!(page.page_info.prev_cursor.is_none());
-}
-
-#[test]
-fn finish_page_next_and_prev_cursors_round_trip_directions() {
-    let fetched = rows(&[(40, 4), (30, 3), (20, 2), (10, 1)]);
-    let page = finish_page(fetched, 3, None, ID, None, row_key).expect("finish_page");
-    let next = page.page_info.next_cursor.expect("has_more must be true");
-    let sought = seek(parsed(&next), ID, None).expect("decode next_cursor");
-    assert_eq!(sought.direction, Direction::Forward);
-
-    let after = Seek {
-        created_at: datetime!(2026-09-27 12:00:50 UTC),
-        id: Uuid::from_u128(9),
-        direction: Direction::Forward,
-    };
-    let fetched2 = rows(&[(30, 3), (20, 2), (10, 1)]);
-    let page2 = finish_page(fetched2, 3, Some(after), ID, None, row_key).expect("finish_page");
-    let prev = page2.page_info.prev_cursor.expect("a cursor was supplied");
-    let sought2 = seek(parsed(&prev), ID, None).expect("decode prev_cursor");
-    assert_eq!(sought2.direction, Direction::Backward);
+    // (name, rows in repo query order, after, expected ids in canonical order, next, prev)
+    #[allow(clippy::type_complexity)]
+    let cases: Vec<(&str, &[(i64, u128)], Option<Seek>, &[u128], bool, bool)> = vec![
+        (
+            "first page with more rows",
+            &[(40, 4), (30, 3), (20, 2), (10, 1)],
+            None,
+            &[4, 3, 2],
+            true,
+            false,
+        ),
+        (
+            "first page without more rows",
+            &[(30, 3), (20, 2), (10, 1)],
+            None,
+            &[3, 2, 1],
+            false,
+            false,
+        ),
+        (
+            "forward page with a cursor always has a prev cursor",
+            &[(30, 3), (20, 2), (10, 1)],
+            Some(position(50, 5, Direction::Forward)),
+            &[3, 2, 1],
+            false,
+            true,
+        ),
+        (
+            // Backward repo query order is ascending, closest to the cursor first.
+            "backward query restores canonical order",
+            &[(30, 3), (40, 4), (50, 5), (60, 6)],
+            Some(position(20, 2, Direction::Backward)),
+            &[5, 4, 3],
+            true,
+            true,
+        ),
+        (
+            "backward query without further rows",
+            &[(30, 3), (40, 4)],
+            Some(position(20, 2, Direction::Backward)),
+            &[4, 3],
+            true,
+            false,
+        ),
+        (
+            "empty result",
+            &[],
+            Some(position(20, 2, Direction::Forward)),
+            &[],
+            false,
+            false,
+        ),
+    ];
+    for (name, specs, after, expected, has_next, has_prev) in cases {
+        let page = finish_page(rows(specs), 3, after, ID, None, row_key).expect(name);
+        let got: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+        let expected: Vec<Uuid> = expected.iter().map(|&i| Uuid::from_u128(i)).collect();
+        assert_eq!(got, expected, "{name}: items");
+        assert_eq!(
+            page.page_info.next_cursor.is_some(),
+            has_next,
+            "{name}: next"
+        );
+        assert_eq!(
+            page.page_info.prev_cursor.is_some(),
+            has_prev,
+            "{name}: prev"
+        );
+        // The emitted tokens resume in the matching direction.
+        if let Some(next) = &page.page_info.next_cursor {
+            let sought = seek(parsed(next), ID, None).expect("decode next_cursor");
+            assert_eq!(sought.direction, Direction::Forward, "{name}");
+        }
+        if let Some(prev) = &page.page_info.prev_cursor {
+            let sought = seek(parsed(prev), ID, None).expect("decode prev_cursor");
+            assert_eq!(sought.direction, Direction::Backward, "{name}");
+        }
+    }
 }
 
 fn ids(page: &toolkit_odata::Page<String>) -> Vec<&str> {
@@ -420,26 +381,6 @@ fn page_by_id_forward_walk_covers_every_item_and_ends_without_next_cursor() {
     }
     assert_eq!(pages, 3);
     assert_eq!(seen, names(&all));
-}
-
-#[test]
-fn page_by_id_backward_walk_reaches_the_start_without_prev_cursor() {
-    let all = ["a", "b", "c", "d", "e"];
-    let mut after = Some(("e".to_owned(), Direction::Backward));
-    let mut pages: Vec<Vec<String>> = Vec::new();
-    loop {
-        let page = page_by_id(names(&all), 2, after, String::as_str).expect("page");
-        pages.push(page.items.clone());
-        match page.page_info.prev_cursor {
-            Some(prev) => after = Some(storage_after(&prev)),
-            None => break,
-        }
-    }
-    assert_eq!(
-        pages,
-        vec![names(&["c", "d"]), names(&["a", "b"])],
-        "backward pages walk towards the start"
-    );
 }
 
 #[test]

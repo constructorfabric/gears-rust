@@ -71,53 +71,52 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn compute_request_hash_is_deterministic() {
-        let meta = vec![
-            ("a".to_owned(), "1".to_owned()),
-            ("b".to_owned(), "2".to_owned()),
-        ];
-        let h1 = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta);
-        let h2 = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta);
-        assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 32, "SHA-256 digest must be 32 bytes");
+    fn meta(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
     }
 
     #[test]
     fn compute_request_hash_is_order_independent_for_metadata() {
-        let meta_a = vec![
-            ("a".to_owned(), "1".to_owned()),
-            ("b".to_owned(), "2".to_owned()),
-        ];
-        let meta_b = vec![
-            ("b".to_owned(), "2".to_owned()),
-            ("a".to_owned(), "1".to_owned()),
-        ];
-        let h_a = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta_a);
-        let h_b = compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", &meta_b);
-        assert_eq!(h_a, h_b, "metadata order must not affect the hash");
-    }
-
-    #[test]
-    fn compute_request_hash_does_not_collide_across_field_boundaries() {
-        let h1 = compute_request_hash("user", Uuid::nil(), "ab", "c", "mime", &[]);
-        let h2 = compute_request_hash("user", Uuid::nil(), "a", "bc", "mime", &[]);
-        assert_ne!(h1, h2, "field-boundary shift must not collide");
-    }
-
-    #[test]
-    fn compute_request_hash_covers_owner_id_and_metadata_value() {
-        let meta = |value: &str| vec![("k".to_owned(), value.to_owned())];
-        let base =
-            compute_request_hash("user", Uuid::from_u128(1), "n", "gts", "mime", &meta("v1"));
-        let other_owner =
-            compute_request_hash("user", Uuid::from_u128(2), "n", "gts", "mime", &meta("v1"));
-        let other_value =
-            compute_request_hash("user", Uuid::from_u128(1), "n", "gts", "mime", &meta("v2"));
-        assert_ne!(base, other_owner, "owner_id must be covered by the hash");
-        assert_ne!(
-            base, other_value,
-            "metadata values must be covered by the hash"
+        let hash = |m: &[(String, String)]| {
+            compute_request_hash("user", Uuid::nil(), "n", "gts", "mime", m)
+        };
+        let ab = meta(&[("a", "1"), ("b", "2")]);
+        let ba = meta(&[("b", "2"), ("a", "1")]);
+        assert_eq!(hash(&ab), hash(&ab), "the hash must be deterministic");
+        assert_eq!(
+            hash(&ab),
+            hash(&ba),
+            "metadata order must not affect the hash"
         );
+    }
+
+    #[test]
+    fn compute_request_hash_covers_every_field_without_boundary_collisions() {
+        let u = Uuid::from_u128;
+        // (name, hash of a variant); every variant must differ from `base`.
+        let base = compute_request_hash("user", u(1), "n", "gts", "mime", &meta(&[("k", "v1")]));
+        for (name, variant) in [
+            (
+                "owner_id",
+                compute_request_hash("user", u(2), "n", "gts", "mime", &meta(&[("k", "v1")])),
+            ),
+            (
+                "metadata value",
+                compute_request_hash("user", u(1), "n", "gts", "mime", &meta(&[("k", "v2")])),
+            ),
+            (
+                "field boundary shift",
+                compute_request_hash("user", u(1), "n", "gts", "mime", &meta(&[("kv", "1")])),
+            ),
+            (
+                "name/gts boundary shift",
+                compute_request_hash("user", u(1), "ng", "ts", "mime", &meta(&[("k", "v1")])),
+            ),
+        ] {
+            assert_ne!(base, variant, "{name} must be covered by the hash");
+        }
     }
 }

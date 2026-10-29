@@ -1,140 +1,48 @@
 //! Usage accounting: bytes credited on finalize, debited on delete; a lifecycle nets to zero.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
-use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::Bytes;
-use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use file_storage::domain::cleanup::CleanupEngine;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::etag;
-use file_storage::domain::multipart::MultipartPlan;
-use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{AgeRetention, RetentionRuleBody, RetentionScope};
-use file_storage::domain::ports::MultipartStore;
-use file_storage::domain::service::FileService;
-use file_storage::infra::backend::StorageBackend;
 use file_storage::infra::content::hash;
-use file_storage::infra::external_clients::{UsageDelta, UsageReporter};
-use file_storage::infra::storage::Store;
-use file_storage_sdk::NewFile;
 
 mod common;
-use common::{StackBuilder, ctx};
-
-const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.usage_test.file.type.v1~");
-
-/// Capturing fake `UsageReporter`; records deltas in call order.
-#[derive(Default)]
-struct FakeUsageReporter {
-    deltas: tokio::sync::Mutex<Vec<UsageDelta>>,
-}
-
-impl FakeUsageReporter {
-    async fn snapshot(&self) -> Vec<UsageDelta> {
-        self.deltas.lock().await.clone()
-    }
-}
-
-#[async_trait]
-impl UsageReporter for FakeUsageReporter {
-    async fn report(&self, delta: UsageDelta) {
-        self.deltas.lock().await.push(delta);
-    }
-}
-
-/// `report_usage` is fire-and-forget, so poll briefly (bounded ~1s) for a captured delta.
-async fn wait_for_reports(fake: &FakeUsageReporter, at_least: usize) -> Vec<UsageDelta> {
-    for _ in 0..200 {
-        let snap = fake.snapshot().await;
-        if snap.len() >= at_least {
-            return snap;
-        }
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    fake.snapshot().await
-}
-
-/// Wires `FileService`, `MultipartService`, `DataPlaneService`, `Store` and `CleanupEngine`
-/// to one fake reporter.
-async fn build_all(
-    fake: Arc<FakeUsageReporter>,
-) -> (
-    Arc<FileService>,
-    Arc<MultipartService>,
-    DataPlaneService,
-    Store,
-    CleanupEngine,
-    Arc<dyn StorageBackend>,
-) {
-    let s = StackBuilder::new("usage-test")
-        .usage_reporter(fake)
-        .build()
-        .await;
-    (s.svc, s.msvc, s.dp, s.store, s.engine, s.backend)
-}
-
-fn new_file(owner: Uuid) -> NewFile {
-    NewFile {
-        gts_file_type: GTS.to_owned(),
-        ..common::new_file_for(owner, "usage.bin", "text/plain")
-    }
-}
-
-/// Drive initiate -> one part -> complete. Returns the part's size.
-async fn drive_multipart_upload(
-    msvc: &Arc<MultipartService>,
-    multipart_store: &Arc<dyn MultipartStore>,
-    backend: &Arc<dyn StorageBackend>,
-    ctx: &SecurityContext,
-    file_id: Uuid,
-    data: Bytes,
-) -> i64 {
-    let size = i64::try_from(data.len()).unwrap();
-    let plan: MultipartPlan = msvc
-        .initiate_multipart_upload(
-            ctx,
-            file_id,
-            "application/octet-stream",
-            data.len() as u64,
-            None,
-            false,
-        )
-        .await
-        .unwrap();
-    assert_eq!(plan.parts.len(), 1, "test payload must fit in one part");
-
-    common::put_part(multipart_store, backend, &plan, file_id, 1, data).await;
-    msvc.complete_multipart_upload(ctx, file_id, plan.upload_id, None)
-        .await
-        .unwrap();
-    size
-}
+use common::{FakeUsageReporter, Stack, StackBuilder, ctx};
 
 /// Finalize credits the version's bytes, through the direct `finalize_upload` path (data plane)
 /// and the token-authenticated `finalize_upload_by_token` path (builds `Claims`).
 #[tokio::test]
 async fn finalize_reports_positive_byte_delta() {
     for by_token in [false, true] {
-        let fake = Arc::new(FakeUsageReporter::default());
-        let (svc, _msvc, dp, _store, _engine, backend) = build_all(Arc::clone(&fake)).await;
+        let fake = FakeUsageReporter::new();
+        let Stack {
+            svc, dp, backend, ..
+        } = StackBuilder::new("usage-test")
+            .usage_reporter(fake.clone())
+            .build()
+            .await;
         let tenant = Uuid::now_v7();
         let owner = Uuid::now_v7();
         let ctx = ctx(tenant);
 
         let ticket = svc
-            .create_file(&ctx, new_file(owner), None, false)
+            .create_file(
+                &ctx,
+                common::new_file_for(owner, "usage.bin", "text/plain"),
+                None,
+                false,
+            )
             .await
             .unwrap();
 
         // `create_file` reports `+1 file / 0 bytes`, so finalize is the only byte credit.
-        let after_create = wait_for_reports(&fake, 1).await;
+        let after_create = fake.reports(1).await;
         assert_eq!(after_create.len(), 1, "by_token={by_token}");
         assert_eq!(after_create[0].bytes_delta, 0, "create must report 0 bytes");
         assert_eq!(after_create[0].file_count_delta, 1);
@@ -166,7 +74,7 @@ async fn finalize_reports_positive_byte_delta() {
             .unwrap();
         }
 
-        let after_finalize = wait_for_reports(&fake, 2).await;
+        let after_finalize = fake.reports(2).await;
         assert_eq!(
             after_finalize.len(),
             2,
@@ -185,31 +93,49 @@ async fn finalize_reports_positive_byte_delta() {
 
 #[tokio::test]
 async fn multipart_complete_reports_byte_delta() {
-    let fake = Arc::new(FakeUsageReporter::default());
-    let (svc, msvc, _dp, store, _engine, backend) = build_all(Arc::clone(&fake)).await;
-    let multipart_store: Arc<dyn MultipartStore> = Arc::new(store.clone());
+    let fake = FakeUsageReporter::new();
+    let Stack {
+        svc,
+        msvc,
+        multipart_store,
+        backend,
+        ..
+    } = StackBuilder::new("usage-test")
+        .usage_reporter(fake.clone())
+        .build()
+        .await;
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
     let ticket = svc
-        .create_file(&ctx, new_file(owner), None, false)
+        .create_file(
+            &ctx,
+            common::new_file_for(owner, "usage.bin", "text/plain"),
+            None,
+            false,
+        )
         .await
         .unwrap();
-    wait_for_reports(&fake, 1).await;
+    fake.reports(1).await;
 
-    let data = Bytes::from_static(b"multipart assembled payload bytes for usage credit");
-    let size = drive_multipart_upload(
+    let data: &'static [u8] = b"multipart assembled payload bytes for usage credit";
+    let size = i64::try_from(data.len()).unwrap();
+    let plan = common::session_with_part(
         &msvc,
         &multipart_store,
         &backend,
         &ctx,
         ticket.file_id,
         data,
+        false,
     )
     .await;
+    msvc.complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
+        .await
+        .unwrap();
 
-    let deltas = wait_for_reports(&fake, 2).await;
+    let deltas = fake.reports(2).await;
     assert_eq!(
         deltas.len(),
         2,
@@ -225,25 +151,47 @@ async fn multipart_complete_reports_byte_delta() {
     assert_eq!(credit.owner_id, owner);
 }
 
-#[tokio::test]
-async fn delete_version_reports_negative_byte_delta() {
-    let fake = Arc::new(FakeUsageReporter::default());
-    let (svc, _msvc, dp, _store, _engine, _backend) = build_all(Arc::clone(&fake)).await;
-    let tenant = Uuid::now_v7();
-    let owner = Uuid::now_v7();
+/// A file whose first version (`V1_PAYLOAD`) is bound, then a second one bound over it, so `v1` is
+/// deletable. Waits for the three reports so far: create, finalize v1, finalize v2 (`bind`
+/// reports nothing).
+struct TwoVersions {
+    fake: Arc<FakeUsageReporter>,
+    stack: Stack,
+    ctx: SecurityContext,
+    tenant: Uuid,
+    owner: Uuid,
+    file_id: Uuid,
+    v1: Uuid,
+}
+
+const V1_PAYLOAD: &[u8] = b"version one payload";
+const V2_PAYLOAD: &[u8] = b"version two payload, a bit longer";
+
+async fn file_with_two_bound_versions() -> TwoVersions {
+    let fake = FakeUsageReporter::new();
+    let stack = StackBuilder::new("usage-test")
+        .usage_reporter(fake.clone())
+        .build()
+        .await;
+    let (tenant, owner) = (Uuid::now_v7(), Uuid::now_v7());
     let ctx = ctx(tenant);
+    let (svc, dp) = (&stack.svc, &stack.dp);
 
     let ticket = svc
-        .create_file(&ctx, new_file(owner), None, false)
+        .create_file(
+            &ctx,
+            common::new_file_for(owner, "usage.bin", "text/plain"),
+            None,
+            false,
+        )
         .await
         .unwrap();
-    let v1_payload = Bytes::from_static(b"version one payload");
     dp.put_content(
         &ctx,
         ticket.file_id,
         ticket.version_id,
         "text/plain",
-        v1_payload.clone(),
+        Bytes::from_static(V1_PAYLOAD),
     )
     .await
     .unwrap();
@@ -251,48 +199,73 @@ async fn delete_version_reports_negative_byte_delta() {
         .await
         .unwrap();
 
-    // Second version bound as current, so v1 is deletable.
     let v2 = svc.presign_version(&ctx, ticket.file_id).await.unwrap();
     dp.put_content(
         &ctx,
         v2.file_id,
         v2.version_id,
         "text/plain",
-        Bytes::from_static(b"version two payload, a bit longer"),
+        Bytes::from_static(V2_PAYLOAD),
     )
     .await
     .unwrap();
-    let file_before_rebind = svc.get_file(&ctx, ticket.file_id).await.unwrap();
-    let if_match = etag::etag_for(&file_before_rebind);
-    svc.bind(&ctx, ticket.file_id, v2.version_id, if_match.as_deref())
+    let file = svc.get_file(&ctx, ticket.file_id).await.unwrap();
+    svc.bind(
+        &ctx,
+        ticket.file_id,
+        v2.version_id,
+        etag::etag_for(&file).as_deref(),
+    )
+    .await
+    .unwrap();
+    fake.reports(3).await;
+
+    TwoVersions {
+        fake,
+        stack,
+        ctx,
+        tenant,
+        owner,
+        file_id: ticket.file_id,
+        v1: ticket.version_id,
+    }
+}
+
+#[tokio::test]
+async fn delete_version_reports_negative_byte_delta() {
+    let t = file_with_two_bound_versions().await;
+
+    t.stack
+        .svc
+        .delete_version(&t.ctx, t.file_id, t.v1)
         .await
         .unwrap();
 
-    // Reports: create, finalize v1, finalize v2 = 3 (`bind` reports nothing).
-    wait_for_reports(&fake, 3).await;
-
-    svc.delete_version(&ctx, ticket.file_id, ticket.version_id)
-        .await
-        .unwrap();
-
-    let deltas = wait_for_reports(&fake, 4).await;
+    let deltas = t.fake.reports(4).await;
     assert_eq!(deltas.len(), 4, "delete_version must add exactly one debit");
     let debit = &deltas[3];
-    assert_eq!(debit.bytes_delta, -i64::try_from(v1_payload.len()).unwrap());
+    assert_eq!(debit.bytes_delta, -i64::try_from(V1_PAYLOAD.len()).unwrap());
     assert_eq!(
         debit.file_count_delta, 0,
-        "the file itself still exists -- only the version's bytes are debited"
+        "the file itself still exists: only the version's bytes are debited"
     );
-    assert_eq!(debit.tenant_id, tenant);
-    assert_eq!(debit.owner_id, owner);
+    assert_eq!(debit.tenant_id, t.tenant);
+    assert_eq!(debit.owner_id, t.owner);
+}
 
-    // Deleting the file debits the rest: the whole create -> upload -> delete lifecycle nets to zero.
-    let file = svc.get_file(&ctx, ticket.file_id).await.unwrap();
-    svc.delete_file(&ctx, ticket.file_id, etag::etag_for(&file).as_deref())
+/// Deleting the file debits everything left, so create -> uploads -> delete nets to zero.
+#[tokio::test]
+async fn delete_file_debits_the_rest_so_a_lifecycle_nets_to_zero() {
+    let t = file_with_two_bound_versions().await;
+    let svc = &t.stack.svc;
+
+    let file = svc.get_file(&t.ctx, t.file_id).await.unwrap();
+    svc.delete_file(&t.ctx, t.file_id, etag::etag_for(&file).as_deref())
         .await
         .unwrap();
-    let deltas = wait_for_reports(&fake, 5).await;
-    assert_eq!(deltas.len(), 5, "delete_file must add exactly one debit");
+
+    let deltas = t.fake.reports(4).await;
+    assert_eq!(deltas.len(), 4, "delete_file must add exactly one debit");
     let bytes_sum: i64 = deltas.iter().map(|d| d.bytes_delta).sum();
     let files_sum: i64 = deltas.iter().map(|d| d.file_count_delta).sum();
     assert_eq!(
@@ -307,14 +280,28 @@ async fn delete_version_reports_negative_byte_delta() {
 
 #[tokio::test]
 async fn sweep_reports_deltas_for_deleted_files() {
-    let fake = Arc::new(FakeUsageReporter::default());
-    let (svc, _msvc, dp, store, engine, _backend) = build_all(Arc::clone(&fake)).await;
+    let fake = FakeUsageReporter::new();
+    let Stack {
+        svc,
+        dp,
+        store,
+        engine,
+        ..
+    } = StackBuilder::new("usage-test")
+        .usage_reporter(fake.clone())
+        .build()
+        .await;
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
     let ctx = ctx(tenant);
 
     let ticket = svc
-        .create_file(&ctx, new_file(owner), None, false)
+        .create_file(
+            &ctx,
+            common::new_file_for(owner, "usage.bin", "text/plain"),
+            None,
+            false,
+        )
         .await
         .unwrap();
     let payload = Bytes::from_static(b"retention-swept payload");
@@ -331,7 +318,7 @@ async fn sweep_reports_deltas_for_deleted_files() {
         .await
         .unwrap();
 
-    wait_for_reports(&fake, 2).await;
+    fake.reports(2).await;
 
     // Tenant-wide age rule with max_age_days = 0 expires immediately.
     store
@@ -356,7 +343,7 @@ async fn sweep_reports_deltas_for_deleted_files() {
         "sweep must delete the retention-expired file"
     );
 
-    let deltas = wait_for_reports(&fake, 3).await;
+    let deltas = fake.reports(3).await;
     assert_eq!(
         deltas.len(),
         3,

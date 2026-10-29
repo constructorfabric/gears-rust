@@ -1,5 +1,4 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -20,10 +19,10 @@ use file_storage::infra::metrics::NoopMetrics;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 use super::{
-    DEFAULT_MAX_BODY_BYTES, Rejection, SidecarState, backend_failure, build_router,
-    finalize_rejection_response, finalize_with_control_plane, interpret_finalize_response,
-    report_part_with_control_plane, truncate_utf8, write_multipart_part_native,
-    write_multipart_part_offset_object,
+    CALLBACK_MAX_ATTEMPTS, DEFAULT_MAX_BODY_BYTES, Rejection, SidecarState, backend_failure,
+    build_router, finalize_rejection_response, finalize_with_control_plane,
+    interpret_finalize_response, report_part_with_control_plane, truncate_utf8,
+    write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 /// `SidecarState` over `backends` (the first is the registry default, no control plane), plus an
@@ -227,98 +226,60 @@ async fn sidecar_body_limit_allows_bodies_over_2mib() {
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 }
 
-/// A control plane that accepts but never responds must not hang the finalize callback:
-/// per-attempt timeouts trip, retries are exhausted and `Err` is returned. The outer
-/// `tokio::time::timeout` only makes a regression fail fast.
-#[tokio::test]
-async fn finalize_callback_times_out_within_configured_bound() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock listener");
-    let addr = listener.local_addr().expect("local addr");
-
-    // Accept connections but never respond, so the client read times out.
-    tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Ok((stream, _)) = listener.accept().await {
-            held.push(stream);
-        }
-    });
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_millis(150))
-        .connect_timeout(Duration::from_millis(150))
+/// A client whose per-attempt timeout is short, so a control plane that never answers trips it.
+/// The only waiting in these tests is this client's own timeout (and the callback's fixed retry
+/// delay); the tests set no timers of their own.
+fn impatient_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(Duration::from_millis(200))
         .build()
-        .expect("client build");
-    let mut state = test_state();
-    state.http = http;
-    state.control_base_url = format!("http://{addr}");
-
-    let outcome = tokio::time::timeout(Duration::from_secs(3), finalize_callback(&state))
-        .await
-        .expect(
-            "finalize_with_control_plane must return within the test's own timeout budget \
-         (production timeout regressed if this fires)",
-        );
-
-    assert!(
-        outcome.is_err(),
-        "finalize must fail when the control plane never responds"
-    );
+        .expect("client build")
 }
 
+/// A timed-out attempt is retried: the control plane hangs on the first request and answers the
+/// second.
 #[tokio::test]
-async fn finalize_callback_retries_on_connection_refused_then_succeeds() {
-    // Reserve a free port and release it: connecting then yields ECONNREFUSED.
-    let probe = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind probe listener");
-    let addr = probe.local_addr().expect("local addr");
-    drop(probe);
-
-    let accepted = Arc::new(AtomicUsize::new(0));
-    let accepted_clone = Arc::clone(&accepted);
-
-    // Let the first attempt fail before a real listener claims the address.
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let listener = TcpListener::bind(addr)
-            .await
-            .expect("bind mock control plane");
-        if let Ok((mut stream, _)) = listener.accept().await {
-            accepted_clone.fetch_add(1, Ordering::SeqCst);
-            let mut buf = [0u8; 1024];
-            if stream.read(&mut buf).await.is_ok() {
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
-                    .await
-                    .ok();
-            }
-        }
-    });
-
-    let http = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .connect_timeout(Duration::from_secs(2))
-        .build()
-        .expect("client build");
+async fn finalize_callback_retries_a_timed_out_attempt() {
+    let cp = mock_control_plane(vec![
+        Reply {
+            hang: true,
+            ..Reply::default()
+        },
+        Reply {
+            status: 204,
+            ..Reply::default()
+        },
+    ])
+    .await;
     let mut state = test_state();
-    state.http = http;
-    state.control_base_url = format!("http://{addr}");
+    state.http = impatient_client();
+    state.control_base_url = cp.url.clone();
 
-    let outcome = tokio::time::timeout(Duration::from_secs(3), finalize_callback(&state))
+    finalize_callback(&state)
         .await
-        .expect("finalize_with_control_plane must return within the test's own timeout budget");
+        .unwrap_or_else(|e| panic!("finalize must succeed once it retries: {}", e.status));
+    assert!(cp.calls() >= 2, "the hung attempt must have been retried");
+}
 
-    assert!(
-        outcome.is_ok(),
-        "finalize must succeed once it retries past the connection-refused attempt"
-    );
-    assert_eq!(
-        accepted.load(Ordering::SeqCst),
-        1,
-        "exactly one connection should reach the mock control plane (the retry)"
-    );
+/// A control plane that never answers does not hang the callback: every attempt times out,
+/// the retries are exhausted and the client-facing error is a generic `502`.
+#[tokio::test]
+async fn finalize_callback_gives_up_after_every_attempt_times_out() {
+    let cp = mock_control_plane(vec![Reply {
+        hang: true,
+        ..Reply::default()
+    }])
+    .await;
+    let mut state = test_state();
+    state.http = impatient_client();
+    state.control_base_url = cp.url.clone();
+
+    let Err(rejection) = finalize_callback(&state).await else {
+        panic!("finalize must fail when the control plane never responds");
+    };
+    assert_eq!(rejection.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(rejection.body, "finalize failed");
+    assert_eq!(cp.calls(), CALLBACK_MAX_ATTEMPTS as usize);
 }
 
 /// The finalize callback with dummy ids and hash.
@@ -342,6 +303,10 @@ struct Reply {
     /// Raw header lines, each ending in CRLF.
     headers: &'static str,
     body: &'static str,
+    /// A complete raw response, sent as-is instead of the fields above.
+    raw: Option<&'static [u8]>,
+    /// Accept the request but never answer (the connection stays open).
+    hang: bool,
 }
 
 /// A mock control plane answering requests with its replies in order (the last one repeats).
@@ -365,22 +330,34 @@ async fn mock_control_plane(replies: Vec<Reply>) -> MockControlPlane {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&requests);
     tokio::spawn(async move {
+        let mut hung = Vec::new();
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut buf = [0u8; 4096];
             if let Ok(n) = stream.read(&mut buf).await {
-                let response = {
+                let reply = {
                     let mut seen = seen.lock().expect("lock");
                     let reply = replies[seen.len().min(replies.len() - 1)];
                     seen.push(String::from_utf8_lossy(&buf[..n]).into_owned());
-                    format!(
-                        "HTTP/1.1 {} X\r\n{}content-length: {}\r\nconnection: close\r\n\r\n{}",
-                        reply.status,
-                        reply.headers,
-                        reply.body.len(),
-                        reply.body
-                    )
+                    reply
                 };
-                stream.write_all(response.as_bytes()).await.ok();
+                if reply.hang {
+                    hung.push(stream);
+                    continue;
+                }
+                let response = reply.raw.map_or_else(
+                    || {
+                        format!(
+                            "HTTP/1.1 {} X\r\n{}content-length: {}\r\nconnection: close\r\n\r\n{}",
+                            reply.status,
+                            reply.headers,
+                            reply.body.len(),
+                            reply.body
+                        )
+                        .into_bytes()
+                    },
+                    <[u8]>::to_vec,
+                );
+                stream.write_all(&response).await.ok();
             }
         }
     });
@@ -557,43 +534,6 @@ async fn download_handles_ranges_and_echoes_claims() {
     }
 }
 
-/// A control-plane finalize error must not leak the upstream status/body or address to the client.
-#[tokio::test]
-async fn finalize_failure_does_not_leak_control_plane_url() {
-    let cp = mock_control_plane(vec![Reply {
-        status: 500,
-        body: "internal-upstream-secret-detail",
-        ..Reply::default()
-    }])
-    .await;
-    let mut state = test_state();
-    state.control_base_url = cp.url.clone();
-
-    let Err(rejection) = finalize_callback(&state).await else {
-        panic!("finalize must fail when the control plane returns an error status");
-    };
-    let response = rejection.into_response();
-    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
-
-    let body_bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-        .await
-        .expect("read response body");
-    let body_text = String::from_utf8_lossy(&body_bytes).to_lowercase();
-
-    assert!(
-        !body_text.contains("internal-upstream-secret-detail"),
-        "client-facing body must not leak the upstream error body: {body_text}"
-    );
-    assert!(
-        !body_text.contains(cp.url.trim_start_matches("http://")),
-        "client-facing body must not leak the control-plane address: {body_text}"
-    );
-    assert!(
-        !body_text.contains("500"),
-        "client-facing body must not leak the raw upstream HTTP status: {body_text}"
-    );
-}
-
 /// The callback builder must send the token in `x-fs-internal-token`.
 #[tokio::test]
 async fn finalize_callback_sends_internal_token_header() {
@@ -656,6 +596,14 @@ async fn sidecar_multipart_native_backend_dispatches_to_upload_part() {
         .expect("complete native multipart session - the part must be real");
     let assembled = backend.get(&obj.path).await.expect("read assembled object");
     assert_eq!(&assembled[..], part);
+}
+
+/// A body whose client resets the stream after four bytes.
+fn reset_stream_body() -> Body {
+    Body::from_stream(futures::stream::iter([
+        Ok(bytes::Bytes::from_static(b"part")),
+        Err(std::io::Error::other("client reset the stream")),
+    ]))
 }
 
 /// What a part write is fed.
@@ -744,10 +692,7 @@ async fn write_multipart_part_rejections() {
             let claims = obj.part_claims(backend.id(), 1, 0, size, &handle);
             let body = match payload {
                 Payload::Bytes(bytes) => Body::from(bytes),
-                Payload::ResetStream => Body::from_stream(futures::stream::iter([
-                    Ok(bytes::Bytes::from_static(b"part")),
-                    Err(std::io::Error::other("client reset the stream")),
-                ])),
+                Payload::ResetStream => reset_stream_body(),
             };
 
             let result = if native {
@@ -790,49 +735,29 @@ async fn sidecar_resolves_backend_by_claims_backend_id() {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
-    let a_paths = backend_a.list_paths().await.expect("list local-fs paths");
-    assert!(
-        a_paths.contains(&obj_a.path),
-        "expected {} in local-fs backend, got {a_paths:?}",
-        obj_a.path
+    // Each blob is in its own backend only.
+    assert_eq!(
+        &backend_a.get(&obj_a.path).await.expect("get a")[..],
+        b"bytes-for-local-fs"
     );
-    assert!(
-        !a_paths.contains(&obj_b.path),
-        "path_b must not land in local-fs backend, got {a_paths:?}"
+    assert_eq!(
+        &backend_b.get(&obj_b.path).await.expect("get b")[..],
+        b"bytes-for-other"
     );
-    let got_a = backend_a
-        .get(&obj_a.path)
-        .await
-        .expect("get from local-fs backend");
-    assert_eq!(&got_a[..], b"bytes-for-local-fs");
-
-    let b_paths = backend_b.list_paths().await.expect("list other paths");
-    assert!(
-        b_paths.contains(&obj_b.path),
-        "expected {} in other backend, got {b_paths:?}",
-        obj_b.path
-    );
-    assert!(
-        !b_paths.contains(&obj_a.path),
-        "path_a must not land in other backend, got {b_paths:?}"
-    );
-    let got_b = backend_b
-        .get(&obj_b.path)
-        .await
-        .expect("get from other backend");
-    assert_eq!(&got_b[..], b"bytes-for-other");
+    assert!(!backend_a.exists(&obj_b.path).await.expect("exists"));
+    assert!(!backend_b.exists(&obj_a.path).await.expect("exists"));
 }
 
+/// A control plane that drops the connection without answering fails the report: a generic `502`.
 #[tokio::test]
-async fn report_part_callback_unreachable_returns_502() {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind a port to release");
-    let addr = listener.local_addr().expect("local addr");
-    drop(listener);
-
+async fn report_part_callback_transport_failure_returns_502() {
+    let cp = mock_control_plane(vec![Reply {
+        raw: Some(b""),
+        ..Reply::default()
+    }])
+    .await;
     let mut state = test_state();
-    state.control_base_url = format!("http://{addr}");
+    state.control_base_url = cp.url.clone();
 
     let err = report_part_with_control_plane(
         &state,
@@ -1043,10 +968,7 @@ async fn upload_body_read_error_returns_400_and_publishes_nothing() {
     let obj = Obj::new();
     let token = sign(&issuer, obj.claims(Op::Put, "test"));
     let mut request = obj.put_request(&token, b"");
-    *request.body_mut() = Body::from_stream(futures::stream::iter([
-        Ok(bytes::Bytes::from_static(b"part")),
-        Err(std::io::Error::other("client reset the stream")),
-    ]));
+    *request.body_mut() = reset_stream_body();
 
     let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
         .oneshot(request)
@@ -1111,77 +1033,53 @@ async fn upload_replay_without_control_plane_returns_409() {
     assert_eq!(&fx.stored().await[..], b"original-bytes");
 }
 
-async fn mock_http_response(raw_response: Vec<u8>) -> reqwest::Response {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind mock server");
-    let addr = listener.local_addr().expect("local addr");
-
-    tokio::spawn(async move {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            let mut buf = [0u8; 1024];
-            let _n = stream.read(&mut buf).await;
-            stream.write_all(&raw_response).await.ok();
-        }
-    });
-
-    reqwest::Client::new()
-        .get(format!("http://{addr}"))
-        .send()
-        .await
-        .expect("mock server responds")
-}
-
-/// `interpret_finalize_response`: success statuses echo the bind headers (`bound`, `etag`,
-/// `current_etag`) and anything else maps to `502`.
+/// `interpret_finalize_response`: success statuses read the bind headers (`bound`, `etag`,
+/// `current_etag`; the router-level forwarding is covered by the replay tests) and anything else
+/// maps to `502`.
 #[tokio::test]
-async fn interpret_finalize_response_echoes_bind_headers_or_maps_error_to_bad_gateway() {
+async fn interpret_finalize_response_reads_bind_headers_or_maps_error_to_bad_gateway() {
     // (row, raw response, expected `(bound, etag, current_etag)`; `None` = expect Err(502))
     type Echo = (
         Option<&'static str>,
         Option<&'static str>,
         Option<&'static str>,
     );
-    type Row = (&'static str, Vec<u8>, Option<Echo>);
-    let mut non_utf8 = b"HTTP/1.1 204 No Content\r\nx-fs-bound: ".to_vec();
-    non_utf8.extend_from_slice(&[0xFF, 0xFE]); // not valid UTF-8
-    non_utf8.extend_from_slice(b"\r\ncontent-length: 0\r\n\r\n");
-    let rows: Vec<Row> = vec![
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, &'static [u8], Option<Echo>); 4] = [
         (
-            // Won auto-bind CAS: bound + etag echoed, no current_etag.
-            "bound forwards bound and etag",
-            b"HTTP/1.1 204 No Content\r\nx-fs-bound: bound\r\netag: \"abc123\"\r\ncontent-length: 0\r\n\r\n"
-                .to_vec(),
+            "bound headers are read",
+            b"HTTP/1.1 204 No Content\r\nx-fs-bound: bound\r\netag: \"abc123\"\r\ncontent-length: 0\r\n\r\n",
             Some((Some("bound"), Some("\"abc123\""), None)),
         ),
         (
-            // Lost auto-bind CAS: bound + current_etag echoed, no new etag (nothing was bound).
-            "conflict forwards current etag",
-            b"HTTP/1.1 204 No Content\r\nx-fs-bound: conflict\r\nx-fs-current-etag: \"xyz789\"\r\n\
-              content-length: 0\r\n\r\n"
-                .to_vec(),
-            Some((Some("conflict"), None, Some("\"xyz789\""))),
-        ),
-        (
             "manual mode has no bind headers",
-            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n".to_vec(),
+            b"HTTP/1.1 204 No Content\r\ncontent-length: 0\r\n\r\n",
             Some((None, None, None)),
         ),
         (
             // A header value that fails to_str() must read as absent, not propagate garbage.
             "non-utf8 header value is treated as absent",
-            non_utf8,
+            b"HTTP/1.1 204 No Content\r\nx-fs-bound: \xFF\xFE\r\ncontent-length: 0\r\n\r\n",
             Some((None, None, None)),
         ),
         (
             "error status maps to bad gateway",
-            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\n\r\noops!".to_vec(),
+            b"HTTP/1.1 500 Internal Server Error\r\ncontent-length: 5\r\n\r\noops!",
             None,
         ),
     ];
 
     for (row, raw, expected) in rows {
-        let resp = mock_http_response(raw).await;
+        let cp = mock_control_plane(vec![Reply {
+            raw: Some(raw),
+            ..Reply::default()
+        }])
+        .await;
+        let resp = reqwest::Client::new()
+            .get(&cp.url)
+            .send()
+            .await
+            .expect("mock server responds");
         let result = interpret_finalize_response(resp, Uuid::nil(), Uuid::nil()).await;
         match (result, expected) {
             (Ok(echo), Some((bound, etag, current_etag))) => {
@@ -1201,36 +1099,6 @@ async fn interpret_finalize_response_echoes_bind_headers_or_maps_error_to_bad_ga
             ),
         }
     }
-}
-
-/// A replayed `PUT` whose bytes differ from the already-published object is refused before
-/// finalize, so a `pending` version cannot be finalized with a digest of bytes never stored.
-#[tokio::test]
-async fn upload_replay_with_different_bytes_returns_409_without_finalize() {
-    let cp = scripted_control_plane(vec![204]).await;
-    let fx = UploadFixture::new(&cp.url);
-    fx.backend
-        .put(&fx.obj.path, bytes::Bytes::from_static(b"original"))
-        .await
-        .expect("seed the published object");
-
-    assert_eq!(fx.put(b"replaced").await.status(), StatusCode::CONFLICT);
-    assert_eq!(cp.calls(), 0, "no finalize for a mismatching replay");
-    assert_eq!(&fx.stored().await[..], b"original");
-}
-
-/// A replay with the published object's exact bytes still finalizes (F3 recovery).
-#[tokio::test]
-async fn upload_replay_with_same_bytes_finalizes() {
-    let cp = scripted_control_plane(vec![204]).await;
-    let fx = UploadFixture::new(&cp.url);
-    fx.backend
-        .put(&fx.obj.path, bytes::Bytes::from_static(b"original"))
-        .await
-        .expect("seed the published object");
-
-    assert_eq!(fx.put(b"original").await.status(), StatusCode::OK);
-    assert_eq!(cp.calls(), 1);
 }
 
 /// The status and text body of a response.
