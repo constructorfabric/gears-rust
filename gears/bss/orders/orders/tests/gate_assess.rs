@@ -396,7 +396,7 @@ fn input_for(op: Operation, lines: Vec<BasketLine>) -> AssessmentInput {
 fn two_lines() -> Vec<BasketLine> {
     vec![
         basket_line(1, vec![sel(ITEM, None, "1")]),
-        basket_line(2, vec![sel(ITEM, None, "2"), sel(ITEM_B, Some("x"), "0.5")]),
+        basket_line(2, vec![sel(ITEM, None, "2"), sel(ITEM_B, Some("x"), "2")]),
     ]
 }
 fn base(op: Operation) -> AssessmentInput {
@@ -1631,7 +1631,7 @@ fn mixed() -> AssessmentInput {
     let lines = vec![
         basket_line(1, vec![sel(ITEM, None, "1"), sel(ITEM_B, Some("x"), "1.0")]),
         basket_line(2, vec![sel(ITEM, None, "2")]),
-        basket_line(3, vec![sel(ITEM_B, Some("x"), "3"), sel(ITEM, None, "0")]),
+        basket_line(3, vec![sel(ITEM_B, Some("x"), "0"), sel(ITEM, None, "0")]),
         basket_line(4, vec![sel(ITEM, None, "4")]),
     ];
     let mut i = input_for(Operation::Submit, lines);

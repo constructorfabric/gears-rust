@@ -1648,3 +1648,45 @@ fn a_policy_version_that_is_not_a_canonical_positive_integer_is_malformed() {
         );
     }
 }
+
+/// R5 (OQ-C2, D-231 item 12, D-227 item 4): a bundle line whose items state different quantities
+/// is an unsupported purchase shape: `reference-unresolvable` at assessment on every
+/// operation, never a 500 at submit. Each quantity alone passes the floor.
+#[test]
+fn a_bundle_line_with_mixed_item_quantities_refuses_reference_unresolvable() {
+    for operation in [Operation::Preview, Operation::Submit] {
+        let mut line = two_lines().remove(0);
+        line.catalog.items[1].quantity = "2".into();
+        let b = basket(operation, vec![line]);
+        let out = assess(&assemble(&b, answered(&b))).unwrap();
+        let find = |p: PredicateId| {
+            out.vector
+                .outcomes()
+                .iter()
+                .find(|r| r.key.predicate == p)
+                .unwrap()
+                .clone()
+        };
+        let reference = find(PredicateId::ReferenceResolution);
+        assert_eq!(reference.verdict, Verdict::Failed, "{operation:?}");
+        assert_eq!(
+            reference.reason.map(bss_orders_sdk::catalog::Reason::token),
+            Some("reference-unresolvable")
+        );
+        assert_eq!(
+            reference
+                .upstream_detail
+                .as_ref()
+                .and_then(|d| d.upstream_code.as_deref()),
+            Some("mixed-item-quantities")
+        );
+        assert_eq!(find(PredicateId::QuantityFloor).verdict, Verdict::Passed);
+    }
+    // Equal values in different canonical spellings cannot occur (the floor requires
+    // canonical text), and one quantity on every item still passes.
+    let b = basket(Operation::Submit, vec![two_lines().remove(0)]);
+    let out = assess(&assemble(&b, answered(&b))).unwrap();
+    assert!(out.vector.outcomes().iter().any(|r| r.key.predicate
+        == PredicateId::ReferenceResolution
+        && r.verdict == Verdict::Passed));
+}

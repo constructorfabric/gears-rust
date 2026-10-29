@@ -187,6 +187,10 @@ fn unevaluable_with(r: Reason, upstream_code: &str) -> Eval {
 }
 /// The upstream code of a basket line whose catalog request names another line.
 const LINE_ID_MISMATCH: &str = "basket-line-id-mismatch";
+
+/// The upstream code of a bundle line whose items state different quantities (D-192: one exact
+/// quantity per line; D-227 item 4: an unsupported shape refuses `reference-unresolvable`).
+const MIXED_ITEM_QUANTITIES: &str = "mixed-item-quantities";
 /// The predicates the D-189 assessment answers (Task 6a Amendment A).
 const ASSESSED: [P; 4] = [
     P::CatalogRevisionAvailable,
@@ -381,14 +385,19 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
     })
 }
 
-/// One line's catalog mapping. A line whose request names another line is never repaired: its
-/// rows stay keyed by `line.line_id` so the vector stays complete, but `ReferenceResolution`
-/// fails with `reference-unresolvable` and the pin carries that reason (a programming error).
+/// One line's catalog mapping. A line whose request names another line, or whose items state
+/// different quantities (an unsupported purchase shape, D-192/D-227 item 4), is never repaired:
+/// its rows stay keyed by `line.line_id` so the vector stays complete, but `ReferenceResolution`
+/// fails with `reference-unresolvable` and the pin carries that reason.
 fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date) -> LineCatalog {
     let id = line.line_id;
-    if line.catalog.line_id == id {
+    let code = if line.catalog.line_id != id {
+        LINE_ID_MISMATCH
+    } else if mixed_quantities(&line.catalog) {
+        MIXED_ITEM_QUANTITIES
+    } else {
         return map_line(&line.catalog, answer, resolve_date);
-    }
+    };
     let keyed = LineCatalogRequest {
         line_id: id,
         ..line.catalog.clone()
@@ -400,13 +409,25 @@ fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date
             o.verdict = Verdict::Failed;
             o.reason = Some(r);
             o.upstream_detail = Some(UpstreamDetail {
-                upstream_code: Some(LINE_ID_MISMATCH.to_owned()),
+                upstream_code: Some(code.to_owned()),
                 ..UpstreamDetail::default()
             });
         }
     }
     mapped.pin = PinOutcome::Unevaluable(r);
     mapped
+}
+
+/// Whether the line's items state more than one quantity value. Text that does not parse is the
+/// quantity floor's to fail, not this rule's.
+fn mixed_quantities(request: &LineCatalogRequest) -> bool {
+    request
+        .items
+        .iter()
+        .filter_map(|i| bss_money::parse_decimal(&i.quantity).ok())
+        .collect::<BTreeSet<_>>()
+        .len()
+        > 1
 }
 
 /// The ports that did not answer. A Pricing port is down when it did not answer for any basket

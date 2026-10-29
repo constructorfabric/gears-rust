@@ -378,7 +378,7 @@ fn input_for(op: Operation, lines: Vec<BasketLine>) -> AssessmentInput {
 fn two_lines() -> Vec<BasketLine> {
     vec![
         basket_line(1, vec![sel(ITEM, None, "1")]),
-        basket_line(2, vec![sel(ITEM, None, "2"), sel(ITEM_B, Some("x"), "0.5")]),
+        basket_line(2, vec![sel(ITEM, None, "2"), sel(ITEM_B, Some("x"), "2")]),
     ]
 }
 fn base(op: Operation) -> AssessmentInput {
