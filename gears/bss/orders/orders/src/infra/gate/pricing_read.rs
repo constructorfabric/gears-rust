@@ -162,17 +162,30 @@ impl PricingCatalogReads {
         }
     }
 
-    /// The line's answer when no service context exists: `Missing` for an unprovisioned seller
-    /// (warned once per seller, naming the seller only), an outage for a failed exchange.
+    /// The line's answer when no service context exists: `Missing` for an unprovisioned or a
+    /// misprovisioned seller (warned once per seller, naming the seller only), an outage for a
+    /// failed exchange.
     fn without_authority(&self, seller: Uuid, e: &AuthorityError) -> CatalogAnswer {
         match e {
-            AuthorityError::NotProvisioned | AuthorityError::Misprovisioned => {
+            AuthorityError::NotProvisioned => {
                 if self.warned.first(seller) {
                     tracing::warn!(
                         target: "orders.gate.authority",
                         seller_tenant_id = %seller,
                         "no commercial identity is configured for the seller; catalog reads are \
                          unavailable"
+                    );
+                }
+                unanswered(Unavailable::Missing)
+            }
+            AuthorityError::Misprovisioned => {
+                if self.warned.first(seller) {
+                    tracing::warn!(
+                        target: "orders.gate.authority",
+                        seller_tenant_id = %seller,
+                        "the seller's commercial identity is misprovisioned: the exchanged \
+                         principal is homed in another tenant or is not a service subject \
+                         (D-194, D-242); catalog reads are unavailable"
                     );
                 }
                 unanswered(Unavailable::Missing)

@@ -218,13 +218,22 @@ impl CommercialAuthority for AuthnAuthority {
         // D-194 R08: the trusted result supplies the subject's tenant and type; the seller's
         // principal is a service subject homed in the seller tenant, as phase B compares
         // (`submit.rs` `commercial_subject`). Nothing of the context is logged but the seller.
-        if ctx.subject_tenant_id() != seller_tenant_id
-            || ctx.subject_type() != Some(SERVICE_SUBJECT_TYPE)
-        {
+        let wrong_tenant = ctx.subject_tenant_id() != seller_tenant_id;
+        let wrong_type = ctx.subject_type() != Some(SERVICE_SUBJECT_TYPE);
+        if wrong_tenant || wrong_type {
+            // Which check failed, by ids and the expected type GTS id only; never the token nor
+            // the exchanged subject's own claims.
+            let mismatch = match (wrong_tenant, wrong_type) {
+                (true, true) => "tenant-and-subject-type",
+                (true, false) => "tenant",
+                (false, _) => "subject-type",
+            };
             if self.warned.first(seller_tenant_id) {
                 tracing::warn!(
                     target: "orders.gate.authority",
                     seller_tenant_id = %seller_tenant_id,
+                    mismatch,
+                    expected_subject_type = SERVICE_SUBJECT_TYPE,
                     "the seller's commercial identity exchanged a principal that is not a \
                      service subject of the seller tenant; refused (D-194)"
                 );
