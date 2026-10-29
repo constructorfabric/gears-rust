@@ -21,6 +21,7 @@ pub mod record_intake;
 pub mod refusal;
 pub mod sensitive_data;
 pub mod settings_scope;
+pub mod subject_control;
 pub mod subject_settings;
 
 #[cfg(test)]
@@ -35,5 +36,7 @@ mod profile_read_test;
 mod record_intake_test;
 #[cfg(test)]
 mod sensitive_data_test;
+#[cfg(test)]
+mod subject_control_test;
 #[cfg(test)]
 mod subject_settings_test;

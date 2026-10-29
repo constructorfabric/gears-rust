@@ -47,6 +47,9 @@ pub enum Origin {
     Reviewer { reviewer: Uuid },
     /// A tenant administrator's added or edited fact.
     Administrator { administrator: Uuid },
+    /// The subject's own delete of one of its facts. Such a plan only
+    /// removes.
+    Subject { subject: Uuid },
 }
 
 impl Origin {
@@ -54,7 +57,10 @@ impl Origin {
     /// confidence and no connector to trust.
     #[must_use]
     pub fn written_by_a_person(&self) -> bool {
-        matches!(self, Self::Reviewer { .. } | Self::Administrator { .. })
+        matches!(
+            self,
+            Self::Reviewer { .. } | Self::Administrator { .. } | Self::Subject { .. }
+        )
     }
 
     /// The name of the origin in audit events.
@@ -65,6 +71,7 @@ impl Origin {
             Self::Agent { .. } => "agent",
             Self::Reviewer { .. } => "reviewer",
             Self::Administrator { .. } => "administrator",
+            Self::Subject { .. } => "subject",
         }
     }
 
@@ -75,7 +82,8 @@ impl Origin {
             Self::Connector { connector, .. } => connector.clone(),
             Self::Agent { agent: id }
             | Self::Reviewer { reviewer: id }
-            | Self::Administrator { administrator: id } => id.to_string(),
+            | Self::Administrator { administrator: id }
+            | Self::Subject { subject: id } => id.to_string(),
         }
     }
 }

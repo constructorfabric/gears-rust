@@ -133,6 +133,37 @@ pub fn too_long(field: &str, limit: usize) -> CanonicalError {
         .create()
 }
 
+/// The REST answer for a domain error on the export. The data protection
+/// officer is told a refusal as such, 403, since the export is not the
+/// subject's own data; a subject without data in the tenant exports empty
+/// and never reaches here.
+///
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
+#[must_use]
+pub fn for_export(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct subject export refused");
+            SubjectFactsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::OutOfScope(refused) => {
+            log_out_of_scope(&refused);
+            SubjectFactsError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        e @ (DomainError::Refused(_)
+        | DomainError::Unavailable(_)
+        | DomainError::NotConfigured(_)
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::NotVisible(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
 /// The REST answer for a domain error on the manage-facts route. A subject the caller may not act for, or whose
 /// settings the caller's policy scope leaves out, answers as a subject that does not exist, so the answer reveals
 /// nothing about it. The gear's own failures are mapped as everywhere else.

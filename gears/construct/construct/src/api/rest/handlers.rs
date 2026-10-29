@@ -2,19 +2,27 @@ use std::sync::Arc;
 
 use axum::extract::Extension;
 use toolkit::api::canonical_prelude::*;
+use toolkit::api::odata::OData;
 use toolkit::api::rest::extract::{Json, Path, Query};
 use toolkit_security::SecurityContext;
 use tracing::Instrument as _;
 use uuid::Uuid;
 
-use crate::api::rest::error::{for_facts, for_rest, for_settings, too_long};
-use crate::api::rest::types::{ConcreteIntake, ConcreteProfile, ConcreteSettings};
+use crate::api::rest::error::{
+    SubjectFactsError, for_export, for_facts, for_rest, for_settings, too_long,
+};
+use crate::api::rest::pagination::{PageError, page};
+use crate::api::rest::types::{
+    ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
+};
+use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
     ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
-    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto,
+    RecordOutcomeDto, RecordQuery, RecordRequest, SUBJECT_FACTS_LISTING, SubjectExportDto,
+    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -138,4 +146,93 @@ pub async fn get_profile(
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
     Ok(Json(ProfileDto::from(profile)))
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
+}
+
+/// The answer for a page that cannot be cut: the caller's `$filter`,
+/// `$orderby` or cursor does not fit the list.
+fn bad_page(err: PageError) -> CanonicalError {
+    let (field, detail, reason) = match err {
+        PageError::Filter(detail) => ("$filter", detail, "invalid_filter"),
+        PageError::Order(detail) => ("$orderby", detail, "invalid_order"),
+        PageError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
+    };
+    SubjectFactsError::invalid_argument()
+        .with_field_violation(field, detail, reason)
+        .create()
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+pub async fn list_subject_facts(
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSubjectControl>>,
+    Path(subject_id): Path<Uuid>,
+    OData(query): OData,
+    // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-parse
+) -> ApiResult<Json<SubjectFactsPageDto>> {
+    let facts = svc
+        .view(&ctx, subject_id)
+        .await
+        .map_err(|e| for_facts(e, subject_id))?;
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-return
+    let page = page(facts.facts, &query, &SUBJECT_FACTS_LISTING).map_err(bad_page)?;
+    Ok(Json(SubjectFactsPageDto {
+        items: page.items.into_iter().map(Into::into).collect(),
+        page_info: page.page_info,
+        version: facts.version,
+    }))
+    // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-return
+}
+
+pub async fn get_subject_fact(
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSubjectControl>>,
+    Path((subject_id, fact_id)): Path<(Uuid, String)>,
+    // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-parse
+) -> ApiResult<Json<SubjectFactDto>> {
+    let fact = svc
+        .fact(&ctx, subject_id, &NodeKey(fact_id))
+        .await
+        .map_err(|e| for_facts(e, subject_id))?;
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-return
+    Ok(Json(SubjectFactDto::from(fact)))
+    // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-return
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
+pub async fn delete_subject_fact(
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSubjectControl>>,
+    Path((subject_id, fact_id)): Path<(Uuid, String)>,
+    // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-parse
+) -> ApiResult<StatusCode> {
+    svc.delete(&ctx, subject_id, &NodeKey(fact_id))
+        .await
+        .map_err(|e| for_facts(e, subject_id))?;
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-return
+    Ok(StatusCode::NO_CONTENT)
+    // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-return
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
+pub async fn export_subject(
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteSubjectControl>>,
+    Path(subject_id): Path<Uuid>,
+    // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-parse
+) -> ApiResult<impl IntoResponse> {
+    let export = svc.export(&ctx, subject_id).await.map_err(for_export)?;
+    // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-return
+    let disposition = format!("attachment; filename=\"subject-{subject_id}.json\"");
+    Ok((
+        [(axum::http::header::CONTENT_DISPOSITION, disposition)],
+        Json(SubjectExportDto::new(
+            export,
+            time::OffsetDateTime::now_utc(),
+        )),
+    ))
+    // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-return
 }
