@@ -164,9 +164,20 @@ fn profile_request(key: SubjectKey, category: Option<Category>) -> AccessRequest
 fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> HashSet<Category> {
     values
         .into_iter()
-        .filter_map(|value| match value {
-            ScopeValue::String(name) => Category::from_name(name),
-            _ => None,
+        .filter_map(|value| {
+            let category = match value {
+                ScopeValue::String(name) => Category::from_name(name),
+                _ => None,
+            };
+            if category.is_none() {
+                // A policy that names no category Construct knows hides it
+                // from every reader; this says why.
+                tracing::warn!(
+                    ?value,
+                    "construct: a policy names a category that is not one; it grants nothing"
+                );
+            }
+            category
         })
         .collect()
 }

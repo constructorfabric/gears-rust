@@ -116,3 +116,27 @@ async fn read_profile_asks_about_the_named_tenant() {
         .collect();
     assert_eq!(asked, [(Some(tenant), Some(tenant.to_string()))]);
 }
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_refused_read_is_logged_with_the_caller_the_subject_and_the_tenant() {
+    let ctx = caller();
+    let (subject, named) = (Uuid::new_v4(), Uuid::new_v4());
+    let client = client(Arc::new(DenyResolver)).await;
+
+    let own = client.read_profile(&ctx, None, subject).await;
+    let other = client.read_profile(&ctx, Some(named), subject).await;
+
+    assert!(own.is_err() && other.is_err());
+    assert!(logs_contain("construct profile read refused"));
+    assert!(logs_contain(&format!("subject_id={subject}")));
+    assert!(logs_contain(&format!("caller={}", ctx.subject_id())));
+    assert!(
+        logs_contain(&format!("tenant_id={}", ctx.subject_tenant_id())),
+        "the caller's own tenant"
+    );
+    assert!(
+        logs_contain(&format!("tenant_id={named}")),
+        "the tenant the read named"
+    );
+}

@@ -191,6 +191,11 @@ pub fn assemble(
     let configured = Configured {
         identity: Part::of(cfg.identity().as_ref()),
         model: Part::of(model.as_ref()),
+        unchecked: if cfg.config().processing.run_without_sensitive_data_checks {
+            Part::Present
+        } else {
+            Part::Missing
+        },
     };
     let identity = cfg
         .identity()
@@ -225,7 +230,10 @@ pub fn assemble(
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
-    let (true, Some(model)) = (identity.is_some(), model) else {
+    // No real sensitive-data check exists yet, so processing runs only where
+    // the deployment opted in to storing values unchecked.
+    let (true, true, Some(model)) = (identity.is_some(), configured.unchecked.present(), model)
+    else {
         configured.log();
         return Ok(Pipeline {
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
@@ -253,8 +261,8 @@ pub fn assemble(
             max_tokens: cfg.config().processing.max_tokens,
         },
     );
-    // No real sensitive-data check exists yet; every value is allowed, and
-    // the operator is told so at start-up.
+    // Every value is allowed until a real check exists; the deployment opted
+    // in, and the operator is told so at start-up.
     let checks = SensitiveDataChecks::new(Vec::new(), Arc::clone(&events) as _);
     tracing::warn!(
         "construct: record processing runs with no sensitive-data check; every planned value \
@@ -335,13 +343,16 @@ impl Part {
 struct Configured {
     identity: Part,
     model: Part,
+    /// The opt-in to process without sensitive-data checks.
+    unchecked: Part,
 }
 
 impl Configured {
     /// Say at start-up what is not configured: an info line when processing
     /// is off on purpose (neither identity nor model), a warning when it is
-    /// only partly configured, and a warning when the profile read is
-    /// unavailable.
+    /// only partly configured or lacks the opt-in to run without
+    /// sensitive-data checks, and a warning when the profile read is not
+    /// configured.
     #[expect(
         clippy::cognitive_complexity,
         reason = "three log lines; the tracing macros count toward the complexity"
@@ -351,6 +362,11 @@ impl Configured {
         if !identity && !model {
             tracing::info!(
                 "construct: record processing is not configured; received records are dropped"
+            );
+        } else if identity && model {
+            tracing::warn!(
+                "construct: record processing needs processing.run_without_sensitive_data_checks \
+                 while no sensitive-data check exists; received records are dropped"
             );
         } else {
             tracing::warn!(

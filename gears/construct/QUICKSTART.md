@@ -2,7 +2,7 @@
 
 Record intake for connectors and the profile read for applications and agents. A connector sends one record per request for one tenant; Construct checks it against its GTS type and answers at once with received, repeat or refused. A received record is handed to background processing in the same transaction that keeps its identity: the planner turns it into a plan, the sensitive-data checks and Admission decide what of it is stored, and the profile writer stores it in graph storage. An application or agent then reads the subject's profile by category.
 
-**Processing runs only with a processing identity and a model configured.** Without them, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `501`, which a caller does not retry.
+**Processing runs only with a processing identity and a model configured, and with `processing.run_without_sensitive_data_checks: true`,** since no sensitive-data check exists yet and every value Admission lets through is stored. Without all three, a record that passes the checks is answered `202`, its identity is kept, and a content-free drop event is logged; nothing from the record is processed. A resend of the same record is a repeat. Without a processing identity, the profile read answers `501`, which a caller does not retry.
 
 **Features:**
 - One authenticated route, `POST /construct/v1/records?tenant=<tenant id>`, with one permission check (`gts.cf.connectors.core.record.v1~` / `send`) for the named tenant
@@ -105,6 +105,7 @@ gears:
         max_rounds: 8
         max_tokens: 32000
         max_reruns: 2
+        run_without_sensitive_data_checks: false  # true to process while no sensitive-data check exists
       admission:                     # all optional; the same rules for every tenant
         confidence_floor: 0.6
         max_steps: 100
@@ -188,7 +189,7 @@ A subject without facts answers `{"subject_id":"…","categories":[]}`; a subjec
 | Issue | Solution |
 |-------|----------|
 | The gear does not start | Check that the config has no unknown key and that every entry in `connectors_off` is a UUID. |
-| A received record changes nothing | Without `processing_identity` and `model`, every received record is dropped, with a drop event in the log. With them, look for a drop event naming the stage and the reason. |
+| A received record changes nothing | Without `processing_identity`, `model` and `processing.run_without_sensitive_data_checks: true`, every received record is dropped, with a drop event in the log and a start-up warning naming what is missing. With them, look for a drop event naming the stage and the reason. |
 | The profile read answers `501` | No `processing_identity` is configured. |
 | The profile read answers `503` | Graph storage, the settings service or the policy service cannot answer. |
 | `404` on `/cf/construct/...` | The example server was started without `--features construct`. |

@@ -9,7 +9,6 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, ObservableGauge};
 
 use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
-use crate::infra::intake_events::stage;
 use crate::infra::record_queue::QueuedHandOff;
 
 /// What the worker has on hand. The queue is held weakly, so the load never
@@ -115,7 +114,7 @@ impl ProcessingMetrics {
         self.dropped.add(
             1,
             &[
-                KeyValue::new("stage", stage(drop_stage)),
+                KeyValue::new("stage", drop_stage.name()),
                 KeyValue::new("reason", reason),
             ],
         );

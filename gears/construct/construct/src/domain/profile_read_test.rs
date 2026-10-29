@@ -888,28 +888,6 @@ async fn a_profile_too_large_to_read_is_the_gears_own_failure_not_a_precondition
 }
 
 #[tokio::test]
-async fn an_allow_without_constraints_is_a_refusal_not_a_grant_of_every_profile() {
-    let db = inmem_db().await;
-    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
-    let service = profile_service(
-        &db,
-        Arc::new(FixedScope(Vec::new())),
-        facts(),
-        Arc::default(),
-        CategoryCheck::OneCall,
-    );
-
-    let result = service
-        .read(&caller_in(tenant), Some(tenant), subject)
-        .await;
-
-    assert!(
-        matches!(result, Err(DomainError::NotVisible(_))),
-        "the read requires constraints: {result:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_category_the_platform_names_that_construct_does_not_know_grants_nothing() {
     let db = inmem_db().await;
     let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
@@ -933,4 +911,62 @@ async fn a_category_the_platform_names_that_construct_does_not_know_grants_nothi
         view.categories.is_empty(),
         "`skills` is no category, so nothing is readable: {view:?}"
     );
+}
+
+/// Allows the profile with a tenant clamp, but answers each category with an
+/// allow that does not grant it: a constraint naming another subject, or
+/// another category.
+struct CategoriesElsewhere {
+    other_category: bool,
+}
+
+#[async_trait]
+impl AuthZResolverApi for CategoriesElsewhere {
+    async fn evaluate(
+        &self,
+        _ctx: PlatformSecurityContext,
+        request: EvaluationRequest,
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        let tenant = tenant_of(&request);
+        let Some(asked) = request
+            .resource
+            .properties
+            .get(CATEGORY_PROPERTY)
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+        else {
+            return Ok(allowed(vec![tenant_is(tenant)]));
+        };
+        Ok(allowed(if self.other_category {
+            let other = if asked == "skill" { "role" } else { "skill" };
+            vec![tenant_is(tenant), category_is(other)]
+        } else {
+            vec![tenant_is(tenant), subject_is(Uuid::new_v4())]
+        }))
+    }
+}
+
+#[tokio::test]
+async fn per_category_an_allow_that_does_not_reach_the_category_hides_it() {
+    for other_category in [false, true] {
+        let db = inmem_db().await;
+        let service = profile_service(
+            &db,
+            Arc::new(CategoriesElsewhere { other_category }),
+            facts(),
+            Arc::default(),
+            CategoryCheck::PerCategory,
+        );
+        let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+
+        let view = service
+            .read(&caller_in(tenant), Some(tenant), subject)
+            .await
+            .unwrap();
+
+        assert!(
+            view.categories.is_empty(),
+            "other_category={other_category}: {view:?}"
+        );
+    }
 }

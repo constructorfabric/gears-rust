@@ -1,4 +1,4 @@
-use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
+use crate::domain::record_intake::{DropEvent, IntakeEvents};
 
 /// [`IntakeEvents`] written to the structured log, until the Audit gear ships.
 /// The event carries no record content.
@@ -6,17 +6,6 @@ use crate::domain::record_intake::{DropEvent, DropStage, IntakeEvents};
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-drop-event:p1
 #[derive(Debug, Default)]
 pub struct LogIntakeEvents;
-
-/// The name of a drop stage in the log and in metrics.
-pub(crate) fn stage(stage: DropStage) -> &'static str {
-    match stage {
-        DropStage::Planner => "planner",
-        DropStage::Checks => "checks",
-        DropStage::Admission => "admission",
-        DropStage::Writer => "writer",
-        DropStage::Worker => "worker",
-    }
-}
 
 impl IntakeEvents for LogIntakeEvents {
     fn dropped(&self, event: DropEvent) {
@@ -29,7 +18,7 @@ impl IntakeEvents for LogIntakeEvents {
             connector = %event.connector,
             record_key = %event.record_key,
             record_type = %event.type_id,
-            stage = stage(event.stage),
+            stage = event.stage.name(),
             reason = event.reason.name(),
             "record dropped"
         );
