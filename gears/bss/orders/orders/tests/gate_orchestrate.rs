@@ -1629,3 +1629,22 @@ fn a_terms_answer_naming_a_line_twice_or_an_unasked_line_is_malformed() {
         Err(Unavailable::Malformed)
     );
 }
+
+/// R5: the hold policy version is frozen as a canonical positive integer (D-191); any other
+/// text is a malformed policy answer, never a 500 at submit.
+#[test]
+fn a_policy_version_that_is_not_a_canonical_positive_integer_is_malformed() {
+    use bss_orders::domain::gate::orchestrate::verify_policy;
+    let policy = |version: &str| AcceptancePolicy {
+        version: version.into(),
+        hold_seconds: 600,
+    };
+    assert_eq!(verify_policy(&policy("7")), Ok(()));
+    for bad in ["07", "+7", "v1", "dev-stub-1", "0", "", "-1"] {
+        assert_eq!(
+            verify_policy(&policy(bad)),
+            Err(Unavailable::Malformed),
+            "{bad:?}"
+        );
+    }
+}

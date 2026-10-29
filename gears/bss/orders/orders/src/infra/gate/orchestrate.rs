@@ -416,6 +416,7 @@ impl Orchestrator {
             ),
             ports.acceptance_policy.policy(&plan.policy, &run, cancel),
         );
+        let acceptance_policy = verified_policy(acceptance_policy);
         down.note(GatePort::IdentityProfile, &identity);
         checkpoint(cancel)?;
         let confirmed = gate_after_identity(&identity) == IdentityGate::Confirmed;
@@ -741,6 +742,22 @@ impl InflightClaims for InMemoryInflightClaims {
             })
             .map(|(_, _, k, _)| k.clone())
             .collect())
+    }
+}
+
+/// Refuse an acceptance-policy answer whose version is not canonical positive-integer text (R5,
+/// `verify_policy`) as `Unavailable(Malformed)` before any consumer reads it.
+fn verified_policy(
+    answer: PortAnswer<Option<crate::domain::gate::answers::AcceptancePolicy>>,
+) -> PortAnswer<Option<crate::domain::gate::answers::AcceptancePolicy>> {
+    match answer {
+        PortAnswer::Answered(Some(policy)) => {
+            match crate::domain::gate::orchestrate::verify_policy(&policy) {
+                Ok(()) => PortAnswer::Answered(Some(policy)),
+                Err(kind) => PortAnswer::Unavailable(kind),
+            }
+        }
+        other => other,
     }
 }
 

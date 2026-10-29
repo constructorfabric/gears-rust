@@ -789,6 +789,18 @@ pub fn verify_evaluation(
     Ok(())
 }
 
+/// Verify the acceptance-policy answer before any consumer uses it (D-191), as
+/// [`verify_evaluation`] does for Rating: the version the Pricing hold policy is frozen from is
+/// canonical positive-integer text (`7`, never `07`, `+7` or `v7`).
+///
+/// # Errors
+/// `Malformed` for any other version text.
+pub fn verify_policy(policy: &AcceptancePolicy) -> Result<(), Unavailable> {
+    super::commercial::positive(&policy.version)
+        .map(|_| ())
+        .ok_or(Unavailable::Malformed)
+}
+
 /// Verify the billing-terms answer before any consumer uses it (D-193, D-197), as
 /// [`verify_evaluation`] does for Rating: every entry names a line the run asked, and no line is
 /// answered twice. The readers disagree on a duplicated line's winner (the assessment query and

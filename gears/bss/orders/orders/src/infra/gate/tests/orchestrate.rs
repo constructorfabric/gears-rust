@@ -1265,6 +1265,48 @@ async fn a_duplicated_terms_entry_is_malformed_and_never_frozen() {
     );
 }
 
+/// R5: the acceptance-policy port answers a version no hold policy can be frozen from.
+struct PolicyVersion(&'static str);
+#[async_trait]
+impl AcceptancePolicyReads for PolicyVersion {
+    async fn policy(
+        &self,
+        _query: &AcceptancePolicyQuery,
+        _run: &RunBudget,
+        _cancel: &CancellationToken,
+    ) -> PortAnswer<Option<AcceptancePolicy>> {
+        PortAnswer::Answered(Some(AcceptancePolicy {
+            version: self.0.into(),
+            hold_seconds: 600,
+        }))
+    }
+}
+
+#[tokio::test]
+async fn a_non_canonical_policy_version_is_malformed_before_any_consumer() {
+    let h = harness_with(fixture(), false, Arc::new(Budget::baseline()), |ports| {
+        ports.acceptance_policy = Arc::new(PolicyVersion("v1"));
+    });
+    let resolved = run(&h, &basket(Operation::Submit)).await.unwrap();
+    assert!(
+        resolved
+            .unavailable_kinds
+            .contains(&(GatePort::AcceptancePolicy, Unavailable::Malformed)),
+        "{:?}",
+        resolved.unavailable_kinds
+    );
+    assert!(resolved.policy.is_none());
+    assert!(
+        resolved
+            .assessment
+            .failures
+            .iter()
+            .any(|f| f.reason == Reason::CatalogPinCompositionUnavailable),
+        "{:?}",
+        resolved.assessment.failures
+    );
+}
+
 #[tokio::test]
 async fn protected_serialized_fixture_reaches_real_orchestration_and_refuses_foreign_tuple() {
     use crate::domain::gate::predicates::PredicateId;

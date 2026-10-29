@@ -828,7 +828,7 @@ fn line_request(
 }
 
 /// A canonical positive integer (`7`, never `07` or `+7`).
-fn positive(text: &str) -> Option<u64> {
+pub(super) fn positive(text: &str) -> Option<u64> {
     text.parse::<u64>()
         .ok()
         .filter(|v| *v > 0 && v.to_string() == text)
