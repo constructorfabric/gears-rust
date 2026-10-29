@@ -96,6 +96,11 @@ pub struct ProcessingConfig {
     pub max_tokens: NonZeroU64,
     /// How many times a record is planned again after a write conflict.
     pub max_reruns: u32,
+    /// Run processing although no sensitive-data check exists yet, so every
+    /// planned value Admission lets through is stored. Off by default: a
+    /// deployment opts in knowingly, and without it received records are
+    /// dropped.
+    pub run_without_sensitive_data_checks: bool,
 }
 
 impl Default for ProcessingConfig {
@@ -106,6 +111,7 @@ impl Default for ProcessingConfig {
             max_rounds: NonZeroU32::new(8).unwrap_or(NonZeroU32::MIN),
             max_tokens: NonZeroU64::new(32_000).unwrap_or(NonZeroU64::MIN),
             max_reruns: 2,
+            run_without_sensitive_data_checks: false,
         }
     }
 }
@@ -164,8 +170,8 @@ pub struct InvalidConfig(pub String);
 /// A [`ConstructConfig`] that passed [`ConstructConfig::validated`]. The gear
 /// builds only from one, so no unchecked value reaches the pipeline; the
 /// values are read through [`ValidConfig::config`], and the processing
-/// identity, which needs its category check, through
-/// [`ValidConfig::identity`].
+/// identity, which needs its category check, only through
+/// [`ValidConfig::identity`]: `config()` holds neither.
 #[derive(Debug, Clone)]
 pub struct ValidConfig {
     config: ConstructConfig,
@@ -205,14 +211,15 @@ impl ConstructConfig {
     /// [`InvalidConfig`] naming the first bad value.
     pub fn validated(self) -> Result<ValidConfig, InvalidConfig> {
         self.check()?;
-        let identity = self
+        let mut config = self;
+        // Taken out of the values `config()` gives, so `identity()`, with its
+        // category check, is the only way to the identity.
+        let identity = config
             .processing_identity
-            .zip(self.profile_category_check)
+            .take()
+            .zip(config.profile_category_check.take())
             .map(|(id, category_check)| ProcessingIdentity { id, category_check });
-        Ok(ValidConfig {
-            config: self,
-            identity,
-        })
+        Ok(ValidConfig { config, identity })
     }
 
     fn check(&self) -> Result<(), InvalidConfig> {

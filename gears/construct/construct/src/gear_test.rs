@@ -19,6 +19,7 @@ use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_queue::record_queue;
 use crate::test_support::{
     AllowResolver, fake_graph_storage, inmem_db, received_chat_record, settings_service,
+    unchecked_processing,
 };
 
 /// A model no test record reaches.
@@ -41,6 +42,7 @@ async fn gear_with_worker() -> (ConstructGear, Arc<dyn RecordHandOff>) {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
         profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
     }
@@ -178,13 +180,24 @@ async fn a_worker_that_panicked_makes_stop_fail() {
 
 #[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_within_the_grace() {
-    let gear = ConstructGear::default();
+async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_and_says_so() {
     // A worker blocked in a call that never yields, so the abort cannot
-    // reach it.
-    let handle = tokio::spawn(async {
-        std::thread::sleep(std::time::Duration::from_secs(3));
+    // reach it; it ends well after the grace stop waits for.
+    let blocked = std::time::Duration::from_secs(3);
+    let gear = ConstructGear::default();
+    let started_blocking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handle = tokio::spawn({
+        let started_blocking = Arc::clone(&started_blocking);
+        async move {
+            started_blocking.store(true, std::sync::atomic::Ordering::SeqCst);
+            std::thread::sleep(blocked);
+        }
     });
+    // An abort before the worker first runs would end it cleanly; wait until
+    // it is blocked.
+    while !started_blocking.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::task::yield_now().await;
+    }
     *lock(&gear.running) = Some(Running {
         token: CancellationToken::new(),
         handle,
@@ -194,11 +207,16 @@ async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_within_the_grace()
     deadline.cancel();
     let started = std::time::Instant::now();
 
-    gear.stop(deadline).await.unwrap();
+    let stopped = gear.stop(deadline).await;
 
+    let err = stopped.expect_err("a worker that did not end is no clean stop");
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(2500),
-        "stop returns after the grace, not when the worker ends: {:?}",
+        format!("{err:#}").contains("did not end after it was aborted"),
+        "{err:#}"
+    );
+    assert!(
+        started.elapsed() < blocked,
+        "stop returns after its grace, before the worker ends: {:?}",
         started.elapsed()
     );
     assert!(logs_contain("did not end after it was aborted"));

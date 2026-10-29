@@ -78,6 +78,10 @@ pub struct SubjectSettingsError;
 ///
 /// @cpt-dod:cpt-cf-construct-dod-subject-settings-routes:p1
 #[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
 pub fn for_settings(e: DomainError) -> CanonicalError {
     match e {
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-owner-only:p1:inst-owner-refuse-return
@@ -95,12 +99,22 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
                 .with_reason("ACCESS_DENIED")
                 .create()
         }
+        // Answered on the settings resource, not as a profile's.
+        DomainError::NotVisible(msg) => {
+            tracing::warn!(msg = %msg, "construct subject settings not visible");
+            SubjectSettingsError::not_found("no such subject")
+                .with_resource("subject")
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            SubjectSettingsError::unimplemented("this deployment does not provide this call")
+                .create()
+        }
         // The settings routes refuse no record; a refusal here is mapped like
         // any other error.
         e @ (DomainError::Refused(_)
-        | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
-        | DomainError::NotConfigured(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
@@ -125,6 +139,10 @@ pub fn too_long(field: &str, limit: usize) -> CanonicalError {
 ///
 /// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
 #[must_use]
+#[expect(
+    clippy::cognitive_complexity,
+    reason = "flat match on the domain enum; the tracing macros count toward the complexity"
+)]
 pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
     match e {
         DomainError::Forbidden(msg) => {
@@ -139,12 +157,21 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
                 .with_resource(subject_id.to_string())
                 .create()
         }
+        // Answered on the subject facts resource, not as a profile's.
+        DomainError::NotVisible(msg) => {
+            tracing::warn!(msg = %msg, "construct subject facts not visible");
+            SubjectFactsError::not_found("no such subject")
+                .with_resource(subject_id.to_string())
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            SubjectFactsError::unimplemented("this deployment does not provide this call").create()
+        }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
-        | DomainError::NotConfigured(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
-        | DomainError::NotVisible(_)
         | DomainError::Database(_)) => e.into(),
     }
 }

@@ -286,15 +286,9 @@ async fn every_record_answer_carries_the_security_headers() {
         let response = router.clone().oneshot(request).await.unwrap();
 
         assert_eq!(response.status(), status);
-        for (name, value) in [
-            (header::CACHE_CONTROL, "no-store"),
-            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
-            (header::X_FRAME_OPTIONS, "DENY"),
-            (header::REFERRER_POLICY, "no-referrer"),
-            (header::X_DNS_PREFETCH_CONTROL, "off"),
-        ] {
+        for (name, value) in crate::test_support::SECURITY_HEADERS {
             assert_eq!(
-                response.headers().get(&name).and_then(|v| v.to_str().ok()),
+                response.headers().get(name).and_then(|v| v.to_str().ok()),
                 Some(value),
                 "{name} on {status}"
             );

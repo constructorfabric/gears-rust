@@ -262,8 +262,11 @@ impl RunnableCapability for ConstructGear {
                     // worker to end; the record tasks it holds are aborted as it
                     // drops them.
                     let Ok(result) = tokio::time::timeout(ABORT_GRACE, &mut handle).await else {
+                        // The host is told the stop was not clean; it logs it.
                         warn!("construct: record processing did not end after it was aborted");
-                        return Ok(());
+                        return Err(anyhow::anyhow!(
+                            "construct record processing did not end after it was aborted"
+                        ));
                     };
                     result
                 }

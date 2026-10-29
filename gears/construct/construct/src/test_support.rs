@@ -1018,3 +1018,32 @@ pub fn fake_graph_storage() -> Arc<dyn graph_storage_sdk::GraphStorageClientV1> 
     ));
     Arc::new(GraphStorageLocalClient::new(services))
 }
+
+/// Processing that runs without sensitive-data checks, as a deployment that
+/// opted in.
+pub fn unchecked_processing() -> crate::config::ProcessingConfig {
+    crate::config::ProcessingConfig {
+        run_without_sensitive_data_checks: true,
+        ..crate::config::ProcessingConfig::default()
+    }
+}
+
+/// Every header the security layer puts on Construct's answers, with its
+/// value.
+pub const SECURITY_HEADERS: [(&str, &str); 9] = [
+    ("cache-control", "no-store"),
+    ("x-content-type-options", "nosniff"),
+    ("x-frame-options", "DENY"),
+    (
+        "content-security-policy",
+        "default-src 'none'; frame-ancestors 'none'",
+    ),
+    ("referrer-policy", "no-referrer"),
+    (
+        "permissions-policy",
+        "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+    ),
+    ("cross-origin-resource-policy", "same-origin"),
+    ("x-permitted-cross-domain-policies", "none"),
+    ("x-dns-prefetch-control", "off"),
+];
