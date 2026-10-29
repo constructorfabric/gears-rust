@@ -634,13 +634,21 @@ pub(crate) fn validate_line_parts(
     validate_dates(dates)
 }
 
-/// Selected items: bounded count, positive quantities (by type) and bounded dimension values.
+/// Selected items: bounded count, positive quantities (by type), one stated quantity per line
+/// (D-192) and bounded dimension values.
 ///
 /// # Errors
 /// `request-invalid` input.
 pub fn validate_items(items: &[SelectedItem]) -> Result<(), AuthoringInvalid> {
     if items.len() > MAX_SELECTED_ITEMS {
         return Err(AuthoringInvalid("selected_items"));
+    }
+    // D-192 (D-231 item 12): a line has one exact quantity; every stated quantity agrees.
+    let mut stated = items.iter().filter_map(|i| i.quantity);
+    if let Some(first) = stated.next()
+        && stated.any(|q| q != first)
+    {
+        return Err(AuthoringInvalid("quantity"));
     }
     for item in items {
         if let Some(value) = &item.selected_dim_value

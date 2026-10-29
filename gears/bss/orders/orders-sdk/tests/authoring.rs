@@ -152,3 +152,25 @@ fn authored_term_bounds_are_exact() {
         assert_eq!(term.validate(), expected, "{term:?}");
     }
 }
+
+/// D-192, D-231 item 12 (OQ-C2): a line has one exact quantity; every stated item quantity
+/// must agree, on add and on a patch that names the items.
+#[test]
+fn a_line_states_one_quantity_on_every_item() {
+    let item = |n: u128, q: Option<&str>| SelectedItem {
+        item_id: Uuid::from_u128(n),
+        quantity: q.map(|q| serde_json::from_value(serde_json::json!(q)).unwrap()),
+        selected_dim_value: None,
+    };
+    let mut same = line();
+    same.selected_items = vec![item(3, Some("2")), item(4, Some("2")), item(5, None)];
+    same.validate().unwrap();
+    let mut mixed = line();
+    mixed.selected_items = vec![item(3, Some("2")), item(4, Some("3"))];
+    assert_eq!(mixed.validate(), Err(AuthoringInvalid("quantity")));
+    let patch = LinePatch {
+        selected_items: Some(mixed.selected_items),
+        ..LinePatch::default()
+    };
+    assert_eq!(patch.validate(), Err(AuthoringInvalid("quantity")));
+}
