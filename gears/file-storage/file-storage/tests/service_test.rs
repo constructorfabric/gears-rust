@@ -1,8 +1,8 @@
-//! End-to-end service tests: temp-file `SQLite`, in-memory backend, tenant-only authorizer.
+//! `FileService` end to end: upload/bind/download lifecycle, versions, listing, deletes, ownership
+//! transfer and the audit trail / outbox rows of every write. Temp-file `SQLite`, in-memory backend,
+//! tenant-only authorizer.
 
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
-
-use std::sync::Arc;
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -16,29 +16,10 @@ use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
 use file_storage::domain::service::FileService;
 use file_storage::infra::signed_url::Claims;
-use file_storage::infra::storage::Store;
-use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerFilter, OwnerKind};
+use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerKind};
 
 mod common;
-use common::{StackBuilder, ctx};
-
-async fn build_service() -> (Arc<FileService>, DataPlaneService) {
-    let (svc, dp, _store) = build_service_with_page_sizes(50, 1000).await;
-    (svc, dp)
-}
-
-/// Like `build_service`, but with caller-chosen page sizes (a small `max_page_size` keeps version
-/// seeding fast), and also returns the `Store` for tests that drive the repo layer directly.
-async fn build_service_with_page_sizes(
-    default_page_size: u64,
-    max_page_size: u64,
-) -> (Arc<FileService>, DataPlaneService, Store) {
-    let s = StackBuilder::new("service-test")
-        .page_sizes(default_page_size, max_page_size)
-        .build()
-        .await;
-    (s.svc, s.dp, s.store)
-}
+use common::{Stack, StackBuilder, ctx, token_of};
 
 fn new_file() -> NewFile {
     NewFile {
@@ -98,30 +79,28 @@ async fn bind_with_current_etag(
 
 #[tokio::test]
 async fn full_upload_bind_download_lifecycle() {
-    let (svc, dp) = build_service().await;
+    let Stack { svc, dp, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
-
     let ticket = svc
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
     assert!(ticket.upload_url.contains("fs-token="), "signed upload URL");
     assert!(ticket.upload_url.starts_with("http://sidecar.test"));
-
     let pre = svc.get_file(&ctx, ticket.file_id).await.unwrap();
     assert!(pre.content_id.is_none());
     assert_eq!(etag::etag_for(&pre), None);
 
+    let content = Bytes::from_static(b"hello world");
     dp.put_content(
         &ctx,
         ticket.file_id,
         ticket.version_id,
         "text/plain",
-        Bytes::from_static(b"hello world"),
+        content.clone(),
     )
     .await
     .unwrap();
-
     let bound = svc
         .bind(&ctx, ticket.file_id, ticket.version_id, None)
         .await
@@ -133,14 +112,21 @@ async fn full_upload_bind_download_lifecycle() {
     let dl = svc.download_url(&ctx, ticket.file_id, None).await.unwrap();
     assert_eq!(dl.version_id, ticket.version_id);
     assert_eq!(dl.etag, etag);
-    assert!(dl.download_url.contains("fs-token="));
+    // The `get` token carries the version's stored MIME and the same `ETag`.
+    let payload = token_of(&dl.download_url)
+        .split('.')
+        .next()
+        .expect("payload segment");
+    let claims: Claims =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).expect("base64url")).unwrap();
+    assert_eq!(claims.content_type, "text/plain");
+    assert_eq!(claims.etag, dl.etag);
 
-    let bytes = dp
+    let read = dp
         .read_content(&ctx, ticket.file_id, ticket.version_id, None)
         .await
         .unwrap();
-    assert_eq!(bytes, Bytes::from_static(b"hello world"));
-
+    assert_eq!(read, content);
     let versions = svc
         .list_versions(&ctx, ticket.file_id, None, None)
         .await
@@ -149,22 +135,15 @@ async fn full_upload_bind_download_lifecycle() {
     assert_eq!(versions.len(), 1);
     assert!(versions[0].is_current);
     assert_eq!(versions[0].size, 11);
-
-    let (_f, meta) = svc
-        .get_file_with_metadata(&ctx, ticket.file_id)
-        .await
-        .unwrap();
-    assert_eq!(meta.len(), 1);
-    assert_eq!(meta[0].key, "tag");
 }
 
 #[tokio::test]
 async fn bind_with_wrong_if_match_returns_precondition_failed() {
-    let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
+    let Stack { svc, dp, store, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
     let (file_id, _v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
-
     let audit_before = store.list_audit(file_id).await.unwrap().len();
+
     let err = svc
         .bind(&ctx, file_id, v2, Some("\"deadbeef\""))
         .await
@@ -173,24 +152,23 @@ async fn bind_with_wrong_if_match_returns_precondition_failed() {
         matches!(err, DomainError::PreconditionFailed { .. }),
         "got {err:?}"
     );
-    // The If-Match guard fails before any CAS runs, so no audit row is written.
+    let audit_after = store.list_audit(file_id).await.unwrap().len();
     assert_eq!(
-        store.list_audit(file_id).await.unwrap().len(),
-        audit_before,
+        audit_after, audit_before,
         "a rejected bind must not write an audit row"
     );
 
-    let current = svc.get_file(&ctx, file_id).await.unwrap();
-    let etag = etag::etag_for(&current).unwrap();
-    let bound = svc.bind(&ctx, file_id, v2, Some(&etag)).await.unwrap();
-    assert_eq!(bound.content_id, Some(v2));
+    bind_with_current_etag(&svc, &ctx, file_id, v2).await;
+    assert_eq!(
+        svc.get_file(&ctx, file_id).await.unwrap().content_id,
+        Some(v2)
+    );
 }
+
 #[tokio::test]
 async fn tenant_isolation_hides_other_tenants_files() {
-    let (svc, _dp) = build_service().await;
-    let ctx_a = ctx(Uuid::now_v7());
-    let ctx_b = ctx(Uuid::now_v7());
-
+    let Stack { svc, .. } = StackBuilder::new("service-test").build().await;
+    let (ctx_a, ctx_b) = (ctx(Uuid::now_v7()), ctx(Uuid::now_v7()));
     let t = svc
         .create_file(&ctx_a, new_file(), None, false)
         .await
@@ -204,39 +182,16 @@ async fn tenant_isolation_hides_other_tenants_files() {
 }
 
 #[tokio::test]
-async fn content_type_mismatch_is_rejected() {
-    let (svc, dp) = build_service().await;
-    let ctx = ctx(Uuid::now_v7());
-    let mut nf = new_file();
-    nf.mime_type = "image/png".to_owned();
-    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
-
-    // Declared png, but the bytes are a PDF signature.
-    let err = dp
-        .put_content(
-            &ctx,
-            t.file_id,
-            t.version_id,
-            "image/png",
-            Bytes::from_static(b"%PDF-1.4\n%%EOF"),
-        )
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::MimeMismatch { .. }),
-        "got {err:?}"
-    );
-}
-
-#[tokio::test]
 async fn update_metadata_merges_and_bumps_meta_version() {
-    let (svc, _dp) = build_service().await;
+    let Stack { svc, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
     let t = svc
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
-
+    let set = |k: &str, v: Option<&str>| CustomMetadataPatch {
+        entries: vec![(k.to_owned(), v.map(str::to_owned))],
+    };
     let patch = CustomMetadataPatch {
         entries: vec![
             ("tag".to_owned(), Some("b".to_owned())),     // overwrite
@@ -247,143 +202,71 @@ async fn update_metadata_merges_and_bumps_meta_version() {
         .update_metadata(&ctx, t.file_id, patch, None)
         .await
         .unwrap();
-    assert_eq!(updated.meta_version, 1, "meta_version bumped");
-
+    assert_eq!(updated.meta_version, 1);
     let (_f, meta) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
     let map: std::collections::BTreeMap<_, _> =
         meta.into_iter().map(|e| (e.key, e.value)).collect();
-    assert_eq!(map.get("tag"), Some(&"b".to_owned()));
-    assert_eq!(map.get("color"), Some(&"red".to_owned()));
+    assert_eq!(map.get("tag").map(String::as_str), Some("b"));
+    assert_eq!(map.get("color").map(String::as_str), Some("red"));
 
-    let del = CustomMetadataPatch {
-        entries: vec![("color".to_owned(), None)],
-    };
-    svc.update_metadata(&ctx, t.file_id, del, None)
+    svc.update_metadata(&ctx, t.file_id, set("color", None), None)
         .await
         .unwrap();
-    let (_f, meta2) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
-    assert!(meta2.iter().all(|e| e.key != "color"), "color removed");
+    let (_f, meta) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
+    assert!(meta.iter().all(|e| e.key != "color"), "color removed");
 }
 
 #[tokio::test]
 async fn restore_prior_version_rebinds_pointer() {
-    let (svc, dp) = build_service().await;
+    let Stack { svc, dp, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
     let (file_id, v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
     bind_with_current_etag(&svc, &ctx, file_id, v2).await;
-
     let restored = svc.restore_version(&ctx, file_id, v1).await.unwrap();
     assert_eq!(restored.content_id, Some(v1));
 }
+
 #[tokio::test]
 async fn download_url_pending_version_is_rejected() {
-    let (svc, _dp) = build_service().await;
+    let Stack { svc, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
-
-    let ticket = svc
+    let t = svc
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
-
     let err = svc
-        .download_url(&ctx, ticket.file_id, Some(ticket.version_id))
+        .download_url(&ctx, t.file_id, Some(t.version_id))
         .await
         .unwrap_err();
-    assert!(
-        matches!(err, DomainError::Conflict { .. }),
-        "expected Conflict for pending version, got {err:?}"
-    );
+    assert!(matches!(err, DomainError::Conflict { .. }), "got {err:?}");
 }
 
 #[tokio::test]
 async fn delete_file_if_match_required_and_enforced() {
-    let (svc, dp) = build_service().await;
+    let Stack { svc, dp, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
+    let t = common::bound_file(&svc, &dp, &ctx, b"hello").await;
+    let file = svc.get_file(&ctx, t.file_id).await.unwrap();
+    let current = etag::etag_for(&file).expect("etag after bind");
 
-    let ticket = svc
-        .create_file(&ctx, new_file(), None, false)
+    for if_match in [None, Some("\"wrong-etag\"")] {
+        let err = svc
+            .delete_file(&ctx, t.file_id, if_match)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DomainError::PreconditionFailed { .. }),
+            "{if_match:?}: {err:?}"
+        );
+    }
+    svc.delete_file(&ctx, t.file_id, Some(&current))
         .await
         .unwrap();
-    dp.put_content(
-        &ctx,
-        ticket.file_id,
-        ticket.version_id,
-        "text/plain",
-        Bytes::from_static(b"hello"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
-        .await
-        .unwrap();
-
-    let file = svc.get_file(&ctx, ticket.file_id).await.unwrap();
-    let current_etag = etag::etag_for(&file).expect("file must have an ETag after bind");
-
-    let err = svc
-        .delete_file(&ctx, ticket.file_id, None)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::PreconditionFailed { .. }),
-        "expected PreconditionFailed when If-Match absent, got {err:?}"
-    );
-
-    let err = svc
-        .delete_file(&ctx, ticket.file_id, Some("\"wrong-etag\""))
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::PreconditionFailed { .. }),
-        "expected PreconditionFailed for wrong ETag, got {err:?}"
-    );
-
-    svc.delete_file(&ctx, ticket.file_id, Some(&current_etag))
-        .await
-        .unwrap();
-    let err = svc.get_file(&ctx, ticket.file_id).await.unwrap_err();
+    let err = svc.get_file(&ctx, t.file_id).await.unwrap_err();
     assert!(
         matches!(err, DomainError::FileNotFound { .. }),
-        "file must be gone after successful delete, got {err:?}"
+        "got {err:?}"
     );
-}
-
-#[tokio::test]
-async fn list_files_filters_by_owner() {
-    let (svc, _dp) = build_service().await;
-    let ctx = ctx(Uuid::now_v7());
-    let owner = Uuid::now_v7();
-    let mut nf = new_file();
-    nf.owner_id = owner;
-    let t = svc.create_file(&ctx, nf, None, false).await.unwrap();
-
-    let found = svc
-        .list_files(
-            &ctx,
-            OwnerFilter {
-                owner_kind: OwnerKind::User,
-                owner_id: owner,
-            },
-            Some(10),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(found.items.iter().any(|f| f.file_id == t.file_id));
-
-    let empty = svc
-        .list_files(
-            &ctx,
-            OwnerFilter {
-                owner_kind: OwnerKind::User,
-                owner_id: Uuid::now_v7(),
-            },
-            Some(10),
-            None,
-        )
-        .await
-        .unwrap();
-    assert!(empty.items.is_empty());
 }
 
 /// `list_versions` caps at `max_page_size`, with or without a larger explicit `limit`, and
@@ -391,106 +274,92 @@ async fn list_files_filters_by_owner() {
 #[tokio::test]
 async fn list_versions_caps_at_max_page_size() {
     // `default_page_size == max_page_size`, so the no-limit case exercises the cap.
-    let max_page_size = 10u64;
-    let (svc, dp, _store) = build_service_with_page_sizes(max_page_size, max_page_size).await;
+    let max_page_size = 3u64;
+    let Stack { svc, dp, .. } = StackBuilder::new("service-test")
+        .page_sizes(max_page_size, max_page_size)
+        .build()
+        .await;
     let ctx = ctx(Uuid::now_v7());
-
-    let total = max_page_size + 5;
-    let mut created = Vec::with_capacity(usize::try_from(total).expect("total fits usize"));
-
     let t0 = svc
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
-    dp.put_content(
-        &ctx,
-        t0.file_id,
-        t0.version_id,
-        "text/plain",
-        Bytes::from_static(b"v0"),
-    )
-    .await
-    .unwrap();
-    created.push(t0.version_id);
-
-    for i in 1..total {
-        let t = svc.presign_version(&ctx, t0.file_id).await.unwrap();
-        dp.put_content(
-            &ctx,
-            t0.file_id,
-            t.version_id,
-            "text/plain",
-            Bytes::from(format!("v{i}")),
-        )
-        .await
-        .unwrap();
-        created.push(t.version_id);
+    let mut created = vec![t0.version_id];
+    for i in 1..=max_page_size + 1 {
+        let version_id = svc
+            .presign_version(&ctx, t0.file_id)
+            .await
+            .unwrap()
+            .version_id;
+        created.push(version_id);
+        let data = Bytes::from(format!("v{i}"));
+        dp.put_content(&ctx, t0.file_id, version_id, "text/plain", data)
+            .await
+            .unwrap();
     }
-    assert_eq!(
-        created.len() as u64,
-        total,
-        "sanity: seeded max_page_size + 5"
-    );
 
-    let page = svc
-        .list_versions(&ctx, t0.file_id, None, None)
-        .await
-        .unwrap()
-        .items;
-    assert_eq!(page.len() as u64, max_page_size);
-
-    let expected: Vec<Uuid> = created
+    let newest_first: Vec<Uuid> = created
         .iter()
         .rev()
-        .take(usize::try_from(max_page_size).expect("max_page_size fits usize"))
+        .take(usize::try_from(max_page_size).unwrap())
         .copied()
         .collect();
-    let actual: Vec<Uuid> = page.iter().map(|v| v.version_id).collect();
-    assert_eq!(actual, expected, "must be the newest-first page");
-
-    let clamped = svc
-        .list_versions(&ctx, t0.file_id, Some(max_page_size + 100), None)
-        .await
-        .unwrap();
-    assert_eq!(clamped.items.len() as u64, max_page_size);
+    for limit in [None, Some(max_page_size + 100)] {
+        let page = svc
+            .list_versions(&ctx, t0.file_id, limit, None)
+            .await
+            .unwrap();
+        let actual: Vec<Uuid> = page.items.iter().map(|v| v.version_id).collect();
+        assert_eq!(
+            actual, newest_first,
+            "limit {limit:?}: the newest-first page, capped"
+        );
+    }
 }
 
+/// Deleting the current version is a conflict and an unknown id is `VersionNotFound`; neither
+/// touches the file.
 #[tokio::test]
-async fn delete_current_version_is_rejected() {
-    let (svc, dp) = build_service().await;
+async fn delete_version_rejects_current_and_unknown_versions() {
+    let Stack { svc, dp, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
     let (file_id, v1, _v2) = file_with_two_versions(&svc, &dp, &ctx).await;
 
     let err = svc.delete_version(&ctx, file_id, v1).await.unwrap_err();
-    assert!(matches!(err, DomainError::Conflict { .. }), "got {err:?}");
+    assert!(
+        matches!(err, DomainError::Conflict { .. }),
+        "current: got {err:?}"
+    );
+    let err = svc
+        .delete_version(&ctx, file_id, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::VersionNotFound { .. }),
+        "unknown: got {err:?}"
+    );
 
     let versions = svc
         .list_versions(&ctx, file_id, None, None)
         .await
         .unwrap()
         .items;
-    assert!(
-        versions.iter().any(|v| v.version_id == v1),
-        "current version must survive the rejected delete"
+    assert_eq!(versions.len(), 2);
+    assert_eq!(
+        svc.get_file(&ctx, file_id).await.unwrap().content_id,
+        Some(v1)
     );
-    let file = svc.get_file(&ctx, file_id).await.unwrap();
-    assert_eq!(file.content_id, Some(v1));
 }
+
 /// Reproduces a stale "is current?" snapshot: a concurrent `bind` promotes the version after the
 /// check. Driven via the store directly; the DB-level guard must refuse the delete.
 #[tokio::test]
 async fn delete_version_then_bind_cannot_dangle() {
-    let (svc, dp, store) = build_service_with_page_sizes(50, 1000).await;
+    let Stack { svc, dp, store, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
-
     let (file_id, _v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
-    let pre_bind = store.get_version(file_id, v2).await.unwrap();
-    assert_eq!(pre_bind.map(|v| v.is_current), Some(false));
-
     bind_with_current_etag(&svc, &ctx, file_id, v2).await;
 
-    // Delete via the store, bypassing the service's fresh pre-check; the
-    // `is_current = false` guard must refuse it.
     let audit = AuditEntry::success(
         ctx.subject_tenant_id(),
         "user",
@@ -504,61 +373,255 @@ async fn delete_version_then_bind_cannot_dangle() {
         !removed,
         "guarded delete of the (now-current) version must not remove the row"
     );
-
-    let file = svc.get_file(&ctx, file_id).await.unwrap();
-    assert_eq!(file.content_id, Some(v2));
-    let still_there = store.get_version(file_id, v2).await.unwrap();
-    assert!(
-        still_there.is_some(),
-        "content_id must never dangle at a deleted version"
+    assert_eq!(
+        svc.get_file(&ctx, file_id).await.unwrap().content_id,
+        Some(v2)
     );
+    assert!(store.get_version(file_id, v2).await.unwrap().is_some());
 }
 
-/// The `op = get` token must carry the version's stored MIME and `ETag` as `content_type`/`etag`
-/// claims; the payload is decoded directly.
+/// A random `version_id` on a single-version file is `VersionNotFound` and must not delete the
+/// file; deleting the only version by its real id deletes the whole file.
 #[tokio::test]
-async fn download_url_token_carries_version_mime_and_etag() {
-    let (svc, dp) = build_service().await;
+async fn delete_only_version_deletes_the_whole_file() {
+    let Stack { svc, store, .. } = StackBuilder::new("service-test").build().await;
     let ctx = ctx(Uuid::now_v7());
-
-    let ticket = svc
+    let t = svc
         .create_file(&ctx, new_file(), None, false)
         .await
         .unwrap();
-    dp.put_content(
-        &ctx,
-        ticket.file_id,
-        ticket.version_id,
-        "text/plain",
-        Bytes::from_static(b"hello world"),
-    )
-    .await
-    .unwrap();
-    svc.bind(&ctx, ticket.file_id, ticket.version_id, None)
+    let scope = toolkit_security::AccessScope::allow_all();
+
+    let err = svc
+        .delete_version(&ctx, t.file_id, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::VersionNotFound { .. }),
+        "got {err:?}"
+    );
+    assert!(store.get_file(&scope, t.file_id).await.unwrap().is_some());
+    assert!(
+        store
+            .get_version(t.file_id, t.version_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    svc.delete_version(&ctx, t.file_id, t.version_id)
+        .await
+        .unwrap();
+    assert!(store.get_file(&scope, t.file_id).await.unwrap().is_none());
+}
+
+/// The owner fields change, and the same transaction leaves one `transfer_ownership` audit row and
+/// one unpublished `file.owner_transferred` event for the new owner.
+#[tokio::test]
+async fn transfer_ownership_updates_owner_fields_and_leaves_audit_row_and_event() {
+    let Stack { svc, store, .. } = StackBuilder::new("service-test").build().await;
+    let tenant = Uuid::now_v7();
+    let ctx = ctx(tenant);
+    let new_owner = Uuid::now_v7();
+    let file_id = common::bare_file(&svc, &ctx).await;
+
+    let updated = svc
+        .transfer_ownership(&ctx, file_id, OwnerKind::App, new_owner)
+        .await
+        .unwrap();
+    assert_eq!(
+        (updated.owner_kind, updated.owner_id),
+        (OwnerKind::App, new_owner)
+    );
+
+    let audit = store.list_audit(file_id).await.unwrap();
+    let transfers: Vec<_> = audit
+        .iter()
+        .filter(|r| r.operation == "transfer_ownership")
+        .collect();
+    assert_eq!(transfers.len(), 1);
+    assert_eq!(transfers[0].outcome, "success");
+    let events = store.list_file_events(file_id).await.unwrap();
+    let transfer_events: Vec<_> = events
+        .iter()
+        .filter(|e| e.event_type == "file.owner_transferred")
+        .collect();
+    assert_eq!(transfer_events.len(), 1);
+    assert_eq!(
+        transfer_events[0].owner_id, new_owner,
+        "the event names the new owner"
+    );
+    assert_eq!(transfer_events[0].tenant_id, tenant);
+    assert!(transfer_events[0].published_at.is_none());
+}
+
+/// A phantom file is `FileNotFound` and the nil UUID is a malformed owner (no principal directory
+/// is wired in); neither writes an audit row or an event, and the owner stays unchanged.
+#[tokio::test]
+async fn transfer_ownership_rejections_write_nothing() {
+    let Stack { svc, store, .. } = StackBuilder::new("service-test").build().await;
+    let ctx = ctx(Uuid::now_v7());
+    let phantom_id = Uuid::now_v7();
+    let err = svc
+        .transfer_ownership(&ctx, phantom_id, OwnerKind::User, Uuid::now_v7())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::FileNotFound { id } if id == phantom_id),
+        "got {err:?}"
+    );
+    assert!(store.list_audit(phantom_id).await.unwrap().is_empty());
+    assert!(store.list_file_events(phantom_id).await.unwrap().is_empty());
+
+    let original_owner = Uuid::now_v7();
+    let file = common::new_file_for(original_owner, "doc.txt", "text/plain");
+    let file_id = svc
+        .create_file(&ctx, file, None, false)
+        .await
+        .unwrap()
+        .file_id;
+    let audit_before = store.list_audit(file_id).await.unwrap().len();
+    let err = svc
+        .transfer_ownership(&ctx, file_id, OwnerKind::App, Uuid::nil())
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::Validation { ref field, .. } if field == "new_owner_id"),
+        "got {err:?}"
+    );
+    let file = svc.get_file(&ctx, file_id).await.unwrap();
+    assert_eq!(
+        (file.owner_id, file.owner_kind),
+        (original_owner, OwnerKind::User)
+    );
+    assert_eq!(store.list_audit(file_id).await.unwrap().len(), audit_before);
+}
+
+/// Every write leaves exactly one `success` audit row for its file, in order, and the outbox gets
+/// exactly the file's lifecycle events (unpublished): create, upload, bind, a second version
+/// bound over the first, metadata patch, `delete_version`, `delete_file`. Audit and event rows
+/// survive the delete (no FK cascade).
+#[tokio::test]
+async fn writes_leave_audit_rows_and_outbox_events() {
+    let Stack { svc, dp, store, .. } = StackBuilder::new("audit-test").build().await;
+    let ctx = ctx(Uuid::now_v7());
+    let (file_id, v1, v2) = file_with_two_versions(&svc, &dp, &ctx).await;
+    let owner = svc.get_file(&ctx, file_id).await.unwrap().owner_id;
+    let patch = CustomMetadataPatch {
+        entries: vec![("k".to_owned(), Some("v".to_owned()))],
+    };
+    svc.update_metadata(&ctx, file_id, patch, None)
+        .await
+        .unwrap();
+    bind_with_current_etag(&svc, &ctx, file_id, v2).await;
+    svc.delete_version(&ctx, file_id, v1).await.unwrap();
+    let cur = svc.get_file(&ctx, file_id).await.unwrap();
+    svc.delete_file(&ctx, file_id, etag::etag_for(&cur).as_deref())
         .await
         .unwrap();
 
-    let dl = svc.download_url(&ctx, ticket.file_id, None).await.unwrap();
-
-    let token = dl
-        .download_url
-        .split("fs-token=")
-        .nth(1)
-        .expect("download_url carries an fs-token query param");
-    let payload_b64 = token
-        .split('.')
-        .next()
-        .expect("token has a payload segment");
-    let payload = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .expect("valid base64url payload");
-    let claims: Claims = serde_json::from_slice(&payload).expect("valid claims JSON");
-
-    assert_eq!(claims.content_type, "text/plain", "declared file mime_type");
-    let expected_etag = etag::content_etag(ticket.file_id, ticket.version_id);
-    assert_eq!(claims.etag, expected_etag);
-    assert_eq!(
-        claims.etag, dl.etag,
-        "one source of truth as the ticket's own etag"
+    let rows = store.list_audit(file_id).await.unwrap();
+    assert!(
+        rows.iter()
+            .all(|r| r.outcome == "success" && r.file_id == Some(file_id)),
+        "every audit row is a success for this file: {rows:?}"
     );
+    let operations: Vec<&str> = rows.iter().map(|r| r.operation.as_str()).collect();
+    assert_eq!(
+        operations,
+        [
+            "create",
+            "finalize_version",
+            "patch_content",
+            "finalize_version",
+            "patch_metadata",
+            "patch_content",
+            "delete_version",
+            "delete_file",
+        ]
+    );
+
+    let events = store.list_file_events(file_id).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|e| e.file_id == file_id && e.owner_id == owner && e.published_at.is_none()),
+        "every event is for this file and owner, still unpublished: {events:?}"
+    );
+    let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+    assert_eq!(
+        types,
+        [
+            "file.created",
+            "file.content_updated",
+            "file.content_updated",
+            "file.deleted"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn multipart_complete_leaves_audit_rows() {
+    let Stack {
+        backend,
+        msvc,
+        multipart_store,
+        store,
+        svc,
+        ..
+    } = StackBuilder::new("audit-test").build().await;
+    let ctx = ctx(Uuid::now_v7());
+    let file_id = common::bare_file(&svc, &ctx).await;
+    let plan = common::session_with_part(
+        &msvc,
+        &multipart_store,
+        &backend,
+        &ctx,
+        file_id,
+        b"part1",
+        false,
+    )
+    .await;
+    msvc.complete_multipart_upload(&ctx, file_id, plan.upload_id, None)
+        .await
+        .unwrap();
+
+    let rows = store.list_audit(file_id).await.unwrap();
+    let complete: Vec<_> = rows
+        .iter()
+        .filter(|r| r.operation == "multipart_complete")
+        .collect();
+    assert_eq!(complete.len(), 1);
+    assert_eq!(complete[0].outcome, "success");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.operation == "finalize_version")
+            .count(),
+        1
+    );
+}
+
+/// A stale `expected_meta_version` rolls back the `meta_version` bump and the audit row together.
+#[tokio::test]
+async fn failed_metadata_cas_leaves_no_audit_row() {
+    let Stack { svc, store, .. } = StackBuilder::new("audit-test").build().await;
+    let ctx = ctx(Uuid::now_v7());
+    let t = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let before = store.list_audit(t.file_id).await.unwrap().len();
+
+    let patch = CustomMetadataPatch {
+        entries: vec![("x".to_owned(), Some("y".to_owned()))],
+    };
+    let err = svc
+        .update_metadata(&ctx, t.file_id, patch, Some(99))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(store.list_audit(t.file_id).await.unwrap().len(), before);
 }

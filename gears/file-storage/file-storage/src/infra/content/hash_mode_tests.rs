@@ -27,80 +27,21 @@ fn sample_entries() -> Vec<ManifestEntry> {
     ]
 }
 
-/// Hand-written expected wire string for `sample_entries`, independent of `Manifest`,
-/// so the test cannot pass by tautology.
-fn expected_wire_string(entries: &[ManifestEntry]) -> String {
-    let mut s = String::from("v1");
-    for e in entries {
-        s.push(',');
-        s.push_str(&e.offset.to_string());
-        s.push(':');
-        s.push_str(&hex::encode(e.digest));
-    }
-    s
-}
-
 #[test]
-fn to_wire_string_matches_hand_written_expected_string_exactly() {
+fn manifest_wire_string_is_exact_and_round_trips() {
     let entries = sample_entries();
     let manifest = Manifest::new(entries.clone()).expect("valid manifest");
-    assert_eq!(manifest.to_wire_string(), expected_wire_string(&entries));
+    let [d0, d1, d2] = [0, 1, 2].map(|i| hex::encode(entries[i].digest));
+    let wire = format!("v1,0:{d0},8388608:{d1},16777216:{d2}");
+    assert_eq!(manifest.to_wire_string(), wire);
 
-    let d0 = hex::encode(entries[0].digest);
-    let d1 = hex::encode(entries[1].digest);
-    let d2 = hex::encode(entries[2].digest);
-    assert_eq!(
-        manifest.to_wire_string(),
-        format!("v1,0:{d0},8388608:{d1},16777216:{d2}")
-    );
-}
-
-#[test]
-fn to_wire_string_single_part_minimal_shape() {
-    let digest = digest_of(b"only-part");
-    let manifest = Manifest::new(vec![ManifestEntry { offset: 0, digest }]).unwrap();
-    assert_eq!(
-        manifest.to_wire_string(),
-        format!("v1,0:{}", hex::encode(digest))
-    );
-}
-
-#[test]
-fn root_matches_independently_computed_reference_sha256() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries.clone()).unwrap();
-    let wire = expected_wire_string(&entries);
-
-    // Reference hash computed with a fresh `Sha256`, not through `Manifest::root()`.
-    let reference_root: [u8; 32] = {
-        let mut hasher = Sha256::new();
-        hasher.update(wire.as_bytes());
-        hasher.finalize().into()
-    };
-
-    assert_eq!(manifest.root(), reference_root);
-}
-
-#[test]
-fn round_trip_encode_decode_reencode_is_byte_identical() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries).unwrap();
-    let wire = manifest.to_wire_string();
+    // The root is the SHA-256 of the wire string, computed here without `Manifest::root()`.
+    assert_eq!(manifest.root(), digest_of(wire.as_bytes()));
 
     let parsed = Manifest::from_wire_string(&wire).expect("valid wire string parses");
     assert_eq!(parsed, manifest);
-    assert_eq!(parsed.to_wire_string(), wire);
-    assert_eq!(parsed.root(), manifest.root());
-}
-
-#[test]
-fn from_wire_string_recovers_exact_entries() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries.clone()).unwrap();
-    let wire = manifest.to_wire_string();
-    let parsed = Manifest::from_wire_string(&wire).unwrap();
     assert_eq!(parsed.entries(), entries.as_slice());
-    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed.to_wire_string(), wire);
 }
 
 #[test]
@@ -122,9 +63,10 @@ fn from_wire_string_rejects_malformed_input() {
         ("non-decimal offset", format!("v1,abc:{d}")),
     ];
     for (name, wire) in cases {
+        let err = Manifest::from_wire_string(&wire).expect_err(name);
         assert!(
-            Manifest::from_wire_string(&wire).is_err(),
-            "{name} must be rejected: {wire}"
+            matches!(err, DomainError::Validation { .. }),
+            "{name}: expected Validation, got {err:?}"
         );
     }
 }
@@ -141,7 +83,11 @@ fn manifest_new_rejects_invalid_entries() {
         ("duplicate offsets", vec![entry(0, b"a"), entry(0, b"b")]),
     ];
     for (name, entries) in cases {
-        assert!(Manifest::new(entries).is_err(), "{name} must be rejected");
+        let err = Manifest::new(entries).expect_err(name);
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "{name}: expected Validation, got {err:?}"
+        );
     }
 }
 

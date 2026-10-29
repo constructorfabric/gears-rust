@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -13,11 +11,15 @@ fn sample_claims(op: Op, exp: i64) -> Claims {
         backend_id: "local".to_owned(),
         backend_path: "/f/v".to_owned(),
         exp,
-        upload: UploadConstraints::default(),
+        upload: UploadConstraints {
+            max_size: Some(1024),
+            exact_size: None,
+            expected_hash: Some("SHA-256:deadbeef".to_owned()),
+        },
         multipart: MultipartClaims::default(),
         request_id: "test-request-id".to_owned(),
-        content_type: String::new(),
-        etag: String::new(),
+        content_type: "image/png".to_owned(),
+        etag: "\"abc123\"".to_owned(),
         bind_on_finalize: false,
     }
 }
@@ -49,171 +51,88 @@ fn lifetime_is_clamped_to_max_ttl() {
 }
 
 #[test]
-fn expiry_is_exclusive_at_the_boundary() {
+fn expiry_is_exclusive_at_the_boundary_with_and_without_grace() {
     let issuer = Issuer::generate(3600).unwrap();
     let verifier = issuer.verifier();
     let exp = now().unix_timestamp() + 60;
-    let token = issuer.issue(sample_claims(Op::Get, exp), now()).unwrap();
+    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
 
-    // (offset from exp, accepted): valid one second before exp, rejected at exp and after.
-    // A zero grace window must behave exactly like strict `verify`.
-    for (offset, accepted) in [(-1, true), (0, false), (30, false)] {
+    // (offset from exp, grace seconds, accepted). Grace only loosens the `exp` deadline.
+    for (offset, grace_secs, accepted) in [
+        (-1, 0, true),
+        (0, 0, false),
+        (30, 0, false),
+        (30, 60, true),
+        (59, 60, true),
+        (60, 60, false),
+        (90, 60, false),
+    ] {
         let at = OffsetDateTime::from_unix_timestamp(exp + offset).unwrap();
-        let strict = verifier.verify(&token, at);
-        let graceless = verifier.verify_with_grace(&token, at, time::Duration::ZERO);
-        assert_eq!(strict.is_ok(), accepted, "verify at exp{offset:+}");
-        assert_eq!(graceless.is_ok(), accepted, "zero grace at exp{offset:+}");
-        if accepted {
-            assert_eq!(strict.unwrap(), graceless.unwrap());
-        } else {
-            assert!(matches!(
-                strict.unwrap_err(),
-                DomainError::TokenInvalid { .. }
-            ));
+        let result = verifier.verify_with_grace(&token, at, time::Duration::seconds(grace_secs));
+        let case = format!("at exp{offset:+} with {grace_secs}s grace");
+        match result {
+            Ok(_) => assert!(accepted, "{case}: must be rejected"),
+            Err(DomainError::TokenInvalid { reason }) => {
+                assert!(!accepted, "{case}: must be accepted");
+                assert_eq!(reason, "token expired", "{case}");
+            }
+            Err(other) => panic!("{case}: unexpected error {other:?}"),
         }
     }
 }
 
 #[test]
-fn verify_with_grace_accepts_a_token_expired_within_the_grace_window() {
+fn verify_rejects_forged_and_malformed_tokens() {
     let issuer = Issuer::generate(3600).unwrap();
-    let verifier = issuer.verifier();
-    let exp = now().unix_timestamp() + 60;
-    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
-
-    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 30).unwrap();
-    assert!(
-        verifier
-            .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
-            .is_ok(),
-        "a token expired within the grace window must be accepted"
-    );
-}
-
-#[test]
-fn verify_with_grace_rejects_a_token_expired_beyond_the_grace_window() {
-    let issuer = Issuer::generate(3600).unwrap();
-    let verifier = issuer.verifier();
-    let exp = now().unix_timestamp() + 60;
-    let token = issuer.issue(sample_claims(Op::Put, exp), now()).unwrap();
-
-    // 90s past exp with a 60s grace: rejected with the same message `verify` uses.
-    let past_exp = OffsetDateTime::from_unix_timestamp(exp + 90).unwrap();
-    let err = verifier
-        .verify_with_grace(&token, past_exp, time::Duration::seconds(60))
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::TokenInvalid { .. }),
-        "got {err:?}"
-    );
-    assert!(
-        err.to_string().contains("token expired"),
-        "grace expiry must surface the same message as strict `verify`, got {err}"
-    );
-}
-
-#[test]
-fn verify_with_grace_does_not_weaken_signature_verification() {
-    // Grace only loosens the `exp` deadline, never the signature check.
-    let issuer = Issuer::generate(3600).unwrap();
-    let verifier = issuer.verifier();
     let token = issuer
         .issue(sample_claims(Op::Put, now().unix_timestamp() + 60), now())
         .unwrap();
-
     let (payload, sig) = token.split_once('.').unwrap();
     let mut p = payload.to_owned();
     let last = p.pop().unwrap();
     p.push(if last == 'A' { 'B' } else { 'A' });
     let tampered = format!("{p}.{sig}");
+    let other_key_token = Issuer::generate(3600)
+        .unwrap()
+        .issue(sample_claims(Op::Put, now().unix_timestamp() + 60), now())
+        .unwrap();
 
-    let err = verifier
-        .verify_with_grace(&tampered, now(), time::Duration::seconds(3600))
-        .unwrap_err();
-    assert!(
-        err.to_string().contains("signature"),
-        "a huge grace must not accept a tampered payload, got {err}"
-    );
+    // (case, token, grace, expected reason fragment). Grace never weakens the signature check.
+    let cases = [
+        ("tampered payload", &tampered, 0, "signature"),
+        ("huge grace, tampered payload", &tampered, 3600, "signature"),
+        ("signed by another key", &other_key_token, 0, "signature"),
+        (
+            "not a token",
+            &"not-a-token".to_owned(),
+            0,
+            "malformed token",
+        ),
+    ];
+    for (case, token, grace_secs, expected) in cases {
+        let err = issuer
+            .verifier()
+            .verify_with_grace(token, now(), time::Duration::seconds(grace_secs))
+            .expect_err(case);
+        assert!(
+            matches!(&err, DomainError::TokenInvalid { reason } if reason.contains(expected)),
+            "{case}: expected TokenInvalid containing {expected:?}, got {err:?}"
+        );
+    }
 }
 
 #[test]
-fn rejects_malformed_public_key() {
-    assert!(Verifier::from_public_key(vec![0u8; 31]).is_err());
-    assert!(Verifier::from_public_key(vec![0u8; 33]).is_err());
+fn from_public_key_requires_exactly_32_bytes() {
+    for len in [31, 33] {
+        let err = Verifier::from_public_key(vec![0u8; len])
+            .err()
+            .expect("must be rejected");
+        assert!(
+            matches!(err, DomainError::TokenInvalid { .. }),
+            "{len}: {err:?}"
+        );
+    }
     assert!(Verifier::from_public_key(vec![0u8; 32]).is_ok());
-}
-
-#[test]
-fn tampered_payload_fails_verification() {
-    let issuer = Issuer::generate(3600).unwrap();
-    let verifier = issuer.verifier();
-    let token = issuer
-        .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
-        .unwrap();
-
-    let (payload, sig) = token.split_once('.').unwrap();
-    let mut p = payload.to_owned();
-    let last = p.pop().unwrap();
-    p.push(if last == 'A' { 'B' } else { 'A' });
-    let tampered = format!("{p}.{sig}");
-
-    assert!(verifier.verify(&tampered, now()).is_err());
-}
-
-#[test]
-fn token_from_other_key_is_rejected() {
-    let issuer_a = Issuer::generate(3600).unwrap();
-    let issuer_b = Issuer::generate(3600).unwrap();
-    let token = issuer_a
-        .issue(sample_claims(Op::Get, now().unix_timestamp() + 60), now())
-        .unwrap();
-    assert!(issuer_b.verifier().verify(&token, now()).is_err());
-}
-
-#[test]
-fn malformed_token_is_rejected() {
-    let verifier = Issuer::generate(3600).unwrap().verifier();
-    assert!(verifier.verify("not-a-token", now()).is_err());
-}
-
-#[test]
-fn issuer_over_explicit_provider_round_trips() {
-    // The codec goes through the `SignatureProvider` seam, so an explicitly supplied provider
-    // behaves identically.
-    let provider = Arc::new(Ed25519Provider::generate().unwrap());
-    let issuer = Issuer::with_provider(provider, 3600);
-    let claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
-
-    let token = issuer.issue(claims.clone(), now()).unwrap();
-    assert_eq!(issuer.verifier().verify(&token, now()).unwrap(), claims);
-}
-
-#[test]
-fn upload_constraints_round_trip() {
-    let issuer = Issuer::generate(3600).unwrap();
-    let mut claims = sample_claims(Op::Put, now().unix_timestamp() + 60);
-    claims.upload = UploadConstraints {
-        max_size: Some(1024),
-        exact_size: None,
-        expected_hash: Some("SHA-256:deadbeef".to_owned()),
-    };
-    let token = issuer.issue(claims.clone(), now()).unwrap();
-    let got = issuer.verifier().verify(&token, now()).unwrap();
-    assert_eq!(got.upload, claims.upload);
-}
-
-#[test]
-fn content_type_and_etag_round_trip() {
-    let issuer = Issuer::generate(3600).unwrap();
-    let mut claims = sample_claims(Op::Get, now().unix_timestamp() + 60);
-    claims.content_type = "image/png".to_owned();
-    claims.etag = "\"abc123\"".to_owned();
-
-    let token = issuer.issue(claims.clone(), now()).unwrap();
-    let got = issuer.verifier().verify(&token, now()).unwrap();
-    assert_eq!(got.content_type, "image/png");
-    assert_eq!(got.etag, "\"abc123\"");
-    assert_eq!(got, claims);
 }
 
 #[test]

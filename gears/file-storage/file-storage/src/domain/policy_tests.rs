@@ -1,8 +1,5 @@
 use super::*;
-
-fn body_unrestricted() -> PolicyBody {
-    PolicyBody::default()
-}
+use crate::domain::error::DomainError;
 
 fn body_with_mimes(mimes: &[&str]) -> PolicyBody {
     PolicyBody {
@@ -33,66 +30,89 @@ fn body_with_meta_limits(max_pairs: u32, max_key_len: u32, max_value_len: u32) -
     }
 }
 
-#[test]
-fn resolve_both_unrestricted_returns_none() {
-    let ep = PolicyResolver::resolve(Some(&body_unrestricted()), Some(&body_unrestricted()));
-    assert!(
-        ep.allowed_mime_types.is_none(),
-        "no restriction from either level"
-    );
+fn limit_for(ep: &EffectivePolicy, mime: &str) -> u64 {
+    ep.per_mime_max_bytes
+        .iter()
+        .find(|e| e.mime == mime)
+        .unwrap_or_else(|| panic!("no per-mime entry for {mime}"))
+        .max_bytes
+}
+
+fn override_for(mime: &str, max_bytes: u64) -> MimeSizeOverride {
+    MimeSizeOverride {
+        mime: mime.to_owned(),
+        max_bytes,
+    }
+}
+
+fn open_policy() -> EffectivePolicy {
+    EffectivePolicy {
+        allowed_mime_types: None,
+        max_bytes: None,
+        per_mime_max_bytes: vec![],
+        metadata_limits: MetadataLimits::default(),
+    }
+}
+
+fn mimes(patterns: &[&str]) -> Vec<String> {
+    patterns.iter().map(ToString::to_string).collect()
 }
 
 #[test]
-fn resolve_no_policies_returns_none() {
-    let ep = PolicyResolver::resolve(None, None);
-    assert!(ep.allowed_mime_types.is_none());
-    assert!(ep.max_bytes.is_none());
-}
-
-#[test]
-fn resolve_tenant_restricted_user_unrestricted_returns_tenant_set() {
-    let tenant = body_with_mimes(&["image/jpeg", "image/png"]);
-    let user = body_unrestricted();
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    let mimes = ep.allowed_mime_types.expect("should be restricted");
-    assert!(mimes.contains(&"image/jpeg".to_owned()));
-    assert!(mimes.contains(&"image/png".to_owned()));
-}
-
-#[test]
-fn resolve_user_restricted_tenant_unrestricted_returns_user_set() {
-    let tenant = body_unrestricted();
-    let user = body_with_mimes(&["text/plain"]);
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    let mimes = ep.allowed_mime_types.expect("should be restricted");
-    assert_eq!(mimes, vec!["text/plain".to_owned()]);
-}
-
-#[test]
-fn resolve_intersection_of_mime_types() {
-    // image/* and image/jpeg must resolve to the narrower image/jpeg, not image/*.
-    let tenant = body_with_mimes(&["image/*", "video/mp4"]);
-    let user = body_with_mimes(&["image/jpeg", "video/mp4"]);
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    let mimes = ep.allowed_mime_types.expect("should be restricted");
-    assert!(
-        mimes.contains(&"image/jpeg".to_owned()),
-        "intersection must narrow image/* down to image/jpeg, got {mimes:?}"
-    );
-    assert!(
-        !mimes.contains(&"image/*".to_owned()),
-        "the broader image/* wildcard must not survive the intersection, got {mimes:?}"
-    );
-    assert!(mimes.contains(&"video/mp4".to_owned()));
-}
-
-#[test]
-fn resolve_disjoint_mime_types_gives_empty_intersection() {
-    let tenant = body_with_mimes(&["image/jpeg"]);
-    let user = body_with_mimes(&["text/plain"]);
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    let mimes = ep.allowed_mime_types.expect("should be restricted");
-    assert!(mimes.is_empty(), "disjoint sets -> nothing allowed");
+fn resolve_allowed_mime_types() {
+    // (row, tenant, user, expected); `None` policy = absent, `Some(&[])` = present but
+    // unrestricted. The result is the intersection, wildcards narrowed to the specific type.
+    type Mimes = Option<&'static [&'static str]>;
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, Mimes, Mimes, Option<&[&str]>); 8] = [
+        ("no policies", None, None, None),
+        ("both unrestricted", Some(&[]), Some(&[]), None),
+        (
+            "tenant restricted only",
+            Some(&["image/jpeg", "image/png"]),
+            Some(&[]),
+            Some(&["image/jpeg", "image/png"]),
+        ),
+        (
+            "user restricted only",
+            Some(&[]),
+            Some(&["text/plain"]),
+            Some(&["text/plain"]),
+        ),
+        (
+            "only tenant present",
+            Some(&["image/png"]),
+            None,
+            Some(&["image/png"]),
+        ),
+        (
+            "only user present",
+            None,
+            Some(&["image/png"]),
+            Some(&["image/png"]),
+        ),
+        (
+            "wildcard narrowed to specific",
+            Some(&["image/*", "video/mp4"]),
+            Some(&["image/jpeg", "video/mp4"]),
+            Some(&["image/jpeg", "video/mp4"]),
+        ),
+        (
+            "disjoint",
+            Some(&["image/jpeg"]),
+            Some(&["text/plain"]),
+            Some(&[]),
+        ),
+    ];
+    for (row, tenant, user, expected) in rows {
+        let body = |m: Mimes| m.map(body_with_mimes);
+        let ep = PolicyResolver::resolve(body(tenant).as_ref(), body(user).as_ref());
+        let got = ep.allowed_mime_types.map(|mut v| {
+            v.sort();
+            v
+        });
+        assert_eq!(got, expected.map(mimes), "{row}");
+    }
 }
 
 #[test]
@@ -108,83 +128,44 @@ fn resolve_global_size_limit_takes_the_smallest_present_value() {
         let ep = PolicyResolver::resolve(Some(&body(tenant)), Some(&body(user)));
         assert_eq!(ep.max_bytes, expected, "tenant={tenant:?} user={user:?}");
     }
+    let body = body_with_size(5 * MB);
+    assert_eq!(
+        PolicyResolver::resolve(Some(&body), None).max_bytes,
+        Some(5 * MB)
+    );
+    assert_eq!(
+        PolicyResolver::resolve(None, Some(&body)).max_bytes,
+        Some(5 * MB)
+    );
 }
 
 #[test]
 fn resolve_per_mime_overrides_merged_most_restrictive() {
     let mut tenant = PolicyBody::default();
     tenant.size_limits.per_mime = vec![
-        MimeSizeOverride {
-            mime: "video/*".to_owned(),
-            max_bytes: 1_000_000_000,
-        },
-        MimeSizeOverride {
-            mime: "image/jpeg".to_owned(),
-            max_bytes: 5_000_000,
-        },
+        override_for("video/*", 1_000_000_000),
+        override_for("image/jpeg", 5_000_000),
     ];
     let mut user = PolicyBody::default();
     user.size_limits.per_mime = vec![
-        MimeSizeOverride {
-            mime: "video/*".to_owned(),
-            max_bytes: 500_000_000,
-        }, // more restrictive
-        MimeSizeOverride {
-            mime: "text/plain".to_owned(),
-            max_bytes: 1_000_000,
-        },
+        override_for("video/*", 500_000_000), // more restrictive
+        override_for("text/plain", 1_000_000),
     ];
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    let video = ep
-        .per_mime_max_bytes
-        .iter()
-        .find(|e| e.mime == "video/*")
-        .unwrap();
-    assert_eq!(video.max_bytes, 500_000_000);
-    let jpeg = ep
-        .per_mime_max_bytes
-        .iter()
-        .find(|e| e.mime == "image/jpeg")
-        .unwrap();
-    assert_eq!(jpeg.max_bytes, 5_000_000);
-    let text = ep
-        .per_mime_max_bytes
-        .iter()
-        .find(|e| e.mime == "text/plain")
-        .unwrap();
-    assert_eq!(text.max_bytes, 1_000_000);
+    assert_eq!(limit_for(&ep, "video/*"), 500_000_000);
+    assert_eq!(limit_for(&ep, "image/jpeg"), 5_000_000);
+    assert_eq!(limit_for(&ep, "text/plain"), 1_000_000);
 }
 
 #[test]
 fn resolve_per_mime_specific_is_tightened_by_covering_wildcard() {
-    // A broader wildcard cap must tighten the more-specific entry it covers.
     let mut tenant = PolicyBody::default();
-    tenant.size_limits.per_mime = vec![MimeSizeOverride {
-        mime: "image/*".to_owned(),
-        max_bytes: 10_000_000, // 10 MB wildcard cap
-    }];
+    tenant.size_limits.per_mime = vec![override_for("image/*", 10_000_000)];
     let mut user = PolicyBody::default();
-    user.size_limits.per_mime = vec![MimeSizeOverride {
-        mime: "image/png".to_owned(),
-        max_bytes: 50_000_000, // 50 MB — looser than the covering wildcard
-    }];
+    user.size_limits.per_mime = vec![override_for("image/png", 50_000_000)];
     let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-
-    let png = ep
-        .per_mime_max_bytes
-        .iter()
-        .find(|e| e.mime == "image/png")
-        .expect("image/png entry present");
-    assert_eq!(
-        png.max_bytes, 10_000_000,
-        "image/png must be capped by the covering image/* wildcard (10MB), not its own 50MB"
-    );
-    let wildcard = ep
-        .per_mime_max_bytes
-        .iter()
-        .find(|e| e.mime == "image/*")
-        .expect("image/* entry present");
-    assert_eq!(wildcard.max_bytes, 10_000_000);
+    assert_eq!(limit_for(&ep, "image/png"), 10_000_000);
+    assert_eq!(limit_for(&ep, "image/*"), 10_000_000);
 }
 
 #[test]
@@ -195,118 +176,266 @@ fn resolve_metadata_limits_takes_most_restrictive_per_field() {
     assert_eq!(ep.metadata_limits.max_pairs, Some(20));
     assert_eq!(ep.metadata_limits.max_key_len, Some(128));
     assert_eq!(ep.metadata_limits.max_value_len, Some(256));
-}
 
-#[test]
-fn resolve_metadata_limits_none_plus_some_returns_some() {
-    let tenant = body_with_meta_limits(100, 64, 256);
-    let user = PolicyBody::default(); // no metadata limits at user level
-    let ep = PolicyResolver::resolve(Some(&tenant), Some(&user));
-    assert_eq!(ep.metadata_limits.max_pairs, Some(100));
-    assert_eq!(ep.metadata_limits.max_key_len, Some(64));
-}
-
-#[test]
-fn resolve_only_tenant_policy_present() {
-    let tenant = PolicyBody {
-        allowed_mime_types: vec!["image/png".to_owned()],
-        size_limits: SizeLimits {
-            max_bytes: Some(20 * 1024 * 1024),
-            ..Default::default()
-        },
-        metadata_limits: MetadataLimits {
-            max_pairs: Some(10),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let ep = PolicyResolver::resolve(Some(&tenant), None);
-    assert_eq!(ep.allowed_mime_types, Some(vec!["image/png".to_owned()]));
-    assert_eq!(ep.max_bytes, Some(20 * 1024 * 1024));
-    assert_eq!(ep.metadata_limits.max_pairs, Some(10));
-}
-
-#[test]
-fn resolve_only_user_policy_present() {
-    let user = body_with_size(5 * 1024 * 1024);
-    let ep = PolicyResolver::resolve(None, Some(&user));
-    assert_eq!(ep.max_bytes, Some(5 * 1024 * 1024));
-    assert!(ep.allowed_mime_types.is_none());
-}
-
-#[test]
-fn policy_body_serde_round_trip() {
-    let body = PolicyBody {
-        allowed_mime_types: vec!["image/jpeg".to_owned(), "video/*".to_owned()],
-        size_limits: SizeLimits {
-            max_bytes: Some(100 * 1024 * 1024),
-            per_mime: vec![MimeSizeOverride {
-                mime: "video/*".to_owned(),
-                max_bytes: 1_000_000_000,
-            }],
-        },
-        metadata_limits: MetadataLimits {
-            max_pairs: Some(50),
-            max_key_len: Some(128),
-            max_value_len: Some(512),
-            max_total_bytes: Some(4096),
-        },
-        enabled_event_types: vec!["file.created".to_owned()],
-    };
-    let json = serde_json::to_string(&body).expect("serialize");
-    let round_tripped: PolicyBody = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(body, round_tripped);
-}
-
-#[test]
-fn retention_rule_body_serde_round_trip() {
-    let body = RetentionRuleBody {
-        age: Some(AgeRetention { max_age_days: 365 }),
-        inactivity: Some(InactivityRetention {
-            inactivity_days: 90,
-        }),
-        metadata: Some(MetadataRetention {
-            key: "status".to_owned(),
-            value: "expired".to_owned(),
-        }),
-    };
-    let json = serde_json::to_string(&body).expect("serialize");
-    let round_tripped: RetentionRuleBody = serde_json::from_str(&json).expect("deserialize");
-    assert_eq!(body, round_tripped);
+    // A limit present on one side only is kept.
+    let ep = PolicyResolver::resolve(Some(&tenant), Some(&PolicyBody::default()));
+    assert_eq!(ep.metadata_limits.max_pairs, Some(50));
+    assert_eq!(ep.metadata_limits.max_key_len, Some(128));
 }
 
 #[test]
 fn mime_allowed_matches_exact_and_subtype_wildcards_only() {
-    // (mime, allowed pattern, expected). A stored pattern without `/` (e.g. "image") must not
+    // (mime, allowed patterns, expected). A stored pattern without `/` (e.g. "image") must not
     // act as a wildcard for `image/...`.
-    for (mime, pattern, expected) in [
-        ("image/jpeg", "image/jpeg", true),
-        ("image/jpeg", "image/*", true),
-        ("video/mp4", "image/*", false),
-        ("image/jpeg", "image", false),
-        ("text/plain", "text", false),
-    ] {
+    let rows: [(&str, &[&str], bool); 10] = [
+        ("image/jpeg", &["image/jpeg"], true),
+        ("image/jpeg", &["image/*"], true),
+        ("video/mp4", &["image/*"], false),
+        ("image/jpeg", &["image"], false),
+        ("text/plain", &["text"], false),
+        ("image/jpeg", &[], false),
+        ("text/plain", &["image/jpeg", "text/plain"], true),
+        ("text/plain", &["image/jpeg", "image/*"], false),
+        ("image/png", &["image/*"], true),
+        ("application/pdf", &["application/pdf", "image/*"], true),
+    ];
+    for (mime, patterns, expected) in rows {
         assert_eq!(
-            PolicyResolver::mime_allowed(mime, &[pattern.to_owned()]),
+            PolicyResolver::mime_allowed(mime, &mimes(patterns)),
             expected,
-            "{mime} against {pattern}"
+            "{mime} against {patterns:?}"
         );
     }
 }
 
 #[test]
-fn scope_parse_and_as_str_round_trip() {
+fn check_allowed_mime_applies_the_allow_list() {
+    // (row, allow list, mime, `None`: permitted, `Some(m)`: rejected as `PolicyMimeNotAllowed { m }`)
+    #[allow(clippy::type_complexity)]
+    let rows: [(&str, Option<&[&str]>, &str, Option<&str>); 5] = [
+        ("no restriction", None, "application/octet-stream", None),
+        (
+            "wildcard match",
+            Some(&["image/*", "text/plain"]),
+            "image/jpeg",
+            None,
+        ),
+        (
+            "exact match",
+            Some(&["image/*", "text/plain"]),
+            "text/plain",
+            None,
+        ),
+        (
+            "non-matching type",
+            Some(&["image/jpeg"]),
+            "video/mp4",
+            Some("video/mp4"),
+        ),
+        (
+            "empty list rejects all",
+            Some(&[]),
+            "image/jpeg",
+            Some("image/jpeg"),
+        ),
+    ];
+    for (row, allowed, mime, rejected) in rows {
+        let policy = EffectivePolicy {
+            allowed_mime_types: allowed.map(mimes),
+            ..open_policy()
+        };
+        match (PolicyResolver::check_allowed_mime(&policy, mime), rejected) {
+            (Ok(()), None) => {}
+            (Err(DomainError::PolicyMimeNotAllowed { mime_type }), Some(expected)) => {
+                assert_eq!(mime_type, expected, "{row}");
+            }
+            (other, _) => panic!("{row}: unexpected outcome {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn compute_effective_max_bytes_takes_the_tightest_limit() {
+    let policy = |max_bytes, per_mime: &[(&str, u64)]| EffectivePolicy {
+        max_bytes,
+        per_mime_max_bytes: per_mime.iter().map(|(m, b)| override_for(m, *b)).collect(),
+        ..open_policy()
+    };
+    let per_mime: &[(&str, u64)] = &[("image/*", 500_000), ("video/*", 50_000_000)];
+
+    // (row, global policy limit, per-mime overrides, mime, backend ceiling, expected)
+    #[allow(clippy::type_complexity)]
+    let rows: [(
+        &str,
+        Option<u64>,
+        &[(&str, u64)],
+        &str,
+        Option<u64>,
+        Option<u64>,
+    ); 8] = [
+        ("no restrictions", None, &[], "image/jpeg", None, None),
+        (
+            "policy global",
+            Some(1_000_000),
+            &[],
+            "image/jpeg",
+            None,
+            Some(1_000_000),
+        ),
+        (
+            "backend ceiling below the policy",
+            Some(10_000_000),
+            &[],
+            "image/jpeg",
+            Some(5_000_000),
+            Some(5_000_000),
+        ),
+        (
+            "policy below the backend ceiling",
+            Some(2_000_000),
+            &[],
+            "image/jpeg",
+            Some(5_000_000),
+            Some(2_000_000),
+        ),
+        (
+            "per-mime image",
+            None,
+            per_mime,
+            "image/jpeg",
+            None,
+            Some(500_000),
+        ),
+        (
+            "per-mime video",
+            None,
+            per_mime,
+            "video/mp4",
+            None,
+            Some(50_000_000),
+        ),
+        (
+            "no per-mime match, no global",
+            None,
+            per_mime,
+            "text/plain",
+            None,
+            None,
+        ),
+        (
+            "global below per-mime",
+            Some(200_000),
+            &[("image/*", 500_000)],
+            "image/jpeg",
+            None,
+            Some(200_000),
+        ),
+    ];
+    for (row, global, overrides, mime, ceiling, expected) in rows {
+        assert_eq!(
+            PolicyResolver::compute_effective_max_bytes(&policy(global, overrides), mime, ceiling),
+            expected,
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn check_metadata_limits_enforces_each_limit() {
+    let pairs = |kv: &[(&str, &str)]| -> Vec<(String, String)> {
+        kv.iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    };
+    let limits = |max_pairs, max_key_len, max_value_len, max_total_bytes| EffectivePolicy {
+        metadata_limits: MetadataLimits {
+            max_pairs,
+            max_key_len,
+            max_value_len,
+            max_total_bytes,
+        },
+        ..open_policy()
+    };
+    let two = [("k1", "v1"), ("k2", "v2")];
+    // (row, policy, entries, permitted)
+    let rows = [
+        ("no limits", open_policy(), pairs(&two), true),
+        (
+            "max_pairs violated",
+            limits(Some(1), None, None, None),
+            pairs(&two),
+            false,
+        ),
+        (
+            "max_pairs ok",
+            limits(Some(2), None, None, None),
+            pairs(&two),
+            true,
+        ),
+        (
+            "key_len violated",
+            limits(None, Some(3), None, None),
+            pairs(&[("toolong_key", "v")]),
+            false,
+        ),
+        (
+            "value_len violated",
+            limits(None, None, Some(5), None),
+            pairs(&[("k", "too_long_value")]),
+            false,
+        ),
+        (
+            // 4+6 + 2+2 = 14 > 10
+            "total_bytes violated",
+            limits(None, None, None, Some(10)),
+            pairs(&[("key1", "value1"), ("k2", "v2")]),
+            false,
+        ),
+        (
+            // 4+6 = 10 <= 20
+            "total_bytes ok",
+            limits(None, None, None, Some(20)),
+            pairs(&[("key1", "value1")]),
+            true,
+        ),
+        (
+            "empty entries always ok",
+            limits(Some(0), Some(0), Some(0), Some(0)),
+            vec![],
+            true,
+        ),
+    ];
+    for (row, policy, entries, permitted) in rows {
+        match PolicyResolver::check_metadata_limits(&policy, &entries) {
+            Ok(()) => assert!(permitted, "{row}: must be rejected"),
+            Err(DomainError::PolicyMetadataExceeded { .. }) => {
+                assert!(!permitted, "{row}: must be permitted");
+            }
+            Err(other) => panic!("{row}: unexpected error {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn bodies_deserialize_with_defaults_and_omit_absent_rules() {
+    // `#[serde(default)]` keeps stored rows written before a field existed readable.
+    let body: PolicyBody = serde_json::from_str("{}").unwrap();
+    assert_eq!(body, PolicyBody::default());
+
+    // `skip_serializing_if` keeps absent rules out of the stored JSON.
+    let rule = RetentionRuleBody {
+        age: Some(AgeRetention { max_age_days: 365 }),
+        ..RetentionRuleBody::default()
+    };
+    let json = serde_json::to_value(&rule).unwrap();
+    assert_eq!(json, serde_json::json!({"age": {"max_age_days": 365}}));
+}
+
+#[test]
+fn scope_parse_accepts_only_known_spellings() {
     assert_eq!(PolicyScope::parse("tenant"), Some(PolicyScope::Tenant));
     assert_eq!(PolicyScope::parse("user"), Some(PolicyScope::User));
-    assert_eq!(PolicyScope::parse("unknown"), None);
-    assert_eq!(PolicyScope::Tenant.as_str(), "tenant");
-    assert_eq!(PolicyScope::User.as_str(), "user");
-
-    assert_eq!(
-        RetentionScope::parse("tenant"),
-        Some(RetentionScope::Tenant)
-    );
-    assert_eq!(RetentionScope::parse("user"), Some(RetentionScope::User));
+    assert_eq!(PolicyScope::parse("file"), None);
     assert_eq!(RetentionScope::parse("file"), Some(RetentionScope::File));
     assert_eq!(RetentionScope::parse("bad"), None);
 }

@@ -9,7 +9,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use axum::Router;
+use axum::body::Body;
+use axum::http::Request;
 use axum::response::Response;
+use axum::routing::post;
 use bytes::Bytes;
 use sea_orm::{ConnectionTrait, Database, Statement};
 use sea_orm_migration::MigratorTrait;
@@ -20,26 +24,35 @@ use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
+use file_storage::api::rest::handlers;
 use file_storage::domain::authz::{Authorizer, TenantOnlyAuthorizer, actions};
 use file_storage::domain::cleanup::{CleanupConfig, CleanupEngine};
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::multipart::{
-    CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPlan,
+    CompletedMultipartUpload, DEFAULT_MIN_PART_SIZE, MultipartCompleteOutcome, MultipartPlan,
 };
 use file_storage::domain::multipart_service::MultipartService;
+use file_storage::domain::policy::{AgeRetention, RetentionRuleBody};
 use file_storage::domain::policy_service::PolicyService;
 use file_storage::domain::ports::{CleanupStore, DataPlanePort, MultipartStore, PolicyStore};
-use file_storage::domain::service::{FileService, ServiceConfig};
+use file_storage::domain::service::{FileService, ServiceConfig, UploadTicket};
 use file_storage::infra::backend::{
     BackendCapabilities, BackendRegistry, InMemoryBackend, MultipartCompletionPart, StorageBackend,
 };
-use file_storage::infra::content::hash_mode::Manifest;
-use file_storage::infra::external_clients::{QuotaClient, UsageReporter};
-use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
+use file_storage::infra::content::hash_mode::{HashMode, Manifest};
+use file_storage::infra::external_clients::{QuotaClient, UsageDelta, UsageReporter};
+use file_storage::infra::signed_url::{
+    Claims, Issuer, MultipartClaims, Op, UploadConstraints, Verifier,
+};
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{ByteRange, NewFile, OwnerKind};
+use file_storage::infra::storage::repo::{FileRepo, VersionRepo};
+use file_storage_sdk::{ByteRange, File, FileVersion, NewFile, OwnerKind, VersionStatus};
+
+/// Declared size that plans to exactly 3 parts at the default min part size (two full parts and
+/// a 3-byte remainder).
+pub const MULTI_PART_DECLARED_SIZE: u64 = 2 * DEFAULT_MIN_PART_SIZE + 3;
 
 pub const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
 
@@ -101,7 +114,7 @@ pub fn new_file_for(owner_id: Uuid, name: &str, mime_type: &str) -> NewFile {
     }
 }
 
-pub fn base_config() -> ServiceConfig {
+fn base_config() -> ServiceConfig {
     ServiceConfig {
         default_url_ttl_secs: 3600,
         sidecar_base_url: "http://sidecar.test".to_owned(),
@@ -119,7 +132,7 @@ pub async fn body_json(resp: Response) -> Value {
 }
 
 /// Lower-case hex of `bytes`.
-pub fn hex_encode(bytes: &[u8]) -> String {
+fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut acc, b| {
         write!(acc, "{b:02x}").expect("writing to a String cannot fail");
         acc
@@ -159,18 +172,396 @@ pub fn uuid_blob(id: Uuid) -> String {
     format!("X'{}'", hex_encode(id.as_bytes()))
 }
 
-/// Number of rows in `files`, read through a second connection to `dsn`.
-pub async fn count_files_rows(dsn: &str) -> i64 {
+/// Runs one raw statement against a second connection to `dsn`; returns the rows affected.
+pub async fn raw_exec(dsn: &str, sql: &str) -> u64 {
     let conn = Database::connect(dsn).await.expect("raw connect");
-    let row = conn
-        .query_one_raw(Statement::from_string(
-            conn.get_database_backend(),
-            "SELECT COUNT(*) AS c FROM files".to_owned(),
-        ))
+    conn.execute_raw(Statement::from_string(
+        conn.get_database_backend(),
+        sql.to_owned(),
+    ))
+    .await
+    .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"))
+    .rows_affected()
+}
+
+/// [`raw_exec`] that asserts the statement hit exactly the one row the test prepared: a silent
+/// no-op tamper would make the rest of the test meaningless.
+pub async fn exec_expect_one_row(dsn: &str, label: &str, sql: &str) {
+    assert_eq!(
+        raw_exec(dsn, sql).await,
+        1,
+        "tamper `{label}` must hit exactly the one row the test prepared"
+    );
+}
+
+/// Number of rows in `table`, read through a second connection to `dsn`.
+pub async fn raw_count(dsn: &str, table: &str) -> i64 {
+    let conn = Database::connect(dsn).await.expect("raw connect");
+    conn.query_one_raw(Statement::from_string(
+        conn.get_database_backend(),
+        format!("SELECT COUNT(*) AS c FROM {table}"),
+    ))
+    .await
+    .expect("count query")
+    .expect("one row")
+    .try_get::<i64>("", "c")
+    .expect("i64 column c")
+}
+
+/// The `fs-token` query value of a signed upload URL.
+pub fn token_of(url: &str) -> &str {
+    &url[url.find("fs-token=").expect("fs-token in URL") + "fs-token=".len()..]
+}
+
+/// A semantically valid retention-rule body, for tests focused on something else.
+pub fn valid_rule_body() -> RetentionRuleBody {
+    RetentionRuleBody {
+        age: Some(AgeRetention { max_age_days: 30 }),
+        inactivity: None,
+        metadata: None,
+    }
+}
+
+/// A `files` row for `(file_id, tenant_id)`: random user owner, unbound, created now. Override
+/// fields with struct-update syntax.
+pub fn file_row(file_id: Uuid, tenant_id: Uuid) -> File {
+    let now = time::OffsetDateTime::now_utc();
+    File {
+        file_id,
+        tenant_id,
+        owner_kind: OwnerKind::User,
+        owner_id: Uuid::now_v7(),
+        name: "doc.bin".to_owned(),
+        gts_file_type: GTS.to_owned(),
+        content_id: None,
+        meta_version: 0,
+        created_at: now,
+        last_modified_at: now,
+    }
+}
+
+/// An `Available`, non-current whole-sha256 `file_versions` row on the `mem` backend. Override
+/// fields with struct-update syntax.
+pub fn version_row(file_id: Uuid, version_id: Uuid) -> FileVersion {
+    FileVersion {
+        file_id,
+        version_id,
+        mime_type: "text/plain".to_owned(),
+        size: 0,
+        hash_algorithm: "SHA-256".to_owned(),
+        hash_value: vec![0u8; 32],
+        hash_mode: HashMode::WholeSha256.as_str().to_owned(),
+        part_count: None,
+        status: VersionStatus::Available,
+        is_current: false,
+        backend_id: "mem".to_owned(),
+        backend_path: backend_path(file_id, version_id),
+        created_at: time::OffsetDateTime::now_utc(),
+        bound_on_finalize: false,
+    }
+}
+
+/// Seeds one file for `owner_id` per entry of `instants`, each with that `created_at` (ties
+/// included); returns the file ids in the order given.
+pub async fn seed_files(
+    db: &Arc<DBProvider<DbError>>,
+    tenant: Uuid,
+    owner_id: Uuid,
+    instants: &[time::OffsetDateTime],
+) -> Vec<Uuid> {
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let mut ids = Vec::with_capacity(instants.len());
+    for &created_at in instants {
+        let file = File {
+            owner_id,
+            created_at,
+            last_modified_at: created_at,
+            ..file_row(Uuid::now_v7(), tenant)
+        };
+        FileRepo::new()
+            .create(&conn, &scope, &file)
+            .await
+            .expect("create file");
+        ids.push(file.file_id);
+    }
+    ids
+}
+
+/// Seeds one file and one non-current whole-sha256 version per entry of `instants` (each with that
+/// `created_at`, ties included); returns the file id and the version ids in the order given.
+pub async fn seed_file_with_versions(
+    db: &Arc<DBProvider<DbError>>,
+    tenant: Uuid,
+    owner_id: Uuid,
+    instants: &[time::OffsetDateTime],
+) -> (Uuid, Vec<Uuid>) {
+    let file_id = seed_files(db, tenant, owner_id, &[time::OffsetDateTime::now_utc()]).await[0];
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let mut ids = Vec::with_capacity(instants.len());
+    for &created_at in instants {
+        let version = FileVersion {
+            created_at,
+            ..version_row(file_id, Uuid::now_v7())
+        };
+        VersionRepo::new()
+            .insert(&conn, &scope, &version)
+            .await
+            .expect("insert version");
+        ids.push(version.version_id);
+    }
+    (file_id, ids)
+}
+
+/// Inserts a two-part `multipart-composite-sha256` version of `file_id` with `manifest_text` as its
+/// manifest row; returns its id.
+pub async fn insert_composite_version(
+    db: &Arc<DBProvider<DbError>>,
+    file_id: Uuid,
+    created_at: time::OffsetDateTime,
+    manifest_text: &str,
+) -> Uuid {
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let version = FileVersion {
+        created_at,
+        hash_mode: HashMode::MultipartCompositeSha256.as_str().to_owned(),
+        part_count: Some(2),
+        ..version_row(file_id, Uuid::now_v7())
+    };
+    let versions = VersionRepo::new();
+    versions
+        .insert(&conn, &scope, &version)
         .await
-        .expect("count query")
-        .expect("one row");
-    row.try_get::<i64>("", "c").expect("i64 column c")
+        .expect("insert composite version");
+    versions
+        .insert_manifest(&conn, &scope, version.version_id, manifest_text, created_at)
+        .await
+        .expect("insert manifest");
+    version.version_id
+}
+
+/// A body-less `GET` request.
+pub fn get_req(uri: impl AsRef<str>) -> Request<Body> {
+    Request::builder()
+        .method("GET")
+        .uri(uri.as_ref())
+        .body(Body::empty())
+        .expect("build request")
+}
+
+/// Asserts `resp` is an RFC 9457 problem document with HTTP `status` (media type
+/// `application/problem+json`, `status`/`type`/`title` fields) and returns its body.
+pub async fn problem_body(resp: Response, status: u16) -> Value {
+    assert_eq!(resp.status().as_u16(), status);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(
+        content_type.starts_with("application/problem+json"),
+        "content-type was `{content_type}`"
+    );
+    let body = body_json(resp).await;
+    assert_eq!(body["status"], status, "{body}");
+    for field in ["type", "title"] {
+        assert!(
+            body[field].as_str().is_some_and(|s| !s.is_empty()),
+            "problem `{field}` must be a non-empty string: {body}"
+        );
+    }
+    body
+}
+
+/// `(field, reason)` of every violation of a canonical problem body, in order.
+pub fn violations(body: &Value) -> Vec<(String, String)> {
+    body["context"]["field_violations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no field_violations in {body}"))
+        .iter()
+        .map(|v| {
+            (
+                v["field"].as_str().expect("field").to_owned(),
+                v["reason"].as_str().expect("reason").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Creates a file, uploads `data` through the data plane and binds it.
+pub async fn bound_file(
+    svc: &FileService,
+    dp: &DataPlaneService,
+    ctx: &SecurityContext,
+    data: &'static [u8],
+) -> UploadTicket {
+    let ticket = svc
+        .create_file(ctx, new_file_of("test.txt", "text/plain"), None, false)
+        .await
+        .unwrap();
+    dp.put_content(
+        ctx,
+        ticket.file_id,
+        ticket.version_id,
+        "text/plain",
+        Bytes::from_static(data),
+    )
+    .await
+    .unwrap();
+    svc.bind(ctx, ticket.file_id, ticket.version_id, None)
+        .await
+        .unwrap();
+    ticket
+}
+
+/// The file's current `content_id` (the bound version), read straight from the store.
+pub async fn content_id_of(store: &Store, file_id: Uuid) -> Option<Uuid> {
+    store
+        .get_file(&AccessScope::allow_all(), file_id)
+        .await
+        .expect("get_file")
+        .expect("file")
+        .content_id
+}
+
+/// Plants a completion lease held by `owner` that expires `secs_from_now` seconds from now
+/// (negative = already expired: a completer that died mid-assembly).
+pub async fn plant_lease(
+    multipart_store: &Arc<dyn MultipartStore>,
+    upload_id: Uuid,
+    owner: &str,
+    secs_from_now: i64,
+) {
+    let now = time::OffsetDateTime::now_utc();
+    let acquired = multipart_store
+        .acquire_multipart_complete_lease(
+            upload_id,
+            owner,
+            now + time::Duration::seconds(secs_from_now),
+            now,
+        )
+        .await
+        .expect("acquire lease");
+    assert!(acquired, "test setup: the lease must attach to the session");
+}
+
+/// The `report_multipart_part` callback behind the internal secret [`REPORT_SECRET`].
+pub fn report_part_router(verifier: Arc<Verifier>, msvc: Arc<MultipartService>) -> Router {
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
+        REPORT_SECRET.to_owned(),
+        time::Duration::ZERO,
+    ));
+    Router::new()
+        .route(
+            "/api/file-storage/v1/files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report",
+            post(handlers::report_multipart_part),
+        )
+        .layer(axum::Extension(verifier))
+        .layer(axum::Extension(finalize_auth))
+        .layer(axum::Extension(msvc))
+}
+
+const REPORT_SECRET: &str = "test-internal-secret";
+
+/// A `report_multipart_part` request for `part_number` of `plan`, authenticated with `token`.
+pub fn report_part_request(
+    file_id: Uuid,
+    plan: &MultipartPlan,
+    part_number: u32,
+    token: &str,
+    body: &Value,
+) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/api/file-storage/v1/files/{file_id}/versions/{}/multipart/{}/parts/{part_number}/report",
+            plan.version_id, plan.upload_id
+        ))
+        .header("content-type", "application/json")
+        .header("x-fs-token", token)
+        .header("x-fs-internal-token", REPORT_SECRET)
+        .body(Body::from(serde_json::to_vec(body).expect("serialize body")))
+        .expect("build request")
+}
+
+/// The authz-focused stack: [`ScopedTestAuthorizer`] (optionally `ADMIN_POLICY`-gated) over one
+/// fresh store.
+pub struct AuthzHarness {
+    pub file_svc: Arc<FileService>,
+    pub policy_svc: Arc<PolicyService>,
+    pub policy_store: Arc<dyn PolicyStore>,
+    pub authz: Arc<ScopedTestAuthorizer>,
+    /// For direct row edits that simulate stored state drifting.
+    pub db: Arc<DBProvider<DbError>>,
+}
+
+pub async fn authz_harness(tag: &str, admin_gated: bool) -> AuthzHarness {
+    let authz = Arc::new(if admin_gated {
+        ScopedTestAuthorizer::admin_gated()
+    } else {
+        ScopedTestAuthorizer::new()
+    });
+    let s = StackBuilder::new(tag)
+        .authorizer(Arc::clone(&authz) as Arc<dyn Authorizer>)
+        .build()
+        .await;
+    AuthzHarness {
+        file_svc: s.svc,
+        policy_svc: s.psvc,
+        policy_store: Arc::new(s.store),
+        authz,
+        db: s.db,
+    }
+}
+
+/// A `NewFile` owned by `owner_id`, for the authz tests.
+pub fn owned_file(owner_id: Uuid) -> NewFile {
+    new_file_for(owner_id, "victim.bin", "application/octet-stream")
+}
+
+/// Capturing `UsageReporter`. Production reports from a spawned task, so a test awaits the
+/// expected number of reports on a channel instead of sleeping.
+pub struct FakeUsageReporter {
+    tx: tokio::sync::mpsc::UnboundedSender<UsageDelta>,
+    rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<UsageDelta>>,
+    seen: tokio::sync::Mutex<Vec<UsageDelta>>,
+}
+
+impl FakeUsageReporter {
+    pub fn new() -> Arc<Self> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Arc::new(Self {
+            tx,
+            rx: tokio::sync::Mutex::new(rx),
+            seen: tokio::sync::Mutex::default(),
+        })
+    }
+
+    /// Waits until at least `at_least` deltas have been reported in total, then yields once so
+    /// the other already spawned report tasks land too, and returns every delta in arrival order.
+    /// `reports(0)` is the "nothing (more) was reported" check.
+    pub async fn reports(&self, at_least: usize) -> Vec<UsageDelta> {
+        let mut rx = self.rx.lock().await;
+        let mut seen = self.seen.lock().await;
+        while seen.len() < at_least {
+            seen.push(rx.recv().await.expect("reporter channel closed"));
+        }
+        tokio::task::yield_now().await;
+        while let Ok(delta) = rx.try_recv() {
+            seen.push(delta);
+        }
+        seen.clone()
+    }
+}
+
+#[async_trait]
+impl UsageReporter for FakeUsageReporter {
+    async fn report(&self, delta: UsageDelta) {
+        self.tx.send(delta).expect("reporter channel open");
+    }
 }
 
 /// Grants every action inside the caller's tenant, except as configured:
@@ -437,16 +828,16 @@ impl StackBuilder {
         }
     }
 
+    /// Like [`Self::new`], over two in-memory backends: `"mem"` (the default) and `"alt"`.
+    pub fn dual_backend(tag: &str) -> Self {
+        let (mem, alt) = mem_and_alt_backends();
+        Self::new(tag).backends(vec![mem, alt], "mem")
+    }
+
     /// Reuse an already migrated DB (and its DSN) instead of creating a fresh one.
     pub fn db(mut self, db: Arc<DBProvider<DbError>>, dsn: &str) -> Self {
         self.db = Some((db, dsn.to_owned()));
         self
-    }
-
-    /// A single backend, which is also the registry default.
-    pub fn backend(self, backend: Arc<dyn StorageBackend>) -> Self {
-        let id = backend.id().to_owned();
-        self.backends(vec![backend], &id)
     }
 
     /// The backend set and the registry's default backend id; `Stack::backend` is the first one.
@@ -478,21 +869,9 @@ impl StackBuilder {
         self
     }
 
-    /// The whole `ServiceConfig`; `default_url_ttl_secs` / `sidecar_base_url` also drive the
-    /// `MultipartService`, the page sizes also drive the `PolicyService`.
-    pub fn config(mut self, cfg: ServiceConfig) -> Self {
-        self.cfg = cfg;
-        self
-    }
-
     pub fn page_sizes(mut self, default_page_size: u64, max_page_size: u64) -> Self {
         self.cfg.default_page_size = default_page_size;
         self.cfg.max_page_size = max_page_size;
-        self
-    }
-
-    pub fn idempotency_ttl_secs(mut self, secs: u64) -> Self {
-        self.cfg.idempotency_ttl_secs = secs;
         self
     }
 
@@ -603,36 +982,6 @@ impl StackBuilder {
     }
 }
 
-/// Build a [`Stack`] on the caller's `issuer` (so tests can mint tokens `svc.verifier()` accepts).
-/// `complete_lease_secs` overrides the multipart complete lease when set.
-pub async fn build_stack(
-    tag: &str,
-    issuer: Arc<Issuer>,
-    complete_lease_secs: Option<i64>,
-) -> Stack {
-    build_stack_with(tag, issuer, 3600, move |msvc| match complete_lease_secs {
-        Some(secs) => msvc.with_complete_lease_secs(secs),
-        None => msvc,
-    })
-    .await
-}
-
-/// [`build_stack`] with a custom per-part URL TTL (for both services) and a hook to tweak the
-/// `MultipartService` (session TTL, lease, ...) before it is shared.
-pub async fn build_stack_with(
-    tag: &str,
-    issuer: Arc<Issuer>,
-    url_ttl_secs: i64,
-    tweak: impl FnOnce(MultipartService) -> MultipartService + 'static,
-) -> Stack {
-    StackBuilder::new(tag)
-        .issuer(issuer)
-        .url_ttl_secs(url_ttl_secs)
-        .tweak_msvc(tweak)
-        .build()
-        .await
-}
-
 /// Upload one part of `plan` the way the sidecar would: bytes to the backend, then the part row.
 pub async fn put_part(
     store: &Arc<dyn MultipartStore>,
@@ -647,7 +996,7 @@ pub async fn put_part(
         .await
         .expect("query session")
         .expect("session");
-    let backend_path = format!("/{file_id}/{}", plan.version_id);
+    let backend_path = backend_path(file_id, plan.version_id);
     let part = plan
         .parts
         .iter()
@@ -681,6 +1030,67 @@ pub async fn put_part(
         )
         .await
         .expect("upsert part");
+}
+
+/// A new file with a two-part session (a 5 MiB part and a 4 KiB tail) whose parts are uploaded but
+/// not completed. Returns `(file_id, plan, full content)`.
+pub async fn composite_session(s: &Stack, ctx: &SecurityContext) -> (Uuid, MultipartPlan, Vec<u8>) {
+    let file_id = s
+        .svc
+        .create_file(ctx, new_file("upload.bin"), None, false)
+        .await
+        .expect("create file")
+        .file_id;
+    let parts = [
+        Bytes::from(vec![b'a'; 5 * 1024 * 1024]),
+        Bytes::from(vec![b'c'; 4096]),
+    ];
+    let full: Vec<u8> = parts.iter().flat_map(|p| p.iter().copied()).collect();
+    let plan = s
+        .msvc
+        .initiate_multipart_upload(
+            ctx,
+            file_id,
+            "application/octet-stream",
+            full.len() as u64,
+            None,
+            false,
+        )
+        .await
+        .expect("initiate");
+    assert_eq!(plan.parts.len(), 2, "test setup: a two-part plan");
+    for (part, data) in plan.parts.iter().zip(parts) {
+        put_part(
+            &s.multipart_store,
+            &s.backend,
+            &plan,
+            file_id,
+            part.part_number,
+            data,
+        )
+        .await;
+    }
+    (file_id, plan, full)
+}
+
+/// A file for `ctx` with no content yet (one pending version); returns its id.
+pub async fn bare_file(svc: &FileService, ctx: &SecurityContext) -> Uuid {
+    svc.create_file(ctx, new_file("upload.bin"), None, false)
+        .await
+        .expect("create file")
+        .file_id
+}
+
+/// A manual-bind session of `size` bytes on `file_id` with the default part size.
+pub async fn initiate(
+    msvc: &MultipartService,
+    ctx: &SecurityContext,
+    file_id: Uuid,
+    size: u64,
+) -> MultipartPlan {
+    msvc.initiate_multipart_upload(ctx, file_id, "application/octet-stream", size, None, false)
+        .await
+        .expect("initiate")
 }
 
 /// A one-part session of exactly `data` on `file_id` (the part is uploaded, nothing completed).
