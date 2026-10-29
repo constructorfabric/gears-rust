@@ -1894,7 +1894,7 @@ pub const EVOLVING: &str =
 /// (gts sec 4.4) and the checker reports `incompatible`. Measured over the
 /// Studio domain model as the exporter emits it today, that is 188 of 188 node
 /// types.
-fn requirement_revision(
+pub fn requirement_revision(
     properties: &serde_json::Value,
     required: &[&str],
     index: &[&str],
@@ -1925,7 +1925,7 @@ fn requirement_revision(
     }
 }
 
-fn requirement_properties(
+pub fn requirement_properties(
     status_values: &[&str],
     with_owner: bool,
     urgency: bool,
@@ -1945,7 +1945,7 @@ fn requirement_properties(
 }
 
 /// Model v7: what the graph already holds 10 000 of.
-fn requirement_v1() -> TypeRegistration {
+pub fn requirement_v1() -> TypeRegistration {
     requirement_revision(
         &requirement_properties(&["proposed", "approved"], false, false),
         &["key", "statement"],
@@ -1953,7 +1953,7 @@ fn requirement_v1() -> TypeRegistration {
     )
 }
 
-fn requirement(key: &str, status: &str) -> NodeSpec {
+pub fn requirement(key: &str, status: &str) -> NodeSpec {
     NodeSpec {
         node_key: key.to_owned(),
         type_id: EVOLVING.to_owned(),
@@ -1986,7 +1986,7 @@ async fn seed_requirements(store: &dyn GraphStoreV1, ctx: &StoreCtx<'_>, statuse
         .expect("the requirements commit");
 }
 
-fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
+pub fn update_options() -> graph_storage_sdk::models::TypeRegistrationOptions {
     graph_storage_sdk::models::TypeRegistrationOptions {
         on_existing: graph_storage_sdk::models::OnExisting::Update,
         revalidate: false,

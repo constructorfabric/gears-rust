@@ -10,8 +10,9 @@ use async_trait::async_trait;
 use graph_storage_sdk::GraphStorageClientV1;
 use graph_storage_sdk::models::{
     DeleteOutcome, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
+    NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page, RegisteredType, SearchRequest,
+    SearchResponse, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_macros::domain_model;
@@ -33,13 +34,14 @@ impl GraphStorageLocalClient {
 
 #[async_trait]
 impl GraphStorageClientV1 for GraphStorageLocalClient {
-    async fn register_types(
+    async fn register_types_with(
         &self,
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, CanonicalError> {
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, CanonicalError> {
         self.services
-            .register_types(ctx, batch)
+            .register_types_with(ctx, batch, options)
             .await
             .map_err(Into::into)
     }

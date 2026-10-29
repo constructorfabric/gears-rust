@@ -11,8 +11,9 @@ use toolkit_security::SecurityContext;
 
 use crate::models::{
     DeleteOutcome, EdgeKey, GraphRevision, GtsTypeId, IngestOutcome, IngestRequest,
-    NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page, SearchRequest, SearchResponse,
-    TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
+    NeighborhoodRequest, NodeKey, NodeRow, NodeView, Page, RegisteredType, SearchRequest,
+    SearchResponse, TraversalResponse, TraverseRequest, TypeQuery, TypeRecord, TypeRegistration,
+    TypeRegistrationOptions,
 };
 
 /// Object-safe client for in-process consumption by other gears (version 1).
@@ -55,14 +56,42 @@ use crate::models::{
 pub trait GraphStorageClientV1: Send + Sync {
     // --- ontology ---------------------------------------------------------
 
-    /// Register a batch of GTS types, atomically. Byte-identical
-    /// re-registration converges; a different schema for a registered
-    /// identifier conflicts.
+    /// Register a batch of GTS types, atomically, under `options` -- the same
+    /// options `POST /types` takes.
+    ///
+    /// `on_existing: Update` admits a changed schema under a registered
+    /// identifier when the change is admissible (ADR-0006): backward
+    /// compatible, or -- with `revalidate` -- contradicted by no stored row,
+    /// or carried by a migration. That is how a type registered before its
+    /// consumers knew which paths to filter on gains an `index` declaration.
+    /// `dry_run` computes every verdict and writes nothing, and reports a
+    /// refusal in the result rather than as an error. Each item says what
+    /// happened to its type (`TypeOutcome`) and on what ground.
+    ///
+    /// The batch stays atomic: one refused type registers none.
+    async fn register_types_with(
+        &self,
+        ctx: &SecurityContext,
+        batch: Vec<TypeRegistration>,
+        options: TypeRegistrationOptions,
+    ) -> Result<Vec<RegisteredType>, CanonicalError>;
+
+    /// Register a batch of GTS types, atomically, under the default options.
+    /// Byte-identical re-registration converges; a different schema for a
+    /// registered identifier conflicts.
+    ///
+    /// Provided, not implemented: one path decides admission, so this form
+    /// cannot drift from the one that carries the options.
     async fn register_types(
         &self,
         ctx: &SecurityContext,
         batch: Vec<TypeRegistration>,
-    ) -> Result<Vec<TypeRecord>, CanonicalError>;
+    ) -> Result<Vec<TypeRecord>, CanonicalError> {
+        let registered = self
+            .register_types_with(ctx, batch, TypeRegistrationOptions::default())
+            .await?;
+        Ok(registered.into_iter().map(|item| item.record).collect())
+    }
 
     async fn get_type(
         &self,

@@ -262,9 +262,11 @@ independently developed implementation can reach the service yet; #4873).
 - *Reason codes for `not_found`, `unimplemented`, `deadline_exceeded`,
   `cancelled`, `unavailable`, `data_loss` and `unknown` are not on the wire*:
   the platform's builders for those categories carry no reason slot.
-- *The in-process `GraphStorageClientV1` is narrower than REST*: no edge read,
-  no compatibility dry run, no registration options or migrations, no
-  source-namespace operations. Widening it is a `ClientV2` question.
+- *The in-process `GraphStorageClientV1` is narrower than REST*: no edge read
+  and no source-namespace operations. Registration takes the REST options
+  through `register_types_with` (`on_existing`, `revalidate`, `dry_run`,
+  migrations), so a compatibility dry run is that call with `dry_run` set.
+  The rest comes with the contract migration (#5021).
 - *Readiness does not state the active provider identity and dimension*, and
   five matrix rows report `not_implemented`.
 - *The `source_epoch` is minted once and never rotates*; the snapshot-identity

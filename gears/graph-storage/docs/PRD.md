@@ -728,7 +728,7 @@ Every node and edge returned by any read surface **MUST** carry a gear-assigned 
 
 The system **MUST** ship a transport-agnostic SDK crate with a typed client trait covering type registration, ingest, search, traversal, projection, and metrics, registered in ClientHub for in-process consumption by other gears, with canonical platform error types. The in-process path **MUST** be subject to the same admission limits as the REST surface — resource bounds are enforced in the shared service layer, not at the HTTP edge only.
 
-> **Found while building the prototype.** Metrics are not part of the client (analytics moved out of this gear), and the trait is narrower than REST: no edge read, no compatibility dry run, no registration options or migrations, no source-namespace operations (README § Known limitations).
+> **Found while building the prototype.** Metrics are not part of the client (analytics moved out of this gear), and the trait is narrower than REST: no edge read and no source-namespace operations; registration takes the REST options, dry run and migrations included, through `register_types_with` (README § Known limitations).
 
 - **Rationale**: Producer and consumer gears integrate in-process; the SDK trait is the platform's inter-gear contract pattern.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`, `cpt-cf-graph-storage-actor-consumer-gear`

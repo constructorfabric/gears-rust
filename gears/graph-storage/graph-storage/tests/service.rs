@@ -2916,3 +2916,84 @@ async fn a_nul_is_refused_at_admission_and_named_where_it_is() {
         "query",
     );
 }
+
+/// The in-process client takes the registration options REST takes, so a
+/// type registered before its consumer knew which paths it filters on can
+/// declare them without being recreated (gears-rust #5021, #5529 item 1).
+/// The same widened schema without the options is the conflict it always was.
+#[tokio::test]
+async fn the_local_client_declares_an_index_path_on_a_registered_type() {
+    use graph_storage::domain::local_client::GraphStorageLocalClient;
+    use graph_storage_sdk::GraphStorageClientV1;
+    use graph_storage_sdk::models::TypeOutcome;
+
+    let harness = Harness::allowed();
+    let ctx = harness.ctx();
+    let client = GraphStorageLocalClient::new(std::sync::Arc::clone(&harness.services));
+    let mut types = conformance::ontology_batch();
+    types.push(conformance::requirement_v1());
+    client
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers in-process");
+    client
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![
+                    conformance::requirement("r0", "proposed"),
+                    conformance::requirement("r1", "approved"),
+                ],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("the requirements commit");
+
+    let by_priority = || {
+        conformance::projection(
+            &[conformance::EVOLVING],
+            "payload/priority eq 'normal'",
+            &[("node_key", toolkit_odata::SortDir::Asc)],
+        )
+        .query
+    };
+    let patterns = [conformance::EVOLVING.to_owned()];
+    client
+        .project_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect_err("an undeclared path is refused before the update");
+
+    let widened = || {
+        conformance::requirement_revision(
+            &conformance::requirement_properties(&["proposed", "approved"], false, false),
+            &["key", "statement"],
+            &["/payload/status", "/payload/priority"],
+        )
+    };
+    let conflict = client
+        .register_types(&ctx, vec![widened()])
+        .await
+        .expect_err("without options a changed schema is still a conflict");
+    assert_eq!(
+        conflict.status_code(),
+        409,
+        "the default stays a conflict: {conflict}"
+    );
+
+    let registered = client
+        .register_types_with(&ctx, vec![widened()], conformance::update_options())
+        .await
+        .expect("declaring another index path is admitted in-process");
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == conformance::EVOLVING)
+        .expect("the type is reported");
+    assert_eq!(updated.outcome, TypeOutcome::Updated);
+
+    let page = client
+        .project_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect("the newly declared path filters at once");
+    assert_eq!(page.items.len(), 2, "both requirements match");
+}
