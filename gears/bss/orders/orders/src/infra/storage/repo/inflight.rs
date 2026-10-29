@@ -8,9 +8,10 @@
 //!
 //! Count unit (F03 predicate 7): the lines carrying the key on each holder's current version. A
 //! claim is reached only through an inner join on its `order_id` foreign key from the orders the
-//! scope admits (as `claims::visible_holder` reads holders), counted only when its `version` is
-//! the holder's `current_version`, and joined to that version's `order_line` rows with the same
-//! `overlap_scope_key`; every row counted is reached through the secured select.
+//! scope admits (as `claims::visible_holder` reads holders), counted when its `version` is at or
+//! below the holder's `current_version` (a retained claim keeps its earlier version, as
+//! [`held_same_tuple`] reads it), and joined to the holder's current-version `order_line` rows
+//! carrying the key; every row counted is reached through the secured select.
 use super::{DBRunner, EntityTrait, QuerySelect, ScopeError, SecureEntityExt, order};
 use crate::domain::overlap::ClaimParties;
 use crate::infra::storage::entity::inflight_overlap_claim as claim;
@@ -35,9 +36,10 @@ struct KeyLines {
 }
 
 /// For each of `keys`, the current-version lines carrying it on orders `scope` admits that
-/// hold a live claim (`released_at IS NULL`) on `(payer, key)` under a resource tenant other
-/// than the tuple's resource, excluding `exclude_order`. Every key asked has an entry (zero when no line
-/// counts); an empty key set reads nothing.
+/// hold a live claim (`released_at IS NULL`, including one retained from an earlier version) on
+/// `(payer, key)` under a resource tenant other than the tuple's resource, excluding
+/// `exclude_order`. Every key asked has an entry (zero when no line counts); an empty key set
+/// reads nothing.
 ///
 /// # Errors
 /// Scope/store failure.
@@ -53,10 +55,11 @@ pub async fn count_other_orders(
         return Ok(counts);
     }
     // The holder's current-version lines with the claimed key: `order_line` joins the order on
-    // `order_id`, narrowed to the claim's version and key.
+    // `order_id`, narrowed to the order's current version (not the claim's: an amendment that
+    // retains a tuple keeps the claim row at its earlier version, `overlap::plan`) and the key.
     let lines_of_claim = line::Relation::Order.def().on_condition(|_, _| {
         Expr::col((line::Entity, line::Column::Version))
-            .eq(Expr::col((claim::Entity, claim::Column::Version)))
+            .eq(Expr::col((order::Entity, order::Column::CurrentVersion)))
             .and(
                 Expr::col((line::Entity, line::Column::OverlapItemKeys))
                     .is_null()
@@ -86,9 +89,12 @@ pub async fn count_other_orders(
         .filter(claim::Column::ResourceTenantId.ne(tuple.resource_tenant_id))
         .filter(claim::Column::OverlapScopeKey.is_in(counts.keys().map(String::as_str)))
         .filter(claim::Column::ReleasedAt.is_null())
+        // A live claim is taken for a version at or below the holder's current one (retained
+        // claims stay at their earlier version); a claim above it belongs to an uncommitted
+        // candidate and never counts.
         .filter(
             Expr::col((claim::Entity, claim::Column::Version))
-                .eq(Expr::col((order::Entity, order::Column::CurrentVersion))),
+                .lte(Expr::col((order::Entity, order::Column::CurrentVersion))),
         );
     if let Some(order_id) = exclude_order {
         query = query.filter(order::Column::OrderId.ne(order_id));

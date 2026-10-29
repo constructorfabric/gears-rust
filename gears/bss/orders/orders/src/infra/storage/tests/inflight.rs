@@ -173,10 +173,61 @@ async fn the_addend_counts_other_resource_tenants_lines_only() -> anyhow::Result
     assert_eq!(
         n.get("stale"),
         Some(&0),
-        // Guards the `claim.version = order.current_version` filter in `repo/inflight.rs`:
-        // without it the version-3 line would be joined and counted.
-        "a claim on a version other than the holder's current version never counts"
+        // Guards both the `claim.version <= order.current_version` filter and the join on the
+        // holder's current version in `repo/inflight.rs`: a claim above the current version is
+        // never counted, and the version-3 line is never joined.
+        "a claim above the holder's current version never counts"
     );
+    Ok(())
+}
+
+/// R10 (D-180, F03 §4.2 predicate 7): an amendment that keeps a tuple retains its claim row at
+/// the earlier version (`overlap::plan` never rewrites it). That holder's *current-version*
+/// lines still count, as `held_same_tuple` reads retained claims.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_retained_claim_counts_the_holders_current_version_lines() -> anyhow::Result<()> {
+    let pg = Pg::new().await?;
+    let (db, _) = pg.role("runtime").await?;
+    // Order 2 (payer 30, resource 11) claimed `kept` at version 2 with one line.
+    create_for(&db, 2, 30, 11).await?;
+    entity::order_version::Entity::insert(version(2, 2, Some(1)).into_active_model())
+        .exec(&pg.raw)
+        .await?;
+    pg.sql(&format!("UPDATE bss_orders__order SET current_version=2,version_allocation_high_water=2 WHERE order_id='{}'", u(2))).await?;
+    line_at(&pg, 2, 2, 2_001, "kept").await?;
+    claim_at(&pg, 2, 30, 11, "kept", 2, false).await?;
+    // An amendment appended version 3 with two lines on `kept` and retained the version-2 claim.
+    db.transaction_ref_mapped(|tx| {
+        Box::pin(async move {
+            let locked = repo::LockedOrder::lock_current(
+                tx,
+                &toolkit_security::AccessScope::for_resources(vec![u(2)]),
+                u(2),
+            )
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("order 2 not visible"))?;
+            locked.insert_order_version(version(2, 3, Some(2))).await?;
+            anyhow::Ok(())
+        })
+    })
+    .await?;
+    pg.sql(&format!("UPDATE bss_orders__order SET current_version=3,version_allocation_high_water=3 WHERE order_id='{}'", u(2))).await?;
+    line_at(&pg, 2, 3, 2_101, "kept").await?;
+    line_at(&pg, 2, 3, 2_102, "kept").await?;
+    // From resource 10: the two current-version lines count, never the version-2 line.
+    let n = count(&db, 10, &["kept"], None).await?;
+    assert_eq!(n.get("kept"), Some(&2), "{n:?}");
+    // The same tuple is held for predicate 9 too: both reads agree on retained claims.
+    let held = repo::inflight::held_same_tuple(
+        &db.conn()?,
+        &PrivateScope::for_payer_count(u(30)),
+        parties(30, 11),
+        &["kept".to_owned()],
+        None,
+    )
+    .await?;
+    assert_eq!(held, ["kept".to_owned()].into_iter().collect());
     Ok(())
 }
 
