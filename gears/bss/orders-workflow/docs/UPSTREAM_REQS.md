@@ -810,7 +810,7 @@ projection loses it nothing.
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
 - **Residual ask**: confirm the projection schema of each of the eleven events against the members
   the start trigger and every `listen` keep (`design/10-process-definition.md` §2.2), and confirm that
-  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `accepted_version`
+  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `acceptance` member (`accepted_version`, `accepted_at`; present only on a self-service submit, Lifecycle D-243; decision D-238)
   stay out of the projection or are accepted in engine history by the data owner. Until confirmed,
   the first route of ADR-0013 *Trigger inputs and consumed events*
   (`…-upreq-serverless-runtime-consumed-event-member-storage`, §2.9) still closes the residual on its
@@ -1755,7 +1755,7 @@ it would shorten (D-105).
    with the canonical `SEAMS.md` meaning. The PRD is the current definition site for the colliding
    `SUB-O6` and the unregistered `SUB-O7`-`SUB-O9`, so it is the artifact that must carry the fix.
 
-2. **`OrderAmended` approval-verdict re-obtaining gap.** PRD §6.2 *Approval Request and Multi-Party Gate* (`PRD.md:277`) requires Workflow to
+2. **`OrderAmended` approval-verdict re-obtaining gap.** *Closed 2026-10-29 by D-238: PRD §6.2 now states the fresh verdict for the new version.* PRD §6.2 *Approval Request and Multi-Party Gate* (`PRD.md:277`) requires Workflow to
    cancel open approval gates for the prior version on `OrderAmended` and open new
    `OrderApprovalRequest`(s) for the new version when approval is required, but no PRD section
    requires **re-obtaining the approval-requirement verdict** for the new order version before

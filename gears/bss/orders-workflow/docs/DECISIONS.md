@@ -7124,6 +7124,44 @@ the algorithm.
 `design/06-saga-and-compensation.md` §4.9; `UPSTREAM_REQS.md` §2.1 (`SUB-O5` row and the
 overlap-presence read).
 
+### D-238 (M) Lifecycle's Stage 4 amendment and consent contract is mirrored: a fresh verdict per new version, version-bound acceptance, no new calls
+
+**Accepted (2026-10-29).** *(mirrors Lifecycle D-240, D-241, D-243, D-244 and D-245 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-231, D-237)*
+
+**Decision**:
+
+1. **`OrderAmended` is now emitted.** Lifecycle sends one `OrderAmended { supersedes_version }`
+   per committed amendment (rows 18–20, Lifecycle D-245) and none on a refusal. This gear's
+   handling is unchanged (`design/03` §3.2): the prior instance terminates and the new version's
+   invocation obtains its verdict from scratch.
+2. **The fresh verdict is now a PRD requirement.** PRD §6.2 states that `OrderAmended` re-runs
+   verdict retrieval and reflection for the new `orderVersion`, as on `OrderSubmitted`, and never
+   carries the prior verdict forward. This closes `design/03` Disclosure 2 and `UPSTREAM_REQS.md`
+   §4 item 2.
+3. **Acceptance is version-bound** (Lifecycle OL-26, D-241). Begin-fulfillment's acceptance guard
+   is satisfied only by acceptance recorded on the version being fulfilled; acceptance on a
+   superseded version never counts (PRD §6.3).
+4. **`OrderSubmitted.acceptance`.** A self-service submit now carries
+   `acceptance { accepted_version, accepted_at }` (Lifecycle D-243); partner and delegated submits
+   carry none. The projection question of `UPSTREAM_REQS.md` §2.4 now names this member.
+5. **Stale results.** A result naming a version an amendment superseded is refused
+   `version-conflict` naming the current version (Lifecycle D-245). `design/03` §4.4 already maps it
+   to `moved`; no row changes.
+6. **The amend operation exists, but this gear does not call it.** `POST
+   /bss-orders/v1/orders/{orderId}/amendments` is the Seller Operator's cure for
+   `order-binding-expired` (PRD §6.3). Lifecycle's amendment reasons (`amendment-cap-exhausted`,
+   `line-not-found`, `no-lines`, D-244) and the removed `payer-rebinding-requires-seller` (D-240)
+   reach none of this gear's calls.
+
+**Rationale**: Lifecycle's Stage 4 waves 1–2 change four things this gear reads: the amendment
+event, the acceptance member, version-bound consent and the stale-result answer. The behaviour was
+already designed here; the decision records the contract and closes the PRD gap the design had
+disclosed.
+
+**Propagated**: `PRD.md` §6.2 (`fr-owf-approval-request`), §6.3 (`fr-owf-payment-auth`,
+`fr-owf-fulfillment-plan`); `DESIGN.md` §3.4 (Orders Lifecycle row); `design/03` Disclosure 2 and
+the §4.4 expected-version paragraph; `UPSTREAM_REQS.md` §2.4 and §4 item 2.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7482,6 +7520,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-211 | 05 Provisioning intents (actual start read back, 2026-10-18) | `design/05`; `UPSTREAM_REQS.md` `SUB-O10`; D-195 |
 | D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
 | D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
+| D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
@@ -7693,6 +7732,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-235 | M Valuation basis and named approver come from the approval policy adapter; seller policy holds five settings (corrects D-229, D-230) | `design/01` §3.7; `design/03` §3.3, §3.6, §3.7; `DESIGN.md` §4.7, §4.8; `PRD.md` §5.3, AC 22 |
 | D-236 | H PRD states this gear's side now and the owners' parts as named assumptions (§14) | `PRD.md`; `UPSTREAM_REQS.md` §4 items 22, 23 |
 | D-237 | M Lifecycle Stage 3 mirrored: gate refusals and `assessment` decode but never reach this gear's calls (*a 5xx* if they do); Preview and `assessment_id` not consumed; re-check conforms to Lifecycle's 22 frozen vectors, requires `count_scope` and the limit, asks every stored key, skips keyless lines; protected v2 vectors are the target | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-208, D-227, D-231 |
+| D-238 | M Lifecycle Stage 4 mirrored: `OrderAmended` emitted and a fresh verdict per new version (PRD §6.2); acceptance is version-bound; `OrderSubmitted.acceptance` on self-service submit; stale results are `version-conflict`; amend is the operator's cure, not this gear's call | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` |
 
-Highest decision number used: **D-237**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-238**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

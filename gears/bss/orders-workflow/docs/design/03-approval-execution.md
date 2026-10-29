@@ -1544,7 +1544,7 @@ a settled success of its round too, and the only way on from it is an operator r
 **Expected version and refusals from Lifecycle.** Every `approval-reflection` call **MUST** carry
 `expected_version = orderVersion`, the process `correlationId`, the `verdict`, one named
 `deciding_authority` and, on `denied` only, the `denial_reason` (§3.6 `inst-rv3-call`). A Lifecycle
-`version-conflict`, and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
+`version-conflict` (Lifecycle D-245: a result naming a superseded version), and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
 mean the order moved on while the reflection was in flight — except the terminal `rejected` a
 `reflect-approval-denied` of this version already reached, which is the reflection applied (below)
 — and they **MUST** answer `moved` with the
@@ -1656,7 +1656,7 @@ verdict forward."* This design implements that rule to keep both sides of the se
 records here that the PRD itself does not yet say so as plainly as the Lifecycle design frames it —
 the PRD owner should amend §6.2 to state the re-query requirement explicitly, closing the gap
 between what Lifecycle's design assumes of this gear and what the PRD text actually commits this
-gear to.
+gear to. **Closed 2026-10-29 (D-238):** PRD §6.2 now states it.
 
 **Open question, routed to the PRD owner**: amend PRD §6.2
 (`cpt-cf-bss-orders-workflow-fr-owf-approval-request`) to state explicitly that `OrderAmended`
