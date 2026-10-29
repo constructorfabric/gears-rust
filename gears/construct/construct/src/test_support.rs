@@ -1114,6 +1114,9 @@ impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
 pub struct MemoryWriter {
     profile: Arc<MemoryProfile>,
     conflicts: std::sync::Mutex<u32>,
+    /// Whether the write that answers a conflict also removed the plan's
+    /// facts, as another writer removing the same fact would.
+    racing: bool,
     pub plans: std::sync::Mutex<Vec<(Uuid, Plan)>>,
 }
 
@@ -1122,8 +1125,36 @@ impl MemoryWriter {
         Arc::new(Self {
             profile,
             conflicts: std::sync::Mutex::new(conflicts),
+            racing: false,
             plans: std::sync::Mutex::default(),
         })
+    }
+
+    /// A writer whose first write conflicts because another writer removed
+    /// the plan's facts just before.
+    pub fn racing(profile: Arc<MemoryProfile>) -> Arc<Self> {
+        Arc::new(Self {
+            profile,
+            conflicts: std::sync::Mutex::new(1),
+            racing: true,
+            plans: std::sync::Mutex::default(),
+        })
+    }
+
+    fn remove(&self, plan: &Plan) {
+        let removed: Vec<&NodeKey> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::RemoveEntity { entity } => Some(entity),
+                _ => None,
+            })
+            .collect();
+        self.profile
+            .facts
+            .lock()
+            .unwrap()
+            .retain(|fact| !removed.contains(&&fact.node_key));
     }
 
     pub fn plans(&self) -> Vec<Plan> {
@@ -1156,21 +1187,12 @@ impl crate::domain::planner::processing::PlanWriter for MemoryWriter {
         *version = Some(version.unwrap_or(0) + 1);
         if *conflicts > 0 {
             *conflicts -= 1;
+            if self.racing {
+                self.remove(plan);
+            }
             return Ok(Written::Conflict);
         }
-        let removed: Vec<&NodeKey> = plan
-            .steps
-            .iter()
-            .filter_map(|step| match &step.change {
-                Change::RemoveEntity { entity } => Some(entity),
-                _ => None,
-            })
-            .collect();
-        self.profile
-            .facts
-            .lock()
-            .unwrap()
-            .retain(|fact| !removed.contains(&&fact.node_key));
+        self.remove(plan);
         Ok(Written::Stored)
     }
 }

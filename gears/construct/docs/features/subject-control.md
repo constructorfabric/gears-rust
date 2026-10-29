@@ -58,19 +58,19 @@ The PRD requires that the subject sees all of its facts with their origin, in ev
 
 The DESIGN lists the view, the delete and the export. The single-fact read is added here, because the subject's screens in the host application open one fact.
 
-**Who may.** The view, the single fact and the delete are the subject's own actions, under the permission to control the profiles one owns (`cpt-cf-construct-fr-access-control`): the path must name the caller, and the AuthZ resolver must allow the action (`read` or `delete`) on the resource type `gts.cf.construct.subject.facts.v1~`, for the subject in the caller's tenant. Another subject, a caller the platform refuses, and a fact the subject does not have all answer `404`, like a subject that does not exist. An application that shows the subject its facts forwards the subject's own token. The export is not the subject's own action: the data protection officer exports a subject on its request, under the permission to export a subject's data (`export` on the same resource type); a caller without it gets `403`. The export covers the caller's tenant only, so a subject of another tenant exports empty, like a subject with no profile. Construct declares the three permissions as GTS permission instances; the tenant grants them in its policy engine.
+**Who may.** The view, the single fact and the delete are the subject's own actions, under the permission to control the profiles one owns (`cpt-cf-construct-fr-access-control`): the path must name the caller, and the AuthZ resolver must allow the action (`read` or `delete`) on the resource type `gts.cf.construct.subject.facts.v1~`, for the subject in the caller's tenant. Another subject, a caller the platform refuses, and a fact the subject does not have all answer `404`, like a subject that does not exist. A `fact_id` that is not shaped like a graph node key (letters, digits, `:`, `-`, `_`, `.`, at most 200 characters) answers `404` before anything is read, and never reaches the log. An application that shows the subject its facts forwards the subject's own token. The export is not the subject's own action: the data protection officer exports a subject on its request, under the permission to export a subject's data (`export` on the same resource type); a caller without it gets `403`. The export covers the caller's tenant only, so a subject of another tenant exports empty, like a subject with no profile. Construct declares the three permissions as GTS permission instances; the tenant grants them in its policy engine.
 
-**The facts.** Every live fact of the subject is listed: the ones the root lists for removal are left out, as in the profile read. The facts are read from graph storage as Construct's processing identity, not as the caller; without an identity every route answers `501`. Each fact has the profile read's shape plus its category: `{entity_kind, fact_id, properties, origin: {kind}, stored_at, produced_at}`. `fact_id` is the fact's graph node key, the id the profile read serves.
+**The facts.** Every live fact of the subject is listed: the ones the root lists for removal are left out, as in the profile read. Unlike the profile read, a stored fact that cannot be decoded fails the read with `500`: the subject must see, export and delete every fact, so none is left out silently. The facts are read from graph storage as Construct's processing identity, not as the caller; without an identity every route answers `501`. Each fact has the profile read's shape plus its category: `{entity_kind, fact_id, properties, origin: {kind}, stored_at, produced_at}`. `fact_id` is the fact's graph node key, the id the profile read serves.
 
-**The page.** `{items, page_info: {next_cursor, prev_cursor, limit}, version}`. `version` is the profile's version, none for a subject without a profile, so a client can poll for a change. `limit` is 50 by default and at most 200; a larger value is cut to 200, not refused. `$filter` and `$orderby` work over `fact_id`, `entity_kind`, `origin` and `stored_at`. The default order is `stored_at desc`, and `fact_id` breaks every tie. The cursor is opaque and remembers the order; a request that sends a cursor with another order, or a filter, field or cursor the list does not know, gets `400`.
+**The page.** `{items, page_info: {next_cursor, prev_cursor, limit}, version}`. `version` is the profile's version, none for a subject without a profile, so a client can poll for a change. `limit` is 50 by default and at most 200; a larger value is cut to 200, not refused. `$filter` and `$orderby` work over `fact_id`, `entity_kind`, `origin` and `stored_at`. The default order is `stored_at desc`, and `fact_id` breaks every tie. The cursor is opaque and remembers the order and the filter; a cursor sent with another filter or none, or a filter, field or value the list does not know, gets `400`, whose field violation names `$filter`, `$orderby` or `cursor`. The page is cut by Subject Control itself, so the read event names the categories of the page served, and a refused query records nothing.
 
-**The delete.** One fact is soft-deleted, as the soft-delete constraint requires (`cpt-cf-construct-constraint-graph-soft-delete-only`): the delete is a plan with one removal, whose origin is the subject, written through the profile writer against the profile's version. The writer lists the fact in the root, so no read serves it from then on, and soft-deletes its node. On a write conflict the delete reads the profile again and writes again, at most as often as processing reruns a plan (`processing.max_reruns`, 2 by default); past that it answers `503`. A delete needs no model: the writer is built wherever graph storage and an identity are.
+**The delete.** One fact is soft-deleted, as the soft-delete constraint requires (`cpt-cf-construct-constraint-graph-soft-delete-only`): the delete is a plan with one removal, whose origin is the subject, written through the profile writer against the profile's version. The writer lists the fact in the root, so no read serves it from then on, and soft-deletes its node. On a write conflict the delete waits a short, growing, jittered pause, reads the profile again and writes again, at most as often as processing reruns a plan (`processing.max_reruns`, 2 by default) and within 20 seconds; past either it answers `503`. Each conflict is logged at debug level. A fact that another write removed meanwhile answers `404`. A delete needs no model: the writer is built wherever graph storage and an identity are. A delete is not cancel-safe: a caller that goes away after the write landed leaves the fact deleted without its event; the 20 seconds keep it well inside the gateway's timeout.
 
-**The export.** `{tenant_id, subject_id, exported_at, settings: {subject_id, personalization_enabled, erasure_in_progress}, facts}`, as an attachment named `subject-{subject_id}.json`. The settings are read under the export's scope.
+**The export.** `{tenant_id, subject_id, exported_at, settings: {subject_id, personalization_enabled, erasure_in_progress}, facts}`, as an attachment named `subject-{subject_id}.json`. The settings are read under the export's scope; a refused settings read is a `403`, like a refused export.
 
 **The settings in the view.** The DESIGN shows the settings with the subject's view. The subject reads them at its settings route (Subject Settings); the export holds both.
 
-**Events.** Each view and each read of one fact writes a read event with the categories served, each delete a delete event with the fact's category, and each export a read event with the caller and the categories exported. None holds a value. They go to the structured log until the Audit gear ships.
+**Events.** Each page served and each read of one fact writes a read event with the categories served, each delete a delete event with the fact's id and category, and each export a read event with the caller and the categories exported. None holds a value. They go to the structured log until the Audit gear ships.
 
 **Out of scope**:
 
@@ -119,9 +119,9 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 **Steps**:
 1. [x] - `p1` - Caller sends `GET /construct/v1/subjects/{subject_id}/facts`, authenticated, with optional `limit`, `cursor`, `$filter` and `$orderby` - `inst-view-send`
 2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the `OData` query - `inst-view-parse`
-3. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-owner-only` for `read`, then `cpt-cf-construct-algo-subject-control-read-facts` - `inst-view-read`
-4. [x] - `p1` - Record a read event with the categories of the facts - `inst-view-event`
-5. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-paginate` on the facts. **RETURN** 200 with the page and the version - `inst-view-return`
+3. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-owner-only` for `read`, `cpt-cf-construct-algo-subject-control-read-facts`, and `cpt-cf-construct-algo-subject-control-paginate` on the facts. **IF** the query does not fit the list, 400, and nothing is recorded - `inst-view-read`
+4. [x] - `p1` - Record a read event with the categories of the facts on the page - `inst-view-event`
+5. [x] - `p1` - **RETURN** 200 with the page and the version - `inst-view-return`
 
 ### Read One of One's Own Facts
 
@@ -138,7 +138,7 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 
 **Steps**:
 1. [x] - `p1` - Caller sends `GET /construct/v1/subjects/{subject_id}/facts/{fact_id}`, authenticated - `inst-fact-send`
-2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the fact id - `inst-fact-parse`
+2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the fact id; a fact id not shaped like a node key answers 404 - `inst-fact-parse`
 3. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-owner-only` for `read` and `cpt-cf-construct-algo-subject-control-read-facts`. **IF** no live fact has the id, the fact is not visible - `inst-fact-read`
 4. [x] - `p1` - Record a read event with the fact's category - `inst-fact-event`
 5. [x] - `p1` - **RETURN** 200 with the fact - `inst-fact-return`
@@ -159,7 +159,7 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 
 **Steps**:
 1. [x] - `p1` - Caller sends `DELETE /construct/v1/subjects/{subject_id}/facts/{fact_id}`, authenticated - `inst-delete-send`
-2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the fact id - `inst-delete-parse`
+2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the fact id; a fact id not shaped like a node key answers 404 - `inst-delete-parse`
 3. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-delete`. **RETURN** 204 - `inst-delete-return`
 
 ### Export a Subject's Data
@@ -172,7 +172,7 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 - The data protection officer gets 200 with the subject's settings and every live fact, as a JSON attachment. A subject without data in the tenant exports its default settings and no facts.
 
 **Error Scenarios**:
-- The platform refuses the export: 403 on the subject facts resource.
+- The platform refuses the export, or the settings: 403 on the subject facts resource.
 - No processing identity: 501. A dependency does not answer: 503.
 
 **Steps**:
@@ -206,7 +206,7 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 **Output**: The profile's version and the live facts.
 
 **Steps**:
-1. [x] - `p1` - Build Construct's context for the tenant; without a processing identity, not configured. Read the root and its facts from graph storage as the profile read does, and leave out each fact the root lists for removal and each that cannot be decoded, logged at error. **RETURN** the root's version and the facts - `inst-facts-read`
+1. [x] - `p1` - Build Construct's context for the tenant; without a processing identity, not configured. Read the root and its facts from graph storage as the profile read does, and leave out each fact the root lists for removal. **IF** a fact cannot be decoded, fail with an internal error. **RETURN** the root's version and the facts - `inst-facts-read`
 
 ### Delete One Fact
 
@@ -217,10 +217,10 @@ The DESIGN lists the view, the delete and the export. The single-fact read is ad
 **Output**: Done, or an error.
 
 **Steps**:
-1. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-owner-only` for `delete`, and build Construct's context for the tenant - `inst-del-own`
-2. [x] - `p1` - Read the subject's facts as in `cpt-cf-construct-algo-subject-control-read-facts`. **IF** no live fact has the id, the fact is not visible, and nothing is written - `inst-del-read`
+1. [x] - `p1` - Start the budget (20 seconds). Run `cpt-cf-construct-algo-subject-control-owner-only` for `delete`, and build Construct's context for the tenant - `inst-del-own`
+2. [x] - `p1` - Read the subject's facts as in `cpt-cf-construct-algo-subject-control-read-facts`. **IF** no live fact has the id, no such fact, and nothing is written - `inst-del-read`
 3. [x] - `p1` - Build a plan with one step that removes the fact, of its category, with the subject as origin and the version just read, and write it through the profile writer - `inst-del-write`
-4. [x] - `p1` - **IF** the writer stored it, record a delete event with the fact's category. **RETURN** done. On a conflict, go back to step 2, at most `processing.max_reruns` times - `inst-del-stored`
+4. [x] - `p1` - **IF** the writer stored it, record a delete event with the fact's id and category. **RETURN** done. On a conflict, log it at debug level, pause briefly (growing, jittered), and go back to step 2, at most `processing.max_reruns` times and while the budget lasts - `inst-del-stored`
 5. [x] - `p1` - **RETURN** unavailable: the profile kept changing - `inst-del-give-up`
 
 ### Cut a Page
@@ -264,7 +264,7 @@ None. Subject Control keeps no state of its own.
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-subject-control-view`
 
-The system **MUST** serve the subject, and only the subject, every live fact of its own with its category, origin and times, paged, and one fact by its id, under the `read` permission on the subject facts resource, whether personalization is on or not. Another subject, a refusal and an unknown fact **MUST** answer 404, before anything is read for another subject.
+The system **MUST** serve the subject, and only the subject, every live fact of its own with its category, origin and times, paged, and one fact by its id, under the `read` permission on the subject facts resource, whether personalization is on or not. Another subject, a refusal, an unknown fact and a malformed fact id **MUST** answer 404, before anything is read for another subject. A fact that cannot be decoded **MUST** fail the read rather than be left out.
 
 **Implements**:
 - `cpt-cf-construct-flow-subject-control-view`
@@ -276,13 +276,13 @@ The system **MUST** serve the subject, and only the subject, every live fact of 
 - API: `GET /construct/v1/subjects/{subject_id}/facts`, `GET /construct/v1/subjects/{subject_id}/facts/{fact_id}`
 - Graph storage: the subject's root and facts, read as Construct
 
-**Verified by**: `the_owner_sees_every_fact_with_the_version_also_while_off_and_erasing`, `another_subject_is_refused_before_the_policy_service_is_asked_or_anything_is_read`, `the_owner_the_platform_refuses_gets_nothing`, `each_operation_asks_for_its_own_action_on_the_subject_facts`, `one_fact_is_served_and_a_fact_the_subject_does_not_have_is_not_visible`, `without_a_processing_identity_every_operation_is_not_configured` (service), `the_owner_lists_its_facts_newest_first_with_kind_origin_and_version`, `another_subject_or_a_refused_owner_gets_404_on_the_facts_resource`, `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found` (routes), `a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject` (over graph storage's in-memory store).
+**Verified by**: `the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_and_erasing`, `a_view_is_recorded_with_the_categories_served_and_not_at_all_for_a_bad_query`, `another_subject_is_refused_before_the_policy_service_is_asked_or_anything_is_read`, `the_owner_the_platform_refuses_gets_nothing`, `a_scope_that_does_not_reach_the_subject_is_a_refusal_and_nothing_is_read`, `each_operation_asks_for_its_own_action_on_the_subject_facts`, `one_fact_is_served_and_a_fact_the_subject_does_not_have_is_no_such_fact`, `without_a_processing_identity_every_operation_is_not_configured` (service), `the_owner_lists_its_facts_newest_first_with_kind_origin_and_version`, `another_subject_or_a_refused_owner_gets_404_on_the_facts_resource`, `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found`, `a_fact_id_that_is_no_node_key_is_not_found_without_reaching_the_service` (routes), `the_subjects_read_serves_the_live_facts_with_the_version`, `the_subjects_read_fails_on_a_fact_it_cannot_read_instead_of_leaving_it_out` (graph storage's in-memory store), `a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject` (round trip).
 
 ### The Subject's Delete
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-subject-control-delete`
 
-The system **MUST** soft-delete one live fact of the subject as a one-removal plan with the subject as origin, written against the profile's version, and **MUST** read and write again on a conflict up to the rerun limit, then answer unavailable. The fact **MUST NOT** be served from the next read, and each delete **MUST** write an event without content.
+The system **MUST** soft-delete one live fact of the subject as a one-removal plan with the subject as origin, written against the profile's version, and **MUST** read and write again after a short pause on a conflict, up to the rerun limit and within its budget, then answer unavailable. The fact **MUST NOT** be served from the next read, and each delete **MUST** write an event with the fact's id and no value. It **MUST** work without a model.
 
 **Implements**:
 - `cpt-cf-construct-flow-subject-control-delete`
@@ -294,13 +294,13 @@ The system **MUST** soft-delete one live fact of the subject as a one-removal pl
 - Graph storage: the root's removal list and version, the fact's node (soft delete)
 - Config: `processing.max_reruns`
 
-**Verified by**: `a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_fact_is_gone`, `a_delete_reads_and_writes_again_on_a_conflict`, `a_delete_gives_up_as_unavailable_once_the_reruns_are_spent`, `deleting_a_fact_the_subject_does_not_have_writes_nothing` (service), `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found` (routes), `a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject` (the real writer and soft delete over graph storage's in-memory store; the profile read no longer serves the fact and the version moved on).
+**Verified by**: `a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_fact_is_gone`, `a_delete_reads_and_writes_again_on_a_conflict`, `a_delete_gives_up_as_unavailable_once_the_reruns_are_spent`, `a_delete_gives_up_as_unavailable_once_its_budget_is_spent`, `a_fact_another_write_removed_before_the_rerun_is_no_such_fact`, `deleting_a_fact_the_subject_does_not_have_writes_nothing` (service), `without_a_model_the_subject_still_deletes_its_facts` (pipeline), `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found` (routes), `a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject` (the real writer and soft delete over graph storage's in-memory store; the profile read no longer serves the fact and the version moved on).
 
 ### The Export
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-subject-control-export`
 
-The system **MUST** give the caller with the export permission all of a subject's data in the caller's tenant, the settings and every live fact, as a JSON attachment, and **MUST** answer 403 without the permission. Each export **MUST** write a read event without content.
+The system **MUST** give the caller with the export permission all of a subject's data in the caller's tenant, the settings and every live fact, as a JSON attachment, and **MUST** answer 403 without the permission or when the settings are refused. Each export **MUST** write a read event without content.
 
 **Implements**:
 - `cpt-cf-construct-flow-subject-control-export`
@@ -309,7 +309,7 @@ The system **MUST** give the caller with the export permission all of a subject'
 - API: `GET /construct/v1/subjects/{subject_id}/export`
 - DB Table: `construct__subject_settings` (read)
 
-**Verified by**: `the_export_needs_its_permission_not_the_owner_and_holds_the_settings_and_every_fact` (service), `the_export_is_a_json_attachment_and_403_without_its_permission` (routes).
+**Verified by**: `the_export_needs_its_permission_not_the_owner_and_holds_the_settings_and_every_fact`, `a_refused_or_failed_settings_read_fails_the_export_as_it_failed` (service), `the_export_is_a_json_attachment_and_403_without_its_permission`, `a_refused_settings_read_on_the_export_is_403` (routes).
 
 ### Shared Pagination
 
@@ -321,9 +321,9 @@ The system **MUST** cut a list into cursor pages of at most 200 items, cutting a
 - `cpt-cf-construct-algo-subject-control-paginate`
 
 **Touches**:
-- Code: `api/rest/pagination.rs`, for the Review Queue's and Administrator Fact Management's lists too
+- Code: `domain/pagination.rs`, for the Review Queue's and Administrator Fact Management's lists too
 
-**Verified by**: `the_default_page_is_newest_first_and_a_limit_past_the_maximum_is_cut_to_it`, `following_the_cursor_walks_every_fact_once_in_order`, `ties_are_broken_by_the_fact_id`, `a_filter_keeps_the_facts_it_matches`, `an_unknown_field_or_a_cursor_of_another_order_is_the_callers_mistake` (pagination), `the_list_filters_orders_and_pages` (routes).
+**Verified by**: `the_default_page_is_newest_first_and_a_limit_past_the_maximum_is_cut_to_it`, `following_the_cursor_walks_every_fact_once_in_the_order_asked`, `the_default_order_walks_every_fact_once_with_ties_across_pages`, `ties_are_broken_by_the_fact_id`, `a_filter_keeps_the_facts_it_matches`, `an_unknown_field_or_a_value_of_another_kind_is_the_callers_mistake`, `a_cursor_continued_under_another_filter_is_refused` (pagination), `the_list_filters_orders_and_pages`, `following_the_cursor_over_http_serves_the_rest_once_under_the_same_filter`, `a_bad_query_names_the_part_that_is_wrong` (routes).
 
 ### Subject Control's Events
 
@@ -337,11 +337,11 @@ The system **MUST** log each view, delete and export as an event with the tenant
 **Touches**:
 - Log target: `construct::audit`
 
-**Verified by**: `each_event_names_its_kind_ids_and_categories_and_no_value`, and the recorded events in the service tests.
+**Verified by**: `a_view_names_its_tenant_subject_caller_and_categories`, `a_delete_names_the_fact_and_its_category_and_no_value`, `an_export_names_the_officer_as_caller`, and the recorded events in the service tests.
 
 ## 6. Acceptance Criteria
 
-- [ ] A subject sees all its facts with origin, also while personalization is off (`the_owner_sees_every_fact_with_the_version_also_while_off_and_erasing`, `the_owner_lists_its_facts_newest_first_with_kind_origin_and_version`).
+- [ ] A subject sees all its facts with origin, also while personalization is off (`the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_and_erasing`, `the_owner_lists_its_facts_newest_first_with_kind_origin_and_version`).
 - [ ] A deleted fact is not served from the next read (`a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject`, `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found`).
 - [ ] The export is refused without its permission; another subject or tenant answers as if there were no profile (`the_export_is_a_json_attachment_and_403_without_its_permission`, `another_subject_or_a_refused_owner_gets_404_on_the_facts_resource`).
 - [ ] Every operation asks for its own permission, and Construct declares it (`each_operation_asks_for_its_own_action_on_the_subject_facts`, `every_enforced_permission_is_declared_once`).
@@ -350,9 +350,9 @@ The system **MUST** log each view, delete and export as an event with the tenant
 
 ## 7. Non-Functional Considerations
 
-- **Security**: The caller and the tenant come only from the platform. The view, one fact and the delete are owner only, checked before the policy service is asked, and each asks for its own action; refusals and unknown facts answer 404, so the answer tells nothing about another subject. The export answers 403 to a caller without its permission, and covers the caller's tenant only. Graph storage is read and written as Construct's processing identity. Every answer is `no-store` with `nosniff`, `X-Frame-Options: DENY` and a CSP that allows nothing.
+- **Security**: The caller and the tenant come only from the platform. The view, one fact and the delete are owner only, checked before the policy service is asked, and each asks for its own action; refusals and unknown facts answer 404, so the answer tells nothing about another subject. The export answers 403 to a caller without its permission, and covers the caller's tenant only. Graph storage is read and written as Construct's processing identity. Every answer is `no-store` with `nosniff`, `X-Frame-Options: DENY`, a CSP that allows nothing, `Referrer-Policy: no-referrer`, a `Permissions-Policy` that grants no browser feature, `Cross-Origin-Resource-Policy: same-origin` and `X-Permitted-Cross-Domain-Policies: none`. A refusal is logged inside a span naming the caller, the subject and the tenant.
 - **Data integrity**: A delete is written against the profile's version, so it cannot remove a fact from a profile that changed under it; it reads again and retries. The fact is listed in the root before its node is soft-deleted, so no read serves it in between. Nothing is hard-deleted.
-- **Reliability**: The rerun limit bounds a delete; past it the answer is 503, which the caller may retry.
-- **Performance**: A list is cut from the whole profile in memory; a profile holds at most as many facts as one read takes, so a page costs one graph read.
+- **Reliability**: The rerun limit and the 20-second budget bound a delete; past either the answer is 503, which the caller may retry.
+- **Performance**: A list is cut from the whole profile in memory; a profile holds at most as many facts as one read takes, so a page costs one graph read. Each fact's sort keys are built once per page.
 - **Observability**: Each operation has a tracing span with the tenant and the subject; the export's also names the caller. Events go to `construct::audit`.
 - **Not done in this part**: see the out-of-scope list in 1.2.

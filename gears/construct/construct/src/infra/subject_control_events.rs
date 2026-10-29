@@ -42,6 +42,7 @@ impl SubjectControlEvents for LogSubjectControlEvents {
             SubjectControlEvent::Deleted {
                 tenant_id,
                 subject_id,
+                fact_id,
                 category,
             } => tracing::info!(
                 target: "construct::audit",
@@ -49,6 +50,7 @@ impl SubjectControlEvents for LogSubjectControlEvents {
                 %tenant_id,
                 %subject_id,
                 caller = %subject_id,
+                fact_id = %fact_id.0,
                 category = category.name(),
                 "subject deleted a fact"
             ),
@@ -76,39 +78,79 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::domain::plan::NodeKey;
+
+    struct Ids {
+        tenant: Uuid,
+        subject: Uuid,
+    }
+
+    impl Ids {
+        fn new() -> Self {
+            Self {
+                tenant: Uuid::new_v4(),
+                subject: Uuid::new_v4(),
+            }
+        }
+
+        /// The fields every event carries; `logs_contain` is the test's own.
+        fn assert_logged_with_caller(&self, caller: Uuid, logs_contain: impl Fn(&str) -> bool) {
+            assert!(logs_contain("construct::audit"), "the audit target");
+            assert!(logs_contain(&format!("tenant_id={}", self.tenant)));
+            assert!(logs_contain(&format!("subject_id={}", self.subject)));
+            assert!(logs_contain(&format!("caller={caller}")));
+        }
+    }
 
     #[tracing_test::traced_test]
     #[test]
-    fn each_event_names_its_kind_ids_and_categories_and_no_value() {
-        let (tenant_id, subject_id, caller) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
-        let events = LogSubjectControlEvents;
+    fn a_view_names_its_tenant_subject_caller_and_categories() {
+        let ids = Ids::new();
 
-        events.record(SubjectControlEvent::Viewed {
-            tenant_id,
-            subject_id,
+        LogSubjectControlEvents.record(SubjectControlEvent::Viewed {
+            tenant_id: ids.tenant,
+            subject_id: ids.subject,
             categories: BTreeSet::from([Category::Skill, Category::Role]),
         });
-        events.record(SubjectControlEvent::Deleted {
-            tenant_id,
-            subject_id,
+
+        assert!(logs_contain("event=\"subject_facts_viewed\""));
+        ids.assert_logged_with_caller(ids.subject, logs_contain);
+        assert!(logs_contain("categories=role,skill"));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn a_delete_names_the_fact_and_its_category_and_no_value() {
+        let ids = Ids::new();
+
+        LogSubjectControlEvents.record(SubjectControlEvent::Deleted {
+            tenant_id: ids.tenant,
+            subject_id: ids.subject,
+            fact_id: NodeKey("construct:t:fact-1".to_owned()),
             category: Category::Skill,
         });
-        events.record(SubjectControlEvent::Exported {
-            tenant_id,
-            subject_id,
-            caller,
-            categories: BTreeSet::new(),
+
+        assert!(logs_contain("event=\"subject_fact_deleted\""));
+        ids.assert_logged_with_caller(ids.subject, logs_contain);
+        assert!(logs_contain("fact_id=construct:t:fact-1"));
+        assert!(logs_contain("category=\"skill\""));
+    }
+
+    #[tracing_test::traced_test]
+    #[test]
+    fn an_export_names_the_officer_as_caller() {
+        let ids = Ids::new();
+        let officer = Uuid::new_v4();
+
+        LogSubjectControlEvents.record(SubjectControlEvent::Exported {
+            tenant_id: ids.tenant,
+            subject_id: ids.subject,
+            caller: officer,
+            categories: BTreeSet::from([Category::Preference]),
         });
 
-        for event in [
-            "subject_facts_viewed",
-            "subject_fact_deleted",
-            "subject_data_exported",
-        ] {
-            assert!(logs_contain(event), "{event}");
-        }
-        assert!(logs_contain(&format!("subject_id={subject_id}")));
-        assert!(logs_contain(&format!("caller={caller}")));
-        assert!(logs_contain("categories=role,skill") || logs_contain("categories=skill,role"));
+        assert!(logs_contain("event=\"subject_data_exported\""));
+        ids.assert_logged_with_caller(officer, logs_contain);
+        assert!(logs_contain("categories=preference"));
     }
 }
