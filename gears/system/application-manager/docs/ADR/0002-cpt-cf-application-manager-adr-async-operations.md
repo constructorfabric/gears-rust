@@ -25,7 +25,7 @@ description: The Application Manager gear runs every seed and uninstall as a bac
 
 ## Context and Problem Statement
 
-A seed fetches every plugin's schema and then calls `apply` on each plugin in turn; an uninstall calls `remove` on each. Each call may take up to `plugin_call_timeout`, so a request's time grows with the plugin count and can pass the gateway's 30s deadline. A call that exceeds its time limit is stopped, and each plugin keeps its own data consistent when that happens. How does the gear answer every request quickly and still bring every accepted request to a known end?
+A seed calls `apply` on each plugin in turn; an uninstall calls `remove` on each. Each call may take up to `plugin_call_timeout`, so a request's time grows with the plugin count and can pass the gateway's 30s deadline. A call that exceeds its time limit is stopped, and each plugin keeps its own data consistent when that happens. How does the gear answer every request quickly and still bring every accepted request to a known end?
 
 ## Decision Drivers
 
@@ -81,7 +81,7 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 ### Fully synchronous seed and uninstall within one HTTP request
 
 * Good, because the answer carries the result, with no operations table or sweeper.
-* Bad, because (N + 1) × `plugin_call_timeout` must stay under the 30s deadline, which ties the plugin count and time limit to it.
+* Bad, because N × `plugin_call_timeout` must stay under the 30s deadline, which ties the plugin count and time limit to it.
 
 ### Background operations with a durable queue that resumes work after a restart
 

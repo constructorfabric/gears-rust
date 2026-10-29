@@ -48,7 +48,7 @@ Chosen option: "Append-only history table written in the same transactions", bec
 * An `operation_history` table in the gear's database, written only by the operation repository, insert only ([DESIGN §3.7](../DESIGN.md#37-database-schemas--tables)).
 * The accepted event commits in the acceptance transaction, the finished event in the final transaction, and a refused event in its own transaction before the refusal answers.
 * A refusal whose event cannot be recorded keeps its category and is logged and signalled.
-* Rows hold only the fields of `cpt-cf-application-manager-entity-history-event-content`, are unrestricted ([ADR 0005](./0005-cpt-cf-application-manager-adr-platform-level-access.md)), and are kept without a purge.
+* Rows hold only the fields of `cpt-cf-application-manager-entity-history-event-content`, are unrestricted ([ADR 0004](./0004-cpt-cf-application-manager-adr-platform-level-access.md)), and are kept without a purge.
 * Operators read a request's events through the gear's history read after a `read_history` permit; the gear never decides from them.
 
 ### Consequences

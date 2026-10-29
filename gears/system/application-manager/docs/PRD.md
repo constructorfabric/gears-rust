@@ -123,7 +123,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Section | The part of a manifest meant for one section plugin, addressed by its section key. |
 | Section type | A type that one section plugin registers, derived directly from the section base type. It names the section and gives its section key. |
 | Section key | The name of the section type that one section plugin registers, without the section base type or any version, for example `acme.iam.roles`. |
-| Section plugin | A platform plugin that registers one section type and one priority, serves the schema for its section, and applies and removes sections. It owns all domain logic and any rollback. |
+| Section plugin | A platform plugin that registers one section type, which holds the schema for its section, and one priority, and applies and removes sections. It owns all domain logic and any rollback. |
 | Priority | A value that each section plugin registers. It fixes the order of dispatch on seed and of removal on uninstall. No two section plugins share one. |
 | Seed | Submitting a manifest for an application. The system checks it and dispatches each section to its section plugin. |
 | Uninstall | Asking every section plugin to remove an application by its id. |
@@ -160,7 +160,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 
 **ID**: `cpt-cf-application-manager-actor-section-plugin`
 
-- **Role**: A platform plugin that registers its section type and priority, serves its schema, and applies and removes its section. Called by the system.
+- **Role**: A platform plugin that registers its section type, which holds its schema, and its priority, and applies and removes its section. Called by the system.
 
 #### Platform Access Control
 
@@ -174,7 +174,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 flowchart LR
     SC["Seeding Caller"] -->|"seed, uninstall, discover, read operation"| AM["Application Manager"]
     OP["Operator"] -->|"seed, uninstall, discover, read operation, read history, list applications"| AM
-    AM -->|"get schema, apply, remove"| SP["Section Plugin"]
+    AM -->|"apply, remove"| SP["Section Plugin"]
     AM -->|"check permission for history and applications"| PAC["Platform Access Control"]
 ```
 
@@ -286,27 +286,27 @@ The system **MUST** use the priority that each section plugin registers to fix t
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-startup-checks`
 
-The system **MUST** fail to start on any plugin-set or configuration problem: the plugin registration facility cannot answer; a section plugin's priority or section type cannot be read; a section type cannot be resolved or is not derived directly from the section base type; two section plugins share a key; two share a priority; or a setting is missing or invalid. It **MUST NOT** read an unreachable plugin registration facility as "no section plugins". When the facility answers with no section plugins, the system **MUST** start with an empty set of section keys.
+The system **MUST** fail to start on any plugin-set or configuration problem: the plugin registration facility cannot answer; a section plugin's priority or section type cannot be read; a section type cannot be resolved, is not derived directly from the section base type, or holds a schema the system cannot use; two section plugins share a key; two share a priority; or a setting is missing or invalid. It **MUST NOT** read an unreachable plugin registration facility as "no section plugins". When the facility answers with no section plugins, the system **MUST** start with an empty set of section keys.
 
 - **Rationale**: Problems must show up at deploy time, when an operator is watching, and not later at seed time.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
 
-#### Per-Seed Schema Fetch and Whole-Manifest Validation
+#### Whole-Manifest Validation
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-validate-before-dispatch`
 
-For every seed, the system **MUST** fetch the current schema from every section plugin, without reusing earlier answers, and validate the whole manifest: the envelope, and each section against its section plugin's schema. If any part is invalid, the system **MUST NOT** dispatch anything to any section plugin, and **MUST** list every problem with its location in the manifest.
+For every seed, the system **MUST** validate the whole manifest: the envelope, and each section against the schema of the section type its section plugin registers. If any part is invalid, the system **MUST NOT** dispatch anything to any section plugin, and **MUST** list every problem with its location in the manifest.
 
-- **Rationale**: Validating everything first prevents half-applied installs caused by a bad manifest. Fresh schemas let section plugins change their schema without a restart.
+- **Rationale**: Validating everything first prevents half-applied installs caused by a bad manifest.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`
 
 #### Section Schema Ownership
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-plugin-served-schemas`
 
-The system **MUST** treat each section plugin as the only source of the schema for its section, **MUST NOT** keep its own copy of a section's rules, and **MUST** apply a schema change from the next seed.
+The system **MUST** treat the section type that each section plugin registers as the only source of the schema for its section, **MUST NOT** keep rules of its own for any section, and **MUST** read the section types at startup, so a schema change applies after a restart.
 
-- **Rationale**: The section plugin knows its domain. Keeping the rules in one place avoids drift between schema and behaviour.
+- **Rationale**: The section plugin knows its domain and publishes its rules with its section type. Keeping the rules in one place avoids drift between schema and behaviour, and seeding never waits on a section plugin to learn them.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`
 - **Verification Method**: Inspection: no section rules are held outside the section plugins.
 
@@ -438,7 +438,7 @@ The system **MUST** let an authorized caller uninstall an application by its id,
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-discovery`
 
-The system **MUST** let an authorized caller list the current section keys, read the current schema for one section key, and read the combined schema for a whole manifest. Schemas **MUST** be served live from the section plugins and returned with their schema version. When a section plugin cannot answer, the read **MUST** end as temporarily unavailable. Reads end as not permitted, not found, or temporarily unavailable, and the outcome categories of seed and uninstall do not apply to reads.
+The system **MUST** let an authorized caller list the current section keys, read the current schema for one section key, and read the combined schema for a whole manifest. Schemas **MUST** come from the registered section types and be returned with their section type. A read **MUST NOT** call any section plugin. Reads end as not permitted, not found, or temporarily unavailable, and the outcome categories of seed and uninstall do not apply to reads.
 
 - **Rationale**: Application teams need to know what to put in a manifest before they seed.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -542,10 +542,10 @@ The system **MUST** treat all seeded applications as one platform-wide set, **MU
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-nfr-authorized-before-plugin`
 
-The system **MUST NOT** call any section plugin, for schema, dispatch, or removal, for a caller who is not authorized for that action.
+The system **MUST NOT** call any section plugin, for dispatch or removal, for a caller who is not authorized for that action.
 
 - **Threshold**: Zero section-plugin calls for requests from callers not allowed for the action, in tests on every action.
-- **Rationale**: Callers without permission must not trigger section-plugin work or probe section-plugin schemas.
+- **Rationale**: Callers without permission must not trigger section-plugin work.
 
 #### Bounded Plugin Call Time
 
@@ -598,7 +598,6 @@ The system **MUST** give operators a visible signal for history events that fail
 - High-volume throughput targets: not applicable, because the set of section keys is small and seeds are infrequent deploy-time requests.
 - Rate limiting at gear level: not applicable, because callers are trusted subjects. Platform request protection applies.
 - Retention and cleanup of history data: out of scope.
-- Response caching of schemas: excluded on purpose, because every seed must use fresh schemas.
 - MFA, SSO, and session management: not applicable, because the gear has no interactive sessions.
 - Safety: not applicable, because the gear only handles information.
 - Usability, accessibility, and internationalization: not applicable, because the interfaces are machine-facing with known internal users.
@@ -655,12 +654,11 @@ The system **MUST** give operators a visible signal for history events that fail
 - **Direction**: required from client
 - **Actors**: `cpt-cf-application-manager-actor-section-plugin`
 - **Protocol/Format**: Platform plugin model. Each section plugin:
-  - registers one section type, derived directly from the section base type, and one priority; the section key is derived from the section type;
-  - serves the schema for its section, with a schema version that changes whenever the schema content changes;
+  - registers one section type, derived directly from the section base type, which holds the schema for its section, and one priority; the section key is derived from the section type;
   - applies its section for an application, and removes an application on uninstall;
   - reports failures as plugin rejected, not permitted, or internal failure;
   - receives the caller's platform identity with every call, and uses its own service credentials, never the caller's.
-- **Compatibility**: Changes to the contract need coordinated updates of all section plugins. A schema change applies from the next seed, with no restart.
+- **Compatibility**: Changes to the contract need coordinated updates of all section plugins. A schema change is a new section type version and applies after a restart of the system.
 
 ## 8. Use Cases
 
@@ -790,25 +788,25 @@ The system **MUST** give operators a visible signal for history events that fail
 - [ ] Every seed and uninstall request that reaches the system, including a refused one, has its history events in the operation history (except a refusal whose history event could not be recorded), and no history event exists for a change that did not commit (`cpt-cf-application-manager-nfr-history-completeness`).
 - [ ] History events are only ever appended to the operation history, and no other place keeps them (`cpt-cf-application-manager-fr-history-event`).
 - [ ] Nothing is dispatched until the accepted event is recorded in the operation history, the finished event is recorded together with the final report, and a refusal whose event cannot be recorded still returns its category and is logged and signalled (`cpt-cf-application-manager-fr-history-ordering`).
-- [ ] The system fails to start when the plugin registration facility cannot answer, a section plugin's priority or section type cannot be read, a section type cannot be resolved or is not derived directly from the section base type, two section plugins share a key, two share a priority, or a setting is missing or invalid, and starts with an empty key set when no section plugin exists.
+- [ ] The system fails to start when the plugin registration facility cannot answer, a section plugin's priority or section type cannot be read, a section type cannot be resolved, is not derived directly from the section base type, or holds a schema the system cannot use, two section plugins share a key, two share a priority, or a setting is missing or invalid, and starts with an empty key set when no section plugin exists.
 - [ ] After a failed dispatch the system undoes nothing (`cpt-cf-application-manager-fr-plugin-owned-semantics`).
-- [ ] A schema read that a section plugin cannot answer ends as temporarily unavailable, and a read for an unknown section key ends as not found (`cpt-cf-application-manager-fr-discovery`).
-- [ ] Discovery returns live section keys and schemas, and a manifest built from the combined schema passes validation.
+- [ ] A schema read calls no section plugin, and a read for an unknown section key ends as not found (`cpt-cf-application-manager-fr-discovery`).
+- [ ] Discovery returns the current section keys and schemas, and a manifest built from the combined schema passes validation.
 - [ ] Inspection shows no way to read manifests, no way to resume or cancel an operation, and no manifest content in logs.
 - [ ] Every refusal and every operation report carries the outcome category, what to fix, retry, or request, and the request id (`cpt-cf-application-manager-fr-response-content`).
 - [ ] Each section plugin gets only its own section, unchanged, with the envelope, and no per-section state is kept (`cpt-cf-application-manager-fr-pass-through`).
 - [ ] Application ids are compared as exact text and never parsed, and the version is passed to section plugins unchanged (`cpt-cf-application-manager-fr-application-id`, `cpt-cf-application-manager-fr-opaque-version`).
-- [ ] Discovery returns each schema with its schema version (`cpt-cf-application-manager-fr-discovery`).
+- [ ] Discovery returns each schema with its section type (`cpt-cf-application-manager-fr-discovery`).
 - [ ] Each listed operational signal is raised in tests, and the counts can be read (`cpt-cf-application-manager-nfr-operational-signals`).
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
-| Section plugins | Each provides its current schema with a schema version, application of its section on seed, and removal of an application on uninstall, and answers with success, plugin rejected, not permitted, or internal failure. | p1 |
+| Section plugins | Each provides application of its section on seed, and removal of an application on uninstall, and answers with success, plugin rejected, not permitted, or internal failure. | p1 |
 | Platform workload authentication | A validated platform identity for every seed, uninstall, discovery, and operation read request. | p1 |
 | Platform access control | A permit or deny for each read history and read applications request, given the caller subject and the action. | p1 |
-| Plugin registration facility | The list of section plugins with their priorities and section types at startup. | p1 |
+| Plugin registration facility | The list of section plugins with their priorities and section types, and the schema each section type holds, at startup. | p1 |
 | Platform storage | Storage for operation records, the operation history, and application records. | p1 |
 | Platform error format | The standard format for failed responses, able to carry the outcome category, what to fix, the running operation id, and the request id. | p1 |
 | Platform observability facility | A place to send operational logs, metrics, and operator signals. | p2 |
@@ -826,7 +824,7 @@ The system **MUST** give operators a visible signal for history events that fail
 
 | Risk | Impact | Mitigation |
 |------|--------|------------|
-| A section plugin is slow or down during seeding | A seed ends as temporarily unavailable when the section plugin cannot serve its schema, or its section ends as an internal failure when the section plugin fails during dispatch | Configurable time limit, per-section results in the report, and retry by seeding again |
+| A section plugin is slow or down during seeding | Its section ends as an internal failure when the section plugin fails or times out during dispatch | Configurable time limit, per-section results in the report, and retry by seeding again |
 | Partial success leaves section plugins out of step | Some services see the application and others do not | Section-plugin-owned rollback, per-section results, and retry |
 | A priority change reorders dispatch | A section plugin that relies on another's data sees a different order | Order changes are intentional, and section-plugin authors document how they choose a priority |
 | A manifest carries a secret | The secret could reach the system's logs, diagnostics, or error text | The seeding callers' responsibility to keep secrets out of manifests (see Assumptions), and the rule that the system does not write manifest content into its own logs |
