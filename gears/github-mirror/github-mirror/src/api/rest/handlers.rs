@@ -565,14 +565,13 @@ pub async fn list_commits(
             query.listing_filter()?.since,
         )
         .await?;
-    let items = items.items;
+    let items = items
+        .items
+        .into_iter()
+        .map(|c| CommitDto::new(c, &owner, &name))
+        .collect();
     let path = format!("/repos/{owner}/{name}/commits");
-    Ok(respond_counted(
-        &page,
-        &path,
-        GithubPage::convert(items),
-        total,
-    ))
+    Ok(respond_counted(&page, &path, items, total))
 }
 
 /// Serves `GET /repos/{owner}/{name}/branches` from the mirror with GitHub-style pagination and a `Link` header.
@@ -780,7 +779,7 @@ pub async fn get_commit(
         .await?
         .items;
 
-    let mut body = CommitDto::from(commit.clone());
+    let mut body = CommitDto::new(commit.clone(), &owner, &name);
     body.stats = Some(CommitStatsDto {
         additions: commit.additions,
         deletions: commit.deletions,
@@ -888,9 +887,12 @@ pub async fn list_pull_request_commits(
     let items = svc
         .list_pull_request_commits(&ctx, &owner, &name, number, page.window())
         .await?
-        .items;
+        .items
+        .into_iter()
+        .map(|c| CommitDto::from_pull_request_commit(c, &owner, &name))
+        .collect();
     let path = format!("/repos/{owner}/{name}/pulls/{number}/commits");
-    Ok(respond(&page, &path, GithubPage::convert(items)))
+    Ok(respond(&page, &path, items))
 }
 
 /// Serves `GET /repos/{owner}/{name}/commits/{sha}/statuses` from the mirror with GitHub-style pagination and a `Link` header.

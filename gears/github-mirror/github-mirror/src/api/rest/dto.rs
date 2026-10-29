@@ -640,6 +640,7 @@ pub struct CommitStatsDto {
 #[toolkit_macros::api_dto(response)]
 pub struct CommitDto {
     pub sha: String,
+    pub html_url: String,
     pub commit: CommitDetailDto,
     pub author: Option<ActorDto>,
     pub committer: Option<ActorDto>,
@@ -649,9 +650,15 @@ pub struct CommitDto {
     pub files: Vec<PullRequestFileDto>,
 }
 
-impl From<Commit> for CommitDto {
-    fn from(c: Commit) -> Self {
+fn commit_html_url(owner: &str, name: &str, sha: &str) -> String {
+    format!("https://github.com/{owner}/{name}/commit/{sha}")
+}
+
+impl CommitDto {
+    #[must_use]
+    pub fn new(c: Commit, owner: &str, name: &str) -> Self {
         Self {
+            html_url: commit_html_url(owner, name, &c.sha),
             sha: c.sha,
             commit: CommitDetailDto {
                 message: c.message,
@@ -1307,9 +1314,11 @@ impl From<Deployment> for DeploymentDto {
     }
 }
 
-impl From<PullRequestCommit> for CommitDto {
-    fn from(c: PullRequestCommit) -> Self {
+impl CommitDto {
+    #[must_use]
+    pub fn from_pull_request_commit(c: PullRequestCommit, owner: &str, name: &str) -> Self {
         Self {
+            html_url: commit_html_url(owner, name, &c.sha),
             sha: c.sha,
             commit: CommitDetailDto {
                 message: c.message,

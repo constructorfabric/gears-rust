@@ -237,7 +237,7 @@ pub async fn query(
                 .await?
                 .0
                 .items,
-            CommitDto::from,
+            |c| CommitDto::new(c, owner, name),
         )?,
         Entity::Contributors => rows(
             service
