@@ -12,6 +12,10 @@ use crate::domain::planner::processing::ProcessingContexts;
 /// expire before processing runs.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-wiring:p1
+/// The subject type on every processing context, so a policy can tell
+/// Construct's service account from a person.
+pub const PROCESSING_SUBJECT_TYPE: &str = "construct.service";
+
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceIdentity {
     identity: Uuid,
@@ -32,6 +36,7 @@ impl ServiceIdentity {
         SecurityContext::builder()
             .subject_id(self.identity)
             .subject_tenant_id(tenant_id)
+            .subject_type(PROCESSING_SUBJECT_TYPE)
             .build()
             .map_err(|err| DomainError::internal(format!("processing context: {err}")))
     }
@@ -65,6 +70,11 @@ mod tests {
         assert_eq!(
             (ctx.subject_id(), ctx.subject_tenant_id()),
             (identity, tenant)
+        );
+        assert_eq!(
+            ctx.subject_type(),
+            Some("construct.service"),
+            "a policy can tell the service account from a person"
         );
         let [constraint] = scope.constraints() else {
             panic!("one constraint, got {scope:?}");

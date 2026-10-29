@@ -162,7 +162,7 @@ pub fn build(
     settings: Arc<dyn SubjectSettingsReader>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
-    let model: Option<Arc<dyn ModelClient>> = match &cfg.model {
+    let model: Option<Arc<dyn ModelClient>> = match &cfg.config().model {
         Some(model) => Some(Arc::new(ChatCompletionsModel::new(
             Arc::clone(hub),
             ChatCompletionsSettings {
@@ -189,10 +189,12 @@ pub fn assemble(
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let configured = Configured {
-        identity: Part::of(cfg.processing_identity.as_ref()),
+        identity: Part::of(cfg.identity().as_ref()),
         model: Part::of(model.as_ref()),
     };
-    let identity = cfg.processing_identity.map(ServiceIdentity::new);
+    let identity = cfg
+        .identity()
+        .map(|identity| ServiceIdentity::new(identity.id));
     let contexts: Arc<dyn ProcessingContexts> = match identity {
         Some(identity) => Arc::new(identity),
         None => Arc::new(NoIdentity),
@@ -213,9 +215,9 @@ pub fn assemble(
             events: Arc::new(LogProfileEvents),
         },
         policy_enforcer,
-        // Validation requires the check with an identity; without one the
-        // read answers unavailable, and the safer check is taken.
-        match cfg.profile_category_check {
+        // Without an identity the read answers not configured before it
+        // checks a category, so the check it would take does not matter.
+        match cfg.identity().map(|identity| identity.category_check) {
             Some(CategoryCheckConfig::OneCall) => CategoryCheck::OneCall,
             Some(CategoryCheckConfig::PerCategory) | None => CategoryCheck::PerCategory,
         },
@@ -231,7 +233,7 @@ pub fn assemble(
             profile,
         });
     };
-    let (hand_off, queue) = record_queue(cfg.processing.queue_capacity);
+    let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
     let hand_off = Arc::new(hand_off);
     let load = WorkerLoad::new(Arc::downgrade(&hand_off));
     let metrics = Arc::new(ProcessingMetrics::new(
@@ -247,8 +249,8 @@ pub fn assemble(
         Arc::new(PropertyCatalog::load().context("the planner's property catalog")?),
         Arc::clone(&events) as _,
         PlannerCaps {
-            max_rounds: cfg.processing.max_rounds,
-            max_tokens: cfg.processing.max_tokens,
+            max_rounds: cfg.config().processing.max_rounds,
+            max_tokens: cfg.config().processing.max_tokens,
         },
     );
     // No real sensitive-data check exists yet; every value is allowed, and
@@ -258,10 +260,10 @@ pub fn assemble(
         "construct: record processing runs with no sensitive-data check; every planned value \
          that Admission lets through is stored"
     );
-    warn_open_lists(&cfg.admission);
+    warn_open_lists(&cfg.config().admission);
     let admission = Admission::new(AdmissionPorts {
         settings,
-        rules: Arc::new(ConfigAdmissionRules::new(&cfg.admission)),
+        rules: Arc::new(ConfigAdmissionRules::new(&cfg.config().admission)),
         events: Arc::new(LogAdmissionEvents),
         drops: Arc::clone(&events) as _,
     });
@@ -281,14 +283,14 @@ pub fn assemble(
             writer: Arc::new(writer),
             events: Arc::clone(&events),
         },
-        cfg.processing.max_reruns,
+        cfg.config().processing.max_reruns,
     ));
     Ok(Pipeline {
         hand_off,
         worker: Some(Worker {
             queue,
             processing,
-            workers: cfg.processing.workers,
+            workers: cfg.config().processing.workers,
             load,
             metrics,
             events,
@@ -358,7 +360,9 @@ impl Configured {
             );
         }
         if !identity {
-            tracing::warn!("construct: the profile read answers unavailable");
+            tracing::warn!(
+                "construct: the profile read answers 501, not configured, until processing_identity is set"
+            );
         }
     }
 }

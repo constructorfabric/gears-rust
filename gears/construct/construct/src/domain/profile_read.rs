@@ -146,7 +146,10 @@ pub struct ProfileReadService {
 /// The request for the profile of the subject at `key`, with the category
 /// when one is asked about.
 fn profile_request(key: SubjectKey, category: Option<Category>) -> AccessRequest {
+    // Constraints are required, so an answer without them is a refusal, never
+    // a grant of every profile; `granted` relies on it.
     let request = AccessRequest::new()
+        .require_constraints(true)
         .context_tenant_id(key.tenant_id)
         .tenant_mode(TenantMode::RootOnly)
         .resource_property(pep_properties::OWNER_TENANT_ID, key.tenant_id);
@@ -291,33 +294,15 @@ fn not_visible(err: EnforcerError) -> DomainError {
 /// both transports map one set of errors.
 fn read_failure(err: DomainError) -> DomainError {
     match err {
-        DomainError::OutOfScope(refused) => {
-            tracing::warn!(
-                caller = %refused.caller,
-                caller_tenant = %refused.caller_tenant,
-                tenant_id = %refused.tenant_id,
-                subject_id = %refused.subject_id,
-                refusal = ?refused.refusal,
-                "construct profile read: the subject's settings are out of the policy scope"
-            );
-            DomainError::NotVisible(format!(
-                "the policy scope does not reach the subject's settings ({:?})",
-                refused.refusal
-            ))
-        }
+        // Logged once, where the answer is mapped: the message carries the
+        // refusal with its ids, which stay out of the answer.
+        DomainError::OutOfScope(refused) => DomainError::NotVisible(format!(
+            "the policy scope does not reach the subject's settings: {refused}"
+        )),
         DomainError::Forbidden(reason) => DomainError::NotVisible(reason),
-        DomainError::ProfileFull(full) => {
-            tracing::warn!(
-                tenant_id = %full.subject.tenant_id,
-                subject_id = %full.subject.subject_id,
-                facts = ?full.facts,
-                limit = full.limit,
-                "construct profile read: the profile is larger than one read takes"
-            );
-            DomainError::internal(format!(
-                "the profile is larger than one read takes: {full:?}"
-            ))
-        }
+        DomainError::ProfileFull(full) => DomainError::internal(format!(
+            "the profile is larger than one read takes: {full:?}"
+        )),
         err @ (DomainError::Refused(_)
         | DomainError::NotVisible(_)
         | DomainError::Unavailable(_)
@@ -358,6 +343,9 @@ impl ProfileReadService {
     /// not exist. Unavailable or internal when a dependency fails. Not
     /// configured when the deployment has no processing identity. No other
     /// error.
+    ///
+    /// Cancel-safe: the read only reads, and its event is recorded after the
+    /// last await, so a dropped read leaves nothing behind.
     #[tracing::instrument(skip_all, fields(%subject_id, caller = %ctx.subject_id()))]
     pub async fn read(
         &self,
@@ -582,6 +570,22 @@ mod tests {
                     .collect(),
             ),
         ])
+    }
+
+    #[test]
+    fn a_category_filter_of_unknown_names_or_other_values_grants_no_category() {
+        let key = key();
+        for values in [
+            vec![ScopeValue::from("skills")],
+            vec![ScopeValue::from(Uuid::new_v4())],
+        ] {
+            let scope = AccessScope::single(ScopeConstraint::new(vec![
+                ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, key.tenant_id),
+                ScopeFilter::r#in(CATEGORY_PROPERTY, values.clone()),
+            ]));
+
+            assert_eq!(granted(&scope, key), Some(HashSet::new()), "{values:?}");
+        }
     }
 
     #[test]

@@ -25,14 +25,14 @@ impl LicenseFeature for License {}
 
 /// @cpt-dod:cpt-cf-construct-dod-record-intake-route:p1
 pub fn register_routes(
-    mut router: Router,
+    router: Router,
     openapi: &dyn OpenApiRegistry,
     intake: Arc<ConcreteIntake>,
     settings: Arc<ConcreteSettings>,
     profile: Arc<ConcreteProfile>,
 ) -> Router {
     // @cpt-begin:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
-    router = OperationBuilder::post("/construct/v1/records")
+    let records = OperationBuilder::post("/construct/v1/records")
         .operation_id("construct.submit_record")
         .summary("Send one connector record")
         .description(
@@ -60,11 +60,11 @@ pub fn register_routes(
         .standard_errors(openapi)
         .error_422(openapi)
         .error_503(openapi)
-        .register(router, openapi);
+        .register(Router::new(), openapi);
     // @cpt-end:cpt-cf-construct-flow-record-intake-submit:p1:inst-submit-send
 
     // Every route about one subject answers with `no-store` and the
-    // security headers.
+    // security headers, as the record route does.
     let mut subject = Router::new();
 
     // @cpt-begin:cpt-cf-construct-flow-subject-settings-view:p1:inst-view-send
@@ -154,6 +154,7 @@ pub fn register_routes(
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-send
 
     router
+        .merge(not_stored(records))
         .merge(not_stored(subject))
         .layer(Extension(intake))
         .layer(Extension(settings))
@@ -196,9 +197,11 @@ pub fn register_manage_route(
 /// `routes` with every answer, errors included, marked
 /// `Cache-Control: no-store`, so no proxy or browser cache keeps one
 /// subject's data, and with the response headers OWASP names for a JSON API:
-/// no content sniffing, no framing, no content to run. HSTS belongs to the
-/// TLS ingress. Only these routes get the layer: the router they are merged
-/// into holds other gears' routes too.
+/// no content sniffing, no framing, no content to run, no referrer, no
+/// browser features, no cross-origin embedding, no cross-domain policy files
+/// and no DNS prefetch. HSTS belongs to the TLS ingress. Every route
+/// Construct registers gets the layer, and only they do: the router they are
+/// merged into holds other gears' routes too.
 fn not_stored(routes: Router) -> Router {
     routes.layer(axum::middleware::map_response(
         |mut response: axum::response::Response| async move {
@@ -211,6 +214,20 @@ fn not_stored(routes: Router) -> Router {
                     header::CONTENT_SECURITY_POLICY,
                     "default-src 'none'; frame-ancestors 'none'",
                 ),
+                (header::REFERRER_POLICY, "no-referrer"),
+                (
+                    header::HeaderName::from_static("permissions-policy"),
+                    "camera=(), microphone=(), geolocation=(), interest-cohort=()",
+                ),
+                (
+                    header::HeaderName::from_static("cross-origin-resource-policy"),
+                    "same-origin",
+                ),
+                (
+                    header::HeaderName::from_static("x-permitted-cross-domain-policies"),
+                    "none",
+                ),
+                (header::X_DNS_PREFETCH_CONTROL, "off"),
             ] {
                 headers.insert(name, header::HeaderValue::from_static(value));
             }

@@ -226,3 +226,32 @@ async fn every_answer_of_the_route_is_no_store_with_the_security_headers() {
         }
     }
 }
+
+#[tokio::test]
+async fn the_route_asks_the_policy_service_for_manage_on_the_subject_facts() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    let resolver = Arc::new(crate::test_support::RecordingResolver::default());
+
+    let (status, body) = post(
+        router(&chain, Arc::clone(&resolver) as _, SUBJECT),
+        SUBJECT,
+        &said("I also know Rust."),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let asked: Vec<(String, String)> = resolver
+        .asked
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(resource, action, ..)| (resource.clone(), action.clone()))
+        .collect();
+    assert_eq!(
+        asked,
+        [(
+            "gts.cf.construct.subject.facts.v1~".to_owned(),
+            "manage".to_owned()
+        )]
+    );
+}
