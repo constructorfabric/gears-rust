@@ -542,7 +542,7 @@ Begin-fulfillment checks current-version acceptance and payment authorization, t
 after wave-1 drafts, before `report-spawn-signal` and activation dispatch. It uses the owning
 identity and Subscriptions SDK contracts described in [03 §3.6](03-gate-and-pin.md#contract-03-3-6), not a new Lifecycle
 endpoint or a caller-supplied pass flag. Missing public SDK operations remain prerequisites.
-The Lifecycle-side inputs — each line's stored `overlap_scope_key` and the version's market and
+The Lifecycle-side inputs — each line's stored overlap keys (`overlap_item_keys`, or the legacy scalar `overlap_scope_key`) and the version's market and
 payer — come from the composed read of [08-read-and-authz — What a read exposes (normative)](../DESIGN.md#contract-08-4-2), which
 carries them as fulfillment inputs ([`../DECISIONS.md`](../DECISIONS.md) D-144).
 The re-check returns exactly one of four outcomes ([03 §3.6](03-gate-and-pin.md#contract-03-3-6) *Re-check Activation

@@ -780,3 +780,88 @@ fn overlap_key_refuses_unknown_members() {
         );
     }
 }
+
+/// R9 (D-144, D-236 item 6): a committed line stores its keys in `overlap_item_keys` with a
+/// NULL scalar (`commit.rs`). The re-check decodes the row through `StoredLine::from_stored`,
+/// so a collection-only line is keyed and occupancy is read; a scalar-only reading of the same
+/// row would `Proceed` unread.
+#[test]
+fn a_committed_item_key_row_decodes_keyed_for_the_recheck() {
+    use bss_orders::domain::gate::ports::{PortAnswer, Unavailable};
+    use bss_orders::domain::gate::recheck::{
+        Recheck, RecheckInput, StoredLine, StoredVersion, recheck,
+    };
+    use bss_orders_sdk::catalog::{OrderState, Reason};
+
+    let line = id(2);
+    // `id` takes a `u8` (file helper).
+    let item = |index: u8, scope: &str| {
+        json!({"profile": "item_keys_v1", "selection": {
+            "line_id": line, "plan_revision_id": id(201), "paid_recurring_sku": id(30),
+            "item_id": id(40 + index), "dimension_value": null, "sku_version": 1
+        }, "overlap_scope_key": scope, "catalog_subscription_product_key": format!("product-{index}"),
+        "classification": {"source": "test", "reference": "r9", "version": "1"}})
+    };
+    let collection = json!([item(0, "a"), item(1, "b")]);
+    let stored = StoredLine::from_stored(line, None, None, Some(&collection), None).unwrap();
+    assert_eq!(
+        stored.scopes().unwrap().into_iter().collect::<Vec<_>>(),
+        ["a", "b"]
+    );
+    // A legacy row keeps its scalar; a mixed or malformed row is unevaluable.
+    let legacy = StoredLine::from_stored(line, Some("k"), None, None, None).unwrap();
+    assert_eq!(
+        legacy.scopes().unwrap().into_iter().collect::<Vec<_>>(),
+        ["k"]
+    );
+    assert_eq!(
+        StoredLine::from_stored(line, Some("k"), None, Some(&collection), None),
+        Err(Reason::OverlapPresenceUnevaluable)
+    );
+    assert_eq!(
+        StoredLine::from_stored(
+            line,
+            None,
+            None,
+            Some(&json!([{"profile": "item_keys_v1"}])),
+            None
+        ),
+        Err(Reason::OverlapPresenceUnevaluable)
+    );
+    // A keyless line decodes and reads no occupancy.
+    assert!(
+        StoredLine::from_stored(line, None, None, None, None)
+            .unwrap()
+            .scopes()
+            .unwrap()
+            .is_empty()
+    );
+    // The decoded line is keyed: an unavailable occupancy answer defers, never proceeds.
+    let input = RecheckInput {
+        requested_version: 1,
+        stored: StoredVersion {
+            order_id: None,
+            resource_tenant_id: None,
+            state: OrderState::Submitted,
+            current_version: 1,
+            market_currency: "EUR".into(),
+            market_region: "EU".into(),
+            payer_tenant_id: id(1),
+            lines: vec![stored],
+        },
+        identity: PortAnswer::Answered(PayerProfile {
+            axes_valid: true,
+            currency: "EUR".into(),
+            region: "EU".into(),
+            in_relationship_with_seller: true,
+            in_relationship_with_resource: true,
+            profile_version: "v1".into(),
+        }),
+        occupancy: PortAnswer::Unavailable(Unavailable::Outage),
+        now: at(),
+    };
+    assert_eq!(
+        recheck(&input),
+        Recheck::Defer(Reason::OverlapPresenceUnevaluable)
+    );
+}

@@ -577,7 +577,7 @@ void wave-1 drafts and lead to failure acknowledgement, while unavailable inputs
 Workflow retries under `activation-recheck-retry-budget` (baseline 3 attempts over ≤ 60 s) and, once
 it is exhausted, acknowledges failure with the port's unevaluable reason; a held, terminal or
 superseded order returns `not-dispatchable` and is re-read, never acknowledged ([03 §3.6](features/03-gate-and-pin.md#contract-03-3-6), D-127).
-Lifecycle's own re-check inputs — each line's stored `overlap_scope_key` and the version's
+Lifecycle's own re-check inputs — each line's stored overlap keys (`overlap_item_keys`, or the legacy scalar `overlap_scope_key`) and the version's
 `market_currency`, `market_region` and `payer_tenant_id` — are carried by Lifecycle's composed
 order read as fulfillment inputs ([08 §4.2](DESIGN.md#contract-08-4-2), D-144); Workflow needs no
 further Lifecycle read.

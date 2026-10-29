@@ -10397,7 +10397,7 @@ The composed read **MUST** carry the order document at its current version, each
 status with the subscription linkage.
 
 It **MUST** also carry the **fulfillment inputs** of the current version: each line's stored
-`overlap_scope_key`, the version's market (`market_currency`, `market_region`), the version's
+overlap keys (`overlap_item_keys`, or the legacy scalar `overlap_scope_key`), the version's market (`market_currency`, `market_region`), the version's
 `payer_tenant_id`, each line's `activation_deadline` (Workflow's check before each activation
 dispatch) and the `accepted_version_ref` it hands to Subscriptions (D-190). Workflow executes the activation re-check that
 [03-gate-and-pin — Interactions and Sequences](features/03-gate-and-pin.md#contract-03-3-6) *Re-check Activation Preconditions* specifies —

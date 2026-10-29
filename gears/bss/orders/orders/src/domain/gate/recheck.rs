@@ -21,18 +21,51 @@ use uuid::Uuid;
 pub struct StoredLine {
     /// The line.
     pub line_id: Uuid,
-    /// The overlap key as stored on `orders_order_line.overlap_scope_key`; `None` when the line
-    /// claims no overlap scope (nothing to re-read in step 6).
+    /// The legacy scalar overlap key (`orders_order_line.overlap_scope_key`), set only on rows
+    /// committed before item keys (D-236 item 6); `None` on every row that stores
+    /// `overlap_item_keys`, and on a keyless line.
     pub overlap_scope_key: Option<String>,
     /// Legacy scalar product identity, retained when supplied.
     pub catalog_subscription_product_key: Option<String>,
-    /// Authoritative complete collection; None is explicitly legacy.
+    /// The authoritative `item_keys_v1` collection (`orders_order_line.overlap_item_keys`): its
+    /// distinct `overlap_scope_key` values are the line's stored keys; `Some([])` is proven
+    /// keyless, `None` is a legacy row read through the scalar.
     pub overlap_item_keys: Option<Vec<super::item_keys::ItemOverlapKey>>,
     /// The accepted-binding deadline; exclusive, so `deadline <= now` is expired (D-191).
     pub binding_deadline: Option<OffsetDateTime>,
 }
 
 impl StoredLine {
+    /// One stored `orders_order_line` row's re-check inputs (D-144): the scalar key, the product
+    /// key and the item-key collection exactly as stored, and the accepted-binding deadline
+    /// (the line's `OrderPin::activation_deadline()`; `None` for a line without a pin). The
+    /// composed read (S6-01) and Workflow decode through this, never the scalar column alone.
+    ///
+    /// # Errors
+    /// [`Reason::OverlapPresenceUnevaluable`] for a collection that does not decode as
+    /// `item_keys_v1` or for mixed or invalid evidence ([`Self::scopes`]).
+    pub fn from_stored(
+        line_id: Uuid,
+        overlap_scope_key: Option<&str>,
+        catalog_subscription_product_key: Option<&str>,
+        overlap_item_keys: Option<&serde_json::Value>,
+        binding_deadline: Option<OffsetDateTime>,
+    ) -> Result<Self, Reason> {
+        let overlap_item_keys = overlap_item_keys
+            .map(|v| serde_json::from_value::<Vec<super::item_keys::ItemOverlapKey>>(v.clone()))
+            .transpose()
+            .map_err(|_| Reason::OverlapPresenceUnevaluable)?;
+        let line = Self {
+            line_id,
+            overlap_scope_key: overlap_scope_key.map(str::to_owned),
+            catalog_subscription_product_key: catalog_subscription_product_key.map(str::to_owned),
+            overlap_item_keys,
+            binding_deadline,
+        };
+        line.scopes()?;
+        Ok(line)
+    }
+
     /// Distinct scopes after rejecting malformed or mixed persisted evidence.
     /// # Errors
     /// Returns the existing unevaluable outcome for invalid stored evidence.
@@ -101,7 +134,7 @@ pub struct RecheckInput {
     pub stored: StoredVersion,
     /// Step 3: the payer's current commercial profile.
     pub identity: PortAnswer<PayerProfile>,
-    /// Step 6: occupancy per stored overlap key, keyed by `overlap_scope_key`; conflicting duplicate rows defer. Not read when no stored line carries an overlap key.
+    /// Step 6: occupancy per stored overlap key (the distinct scopes of [`StoredLine::scopes`]), keyed by `overlap_scope_key`; conflicting duplicate rows defer. Not read when no stored line carries an overlap key.
     pub occupancy: PortAnswer<Vec<(OccupancyQuery, OccupancyObservation)>>,
     /// Step 9: the live Workflow clock.
     pub now: OffsetDateTime,
