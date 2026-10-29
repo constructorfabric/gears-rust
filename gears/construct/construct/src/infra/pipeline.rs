@@ -199,7 +199,7 @@ pub fn assemble(
     };
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-read
-    // Without an identity the read answers unavailable at the identity, before
+    // Without an identity the read answers not configured at the identity, before
     // it reaches graph storage.
     let reader = Arc::new(GraphProfileSource::new(
         Arc::clone(&graph),

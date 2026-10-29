@@ -355,8 +355,9 @@ impl ProfileReadService {
     ///
     /// [`DomainError::NotVisible`] when the caller may not act for the subject
     /// in the tenant, which both transports answer like a subject that does
-    /// not exist. Unavailable or internal when a dependency fails, also when
-    /// no processing identity is configured. No other error.
+    /// not exist. Unavailable or internal when a dependency fails. Not
+    /// configured when the deployment has no processing identity. No other
+    /// error.
     #[tracing::instrument(skip_all, fields(%subject_id, caller = %ctx.subject_id()))]
     pub async fn read(
         &self,
@@ -389,8 +390,8 @@ impl ProfileReadService {
 
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-settings
         // The facts are Construct's own, so graph storage is read as
-        // Construct, not as the caller. Without an identity the read is
-        // unavailable, whatever it would serve.
+        // Construct, not as the caller. Without an identity the read is not
+        // configured, whatever it would serve.
         let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
         let settings = self
             .ports

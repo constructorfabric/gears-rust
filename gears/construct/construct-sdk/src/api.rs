@@ -40,9 +40,9 @@ pub trait ConstructClientV1: Send + Sync {
     /// # Errors
     ///
     /// A subject the caller may not act for is not found, like one that does
-    /// not exist. Unavailable when a dependency is down or no processing
-    /// identity is configured. Internal when the profile is larger than one
-    /// read takes.
+    /// not exist. Unavailable when a dependency is down. Unimplemented, which
+    /// a retry does not cure, when the deployment configures no processing
+    /// identity. Internal when the profile is larger than one read takes.
     async fn read_profile(
         &self,
         ctx: &SecurityContext,
