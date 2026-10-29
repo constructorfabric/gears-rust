@@ -9,9 +9,8 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::api::rest::error::{
-    SubjectFactsError, for_export, for_facts, for_rest, for_settings, too_long,
+    for_export, for_facts, for_rest, for_settings, no_such_fact, too_long,
 };
-use crate::api::rest::pagination::{PageError, page};
 use crate::api::rest::types::{
     ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
 };
@@ -21,8 +20,8 @@ use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
     ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
-    RecordOutcomeDto, RecordQuery, RecordRequest, SUBJECT_FACTS_LISTING, SubjectExportDto,
-    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto,
+    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectExportDto, SubjectFactDto,
+    SubjectFactsPageDto, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -148,17 +147,35 @@ pub async fn get_profile(
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-return
 }
 
-/// The answer for a page that cannot be cut: the caller's `$filter`,
-/// `$orderby` or cursor does not fit the list.
-fn bad_page(err: PageError) -> CanonicalError {
-    let (field, detail, reason) = match err {
-        PageError::Filter(detail) => ("$filter", detail, "invalid_filter"),
-        PageError::Order(detail) => ("$orderby", detail, "invalid_order"),
-        PageError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
-    };
-    SubjectFactsError::invalid_argument()
-        .with_field_violation(field, detail, reason)
-        .create()
+/// The longest fact id the routes take; a graph node key is far shorter.
+const MAX_FACT_ID_CHARS: usize = 200;
+
+/// The fact id in the path, when it has the shape of a graph node key:
+/// letters, digits, `:`, `-`, `_` and `.`, at most [`MAX_FACT_ID_CHARS`].
+/// Anything else is no fact of the subject's, and never reaches the log.
+fn fact_key(subject_id: Uuid, raw: String) -> Result<NodeKey, CanonicalError> {
+    let plausible = (1..=MAX_FACT_ID_CHARS).contains(&raw.len())
+        && raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.'));
+    if plausible {
+        Ok(NodeKey(raw))
+    } else {
+        tracing::warn!(len = raw.len(), "construct subject fact id malformed");
+        Err(no_such_fact(subject_id))
+    }
+}
+
+/// A span that names who asked for which subject, for the error mapped and
+/// logged in it.
+fn subject_span(name: &'static str, ctx: &SecurityContext, subject_id: Uuid) -> tracing::Span {
+    tracing::info_span!(
+        "subject_control",
+        operation = name,
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %ctx.subject_tenant_id()
+    )
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
@@ -170,17 +187,15 @@ pub async fn list_subject_facts(
     OData(query): OData,
     // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-parse
 ) -> ApiResult<Json<SubjectFactsPageDto>> {
-    let facts = svc
-        .view(&ctx, subject_id)
-        .await
-        .map_err(|e| for_facts(e, subject_id))?;
+    let page = async {
+        svc.view(&ctx, subject_id, &query)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(subject_span("view", &ctx, subject_id))
+    .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-return
-    let page = page(facts.facts, &query, &SUBJECT_FACTS_LISTING).map_err(bad_page)?;
-    Ok(Json(SubjectFactsPageDto {
-        items: page.items.into_iter().map(Into::into).collect(),
-        page_info: page.page_info,
-        version: facts.version,
-    }))
+    Ok(Json(SubjectFactsPageDto::from(page)))
     // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-return
 }
 
@@ -191,10 +206,14 @@ pub async fn get_subject_fact(
     Path((subject_id, fact_id)): Path<(Uuid, String)>,
     // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-parse
 ) -> ApiResult<Json<SubjectFactDto>> {
-    let fact = svc
-        .fact(&ctx, subject_id, &NodeKey(fact_id))
-        .await
-        .map_err(|e| for_facts(e, subject_id))?;
+    let fact = async {
+        let fact_id = fact_key(subject_id, fact_id)?;
+        svc.fact(&ctx, subject_id, &fact_id)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(subject_span("read_fact", &ctx, subject_id))
+    .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-return
     Ok(Json(SubjectFactDto::from(fact)))
     // @cpt-end:cpt-cf-construct-flow-subject-control-fact:p1:inst-fact-return
@@ -208,9 +227,14 @@ pub async fn delete_subject_fact(
     Path((subject_id, fact_id)): Path<(Uuid, String)>,
     // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-parse
 ) -> ApiResult<StatusCode> {
-    svc.delete(&ctx, subject_id, &NodeKey(fact_id))
-        .await
-        .map_err(|e| for_facts(e, subject_id))?;
+    async {
+        let fact_id = fact_key(subject_id, fact_id)?;
+        svc.delete(&ctx, subject_id, &fact_id)
+            .await
+            .map_err(|e| for_facts(e, subject_id))
+    }
+    .instrument(subject_span("delete_fact", &ctx, subject_id))
+    .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-return
     Ok(StatusCode::NO_CONTENT)
     // @cpt-end:cpt-cf-construct-flow-subject-control-delete:p1:inst-delete-return
@@ -224,7 +248,9 @@ pub async fn export_subject(
     Path(subject_id): Path<Uuid>,
     // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-parse
 ) -> ApiResult<impl IntoResponse> {
-    let export = svc.export(&ctx, subject_id).await.map_err(for_export)?;
+    let export = async { svc.export(&ctx, subject_id).await.map_err(for_export) }
+        .instrument(subject_span("export", &ctx, subject_id))
+        .await?;
     // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-return
     let disposition = format!("attachment; filename=\"subject-{subject_id}.json\"");
     Ok((

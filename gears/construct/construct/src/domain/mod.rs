@@ -13,6 +13,7 @@ pub mod admission;
 pub mod error;
 pub mod local_client;
 pub mod model_client;
+pub mod pagination;
 pub mod plan;
 pub mod planner;
 pub mod profile;
@@ -28,6 +29,8 @@ pub mod subject_settings;
 mod admission_test;
 #[cfg(test)]
 mod local_client_test;
+#[cfg(test)]
+mod pagination_test;
 #[cfg(test)]
 mod plan_test;
 #[cfg(test)]

@@ -43,14 +43,28 @@ impl Subject {
 
     /// The routes as `caller` of the subject's tenant sees them.
     fn routes(&self, resolver: Arc<dyn AuthZResolverApi>, caller: Uuid) -> Router {
-        let service = subject_control(
+        self.routes_with(
             resolver,
-            Arc::clone(&self.profile),
-            MemoryWriter::new(Arc::clone(&self.profile), 0),
+            caller,
             Arc::new(FixedSubjectSettings(Ok(SubjectSettings {
                 personalization_enabled: false,
                 erasure_in_progress: false,
             }))),
+        )
+    }
+
+    /// The routes as `caller` sees them, with the settings `settings`.
+    fn routes_with(
+        &self,
+        resolver: Arc<dyn AuthZResolverApi>,
+        caller: Uuid,
+        settings: Arc<dyn crate::domain::subject_settings::SubjectSettingsReader>,
+    ) -> Router {
+        let service = subject_control(
+            resolver,
+            Arc::clone(&self.profile),
+            MemoryWriter::new(Arc::clone(&self.profile), 0),
+            settings,
             Arc::default(),
             Some(Uuid::new_v4()),
         );
@@ -287,6 +301,15 @@ async fn every_answer_is_no_store_with_the_security_headers() {
             (header::CACHE_CONTROL, "no-store"),
             (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
             (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (
+                header::HeaderName::from_static("cross-origin-resource-policy"),
+                "same-origin",
+            ),
+            (
+                header::HeaderName::from_static("x-permitted-cross-domain-policies"),
+                "none",
+            ),
         ] {
             assert_eq!(
                 answer.headers.get(&name).and_then(|v| v.to_str().ok()),
@@ -295,4 +318,121 @@ async fn every_answer_is_no_store_with_the_security_headers() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn following_the_cursor_over_http_serves_the_rest_once_under_the_same_filter() {
+    let subject = Subject::new();
+    let filtered = encoded(&format!(
+        "{}?$filter=origin eq 'connector'&limit=1",
+        subject.facts()
+    ));
+
+    let first = send(subject.own(), Method::GET, &filtered).await;
+    let cursor = first.body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a next page")
+        .to_owned();
+    let second = send(
+        subject.own(),
+        Method::GET,
+        &encoded(&format!(
+            "{}?$filter=origin eq 'connector'&limit=1&cursor={cursor}",
+            subject.facts()
+        )),
+    )
+    .await;
+    let unfiltered = send(
+        subject.own(),
+        Method::GET,
+        &format!("{}?limit=1&cursor={cursor}", subject.facts()),
+    )
+    .await;
+
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+    assert_eq!(first.body["items"][0]["entity_kind"], "role");
+    assert_eq!(second.body["items"][0]["entity_kind"], "skill");
+    assert!(second.body["page_info"]["next_cursor"].is_null());
+    assert_eq!(
+        unfiltered.status,
+        StatusCode::BAD_REQUEST,
+        "a cursor resumes only its own filter: {}",
+        unfiltered.body
+    );
+    assert_eq!(
+        unfiltered.body["context"]["field_violations"][0]["field"],
+        "cursor"
+    );
+}
+
+#[tokio::test]
+async fn a_bad_query_names_the_part_that_is_wrong() {
+    let subject = Subject::new();
+
+    for (query, field, reason) in [
+        ("$filter=value eq 'x'", "$filter", "invalid_filter"),
+        ("$orderby=value asc", "$orderby", "invalid_order"),
+    ] {
+        let answer = send(
+            subject.own(),
+            Method::GET,
+            &encoded(&format!("{}?{query}", subject.facts())),
+        )
+        .await;
+
+        assert_eq!(
+            answer.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            answer.body
+        );
+        let violation = &answer.body["context"]["field_violations"][0];
+        assert_eq!(violation["field"], field, "{query}: {}", answer.body);
+        assert_eq!(violation["reason"], reason, "{query}: {}", answer.body);
+    }
+}
+
+#[tokio::test]
+async fn a_fact_id_that_is_no_node_key_is_not_found_without_reaching_the_service() {
+    let subject = Subject::new();
+    let too_long = "a".repeat(201);
+
+    for fact_id in ["bad%0Aid", "bad%20id", too_long.as_str()] {
+        for method in [Method::GET, Method::DELETE] {
+            let answer = send(subject.own(), method.clone(), &subject.fact(fact_id)).await;
+            assert_eq!(answer.status, StatusCode::NOT_FOUND, "{method} {fact_id}");
+            assert_eq!(
+                answer.body["context"]["resource_type"], FACTS_RESOURCE_TYPE,
+                "{method} {fact_id}"
+            );
+        }
+    }
+    assert_eq!(subject.profile.live().len(), 2);
+    assert!(
+        subject.profile.reads.lock().unwrap().is_empty(),
+        "nothing was read for a malformed id"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_settings_read_on_the_export_is_403() {
+    let subject = Subject::new();
+    let router = subject.routes_with(
+        Arc::new(AllowResolver),
+        Uuid::new_v4(),
+        Arc::new(FixedSubjectSettings(Err(|| {
+            crate::domain::error::DomainError::forbidden("the settings scope refuses")
+        }))),
+    );
+
+    let answer = send(
+        router,
+        Method::GET,
+        &format!("/construct/v1/subjects/{}/export", subject.id),
+    )
+    .await;
+
+    assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", answer.body);
+    assert_eq!(answer.body["context"]["resource_type"], FACTS_RESOURCE_TYPE);
 }

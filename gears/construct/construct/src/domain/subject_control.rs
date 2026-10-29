@@ -4,20 +4,25 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::AccessRequest;
+use time::OffsetDateTime;
+use tokio::time::Instant;
 use toolkit_macros::domain_model;
+use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
 
 use super::error::DomainError;
+use super::pagination::{Key, Listed, Listing, page};
 use super::plan::{Change, NodeKey, Origin, Plan, Step};
 use super::planner::manage::SUBJECT_FACTS_RESOURCE;
 use super::planner::processing::{PlanWriter, ProcessingContexts, Written};
 use super::profile::Category;
-use super::profile_read::{StoredFact, granted, read_failure, settings_scope};
+use super::profile_read::{OriginKind, StoredFact, granted, settings_scope};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 
 pub(crate) mod actions {
@@ -29,6 +34,62 @@ pub(crate) mod actions {
     pub const EXPORT: &str = "export";
 }
 
+/// How long one delete may take, its reruns and their pauses included; well
+/// below the gateway's request timeout, so the caller hears how it ended.
+pub const DELETE_BUDGET: Duration = Duration::from_secs(20);
+
+/// The fields a subject's facts list filters and orders by. Exists only to
+/// derive [`SubjectFactField`].
+#[domain_model]
+#[derive(toolkit_odata_macros::ODataFilterable)]
+pub struct SubjectFactQuery {
+    /// The fact's id, the graph node key.
+    #[odata(filter(kind = "String"))]
+    pub fact_id: String,
+    /// The fact's category: `identity`, `role`, `skill` or `preference`.
+    #[odata(filter(kind = "String"))]
+    pub entity_kind: String,
+    /// Who the fact came from: `connector`, `agent`, `reviewer` or
+    /// `administrator`.
+    #[odata(filter(kind = "String"))]
+    pub origin: String,
+    /// When the fact was stored.
+    #[odata(filter(kind = "DateTimeUtc"))]
+    pub stored_at: OffsetDateTime,
+}
+
+pub use SubjectFactQueryFilterField as SubjectFactField;
+
+/// The subject's facts list: newest first, then by fact id.
+pub const SUBJECT_FACTS_LISTING: Listing<SubjectFactField> = Listing {
+    default_order: &[(SubjectFactField::StoredAt, SortDir::Desc)],
+    tiebreaker: SubjectFactField::FactId,
+};
+
+/// The name of an origin in the list's `origin` field.
+#[must_use]
+pub fn origin_name(origin: OriginKind) -> &'static str {
+    match origin {
+        OriginKind::Connector => "connector",
+        OriginKind::Agent => "agent",
+        OriginKind::Reviewer => "reviewer",
+        OriginKind::Administrator => "administrator",
+    }
+}
+
+impl Listed for StoredFact {
+    type Field = SubjectFactField;
+
+    fn key(&self, field: SubjectFactField) -> Option<Key> {
+        Some(match field {
+            SubjectFactField::FactId => Key::text(self.node_key.0.clone()),
+            SubjectFactField::EntityKind => Key::text(self.category.name()),
+            SubjectFactField::Origin => Key::text(origin_name(self.origin)),
+            SubjectFactField::StoredAt => Key::time(self.stored_at),
+        })
+    }
+}
+
 /// A subject's live facts, and the version of its profile they belong to;
 /// none for a subject without a profile.
 #[domain_model]
@@ -38,12 +99,23 @@ pub struct SubjectFacts {
     pub facts: Vec<StoredFact>,
 }
 
+/// One page of the subject's facts, and the version of the profile it was
+/// cut from.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct SubjectFactsPage {
+    pub version: Option<u64>,
+    pub page: Page<StoredFact>,
+}
+
 /// Reads a subject's live facts with its profile's version, as Construct.
 #[async_trait]
 pub trait SubjectProfiles: Send + Sync {
     /// # Errors
     ///
-    /// The errors of the profile store.
+    /// The errors of the profile store, and an internal error for a stored
+    /// fact that cannot be read: the subject must see, export and delete
+    /// every fact, so none is left out.
     async fn facts(
         &self,
         ctx: &SecurityContext,
@@ -66,7 +138,7 @@ pub struct SubjectExport {
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SubjectControlEvent {
-    /// The subject read its own facts, all of them or one.
+    /// The subject was served its own facts, a page of them or one.
     Viewed {
         tenant_id: Uuid,
         subject_id: Uuid,
@@ -76,6 +148,7 @@ pub enum SubjectControlEvent {
     Deleted {
         tenant_id: Uuid,
         subject_id: Uuid,
+        fact_id: NodeKey,
         category: Category,
     },
     /// The data protection officer exported the subject's data.
@@ -111,6 +184,7 @@ pub struct SubjectControlService {
     ports: SubjectControlPorts,
     policy_enforcer: PolicyEnforcer,
     max_reruns: u32,
+    budget: Duration,
 }
 
 impl SubjectControlService {
@@ -124,16 +198,26 @@ impl SubjectControlService {
             ports,
             policy_enforcer,
             max_reruns,
+            budget: DELETE_BUDGET,
         }
     }
 
-    /// Every live fact of the subject, with its profile's version.
+    /// The same service with another budget for one delete.
+    #[must_use]
+    pub fn with_budget(mut self, budget: Duration) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// The page of the subject's live facts that `query` asks for, with its
+    /// profile's version.
     ///
     /// # Errors
     ///
     /// [`DomainError::Forbidden`] when the caller is not the subject or the
-    /// platform refuses; not configured without a processing identity;
-    /// unavailable or internal when a dependency fails.
+    /// platform refuses; [`DomainError::InvalidQuery`] for a filter, order
+    /// or cursor the list does not take; not configured without a
+    /// processing identity; unavailable or internal when a dependency fails.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id))]
@@ -141,26 +225,31 @@ impl SubjectControlService {
         &self,
         ctx: &SecurityContext,
         subject_id: Uuid,
-    ) -> Result<SubjectFacts, DomainError> {
+        query: &ODataQuery,
+    ) -> Result<SubjectFactsPage, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-read
         let key = self.own(ctx, subject_id, actions::READ).await?;
         let facts = self.facts(key).await?;
+        let page = page(facts.facts, query, &SUBJECT_FACTS_LISTING)?;
         // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-read
         // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-event
         self.ports.events.record(SubjectControlEvent::Viewed {
             tenant_id: key.tenant_id,
             subject_id,
-            categories: categories_of(&facts.facts),
+            categories: categories_of(&page.items),
         });
         // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-event
-        Ok(facts)
+        Ok(SubjectFactsPage {
+            version: facts.version,
+            page,
+        })
     }
 
     /// One live fact of the subject.
     ///
     /// # Errors
     ///
-    /// [`DomainError::NotVisible`] when the subject has no such live fact;
+    /// [`DomainError::NoSuchFact`] when the subject has no such live fact;
     /// otherwise as [`Self::view`].
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id))]
     pub async fn fact(
@@ -191,16 +280,23 @@ impl SubjectControlService {
 
     /// Soft-delete one live fact of the subject: a plan with one removal,
     /// written against the profile's version, and read and written again
-    /// on a conflict, at most `max_reruns` times.
+    /// after a short pause on a conflict, at most `max_reruns` times and
+    /// within the budget.
+    ///
+    /// NOT cancel-safe: a drop after the writer stored the plan leaves the
+    /// fact deleted without its delete event. The budget keeps the delete
+    /// well inside the gateway's timeout, so a drop comes only from the
+    /// caller going away.
     ///
     /// # Errors
     ///
-    /// [`DomainError::NotVisible`] when the subject has no such live fact;
-    /// unavailable when the profile kept changing past the reruns; otherwise
-    /// as [`Self::view`].
+    /// [`DomainError::NoSuchFact`] when the subject has no such live fact,
+    /// also when a concurrent write removed it before a rerun; unavailable
+    /// when the profile kept changing past the reruns or the budget;
+    /// otherwise as [`Self::view`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
-    #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id))]
+    #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id, fact_id = %fact_id.0))]
     pub async fn delete(
         &self,
         ctx: &SecurityContext,
@@ -208,10 +304,11 @@ impl SubjectControlService {
         fact_id: &NodeKey,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
+        let deadline = Instant::now() + self.budget;
         let key = self.own(ctx, subject_id, actions::DELETE).await?;
         let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
-        for _ in 0..=self.max_reruns {
+        for attempt in 0..=self.max_reruns {
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
             let current = self.ports.profiles.facts(&construct, key).await?;
             let fact = current
@@ -221,38 +318,43 @@ impl SubjectControlService {
                 .ok_or_else(|| no_such_fact(fact_id))?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
-            let plan = Plan {
-                tenant_id: key.tenant_id,
-                subject_id,
-                origin: Origin::Subject {
-                    subject: subject_id,
-                },
-                profile_version: current.version,
-                steps: vec![Step {
-                    entity_kind: fact.category.name().to_owned(),
-                    change: Change::RemoveEntity {
-                        entity: fact.node_key.clone(),
-                    },
-                    confidence: None,
-                }],
-            };
+            let plan = removal(key, current.version, fact);
             let written = self.ports.writer.write(&construct, &plan).await?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-stored
-            if written == Written::Stored {
-                self.ports.events.record(SubjectControlEvent::Deleted {
-                    tenant_id: key.tenant_id,
-                    subject_id,
-                    category: fact.category,
-                });
-                return Ok(());
+            match written {
+                Written::Stored => {
+                    self.ports.events.record(SubjectControlEvent::Deleted {
+                        tenant_id: key.tenant_id,
+                        subject_id,
+                        fact_id: fact.node_key.clone(),
+                        category: fact.category,
+                    });
+                    return Ok(());
+                }
+                Written::Conflict => {
+                    tracing::debug!(
+                        attempt,
+                        version = ?current.version,
+                        "construct: the profile changed under a delete; reading it again"
+                    );
+                    let pause = rerun_pause(attempt);
+                    if Instant::now() + pause >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(pause).await;
+                }
             }
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-stored
         }
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-give-up
+        tracing::warn!(
+            max_reruns = self.max_reruns,
+            "construct: a delete gave up; the profile kept changing"
+        );
         Err(DomainError::Unavailable(format!(
-            "the profile kept changing; fact {} was not deleted after {} reruns",
-            fact_id.0, self.max_reruns
+            "the profile kept changing; fact {} was not deleted",
+            fact_id.0
         )))
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-give-up
     }
@@ -263,9 +365,9 @@ impl SubjectControlService {
     ///
     /// # Errors
     ///
-    /// [`DomainError::Forbidden`] when the platform refuses the export; not
-    /// configured without a processing identity; unavailable or internal
-    /// when a dependency fails.
+    /// [`DomainError::Forbidden`] or [`DomainError::OutOfScope`] when the
+    /// platform refuses the export or the settings; not configured without a
+    /// processing identity; unavailable or internal when a dependency fails.
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-export:p1
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id, caller = %ctx.subject_id()))]
@@ -282,12 +384,13 @@ impl SubjectControlService {
         let scope = self.authorize(ctx, key, actions::EXPORT).await?;
         // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-authorize
         // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-read
+        // A refusal of the settings stays a refusal: the export answers it
+        // as one, not as a missing subject.
         let settings = self
             .ports
             .settings
             .read(ctx, &settings_scope(&scope), key)
-            .await
-            .map_err(read_failure)?;
+            .await?;
         let facts = self.facts(key).await?.facts;
         // @cpt-end:cpt-cf-construct-flow-subject-control-export:p1:inst-export-read
         // @cpt-begin:cpt-cf-construct-flow-subject-control-export:p1:inst-export-event
@@ -368,10 +471,38 @@ impl SubjectControlService {
     }
 }
 
+/// The subject's delete of `fact` as a plan: one step that removes it, with
+/// the subject as origin, written against `version`. The only plan with the
+/// subject as origin, and it stores nothing.
+fn removal(key: SubjectKey, version: Option<u64>, fact: &StoredFact) -> Plan {
+    Plan {
+        tenant_id: key.tenant_id,
+        subject_id: key.subject_id,
+        origin: Origin::Subject {
+            subject: key.subject_id,
+        },
+        profile_version: version,
+        steps: vec![Step {
+            entity_kind: fact.category.name().to_owned(),
+            change: Change::RemoveEntity {
+                entity: fact.node_key.clone(),
+            },
+            confidence: None,
+        }],
+    }
+}
+
+/// The pause before rerun `attempt + 1`: growing, with jitter, so a delete
+/// and processing writing the same profile drift apart.
+fn rerun_pause(attempt: u32) -> Duration {
+    let base = 20_u64.saturating_mul(1 << attempt.min(6));
+    Duration::from_millis(base + rand::random_range(0..=base))
+}
+
 fn categories_of(facts: &[StoredFact]) -> BTreeSet<Category> {
     facts.iter().map(|fact| fact.category).collect()
 }
 
 fn no_such_fact(fact_id: &NodeKey) -> DomainError {
-    DomainError::NotVisible(format!("the subject has no live fact {}", fact_id.0))
+    DomainError::NoSuchFact(format!("the subject has no live fact {}", fact_id.0))
 }

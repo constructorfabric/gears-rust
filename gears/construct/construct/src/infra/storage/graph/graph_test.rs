@@ -857,6 +857,58 @@ async fn the_application_read_leaves_out_a_fact_it_cannot_read_and_serves_the_re
     assert!(logs_contain(&foreign), "the log names the node");
 }
 
+#[tokio::test]
+async fn the_subjects_read_fails_on_a_fact_it_cannot_read_instead_of_leaving_it_out() {
+    use crate::domain::subject_control::SubjectProfiles as _;
+
+    let profiles = Profiles::new();
+    let other = profiles.neighbour();
+    other.given(None, vec![add_skill("Rust")]).await;
+    profiles.given(None, vec![add_skill("Go")]).await;
+    profiles
+        .ingest_directly(IngestRequest {
+            edges: vec![EdgeSpec {
+                type_id: construct_sdk::gts::HAS_FACT_TYPE.to_owned(),
+                src_node_key: root_key(&profiles.subject_key()).0,
+                dst_node_key: root_key(&other.subject_key()).0,
+                discriminator: None,
+                payload: None,
+            }],
+            ..IngestRequest::default()
+        })
+        .await;
+
+    let read = profiles
+        .reader()
+        .facts(&profiles.ctx, profiles.subject_key())
+        .await;
+
+    assert!(
+        matches!(read, Err(DomainError::Internal(_))),
+        "the subject must see, export and delete every fact: {read:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_subjects_read_serves_the_live_facts_with_the_version() {
+    use crate::domain::subject_control::SubjectProfiles as _;
+
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Go")]).await;
+
+    let read = profiles
+        .reader()
+        .facts(&profiles.ctx, profiles.subject_key())
+        .await
+        .unwrap();
+
+    let [fact] = read.facts.as_slice() else {
+        panic!("one fact, got {read:?}");
+    };
+    assert_eq!(fact.value, skills("Go"));
+    assert!(read.version.is_some());
+}
+
 // --- Removals ------------------------------------------------------------------
 
 /// A removal that cannot run.

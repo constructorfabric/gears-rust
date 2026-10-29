@@ -6,45 +6,80 @@
 
 use std::cmp::Ordering;
 
+use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use toolkit_odata::filter::{FilterField, FilterNode, FilterOp, ODataValue};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, Page, PageInfo, SortDir};
+use uuid::Uuid;
 
 /// The page size when the request names none.
 pub const DEFAULT_LIMIT: u64 = 50;
 /// The largest page; a larger `limit` is cut to it, not refused.
 pub const MAX_LIMIT: u64 = 200;
 
-/// An item of a paged list: the value of each of its fields as a key that
-/// sorts the way the value does.
+/// The key a field's value sorts, filters and resumes by. It is built only
+/// from text, a time or an id, each encoded so that keys compare as their
+/// values do; a cursor carries keys as their text.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Key(String);
+
+impl Key {
+    /// A text, which compares as text.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self(text.into())
+    }
+
+    /// A time, as its nanoseconds since the epoch, zero-padded to the width
+    /// of the latest time `time` represents. A time before the epoch keys as
+    /// the epoch: no stored time is earlier.
+    #[must_use]
+    pub fn time(at: OffsetDateTime) -> Self {
+        Self::nanos(at.unix_timestamp_nanos())
+    }
+
+    /// An id, as its hyphenated text.
+    #[must_use]
+    pub fn id(id: Uuid) -> Self {
+        Self(id.to_string())
+    }
+
+    fn nanos(nanos: i128) -> Self {
+        Self(format!("{:024}", nanos.max(0)))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// An item of a paged list: the key of each of its fields.
 pub trait Listed {
     type Field: FilterField;
 
     /// The key of `field`, none when the item has no value for it.
-    fn key(&self, field: Self::Field) -> Option<String>;
+    fn key(&self, field: Self::Field) -> Option<Key>;
 }
 
 /// How a list is ordered when the request names no order, and the field
 /// that makes every order total.
+#[domain_model]
 pub struct Listing<F: FilterField> {
     pub default_order: &'static [(F, SortDir)],
     pub tiebreaker: F,
 }
 
-/// Why a page cannot be cut: a bad `$filter`, an `$orderby` on a field the
-/// list does not have, or a cursor for another query. Each is the caller's
-/// mistake.
+/// Why a page cannot be cut. The first three are the caller's mistake: a
+/// bad `$filter`, an `$orderby` on a field the list does not have, or a
+/// cursor for another query. The last is Construct's own.
+#[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PageError {
     Filter(String),
     Order(String),
     Cursor(String),
-}
-
-/// The key of a time: its nanoseconds since the epoch, zero-padded, so keys
-/// sort as the times do. A time before the epoch keys as the epoch.
-#[must_use]
-pub fn time_key(nanos: i128) -> String {
-    format!("{:020}", nanos.max(0))
+    Internal(String),
 }
 
 /// The page of `items` that `query` asks for.
@@ -52,11 +87,11 @@ pub fn time_key(nanos: i128) -> String {
 /// # Errors
 ///
 /// [`PageError`] when the filter, the order or the cursor does not fit the
-/// list.
+/// list, or the next cursor cannot be built.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-subject-control-pagination:p1
 pub fn page<T: Listed>(
-    mut items: Vec<T>,
+    items: Vec<T>,
     query: &ODataQuery,
     listing: &Listing<T::Field>,
 ) -> Result<Page<T>, PageError> {
@@ -64,6 +99,7 @@ pub fn page<T: Listed>(
     let limit = query.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-limit
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-filter
+    let mut items = items;
     if let Some(expr) = query.filter.as_deref() {
         let filter = toolkit_odata::filter::convert_expr_to_filter_node::<T::Field>(expr)
             .map_err(|err| PageError::Filter(err.to_string()))?;
@@ -73,41 +109,44 @@ pub fn page<T: Listed>(
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-order
     let order = effective_order(query, listing)?;
     let fields = fields_of::<T::Field>(&order)?;
-    items.sort_by(|a, b| compare(&keys(a, &fields), &keys(b, &fields), &order));
+    // Each item's keys are built once, then sorted on, skipped by and
+    // resumed from.
+    let mut keyed: Vec<(Vec<String>, T)> = items
+        .into_iter()
+        .map(|item| (keys(&item, &fields), item))
+        .collect();
+    keyed.sort_by(|(a, _), (b, _)| compare(a, b, &order));
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-order
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-cursor
-    let mut rest: Vec<T> = match &query.cursor {
-        Some(cursor) => {
-            toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())
-                .map_err(|err| PageError::Cursor(err.to_string()))?;
-            items
-                .into_iter()
-                .filter(|item| compare(&keys(item, &fields), &cursor.k, &order).is_gt())
-                .collect()
-        }
-        None => items,
-    };
+    if let Some(cursor) = &query.cursor {
+        toolkit_odata::validate_cursor_against(cursor, &order, query.filter_hash.as_deref())
+            .map_err(|err| PageError::Cursor(err.to_string()))?;
+        keyed.retain(|(keys, _)| compare(keys, &cursor.k, &order).is_gt());
+    }
     // @cpt-end:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-cursor
     // @cpt-begin:cpt-cf-construct-algo-subject-control-paginate:p1:inst-page-cut
     let take = usize::try_from(limit).unwrap_or(usize::MAX);
-    let next_cursor = if rest.len() > take {
-        rest.truncate(take);
-        rest.last()
-            .map(|last| CursorV1 {
-                k: keys(last, &fields),
-                o: order.0.first().map_or(SortDir::Asc, |key| key.dir),
-                s: order.to_signed_tokens(),
-                f: query.filter_hash.clone(),
-                d: "fwd".to_owned(),
-            })
-            .map(|cursor| cursor.encode())
-            .transpose()
-            .map_err(|err| PageError::Cursor(err.to_string()))?
+    let next_cursor = if keyed.len() > take {
+        keyed.truncate(take);
+        match keyed.last() {
+            Some((last, _)) => Some(
+                CursorV1 {
+                    k: last.clone(),
+                    o: order.0.first().map_or(SortDir::Asc, |key| key.dir),
+                    s: order.to_signed_tokens(),
+                    f: query.filter_hash.clone(),
+                    d: "fwd".to_owned(),
+                }
+                .encode()
+                .map_err(|err| PageError::Internal(format!("the next cursor: {err}")))?,
+            ),
+            None => None,
+        }
     } else {
         None
     };
     Ok(Page::new(
-        rest,
+        keyed.into_iter().map(|(_, item)| item).collect(),
         PageInfo {
             next_cursor,
             prev_cursor: None,
@@ -156,10 +195,11 @@ fn fields_of<F: FilterField>(order: &ODataOrderBy) -> Result<Vec<F>, PageError> 
         .collect()
 }
 
+/// The item's keys for `fields`, as text, an absent value as the empty text.
 fn keys<T: Listed>(item: &T, fields: &[T::Field]) -> Vec<String> {
     fields
         .iter()
-        .map(|field| item.key(*field).unwrap_or_default())
+        .map(|field| item.key(*field).map(|key| key.0).unwrap_or_default())
         .collect()
 }
 
@@ -181,12 +221,12 @@ fn compare(a: &[String], b: &[String], order: &ODataOrderBy) -> Ordering {
 
 fn matches<T: Listed>(item: &T, filter: &FilterNode<T::Field>) -> bool {
     match filter {
-        FilterNode::Binary { field, op, value } => holds(item.key(*field), *op, value),
+        FilterNode::Binary { field, op, value } => holds(item.key(*field).as_ref(), *op, value),
         FilterNode::InList { field, values } => {
             let key = item.key(*field);
             values
                 .iter()
-                .any(|value| holds(key.clone(), FilterOp::Eq, value))
+                .any(|value| holds(key.as_ref(), FilterOp::Eq, value))
         }
         FilterNode::Composite {
             op: FilterOp::Or,
@@ -199,14 +239,13 @@ fn matches<T: Listed>(item: &T, filter: &FilterNode<T::Field>) -> bool {
 }
 
 /// Whether an item's key stands in `op` to `value`. An absent key is equal
-/// to nothing, so only `ne` holds for it.
-fn holds(key: Option<String>, op: FilterOp, value: &ODataValue) -> bool {
-    let Some(key) = key else {
+/// to nothing, so only `ne` holds for it. The typed filter lets through only
+/// values of the field's kind, so a value without a key is never compared.
+fn holds(key: Option<&Key>, op: FilterOp, value: &ODataValue) -> bool {
+    let (Some(key), Some(probe)) = (key, value_key(value)) else {
         return op == FilterOp::Ne;
     };
-    let Some(probe) = value_key(value) else {
-        return op == FilterOp::Ne;
-    };
+    let (key, probe) = (key.as_str(), probe.as_str());
     match op {
         FilterOp::Eq => key == probe,
         FilterOp::Ne => key != probe,
@@ -214,22 +253,25 @@ fn holds(key: Option<String>, op: FilterOp, value: &ODataValue) -> bool {
         FilterOp::Ge => key >= probe,
         FilterOp::Lt => key < probe,
         FilterOp::Le => key <= probe,
-        FilterOp::Contains => key.contains(&probe),
-        FilterOp::StartsWith => key.starts_with(&probe),
-        FilterOp::EndsWith => key.ends_with(&probe),
+        FilterOp::Contains => key.contains(probe),
+        FilterOp::StartsWith => key.starts_with(probe),
+        FilterOp::EndsWith => key.ends_with(probe),
         FilterOp::In | FilterOp::And | FilterOp::Or => false,
     }
 }
 
-/// A filter value as a key of the same form [`Listed::key`] gives.
-fn value_key(value: &ODataValue) -> Option<String> {
+/// A filter value as the key [`Listed::key`] gives for the same value.
+fn value_key(value: &ODataValue) -> Option<Key> {
     match value {
-        ODataValue::String(text) => Some(text.clone()),
-        ODataValue::Uuid(id) => Some(id.to_string()),
-        ODataValue::DateTime(at) => at.timestamp_nanos_opt().map(|n| time_key(i128::from(n))),
-        ODataValue::Bool(flag) => Some(flag.to_string()),
-        ODataValue::Null | ODataValue::Number(_) | ODataValue::Date(_) | ODataValue::Time(_) => {
-            None
-        }
+        ODataValue::String(text) => Some(Key::text(text.clone())),
+        ODataValue::Uuid(id) => Some(Key::id(*id)),
+        ODataValue::DateTime(at) => Some(Key::nanos(
+            i128::from(at.timestamp()) * 1_000_000_000 + i128::from(at.timestamp_subsec_nanos()),
+        )),
+        ODataValue::Null
+        | ODataValue::Bool(_)
+        | ODataValue::Number(_)
+        | ODataValue::Date(_)
+        | ODataValue::Time(_) => None,
     }
 }

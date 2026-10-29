@@ -265,9 +265,18 @@ impl SubjectProfiles for GraphProfileSource {
             &subject,
         )
         .await?;
+        // Unlike the profile read, a fact that cannot be read fails the read:
+        // the subject must see, export and delete every fact it has.
+        let listed = &stored.root.removals;
+        let facts = stored
+            .facts
+            .iter()
+            .filter(|node| !listed.contains(node.node_key.as_str()))
+            .map(stored_fact_of)
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(SubjectFacts {
             version: stored.version,
-            facts: served(&stored),
+            facts,
         })
         // @cpt-end:cpt-cf-construct-algo-subject-control-read-facts:p1:inst-facts-read
     }

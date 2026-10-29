@@ -1,7 +1,6 @@
 pub mod dto;
 pub mod error;
 pub mod handlers;
-pub mod pagination;
 pub mod routes;
 pub mod types;
 
@@ -19,9 +18,6 @@ mod routes_test;
 
 #[cfg(test)]
 mod settings_routes_test;
-
-#[cfg(test)]
-mod pagination_test;
 
 #[cfg(test)]
 mod subject_control_routes_test;

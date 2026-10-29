@@ -196,8 +196,8 @@ pub fn register_subject_control_routes(
         .path_param("subject_id", "The caller's own subject id")
         .query_param_typed("limit", false, "Page size, at most 200", "integer")
         .query_param("cursor", false, "Cursor of the next page")
-        .with_odata_filter::<dto::SubjectFactField>()
-        .with_odata_orderby::<dto::SubjectFactField>()
+        .with_odata_filter::<crate::domain::subject_control::SubjectFactField>()
+        .with_odata_orderby::<crate::domain::subject_control::SubjectFactField>()
         .handler(handlers::list_subject_facts)
         .json_response_with_schema::<dto::SubjectFactsPageDto>(
             openapi,
