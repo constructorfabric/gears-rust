@@ -3,7 +3,7 @@
 ClickHouse storage-backend plugin that implements the Usage Collector `UsageCollectorPluginV1` SPI. It is the durable system of record for usage records and the usage-type catalog: the Usage Collector gateway gear discovers it via the types registry and dispatches all persistence to it. The plugin owns nothing of the host's domain logic — it is pure persistence over a ClickHouse columnar OLAP database, with no coordination backend: every write is a plain read-then-insert whose convergence rests on the engine's `insert_deduplication_token` window, `ReplacingMergeTree(version)` merges, and — on the hot `list`/`aggregate` reads — an anti-join against the deactivation-marker ids rather than read-time version resolution.
 
 ## Configuration
-
+P
 Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole seconds (repo convention).
 
 | Key | Default | Description |
@@ -56,7 +56,7 @@ The DDL is built in Rust, with no SQL files, and one step list serves both topol
 
 - **Existing deployments.** A deployment from before the runner has its tables but no tracking table. Its first start runs every step as a no-op and records them.
 - **No lock.** ClickHouse has no advisory lock, so replicas that start together can run the same step concurrently. Every step must therefore be idempotent: `IF NOT EXISTS` DDL, read before alter, and guarded data movement. A duplicate record in the tracking table is harmless.
-- **Adding a step.** Append it to the end of its list in `migrator/single_node.rs` or `migrator/cluster.rs` with the next number. Never rename, reorder or remove a step that has shipped, because steps are matched by name. A one-time schema fix that a restart cannot apply today, such as the indexes below, belongs in a new step.
+- **Adding a step.** Add the next numbered file under `src/infra/storage/migrator/` (`m0003_….rs`), declare it in `migrator.rs`, and append it to the end of `migrations()` there. The same list serves both topologies. Never rename, reorder or remove a step that has shipped, because steps are matched by name. A one-time schema fix that a restart cannot apply today, such as the indexes below, belongs in a new step.
 - **Every start.** `ensure_retention_ttl` is not a step. It follows config, so it runs on every start, after the migrations.
 
 ### Retention window management
