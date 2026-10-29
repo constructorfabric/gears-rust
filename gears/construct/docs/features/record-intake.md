@@ -38,7 +38,7 @@
 
 ### 1.1 Overview
 
-Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Until the Planner delivers the processing, a stub drops every received record with a content-free drop event.
+Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Processing runs where the deployment configures a processing identity and a model (Profile Reader, `cpt-cf-construct-feature-profile-reader`); elsewhere a stub drops every received record with a content-free drop event.
 
 ### 1.2 Purpose
 
@@ -58,11 +58,11 @@ The PRD requires Construct to take records one at a time, check each against its
 - `UNKNOWN_TYPE` and `CONNECTOR_OFF` can clear: once the type is registered, or the tenant turns the connector on.
 - `PERSONALIZATION_OFF` and `ERASURE_IN_PROGRESS` are final for the record, though the state behind them can change: a connector **MUST NOT** send such a record again, so data from a time the subject opted out, or data an erasure removed, never comes back. Construct does not remember refusals, so it cannot enforce this; it is the connector's rule.
 
-**Until the Planner exists.** The stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity, as the story asks. A record received while the stub is wired in is not processed, and a resend after the Planner ships is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when the stub is replaced.
+**Without processing.** Where no processing identity or no model is configured, the stub takes every record and drops it, with a drop event: intake answers `202` and keeps the identity. A record received while the stub is wired in is not processed, and a resend once processing is configured is a repeat. Records the stub takes are development data: an environment that took records with the stub is reset when processing is configured.
 
 **Out of scope**:
 
-- The Planner's entry point and background processing; a stub that drops every record with a drop event stands in.
+- The Planner's entry point and background processing, which the Planner and the Profile Reader's wiring deliver; this feature's stub, which drops every record with a drop event, stands in where processing is not configured.
 - Connectors on or off in the settings service. This feature reads the switch through a small interface whose first version takes the deployment config (every connector on unless configured off); declaring and reading it in the settings service waits until it is decided whether the settings service runs in Construct's host.
 - Writing drop events to the Audit gear, which does not exist yet; they go to the structured log.
 - Erasure and retention of record identities.
