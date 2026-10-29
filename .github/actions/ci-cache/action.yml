@@ -1,0 +1,100 @@
+---
+name: ci-cache
+description: >-
+  Wire a job to the platform's S3 caches: sccache (Rust), runs-on/cache
+  (downloads) and BuildKit's S3 cache (images). Writes only on trusted jobs;
+  does nothing on a runner without a cache key. See README.md.
+
+inputs:
+  rw-key-id:
+    description: secrets.CI_CACHE_RW_KEY_ID; empty unless the job runs under the environment ci-trusted
+    default: ""
+  rw-secret:
+    description: secrets.CI_CACHE_RW_SECRET; empty unless the job runs under the environment ci-trusted
+    default: ""
+  trusted:
+    description: "true only for push to main under ci-trusted; anything else restores but never saves"
+    default: "false"
+  endpoint:
+    description: S3 endpoint; default the runner's CI_CACHE_ENDPOINT
+    default: ""
+  region:
+    description: S3 region; default the runner's CI_CACHE_REGION
+    default: ""
+  project:
+    description: "insight, gears or studio; default the runner's CI_CACHE_PROJECT, else derived from the repository name"
+    default: ""
+  key-prefix:
+    description: "Prefix for every cache object, e.g. sandbox/ for tests; empty in real use"
+    default: ""
+  rust:
+    description: Route rustc through sccache backed by sccache-<project>
+    default: "false"
+  downloads:
+    description: Newline-separated paths for runs-on/cache (bucket actions-cache-<project>)
+    default: ""
+  downloads-key:
+    description: "Cache key for downloads, e.g. cargo- plus hashFiles of Cargo.lock; required with downloads"
+    default: ""
+  downloads-restore-keys:
+    description: Newline-separated restore-key prefixes for downloads
+    default: ""
+  buildkit:
+    description: Create a docker-container buildx builder and put ci-cache-buildx-args on PATH
+    default: "false"
+
+outputs:
+  mode:
+    description: "none (no key on this runner), read or write"
+    value: ${{ steps.setup.outputs.mode }}
+
+runs:
+  using: composite
+  steps:
+    - id: setup
+      shell: bash
+      env:
+        IN_RW_KEY_ID: ${{ inputs.rw-key-id }}
+        IN_RW_SECRET: ${{ inputs.rw-secret }}
+        IN_TRUSTED: ${{ inputs.trusted }}
+        IN_ENDPOINT: ${{ inputs.endpoint }}
+        IN_REGION: ${{ inputs.region }}
+        IN_PROJECT: ${{ inputs.project }}
+        IN_PREFIX: ${{ inputs.key-prefix }}
+        IN_RUST: ${{ inputs.rust }}
+        IN_DOWNLOADS: ${{ inputs.downloads }}
+        IN_DOWNLOADS_KEY: ${{ inputs.downloads-key }}
+        IN_DOWNLOADS_RESTORE_KEYS: ${{ inputs.downloads-restore-keys }}
+        IN_BUILDKIT: ${{ inputs.buildkit }}
+      run: '"$GITHUB_ACTION_PATH/setup.sh"'
+
+    # runs-on/cache v5.0.7. It reads its settings from the environment only,
+    # and an empty RUNS_ON_S3_BUCKET_CACHE is an error, not "off": hence the
+    # two steps, each entered only with a key in hand.
+    - if: steps.setup.outputs.downloads == 'write'
+      uses: runs-on/cache@88d90644011a3a9957fd141a106f5a94f9794203
+      env:
+        RUNS_ON_S3_BUCKET_CACHE: ${{ steps.setup.outputs.downloads-bucket }}
+        RUNS_ON_S3_BUCKET_ENDPOINT: ${{ steps.setup.outputs.endpoint }}
+        RUNS_ON_S3_FORCE_PATH_STYLE: "true"
+      with:
+        path: ${{ inputs.downloads }}
+        key: ${{ inputs.key-prefix }}${{ inputs.downloads-key }}
+        restore-keys: ${{ steps.setup.outputs.downloads-restore-keys }}
+    - if: steps.setup.outputs.downloads == 'read'
+      uses: runs-on/cache/restore@88d90644011a3a9957fd141a106f5a94f9794203
+      env:
+        RUNS_ON_S3_BUCKET_CACHE: ${{ steps.setup.outputs.downloads-bucket }}
+        RUNS_ON_S3_BUCKET_ENDPOINT: ${{ steps.setup.outputs.endpoint }}
+        RUNS_ON_S3_FORCE_PATH_STYLE: "true"
+      with:
+        path: ${{ inputs.downloads }}
+        key: ${{ inputs.key-prefix }}${{ inputs.downloads-key }}
+        restore-keys: ${{ steps.setup.outputs.downloads-restore-keys }}
+
+    # A composite action has no post step of its own; this one writes
+    # `sccache --show-stats` into the job summary when the job ends, whatever
+    # its result. The path is relative to the workspace: the action must live
+    # at .github/actions/ci-cache in the calling repository.
+    - if: steps.setup.outputs.rust == 'true'
+      uses: ./.github/actions/ci-cache/stats

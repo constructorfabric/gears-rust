@@ -1,7 +1,8 @@
 # CI compilation cache and timing
 
-sccache uses S3 storage when it is configured, else the GitHub Actions cache,
-else plain rustc (see `.github/actions/sccache` and docs/TESTING.md, section 7.4).
+On the organisation's self-hosted runners sccache uses the shared build cache
+(see `.github/actions/ci-cache` and docs/TESTING.md, section 7.4); GitHub-hosted
+runs build with plain rustc.
 Only main writes the compilation cache; PRs read it. PRs also never upload Cargo
 registry caches: every rust-cache step saves only on pushes to main.
 The pinned cargo-gears executable is cached by version, OS and architecture;
@@ -9,7 +10,8 @@ only main writes that cache, and a cached executable that does not run is
 reinstalled. CI preinstalls nextest; make's opt-in CI_PREINSTALLED_TOOLS checks
 it rather than installing unrelated tools. Local make behavior is unchanged.
 
-Cache hits, misses and write errors are retained as sccache-* artifacts.
+Cache hits, misses and write errors appear in the job summary (the ci-cache
+post step).
 SCCACHE_IDLE_TIMEOUT=0 keeps the server, its backend settings and its counters
 across long test phases without compilation.
 

@@ -1,7 +1,7 @@
 name: Test Suite
 
 # Runs the Rust unit tests (nextest) on one OS.
-# Called by ci.yml (Ubuntu) and macos-windows-tests.yml (macOS and Windows).
+# Called by ci.yml (Linux) and macos-windows-tests.yml (macOS and Windows).
 #
 # Jobs show up as `<caller job> / nextest`. test-report.yml relies on these
 # names.
@@ -9,18 +9,14 @@ on:
   workflow_call:
     inputs:
       os:
-        description: Runner label, e.g. ubuntu-latest.
+        description: >-
+          Runner label or routing expression. ci.yml passes the self-hosted rule
+          (see .github/runners/README.md); macos-windows-tests.yml passes
+          macos-latest and windows-latest.
         required: true
         type: string
-    # A called workflow must declare these, even for environment secrets.
-    # Optional: without them the job uses the GitHub cache.
-    secrets:
-      S3_ACCESS_KEY_ID:
-        description: S3 access key id for the selected cache environment.
-        required: false
-      S3_SECRET_ACCESS_KEY:
-        description: S3 secret access key for the selected cache environment.
-        required: false
+    # No `secrets:` list: the read-write key of the shared build cache is an
+    # environment secret of `ci-trusted`, which callers pass with `secrets: inherit`.
 
 # A called workflow does not get the caller's env, so set it here.
 env:
@@ -33,10 +29,10 @@ jobs:
   nextest:
     name: nextest
     runs-on: ${{ inputs.os }}
-    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
-    # No environment until the S3_BUCKET variable is set, so the job runs without one.
+    # Only a push to main enters the environment, whose read-write key for the
+    # shared build cache GitHub releases to main alone; every other run reads.
     environment:
-      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
+      name: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'ci-trusted' || '' }}
       deployment: false
     env:
       # Windows: use lld-link. It comes with LLVM on the runner and links much
@@ -48,7 +44,7 @@ jobs:
       JUNIT_DIR: test-results
     steps:
       - name: Free disk space
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
         uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
         with:
           tool-cache: false
@@ -69,6 +65,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
@@ -85,29 +82,38 @@ jobs:
           rustup show
 
       - name: Install nextest
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest
 
+      # Linux only: the macOS and Windows legs run on GitHub-hosted runners.
+      - name: Set up the shared build cache
+        if: runner.os == 'Linux'
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rw-key-id: ${{ secrets.CI_CACHE_RW_KEY_ID }}
+          rw-secret: ${{ secrets.CI_CACHE_RW_SECRET }}
+          trusted: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       # Caches the Cargo registry and git deps, not target/.
       - name: Cache Cargo/target
+        if: ${{ runner.os != 'Linux' || steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        id: sccache
-        uses: ./.github/actions/sccache
-        with:
-          s3-endpoint: ${{ vars.S3_ENDPOINT }}
-          s3-region: ${{ vars.S3_REGION }}
-          s3-bucket: ${{ vars.S3_BUCKET }}
-          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
-          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
 
       - name: cargo test (no macros)
         shell: bash
@@ -123,8 +129,3 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
-
-      - name: Save compilation metrics
-        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
-        continue-on-error: true
-        uses: ./.github/actions/sccache-stats

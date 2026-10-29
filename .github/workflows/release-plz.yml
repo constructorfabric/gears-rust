@@ -128,7 +128,7 @@ jobs:
 
   release-pr:
     name: Create release PR
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     # Ordered after `release` so release-plz never derives the next versions from
     # crates.io while a publish is mid-flight. `!cancelled()` keeps this running when
     # `release` was skipped (manual release-pr dispatch) or failed.
@@ -150,6 +150,11 @@ jobs:
     permissions:
       contents: write
       pull-requests: write
+    # Only a push to main enters the environment, whose read-write key for the
+    # shared build cache GitHub releases to main alone; every other run reads.
+    environment:
+      name: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && 'ci-trusted' || '' }}
+      deployment: false
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,6 +174,7 @@ jobs:
           cache: false
 
       - name: Install protoc
+        if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
@@ -177,6 +183,22 @@ jobs:
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup show
+
+      # cargo-semver-checks compiles the crates it documents; the shared cache
+      # takes the dependency half of that.
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rw-key-id: ${{ secrets.CI_CACHE_RW_KEY_ID }}
+          rw-secret: ${{ secrets.CI_CACHE_RW_SECRET }}
+          trusted: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
 
       - name: release-plz release-pr
         uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.3.155
