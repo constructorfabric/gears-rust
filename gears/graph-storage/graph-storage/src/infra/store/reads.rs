@@ -610,7 +610,7 @@ async fn listing_select(
     ),
     GraphStoreError,
 > {
-    let mut select = node::Entity::find()
+    let mut select = crate::infra::projections::node_listing_select()
         .secure()
         .scope_with(ctx.scope)
         .filter(Condition::all().add(node::Column::DeletedAt.is_null()));
