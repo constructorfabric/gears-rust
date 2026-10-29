@@ -10,8 +10,9 @@ repeat and added round-trip time. This turns a log of them into the tables
   * per repeat: the slope of p50 against the added round-trip time, in ms per
     ms -- an estimate of how many sequential round trips the request makes.
 
-Usage (from the repo root):
-  python3 gears/graph-storage/scripts/perf_summary.py perf.log [more.log ...]
+Usage (from the repo root), the log on standard input:
+  python3 gears/graph-storage/scripts/perf_summary.py < perf.log
+
 """
 
 import re
@@ -25,16 +26,15 @@ LINE = re.compile(
 )
 
 
-def load(path):
+def load(lines):
     """(scenario, backend) -> rtt -> [(repeat, p50, p95)]"""
     data = defaultdict(lambda: defaultdict(list))
-    with open(path, encoding="utf-8") as log:
-        for line in log:
-            match = LINE.search(line)
-            if not match:
-                continue
-            rep, rtt, backend, scenario, p50, p95 = match.groups()[:6]
-            data[(scenario, backend)][float(rtt)].append((int(rep), float(p50), float(p95)))
+    for line in lines:
+        match = LINE.search(line)
+        if not match:
+            continue
+        rep, rtt, backend, scenario, p50, p95 = match.groups()[:6]
+        data[(scenario, backend)][float(rtt)].append((int(rep), float(p50), float(p95)))
     return data
 
 
@@ -80,12 +80,17 @@ def table(data, title):
         print(f"| {scenario} | {backend} | " + " | ".join(cells) + f" | {', '.join(slopes)} |")
 
 
-def main(paths):
-    if not paths:
+def main(args):
+    # The log comes on standard input rather than as a path: the script never
+    # opens a file a caller names, so there is no path to validate.
+    if args or sys.stdin.isatty():
         print(__doc__, file=sys.stderr)
         return 2
-    for path in paths:
-        table(load(path), path)
+    data = load(sys.stdin)
+    if not data:
+        print("no RESULT lines on standard input", file=sys.stderr)
+        return 1
+    table(data, "perf lane")
     return 0
 
 

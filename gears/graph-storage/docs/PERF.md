@@ -72,7 +72,7 @@ GEARS_GRAPH_PERF_RTT_MS=0,0.5,1,2 \
   cargo test --release -p cf-gears-graph-storage --test perf \
   -- --nocapture the_retrieval_scenarios 2>&1 | tee perf.log
 
-python3 gears/graph-storage/scripts/perf_summary.py perf.log
+python3 gears/graph-storage/scripts/perf_summary.py < perf.log
 ```
 
 Seeding takes 13–18 minutes on a laptop; the matrix above adds a few minutes.
