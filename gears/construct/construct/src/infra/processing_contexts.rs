@@ -5,6 +5,10 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::planner::processing::ProcessingContexts;
 
+/// The subject type on every processing context, so a policy can tell
+/// Construct's service account from a person.
+pub const PROCESSING_SUBJECT_TYPE: &str = "construct.service";
+
 /// [`ProcessingContexts`] as one configured identity, Construct's processing
 /// service account, in the tenant at hand. It reads and writes graph storage
 /// and reads the settings service for every tenant, so the deployment grants
@@ -12,10 +16,6 @@ use crate::domain::planner::processing::ProcessingContexts;
 /// expire before processing runs.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-wiring:p1
-/// The subject type on every processing context, so a policy can tell
-/// Construct's service account from a person.
-pub const PROCESSING_SUBJECT_TYPE: &str = "construct.service";
-
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceIdentity {
     identity: Uuid,

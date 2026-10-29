@@ -28,6 +28,7 @@ use crate::domain::profile_read::OriginKind;
 use crate::domain::record_intake::IntakeOutcome;
 use crate::test_support::{
     AllowResolver, IntakeFixture, chat_record, fake_graph_storage, inmem_db, settings_service,
+    unchecked_processing,
 };
 
 /// A model that answers with the given answers in turn, then the last again.
@@ -85,6 +86,7 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
         profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
     }
@@ -155,8 +157,9 @@ async fn a_record_is_planned_checked_admitted_written_and_read_back() {
     );
 }
 
-/// A model whose call panics.
-struct Panics;
+/// A model whose call panics; it counts its calls.
+#[derive(Default)]
+struct Panics(std::sync::atomic::AtomicUsize);
 
 #[async_trait]
 impl ModelClient for Panics {
@@ -165,6 +168,7 @@ impl ModelClient for Panics {
         _ctx: &SecurityContext,
         _request: &ModelRequest,
     ) -> Result<ModelResponse, ModelError> {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         panic!("the model client broke")
     }
 }
@@ -173,8 +177,10 @@ impl ModelClient for Panics {
 #[tokio::test]
 async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
     let db = inmem_db().await;
+    let model = Arc::new(Panics::default());
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
         profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
     }
@@ -182,7 +188,7 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
     .unwrap();
     let pipeline = assemble(
         &cfg,
-        Some(Arc::new(Panics)),
+        Some(Arc::clone(&model) as _),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
@@ -218,7 +224,23 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
     assert!(logs_contain("the model client broke"));
     assert!(logs_contain(r#"stage="worker""#));
     assert!(logs_contain(r#"reason="processing_failed""#));
-    assert!(!running.is_finished(), "the worker goes on");
+    // The worker goes on: a second record reaches the model too.
+    intake
+        .submit(
+            &in_tenant(Uuid::new_v4()),
+            Uuid::new_v4(),
+            chat_record(Uuid::new_v4(), "chat/t/2", "v1"),
+        )
+        .await
+        .expect("intake answers");
+    let second = async {
+        while model.0.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(30), second)
+        .await
+        .expect("the worker takes the next record after a panic");
     cancel.cancel();
     running.await.unwrap();
 }
@@ -229,6 +251,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
     let db = inmem_db().await;
     let cfg = ConstructConfig {
         processing_identity: Some(Uuid::new_v4()),
+        processing: unchecked_processing(),
         profile_category_check: Some(CategoryCheckConfig::OneCall),
         ..ConstructConfig::default()
     }
@@ -334,6 +357,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
         let asked = Arc::new(CategoriesAsked::default());
         let cfg = ConstructConfig {
             processing_identity: Some(Uuid::new_v4()),
+            processing: unchecked_processing(),
             profile_category_check: Some(check),
             ..ConstructConfig::default()
         }
@@ -388,4 +412,32 @@ async fn without_a_processing_identity_even_an_empty_profile_is_not_configured()
         ),
         "{result:?}"
     );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
+    let db = inmem_db().await;
+    let cfg = ConstructConfig {
+        processing_identity: Some(Uuid::new_v4()),
+        profile_category_check: Some(CategoryCheckConfig::OneCall),
+        ..ConstructConfig::default()
+    }
+    .validated()
+    .unwrap();
+
+    let pipeline = assemble(
+        &cfg,
+        Some(adds_a_skill()),
+        fake_graph_storage(),
+        Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    )
+    .unwrap();
+
+    assert!(
+        pipeline.worker.is_none(),
+        "an identity and a model are not enough while no sensitive-data check exists"
+    );
+    assert!(logs_contain("run_without_sensitive_data_checks"));
 }
