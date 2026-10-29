@@ -43,7 +43,7 @@ jobs:
   # Catches the two ways these pins drift silently - the Rust version getting
   # out of step with rust-toolchain.toml, and a FROM line losing its digest.
   docker-pins:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -58,7 +58,7 @@ jobs:
   # trigger, so gating on pushes would be a no-op; the real gap is a PR that
   # edits the docker lane and merges without it ever being built.
   docker-changes:
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 5
     outputs:
       docker: ${{ steps.filter.outputs.docker }}
@@ -115,7 +115,7 @@ jobs:
         github.event_name == 'workflow_dispatch' ||
         needs.docker-changes.outputs.docker == 'true'
       )
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     timeout-minutes: 60
 
     env:
@@ -185,12 +185,7 @@ jobs:
         run: docker compose -f testing/docker/docker-compose.yml down -v || true
 
   e2e:
-    runs-on: ubuntu-latest
-    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
-    # No environment until the S3_BUCKET variable is set, so the job runs without one.
-    environment:
-      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
-      deployment: false
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
     timeout-minutes: 45
 
     steps:
@@ -200,6 +195,7 @@ jobs:
           persist-credentials: false
 
       - name: Install system dependencies
+        if: runner.environment == 'github-hosted'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler
@@ -218,24 +214,29 @@ jobs:
       # binary and the lane-specific targets below each build their own feature
       # configuration. Without a cache every run started from zero, which is
       # what put e2e runs at 29-41 minutes. Mirrors the `integration` job in
-      # ci.yml — same actions, same pinned SHAs, same cache-targets: false
-      # (rust-cache holds the registry; sccache holds the compiled objects).
+      # ci.yml: the shared build cache on the self-hosted runners, rust-cache for
+      # the registry on GitHub-hosted ones; sccache holds the compiled objects.
+      # This workflow never runs on a push to main, so it only reads that cache.
+      - name: Set up the shared build cache
+        id: cache
+        uses: ./.github/actions/ci-cache
+        with:
+          rust: true
+          downloads: |
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          downloads-key: cargo-${{ hashFiles('**/Cargo.lock') }}
+          downloads-restore-keys: cargo-
+
+      # GitHub-hosted runs (fork pull requests, the kill switch) keep the
+      # registry cache; on the self-hosted runners ci-cache covers it.
       - name: Cache Cargo/target
+        if: ${{ steps.cache.outputs.mode == 'none' }}
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-e2e-${{ hashFiles('rust-toolchain.toml') }}
-
-      # Only main writes to the cache. See .github/actions/sccache.
-      - name: Set up sccache
-        uses: ./.github/actions/sccache
-        with:
-          s3-endpoint: ${{ vars.S3_ENDPOINT }}
-          s3-region: ${{ vars.S3_REGION }}
-          s3-bucket: ${{ vars.S3_BUCKET }}
-          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
-          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
 
       - name: Install Python dependencies
         id: setup
