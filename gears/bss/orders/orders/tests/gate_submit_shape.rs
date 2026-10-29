@@ -2250,6 +2250,67 @@ fn a_stored_unreduced_exact_pair_decodes_reduced() {
     );
 }
 
+/// D-242: the stored decode reduces only the typed `ExactMoney` positions of the evaluation.
+/// Producer evidence (`TotalsDeclaration`'s opaque members, `Tcv.evidence`) is copied verbatim
+/// into `resolved_total` rows (D-197/D-216), so a money-shaped unreduced object there keeps its
+/// stored bytes, while unreduced typed pairs (a negative discount, the TCV carrier) are reduced.
+#[test]
+fn the_stored_decode_reduces_only_typed_exact_positions() {
+    let evidence = serde_json::json!({
+        "numerator": "40", "denominator": "2", "currency": "USD", "currency_scale": 2
+    });
+    let unreduced = |numerator: &str| {
+        serde_json::json!({
+            "numerator": numerator, "denominator": "2", "currency": "USD", "currency_scale": 2
+        })
+    };
+    let mut value: serde_json::Value = serde_json::from_str(LEGACY_ATTEMPT).unwrap();
+    let evaluation = &mut value[ORDER_MEMBER]["evaluation"];
+    evaluation["lines"][0]["declaration"]["item_breakdown"] = serde_json::json!([evidence]);
+    evaluation["tcv"]["evidence"]["carry"] = evidence.clone();
+    evaluation["tcv"]["exact"] = unreduced("480");
+    evaluation["lines"][0]["totals"]["discount"] =
+        serde_json::json!({"status": "available", "exact": unreduced("-40"), "display": "-20"});
+    let mut carrier_totals = evaluation["order_totals"].clone();
+    carrier_totals["gross"]["exact"] = unreduced("40");
+    evaluation["order_tcv_carrier"] = serde_json::json!({
+        "totals": carrier_totals,
+        "declaration": evaluation["order_declaration"].clone(),
+    });
+    let decoded = decode_line_requests(&value).unwrap().order.evaluation;
+    let line = &decoded.lines[0];
+    assert_eq!(
+        line.declaration.as_ref().unwrap().item_breakdown,
+        serde_json::json!([evidence]),
+        "evidence under a declaration keeps its stored bytes"
+    );
+    let tcv = decoded.tcv.as_ref().unwrap();
+    assert_eq!(
+        tcv.evidence.as_ref().unwrap()["carry"],
+        evidence,
+        "TCV evidence is verbatim"
+    );
+    assert_eq!(
+        (tcv.exact.numerator(), tcv.exact.denominator()),
+        ("240", "1")
+    );
+    let Availability::Available(discount) = &line.totals.discount else {
+        panic!("the discount is available")
+    };
+    assert_eq!(
+        (discount.exact.numerator(), discount.exact.denominator()),
+        ("-20", "1")
+    );
+    let carrier = &decoded
+        .order_tcv_carrier
+        .as_ref()
+        .unwrap()
+        .totals
+        .gross
+        .exact;
+    assert_eq!((carrier.numerator(), carrier.denominator()), ("20", "1"));
+}
+
 #[test]
 fn line_requests_value_is_byte_stable_with_typed_digest() {
     let inputs = two_lines();

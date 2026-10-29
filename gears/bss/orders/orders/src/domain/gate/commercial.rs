@@ -638,36 +638,64 @@ pub fn decode_line_requests(value: &Value) -> Result<FrozenRequests, MalformedRe
     Ok(FrozenRequests { lines, order })
 }
 
-/// Rewrite every stored exact-money object (`{numerator, denominator, currency,
-/// currency_scale}`) under a frozen evaluation to its reduced fraction (D-242). Attempts frozen
-/// before D-241 may hold a pair with a common factor that Orders then accepted and reduced when
-/// rendering totals, so the reduced pair commits the same totals. A pair whose parts are not
-/// canonical integer text is left as stored, and the strict [`ExactMoney`] decode refuses it.
+/// Reduce the stored exact pairs at the typed [`ExactMoney`] positions of a frozen
+/// [`OrderEvaluation`] (D-242): `exact` of `Totals.{gross, net, discount}` on every line, line
+/// component, order component, the TCV carrier and the order totals, plus `tcv.exact` and an
+/// available `promotion_status`. Attempts frozen before D-241 may hold a pair with a common
+/// factor that Orders then accepted and reduced when rendering totals, so the reduced pair
+/// commits the same totals. A pair whose parts are not canonical integer text is left as stored,
+/// and the strict [`ExactMoney`] decode refuses it. The opaque producer evidence
+/// (`TotalsDeclaration`'s members, `Tcv.evidence`) is never visited: it is copied verbatim into
+/// `resolved_total` rows (D-197/D-216).
 ///
 /// [`ExactMoney`]: super::answers::ExactMoney
-fn reduce_stored_money(value: &mut Value) {
-    match value {
-        Value::Object(map) => {
-            let money = map.len() == 4
-                && map.contains_key("currency")
-                && map.contains_key("currency_scale");
-            let reduced = if money {
-                match (map.get("numerator"), map.get("denominator")) {
-                    (Some(Value::String(n)), Some(Value::String(d))) => reduced_fraction(n, d),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            if let Some((numerator, denominator)) = reduced {
-                map.insert("numerator".to_owned(), Value::String(numerator));
-                map.insert("denominator".to_owned(), Value::String(denominator));
-                return;
-            }
-            map.values_mut().for_each(reduce_stored_money);
+fn reduce_stored_money(evaluation: &mut Value) {
+    if let Some(Value::Array(lines)) = evaluation.get_mut("lines") {
+        for line in lines {
+            reduce_stored_totals(line.get_mut("totals"));
+            reduce_stored_components(line.get_mut("committed_components"));
         }
-        Value::Array(items) => items.iter_mut().for_each(reduce_stored_money),
-        _ => {}
+    }
+    reduce_stored_totals(evaluation.get_mut("order_totals"));
+    reduce_stored_components(evaluation.get_mut("order_committed_components"));
+    if let Some(carrier) = evaluation.get_mut("order_tcv_carrier") {
+        reduce_stored_totals(carrier.get_mut("totals"));
+    }
+    reduce_stored_amount(evaluation.get_mut("tcv"));
+    reduce_stored_amount(evaluation.get_mut("promotion_status"));
+}
+
+/// [`reduce_stored_money`] for each `CommittedComponent.totals` of a component list.
+fn reduce_stored_components(components: Option<&mut Value>) {
+    if let Some(components) = components.and_then(Value::as_array_mut) {
+        for component in components {
+            reduce_stored_totals(component.get_mut("totals"));
+        }
+    }
+}
+
+/// [`reduce_stored_money`] for a `Totals` value.
+fn reduce_stored_totals(totals: Option<&mut Value>) {
+    if let Some(totals) = totals {
+        for name in ["gross", "net", "discount"] {
+            reduce_stored_amount(totals.get_mut(name));
+        }
+    }
+}
+
+/// [`reduce_stored_money`] for the `exact` member of an `Amount`, an available `Availability`
+/// or a `Tcv`.
+fn reduce_stored_amount(amount: Option<&mut Value>) {
+    let Some(Value::Object(exact)) = amount.and_then(|a| a.get_mut("exact")) else {
+        return;
+    };
+    let reduced = match (exact.get("numerator"), exact.get("denominator")) {
+        (Some(Value::String(n)), Some(Value::String(d))) => reduced_fraction(n, d),
+        _ => None,
+    };
+    if let Some((numerator, denominator)) = reduced {
+        exact.insert("numerator".to_owned(), Value::String(numerator));
+        exact.insert("denominator".to_owned(), Value::String(denominator));
     }
 }
 
