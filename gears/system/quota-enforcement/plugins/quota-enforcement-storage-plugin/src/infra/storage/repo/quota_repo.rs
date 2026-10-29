@@ -7,7 +7,7 @@
 //! omitted on `SQLite`, whose writers serialize) is taken on the plain select
 //! before the secure layer scopes it.
 
-use sea_orm::sea_query::{Condition, Expr, ExprTrait, LockType};
+use sea_orm::sea_query::{Condition, Expr, ExprTrait};
 use sea_orm::{
     ColumnTrait, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder, QuerySelect,
 };
@@ -16,6 +16,7 @@ use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt,
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
+use super::RowWait;
 use crate::infra::storage::entity::quota::{self, Column, Entity};
 use crate::infra::storage::quota_mapping::{QuotaUpdate, STATUS_ACTIVE, STATUS_DEACTIVATED};
 
@@ -70,7 +71,8 @@ pub async fn insert(
     secure_insert::<Entity>(row, scope, runner).await
 }
 
-/// The row with `id` inside `scope`, locked for update when `lock` is set.
+/// The row with `id` inside `scope`: unlocked for `None`, otherwise locked for
+/// update with the given behaviour on a held row.
 ///
 /// # Errors
 ///
@@ -79,12 +81,13 @@ pub async fn find_by_id(
     runner: &impl DBRunner,
     scope: &AccessScope,
     id: Uuid,
-    lock: bool,
+    lock: Option<RowWait>,
 ) -> Result<Option<quota::Model>, ScopeError> {
-    let mut select = Entity::find().filter(Column::Id.eq(id));
-    if lock {
-        select = select.lock(LockType::Update);
-    }
+    let select = Entity::find().filter(Column::Id.eq(id));
+    let select = match lock {
+        Some(wait) => wait.apply(select),
+        None => select,
+    };
     select.secure().scope_with(scope).one(runner).await
 }
 

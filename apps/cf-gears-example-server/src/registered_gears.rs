@@ -128,3 +128,14 @@ use policy_engine as _;
 
 #[cfg(feature = "bss-approvals")]
 use bss_approvals as _;
+
+#[cfg(feature = "bss-orders")]
+use bss_orders as _;
+// Orders' required Event Broker gear (and, through it, the cluster gear) plus the plugins its
+// standalone deployment selects.
+#[cfg(feature = "bss-orders")]
+use event_broker as _;
+#[cfg(feature = "bss-orders")]
+use sqlite_event_broker_plugin as _;
+#[cfg(feature = "bss-orders")]
+use standalone_cluster_plugin as _;

@@ -19,11 +19,11 @@ use time::OffsetDateTime;
 use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
-use toolkit_db::secure::SecureUpdateExt;
+use toolkit_db::secure::{SecureDeleteExt, SecureUpdateExt};
 use toolkit_security::{AccessScope, SecurityContext};
 
 use super::SqlConsumptionStore;
-use crate::domain::ports::{ConsumptionStore, QuotaStore};
+use crate::domain::ports::{ConsumptionStore, LeaseStore, QuotaStore, StoreError};
 use crate::infra::storage::entity::{
     quota_allocation_counter as alloc, quota_consumption_counter as counter,
 };
@@ -279,6 +279,35 @@ impl Harness {
             .await
     }
 
+    async fn acquire(
+        &self,
+        subject_id: &str,
+        amount: u64,
+        ttl: std::time::Duration,
+        idempotency: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedLease>, StorageError> {
+        let applicable = applicable(subject_id);
+        let null = serde_json::Value::Null;
+        self.store
+            .acquire_lease(
+                &ctx(),
+                &scope_for(tenant()),
+                &EvaluatedMutation {
+                    applicable: &applicable,
+                    amount,
+                    request: &null,
+                    resource: &null,
+                    user_projection: None,
+                    limits: limits(),
+                    idempotency,
+                    authorized: authorized(),
+                    evaluate: self.callback(),
+                },
+                ttl,
+            )
+            .await
+    }
+
     async fn consumed(&self, subject_id: &str, id: QuotaId) -> u64 {
         self.store
             .read_quota_snapshot(&ctx(), &scope_for(tenant()), &applicable(subject_id))
@@ -287,6 +316,21 @@ impl Harness {
             .into_iter()
             .find(|snapshot| snapshot.quota_id == id)
             .map_or(0, |snapshot| snapshot.consumed)
+    }
+
+    /// The current period row's counter, read directly: a snapshot skips a
+    /// deactivated Quota.
+    async fn period_consumed(&self, id: QuotaId) -> i64 {
+        let conn = self.db.conn().expect("conn");
+        crate::infra::storage::repo::consumption_counter_repo::find_latest(
+            &conn,
+            &AccessScope::allow_all(),
+            id.as_uuid(),
+        )
+        .await
+        .expect("read the period row")
+        .expect("the period row exists")
+        .consumed
     }
 
     async fn pin_versions_at_max(&self, id: QuotaId) {
@@ -1117,6 +1161,775 @@ async fn a_debit_that_waits_out_a_boundary_charges_the_period_it_commits_in() {
     h.down().await;
 }
 
+// --- lease accounting (I4, I5) ---------------------------------------------
+
+/// One hour, comfortably inside the platform's TTL window.
+const TTL: std::time::Duration = std::time::Duration::from_hours(1);
+
+#[tokio::test]
+async fn an_expired_hold_stops_counting_against_capacity_before_any_sweep() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+
+    h.acquire("u1", 100, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the whole cap is held");
+    assert_eq!(h.consumed("u1", id).await, 100);
+
+    // Past the TTL, with no sweeper anywhere near it.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    assert_eq!(
+        h.consumed("u1", id).await,
+        0,
+        "a read subtracts what an expired hold still occupies (I4)"
+    );
+    let admitted = h
+        .debit("u1", 100, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert!(
+        matches!(
+            admitted.get().decision.result,
+            quota_enforcement_sdk::DecisionResult::Allowed
+        ),
+        "an unreclaimed expired hold blocks nothing"
+    );
+    assert_eq!(h.consumed("u1", id).await, 100, "only the debit counts");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_first_writer_returns_an_expired_hold_and_a_later_sweep_moves_nothing() {
+    // The sequence a read-side correction alone gets wrong: a credit that
+    // floors, a debit after it, and only then the sweeper. Returning the hold
+    // twice would erase the debit that arrived in between.
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(1000)).await;
+
+    h.debit("u1", 20, &write(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit");
+    h.acquire("u1", 80, TTL, &write(OperationType::Reserve, "r1", 2))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 100, "20 debited plus 80 held");
+
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    assert_eq!(h.consumed("u1", id).await, 20, "the hold expired");
+
+    h.store
+        .apply_credit(&ctx(), &scope_for(tenant()), id, 50, &partial("c1", 3), &[])
+        .await
+        .expect("credit");
+    assert_eq!(h.consumed("u1", id).await, 0, "a credit floors at zero");
+
+    h.debit("u1", 30, &write(OperationType::Debit, "d2", 4))
+        .await
+        .expect("debit after the credit");
+    assert_eq!(h.consumed("u1", id).await, 30);
+
+    let reclaimed = h
+        .store
+        .reclaim_expired_leases(10, DAY_ONE + time::Duration::hours(2))
+        .await
+        .expect("sweep");
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the hold was already returned, so the sweep moves nothing"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_period_holding_a_live_lease_is_not_settled() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(1000), Vec::new()).await;
+    // A TTL that outlives the boundary, which is what opens a settlement
+    // window at all. The store takes the TTL as given; bounding it to
+    // `[min_lease_ttl, max_lease_ttl]` is the gear's job.
+    let across_the_boundary = std::time::Duration::from_hours(48);
+    h.acquire(
+        "u1",
+        10,
+        across_the_boundary,
+        &write(OperationType::Reserve, "r1", 1),
+    )
+    .await
+    .expect("acquire inside day one");
+
+    // Day two: the debit would normally settle day one and emit its rollover.
+    h.set_now(DAY_ONE + time::Duration::days(1));
+    h.debit("u1", 5, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit in the new period");
+    assert!(
+        !h.events()
+            .await
+            .iter()
+            .any(|kind| kind == "period-rollover"),
+        "a period a live lease can still settle against stays open (I5)"
+    );
+
+    // Once the lease has resolved, the next writer closes the period.
+    h.set_now(DAY_ONE + time::Duration::days(3));
+    h.store
+        .reclaim_expired_leases(10, DAY_ONE + time::Duration::days(3))
+        .await
+        .expect("sweep");
+    h.debit("u1", 5, &write(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit after the lease resolved");
+    assert!(
+        h.events()
+            .await
+            .iter()
+            .any(|kind| kind == "period-rollover"),
+        "with no live lease left the closing period settles"
+    );
+    let _ = id;
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_zero_commit_reverses_as_a_no_op_while_a_denied_debit_stays_irreversible() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+
+    h.store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(0),
+            &partial("c1", 2),
+            &[],
+        )
+        .await
+        .expect("a job that used nothing commits nothing");
+    assert_eq!(h.consumed("u1", id).await, 0, "every hold came back");
+
+    // The commit is a real operation, so its rollback succeeds with nothing to
+    // move. The subject key is the acquisition's, which the commit reused.
+    let commit_scope = IdempotencyScope {
+        tenant_id: tenant(),
+        subject_key: IdempotencySubjectKey::of(&[user("u1")]),
+        operation_type: OperationType::Commit,
+        key: "c1".to_owned(),
+    };
+    h.store
+        .apply_rollback(
+            &ctx(),
+            &scope_for(tenant()),
+            &RollbackTarget {
+                original: commit_scope,
+                authorized: authorized(),
+            },
+            &write(OperationType::Rollback, "rb", 3),
+            &[],
+        )
+        .await
+        .expect("a zero commit reverses as a no-op");
+
+    // A debit that moved nothing is not a committed debit.
+    let denied = h
+        .debit("u1", 1_000, &write(OperationType::Debit, "d1", 4))
+        .await
+        .expect("a denial is a successful call");
+    assert!(matches!(
+        denied.get().decision.result,
+        quota_enforcement_sdk::DecisionResult::Denied { .. }
+    ));
+    let refused = h
+        .store
+        .apply_rollback(
+            &ctx(),
+            &scope_for(tenant()),
+            &RollbackTarget {
+                original: write(OperationType::Debit, "d1", 4).scope,
+                authorized: authorized(),
+            },
+            &write(OperationType::Rollback, "rb2", 5),
+            &[],
+        )
+        .await
+        .expect_err("a denied debit is not reversible");
+    assert!(matches!(refused, StorageError::OperationNotFound { .. }));
+    h.down().await;
+}
+
+#[tokio::test]
+async fn an_expired_hold_does_not_hold_a_cap_reduction_hostage() {
+    // The cap guard is a writer on the counter row, so it reconciles before it
+    // judges: capacity an expired lease no longer holds must not block a
+    // reduction until some sweeper happens to run (I4, I6). What it must still
+    // see is the usage that is real.
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.debit("u1", 30, &write(OperationType::Debit, "d1", 9))
+        .await
+        .expect("debit");
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 70, "30 debited plus 40 held");
+
+    let blocked = h
+        .quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(50)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("a live hold does block a reduction below it");
+    assert!(matches!(
+        blocked,
+        crate::domain::ports::StoreError::CapBelowConsumed {
+            new_cap: 50,
+            consumed: 70
+        }
+    ));
+
+    // The TTL passes; nothing sweeps.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+
+    // This is the call that reconciles, and it must judge against the 30 that
+    // is really used — not against the reconciled counter minus the returned
+    // amount a second time, which would read zero and let this through. It has
+    // to come first: once the hold is stamped returned, a later call has
+    // nothing left to subtract twice and the fault hides.
+    let below_usage = h
+        .quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(20)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect_err("a cap below the real usage is refused");
+    assert!(matches!(
+        below_usage,
+        crate::domain::ports::StoreError::CapBelowConsumed {
+            new_cap: 20,
+            consumed: 30
+        }
+    ));
+
+    // And the reduction the expired hold was wrongly blocking now goes through.
+    h.quotas
+        .update_quota(
+            &actor(),
+            &scope_for(tenant()),
+            id,
+            quota_enforcement_sdk::QuotaPatch {
+                cap: Some(quota_enforcement_sdk::CapPatch::Bounded(50)),
+                ..quota_enforcement_sdk::QuotaPatch::default()
+            },
+            &[],
+        )
+        .await
+        .expect("an expired hold holds nothing hostage");
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the hold came back, the debit stayed"
+    );
+    h.down().await;
+}
+
+// --- batch debit ------------------------------------------------------------
+
+fn batch_item(
+    subject_id: &str,
+    metric: &str,
+    amount: u64,
+) -> quota_enforcement_sdk::BatchDebitItem {
+    let mut applicable = applicable(subject_id);
+    applicable.metric = quota_enforcement_sdk::MetricId::parse(metric).expect("metric");
+    quota_enforcement_sdk::BatchDebitItem {
+        applicable,
+        amount,
+        request: serde_json::Value::Null,
+        resource: serde_json::Value::Null,
+        authorized: authorized(),
+        item_scope: None,
+    }
+}
+
+fn tokens(subject_id: &str, amount: u64) -> quota_enforcement_sdk::BatchDebitItem {
+    batch_item(subject_id, METRIC_TOKENS, amount)
+}
+
+impl Harness {
+    async fn batch_within(
+        &self,
+        items: &[quota_enforcement_sdk::BatchDebitItem],
+        envelope: &IdempotencyWrite,
+        timer: Arc<quota_enforcement_sdk::BatchTimer>,
+    ) -> Result<TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>, StorageError> {
+        let item_scope = scope_for(tenant());
+        let entries: Vec<quota_enforcement_sdk::BatchEntry<'_>> = items
+            .iter()
+            .map(|item| quota_enforcement_sdk::BatchEntry {
+                item,
+                scope: &item_scope,
+                user_projection: None,
+            })
+            .collect();
+        self.store
+            .apply_batch_debit(
+                &ctx(),
+                &scope_for(tenant()),
+                &quota_enforcement_sdk::EvaluatedBatch {
+                    envelope,
+                    items: &entries,
+                    limits: limits(),
+                    evaluate: self.callback(),
+                    timer,
+                },
+                &[],
+            )
+            .await
+    }
+
+    async fn batch(
+        &self,
+        items: &[quota_enforcement_sdk::BatchDebitItem],
+        envelope: &IdempotencyWrite,
+    ) -> Result<TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>, StorageError> {
+        let timer = Arc::new(quota_enforcement_sdk::BatchTimer::new(
+            std::time::Duration::from_secs(5),
+        ));
+        self.batch_within(items, envelope, timer).await
+    }
+}
+
+fn allowed(outcome: &TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>) -> Vec<bool> {
+    outcome
+        .get()
+        .iter()
+        .map(|item| matches!(item.decision.result, DecisionResult::Allowed))
+        .collect()
+}
+
+#[tokio::test]
+async fn an_allowed_batch_applies_exactly_the_union_of_its_plans_and_replays() {
+    let h = Harness::up().await;
+    let first = h.allocation_quota("u1", Some(100)).await;
+    let second = h.allocation_quota("u2", Some(100)).await;
+    let untouched = h.allocation_quota("u3", Some(100)).await;
+    let envelope = write(OperationType::BatchDebit, "b1", 1);
+
+    let outcome = h
+        .batch(
+            &[tokens("u1", 10), tokens("u2", 20), tokens("u1", 5)],
+            &envelope,
+        )
+        .await
+        .expect("batch");
+
+    assert_eq!(allowed(&outcome), [true, true, true]);
+    assert_eq!(
+        h.consumed("u1", first).await,
+        15,
+        "two items on one Quota, once each"
+    );
+    assert_eq!(h.consumed("u2", second).await, 20);
+    assert_eq!(
+        h.consumed("u3", untouched).await,
+        0,
+        "a Quota no plan names never moves"
+    );
+
+    let calls = h.calls();
+    let replay = h
+        .batch(
+            &[tokens("u1", 10), tokens("u2", 20), tokens("u1", 5)],
+            &envelope,
+        )
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(allowed(&replay), [true, true, true]);
+    assert_eq!(h.calls(), calls, "a replay evaluates nothing");
+    assert_eq!(h.consumed("u1", first).await, 15, "and moves nothing");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_denied_item_denies_the_batch_moves_nothing_and_still_reports_every_item() {
+    // The PRD fixture: 800 of room, 500 fits, the next 500 does not; a third
+    // item of 200 is still evaluated against what the first would leave.
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(800)).await;
+    let envelope = write(OperationType::BatchDebit, "prd", 2);
+
+    let outcome = h
+        .batch(
+            &[tokens("u1", 500), tokens("u1", 500), tokens("u1", 200)],
+            &envelope,
+        )
+        .await
+        .expect("a denied batch is a decision");
+
+    assert_eq!(allowed(&outcome), [true, false, true]);
+    assert_eq!(
+        h.consumed("u1", id).await,
+        0,
+        "nothing moves on a denied batch"
+    );
+    assert!(
+        matches!(outcome.get()[0].retention, Retention::Recorded { .. }),
+        "the denial occupies the envelope key"
+    );
+
+    let replay = h
+        .batch(
+            &[tokens("u1", 500), tokens("u1", 500), tokens("u1", 200)],
+            &envelope,
+        )
+        .await
+        .expect("replay");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+    assert_eq!(
+        allowed(&replay),
+        [true, false, true],
+        "the replay denies again"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_same_envelope_key_with_another_payload_is_a_mismatch() {
+    let h = Harness::up().await;
+    h.allocation_quota("u1", Some(100)).await;
+    h.batch(
+        &[tokens("u1", 1)],
+        &write(OperationType::BatchDebit, "k", 1),
+    )
+    .await
+    .expect("batch");
+
+    let error = h
+        .batch(
+            &[tokens("u1", 2)],
+            &write(OperationType::BatchDebit, "k", 2),
+        )
+        .await
+        .expect_err("different payload");
+    assert!(
+        matches!(error, StorageError::IdempotencyPayloadMismatch),
+        "{error:?}"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_spent_batch_timer_rolls_back_and_records_nothing() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let envelope = write(OperationType::BatchDebit, "late", 3);
+
+    let error = h
+        .batch_within(
+            &[tokens("u1", 1)],
+            &envelope,
+            Arc::new(quota_enforcement_sdk::BatchTimer::new(
+                std::time::Duration::ZERO,
+            )),
+        )
+        .await
+        .expect_err("no time left");
+
+    assert!(matches!(error, StorageError::BatchTimeout), "{error:?}");
+    assert_eq!(h.consumed("u1", id).await, 0);
+    assert!(
+        h.store
+            .lookup_idempotency(&envelope.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a timed-out batch leaves its key free, so the retry runs again"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn an_item_with_no_applicable_quota_records_nothing() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let envelope = write(OperationType::BatchDebit, "none", 4);
+
+    let outcome = h
+        .batch(&[tokens("u1", 1), tokens("nobody", 1)], &envelope)
+        .await
+        .expect("a denial is a decision");
+
+    assert_eq!(allowed(&outcome), [true, false]);
+    assert_eq!(outcome.get()[1].retention, Retention::Unrecorded);
+    assert_eq!(h.consumed("u1", id).await, 0);
+    assert!(
+        h.store
+            .lookup_idempotency(&envelope.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "provisioning the missing Quota must change the answer"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_envelope_record_lives_as_long_as_its_longest_metric_retention() {
+    use crate::infra::storage::entity::idempotency_retention_config;
+    use sea_orm::ActiveValue::Set;
+    let h = Harness::up().await;
+    h.allocation_quota("u1", Some(100)).await;
+    let mut other = draft(tenant(), "u1", Some(100));
+    other.metric = quota_enforcement_sdk::MetricId::parse(crate::test_support::METRIC_REQUESTS)
+        .expect("metric");
+    h.quotas
+        .create_quota(&actor(), &scope_for(tenant()), other, &[])
+        .await
+        .expect("create quota");
+    let week = 7 * 24 * 3600;
+    toolkit_db::secure::secure_insert::<idempotency_retention_config::Entity>(
+        idempotency_retention_config::ActiveModel {
+            tenant_key: Set(tenant().as_uuid().to_string()),
+            metric_key: Set(crate::test_support::METRIC_REQUESTS.to_owned()),
+            retention_seconds: Set(week),
+            updated_at: Set(DAY_ONE),
+        },
+        &toolkit_security::AccessScope::allow_all(),
+        &h.db.conn().expect("conn"),
+    )
+    .await
+    .expect("configure retention");
+    h.set_now(DAY_ONE);
+
+    let outcome = h
+        .batch(
+            &[
+                tokens("u1", 1),
+                batch_item("u1", crate::test_support::METRIC_REQUESTS, 1),
+            ],
+            &write(OperationType::BatchDebit, "long", 5),
+        )
+        .await
+        .expect("batch");
+
+    assert_eq!(
+        outcome.get()[0].retention,
+        Retention::Recorded {
+            expires_at: DAY_ONE + time::Duration::seconds(week)
+        },
+        "the requests metric keeps records longest"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn across_a_period_boundary_only_an_applied_batch_settles_and_opens_periods() {
+    use crate::infra::storage::entity::quota_consumption_counter;
+    use crate::infra::storage::repo::consumption_counter_repo as counter_repo;
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.set_now(DAY_ONE);
+    let first = h
+        .debit("u1", 10, &write(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit");
+    let closing = first.get().mutation.counters[0].period_id.expect("period");
+    h.set_now(DAY_ONE + time::Duration::days(1));
+    let scope = scope_for(tenant());
+    let conn = h.db.conn().expect("conn");
+    let settled =
+        |row: Option<quota_consumption_counter::Model>| row.expect("closing row").is_settled;
+
+    let denied = h
+        .batch(
+            &[tokens("u1", 500)],
+            &write(OperationType::BatchDebit, "no", 2),
+        )
+        .await
+        .expect("a denial is a decision");
+    assert_eq!(allowed(&denied), [false]);
+    assert_eq!(
+        crate::test_support::count_rows::<quota_consumption_counter::Entity>(&h.db).await,
+        1,
+        "a denied batch opens no period"
+    );
+    let row = counter_repo::find_by_period_id_for_update(
+        &conn,
+        &scope,
+        closing.as_uuid(),
+        crate::infra::storage::repo::RowWait::Wait,
+    )
+    .await
+    .expect("read");
+    assert!(!settled(row), "and settles none");
+
+    h.batch(
+        &[tokens("u1", 5)],
+        &write(OperationType::BatchDebit, "yes", 3),
+    )
+    .await
+    .expect("batch");
+    assert_eq!(
+        crate::test_support::count_rows::<quota_consumption_counter::Entity>(&h.db).await,
+        2,
+        "the applied batch opened the new period"
+    );
+    let row = counter_repo::find_by_period_id_for_update(
+        &conn,
+        &scope,
+        closing.as_uuid(),
+        crate::infra::storage::repo::RowWait::Wait,
+    )
+    .await
+    .expect("read");
+    assert!(settled(row), "and settled the elapsed one");
+    assert_eq!(
+        h.consumed("u1", id).await,
+        5,
+        "the new period holds only the batch"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_batch_spans_allocation_and_consumption_quotas() {
+    let h = Harness::up().await;
+    let allocation = h.allocation_quota("u1", Some(100)).await;
+    let consumption = h.consumption_quota("u2", Some(100), Vec::new()).await;
+
+    let outcome = h
+        .batch(
+            &[tokens("u1", 7), tokens("u2", 9)],
+            &write(OperationType::BatchDebit, "mix", 6),
+        )
+        .await
+        .expect("batch");
+
+    assert_eq!(allowed(&outcome), [true, true]);
+    assert_eq!(h.consumed("u1", allocation).await, 7);
+    assert_eq!(h.consumed("u2", consumption).await, 9);
+    h.down().await;
+}
+
+// --- consumption leases and acquisition outcomes ---------------------------
+
+#[tokio::test]
+async fn deactivating_a_consumption_quota_returns_its_lease_hold_to_the_period_row() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("acquired");
+    assert_eq!(
+        h.period_consumed(id).await,
+        40,
+        "the hold occupies the period"
+    );
+
+    let outcome = h
+        .quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect("deactivate");
+    assert_eq!(outcome.resolved_leases, vec![token]);
+    assert_eq!(
+        h.period_consumed(id).await,
+        0,
+        "the cascade gives the hold back to the period row"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_first_writer_returns_an_expired_consumption_hold() {
+    let h = Harness::up().await;
+    let id = h.consumption_quota("u1", Some(100), Vec::new()).await;
+    h.acquire("u1", 80, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert_eq!(h.consumed("u1", id).await, 80);
+
+    // Past the TTL, inside the same daily period, with no sweeper.
+    h.set_now(DAY_ONE + time::Duration::hours(2));
+    h.debit("u1", 30, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert_eq!(
+        h.consumed("u1", id).await,
+        30,
+        "the debit reconciled the expired hold on its period row"
+    );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_repeated_acquisition_replays_the_stored_lease() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let first = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    assert!(matches!(first, TransitionOutcome::Applied(_)));
+
+    let replay = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("replay");
+    match replay {
+        TransitionOutcome::NoOp(lease) => assert_eq!(&lease, first.get(), "the same lease"),
+        TransitionOutcome::Applied(_) => panic!("a replay must not hold again"),
+    }
+    assert_eq!(h.consumed("u1", id).await, 40, "held once");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_denied_acquisition_holds_nothing_and_returns_no_token() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(10)).await;
+    let outcome = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("a denial is an outcome, not an error");
+    let lease = outcome.get();
+    assert_eq!(lease.token, None);
+    assert!(
+        matches!(
+            &lease.decision.result,
+            DecisionResult::Denied { violated_quota_ids, .. } if violated_quota_ids == &vec![id]
+        ),
+        "{lease:?}"
+    );
+    assert_eq!(h.consumed("u1", id).await, 0);
+    h.down().await;
+}
+
 #[tokio::test]
 async fn a_counter_at_the_last_version_keeps_accepting_writes() {
     let h = Harness::up().await;
@@ -1142,5 +1955,180 @@ async fn a_counter_at_the_last_version_keeps_accepting_writes() {
         assert!(matches!(applied, TransitionOutcome::Applied(_)));
         assert_eq!(h.consumed(subject, id).await, 20);
     }
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_commit_refuses_a_hold_a_faster_clock_already_returned() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+    let expiry = DAY_ONE + time::Duration::hours(1);
+
+    // A replica whose clock is past the expiry returns the hold first.
+    h.set_now(expiry + time::Duration::seconds(1));
+    h.debit("u1", 10, &write(OperationType::Debit, "d1", 2))
+        .await
+        .expect("debit");
+    assert_eq!(h.consumed("u1", id).await, 10);
+
+    h.set_now(expiry - time::Duration::seconds(1));
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            Some(25),
+            &partial("c1", 3),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::LeaseNotActive { token: refused }) if refused == token),
+        "{committed:?}"
+    );
+    assert_eq!(h.consumed("u1", id).await, 10, "nothing was charged");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_deactivation_that_returns_a_hold_stamps_the_counter_with_its_own_time() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let later = DAY_ONE + time::Duration::minutes(10);
+    h.set_now(later);
+
+    h.quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect("deactivate");
+
+    let conn = h.db.conn().expect("connection");
+    let row = crate::infra::storage::repo::consumption_counter_repo::find_allocation(
+        &conn,
+        &AccessScope::allow_all(),
+        id.as_uuid(),
+    )
+    .await
+    .expect("read the counter")
+    .expect("the counter row exists");
+    assert_eq!(row.in_flight, 0, "the hold came back");
+    assert_eq!(row.updated_at, later);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_deactivation_refuses_to_return_a_hold_to_a_missing_counter() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    h.acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let conn = h.db.conn().expect("connection");
+    alloc::Entity::delete_many()
+        .filter(alloc::Column::QuotaId.eq(id.as_uuid()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("drop the counter row");
+
+    let refused = h
+        .quotas
+        .deactivate_quota(&actor(), &scope_for(tenant()), id, &[])
+        .await
+        .expect_err("the held capacity has nowhere to go");
+    assert!(matches!(refused, StoreError::Corrupt { .. }), "{refused:?}");
+    h.down().await;
+}
+
+#[tokio::test]
+async fn the_backlog_gauge_counts_only_expired_leases_still_active() {
+    let h = Harness::up().await;
+    h.allocation_quota("u1", Some(100)).await;
+    let committed = h
+        .acquire("u1", 10, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire")
+        .get()
+        .token
+        .expect("held");
+    for key in ["r2", "r3"] {
+        h.acquire("u1", 10, TTL, &write(OperationType::Reserve, key, 1))
+            .await
+            .expect("acquire");
+    }
+    h.acquire(
+        "u1",
+        10,
+        std::time::Duration::from_hours(48),
+        &write(OperationType::Reserve, "r4", 1),
+    )
+    .await
+    .expect("acquire a lease that outlives the sample");
+    h.store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            committed,
+            Some(5),
+            &partial("c1", 2),
+            &[],
+        )
+        .await
+        .expect("commit");
+
+    let backlog = h
+        .store
+        .count_expired_unreclaimed_leases_impl(DAY_ONE + time::Duration::hours(2))
+        .await
+        .expect("count");
+    let metric = quota_enforcement_sdk::MetricId::parse(METRIC_TOKENS).expect("metric");
+    assert_eq!(backlog, vec![(metric, 2)]);
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_full_commit_refuses_a_hold_whose_counter_row_is_missing() {
+    let h = Harness::up().await;
+    let id = h.allocation_quota("u1", Some(100)).await;
+    let acquired = h
+        .acquire("u1", 40, TTL, &write(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("acquire");
+    let token = acquired.get().token.expect("an allowed acquisition holds");
+    let conn = h.db.conn().expect("connection");
+    alloc::Entity::delete_many()
+        .filter(alloc::Column::QuotaId.eq(id.as_uuid()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .exec(&conn)
+        .await
+        .expect("drop the counter row");
+
+    // Nothing comes back on a full commit, so no credit runs to notice the gap.
+    let committed = h
+        .store
+        .commit_lease(
+            &ctx(),
+            &scope_for(tenant()),
+            token,
+            None,
+            &partial("c1", 2),
+            &[],
+        )
+        .await;
+    assert!(
+        matches!(committed, Err(StorageError::Internal(_))),
+        "{committed:?}"
+    );
     h.down().await;
 }

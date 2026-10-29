@@ -150,10 +150,59 @@ impl std::fmt::Display for PostedMoney {
 /// [`MoneyError::AmountOutOfRange`] for a normalized coefficient with more than
 /// 28 digits, whether or not the carrier could hold it.
 pub fn parse_decimal(text: &str) -> Result<Decimal, MoneyError> {
-    if text.is_empty() || text.len() > MAX_DECIMAL_BYTES {
+    if text.len() > MAX_DECIMAL_BYTES {
         return Err(MoneyError::InvalidDecimal);
     }
-    let unsigned = text.strip_prefix('-').unwrap_or(text);
+    let parts = split_decimal(text)?;
+    // Parse only up to the last significant fractional digit so harmless zero
+    // suffixes do not exceed the carrier's scale or coefficient capacity.
+    let point_and_fraction = if parts.fraction.is_empty() {
+        0
+    } else {
+        1 + parts.fraction.len()
+    };
+    let significant = usize::from(parts.negative) + parts.integer.len() + point_and_fraction;
+    let exact_text = text.get(..significant).ok_or(MoneyError::InvalidDecimal)?;
+    let amount = Decimal::from_str_exact(exact_text).map_err(|_| {
+        // The syntax is already valid here, so the carrier refused it for size.
+        // Precision beyond 28 fractional places is not representable; anything
+        // else is a coefficient with more than 28 digits, which is out of range.
+        if parts.fraction.len() > 28 {
+            MoneyError::InvalidDecimal
+        } else {
+            MoneyError::AmountOutOfRange
+        }
+    })?;
+    validate_amount(amount)
+}
+
+/// Plain decimal text split at its point, as borrowed digits.
+///
+/// Internal to the crate: `money` is private and `lib.rs` does not re-export it (the lints
+/// deny `pub(crate)` here as `redundant_pub_crate`).
+#[derive(Clone, Copy, Debug)]
+pub struct DecimalParts<'a> {
+    /// Whether the text starts with `-`; never set for a zero.
+    pub negative: bool,
+    /// The integer digits: `0`, or digits without a leading zero.
+    pub integer: &'a str,
+    /// The fractional digits without their trailing zeros; empty for an integer.
+    pub fraction: &'a str,
+}
+
+/// Split plain decimal text: the one syntax every decimal parser of the crate accepts.
+///
+/// Fractional trailing zeros are accepted and dropped. Exponents, whitespace, `+`,
+/// leading integer zeros, a bare point and negative zero are rejected. It only scans
+/// the text; each caller bounds the length before any number is built from it. Internal
+/// to the crate, like [`DecimalParts`].
+///
+/// # Errors
+/// Returns [`MoneyError::InvalidDecimal`] for any other text.
+pub fn split_decimal(text: &str) -> Result<DecimalParts<'_>, MoneyError> {
+    let (negative, unsigned) = text
+        .strip_prefix('-')
+        .map_or((false, text), |rest| (true, rest));
     let (integer, fraction) = unsigned
         .split_once('.')
         .map_or((unsigned, None), |(i, f)| (i, Some(f)));
@@ -164,28 +213,15 @@ pub fn parse_decimal(text: &str) -> Result<Decimal, MoneyError> {
     {
         return Err(MoneyError::InvalidDecimal);
     }
-    // Strip only fractional zeros before exact parsing so harmless zero suffixes
-    // do not exceed the carrier's scale or coefficient capacity.
-    let exact_text = if fraction.is_some() {
-        text.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        text
-    };
-    let amount = Decimal::from_str_exact(exact_text).map_err(|_| {
-        // The syntax is already valid here, so the carrier refused it for size.
-        // Precision beyond 28 fractional places is not representable; anything
-        // else is a coefficient with more than 28 digits, which is out of range.
-        let fraction_digits = exact_text.split_once('.').map_or(0, |(_, f)| f.len());
-        if fraction_digits > 28 {
-            MoneyError::InvalidDecimal
-        } else {
-            MoneyError::AmountOutOfRange
-        }
-    })?;
-    if text.starts_with('-') && amount.is_zero() {
+    let fraction = fraction.map_or("", |f| f.trim_end_matches('0'));
+    if negative && integer == "0" && fraction.is_empty() {
         return Err(MoneyError::InvalidDecimal);
     }
-    validate_amount(amount)
+    Ok(DecimalParts {
+        negative,
+        integer,
+        fraction,
+    })
 }
 
 /// Format a decimal without exponents, fractional trailing zeros or negative zero.

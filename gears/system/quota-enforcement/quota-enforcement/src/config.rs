@@ -40,6 +40,8 @@ pub struct QuotaEnforcementConfig {
     pub operations: OperationsSection,
     /// Timing of the retention sweeper.
     pub retention: RetentionSection,
+    /// The lease TTL window and the lease sweeper's timing.
+    pub leases: LeasesSection,
 }
 
 impl Default for QuotaEnforcementConfig {
@@ -56,6 +58,7 @@ impl Default for QuotaEnforcementConfig {
             gauges: GaugesSection::default(),
             operations: OperationsSection::default(),
             retention: RetentionSection::default(),
+            leases: LeasesSection::default(),
         }
     }
 }
@@ -86,7 +89,8 @@ impl QuotaEnforcementConfig {
         self.policies.validate()?;
         self.gauges.validate()?;
         self.operations.validate()?;
-        self.retention.validate()
+        self.retention.validate()?;
+        self.leases.validate()
     }
 
     /// Budget for a sweep body to stop after leadership loss or shutdown.
@@ -596,6 +600,11 @@ pub struct OperationsSection {
     /// How long a cached record may answer a replay, in milliseconds. An entry
     /// never outlives the record's own retention whatever this says.
     pub idempotency_cache_ttl_ms: u64,
+    /// Most items one batch debit may carry.
+    pub max_batch_items: usize,
+    /// Batch-level evaluation timeout, in milliseconds. It supersedes each
+    /// item's per-policy timeout for the batch as a whole.
+    pub batch_timeout_ms: u64,
 }
 
 impl Default for OperationsSection {
@@ -604,6 +613,8 @@ impl Default for OperationsSection {
             idempotency_cache_entries: 4096,
             // The P1 reference default of the idempotency-replay algorithm.
             idempotency_cache_ttl_ms: 5_000,
+            max_batch_items: 100,
+            batch_timeout_ms: 250,
         }
     }
 }
@@ -625,7 +636,22 @@ impl OperationsSection {
                 "[quota-enforcement.operations].idempotency_cache_ttl_ms must be at least 1"
             );
         }
+        if self.max_batch_items == 0 {
+            anyhow::bail!("[quota-enforcement.operations].max_batch_items must be at least 1");
+        }
+        if self.batch_timeout_ms == 0 {
+            anyhow::bail!("[quota-enforcement.operations].batch_timeout_ms must be at least 1");
+        }
         Ok(())
+    }
+
+    /// The batch debit's bounds.
+    #[must_use]
+    pub const fn to_batch_limits(&self) -> crate::domain::operations::BatchLimits {
+        crate::domain::operations::BatchLimits {
+            max_items: self.max_batch_items,
+            timeout: Duration::from_millis(self.batch_timeout_ms),
+        }
     }
 
     /// How long a cached record may answer.
@@ -693,6 +719,78 @@ impl RetentionSection {
             operation_log_retention: time::Duration::days(i64::from(
                 self.operation_log_retention_days,
             )),
+        })
+    }
+}
+
+/// The lease TTL window and the lease sweeper's timing
+/// (`[quota-enforcement.leases]`).
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeasesSection {
+    /// Shortest TTL an acquisition may ask for, in seconds.
+    pub min_ttl_secs: u64,
+    /// Longest TTL an acquisition may ask for, in seconds.
+    pub max_ttl_secs: u64,
+    /// Seconds between lease sweeps.
+    pub sweep_interval_secs: u64,
+    /// Leases one reclamation transaction transitions.
+    pub sweep_batch_size: u32,
+}
+
+impl Default for LeasesSection {
+    fn default() -> Self {
+        Self {
+            min_ttl_secs: 1,
+            max_ttl_secs: 3_600,
+            sweep_interval_secs: 60,
+            sweep_batch_size: 1_000,
+        }
+    }
+}
+
+impl LeasesSection {
+    /// Reject a window or timing the lease path cannot run with.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error naming the field that is out of its range.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.min_ttl_secs == 0 {
+            anyhow::bail!("[quota-enforcement.leases].min_ttl_secs must be at least 1");
+        }
+        if self.max_ttl_secs < self.min_ttl_secs {
+            anyhow::bail!("[quota-enforcement.leases].max_ttl_secs must be at least min_ttl_secs");
+        }
+        if self.sweep_interval_secs == 0 {
+            anyhow::bail!("[quota-enforcement.leases].sweep_interval_secs must be at least 1");
+        }
+        if self.sweep_batch_size == 0 {
+            anyhow::bail!("[quota-enforcement.leases].sweep_batch_size must be at least 1");
+        }
+        Ok(())
+    }
+
+    /// The TTL window acquisitions are checked against.
+    #[must_use]
+    pub const fn to_limits(&self) -> crate::domain::operations::LeaseLimits {
+        crate::domain::operations::LeaseLimits {
+            min_ttl: Duration::from_secs(self.min_ttl_secs),
+            max_ttl: Duration::from_secs(self.max_ttl_secs),
+        }
+    }
+
+    /// The domain view of the sweeper timing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the batch size is zero, which [`Self::validate`]
+    /// has already rejected at startup.
+    pub fn to_sweep_timing(&self) -> anyhow::Result<crate::domain::operations::LeaseSweepTiming> {
+        Ok(crate::domain::operations::LeaseSweepTiming {
+            interval: Duration::from_secs(self.sweep_interval_secs),
+            batch_size: std::num::NonZeroU32::new(self.sweep_batch_size)
+                .ok_or_else(|| anyhow::anyhow!("lease sweep batch size must be at least 1"))?,
         })
     }
 }

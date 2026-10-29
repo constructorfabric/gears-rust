@@ -367,17 +367,48 @@ or promotion is `adjustment_unsupported`, and a billing currency other than the 
 
 Rating evaluation **MUST** expose a conceptual evaluation contract that, for a given evaluation context at timestamp `t` (UTC), prices the bindings Pricing resolved for the subscription (the binding of record) and produces a **resolved price outcome** (bound prices, model kind, tier thresholds, exact amounts) plus a `pricingSnapshotRef` and evaluation metadata. It **MUST** be replay-safe: a replay reads the stored binding of record, never a new `resolve` call.
 
+**Design**: exact amounts are written, stored and reloaded as reduced fractions with the shared money crate's exact-fraction API (`cpt-cf-bss-rating-upreq-bss-money-exact-api`, DECISIONS R-35; DESIGN §3.3), never with a Rating copy of it (money ADR rule 2).
+
 **Rationale**: Rating and Finance require a stable, reproducible outcome to reproduce charges and audits.
 
 **Actors**: `cpt-cf-bss-rating-actor-rating`
 
 #### Pre-purchase evaluation (order-time price preview)
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
 
-Rating evaluation **MUST** expose a **pre-purchase** evaluation contract for a prospective purchase that has **no subscription yet**. The request is the one Orders Lifecycle defines (Orders D-154, D-167; DECISIONS T-D-79): an `assessment_id`, a `resolve_date`, the tenant axes, the `market{currency, region}`, an optional `contract_ref`, and `lines[{line_id, plan_revision_id, term: Rolling | FixedPeriods{count}, cycle: month | year, items[{item_id, quantity, chains[{dim_value, binding}]}]}]` — `market`, `contract_ref` and the per-line `term`/`cycle` are Rating's additions pending Orders' confirmation (R-24) of the context Orders lists — the **exact bindings** Pricing resolved for the order, which Rating prices as given (no renewal walk, no `resolve` call). The contract **MUST** return, per item, per line and for the whole order, gross, discount and net amounts **decomposed by `chargeKind`** — `recurring`, `one_time` (listed once) and `usage` flagged as carrying no committed amount (it prices at rating time) — together with the minimum-fee application, the currency and `currency_scale` (no rounding mode: HALF_EVEN is Billing's, money ADR rule 7), and the **net pre-tax TCV** (rolling terms annualised ×12 for `month` and ×1 for `year`; any other cycle is refused). Amounts are returned both exact and as major-unit display decimals rounded HALF_EVEN at `currency_scale` and marked as estimates (the money ADR retires the integer minor units Orders' documents still name (`orders-lifecycle/docs/UPSTREAM_REQS.md:317, 347`); DECISIONS T-D-80, R-24). The outcome is **non-authoritative**: it **MUST NOT** be a billing input, **MUST NOT** post, and **MUST NOT** create evaluation state. `discount` and `promotion_status` **MUST** be reported `unavailable` (promotions are deferred in Pricing, D-409), never as a zero discount; brand-scoped terms and indicative tax are likewise unavailable. Access is `sellerTenantId`-scoped. A missing or inconsistent input fails with `evaluation-unavailable` (the code Orders expects).
+**Selected target reconciliation, Orders D-197 (2026-10-05); implementation remains missing.**
+Rating **MUST** expose an authorized, nonbinding pre-purchase evaluation SDK over the exact
+selected native Pricing bindings, quantities, market and Subscriptions-resolved term/BillingTerms
+specified by [the joint purchase contract](../../orders/docs/DESIGN.md#contract-03-rating-purchase-evaluation).
+No subscription, activated cohort, receipt or complete billing snapshot is invented. The request
+fixes assessment/line/revision identity and producer digests; Rating does not select a successor
+or return the obsolete catalog-version/cohort prefix as purchase authority.
 
-**Design**: `OrderEvaluationV1::evaluate` (DECISIONS T-D-54, refined by T-D-79 to Orders' D-167 contract; it replaces the Seam Atlas C06 DTO with `plan_id`, `price_ids[]` and `catalog_version`). **Orders ask (R-24)**: Orders Lifecycle requires totals at every submit and amendment and asks to raise this requirement to `p1` and drop its catalog-version prefix (`orders-lifecycle/docs/UPSTREAM_REQS.md:315-319`); the priority stays `p2` until the product owner decides.
+Rating **MUST** compute item/line/order monetary aggregation, scale conversion and rounding,
+return exact amounts and major-unit display estimates rounded HALF_EVEN at `currency_scale`
+with gross/net/discount, promotion availability, all three charge kinds,
+cycle-labelled components and one net pre-tax TCV with finite/rolling-annualized/mixed basis.
+Usage has no committed amount; one-time is counted once without synthesizing a usage evaluation
+unit. The caller **MUST NOT** sum or convert money. No implicit defaults, FX or guessed discount
+are allowed. Required unsupported scope/model/context fails explicitly; the declared subscription-
+context exclusions and Preview-only term/cycle withholding follow the joint contract.
+
+The result **MUST NOT** post, create evaluation state or become a billing input. Seller/resource/
+payer authorization and the service grant are required before disclosure. Actual period-snapshot
+composition and activation geometry remain owned downstream. This replaces only the former
+pre-purchase caller-summation/catalog-prefix contract; it does not claim delivery, producer-owner
+signoff or reconciliation of the rest of Rating's historical design. While promotions are
+deferred, `discount` and `promotion_status` remain `unavailable`, never a guessed zero;
+brand-scoped terms and indicative tax are likewise unavailable. Missing or inconsistent required
+inputs fail with `evaluation-unavailable`.
+
+**Design**: `OrderEvaluationV1::evaluate` (DECISIONS T-D-54/T-D-79), refined for the selected
+Orders D-197 purchase contract above, with exact money and display estimates (T-D-80; Orders
+D-216). Orders requires totals at submit and amendment as a `p1` dependency. Rating's historical
+`p2` priority and DTO confirmation remain tracked under R-24 in
+[`UPSTREAM_REQS.md` §2.11](./UPSTREAM_REQS.md#211-orders-lifecycle); this selected target does not
+claim producer-owner signoff.
 
 **Rationale**: A purchase must be priced, displayed and threshold-checked **before** the subscription that anchors evaluation exists; without this contract every caller would re-implement the money arithmetic and fork it. Selection stays Pricing's (the order carries the bindings); the arithmetic stays single-sourced here.
 

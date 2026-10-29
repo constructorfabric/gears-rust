@@ -89,8 +89,8 @@ pub enum OperationKind {
 
 /// `operation.plane` — 1 platform, 2 tenant.
 ///
-/// Every P0 operation is `Platform`. The plane is expressed by the contract and
-/// the data, not enforced by the transport (ceiling C8).
+/// Every P0 operation is `Platform`: only platform routes and the platform contract
+/// reach a mutation (D17). No listener separates the planes yet (ceiling C8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum Plane {

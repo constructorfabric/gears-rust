@@ -27,7 +27,9 @@ pub use operation_builder::{
     ThrottlingSpec, state,
 };
 pub use select::{apply_select, page_to_projected_json, project_json};
-pub use toolkit_trace_context::extract_trace_id;
+pub use toolkit_trace_context::{
+    current_request_id, extract_request_id, extract_trace_id, with_request_id,
+};
 
 /// Prelude that re-exports the canonical error types and common API utilities.
 pub mod canonical_prelude {

@@ -101,6 +101,7 @@ jobs:
             fips:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
+              - 'libs/toolkit-http-proxy/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
@@ -369,6 +370,16 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
 
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);
@@ -430,6 +441,13 @@ jobs:
       - name: Test bss-ledger with Postgres (integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
+
+      # bss-orders' Postgres tier: the engine, sealed audit, idempotency, claims, role-isolation
+      # and gear-boot proofs all run against a real PostgreSQL. Without this step the tier
+      # compiles here and runs nowhere.
+      - name: Test bss-orders with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
 
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -574,13 +592,16 @@ jobs:
         run: |
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
+          cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
       # Windows: build-verify the CNG provider path. Compile-only is sufficient —
       # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
       - name: FIPS build check (Windows / CNG)
         if: runner.os == 'Windows'
         shell: bash
-        run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+        run: |
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
 
       - name: Save compilation metrics
         if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
@@ -1179,6 +1200,18 @@ jobs:
         uses: ./.github/actions/cargo-gears
         with:
           version: ${{ env.CARGO_GEARS_VERSION }}
+
+      # rust-lang/rust-clippy renamed `master` to `main`, but dylint (up to 6.2.0) clones it and
+      # checks out `master`, so building the dylint driver fails. Serve that clone from a local
+      # mirror whose default branch `master` is `main`. Remove once dylint checks out `main`.
+      - name: Work around dylint's hard-coded rust-clippy `master`
+        shell: bash
+        run: |
+          mirror="$RUNNER_TEMP/rust-clippy.git"
+          git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+          git -C "$mirror" branch -f master main
+          git -C "$mirror" symbolic-ref HEAD refs/heads/master
+          git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
         run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint

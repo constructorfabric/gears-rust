@@ -107,6 +107,32 @@ fn split_fixtures(entities: &[Value]) -> (Vec<Value>, Vec<(String, i64)>) {
     (documents, partitions)
 }
 
+/// Where the spawned server keeps its event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventLog {
+    /// The in-process memory backend: the log dies with the process.
+    Memory,
+    /// The `SQLite` backend plugin, in `events.db` under the server's home
+    /// directory, beside the gear's own database: the log survives a restart.
+    Sqlite,
+}
+
+impl EventLog {
+    /// The `backends:` entry `main` for this log.
+    fn backend_entry(self, home_dir: &Path) -> String {
+        match self {
+            Self::Memory => {
+                "        main:\n          type: \"gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~\"\n"
+                    .to_owned()
+            }
+            Self::Sqlite => format!(
+                "        main:\n          type: \"gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~\"\n          path: '{}'\n",
+                home_dir.join("events.db").display()
+            ),
+        }
+    }
+}
+
 /// Builds the `types-registry` `entities:` list as a YAML flow sequence of
 /// JSON-object literals (YAML is a superset of JSON for values) - avoids
 /// hand-crafting indentation-sensitive block-style YAML per entity.
@@ -115,6 +141,7 @@ fn config_yaml(
     port: u16,
     entities: &[Value],
     heartbeat_secs: Option<u32>,
+    event_log: EventLog,
 ) -> String {
     let (documents, partitions) = split_fixtures(entities);
     let entities_json: Vec<String> = documents
@@ -180,22 +207,17 @@ gears:
       file: "event_broker.db"
     config:
       mode: standalone
-      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+      backends:
+{backend_entry}      backend_routing:
+        "gts.cf.core.events.topic.v1~": main
       streaming:
         heartbeat_interval_secs: {heartbeat_interval_secs}
         read_batch_max_events: 256
         read_batch_max_bytes: 1048576
         progress_drift_threshold: 1000
         progress_min_interval_secs: 30
-      # The event log lives in the backend's own database, beside the gear's
-      # rather than inside it - the gear's keeps ingest and delivery metadata.
-      # A file rather than `:memory:` because the restart test asserts events
-      # survive the process that wrote them.
       topics:
-        "gts.cf.core.events.topic.v1~":
-          backend:
-            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
-            path: '{home}/event-broker/event_log.db'
+        "gts.cf.core.events.topic.v1~": {{}}
 {topic_settings}
 
   api-gateway:
@@ -207,6 +229,7 @@ gears:
         home = home_dir.display(),
         entities = entities_json.join(", "),
         topic_settings = topic_settings,
+        backend_entry = event_log.backend_entry(home_dir),
     )
 }
 
@@ -225,11 +248,12 @@ fn spawn_server(
     port: u16,
     entities: &[Value],
     heartbeat_secs: Option<u32>,
+    event_log: EventLog,
 ) -> (Child, Arc<Mutex<Vec<String>>>) {
     let config_path = home_dir.join("config.yaml");
     std::fs::write(
         &config_path,
-        config_yaml(home_dir, port, entities, heartbeat_secs),
+        config_yaml(home_dir, port, entities, heartbeat_secs, event_log),
     )
     .expect("write config");
 
@@ -296,6 +320,8 @@ pub struct TestServer {
     /// The heartbeat cadence this server was booted with, re-applied on
     /// `restart` so a restarted server keeps whatever a test configured.
     heartbeat_secs: Option<u32>,
+    /// Where the event log lives, re-applied on `restart`.
+    event_log: EventLog,
 }
 
 impl TestServer {
@@ -303,7 +329,12 @@ impl TestServer {
     /// config (the same `entities:` mechanism `config/event-broker-
     /// standalone.yaml` documents) - typically topic/event-type fixtures.
     pub async fn start(entities: Vec<Value>) -> Self {
-        Self::start_with_heartbeat(entities, None).await
+        Self::boot(entities, None, EventLog::Memory).await
+    }
+
+    /// Boots with its event log in `event_log` instead of the memory backend.
+    pub async fn start_with_event_log(entities: Vec<Value>, event_log: EventLog) -> Self {
+        Self::boot(entities, None, event_log).await
     }
 
     /// Boots with an explicit idle heartbeat cadence (seconds); `None` keeps the
@@ -312,9 +343,14 @@ impl TestServer {
     /// frame it fails to write - a heartbeat, for an idle stream. A short cadence
     /// bounds that detection latency, which a disconnect-departure test relies on.
     pub async fn start_with_heartbeat(entities: Vec<Value>, heartbeat_secs: Option<u32>) -> Self {
+        Self::boot(entities, heartbeat_secs, EventLog::Memory).await
+    }
+
+    async fn boot(entities: Vec<Value>, heartbeat_secs: Option<u32>, event_log: EventLog) -> Self {
         let home_dir = TempDir::new().expect("tempdir");
         let port = alloc_port();
-        let (mut child, logs) = spawn_server(home_dir.path(), port, &entities, heartbeat_secs);
+        let (mut child, logs) =
+            spawn_server(home_dir.path(), port, &entities, heartbeat_secs, event_log);
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_ready(&mut child, &base_url, &logs).await;
         Self {
@@ -324,6 +360,7 @@ impl TestServer {
             home_dir,
             entities,
             heartbeat_secs,
+            event_log,
         }
     }
 
@@ -344,6 +381,7 @@ impl TestServer {
             port,
             &self.entities,
             self.heartbeat_secs,
+            self.event_log,
         );
         let base_url = format!("http://127.0.0.1:{port}");
         wait_for_ready(&mut child, &base_url, &logs).await;

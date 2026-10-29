@@ -343,7 +343,7 @@ leave `content_id` untouched at finalize and require the client to make the exis
 activate the uploaded content. Either way the bind **MUST** remain the same optimistic-CAS operation
 (`cpt-cf-file-storage-fr-conditional-requests`): auto-bind either wins the CAS or reports a conflict without failing
 the upload, and the outcome **MUST** be reported back to the caller (`X-FS-Bound` header for single-part,
-`bind_state` field for multipart complete).
+`bind_state` field for multipart complete, with the same closed vocabulary `bound`/`conflict`/`manual`).
 
 **Rationale**: Auto-bind collapses the common "upload then immediately make it live" case from three round trips
 (presign, upload, bind) down to two (presign, upload) without weakening the CAS guarantee a manual bind already
@@ -1314,8 +1314,8 @@ The priority order and the trade-off rule are those of §6.4.
 #### Efficiency
 
 - **Guiding question** — *How quickly and economically can software be built, deployed, and operated?* Content moves
-  between clients, the sidecar and the backend without crossing the control plane; a default upload takes two client
-  requests (multipart: N + 2); Gears call an in-process SDK; storage backends are chosen by configuration.
+  between clients, the sidecar and the backend without crossing the control plane; an upload binds its first content
+  without a separate `bind` request; Gears call an in-process SDK; storage backends are chosen by configuration.
 - **North Star — Total Cost of Ownership (TCO)**: Inherited — cost is modelled at the platform level (§6.2). The gear
   bounds its own cost drivers: bytes transit only the sidecar (`cpt-cf-file-storage-nfr-bandwidth`), memory per
   transfer is bounded by streaming, and cleanup (once a cleanup job exists) is bounded by a time budget.

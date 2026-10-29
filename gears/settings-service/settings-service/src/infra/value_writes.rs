@@ -17,7 +17,7 @@ use toolkit_db::{DBProvider, DbError};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
@@ -653,6 +653,7 @@ impl WriteCoordinator {
                         key_owned.as_str(),
                         Some(tenant_id),
                         actor_owned.subject(),
+                        ActorTenant::of(actor_owned.tenant()),
                         AuditOperation::Stage,
                         actor_owned.request_id.clone(),
                     )

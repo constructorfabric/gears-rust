@@ -354,7 +354,7 @@ arch_status_svg_update: py-env
 
 # -------- Tests --------
 
-.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s coverage-cluster-k8s test-durable-execution-pg coverage-durable-execution-pg test-github-mirror-db test-github-mirror-scale test-fips
+.PHONY: test-no-macros test-macros test-db test-integration test-graph-storage test-graph-storage-pg test-cluster-k8s coverage-cluster-k8s test-durable-execution-pg coverage-durable-execution-pg test-eb-pg test-eb-sqlite test-eb-mysql test-eb-mariadb test-eb-kafka test-github-mirror-db test-github-mirror-scale test-fips
 
 # Run the workspace tests except the macro test crates (CI test job)
 test-no-macros: install-tools
@@ -394,6 +394,43 @@ test-graph-storage-pg: install-tools
 	GEARS_TEST_PG_GRAPH_REQUIRED=1 cargo nextest run -p cf-gears-graph-storage \
 		--test pg_conformance --test-threads=$(GRAPH_PG_TEST_THREADS)
 
+## Run the event-broker PostgreSQL backend's conformance and plugin tests (Docker required)
+## The shared backend conformance suite and the plugin's own tests against a
+## real PostgreSQL (testcontainers). `EB_TEST_POSTGRES_URL` points it at an
+## existing server.
+test-eb-pg: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-postgres-event-broker-plugin --features integration --retries 1
+
+## Run the event-broker SQLite backend's conformance and plugin tests
+## The shared backend conformance suite and the plugin's own tests over a file
+## in a temporary directory; no Docker needed.
+test-eb-sqlite: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-sqlite-event-broker-plugin --retries 1
+
+## Run the event-broker MySQL backend's conformance and plugin tests on MySQL (Docker required)
+## Every test of the plugin but the MariaDB ones, against a real MySQL
+## (testcontainers). `EB_TEST_MYSQL_URL` points it at an existing server.
+test-eb-mysql: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-mysql-event-broker-plugin --features integration --retries 1 -E 'not test(/mariadb/)'
+
+## Run the event-broker MySQL backend's conformance and plugin tests on MariaDB (Docker required)
+## The plugin's MariaDB tests, against a real MariaDB (testcontainers).
+## `EB_TEST_MARIADB_URL` points it at an existing server.
+test-eb-mariadb: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-mysql-event-broker-plugin --features integration --retries 1 -E 'test(/mariadb/)'
+
+## Run the event-broker Kafka backend's conformance and plugin tests (Docker required)
+## The shared backend conformance suite and the plugin's own tests against a
+## single-node Kafka (testcontainers). `EB_TEST_KAFKA_BOOTSTRAP` points it at
+## an existing cluster.
+test-eb-kafka: install-tools
+	$(call print_target_banner)
+	cargo nextest run -p cf-gears-kafka-event-broker-plugin --features integration --retries 1
+
 # Integration lanes
 #
 # A lane is one `cargo nextest run` of an integration suite (most need Docker).
@@ -408,7 +445,7 @@ test-graph-storage-pg: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -446,6 +483,15 @@ lane_env_usage-collector-ch = CH_REQUIRE_DOCKER=1
 ## types-registry PostgreSQL + MySQL integration tests (Docker required;
 ## each test spins up its own postgres or mysql container via testcontainers).
 lane_args_types-registry-db = -p cf-gears-types-registry --features integration -E 'binary(/_backends_test$$/)'
+
+## The event-broker gear database on SQLite, PostgreSQL and MySQL: migrations,
+## first-publish contention and producer-chain resubmission races (Docker
+## required; each test starts its own container, the gear database and the
+## storage backend in separate schemas or databases on it).
+## EB_TEST_REQUIRE_DOCKER=1 turns an unreachable Docker into a failure; without
+## it the PostgreSQL and MySQL tests skip.
+lane_args_eb-gear-db = -p cf-gears-event-broker --features integration -E 'binary(/_backends_test$$/)'
+lane_env_eb-gear-db = EB_TEST_REQUIRE_DOCKER=1
 
 ## OAGW's database tier: the repository conformance suite and the
 ## migration tests on PostgreSQL and MySQL (Docker required; no skip without
@@ -580,6 +626,16 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
 
+## bss-orders' Postgres tier (Docker required; testcontainers).
+##
+## Same `--run-ignored ignored-only` shape as ledger and products: every Orders test that starts a
+## PostgreSQL container is `#[ignore]` with the Docker reason — the lib's `infra::storage::tests`
+## modules and the gear-boot tests in `gear::tests` — and the attribute marks nothing else, so
+## there is no binary or name filter. The unit tier keeps the config, codec and REST-surface tests
+## that need no container (D-224).
+## `--no-fail-fast` for the reason the pricing lane gives.
+lane_args_orders-pg = -p cf-gears-bss-orders --run-ignored ignored-only --no-fail-fast
+
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
 
@@ -709,8 +765,8 @@ coverage-durable-execution-pg:
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
-	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
-		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-oagw/fips
+	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
+		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
 
 GM_PG_TAG := $(shell sed -n 's/^pub const POSTGRES_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
 GM_MARIADB_TAG := $(shell sed -n 's/^pub const MARIADB_TAG: &str = "\(.*\)";/\1/p' libs/test-containers/src/lib.rs)
@@ -768,7 +824,7 @@ check-windows-fips:
 
 # -------- Benchmarks --------
 
-.PHONY: bench-toolkit-db-outbox
+.PHONY: bench-toolkit-db-outbox bench-eb-memory bench-eb-pg bench-eb-sqlite bench-eb-mysql bench-eb-kafka longhaul-eb-pg
 
 # Outbox throughput benchmarks of cf-gears-toolkit-db, per database engine:
 # the Cargo feature that enables the engine and the benchmark filter.
@@ -798,9 +854,81 @@ help.LONGHAUL.usage := LONGHAUL=1
 help.LONGHAUL.targets := bench-toolkit-db-outbox
 help.LONGHAUL.text = Run the long-haul benchmarks (1M+10M rows; 100K on sqlite).
 
+# The event-broker bench and long-haul runs are confined to BENCH_MEMORY_MAX
+# (systemd user scope, no swap), so a runaway is killed before it takes the
+# machine with it.
+BENCH_MEMORY_MAX ?= 6G
+# Two malloc arenas: with one per thread, memory a finished phase freed on one
+# thread is not reused by the next phase's allocations on another, and RSS
+# climbs phase after phase.
+BENCH_SCOPE ?= MALLOC_ARENA_MAX=2 systemd-run --user --scope --quiet -p MemoryMax=$(BENCH_MEMORY_MAX) -p MemorySwapMax=0
+
+## Event-broker backend bench against the memory backend
+## See plugins/event-broker-backend-bench/README.md. Extra flags go in
+## BENCH_ARGS, e.g. `make bench-eb-memory BENCH_ARGS="--quick --scenarios b2"`.
+## The build runs first; only the run itself is confined to BENCH_MEMORY_MAX.
+bench-eb-memory:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-memory-event-broker-plugin --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-memory-event-broker-plugin --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/memory.json $(BENCH_ARGS)
+
+## Event-broker backend bench against PostgreSQL
+## The server EB_BENCH_POSTGRES_URL names, or a testcontainers container (needs
+## a Docker daemon; the container runs outside the memory scope).
+bench-eb-pg:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/postgres.json $(BENCH_ARGS)
+
+## Event-broker backend bench against SQLite
+## A file in a temporary directory, or the file EB_BENCH_SQLITE_PATH names (put
+## it on the disk being measured: a tmpfs makes every sync free).
+bench-eb-sqlite:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-sqlite-event-broker-plugin --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-sqlite-event-broker-plugin --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/sqlite.json $(BENCH_ARGS)
+
+## Event-broker backend bench against MySQL
+## The server the plugin's bench is pointed at, or a testcontainers container
+## (needs a Docker daemon; the container runs outside the memory scope).
+bench-eb-mysql:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-mysql-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-mysql-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/mysql.json $(BENCH_ARGS)
+
+## Event-broker backend bench against Kafka
+## The cluster the plugin's bench is pointed at, or a testcontainers broker
+## (needs a Docker daemon; the container runs outside the memory scope).
+bench-eb-kafka:
+	$(call print_target_banner)
+	cargo bench -p cf-gears-kafka-event-broker-plugin --features integration --bench backend --no-run
+	$(BENCH_SCOPE) cargo bench -p cf-gears-kafka-event-broker-plugin --features integration --bench backend -- \
+		--out $(CURDIR)/target/eb-bench/kafka.json $(BENCH_ARGS)
+
+EB_LONGHAUL_URL ?= postgres://postgres:postgres@127.0.0.1:54329/events
+
+## Event-broker PostgreSQL long-haul run, until Ctrl-C
+## See plugins/postgres-event-broker-plugin/longhaul/README.md. Runs against
+## EB_LONGHAUL_URL, by default the server longhaul/compose.yaml starts. Flags go
+## in LONGHAUL_ARGS, e.g. `make longhaul-eb-pg LONGHAUL_ARGS="--reset --duration 30m"`.
+## The binary runs without cargo in front of it: Ctrl-C reaches only the run,
+## and make returns once the run has finished and printed its report.
+longhaul-eb-pg:
+	$(call print_target_banner)
+	@bin=$$(cargo bench -p cf-gears-postgres-event-broker-plugin --features integration --bench longhaul \
+		--no-run --message-format=json-render-diagnostics \
+		| grep '"name":"longhaul"' | sed -n 's/.*"executable":"\([^"]*\)".*/\1/p' | tail -n 1); \
+	test -n "$$bin" || { echo "longhaul-eb-pg: the longhaul binary was not built" >&2; exit 1; }; \
+	exec env EB_LONGHAUL_URL=$(EB_LONGHAUL_URL) $(BENCH_SCOPE) "$$bin" \
+		--out $(CURDIR)/target/eb-longhaul/report.json $(LONGHAUL_ARGS)
+
 # -------- E2E tests --------
 
-.PHONY: e2e e2e-local e2e-local-smoke e2e-docker e2e-docker-smoke e2e-tr-authz e2e-oagw-sqlite e2e-usage-collector e2e-event-broker e2e-oop
+.PHONY: e2e e2e-local e2e-local-smoke e2e-docker e2e-docker-smoke e2e-tr-authz e2e-oagw-sqlite e2e-usage-collector e2e-event-broker e2e-event-broker-pg e2e-event-broker-sqlite e2e-event-broker-mysql e2e-event-broker-mariadb e2e-event-broker-kafka e2e-oop
 
 E2E_TARGET ?=
 # E2E selectors for `make e2e-local`:
@@ -911,6 +1039,46 @@ e2e-event-broker: py-env
 	E2E_BINARY=target/debug/cf-gears-event-broker-server \
 		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv
 
+## Run event-broker E2E tests on the PostgreSQL storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a PostgreSQL sidecar.
+e2e-event-broker-pg: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=postgres E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the SQLite storage backend
+## The backend-sensitive tests of e2e-event-broker, the events in a file under the server's home.
+e2e-event-broker-sqlite: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=sqlite E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the MySQL storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a MySQL sidecar.
+e2e-event-broker-mysql: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=mysql E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the MySQL storage backend on MariaDB (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a MariaDB sidecar.
+e2e-event-broker-mariadb: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=mariadb E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
+## Run event-broker E2E tests on the Kafka storage backend (Docker required)
+## The backend-sensitive tests of e2e-event-broker, with a single-node Kafka sidecar.
+e2e-event-broker-kafka: py-env
+	$(call print_target_banner)
+	cargo build -p cf-gears-event-broker --bin cf-gears-event-broker-server
+	EB_E2E_BACKEND=kafka E2E_BINARY=target/debug/cf-gears-event-broker-server \
+		$(PYTHON) -m pytest testing/e2e/suites/event_broker/ -vv -m backend_sensitive
+
 ## Run the out-of-process (loopback, no-k8s) E2E suite
 # Out-of-process (loopback) E2E: boots flight-control + OoP gears as local
 # processes (no Kubernetes) and asserts the cross-process seams. Self-managed:
@@ -962,6 +1130,14 @@ coverage-e2e-local: check-prereq-e2e-local
 
 .PHONY: mini-chat-docker mini-chat-helm mini-chat-helm-template mini-chat-up mini-chat-down mini-chat-port-forward
 
+# Dockerfiles that use BuildKit cache mounts need the Buildx CLI plugin. Without
+# it `docker build` stops at "BuildKit is enabled but the buildx component is
+# missing or broken", which does not say which plugin to install. $(1) is the
+# Dockerfile that needs it.
+define check_docker_buildx
+    @docker buildx version >/dev/null 2>&1 || (echo "ERROR: 'docker buildx' is not available, and $(1) uses BuildKit cache mounts. Install the Buildx plugin for your Docker distribution - see 'Prepare environment > Docker' in docs/web-docs/build-with-gears/index.mdx." && exit 1)
+endef
+
 ## Build mini-chat Docker image for K8s (dev build by default, RELEASE=1 for optimized)
 ## On linux: builds on host (reuses local target/), then packages the binary.
 ## On other OS: full multi-stage Docker build with BuildKit caching.
@@ -983,6 +1159,7 @@ ifeq ($(shell uname -s),Linux)
 	@rm -rf .docker-stage
 else
 	@echo "==> Non-linux host: full Docker build"
+	$(call check_docker_buildx,mini-chat.Dockerfile)
 	DOCKER_BUILDKIT=1 docker build \
 		-f gears/mini-chat/deploy/docker/mini-chat.Dockerfile \
 		--build-arg CARGO_FEATURES="$(MINI_CHAT_K8S_FEATURES)" \

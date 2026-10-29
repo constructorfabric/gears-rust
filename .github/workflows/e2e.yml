@@ -313,6 +313,22 @@ jobs:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop.xml -o junit_suite_name=e2e-oop"
         run: tools/scripts/with_rust_annotations.sh make e2e-oop
 
+      # Self-managed suite (launcher: pytest): its own server binary. The whole
+      # suite runs on the in-process memory backend; the `backend_sensitive`
+      # tests run again on PostgreSQL (a container, so the second step needs a
+      # reachable Docker daemon).
+      - name: Run event-broker E2E tests (memory backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker.xml -o junit_suite_name=e2e-event-broker"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker
+
+      - name: Run event-broker E2E tests (PostgreSQL backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker-pg.xml -o junit_suite_name=e2e-event-broker-pg"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker-pg
+
       # pytest records the assertion but not where it failed; take that from
       # the traceback so the report can annotate the test's source line.
       # --github also annotates the failures on this job and writes the job

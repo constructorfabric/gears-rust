@@ -739,3 +739,117 @@ async fn content_hash_modes_leaves_hash_algorithm_check_intact() {
         "hash_algorithm CHECK must still reject any non-SHA-256 value"
     );
 }
+
+/// Shared body of the `upload_flow` data-preservation tests: applies everything before it, seeds a
+/// session with a version row, a session without one and two parts, then applies the rest.
+async fn upload_flow_backfills_sessions_and_keeps_parts(foreign_keys: &str) {
+    let db = Database::connect("sqlite::memory:")
+        .await
+        .expect("connect in-memory sqlite");
+    db.execute_raw(stmt(&db, format!("PRAGMA foreign_keys = {foreign_keys};")))
+        .await
+        .expect("set foreign keys pragma");
+
+    Migrator::up(&db, Some(8))
+        .await
+        .expect("apply migrations up to (not including) upload_flow");
+
+    let file2 = "00000000-0000-0000-0000-0000000000c2";
+    let version2 = "00000000-0000-0000-0000-0000000000d2";
+    let upload_with_version = "00000000-0000-0000-0000-0000000000e1";
+    let upload_without_version = "00000000-0000-0000-0000-0000000000e2";
+
+    insert_file(&db, FILE).await;
+    insert_version(&db, FILE, VERSION, 0).await;
+    insert_file(&db, file2).await;
+
+    for (upload_id, file_id, version_id) in [
+        (upload_with_version, FILE, VERSION),
+        (upload_without_version, file2, version2),
+    ] {
+        db.execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO multipart_uploads \
+                 (upload_id, file_id, version_id, backend_upload_handle, state, declared_mime, \
+                  mime_validated, declared_size, part_size, created_at, expires_at) \
+                 VALUES ('{upload_id}', '{file_id}', '{version_id}', 'h', 'in_progress', \
+                         'text/plain', 0, 10, 5, '2026-01-01T00:00:00Z', '2026-01-02T00:00:00Z')"
+            ),
+        ))
+        .await
+        .expect("insert pre-migration session");
+    }
+    for part in 1..=2 {
+        db.execute_raw(stmt(
+            &db,
+            format!(
+                "INSERT INTO multipart_upload_parts \
+                 (upload_id, part_number, backend_etag, part_hash, size) \
+                 VALUES ('{upload_with_version}', {part}, 'etag{part}', X'{HASH32}', 5)"
+            ),
+        ))
+        .await
+        .expect("insert part");
+    }
+
+    Migrator::up(&db, None)
+        .await
+        .expect("upload_flow migration must pass regardless of the foreign_keys pragma");
+
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            format!(
+                "SELECT backend_id, backend_path FROM multipart_uploads \
+                 WHERE upload_id = '{upload_with_version}'"
+            ),
+        ))
+        .await
+        .expect("query backfilled session")
+        .expect("session row survives");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "backend_id").unwrap(),
+        Some("local".to_owned())
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "backend_path").unwrap(),
+        Some(format!("/{FILE}/{VERSION}"))
+    );
+
+    let row = db
+        .query_one_raw(stmt(
+            &db,
+            format!(
+                "SELECT backend_id, backend_path FROM multipart_uploads \
+                 WHERE upload_id = '{upload_without_version}'"
+            ),
+        ))
+        .await
+        .expect("query session without version")
+        .expect("session row survives");
+    assert_eq!(
+        row.try_get::<Option<String>>("", "backend_id").unwrap(),
+        None
+    );
+    assert_eq!(
+        row.try_get::<Option<String>>("", "backend_path").unwrap(),
+        None
+    );
+
+    assert_eq!(
+        count(&db, "SELECT COUNT(*) AS c FROM multipart_upload_parts").await,
+        2,
+        "both parts must survive the rebuild"
+    );
+}
+
+#[tokio::test]
+async fn upload_flow_backfills_backend_pair_and_keeps_parts_with_fk_on() {
+    upload_flow_backfills_sessions_and_keeps_parts("ON").await;
+}
+
+#[tokio::test]
+async fn upload_flow_migration_passes_with_fk_off() {
+    upload_flow_backfills_sessions_and_keeps_parts("OFF").await;
+}

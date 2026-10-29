@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use super::{
-    CatalogSection, ElectionTimingConfig, GaugesSection, MetricsConfig, PoliciesSection,
-    QuotaEnforcementConfig, QuotasSection,
+    CatalogSection, ElectionTimingConfig, GaugesSection, LeasesSection, MetricsConfig,
+    OperationsSection, PoliciesSection, QuotaEnforcementConfig, QuotasSection,
 };
 
 #[test]
@@ -429,4 +429,62 @@ fn the_gauges_section_keeps_the_sample_fresher_than_the_refresh_interval() {
             .is_err(),
         "unknown keys are rejected"
     );
+}
+
+#[test]
+fn the_lease_section_defaults_to_the_platform_window_and_rejects_a_bad_one() {
+    let section = LeasesSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_limits();
+    assert_eq!(limits.min_ttl, Duration::from_secs(1));
+    assert_eq!(limits.max_ttl, Duration::from_hours(1));
+    assert_eq!(
+        section.to_sweep_timing().expect("timing").interval,
+        Duration::from_mins(1)
+    );
+
+    for bad in [
+        LeasesSection {
+            min_ttl_secs: 0,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            min_ttl_secs: 10,
+            max_ttl_secs: 9,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            sweep_interval_secs: 0,
+            ..LeasesSection::default()
+        },
+        LeasesSection {
+            sweep_batch_size: 0,
+            ..LeasesSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_batch_bounds_default_to_the_platform_values_and_reject_zero() {
+    let section = OperationsSection::default();
+    section.validate().expect("defaults are valid");
+    let limits = section.to_batch_limits();
+    assert_eq!(limits.max_items, 100);
+    assert_eq!(limits.timeout, Duration::from_millis(250));
+    assert_eq!(limits, crate::domain::operations::BatchLimits::default());
+
+    for bad in [
+        OperationsSection {
+            max_batch_items: 0,
+            ..OperationsSection::default()
+        },
+        OperationsSection {
+            batch_timeout_ms: 0,
+            ..OperationsSection::default()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?} must be rejected");
+    }
 }

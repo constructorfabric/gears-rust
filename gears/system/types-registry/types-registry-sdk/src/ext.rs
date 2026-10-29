@@ -21,11 +21,18 @@
 //! With both traits imported, dual-contract clients have ambiguous helper names.
 //! Use a typed trait object or UFCS (`TypesRegistryApiExt::get_type_schema(&client, …)`).
 //!
-//! Single and batch helpers take [`ReadOptions`]. Set `ReadOptions::fresh` to bypass
+//! Single and batch Type Schema and Instance reads take [`ReadOptions`]; the `resolve_*`
+//! helpers take none. Set `ReadOptions::fresh` to bypass
 //! a client cache; the default keeps normal caching. On a client without a cache,
 //! `fresh` has no effect.
 //!
 //! Identifier kind checks are local; a UUID of the other kind is `NotFound`.
+//!
+//! The `resolve_*` helpers map a registered entity's identifier to its Registry Reference
+//! and back. They always read the registry, selecting the mandatory fields only, and answer
+//! from the snapshot read: an unregistered identifier does not resolve, a deleted entity
+//! does. They use the normal client cache. For an identifier's deterministic UUID before
+//! registration, use [`GtsId::to_uuid`].
 
 use std::collections::HashMap;
 use std::hash::Hash;
@@ -225,6 +232,123 @@ pub trait PlatformTypesRegistryApiExt: PlatformTypesRegistryApi {
         get_many_by_uuid(&PlatformReads { api: self, ctx }, uuids, options).await
     }
 
+    /// The Registry Reference of a registered Type Schema, Active or deleted, as read.
+    ///
+    /// # Errors
+    /// `NotFound` if not registered. `InvalidArgument` for an invalid or wrong-kind
+    /// identifier, before any request.
+    async fn resolve_type_uuid(
+        &self,
+        ctx: &PlatformSecurityContext,
+        type_id: &GtsTypeId,
+    ) -> Result<Uuid, CanonicalError> {
+        Ok(self
+            .get_type_schema(ctx, type_id, id_only())
+            .await?
+            .type_uuid)
+    }
+
+    /// Registry References of Type Schemas, read as [`Self::batch_get_type_schemas`];
+    /// `None` when not registered.
+    ///
+    /// # Errors
+    /// As [`Self::batch_get_type_schemas`].
+    async fn resolve_type_uuids(
+        &self,
+        ctx: &PlatformSecurityContext,
+        type_ids: &[GtsTypeId],
+    ) -> Result<HashMap<GtsTypeId, Option<Uuid>>, CanonicalError> {
+        let schemas = self
+            .batch_get_type_schemas(ctx, type_ids, id_only())
+            .await?;
+        Ok(project(schemas, |schema| schema.type_uuid))
+    }
+
+    /// The identifier of the Type Schema a Registry Reference names, Active or deleted.
+    ///
+    /// # Errors
+    /// `NotFound` when absent or when the reference names an Instance.
+    async fn resolve_type_id(
+        &self,
+        ctx: &PlatformSecurityContext,
+        type_uuid: Uuid,
+    ) -> Result<GtsTypeId, CanonicalError> {
+        Ok(self
+            .get_type_schema_by_uuid(ctx, type_uuid, id_only())
+            .await?
+            .type_id)
+    }
+
+    /// Type Schema identifiers by Registry Reference, read as
+    /// [`Self::batch_get_type_schemas_by_uuid`]; `None` when absent or an Instance.
+    ///
+    /// # Errors
+    /// As [`Self::batch_get_type_schemas`].
+    async fn resolve_type_ids(
+        &self,
+        ctx: &PlatformSecurityContext,
+        type_uuids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<GtsTypeId>>, CanonicalError> {
+        let schemas = self
+            .batch_get_type_schemas_by_uuid(ctx, type_uuids, id_only())
+            .await?;
+        Ok(project(schemas, |schema| schema.type_id))
+    }
+
+    /// The Registry Reference of a registered Instance, as [`Self::resolve_type_uuid`].
+    ///
+    /// # Errors
+    /// As [`Self::resolve_type_uuid`], for an Instance.
+    async fn resolve_instance_uuid(
+        &self,
+        ctx: &PlatformSecurityContext,
+        id: &GtsInstanceId,
+    ) -> Result<Uuid, CanonicalError> {
+        Ok(self.get_instance(ctx, id, id_only()).await?.uuid)
+    }
+
+    /// Registry References of Instances, as [`Self::resolve_type_uuids`].
+    ///
+    /// # Errors
+    /// As [`Self::batch_get_type_schemas`].
+    async fn resolve_instance_uuids(
+        &self,
+        ctx: &PlatformSecurityContext,
+        ids: &[GtsInstanceId],
+    ) -> Result<HashMap<GtsInstanceId, Option<Uuid>>, CanonicalError> {
+        let instances = self.batch_get_instances(ctx, ids, id_only()).await?;
+        Ok(project(instances, |instance| instance.uuid))
+    }
+
+    /// The identifier of the Instance a Registry Reference names — the Instance's own,
+    /// not its Type Schema's — Active or deleted.
+    ///
+    /// # Errors
+    /// `NotFound` when absent or when the reference names a Type Schema.
+    async fn resolve_instance_id(
+        &self,
+        ctx: &PlatformSecurityContext,
+        uuid: Uuid,
+    ) -> Result<GtsInstanceId, CanonicalError> {
+        Ok(self.get_instance_by_uuid(ctx, uuid, id_only()).await?.id)
+    }
+
+    /// Instance identifiers by Registry Reference, as [`Self::resolve_type_ids`];
+    /// `None` when absent or a Type Schema.
+    ///
+    /// # Errors
+    /// As [`Self::batch_get_type_schemas`].
+    async fn resolve_instance_ids(
+        &self,
+        ctx: &PlatformSecurityContext,
+        uuids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<GtsInstanceId>>, CanonicalError> {
+        let instances = self
+            .batch_get_instances_by_uuid(ctx, uuids, id_only())
+            .await?;
+        Ok(project(instances, |instance| instance.id))
+    }
+
     /// Traverse Type Schemas, preserving filters and page size. [`Projection::Default`]
     /// includes content and derived documents; explicit selections are kept as given.
     /// Cursors must match the query. Traversal provides no point-in-time snapshot.
@@ -373,6 +497,118 @@ pub trait TypesRegistryApiExt: TypesRegistryApi {
     ) -> Result<HashMap<Uuid, Option<Instance>>, CanonicalError> {
         let reads = TenantReads { api: self, ctx };
         get_many_by_uuid(&reads, uuids, options).await
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_uuid`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_uuid`].
+    async fn resolve_type_uuid(
+        &self,
+        ctx: &SecurityContext,
+        type_id: &GtsTypeId,
+    ) -> Result<Uuid, CanonicalError> {
+        Ok(self
+            .get_type_schema(ctx, type_id, id_only())
+            .await?
+            .type_uuid)
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_uuids`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_uuids`].
+    async fn resolve_type_uuids(
+        &self,
+        ctx: &SecurityContext,
+        type_ids: &[GtsTypeId],
+    ) -> Result<HashMap<GtsTypeId, Option<Uuid>>, CanonicalError> {
+        let schemas = self
+            .batch_get_type_schemas(ctx, type_ids, id_only())
+            .await?;
+        Ok(project(schemas, |schema| schema.type_uuid))
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_id`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_id`].
+    async fn resolve_type_id(
+        &self,
+        ctx: &SecurityContext,
+        type_uuid: Uuid,
+    ) -> Result<GtsTypeId, CanonicalError> {
+        Ok(self
+            .get_type_schema_by_uuid(ctx, type_uuid, id_only())
+            .await?
+            .type_id)
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_ids`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_type_ids`].
+    async fn resolve_type_ids(
+        &self,
+        ctx: &SecurityContext,
+        type_uuids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<GtsTypeId>>, CanonicalError> {
+        let schemas = self
+            .batch_get_type_schemas_by_uuid(ctx, type_uuids, id_only())
+            .await?;
+        Ok(project(schemas, |schema| schema.type_id))
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuid`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuid`].
+    async fn resolve_instance_uuid(
+        &self,
+        ctx: &SecurityContext,
+        id: &GtsInstanceId,
+    ) -> Result<Uuid, CanonicalError> {
+        Ok(self.get_instance(ctx, id, id_only()).await?.uuid)
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuids`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_uuids`].
+    async fn resolve_instance_uuids(
+        &self,
+        ctx: &SecurityContext,
+        ids: &[GtsInstanceId],
+    ) -> Result<HashMap<GtsInstanceId, Option<Uuid>>, CanonicalError> {
+        let instances = self.batch_get_instances(ctx, ids, id_only()).await?;
+        Ok(project(instances, |instance| instance.uuid))
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_id`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_id`].
+    async fn resolve_instance_id(
+        &self,
+        ctx: &SecurityContext,
+        uuid: Uuid,
+    ) -> Result<GtsInstanceId, CanonicalError> {
+        Ok(self.get_instance_by_uuid(ctx, uuid, id_only()).await?.id)
+    }
+
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_ids`].
+    ///
+    /// # Errors
+    /// As [`PlatformTypesRegistryApiExt::resolve_instance_ids`].
+    async fn resolve_instance_ids(
+        &self,
+        ctx: &SecurityContext,
+        uuids: &[Uuid],
+    ) -> Result<HashMap<Uuid, Option<GtsInstanceId>>, CanonicalError> {
+        let instances = self
+            .batch_get_instances_by_uuid(ctx, uuids, id_only())
+            .await?;
+        Ok(project(instances, |instance| instance.id))
     }
 
     /// As [`PlatformTypesRegistryApiExt::list_type_schemas`].
@@ -550,6 +786,25 @@ async fn get_many<R: EntityReads + ?Sized, K, T: Kinded>(
     Ok(out)
 }
 
+/// Each answered snapshot reduced to the field a `resolve_*` helper returns.
+fn project<K: Eq + Hash, T, V>(
+    answers: HashMap<K, Option<T>>,
+    field: impl Fn(T) -> V,
+) -> HashMap<K, Option<V>> {
+    answers
+        .into_iter()
+        .map(|(key, answer)| (key, answer.map(&field)))
+        .collect()
+}
+
+/// The read behind every `resolve_*` helper: the mandatory fields, through any cache.
+fn id_only() -> ReadOptions {
+    ReadOptions {
+        projection: Projection::Select(FieldSelection::light()),
+        fresh: false,
+    }
+}
+
 async fn list_kind<R: EntityReads + ?Sized, T: Kinded>(
     reads: &R,
     mut query: ListEntitiesRequest,
@@ -713,3 +968,7 @@ mod ext_tests;
 #[cfg(test)]
 #[path = "ext_read_options_tests.rs"]
 mod ext_read_options_tests;
+
+#[cfg(test)]
+#[path = "ext_resolve_tests.rs"]
+mod ext_resolve_tests;

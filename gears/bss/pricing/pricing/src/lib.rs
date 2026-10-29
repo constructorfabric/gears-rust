@@ -9,8 +9,6 @@ pub mod config;
 #[doc(hidden)]
 pub mod domain;
 #[doc(hidden)]
-pub mod gts;
-#[doc(hidden)]
 pub mod infra;
 #[doc(hidden)]
 pub mod module;

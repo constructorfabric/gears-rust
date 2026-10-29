@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-quota-enforcement"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,10 +17,6 @@ name = "quota_enforcement"
 
 [lints]
 workspace = true
-
-[package.metadata.cargo-shear]
-# Referenced only by the `api_dto` macro expansion.
-ignored = ["utoipa"]
 
 [features]
 # Forwarding feature for the deployed profile (cluster DESIGN section 3.17.7):

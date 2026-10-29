@@ -59,13 +59,6 @@ aws-lc-rs = { workspace = true }
 # SDK's `rust_decimal` values, the type `bss_products_sdk::derived` declares them in.
 rust_decimal = { workspace = true }
 
-# `normalized(name)` is pinned to NFKC then full casefold then whitespace
-# collapse, and is computed application-side precisely so both engines store
-# identical bytes. `char::to_lowercase` is not full casefold and NFKC has no
-# std equivalent, so the normalization cannot be hand-rolled without becoming a
-# second, wrong answer to the uniqueness operand.
-unicode-normalization = { workspace = true }
-
 # `toolkit` itself carries no `rest` Cargo feature — the REST API layer is not
 # feature-gated, so declaring `rest` in `#[toolkit::gear(capabilities = [...])]`
 # needs no feature bump here, matching the sibling pricing gear's manifest.
@@ -99,11 +92,6 @@ toolkit-macros = { workspace = true }
 # same reason, and the ledger's own instant module says so in its first line.
 time = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
-# `#[derive(ODataFilterable)]` on the per-door filter declarations: one
-# struct per list surface whose fields ARE the filterable vocabulary, so the
-# wire contract, the `OpenAPI` `$filter` doc and the storage mapping cannot
-# drift apart. The account-management gear declares its own the same way.
-toolkit-odata-macros = { workspace = true }
 
 # REST surface: the axum router `api::rest::router` mounts under the gear's
 # reserved `/bss-products/v1` prefix.
@@ -177,8 +165,8 @@ tower = { workspace = true }
 # `DBRunner` calls against the executed `SQLite` mirror. `sync` on top of the
 # in-crate suite's needs: the Postgres race probe parks one transaction on a
 # `tokio::sync::Notify` while the other contends, which is what makes the race
-# an observed sequence rather than a coin toss.
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# `test-util` for the paused-clock test in `gear_tests.rs`
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util"] }
 # The Postgres testcontainers harness (`tests/pg_support/`), adopted from the
 # sibling pricing gear rather than invented. Tests reach `testcontainers` items
 # through the `testcontainers_modules::testcontainers` re-export, so the bare

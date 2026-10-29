@@ -125,12 +125,7 @@ impl DbDeduplication {
 
     #[must_use]
     pub fn managed(mode: ProducerMode) -> ManagedDeduplicationBuilder {
-        ManagedDeduplicationBuilder {
-            mode,
-            key: None,
-            on_missing: MissingProducerRegistration::Fail,
-            on_unknown: UnknownProducerRegistration::Fail,
-        }
+        ManagedDeduplicationBuilder { mode, key: None }
     }
 
     /// The producer mode this deduplication setting implies (`Stateless` when unmanaged).
@@ -150,18 +145,12 @@ pub struct ManagedDeduplication {
     pub(crate) mode: ProducerMode,
     /// Stable producer key the registration is stored under.
     pub(crate) key: String,
-    /// Behaviour when no stored registration exists for the key.
-    pub(crate) on_missing: MissingProducerRegistration,
-    /// Behaviour when the broker rejects the registered producer id as unknown.
-    pub(crate) on_unknown: UnknownProducerRegistration,
 }
 
 #[cfg(feature = "db")]
 pub struct ManagedDeduplicationBuilder {
     mode: ProducerMode,
     key: Option<String>,
-    on_missing: MissingProducerRegistration,
-    on_unknown: UnknownProducerRegistration,
 }
 
 #[cfg(feature = "db")]
@@ -169,18 +158,6 @@ impl ManagedDeduplicationBuilder {
     #[must_use]
     pub fn key(mut self, key: impl Into<String>) -> Self {
         self.key = Some(key.into());
-        self
-    }
-
-    #[must_use]
-    pub fn on_missing(mut self, policy: MissingProducerRegistration) -> Self {
-        self.on_missing = policy;
-        self
-    }
-
-    #[must_use]
-    pub fn on_unknown(mut self, policy: UnknownProducerRegistration) -> Self {
-        self.on_unknown = policy;
         self
     }
 
@@ -201,11 +178,17 @@ impl ManagedDeduplicationBuilder {
                 detail: "managed producer registration key must not be empty".to_owned(),
             });
         }
+        if key.len() > super::registration::MAX_NAME_LEN {
+            return Err(crate::error::EventBrokerError::InvalidProducerOptions {
+                detail: format!(
+                    "managed producer registration key must be at most {} bytes",
+                    super::registration::MAX_NAME_LEN
+                ),
+            });
+        }
         Ok(DbDeduplication::Managed(ManagedDeduplication {
             mode: self.mode,
             key,
-            on_missing: self.on_missing,
-            on_unknown: self.on_unknown,
         }))
     }
 }
@@ -217,18 +200,4 @@ impl From<ManagedDeduplicationBuilder> for DbDeduplication {
             .build()
             .expect("managed producer deduplication must be complete")
     }
-}
-
-#[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MissingProducerRegistration {
-    Fail,
-    RegisterNew,
-}
-
-#[cfg(feature = "db")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnknownProducerRegistration {
-    Fail,
-    RegisterNew,
 }

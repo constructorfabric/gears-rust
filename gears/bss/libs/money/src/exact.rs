@@ -4,15 +4,29 @@ use std::borrow::Borrow;
 use std::cmp::Ordering;
 use std::sync::LazyLock;
 
-use bigdecimal::num_bigint::{BigInt, BigUint};
+/// The integer type of [`ExactAmount::numer`], [`ExactAmount::denom`] and
+/// [`ExactAmount::from_parts`], re-exported so callers use the crate's version.
+pub use bigdecimal::num_bigint::BigInt;
+use bigdecimal::num_bigint::BigUint;
 use bigdecimal::num_traits::{One, Signed, ToPrimitive, Zero};
 use rust_decimal::Decimal;
 
+use crate::money::split_decimal;
 use crate::{CurrencySpec, MoneyError, PostedMoney};
 
 const FINAL_DIGITS: u32 = 256;
 const PRODUCT_DIGITS: u32 = 512;
 const SUM_DIGITS: u32 = 513;
+
+/// The most digits of a canonical integer string: the reduced budget, `FINAL_DIGITS`.
+const INTEGER_TEXT_DIGITS: usize = 256;
+/// The most integer digits [`ExactAmount::parse_decimal`] reads.
+const DECIMAL_INTEGER_DIGITS: usize = 60;
+/// The most fractional digits [`ExactAmount::parse_decimal`] reads, after trailing zeros.
+const DECIMAL_FRACTION_DIGITS: u32 = 28;
+/// The longest text [`ExactAmount::parse_decimal`] reads: a sign, 60 + 28 digits, the
+/// point and room for fractional trailing zeros.
+const DECIMAL_TEXT_BYTES: usize = 128;
 
 /// Exclusive magnitude bounds: an integer has more than `N` decimal digits
 /// exactly when its magnitude is at least `10^N`. Computed once, so a digit
@@ -66,6 +80,104 @@ impl ExactAmount {
     #[must_use]
     pub fn from_coefficient(coefficient: i128, scale: u8) -> Self {
         Self::normalize(BigInt::from(coefficient), ten_pow(u32::from(scale)))
+    }
+
+    /// The reduced fraction `numerator / denominator`, with the sign moved to the
+    /// numerator: `94 / -800` is `-47/400`, and any zero is `0/1`.
+    ///
+    /// # Errors
+    /// Returns [`ExactError::DivisionByZero`] for a zero denominator, or
+    /// [`ExactError::ArithmeticLimit`] when an input is too large to reduce (more than 513
+    /// numerator or 512 denominator digits) or the reduced fraction exceeds 256 digits.
+    pub fn from_parts(numerator: BigInt, denominator: BigInt) -> Result<Self, ExactError> {
+        Self::reduce(numerator, denominator)
+    }
+
+    /// The exact value of plain decimal text with at most 60 integer and 28 fractional
+    /// digits, past the 28 significant digits of [`Self::from_decimal`]: the widest
+    /// quantity a BSS contract publishes (`NUMERIC(88,28)`). The syntax is
+    /// [`crate::parse_decimal`]'s: fractional trailing zeros are accepted, while exponents,
+    /// whitespace, `+`, leading integer zeros and negative zero are rejected.
+    ///
+    /// # Errors
+    /// Returns [`MoneyError::InvalidDecimal`] for any other text, text over 128 bytes or
+    /// more than 28 fractional digits, and [`MoneyError::AmountOutOfRange`] for more than
+    /// 60 integer digits.
+    pub fn parse_decimal(text: &str) -> Result<Self, ExactError> {
+        if text.len() > DECIMAL_TEXT_BYTES {
+            return Err(MoneyError::InvalidDecimal.into());
+        }
+        let parts = split_decimal(text)?;
+        let scale = u32::try_from(parts.fraction.len())
+            .ok()
+            .filter(|scale| *scale <= DECIMAL_FRACTION_DIGITS)
+            .ok_or(MoneyError::InvalidDecimal)?;
+        if parts.integer.len() > DECIMAL_INTEGER_DIGITS {
+            return Err(MoneyError::AmountOutOfRange.into());
+        }
+        let magnitude = parse_digits(&[parts.integer, parts.fraction].concat())?;
+        let numerator = if parts.negative {
+            -magnitude
+        } else {
+            magnitude
+        };
+        // At most 88 digits over 10^28 always fits the budget.
+        Ok(Self::normalize(numerator, ten_pow(scale)))
+    }
+
+    /// Read back the text of [`Self::canonical_fraction`], and nothing else, so a stored or
+    /// received fraction has one text and one digest: integer strings with `-` only on a
+    /// negative numerator, no `+`, whitespace, point or leading zeros, a positive
+    /// denominator and no common factor (`1`/`2` and `0`/`1` are accepted, `2`/`4` and
+    /// `0`/`2` are not). Use [`Self::from_parts`] to reduce other integers.
+    ///
+    /// Canonical means reduced and well-formed, not inside the caller's contract: each
+    /// integer is bounded only by the crate's 256-digit budget, so a caller with narrower
+    /// wire or storage bounds still checks them on the parsed value.
+    ///
+    /// # Errors
+    /// Returns [`MoneyError::InvalidDecimal`] for text that is not that form, however long,
+    /// [`ExactError::DivisionByZero`] for a zero denominator, or
+    /// [`ExactError::ArithmeticLimit`] for a well-formed integer of more than 256 digits,
+    /// refused after one byte scan without building a number.
+    pub fn parse_fraction(numerator: &str, denominator: &str) -> Result<Self, ExactError> {
+        let numerator = canonical_integer(numerator)?;
+        let denominator = canonical_integer(denominator)?;
+        if denominator.is_zero() {
+            return Err(ExactError::DivisionByZero);
+        }
+        if denominator.is_negative() || !gcd(&numerator, &denominator).is_one() {
+            return Err(MoneyError::InvalidDecimal.into());
+        }
+        Ok(Self {
+            numerator,
+            denominator,
+        })
+    }
+
+    /// The reduced numerator, which carries the sign; `0` for zero.
+    #[must_use]
+    pub fn numer(&self) -> &BigInt {
+        &self.numerator
+    }
+
+    /// The reduced denominator, always positive; `1` for a whole number.
+    #[must_use]
+    pub fn denom(&self) -> &BigInt {
+        &self.denominator
+    }
+
+    /// The canonical fraction text (money ADR rule 6) as `(numerator, denominator)`
+    /// integer strings: reduced, the sign on the numerator, a positive denominator, no `+`
+    /// or leading zeros, and zero as `0`/`1`. `47/400` gives `("47", "400")` and `-3` gives
+    /// `("-3", "1")`. This is the form for the wire, storage and digests;
+    /// [`Self::parse_fraction`] reads it back, and `Display` is for messages only.
+    #[must_use]
+    pub fn canonical_fraction(&self) -> (String, String) {
+        (
+            self.numerator.to_str_radix(10),
+            self.denominator.to_str_radix(10),
+        )
     }
 
     /// Inspect the exact sign without narrowing an intermediate to a posted amount.
@@ -130,6 +242,22 @@ impl ExactAmount {
         let mut whole = &self.numerator / &self.denominator;
         if self.numerator.is_positive() && !(&self.numerator % &self.denominator).is_zero() {
             whole += 1;
+        }
+        Self::reduce(whole, BigInt::one())
+    }
+
+    /// The largest integer that is not above the value: `7/3` gives `2`, `-7/3` gives `-3`
+    /// and `1/3` gives `0`. The result is an exact whole number, not a posting.
+    ///
+    /// # Errors
+    /// Returns [`ExactError::ArithmeticLimit`] if the fraction exceeds its budget.
+    pub fn floor(&self) -> Result<Self, ExactError> {
+        self.check_budget()?;
+        // Integer division truncates toward zero, which is already the floor of a positive
+        // value; only a negative value with a remainder needs one less.
+        let mut whole = &self.numerator / &self.denominator;
+        if self.numerator.is_negative() && !(&self.numerator % &self.denominator).is_zero() {
+            whole -= 1;
         }
         Self::reduce(whole, BigInt::one())
     }
@@ -268,13 +396,7 @@ impl ExactAmount {
             numerator = -numerator;
             denominator = -denominator;
         }
-        let mut divisor = numerator.abs();
-        let mut remainder = denominator.clone();
-        while !remainder.is_zero() {
-            let next = &divisor % &remainder;
-            divisor = remainder;
-            remainder = next;
-        }
+        let divisor = gcd(&numerator, &denominator);
         Self {
             numerator: numerator / &divisor,
             denominator: denominator / divisor,
@@ -523,6 +645,49 @@ fn check_digits(value: &BigInt, bound: &BigUint) -> Result<(), ExactError> {
         return Err(ExactError::ArithmeticLimit);
     }
     Ok(())
+}
+
+/// The greatest common divisor of the magnitudes, by Euclid's algorithm; `gcd(0, d)` is
+/// `|d|`.
+fn gcd(left: &BigInt, right: &BigInt) -> BigInt {
+    let mut divisor = left.abs();
+    let mut remainder = right.abs();
+    while !remainder.is_zero() {
+        let next = &divisor % &remainder;
+        divisor = remainder;
+        remainder = next;
+    }
+    divisor
+}
+
+/// Parse ASCII decimal digits the caller has already validated.
+fn parse_digits(text: &str) -> Result<BigInt, ExactError> {
+    BigInt::parse_bytes(text.as_bytes(), 10).ok_or_else(|| MoneyError::InvalidDecimal.into())
+}
+
+/// A canonical integer string: plain decimal syntax without a point, at most 256 digits.
+fn canonical_integer(text: &str) -> Result<BigInt, ExactError> {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    if digits.len() > INTEGER_TEXT_DIGITS {
+        // Without leading zeros the digit count is the magnitude's, so an integer this long is
+        // past the budget and any other text is malformed: one byte scan tells them apart.
+        let integer = !digits.starts_with('0') && digits.bytes().all(|byte| byte.is_ascii_digit());
+        return Err(if integer {
+            ExactError::ArithmeticLimit
+        } else {
+            MoneyError::InvalidDecimal.into()
+        });
+    }
+    if text.contains('.') {
+        return Err(MoneyError::InvalidDecimal.into());
+    }
+    let parts = split_decimal(text)?;
+    let magnitude = parse_digits(parts.integer)?;
+    Ok(if parts.negative {
+        -magnitude
+    } else {
+        magnitude
+    })
 }
 
 /// Multiply bounded operands and enforce the 512-digit scratch bound.

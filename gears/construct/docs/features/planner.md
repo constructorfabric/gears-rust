@@ -19,6 +19,7 @@
   - [Queue a Received Record](#queue-a-received-record)
   - [Process a Record](#process-a-record)
   - [Manage What a Subject Told an Agent](#manage-what-a-subject-told-an-agent)
+  - [Score the Planner](#score-the-planner)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Numbered Profile](#numbered-profile)
@@ -30,6 +31,7 @@
   - [Processing](#processing)
   - [Managing Facts](#managing-facts)
   - [Manage-Facts Route](#manage-facts-route)
+  - [Reference Evaluation Set](#reference-evaluation-set)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Non-Functional Considerations](#7-non-functional-considerations)
 
@@ -48,7 +50,8 @@ The planner decides how a record changes the subject's profile. A language model
 steps through tools; the planner builds them into a plan in memory and writes nothing. This document covers the profile
 read port, the numbered profile the model sees, the plan tools with their checks, building the plan with its node keys
 and origin, the agent loop with its caps and drop events, the prompt, the queue that takes a received record from
-intake, and the processing of a record through the checks, Admission and the writer with a rerun on a write conflict.
+intake, the processing of a record through the checks, Admission and the writer with a rerun on a write conflict, and
+the reference evaluation set that scores the planner.
 
 ### 1.2 Purpose
 
@@ -57,10 +60,10 @@ The model works on numbered values and plain property names, never on IDs
 (`cpt-cf-construct-principle-model-never-sees-ids`). The tools refuse a call that breaks a rule and tell the model
 why, so the plan holds only steps that fit the person types.
 
-**Out of scope**: the reference evaluation set that scores the prompt; skipping a fact under an open review request
-(Review Queue); the graph storage implementations of the profile read and the write (Profile Writer); the context
-processing runs under for a tenant; wiring the queue into the gear in place of the stub that drops every record,
-which waits for those three and for the admission rules from the deployment configuration.
+**Out of scope**: skipping a fact under an open review request (Review Queue); the graph storage implementations of the
+profile read and the write (Profile Writer); the context processing runs under for a tenant; wiring the queue into the
+gear in place of the stub that drops every record, which waits for those three and for the admission rules from the
+deployment configuration.
 
 **Requirements**: `cpt-cf-construct-fr-fact-decisions`
 
@@ -264,6 +267,29 @@ which waits for those three and for the admission rules from the deployment conf
    logged without what the subject said - `inst-manage-nothing`
 6. [ ] - `p1` - A failed profile read, settings or rules read, or write is an error to the caller - `inst-manage-error`
 
+### Score the Planner
+
+- [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-eval`
+
+1. [ ] - `p1` - The reference evaluation set is JSON files of cases in the crate, `tests/eval/`. A case has a name, a
+   starting profile of properties and values, one record, the expected decision per property, the values that must
+   not remain, and the values that must be held after the plan - `inst-eval-cases`
+2. [ ] - `p1` - A record is a user message or a fact candidate payload. An assistant message never reaches the
+   planner (`inst-process-subject`), so the set has none. The cases use invented people only - `inst-eval-records`
+3. [ ] - `p1` - Each case is checked against the person types and its record type on every test run: a profile value
+   or a value that must be held fits its property's schema, a value that must not remain is in the profile and is not
+   also a value that must be held, and the payload fits its record type - `inst-eval-check`
+4. [ ] - `p1` - The planner runs on each case through the chat completions adapter against the model named by
+   `CONSTRUCT_EVAL_URL`, `CONSTRUCT_EVAL_MODEL` and `CONSTRUCT_EVAL_API_KEY`, with 10 rounds and 50 000 tokens. The run
+   is an ignored test, because it calls a model - `inst-eval-run`
+5. [ ] - `p1` - The decision per property comes from the plan: a replace, or a remove and an add of one property, is
+   `replace`; otherwise `add` or `remove`. A record is right when its decisions are the expected ones, no other
+   property changed, and every value that must be held is held. A dropped record is wrong - `inst-eval-decision`
+6. [ ] - `p1` - A contradicting pair is a value that must not remain and is still in the profile after the plan -
+   `inst-eval-contradiction`
+7. [ ] - `p1` - The run prints each wrong record and each contradicting pair, and fails below 95 % right records or
+   with any contradicting pair (PRD G2) - `inst-eval-target`
+
 ## 4. States (CDSL)
 
 None. A plan lives in memory for one planning run.
@@ -433,6 +459,26 @@ platform authenticated, and the steps before the write have a deadline inside th
 `a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so` and
 `an_unreachable_profile_answers_unavailable`.
 
+### Reference Evaluation Set
+
+- [x] `p1` - **ID**: `cpt-cf-construct-dod-planner-eval`
+
+The system **MUST** ship a reference evaluation set with a runner that scores the planner's decisions and counts the
+contradicting pairs against the PRD G2 target.
+
+**Implements**:
+- `cpt-cf-construct-algo-planner-eval`
+
+**Touches**:
+- Code: `tests/planner_eval.rs`, `tests/eval/`
+
+**Verified by**: `every_case_fits_the_person_types_and_its_record_type`. The score itself comes from
+`the_planner_meets_the_decision_target`, run with
+`cargo test -p cf-gears-construct --test planner_eval -- --ignored --nocapture`.
+
+The reference model is `gpt-5.6-luna`. On 2026-10-27 three runs on it decided 94, 95 and 96 of the 97 records right,
+with no contradicting pair.
+
 ## 6. Acceptance Criteria
 
 - [ ] For a record and a profile, the planner builds a plan of add, replace and remove steps with node keys, the
@@ -442,6 +488,8 @@ platform authenticated, and the steps before the write have a deadline inside th
 - [ ] A loop that hits a cap, or a failed model call, drops the record with a content-free event and gives no plan.
 - [ ] A full queue refuses a record, and intake answers `503` with no identity kept.
 - [ ] A write conflict plans the record again on the new profile; past the rerun limit the record is dropped.
+- [ ] On the reference evaluation set, at least 95 % of records give the expected decisions, and no contradicting
+      pair remains.
 
 ## 7. Non-Functional Considerations
 

@@ -1,9 +1,12 @@
 //! Storage layer of the plugin.
 
+pub mod batch_store;
 pub mod consumption_store;
 pub mod cursor;
 pub mod entity;
 pub mod foundation_store;
+pub mod lease_store;
+pub mod locking;
 pub mod migrations;
 pub mod policy_store;
 pub mod quota_mapping;

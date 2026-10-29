@@ -66,8 +66,6 @@ pub async fn bind_producer(
         .deduplication(
             event_broker_sdk::DbDeduplication::managed(event_broker_sdk::ProducerMode::Monotonic)
                 .key(SOURCE)
-                .on_missing(event_broker_sdk::MissingProducerRegistration::RegisterNew)
-                .on_unknown(event_broker_sdk::UnknownProducerRegistration::RegisterNew)
                 .build()?,
         )
         .topics([TOPIC])

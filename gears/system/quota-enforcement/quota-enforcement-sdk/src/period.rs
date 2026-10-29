@@ -6,7 +6,7 @@
 //! predicate "closed" is `now >= end` everywhere in the system.
 //!
 //! One-time Quotas have no reset. They still carry a window, ending at the
-//! sentinel [`PeriodWindow::OPEN_END`], so that storage columns stay
+//! sentinel [`PeriodWindow::open_end`], so that storage columns stay
 //! `NOT NULL` and the closed predicate needs no special case: it is simply
 //! never true before the year 10000.
 

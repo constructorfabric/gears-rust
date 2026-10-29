@@ -70,7 +70,8 @@ pub async fn settings(
 /// code stored earlier can stop being known when the deployment's table changes.
 fn validate_currencies(codes: &[String], scales: &CurrencyScales) -> Result<(), CanonicalError> {
     let mut seen = BTreeSet::new();
-    for code in codes {
+    // The violation names the offending code's place in the list (D-538): `currencies[1]`.
+    for (i, code) in codes.iter().enumerate() {
         let reason = if !book::currency_code(code) {
             "an offered currency is a currency code: three uppercase letters".to_owned()
         } else if scales.resolve(code).is_none() {
@@ -80,7 +81,11 @@ fn validate_currencies(codes: &[String], scales: &CurrencyScales) -> Result<(), 
         } else {
             continue;
         };
-        return Err(invalid_because("currencies", "CURRENCY_INVALID", &reason));
+        return Err(invalid_because(
+            &format!("currencies[{i}]"),
+            "CURRENCY_INVALID",
+            &reason,
+        ));
     }
     Ok(())
 }

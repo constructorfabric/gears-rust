@@ -24,6 +24,7 @@ pub mod api_v1;
 pub mod authz_doubles;
 pub mod body;
 pub mod fault_broker;
+pub mod gear_db;
 // Not every harness convenience method (builder customization beyond
 // tenant/subject id, additional response assertions like `assert_header`)
 // is exercised by the specific handler tests that exist today (task group
@@ -35,16 +36,20 @@ pub mod fault_broker;
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub mod harness;
+pub mod module_boot;
+#[allow(
+    dead_code,
+    reason = "general-purpose harness API surface, not all of it exercised yet"
+)]
+pub mod outbox_rows;
+pub mod pause;
 #[allow(
     dead_code,
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub mod request;
-#[allow(
-    dead_code,
-    reason = "general-purpose harness API surface, not all of it exercised yet"
-)]
 pub mod response;
+pub mod single_backend;
 pub mod type_registry;
 
 pub use authz_doubles::DenyingAuthZ;
@@ -55,11 +60,14 @@ pub use authz_doubles::DenyingAuthZ;
 pub use body::IntoBody;
 pub use body::Json;
 pub use fault_broker::{DeliveredOutcome, DeliveredPublish, FaultInjectingBroker, TransientFault};
+pub use gear_db::GearDb;
 #[allow(
     unused_imports,
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub use harness::{EventBrokerHarness, EventBrokerHarnessBuilder};
+pub use outbox_rows::outbox_queue_partitions;
+pub use pause::PausePoint;
 #[allow(
     unused_imports,
     reason = "general-purpose harness API surface, not all of it exercised yet"
@@ -70,6 +78,7 @@ pub use request::RequestCase;
     reason = "general-purpose harness API surface, not all of it exercised yet"
 )]
 pub use response::TestResponse;
+pub use single_backend::SingleBackendResolver;
 pub use type_registry::StaticTypesRegistry;
 
 /// The GTS **type** identifier an event names, for a test that builds an

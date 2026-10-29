@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-flight-control"
-version = "0.1.0"
+version = "0.1.1"
 publish = false
 edition.workspace = true
 license.workspace = true
@@ -63,7 +63,6 @@ oidc-authn-plugin = { package = "cf-gears-oidc-authn-plugin", path = "../../gear
 anyhow = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
-tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

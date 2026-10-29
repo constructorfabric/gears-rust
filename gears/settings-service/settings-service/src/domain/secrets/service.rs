@@ -16,7 +16,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::access::AccessRepository;
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
@@ -135,6 +135,7 @@ where
             effective.key.as_str(),
             Some(effective.tenant_id),
             ctx.subject_id().to_string(),
+            ActorTenant::of(ctx.subject_tenant_id()),
             AuditOperation::SecretUse,
             Uuid::new_v4().to_string(),
         )

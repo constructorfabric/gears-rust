@@ -14,7 +14,7 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{SettingTypeRegistrar, reason};
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
 use crate::domain::declaration::admin::{is_empty_placeholder, normalise_display_name};
 use crate::domain::declaration::{
@@ -805,6 +805,7 @@ where
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -936,8 +937,18 @@ where
         pre: Option<Value>,
         post: Option<Value>,
     ) -> Result<(), DomainError> {
-        let mut rec =
-            AuditRecord::new(key.as_str(), None, owner_module, operation, request_id).by_module();
+        // A machine act has no security context to take a tenant from: the
+        // record names no actor tenant, so no tenant reader is shown its actor
+        // and a platform administrator is.
+        let mut rec = AuditRecord::new(
+            key.as_str(),
+            None,
+            owner_module,
+            ActorTenant::machine(),
+            operation,
+            request_id,
+        )
+        .by_module();
         if let Some(pre) = pre {
             rec = rec.with_pre_image(AuditValue::definition(pre));
         }

@@ -927,3 +927,151 @@ mod no_k8s_registration {
         assert!(registry.lock_provider("postgres").is_some());
     }
 }
+
+/// The four providers, from their declarations to a call. The
+/// gear's own installers serve them (as `grpc-hub` would), and the `wire_*`
+/// methods `#[toolkit::provides]` generates bind each contract to that server
+/// over gRPC in a consumer's hub. `tests/common/served_gear.rs` assembles the
+/// services by hand, so it would not notice a declaration removed (this no
+/// longer compiles) or a service the gear stopped installing (a call fails).
+#[tokio::test]
+async fn each_declared_provider_is_served_by_the_gears_own_installers() {
+    use cluster_sdk::contract::{
+        ClusterCacheApi, ClusterProfileApi, DistributedLockApi, LeaderElectionApi,
+    };
+    use cluster_sdk::dto::{
+        DescribeProfilesRequest, GetRequest, JoinRequest, PutRequest, TryLockRequest,
+        WireLeaderStatus,
+    };
+    use toolkit_security::PlatformSecurityContext;
+
+    let hub = Arc::new(ClientHub::default());
+    let ctx = ctx_with_default_profile(&hub);
+    let gear = ClusterGear::default();
+    gear.init(&ctx).await.expect("init");
+    let services = gear.get_grpc_services(&ctx).await.expect("services");
+    gear.start(CancellationToken::new()).await.expect("start");
+    let mut routes = tonic::service::RoutesBuilder::default();
+    for service in &services {
+        (service.register)(&mut routes);
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let endpoint = format!("http://{}", listener.local_addr().expect("addressed"));
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(
+        Server::builder()
+            .add_routes(routes.routes())
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _stopped = shutdown_rx.await;
+            }),
+    );
+
+    // A consumer process: its own hub, its configuration wiring every declared
+    // contract to that server over gRPC.
+    let grpc = serde_json::json!({ "transport": "grpc", "endpoint": endpoint });
+    let consumer_hub = Arc::new(ClientHub::default());
+    let consumer_ctx = GearCtx::new(
+        "cluster",
+        uuid::Uuid::new_v4(),
+        Arc::new(MockConfig(serde_json::json!({
+            "config": { "client_wiring": {
+                "cluster_cache_api": grpc,
+                "distributed_lock_api": grpc,
+                "leader_election_api": grpc,
+                "cluster_profile_api": grpc,
+            } }
+        }))),
+        Arc::clone(&consumer_hub),
+        CancellationToken::new(),
+    );
+    gear.wire_cluster_cache_api(&consumer_ctx)
+        .await
+        .expect("cache wires");
+    gear.wire_distributed_lock_api(&consumer_ctx)
+        .await
+        .expect("lock wires");
+    gear.wire_leader_election_api(&consumer_ctx)
+        .await
+        .expect("leader election wires");
+    gear.wire_cluster_profile_api(&consumer_ctx)
+        .await
+        .expect("profile wires");
+
+    let platform = PlatformSecurityContext::outbound_marker();
+    let profiles = consumer_hub
+        .get::<dyn ClusterProfileApi>()
+        .expect("profile client")
+        .describe_profiles(&platform, DescribeProfilesRequest { profiles: vec![] })
+        .await
+        .expect("describe_profiles");
+    assert_eq!(profiles.profiles[0].name, "default");
+
+    let cache = consumer_hub
+        .get::<dyn ClusterCacheApi>()
+        .expect("cache client");
+    cache
+        .put(
+            &platform,
+            PutRequest {
+                profile: "default".to_owned(),
+                key: "declared".to_owned(),
+                value: b"42".to_vec(),
+                ttl_ms: None,
+                client_request_id: None,
+            },
+        )
+        .await
+        .expect("put");
+    let entry = cache
+        .get(
+            &platform,
+            GetRequest {
+                profile: "default".to_owned(),
+                key: "declared".to_owned(),
+            },
+        )
+        .await
+        .expect("get")
+        .entry
+        .expect("the key was just written");
+    assert_eq!(entry.value, b"42");
+
+    consumer_hub
+        .get::<dyn DistributedLockApi>()
+        .expect("lock client")
+        .try_lock(
+            &platform,
+            TryLockRequest {
+                profile: "default".to_owned(),
+                name: "declared".to_owned(),
+                ttl_ms: 30_000,
+                client_request_id: None,
+            },
+        )
+        .await
+        .expect("try_lock");
+    let joined = consumer_hub
+        .get::<dyn LeaderElectionApi>()
+        .expect("leader election client")
+        .join(
+            &platform,
+            JoinRequest {
+                profile: "default".to_owned(),
+                name: "declared".to_owned(),
+                ttl_ms: 30_000,
+                max_missed_renewals: None,
+                client_request_id: None,
+            },
+        )
+        .await
+        .expect("join");
+    assert_eq!(joined.initial_status, WireLeaderStatus::Leader);
+
+    gear.stop(CancellationToken::new()).await.expect("stop");
+    let _sent = shutdown.send(());
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server stops")
+        .expect("the server task does not panic")
+        .expect("the server ends cleanly");
+}

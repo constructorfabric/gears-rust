@@ -2,10 +2,11 @@
 
 use std::error::Error;
 
+use event_broker_sdk::backend::BackendError;
 use event_broker_sdk::error::{reasons, resources};
 use event_broker_sdk::{
     ConsumerError, ConsumerGroupId, EventBrokerError, OffsetManagerError, OutOfRange,
-    PositionViolation, ProducerId, Sequence, StorageBackendError, SubscriptionId,
+    PositionViolation, ProducerId, Sequence, SubscriptionId,
 };
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, Problem};
@@ -37,9 +38,9 @@ fn display_interpolates_fields() {
 
 #[test]
 fn from_conversions() {
-    let storage_err = StorageBackendError::Internal("test".into());
-    let broker_err = EventBrokerError::from(storage_err);
-    assert!(matches!(broker_err, EventBrokerError::StorageBackend(_)));
+    let backend_err = BackendError::Internal("test".into());
+    let broker_err = EventBrokerError::from(backend_err);
+    assert!(matches!(broker_err, EventBrokerError::Backend(_)));
 
     let offset_err = OffsetManagerError::Internal("test".into());
     let broker_err = EventBrokerError::from(offset_err);
@@ -714,10 +715,10 @@ fn top_level_event_broker_errors_have_full_canonical_representation() {
 }
 
 #[test]
-fn nested_storage_backend_errors_have_full_canonical_representation() {
+fn nested_backend_errors_have_full_canonical_representation() {
     let cases = [
         (
-            StorageBackendError::Unavailable {
+            BackendError::Unavailable {
                 reason: "database refused connection".into(),
                 detail: "backend unavailable".into(),
             },
@@ -732,7 +733,7 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::InvalidConfig {
+            BackendError::InvalidConfig {
                 detail: "missing DSN".into(),
             },
             json!({
@@ -753,7 +754,7 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::OffsetOutOfRange {
+            BackendError::OffsetOutOfRange {
                 floor: Sequence::assigned(20),
                 ceiling: Sequence::assigned(90),
                 breached: OutOfRange::BelowFloor,
@@ -777,7 +778,7 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::PartitionNotFound {
+            BackendError::PartitionNotFound {
                 detail: "partition missing".into(),
             },
             json!({
@@ -794,9 +795,9 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::PersistFailed {
+            BackendError::AppendFailed {
                 reason: "unique index detail".into(),
-                detail: "persist failed".into(),
+                detail: "append failed".into(),
             },
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
@@ -809,7 +810,7 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::ReadFailed {
+            BackendError::ReadFailed {
                 reason: "driver timeout".into(),
                 detail: "read failed".into(),
             },
@@ -824,7 +825,35 @@ fn nested_storage_backend_errors_have_full_canonical_representation() {
             }),
         ),
         (
-            StorageBackendError::Internal("private storage invariant".into()),
+            BackendError::NotProvisioned {
+                detail: "append: the topic has no log on this backend".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+                "title": "Service Unavailable",
+                "status": 503,
+                "detail": "Service temporarily unavailable",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {}
+            }),
+        ),
+        (
+            BackendError::LogConflict {
+                detail: "provision: the backend holds another log id for this topic".into(),
+            },
+            json!({
+                "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+                "title": "Service Unavailable",
+                "status": 503,
+                "detail": "Service temporarily unavailable",
+                "instance": "/v1/event-broker/test",
+                "trace_id": "trace-123",
+                "context": {}
+            }),
+        ),
+        (
+            BackendError::Internal("private storage invariant".into()),
             json!({
                 "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.internal.v1~",
                 "title": "Internal",

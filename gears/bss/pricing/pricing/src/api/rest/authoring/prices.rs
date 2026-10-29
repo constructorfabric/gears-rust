@@ -67,14 +67,16 @@ fn refuse_half(error: RuleError, half: &Price) -> DoorError {
 }
 /// A price body refusal, worded by its cause: a decimal sent as a JSON number is told to send
 /// a string, invalid text to send plain decimal text, a value over a limit gets the limit, and a
-/// sign error names the field. A shape error (`PRICE_MISSING`) is refused as any other rule.
+/// sign error names the field. The violation's field is the refused decimal's path (D-538):
+/// `price.rate`, `price.tiers[1].up_to`. A shape error (`PRICE_MISSING`) is refused as any other
+/// rule, on `price`.
 fn refuse_price(error: money::DecodeError) -> DoorError {
     match error {
         money::DecodeError::Shape => refuse(error.into()),
-        money::DecodeError::JsonNumber
+        money::DecodeError::JsonNumber { .. }
         | money::DecodeError::Numeric { .. }
         | money::DecodeError::NotCanonical { .. } => {
-            support::invalid_because("price", error.code(), &error.message()).into()
+            support::invalid_because(&error.path(), error.code(), &error.message()).into()
         }
     }
 }

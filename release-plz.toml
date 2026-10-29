@@ -148,6 +148,11 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
+name = "cf-gears-toolkit-http-proxy"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
 name = "cf-gears-toolkit-http-middleware"
 changelog_update = false
 git_release_enable = false

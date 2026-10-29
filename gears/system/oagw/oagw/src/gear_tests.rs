@@ -179,8 +179,11 @@ fn database_section() -> Value {
 }
 
 /// A context over `section` (the whole `gears.oagw` value) and `hub`, with the
-/// handle the runtime's DB phase would attach, if any.
+/// handle the runtime's DB phase would attach, if any. Also installs the
+/// crypto provider the runtime bootstrap would have (`init` builds the
+/// upstream engine, whose TLS config fails closed without one under `fips`).
 fn context(section: Value, db: Option<Db>, hub: Arc<ClientHub>) -> GearCtx {
+    crate::domain::test_support::ensure_crypto_provider();
     let ctx = GearCtx::new(
         OutboundApiGatewayGear::MODULE_NAME,
         Uuid::new_v4(),

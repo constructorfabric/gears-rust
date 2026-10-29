@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod consumption;
+pub mod leases;
 pub mod ports;
 pub mod quotas;
 

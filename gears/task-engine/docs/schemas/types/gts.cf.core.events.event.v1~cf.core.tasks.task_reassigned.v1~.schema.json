@@ -1,0 +1,124 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.tasks.task_reassigned.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task Engine lifecycle event type 'taskReassigned'. Published when a task is reassigned/handed off from one worker to another (PRD cpt-cf-task-engine-fr-reassignment). Derived from the Event Broker base event type; routed to the task_events topic and partitioned by subject (the task ID) for per-task ordering.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+    "partition_key": "/subject",
+    "allowed_subject_types": [
+      "gts.cf.core.tasks.task.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~cf.core.tasks.task_reassigned.v1~",
+          "$comment": "Pins the event-type identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "task_id": {
+              "description": "The task.",
+              "type": "string",
+              "format": "uuid"
+            },
+            "resource_refs": {
+              "description": "The task's resource references (PRD cpt-cf-task-engine-fr-resource-refs), carried on task-scoped events so consumers can route per resource without a read-back.",
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "resource_type": {
+                    "description": "GTS type identifier of the referenced resource.",
+                    "type": "string",
+                    "x-gts-type-ref": "gts.*"
+                  },
+                  "resource_id": {
+                    "description": "Identifier of the referenced resource.",
+                    "type": "string",
+                    "maxLength": 1024
+                  },
+                  "verified": {
+                    "description": "True only if a creator check of the task type confirmed, at creation, that the creator may act on this resource (PRD cpt-cf-task-engine-fr-resource-refs). False means the reference is the creator's unverified claim; consumers MUST NOT treat it as proof of access.",
+                    "type": "boolean"
+                  }
+                },
+                "required": [
+                  "resource_type",
+                  "resource_id",
+                  "verified"
+                ]
+              }
+            },
+            "queue": {
+              "description": "The task's current queue at the time of the event, so consumers can route by queue without reading the task. The task type is the event's subject_type.",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "actor": {
+              "description": "Authenticated subject whose API or worker call caused this event. Absent when the engine itself caused it (timer, lease scan, retention, cascade from another task).",
+              "type": "string",
+              "maxLength": 256
+            },
+            "previous_assignee": {
+              "description": "Worker that previously held the lease (`worker_id`).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "previous_assignee_subject": {
+              "description": "Principal (`subject_id`) of the previous worker.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 256,
+              "default": null
+            },
+            "new_assignee": {
+              "description": "New worker (`worker_id`) named by the reassignment. It takes the task over with an accept call under its own credentials; no lease token is ever carried in this event (PRD cpt-cf-task-engine-fr-reassignment, cpt-cf-task-engine-fr-lease-fencing).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "default": null
+            },
+            "new_assignee_subject": {
+              "description": "Principal (`subject_id`) of the new worker.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "maxLength": 256,
+              "default": null
+            },
+            "lease_epoch": {
+              "description": "Lease epoch after the reassignment (increased by one); the previous holder's epoch is now stale.",
+              "type": "integer",
+              "minimum": 1
+            },
+            "reason": {
+              "description": "Why the task was reassigned (e.g. lease_expiry, assignment_timeout, manual).",
+              "type": "string"
+            }
+          },
+          "required": [
+            "task_id",
+            "reason"
+          ]
+        }
+      }
+    }
+  ]
+}

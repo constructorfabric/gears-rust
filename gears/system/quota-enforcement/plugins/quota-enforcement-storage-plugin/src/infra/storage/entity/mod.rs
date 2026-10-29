@@ -10,7 +10,11 @@
 pub mod contention_timeout_config;
 pub mod idempotency_record;
 pub mod idempotency_retention_config;
+pub mod idempotency_stripe;
+pub mod lease;
 pub mod lease_capacity_config;
+pub mod lease_capacity_counter;
+pub mod lease_hold;
 pub mod operation_log;
 pub mod quota;
 pub mod quota_allocation_counter;

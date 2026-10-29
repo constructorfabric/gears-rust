@@ -18,6 +18,21 @@ use tokio_stream::StreamExt;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use event_broker_sdk::Sequence;
+use event_broker_sdk::api::Position;
+use event_broker_sdk::backend::{
+    AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, TopicPartition,
+    TopicSpec, Wait, Watch,
+};
+use event_broker_sdk::models::{Event as SdkEvent, PartitionRange, TopicSegment};
+use memory_event_broker_plugin::MemoryBackend;
+
+use toolkit_gts::GtsInstanceId;
+
+use crate::domain::streaming::source::PartitionKey;
 use crate::test_support::{EventBrokerHarness, Json, StaticTypesRegistry};
 
 #[tokio::test]
@@ -359,14 +374,76 @@ async fn seek_while_streaming_returns_409_streaming_in_progress() {
     drop(stream_response);
 }
 
+/// A memory backend that declares it cannot push heads, so the loader polls
+/// `resolve(Latest)` for them (feature 0007 §2.5); everything else is the
+/// memory backend's.
+struct PolledMemory(MemoryBackend);
+
+#[async_trait::async_trait]
+impl Backend for PolledMemory {
+    async fn provision(
+        &self,
+        topic: &TopicSpec,
+        claim: &LogClaim,
+    ) -> Result<Provisioning, BackendError> {
+        self.0.provision(topic, claim).await
+    }
+    async fn append(&self, request: &AppendRequest<'_>) -> Result<Appended, BackendError> {
+        self.0.append(request).await
+    }
+    fn dedup(&self) -> Dedup {
+        self.0.dedup()
+    }
+    fn max_events_per_append(&self) -> usize {
+        self.0.max_events_per_append()
+    }
+    async fn read(
+        &self,
+        at: &TopicPartition,
+        offset: Sequence,
+        max_events: usize,
+        wait: Wait,
+    ) -> Result<Vec<SdkEvent>, BackendError> {
+        self.0.read(at, offset, max_events, wait).await
+    }
+    async fn resolve(
+        &self,
+        at: &TopicPartition,
+        position: Position,
+    ) -> Result<Sequence, BackendError> {
+        self.0.resolve(at, position).await
+    }
+    fn watch(&self) -> Watch<'_> {
+        Watch::Poll(Duration::from_millis(20))
+    }
+    async fn query(
+        &self,
+        at: &TopicPartition,
+        range: PartitionRange,
+    ) -> Result<Vec<TopicSegment>, BackendError> {
+        self.0.query(at, range).await
+    }
+}
+
 #[tokio::test]
-async fn stream_events_delivers_published_event_via_notification_wakeup() {
-    // Verifies the D6 wake-up mechanism itself (`domain::notify::DeliveryNotifier`,
-    // `ClusterCacheV1::watch_prefix`) actually delivers a live event promptly -
-    // not just that a pre-seeded position can be replayed. Group 7 removed the
-    // old fixed-interval poll, so a regression here would only show up as a
-    // stream that never wakes until its next heartbeat.
+async fn stream_events_delivers_a_published_event_on_a_pushed_head() {
+    delivers_a_published_event_on_its_head_change(Arc::new(MemoryBackend::new())).await;
+}
+
+#[tokio::test]
+async fn stream_events_delivers_a_published_event_on_a_polled_head() {
+    delivers_a_published_event_on_its_head_change(Arc::new(PolledMemory(MemoryBackend::new())))
+        .await;
+}
+
+/// Verifies the wake-up itself - the backend's head watch moving the
+/// partition's head in the loader (`infra::loader::heads`) - delivers a live
+/// event promptly, not just that a pre-seeded position can be replayed. A
+/// regression here would only show up as a stream that never wakes until its
+/// next heartbeat.
+async fn delivers_a_published_event_on_its_head_change(backend: Arc<dyn Backend>) {
     let harness = EventBrokerHarness::builder()
+        .with_backend(backend)
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
             {
@@ -439,7 +516,7 @@ async fn stream_events_delivers_published_event_via_notification_wakeup() {
             "id": event_id,
             "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
             "tenant_id": tenant_id,
-            "source": "test-stream_events_delivers_published_event_via_notification_wakeup",
+            "source": "test-delivers_a_published_event_on_its_head_change",
             "subject": "s1",
             "subject_type": "gts.x.eb.t1.subject.v1~",
             "occurred_at": chrono::Utc::now().to_rfc3339(),
@@ -450,9 +527,7 @@ async fn stream_events_delivers_published_event_via_notification_wakeup() {
 
     let event_chunk = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
         .await
-        .expect(
-            "the notification wake-up must deliver the event within 3s, not wait for a heartbeat",
-        )
+        .expect("the head change must deliver the event within 3s, not wait for a heartbeat")
         .expect("stream must not end before the event frame")
         .expect("event chunk must not be an error");
     let text = String::from_utf8_lossy(&event_chunk).into_owned();
@@ -475,6 +550,23 @@ async fn stream_events_delivers_published_event_via_notification_wakeup() {
     );
     assert_eq!(frame["payload"]["tenant_id"], tenant_id.to_string());
     assert_eq!(frame["payload"]["subject"], "s1");
+
+    // The head reached the loader through the backend's watch, not only a
+    // blind tail read.
+    let partition = harness
+        .topics()
+        .get(&PartitionKey::new(
+            GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1").unwrap(),
+            0,
+        ))
+        .expect("the streamed partition is live");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while partition.known_head() != Some(Sequence::assigned(1)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the watch reports head 1 within 2s");
 }
 
 #[tokio::test]

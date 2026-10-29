@@ -266,7 +266,7 @@ async fn reset_producer_full_scope_returns_200_with_no_body() {
             .json()["topics"],
         json!([{
             "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            "partitions": [{ "partition": 0, "last_sequence": 1 }],
+            "last_sequence": 1,
         }]),
         "cursor must reflect the published chain position before reset"
     );
@@ -302,7 +302,7 @@ async fn reset_producer_full_scope_returns_200_with_no_body() {
 }
 
 #[tokio::test]
-async fn reset_producer_scoped_to_topic_partition_returns_200_with_no_body() {
+async fn reset_producer_scoped_to_topic_returns_200_with_no_body() {
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partitions": 1 },
@@ -353,7 +353,7 @@ async fn reset_producer_scoped_to_topic_partition_returns_200_with_no_body() {
         .api_v1()
         .post_producer_reset(&id)
         .with_body(Json(
-            &json!({ "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1", "partition": 0 }),
+            &json!({ "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_a.v1" }),
         ))
         .send()
         .await;
@@ -369,9 +369,9 @@ async fn reset_producer_scoped_to_topic_partition_returns_200_with_no_body() {
             .json()["topics"],
         json!([{
             "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic_b.v1",
-            "partitions": [{ "partition": 0, "last_sequence": 1 }],
+            "last_sequence": 1,
         }]),
-        "a scoped reset must clear only the given (topic, partition), leaving the other topic's cursor untouched"
+        "a scoped reset must clear only the given topic's chain, leaving the other topic's untouched"
     );
 }
 
@@ -398,6 +398,36 @@ async fn reset_producer_not_found_returns_404() {
             "context": {
                 "resource_name": producer_id.to_string(),
                 "resource_type": "gts.cf.core.events.producer.v1~",
+            },
+        })
+    );
+}
+
+/// The chain carries no partition, so neither does a reset: a body naming one
+/// is refused as an unknown field (ADR-0004 "Chain Scope").
+#[tokio::test]
+async fn reset_producer_naming_a_partition_returns_400() {
+    let harness = EventBrokerHarness::builder().build().await;
+
+    let resp = harness
+        .api_v1()
+        .post_producer_reset("643e0248-aab7-4515-9d55-db17df58e063")
+        .with_body(Json(&json!({ "partition": 0 })))
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidBody: invalid JSON body: unknown field `partition`, expected `topic` at line 1 column 12",
+            "instance": "/event-broker/v1/producers/643e0248-aab7-4515-9d55-db17df58e063:reset",
+            "context": {
+                "format": "InvalidBody: invalid JSON body: unknown field `partition`, expected `topic` at line 1 column 12",
+                "resource_type": "gts.cf.core.events.request.v1~",
             },
         })
     );

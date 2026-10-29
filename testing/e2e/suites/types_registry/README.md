@@ -1,6 +1,6 @@
 # Types Registry e2e suite
 
-The suite covers asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, and discovery through numbered scenarios. The [legacy suite](legacy/README.md) covers the original synchronous v1 API (`200` + a `results` array) and has no reserved scenario IDs.
+The suite covers asynchronous admission (`202` + `GET /operations/{id}`), exact and batch reads, discovery and plane separation through numbered scenarios. Ordinary scenarios use one selected API and HTTP client for submissions, deletions, operation polling and entity reads. By default this is `/types-registry/v2/platform/` with the internal token. The plane-separation scenarios additionally exercise tenant reads under `/types-registry/v2/` with a bearer (D17). Helpers accept an explicit HTTP client and API path so the same workflows can exercise tenant mutations once supported. The [legacy suite](legacy/README.md) covers the original synchronous v1 API (`200` + a `results` array) and has no reserved scenario IDs.
 
 ## Scenario index
 
@@ -35,6 +35,7 @@ Every scenario has a test. Scenarios proved by one workflow share a test functio
 | 23 | [Filters](scenarios/discovery.md#filters) | `TR-DISC-101`–`TR-DISC-199` | [test_discovery.py](test_discovery.py) | Implemented |
 | 24 | [Cursor continuation](scenarios/discovery.md#cursor-continuation) | `TR-DISC-201`–`TR-DISC-299` | [test_discovery.py](test_discovery.py) | Implemented |
 | 25 | [Read discovered entities with batchGet](scenarios/discovery.md#read-discovered-entities-with-batchget) | `TR-DISC-301`–`TR-DISC-399` | [test_discovery.py](test_discovery.py) | Implemented |
+| 26 | [Plane separation](scenarios/planes.md#plane-separation) | `TR-PLANE-001`–`TR-PLANE-099` | [test_planes.py](test_planes.py) | Implemented |
 
 The shared base config (`config/e2e-local.yaml`) allows `skip_compatibility_check` requests and allows vendor `acme` only under `gts.acme.e2e.*`, so the unscoped `make e2e-local` server runs TR-REG-903 and TR-REG-904 too. TR-REG-902 uses the force-disabled profile; every other run skips it.
 
@@ -54,7 +55,12 @@ Leave exhaustive parameter combinations, malformed inputs, numeric boundaries, a
 
 ## Execution rules
 
-- `registry_api` defaults to `v2` today. Set `TYPES_REGISTRY_API_VERSION` explicitly when running against another version; there is no fallback.
+The current platform base is `/types-registry/v2/platform`. After legacy removal,
+T38 promotes it to `/types-registry/v1/platform` alongside the tenant `/v2` → `/v1`
+cutover; the platform fixture value then becomes `v1/platform`.
+
+- The focused launcher starts each run with fresh databases under `target/e2e-home-types_registry`, isolating seed revisions and migrations from other branches and local development data.
+- Every ordinary workflow uses `registry_http` / `registry_api_path`, with `TYPES_REGISTRY_API_VERSION=v2/platform` by default. Platform paths select the internal-token client; tenant paths select bearer credentials. Set the version to `v2` once tenant mutations are supported to run the same scenarios there. There is no automatic fallback and credentials are never merged. `test_planes.py` fixes the platform/tenant routes explicitly and adds a tenant client only for plane-separation checks.
 - Each test gets a fresh `cf.e2e.r<uuid>.` namespace. Fixture loaders rewrite IDs and `$ref` targets, not schema constraints or values. TR-REG-901 and TR-REG-904 change the vendor and package after loading to exercise the configured policy region.
 - Submissions use a fresh `Idempotency-Key` by default. Replay and conflict scenarios intentionally reuse the key they are testing.
 - Registration outcomes match by GTS ID. Deletion outcomes preserve request order and use `assert_operation(..., ordered=True)`.

@@ -17,7 +17,9 @@ use file_storage::domain::authz::TenantOnlyAuthorizer;
 use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::idempotency::compute_request_hash;
-use file_storage::domain::multipart::{MultipartPlan, MultipartUploadState};
+use file_storage::domain::multipart::{
+    MultipartCompleteOutcome, MultipartPlan, MultipartUploadState,
+};
 use file_storage::domain::multipart_service::MultipartService;
 use file_storage::domain::policy::{PolicyBody, PolicyScope, SizeLimits};
 use file_storage::domain::policy_service::PolicyService;
@@ -28,7 +30,7 @@ use file_storage::infra::backend::{
     StorageBackend,
 };
 use file_storage::infra::content::hash;
-use file_storage::infra::content::hash_mode::{HashMode, Manifest, ManifestEntry};
+use file_storage::infra::content::hash_mode::{HashMode, Manifest};
 use file_storage::infra::signed_url::Issuer;
 use file_storage::infra::storage::Store;
 use file_storage::infra::storage::migrations::Migrator;
@@ -320,7 +322,10 @@ async fn multipart_happy_path_in_memory() {
     let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let declared_size = 13u64;
     let plan = msvc
@@ -330,7 +335,7 @@ async fn multipart_happy_path_in_memory() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -378,9 +383,9 @@ async fn multipart_happy_path_in_memory() {
     assert_eq!(content, Bytes::from_static(b"Hello, World!"));
 }
 
-/// The session-level guard alone rejects the replay, before the version-level CAS.
+/// A repeated complete of a `completed` session replays the stored result (no re-finalize).
 #[tokio::test]
-async fn multipart_complete_after_already_finalized_is_rejected() {
+async fn multipart_complete_after_already_finalized_replays_result() {
     let db = build_db().await;
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![Arc::clone(&backend)], "mem").expect("registry");
@@ -416,7 +421,10 @@ async fn multipart_complete_after_already_finalized_is_rejected() {
     ));
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let declared_size = 13u64;
     let plan = msvc
         .initiate_multipart_upload(
@@ -425,7 +433,7 @@ async fn multipart_complete_after_already_finalized_is_rejected() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -450,13 +458,16 @@ async fn multipart_complete_after_already_finalized_is_rejected() {
         .await
         .unwrap();
 
-    let err = msvc
+    let replay = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .unwrap_err();
+        .unwrap();
     assert!(
-        matches!(err, DomainError::MultipartUploadNotInProgress { .. }),
-        "expected MultipartUploadNotInProgress, got {err:?}"
+        matches!(
+            replay,
+            MultipartCompleteOutcome::Completed(ref c) if c.version_id == plan.version_id
+        ),
+        "a repeated complete must replay the stored result, got {replay:?}"
     );
 }
 
@@ -503,10 +514,20 @@ async fn multipart_complete_rejects_content_not_matching_declared_mime() {
     ));
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let declared_size = JPEG_MAGIC.len() as u64;
     let plan = msvc
-        .initiate_multipart_upload(&ctx, ticket.file_id, "image/png", declared_size, None, None)
+        .initiate_multipart_upload(
+            &ctx,
+            ticket.file_id,
+            "image/png",
+            declared_size,
+            None,
+            false,
+        )
         .await
         .unwrap();
     let session = multipart_store
@@ -592,7 +613,10 @@ async fn multipart_complete_persists_validated_mime_and_flag() {
     ));
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let content = Bytes::from_static(b"Hello, World! This is plain text.");
     let declared_size = content.len() as u64;
     let plan = msvc
@@ -602,7 +626,7 @@ async fn multipart_complete_persists_validated_mime_and_flag() {
             "text/plain",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -672,7 +696,7 @@ async fn multipart_full_lifecycle_create_to_delete() {
         None,
         None,
     );
-    let msvc = MultipartService::new(
+    let msvc = Arc::new(MultipartService::new(
         Arc::clone(&multipart_store),
         backends,
         Arc::clone(&authorizer),
@@ -680,10 +704,13 @@ async fn multipart_full_lifecycle_create_to_delete() {
         issuer,
         "http://sidecar.test".to_owned(),
         3600,
-    );
+    ));
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let declared_size = 13u64;
     let plan = msvc
         .initiate_multipart_upload(
@@ -692,7 +719,7 @@ async fn multipart_full_lifecycle_create_to_delete() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -783,7 +810,10 @@ async fn multipart_rejected_on_local_fs() {
     ));
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = msvc
         .initiate_multipart_upload(
@@ -792,7 +822,7 @@ async fn multipart_rejected_on_local_fs() {
             "application/octet-stream",
             1024,
             None,
-            None,
+            false,
         )
         .await
         .unwrap_err();
@@ -808,7 +838,10 @@ async fn multipart_rejected_on_local_fs() {
 async fn initiate_returns_coherent_parts_plan() {
     let (svc, msvc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     // Minimum valid `preferred_part_size` (`DEFAULT_MIN_PART_SIZE`) to force multiple parts.
     let part_size = 5 * 1024 * 1024u64; // DEFAULT_MIN_PART_SIZE
@@ -821,7 +854,7 @@ async fn initiate_returns_coherent_parts_plan() {
             "application/octet-stream",
             declared_size,
             preferred_part_size,
-            Some(3),
+            false,
         )
         .await
         .unwrap();
@@ -868,12 +901,12 @@ async fn idempotency_same_key_returns_same_file() {
     let key = "idem-key-1".to_owned();
 
     let t1 = svc
-        .create_file(&ctx, nf.clone(), Some(key.clone()))
+        .create_file(&ctx, nf.clone(), Some(key.clone()), false)
         .await
         .unwrap();
 
     nf.owner_id = owner_id; // same owner
-    let t2 = svc.create_file(&ctx, nf, Some(key)).await.unwrap();
+    let t2 = svc.create_file(&ctx, nf, Some(key), false).await.unwrap();
 
     assert_eq!(
         t1.file_id, t2.file_id,
@@ -890,12 +923,15 @@ async fn idempotency_replay_with_diverging_name_returns_conflict() {
 
     let mut nf = new_file();
     nf.name = "original.bin".to_owned();
-    svc.create_file(&ctx, nf.clone(), Some(key.clone()))
+    svc.create_file(&ctx, nf.clone(), Some(key.clone()), false)
         .await
         .unwrap();
 
     nf.name = "different.bin".to_owned();
-    let err = svc.create_file(&ctx, nf, Some(key)).await.unwrap_err();
+    let err = svc
+        .create_file(&ctx, nf, Some(key), false)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, DomainError::Conflict { .. }),
         "expected Conflict on a diverging name, got {err:?}"
@@ -918,7 +954,7 @@ async fn idempotency_replay_with_diverging_metadata_returns_conflict() {
         key: "tag".to_owned(),
         value: "a".to_owned(),
     }];
-    svc.create_file(&ctx, nf.clone(), Some(key.clone()))
+    svc.create_file(&ctx, nf.clone(), Some(key.clone()), false)
         .await
         .unwrap();
 
@@ -926,7 +962,10 @@ async fn idempotency_replay_with_diverging_metadata_returns_conflict() {
         key: "tag".to_owned(),
         value: "b".to_owned(),
     }];
-    let err = svc.create_file(&ctx, nf, Some(key)).await.unwrap_err();
+    let err = svc
+        .create_file(&ctx, nf, Some(key), false)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, DomainError::Conflict { .. }),
         "expected Conflict on diverging metadata, got {err:?}"
@@ -947,7 +986,7 @@ async fn idempotency_replay_with_diverging_owner_returns_conflict() {
     let key = "diverging-owner-key".to_owned();
 
     let nf = new_file();
-    svc.create_file(&ctx, nf.clone(), Some(key.clone()))
+    svc.create_file(&ctx, nf.clone(), Some(key.clone()), false)
         .await
         .unwrap();
 
@@ -970,7 +1009,10 @@ async fn idempotency_replay_with_diverging_owner_returns_conflict() {
     )
     .await;
 
-    let err = svc.create_file(&ctx, nf, Some(key)).await.unwrap_err();
+    let err = svc
+        .create_file(&ctx, nf, Some(key), false)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, DomainError::Conflict { .. }),
         "expected Conflict when the stored hash reflects a different owner, got {err:?}"
@@ -997,10 +1039,13 @@ async fn idempotency_different_owner_different_file() {
     nf_b.owner_id = Uuid::now_v7(); // different owner_id
 
     let t_a = svc
-        .create_file(&ctx_a, nf_a, Some(key.clone()))
+        .create_file(&ctx_a, nf_a, Some(key.clone()), false)
         .await
         .unwrap();
-    let t_b = svc.create_file(&ctx_b, nf_b, Some(key)).await.unwrap();
+    let t_b = svc
+        .create_file(&ctx_b, nf_b, Some(key), false)
+        .await
+        .unwrap();
 
     assert_ne!(
         t_a.file_id, t_b.file_id,
@@ -1017,14 +1062,14 @@ async fn idempotency_expiry_creates_new_file() {
 
     let key = "expiry-key".to_owned();
     let t1 = svc
-        .create_file(&ctx, nf.clone(), Some(key.clone()))
+        .create_file(&ctx, nf.clone(), Some(key.clone()), false)
         .await
         .unwrap();
 
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
     nf.owner_id = owner_id;
-    let t2 = svc.create_file(&ctx, nf, Some(key)).await.unwrap();
+    let t2 = svc.create_file(&ctx, nf, Some(key), false).await.unwrap();
 
     assert_ne!(
         t1.file_id, t2.file_id,
@@ -1067,6 +1112,7 @@ async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
                 custom_metadata: vec![],
             },
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1078,7 +1124,7 @@ async fn initiate_multipart_rejected_when_declared_size_exceeds_policy_limit() {
             "application/octet-stream",
             11,
             None,
-            None,
+            false,
         )
         .await
         .unwrap_err();
@@ -1122,6 +1168,7 @@ async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
                 custom_metadata: vec![],
             },
             None,
+            false,
         )
         .await
         .unwrap();
@@ -1133,7 +1180,7 @@ async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
             "application/octet-stream",
             50,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1145,7 +1192,10 @@ async fn initiate_multipart_allowed_when_declared_size_within_policy_limit() {
 async fn initiate_multipart_rejects_absurd_preferred_part_size() {
     let (svc, msvc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = msvc
         .initiate_multipart_upload(
@@ -1154,7 +1204,7 @@ async fn initiate_multipart_rejects_absurd_preferred_part_size() {
             "application/octet-stream",
             1024,
             Some(u64::MAX),
-            None,
+            false,
         )
         .await
         .unwrap_err();
@@ -1205,7 +1255,10 @@ async fn initiate_plan_urls_carry_valid_multipart_tokens() {
     ));
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let part_size = 5 * 1024 * 1024u64; // DEFAULT_MIN_PART_SIZE
     let declared_size = 2 * part_size + 3;
@@ -1216,7 +1269,7 @@ async fn initiate_plan_urls_carry_valid_multipart_tokens() {
             "application/octet-stream",
             declared_size,
             Some(part_size),
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1301,7 +1354,10 @@ async fn multipart_initiate_against_real_default_topology_is_rejected_until_back
     ));
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let err = msvc
         .initiate_multipart_upload(
@@ -1310,7 +1366,7 @@ async fn multipart_initiate_against_real_default_topology_is_rejected_until_back
             "application/octet-stream",
             1024,
             None,
-            None,
+            false,
         )
         .await
         .unwrap_err();
@@ -1374,7 +1430,10 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
     ));
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let declared_size = 2 * DEFAULT_MIN_PART_SIZE + 3;
     let plan = msvc
@@ -1384,7 +1443,7 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1396,6 +1455,7 @@ async fn multipart_complete_uses_reported_parts_not_empty_list() {
 
     let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
         "test-internal-secret".to_owned(),
+        time::Duration::ZERO,
     ));
 
     let router = Router::new()
@@ -1544,7 +1604,10 @@ async fn report_part_rejects_forged_size() {
     ));
 
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let declared_size: u64 = 100;
     let plan = msvc
@@ -1554,7 +1617,7 @@ async fn report_part_rejects_forged_size() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1568,6 +1631,7 @@ async fn report_part_rejects_forged_size() {
 
     let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
         "test-internal-secret".to_owned(),
+        time::Duration::ZERO,
     ));
 
     let router = Router::new()
@@ -1687,7 +1751,10 @@ async fn multipart_initiate_rejected_when_backend_not_multipart_native() {
         ));
 
         let ctx = ctx(Uuid::now_v7());
-        let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+        let ticket = svc
+            .create_file(&ctx, new_file(), None, false)
+            .await
+            .unwrap();
 
         let result = msvc
             .initiate_multipart_upload(
@@ -1696,7 +1763,7 @@ async fn multipart_initiate_rejected_when_backend_not_multipart_native() {
                 "application/octet-stream",
                 1024,
                 None,
-                None,
+                false,
             )
             .await;
 
@@ -1763,6 +1830,14 @@ impl StorageBackend for CompleteCallCountingBackend {
     }
     async fn delete(&self, path: &str) -> Result<(), DomainError> {
         self.inner.delete(path).await
+    }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
     }
     async fn exists(&self, path: &str) -> Result<bool, DomainError> {
         self.inner.exists(path).await
@@ -1839,7 +1914,10 @@ async fn complete_returns_version_size_and_composite_hash() {
     ));
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
     let content = Bytes::from_static(b"Hello, World!");
     let declared_size = content.len() as u64;
     let plan = msvc
@@ -1849,7 +1927,7 @@ async fn complete_returns_version_size_and_composite_hash() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1870,22 +1948,24 @@ async fn complete_returns_version_size_and_composite_hash() {
     )
     .await;
 
-    let completed = msvc
+    let MultipartCompleteOutcome::Completed(completed) = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan.upload_id, None)
         .await
-        .unwrap();
+        .unwrap()
+    else {
+        panic!("complete must finish synchronously");
+    };
 
-    let digest = hash::digest_to_array(hash::sha256(&content));
-    let expected_manifest = Manifest::new(vec![ManifestEntry { offset: 0, digest }]).unwrap();
-    let expected_root = expected_manifest.root();
+    // ADR-0006: a one-part plan is `whole-sha256` with no manifest.
+    let expected_hash = hash::sha256(&content);
 
     assert_eq!(completed.version_id, plan.version_id);
     assert_eq!(completed.size, i64::try_from(declared_size).unwrap());
     assert_eq!(completed.hash_algorithm, "SHA-256");
-    assert_eq!(completed.content_hash, expected_root.to_vec());
-    assert_eq!(completed.hash_mode, HashMode::MultipartCompositeSha256);
+    assert_eq!(completed.content_hash, expected_hash);
+    assert_eq!(completed.hash_mode, HashMode::WholeSha256);
     assert_eq!(completed.part_count, 1);
-    assert_eq!(completed.manifest, expected_manifest.to_wire_string());
+    assert_eq!(completed.manifest, None);
 }
 
 /// Bind A, then B (A's ETag is now stale); completing a third session with A's ETag must fail
@@ -1926,7 +2006,10 @@ async fn complete_with_stale_if_match_is_rejected() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let plan_a = msvc
         .initiate_multipart_upload(
@@ -1935,7 +2018,7 @@ async fn complete_with_stale_if_match_is_rejected() {
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -1972,7 +2055,7 @@ async fn complete_with_stale_if_match_is_rejected() {
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2011,7 +2094,7 @@ async fn complete_with_stale_if_match_is_rejected() {
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2095,7 +2178,10 @@ async fn complete_wildcard_if_match_succeeds() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let plan_a = msvc
         .initiate_multipart_upload(
@@ -2104,7 +2190,7 @@ async fn complete_wildcard_if_match_succeeds() {
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2138,7 +2224,7 @@ async fn complete_wildcard_if_match_succeeds() {
             "application/octet-stream",
             5,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2159,10 +2245,13 @@ async fn complete_wildcard_if_match_succeeds() {
     )
     .await;
 
-    let completed = msvc
+    let MultipartCompleteOutcome::Completed(completed) = msvc
         .complete_multipart_upload(&ctx, ticket.file_id, plan_b.upload_id, Some("*"))
         .await
-        .expect("If-Match: * must bypass the precondition check");
+        .expect("If-Match: * must bypass the precondition check")
+    else {
+        panic!("complete must finish synchronously");
+    };
     assert_eq!(completed.version_id, plan_b.version_id);
 }
 
@@ -2208,7 +2297,10 @@ async fn complete_with_missing_parts_lists_them() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let declared_size = 2 * DEFAULT_MIN_PART_SIZE + 3;
     let plan = msvc
@@ -2218,7 +2310,7 @@ async fn complete_with_missing_parts_lists_them() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2314,7 +2406,10 @@ async fn introspect_reports_received_and_missing_parts() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let declared_size = 2 * DEFAULT_MIN_PART_SIZE + 3;
     let plan = msvc
@@ -2324,7 +2419,7 @@ async fn introspect_reports_received_and_missing_parts() {
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2396,8 +2491,14 @@ async fn introspect_foreign_upload_id_is_not_found() {
     let (svc, msvc, _dp) = build_service().await;
     let ctx = ctx(Uuid::now_v7());
 
-    let ticket_a = svc.create_file(&ctx, new_file(), None).await.unwrap();
-    let ticket_b = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket_a = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
+    let ticket_b = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let plan_a = msvc
         .initiate_multipart_upload(
@@ -2406,7 +2507,7 @@ async fn introspect_foreign_upload_id_is_not_found() {
             "application/octet-stream",
             13,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2458,7 +2559,10 @@ async fn introspect_expired_session_returns_state_without_urls() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let plan = msvc
         .initiate_multipart_upload(
@@ -2467,7 +2571,7 @@ async fn introspect_expired_session_returns_state_without_urls() {
             "application/octet-stream",
             13,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();
@@ -2541,7 +2645,10 @@ async fn introspect_resume_urls_expire_with_session() {
         3600,
     ));
     let ctx = ctx(Uuid::now_v7());
-    let ticket = svc.create_file(&ctx, new_file(), None).await.unwrap();
+    let ticket = svc
+        .create_file(&ctx, new_file(), None, false)
+        .await
+        .unwrap();
 
     let plan = msvc
         .initiate_multipart_upload(
@@ -2550,7 +2657,7 @@ async fn introspect_resume_urls_expire_with_session() {
             "application/octet-stream",
             13,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();

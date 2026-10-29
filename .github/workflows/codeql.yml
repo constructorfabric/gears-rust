@@ -1,21 +1,18 @@
-# For most projects, this workflow file will not need changing; you simply need
-# to commit it to your repository.
+# CodeQL code scanning.
 #
-# You may wish to alter this file to override the set of languages analyzed,
-# or to provide custom queries or build logic.
-#
-# ******** NOTE ********
-# We have attempted to detect the languages in your repository. Please check
-# the `language` matrix defined below to confirm you have the correct set of
-# supported CodeQL languages.
-#
+# Full Rust analysis costs ~1h of runner time (codeql-action has no overlay/incremental
+# mode for Rust), so pull requests run it only when non-test `.rs` files change.
+# Drafts and PRs without Rust, Python or `.github` changes are not scanned at all.
+# Scheduled and manual runs always analyze everything.
 name: "CodeQL Advanced"
 
 on:
   pull_request:
     branches: [ "main" ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
   schedule:
-    - cron: '40 23 * * 5'
+    - cron: '40 23 * * *'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
@@ -30,45 +27,58 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # Gate: detect whether anything other than docs changed. Doc-only PRs skip the
-  # expensive CodeQL steps below but the analyze job still runs and reports green,
-  # so required status checks are never left pending.
-  changes:
-    name: Detect code changes
+  select:
+    name: Select CodeQL languages
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
-      code: ${{ steps.filter.outputs.code }}
+      scan: ${{ steps.choose.outputs.scan }}
+      rust: ${{ steps.choose.outputs.rust }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          fetch-depth: 0
-      - name: Filter changed paths
-        id: filter
+      - name: Select scan mode from changed files
+        id: choose
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
         run: |
-          base="${{ github.event.pull_request.base.sha }}"
-          if [ -z "$base" ]; then
-            # schedule / non-PR runs: always analyze
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
+          set -euo pipefail
+          emit() { printf 'scan=%s\nrust=%s\n' "$1" "$2" | tee -a "$GITHUB_OUTPUT"; }
+
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then emit true full; exit 0; fi
+          if [[ "$IS_DRAFT" == true ]]; then echo 'Draft PR: skipping CodeQL.'; emit false stub; exit 0; fi
+
+          # Fail closed: API error, empty or possibly truncated (3,000-file cap) list => full scan.
+          if ! files="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" --jq '.[].filename')" \
+             || [[ -z "$files" ]] || (( $(wc -l <<< "$files") >= 3000 )); then
+            echo 'Incomplete PR file list; running a full scan.' >&2
+            emit true full; exit 0
           fi
-          changed="$(git diff --name-only "$base"...HEAD)"
-          if printf '%s\n' "$changed" | grep -vE '(\.md$|^docs/)' | grep -q .; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
+
+          # Only `.rs` sources and this workflow trigger a full Rust scan. Manifests
+          # (Cargo.toml/lock, rust-toolchain, .cargo/, .proto) do not: Rust alerts are
+          # located only in `.rs` files and codeql-action drops alerts outside the PR
+          # diff before upload, so a full scan of such a PR would report nothing either.
+          # The exclusions mirror `paths-ignore` below (keep both in sync).
+          rust_files="$(grep -E '\.rs$|^\.github/workflows/codeql\.yml$' <<< "$files" || true)"
+          if [[ -n "$rust_files" ]] && grep -Evq '(^|/)(tests|benches)/|(^|/|_)tests?\.rs$|(^|/)examples/|^tools/fuzz/' <<< "$rust_files"; then
+            emit true full
+          elif grep -Eq '\.py$|(^|/)(pyproject\.toml|requirements[^/]*\.txt|poetry\.lock)$|^\.github/' <<< "$files"; then
+            emit true stub
           else
-            echo "code=false" >> "$GITHUB_OUTPUT"
+            emit false stub
           fi
 
   analyze:
-    needs: changes
+    needs: select
+    if: needs.select.outputs.scan == 'true'
     name: Analyze (${{ matrix.language }})
-    # Runner size impacts CodeQL analysis time. To learn more, please see:
-    #   - https://gh.io/recommended-hardware-resources-for-running-codeql
-    #   - https://gh.io/supported-runners-and-hardware-resources
-    #   - https://gh.io/using-larger-runners (GitHub.com only)
-    # Consider using larger runners or machines with greater resources for possible analysis time improvements.
-    runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
     permissions:
       # Required to upload SARIF results.
       security-events: write
@@ -77,64 +87,51 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-        - language: actions
-          build-mode: none
-        - language: python
-          build-mode: none
-        - language: rust
-          build-mode: none
-        # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
-        # Use `c-cpp` to analyze code written in C, C++ or both
-        # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
-        # Use 'javascript-typescript' to analyze code written in JavaScript, TypeScript or both
-        # To learn more about changing the languages that are analyzed or customizing the build mode for your analysis,
-        # see https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/customizing-your-advanced-setup-for-code-scanning.
-        # If you are analyzing a compiled language, you can modify the 'build-mode' for that language to customize how
-        # your codebase is analyzed, see https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages
+        # Every scanned PR must upload all categories: a missing one turns the PR's code
+        # scanning check neutral ("configuration not found") and hides its new alerts.
+        language: [ rust, python, actions ]
+    env:
+      RUST_STUB: ${{ matrix.language == 'rust' && needs.select.outputs.rust == 'stub' }}
     steps:
     - name: Checkout repository
       uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        # Rust stub: check out only `.github/` so the extractor sees just the stub crate.
+        sparse-checkout: ${{ env.RUST_STUB == 'true' && '/.github/' || '' }}
+        sparse-checkout-cone-mode: false
 
-    # Add any setup steps before running the `github/codeql-action/init` action.
-    # This includes steps like installing compilers or runtimes (`actions/setup-node`
-    # or others). This is typically only required for manual builds.
-    # - name: Setup runtime (example)
-    #   uses: actions/setup-example@v1
+    - name: Create Rust stub crate
+      if: env.RUST_STUB == 'true'
+      shell: bash
+      run: |
+        # No non-test `.rs` changes: analyze a one-line crate instead of the workspace so
+        # the `/language:rust` configuration is still uploaded. Diff-informed analysis
+        # reports only alerts on changed lines, so this matches a full scan's outcome.
+        mkdir codeql-rust-stub
+        printf '[package]\nname = "codeql-rust-stub"\nversion = "0.0.0"\nedition = "2021"\npublish = false\n\n[lib]\npath = "lib.rs"\n' \
+          > codeql-rust-stub/Cargo.toml
+        echo 'pub fn stub() {}' > codeql-rust-stub/lib.rs
 
-    # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      if: needs.changes.outputs.code == 'true'
       uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
       with:
         languages: ${{ matrix.language }}
-        build-mode: ${{ matrix.build-mode }}
-        # If you wish to specify custom queries, you can do so here or in a config file.
-        # By default, queries listed here will override any specified in a config file.
-        # Prefix the list here with "+" to use these queries and those in the config file.
-
-        # For more details on CodeQL's query packs, refer to: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities-and-errors/configuring-code-scanning#using-queries-in-ql-packs
-        # queries: security-extended,security-and-quality
-
-    # If the analyze step fails for one of the languages you are analyzing with
-    # "We were unable to automatically build your code", modify the matrix above
-    # to set the build mode to "manual" for that language. Then modify this step
-    # to build your code.
-    # ℹ️ Command-line programs to run using the OS shell.
-    # 📚 See https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#jobsjob_idstepsrun
-    - name: Run manual build steps
-      if: needs.changes.outputs.code == 'true' && matrix.build-mode == 'manual'
-      shell: bash
-      run: |
-        echo 'If you are using a "manual" build mode for one or more of the' \
-          'languages you are analyzing, replace this with the commands to build' \
-          'your code, for example:'
-        echo '  make bootstrap'
-        echo '  make release'
-        exit 1
+        build-mode: none
+        # Test code is ~46% of the Rust LOC and dominates query time. Applied to PR and
+        # scheduled runs alike so alert comparison stays consistent. Keep in sync with
+        # the Rust exclusion regex in the `select` job.
+        config: |
+          paths-ignore:
+            - '**/tests/**'
+            - '**/benches/**'
+            - '**/tests.rs'
+            - '**/test.rs'
+            - '**/*_tests.rs'
+            - '**/*_test.rs'
+            - '**/examples/**'
+            - 'tools/fuzz/**'
 
     - name: Perform CodeQL Analysis
-      if: needs.changes.outputs.code == 'true'
       uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
       with:
-        category: "/language:${{matrix.language}}"
+        category: "/language:${{ matrix.language }}"

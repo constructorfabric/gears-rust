@@ -230,29 +230,23 @@ impl Gear for OutboundApiGatewayGear {
             &metrics_prefix,
         ));
 
-        // -- Data Plane init (Pingora proxy engine) --
-        let server_conf = Arc::new(pingora_core::server::configuration::ServerConf {
-            upstream_keepalive_pool_size: 128,
-            ..Default::default()
-        });
-        let connect_timeout = Duration::from_secs(10);
-        let read_timeout = Duration::from_secs(cfg.proxy_timeout_secs);
-        let protocol_cache_ttl = Duration::from_secs(cfg.protocol_cache_ttl_secs);
-        let pingora_proxy = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
-            connect_timeout,
-            read_timeout,
-            protocol_cache_ttl,
-            ssrf_guard.clone(),
+        // -- Data Plane init (toolkit-http-proxy upstream engine, ADR-0019) --
+        let engine_settings = crate::infra::proxy::engine::EngineSettings {
+            connect_timeout: Duration::from_secs(10),
+            read_timeout: Duration::from_secs(cfg.proxy_timeout_secs),
+            protocol_cache_ttl: Duration::from_secs(cfg.protocol_cache_ttl_secs),
+            #[cfg(feature = "test-utils")]
+            skip_upstream_tls_verify: false,
+        };
+        let engine = Arc::new(
+            crate::infra::proxy::engine::ProxyEngine::new(&engine_settings, ssrf_guard.clone())
+                .map_err(|e| anyhow::anyhow!("failed to build the upstream proxy engine: {e}"))?,
         );
-        let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
-            &server_conf,
-            pingora_proxy,
-        ));
-        let pingora_selector = Arc::new(
-            crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(ssrf_guard.clone()),
+        let pool_selector = Arc::new(
+            crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(ssrf_guard.clone()),
         );
-        pingora_selector.spawn_idle_sweeper(ctx.cancellation_token().clone());
-        let backend_selector: Arc<dyn EndpointSelector> = pingora_selector;
+        pool_selector.spawn_idle_sweeper(ctx.cancellation_token().clone());
+        let backend_selector: Arc<dyn EndpointSelector> = pool_selector;
 
         let token_http_config = if cfg.allow_http_upstream {
             tracing::warn!("allow_http_upstream is enabled — HTTP token endpoints also allowed");
@@ -272,7 +266,7 @@ impl Gear for OutboundApiGatewayGear {
             token_http_config,
             token_cache_config,
             backend_selector.clone(),
-            proxy,
+            engine,
             metrics.clone(),
         )
         .with_request_timeout(Duration::from_secs(cfg.proxy_timeout_secs))

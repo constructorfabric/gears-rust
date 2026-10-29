@@ -77,6 +77,8 @@ The OAGW plugin is multi-tenant: each cache miss resolves a different (tenant, s
 
 ## Decision Outcome
 
+> **Amended by [ADR-0019](./0019-upstream-proxy-engine.md)** (`cpt-cf-oagw-adr-upstream-proxy-engine`): Pingora left the platform, so the token cache is now OAGW's own bounded, sharded LRU with per-entry TTL (`infra/ttl_cache.rs`). The decision below (an internal, capacity- and TTL-bounded cache inside the plugin, zero TTL not cached, zeroize on eviction) stands; references to `pingora-memory-cache` and TinyUFO describe the original implementation.
+
 Chosen option: "Plugin with internal `pingora-memory-cache` token cache". The plugin fetches a token from the IdP on the first request for a given (tenant, subject, config) tuple, caches it with a configurable TTL (default 5 minutes), and serves subsequent requests from cache until expiry.
 
 Caching is an internal concern of the OAuth2 CC plugin — not a generic decorator. `ApiKeyAuthPlugin` and `NoopAuthPlugin` have no expensive fetch and carry no caching infrastructure. The `AuthPlugin` trait remains unchanged.

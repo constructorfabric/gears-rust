@@ -87,7 +87,7 @@ pub struct RetainedWindows {
 /// actually there.
 ///
 /// The threshold is a number of events, and a sequence span is not one: a
-/// partition's sequence space is assigned contiguously but not populated
+/// partition's sequence space may have gaps and is not populated
 /// contiguously, so `from + events` may cover far more events than the
 /// threshold names, or far fewer. Counting through the segments that hold them
 /// is the only reading of "this many events ahead" that survives a sparse

@@ -1,6 +1,7 @@
 //! File-level queries and mutating operations on the `files` table.
 
 use time::OffsetDateTime;
+use toolkit_db::secure::TxConfig;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -8,6 +9,7 @@ use file_storage_sdk::{File, NewFile, OwnerFilter};
 
 use crate::domain::audit::{AuditEntry, FileEvent};
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
 use crate::infra::storage::store::{IdempotencyInsert, Store, pending_version};
 
 impl Store {
@@ -82,7 +84,11 @@ impl Store {
         let del_scope = scope.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let audit_repo = audit_repo.clone();
+                let del_scope = del_scope.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let removed = files.delete(tx, &del_scope, file_id).await?;
                     if removed {
@@ -140,7 +146,15 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let file = file.clone();
+                let pending = pending.clone();
+                let metadata_entries = metadata_entries.clone();
+                let files = files.clone();
+                let versions = versions.clone();
+                let metadata = metadata.clone();
+                let audit_repo = audit_repo.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     files.create(tx, &AccessScope::allow_all(), &file).await?;
                     versions
@@ -174,7 +188,13 @@ impl Store {
         let del_scope = scope.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let audit_repo = audit_repo.clone();
+                let events_repo = events_repo.clone();
+                let del_scope = del_scope.clone();
+                let audit = audit.clone();
+                let event = event.clone();
                 Box::pin(async move {
                     let removed = files.delete(tx, &del_scope, file_id).await?;
                     if removed {
@@ -207,7 +227,13 @@ impl Store {
         let events_repo = self.repos.events_outbox.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let versions = versions.clone();
+                let audit_repo = audit_repo.clone();
+                let events_repo = events_repo.clone();
+                let audit = audit.clone();
+                let event = event.clone();
                 Box::pin(async move {
                     let scope = AccessScope::allow_all();
                     // Re-check the orphan guard inside the transaction, not on the
@@ -285,7 +311,19 @@ impl Store {
         let idempotency_repo = self.repos.idempotency_keys.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let file = file.clone();
+                let pending = pending.clone();
+                let metadata_entries = metadata_entries.clone();
+                let files = files.clone();
+                let versions = versions.clone();
+                let metadata = metadata.clone();
+                let audit_repo = audit_repo.clone();
+                let events_repo = events_repo.clone();
+                let idempotency_repo = idempotency_repo.clone();
+                let audit = audit.clone();
+                let event = event.clone();
+                let idempotency = idempotency.clone();
                 Box::pin(async move {
                     files.create(tx, &AccessScope::allow_all(), &file).await?;
                     versions

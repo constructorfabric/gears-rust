@@ -13,7 +13,7 @@ runs:
         python3 -c 'import json,os; names=["GITHUB_SHA","GITHUB_RUN_ID","GITHUB_RUN_ATTEMPT","RUNNER_OS","RUNNER_ARCH","ImageOS","ImageVersion"]; print(json.dumps({k:os.environ.get(k,"") for k in names},indent=2))' > ci-metrics/environment.json
         cat ci-metrics/sccache.txt >> "$GITHUB_STEP_SUMMARY"
     - name: Upload metrics
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
       with:
         name: sccache-${{ github.job }}-${{ runner.os }}-${{ github.run_attempt }}
         path: ci-metrics/

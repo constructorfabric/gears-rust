@@ -380,6 +380,28 @@ impl K8sCache {
         )
     }
 
+    /// Creates `req` at version 1 and arms the sweeper. `Ok(false)` when the key
+    /// already exists.
+    async fn create_for_put(
+        &self,
+        api: &Api<ClusterCacheEntry>,
+        req: &PutRequest<'_>,
+    ) -> Result<bool, ClusterError> {
+        let object = self.runtime.new_object(req.key, req.value, 1, req.ttl)?;
+        let created = self
+            .runtime
+            .timed(
+                "create cache entry",
+                guarded::create(api, &object, CallSite::CachePut),
+            )
+            .await?;
+        let applied = matches!(created, Created::Created(_));
+        if applied {
+            self.runtime.arm_sweeper(req.key, req.ttl);
+        }
+        Ok(applied)
+    }
+
     /// Spawns the single shared cache watcher feeding the registry and sweeper (§6.3).
     ///
     /// `ready_tx` is flipped to `true` on the first `InitDone` — the marker that the
@@ -548,19 +570,7 @@ impl ClusterCacheBackend for K8sCache {
 
         // Bounded create-then-overwrite (§6.1): create at v1, else read + guarded
         // replace at prev+1, retrying a lost race within the budget.
-        let created = self
-            .runtime
-            .timed(
-                "create cache entry",
-                guarded::create(
-                    &api,
-                    &self.runtime.new_object(req.key, req.value, 1, req.ttl)?,
-                    CallSite::CachePut,
-                ),
-            )
-            .await?;
-        if matches!(created, Created::Created(_)) {
-            self.runtime.arm_sweeper(req.key, req.ttl);
+        if self.create_for_put(&api, &req).await? {
             return Ok(());
         }
 
@@ -568,19 +578,7 @@ impl ClusterCacheBackend for K8sCache {
             let Some(mut current) = self.runtime.read_raw(req.key).await? else {
                 // Vanished between create and read (a concurrent delete/sweep):
                 // create again at v1 rather than spinning the budget on re-reads.
-                let created = self
-                    .runtime
-                    .timed(
-                        "create cache entry",
-                        guarded::create(
-                            &api,
-                            &self.runtime.new_object(req.key, req.value, 1, req.ttl)?,
-                            CallSite::CachePut,
-                        ),
-                    )
-                    .await?;
-                if matches!(created, Created::Created(_)) {
-                    self.runtime.arm_sweeper(req.key, req.ttl);
+                if self.create_for_put(&api, &req).await? {
                     return Ok(());
                 }
                 // Recreated by someone else in the meantime: re-read + guarded replace.
@@ -599,13 +597,23 @@ impl ClusterCacheBackend for K8sCache {
                     guarded::replace(&api, &name, &current, CallSite::CachePut),
                 )
                 .await?;
-            if matches!(replaced, Replaced::Applied(_)) {
-                self.runtime.arm_sweeper(req.key, req.ttl);
-                return Ok(());
+            match replaced {
+                Replaced::Applied(_) => {
+                    self.runtime.arm_sweeper(req.key, req.ttl);
+                    return Ok(());
+                }
+                // Deleted between the read and the PUT: create again at v1 (§6.1).
+                Replaced::Gone => {
+                    if self.create_for_put(&api, &req).await? {
+                        return Ok(());
+                    }
+                    // Recreated by someone else in the meantime: re-read + replace.
+                }
+                // A 409: someone else wrote; re-read and retry within the budget,
+                // after a jittered backoff so concurrent writers do not spin in
+                // lock-step (§6.1).
+                Replaced::Conflict => self.runtime.backoff().await,
             }
-            // A 409: someone else wrote; re-read and retry within the budget, after a
-            // jittered backoff so concurrent writers do not spin in lock-step (§6.1).
-            self.runtime.backoff().await;
         }
         Err(ClusterError::Provider {
             kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
@@ -742,9 +750,9 @@ impl ClusterCacheBackend for K8sCache {
                 self.runtime.arm_sweeper(key, ttl);
                 Ok(applied.spec.to_cache_entry()?)
             }
-            // Matched at the read but lost the guarded write: re-read once to carry
-            // the live version in the conflict (§6.1).
-            Replaced::Conflict => {
+            // Matched at the read but lost the guarded write to another writer or a
+            // delete: re-read once to carry the live entry in the conflict (§6.1).
+            Replaced::Conflict | Replaced::Gone => {
                 let current = match self.runtime.read_live(key).await? {
                     Some(entry) => Some(entry.spec.to_cache_entry()?),
                     None => None,
@@ -901,5 +909,150 @@ mod tests {
             }
             other => panic!("expected InvalidConfig, got {other:?}"),
         }
+    }
+}
+
+/// A key deleted between the read and the guarded `PUT`, replayed against a
+/// scripted API server so the `404` path is tested deterministically.
+#[cfg(test)]
+mod vanished_object_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, reason = "unit tests")]
+
+    use super::K8sCache;
+    use crate::client::ResolvedClient;
+    use crate::config::K8sCacheConfig;
+    use crate::test_support::{Reply, object_not_found, scripted_client, status_body};
+    use cluster_sdk::ClusterError;
+    use cluster_sdk::cache::{ClusterCacheBackend, PutRequest, Ttl};
+    use http::Method;
+    use serde_json::{Value, json};
+
+    const GROUP: &str = "cluster.cf-gears.io";
+    const PLURAL: &str = "clustercacheentries";
+
+    /// A cache over `script`, with no watcher and a sweeper that never runs.
+    fn cache(script: Vec<Reply>) -> (K8sCache, crate::test_support::Seen) {
+        let (client, seen) = scripted_client(script);
+        let resolved = ResolvedClient {
+            client,
+            namespace: "ns".to_owned(),
+            identity: "test".to_owned(),
+        };
+        let config = K8sCacheConfig {
+            max_acquire_backoff_ms: 1,
+            cache_watch: false,
+            cache_sweep_interval_ms: 3_600_000,
+            ..K8sCacheConfig::default()
+        };
+        (K8sCache::new(&resolved, &config).expect("cache"), seen)
+    }
+
+    /// A stored `ClusterCacheEntry` named `name` at `spec.version`.
+    fn entry(name: &str, version: i64) -> Value {
+        json!({
+            "apiVersion": format!("{GROUP}/v1"),
+            "kind": "ClusterCacheEntry",
+            "metadata": {
+                "name": name, "namespace": "ns",
+                "resourceVersion": "100", "uid": "uid-1",
+            },
+            "spec": { "value": "b2xk", "version": version },
+        })
+    }
+
+    fn methods(seen: &crate::test_support::Seen) -> Vec<Method> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .map(|(m, _)| m.clone())
+            .collect()
+    }
+
+    /// `put` creates the key again when the guarded `PUT` gets a `404`.
+    #[tokio::test]
+    async fn put_recreates_when_the_object_vanishes_before_the_guarded_replace() {
+        let name = crate::naming::lease_name("cluster", crate::naming::Seg::Cache, "k");
+        let (cache, seen) = cache(vec![
+            (
+                Method::POST,
+                409,
+                status_body(409, "AlreadyExists", "already exists"),
+            ),
+            (Method::GET, 200, entry(&name, 4)),
+            (Method::PUT, 404, object_not_found(GROUP, PLURAL, &name)),
+            (Method::POST, 201, entry(&name, 1)),
+        ]);
+        let res = cache
+            .put(PutRequest {
+                key: "k",
+                value: b"new",
+                ttl: Ttl::Indefinite,
+            })
+            .await;
+        assert!(
+            res.is_ok(),
+            "put must upsert across a concurrent delete: {res:?}"
+        );
+        assert_eq!(
+            methods(&seen),
+            [Method::POST, Method::GET, Method::PUT, Method::POST],
+            "the vanished object is re-created directly, with no extra read"
+        );
+        cache.stop().await;
+    }
+
+    /// `compare_and_swap` returns `CasConflict { current: None }` when the guarded
+    /// `PUT` gets a `404`.
+    #[tokio::test]
+    async fn cas_on_an_object_deleted_after_the_read_is_a_conflict_with_no_current() {
+        let name = crate::naming::lease_name("cluster", crate::naming::Seg::Cache, "k");
+        let (cache, seen) = cache(vec![
+            (Method::GET, 200, entry(&name, 4)),
+            (Method::PUT, 404, object_not_found(GROUP, PLURAL, &name)),
+            (Method::GET, 404, object_not_found(GROUP, PLURAL, &name)),
+        ]);
+        let res = cache
+            .compare_and_swap("k", 4, b"new", Ttl::Indefinite)
+            .await;
+        match res {
+            Err(ClusterError::CasConflict { current, .. }) => assert!(current.is_none()),
+            other => panic!("expected CasConflict {{ current: None }}, got {other:?}"),
+        }
+        assert_eq!(methods(&seen), [Method::GET, Method::PUT, Method::GET]);
+        cache.stop().await;
+    }
+
+    /// A `404` that does not name the object (e.g. the CRD is not served) stays an
+    /// error and is not turned into a create.
+    #[tokio::test]
+    async fn put_does_not_treat_a_resource_level_404_as_a_vanished_object() {
+        let name = crate::naming::lease_name("cluster", crate::naming::Seg::Cache, "k");
+        let (cache, seen) = cache(vec![
+            (
+                Method::POST,
+                409,
+                status_body(409, "AlreadyExists", "already exists"),
+            ),
+            (Method::GET, 200, entry(&name, 4)),
+            (
+                Method::PUT,
+                404,
+                status_body(
+                    404,
+                    "NotFound",
+                    "the server could not find the requested resource",
+                ),
+            ),
+        ]);
+        let res = cache
+            .put(PutRequest {
+                key: "k",
+                value: b"new",
+                ttl: Ttl::Indefinite,
+            })
+            .await;
+        assert!(res.is_err(), "a resource-level 404 must stay an error");
+        assert_eq!(methods(&seen), [Method::POST, Method::GET, Method::PUT]);
+        cache.stop().await;
     }
 }

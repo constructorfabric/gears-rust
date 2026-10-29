@@ -100,6 +100,7 @@ async fn set_classified(
                 needs_review: false,
                 needs_review_detail: None,
                 set_by: "test".to_owned(),
+                set_by_tenant: None,
             },
         )
         .await
@@ -597,16 +598,6 @@ fn the_predicates_render_for_each_dialect_with_the_pattern_bound_in_place() {
     assert_eq!(
         values.0.last(),
         Some(&sea_orm::Value::from("%nee\\_dle%".to_owned()))
-    );
-
-    // The JSON-null guard on the Schema Default, per dialect.
-    assert_eq!(
-        super::Dialect::Postgres.not_json_null("setting_declarations.default_value"),
-        "jsonb_typeof(setting_declarations.default_value) <> 'null'"
-    );
-    assert_eq!(
-        super::Dialect::Sqlite.not_json_null("setting_declarations.default_value"),
-        "json_type(setting_declarations.default_value) <> 'null'"
     );
 }
 

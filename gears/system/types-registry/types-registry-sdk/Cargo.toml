@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry-sdk"
-version = "0.3.9"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -23,6 +23,17 @@ workspace = true
 default = []
 # In-memory clients and fixtures for consumer tests.
 test-util = ["dep:toolkit", "dep:parking_lot"]
+# Both REST clients and their private wire DTOs.
+rest-client = ["dep:serde", "dep:toolkit-http", "dep:bytes", "dep:secrecy", "toolkit-contract/rest-client"]
+# The HTTP binding descriptors `#[toolkit::provides(transports = [.., rest])]` validates.
+rest-server = []
+# W3C trace propagation and RED client metrics on the REST client, as a generated one has.
+otel = ["rest-client", "toolkit-contract/otel"]
+
+# Needs the resolving clients `#[toolkit::consumes]` registers.
+[[test]]
+name = "consumes_remote_test"
+required-features = ["rest-client"]
 
 [dependencies]
 # API errors and client-side validation.
@@ -51,6 +62,13 @@ tokio-util = { workspace = true }
 # Jittered backoff of reconciliation passes and transport retries.
 rand = { workspace = true }
 
+# Wire DTOs and both REST clients (`rest-client`); `secrecy` exposes the caller's bearer
+# only to the header it is sent in.
+serde = { workspace = true, optional = true }
+toolkit-http = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+
 # Test doubles only (`test-util`).
 toolkit = { workspace = true, optional = true }
 parking_lot = { workspace = true, optional = true }
@@ -65,3 +83,5 @@ tracing-subscriber = { workspace = true }
 # The test doubles also compile under `cfg(test)` without `test-util`.
 toolkit = { workspace = true }
 parking_lot = { workspace = true }
+# The README's examples compile as doctests.
+anyhow = { workspace = true }

@@ -12,7 +12,7 @@ runs:
   steps:
     - name: Restore executable
       id: cache
-      uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       with:
         path: ${{ runner.temp }}/cargo-gears
         key: cargo-gears-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
@@ -37,7 +37,7 @@ runs:
       run: echo "$RUNNER_TEMP/cargo-gears/bin" >> "$GITHUB_PATH"
     - name: Save executable
       if: steps.install.outputs.installed == 'true' && steps.cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-      uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
       with:
         path: ${{ runner.temp }}/cargo-gears
         key: cargo-gears-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}

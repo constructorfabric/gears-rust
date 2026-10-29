@@ -249,6 +249,26 @@ impl AuditValue {
     }
 }
 
+/// The tenant an audit record's actor acted from — a type of its own, so it
+/// cannot be swapped for the record's [`AuditTenant`] without the compiler
+/// noticing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActorTenant(Option<Uuid>);
+
+impl ActorTenant {
+    /// The actor acted from `tenant`: the security context's subject tenant.
+    #[must_use]
+    pub const fn of(tenant: Uuid) -> Self {
+        Self(Some(tenant))
+    }
+
+    /// A machine act with no security context: no actor tenant is recorded.
+    #[must_use]
+    pub const fn machine() -> Self {
+        Self(None)
+    }
+}
+
 /// One audit record, as a mutation hands it to the sink.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -267,6 +287,12 @@ pub struct AuditRecord {
     pub actor: String,
     /// How the actor identity is classified for the read side.
     pub actor_classification: ActorClassification,
+    /// The tenant the actor acted from, taken from the request's security
+    /// context; `None` for a machine act with no context, such as a gear's
+    /// reconcile or upgrade. Decides whether a tenant reader of the history is
+    /// shown the actor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_tenant_id: Option<Uuid>,
     /// The value before, masked when secret.
     pub pre_image: Option<AuditValue>,
     /// The value after, masked when secret.
@@ -291,6 +317,10 @@ impl AuditRecord {
     /// A successful mutation of `key` at `tenant` by an administrator, or of a
     /// scopeless definition when `tenant` is `None`.
     ///
+    /// `actor_tenant` is the tenant the actor acted from, taken from the
+    /// request's security context; [`ActorTenant::machine`] only for a machine
+    /// act that has no context, whose record then names no actor tenant.
+    ///
     /// The actor is classified `pii`: an administrator identity is personal
     /// data. A module actor calls [`Self::by_module`].
     #[must_use]
@@ -298,6 +328,7 @@ impl AuditRecord {
         key: impl Into<String>,
         tenant: AuditTenant,
         actor: impl Into<String>,
+        actor_tenant: ActorTenant,
         operation: AuditOperation,
         request_id: impl Into<String>,
     ) -> Self {
@@ -315,6 +346,7 @@ impl AuditRecord {
             operation,
             actor: actor.into(),
             actor_classification: ActorClassification::Pii,
+            actor_tenant_id: actor_tenant.0,
             pre_image: None,
             post_image: None,
             outcome: AuditOutcome::Success,
@@ -383,6 +415,9 @@ pub struct StoredAuditRecord {
     pub actor: String,
     /// How the actor identity is classified.
     pub actor_classification: ActorClassification,
+    /// The tenant the actor acted from; `None` on a record written before it
+    /// was recorded.
+    pub actor_tenant_id: Option<Uuid>,
     /// The value before.
     pub pre_image: Option<AuditValue>,
     /// The value after.

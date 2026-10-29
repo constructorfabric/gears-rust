@@ -11,21 +11,22 @@ use super::{
     InMemoryStorage, ScriptedEvaluator, bundle_with_global_policy, empty_engine_config,
     quota_draft, test_metric, test_subject, test_tenant,
 };
+use crate::engine::TransactionEvaluator;
 use crate::engine::{EvaluationContext, EvaluationLimits, PolicySchemaSnapshot};
 use crate::models::{
-    ApplicableQuotas, AttributionDigest, BatchDebitItem, BootstrapBundle, CapPatch, ConfigDefaults,
-    DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, LeaseState,
-    LeaseToken, NotificationEvent, NotificationEventKind, OperationType, PageRequest, PayloadHash,
-    PolicyDraft, PolicyId, PolicyScope, PolicyUpdate, PolicyVersionState, QuotaFilter, QuotaId,
-    QuotaPatch, QuotaStatus,
+    ApplicableQuotas, AttributionDigest, BatchDebitItem, BatchRecord, BootstrapBundle, CapPatch,
+    ConfigDefaults, DecisionResult, EventId, IdempotencyScope, IdempotencySubjectKey,
+    IdempotencyWrite, LeaseState, LeaseToken, NotificationEvent, NotificationEventKind,
+    OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyId, PolicyScope, PolicyUpdate,
+    PolicyVersionState, QuotaFilter, QuotaId, QuotaPatch, QuotaStatus,
 };
 use crate::models::{
     EvaluatedDebit, EvaluatedLease, PartialIdempotencyWrite, PeriodType, Retention, RollbackTarget,
     TransitionOutcome,
 };
 use crate::storage_plugin::{
-    CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation, QuotaEnforcementStoragePluginV1,
-    StorageError,
+    BatchEntry, BatchTimer, CONTRACT_MAJOR, EvaluatedBatch, EvaluatedMutation,
+    QuotaEnforcementStoragePluginV1, StorageError,
 };
 
 /// The scripted evaluator as the owned callback the contract now takes.
@@ -57,6 +58,17 @@ fn idem(op: OperationType, key: &str, payload: u8) -> IdempotencyWrite {
             operation_type: op,
             key: key.to_owned(),
         },
+        payload_hash: PayloadHash::from_bytes([payload; 32]),
+    }
+}
+
+/// The caller's half of a settlement's key. Commit and release cannot name a
+/// subject key: storage completes the scope from the one the acquisition
+/// persisted.
+fn partial_idem(key: &str, payload: u8) -> PartialIdempotencyWrite {
+    PartialIdempotencyWrite {
+        tenant_id: test_tenant(),
+        key: key.to_owned(),
         payload_hash: PayloadHash::from_bytes([payload; 32]),
     }
 }
@@ -397,7 +409,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
             &scope(),
             token,
             Some(31),
-            &idem(OperationType::Commit, "c0", 1),
+            &partial_idem("c0", 1),
             &[],
         )
         .await
@@ -416,7 +428,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
             &scope(),
             token,
             Some(20),
-            &idem(OperationType::Commit, "c1", 1),
+            &partial_idem("c1", 1),
             &[],
         )
         .await
@@ -424,13 +436,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     assert_eq!(storage.consumed(id), 20, "unused reservation is returned");
     assert_eq!(storage.lease_state(token), Some(LeaseState::Committed));
     let again = storage
-        .release_lease(
-            &ctx(),
-            &scope(),
-            token,
-            &idem(OperationType::Release, "x", 1),
-            &[],
-        )
+        .release_lease(&ctx(), &scope(), token, &partial_idem("x", 1), &[])
         .await
         .expect_err("terminal lease");
     assert_eq!(again, StorageError::LeaseNotActive { token });
@@ -442,14 +448,7 @@ async fn storage_lease_lifecycle_commit_release_expiry_and_deactivation() {
     let token2 = token_of(&expiring_lease);
     storage.expire_leases();
     let expired = storage
-        .commit_lease(
-            &ctx(),
-            &scope(),
-            token2,
-            None,
-            &idem(OperationType::Commit, "c2", 1),
-            &[],
-        )
+        .commit_lease(&ctx(), &scope(), token2, None, &partial_idem("c2", 1), &[])
         .await
         .expect_err("expired leases are released lazily (I4)");
     assert_eq!(expired, StorageError::LeaseNotActive { token: token2 });
@@ -894,7 +893,9 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
         .await
         .expect("live lease");
     let live = token_of(&live_outcome);
-    assert_eq!(storage.consumed(id), 35);
+    // The second acquisition is a writer on this row, so it gives back the
+    // expired hold before adding its own: 30 returned, 5 held (I4).
+    assert_eq!(storage.consumed(id), 5);
 
     let outcome = storage
         .deactivate_quota(&ctx(), &scope(), id, &[])
@@ -906,7 +907,7 @@ async fn storage_deactivation_is_terminal_returns_held_capacity_and_skips_expire
         "expired leases are not resolved (I4)"
     );
     assert_eq!(storage.lease_state(expired), Some(LeaseState::Active));
-    assert_eq!(storage.consumed(id), 30, "the live hold was returned");
+    assert_eq!(storage.consumed(id), 0, "the live hold was returned");
     let row = storage.quota(id).expect("row");
     assert_eq!(row.status, QuotaStatus::Deactivated);
     assert_eq!(row.record_version, 2);
@@ -1437,23 +1438,14 @@ async fn an_atomic_batch_evaluates_each_item_and_replays_as_one_envelope() {
             item_scope: None,
         },
     ];
-    let batch = EvaluatedBatch {
-        envelope: &envelope,
-        items: &items,
-        user_projection: None,
-        limits: limits(),
-        evaluate: Arc::clone(&call),
-    };
-    let applied = storage
-        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+    let applied = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("batch");
     assert_eq!(applied.get().len(), 2);
     assert_eq!(storage.consumed(id), 10, "both items applied");
     assert_eq!(evaluator.calls(), 2, "each item is evaluated on its own");
 
-    let replay = storage
-        .apply_batch_debit(&ctx(), &scope(), &batch, &[])
+    let replay = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("replay");
     assert!(matches!(replay, TransitionOutcome::NoOp(_)));
@@ -1516,6 +1508,56 @@ async fn selection_prefers_the_metric_policy_and_falls_through_to_global_once_it
     );
 }
 
+/// Run `items` as one atomic batch under `envelope`, every item under the
+/// test scope with no user tier, on a generous batch timer.
+async fn run_batch(
+    storage: &InMemoryStorage,
+    envelope: &IdempotencyWrite,
+    items: &[BatchDebitItem],
+    call: &Arc<TransactionEvaluator>,
+) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+    run_batch_within(
+        storage,
+        envelope,
+        items,
+        call,
+        Arc::new(BatchTimer::new(Duration::from_secs(5))),
+    )
+    .await
+}
+
+async fn run_batch_within(
+    storage: &InMemoryStorage,
+    envelope: &IdempotencyWrite,
+    items: &[BatchDebitItem],
+    call: &Arc<TransactionEvaluator>,
+    timer: Arc<BatchTimer>,
+) -> Result<TransitionOutcome<Vec<EvaluatedDebit>>, StorageError> {
+    let item_scope = scope();
+    let entries: Vec<BatchEntry<'_>> = items
+        .iter()
+        .map(|item| BatchEntry {
+            item,
+            scope: &item_scope,
+            user_projection: None,
+        })
+        .collect();
+    storage
+        .apply_batch_debit(
+            &ctx(),
+            &scope(),
+            &EvaluatedBatch {
+                envelope,
+                items: &entries,
+                limits: limits(),
+                evaluate: Arc::clone(call),
+                timer,
+            },
+            &[],
+        )
+        .await
+}
+
 fn batch_item(amount: u64) -> BatchDebitItem {
     BatchDebitItem {
         applicable: applicable(),
@@ -1537,19 +1579,7 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
     let evaluator = Arc::new(ScriptedEvaluator::new());
     let call = scripted(&evaluator);
     let items = vec![batch_item(500), batch_item(500)];
-    let outcome = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &envelope,
-                items: &items,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
+    let outcome = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("a denied batch is a decision, not a failure");
     let decided = outcome.get();
@@ -1578,21 +1608,14 @@ async fn an_atomic_batch_evaluates_against_running_state_and_denies_as_a_whole()
     // A batch every item can afford commits the union of the plans, each item
     // still evaluated against what its predecessors took.
     let fits = vec![batch_item(500), batch_item(200)];
-    let committed = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &idem(OperationType::Debit, "fits", 7),
-                items: &fits,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
-        .await
-        .expect("batch");
+    let committed = run_batch(
+        &storage,
+        &idem(OperationType::Debit, "fits", 7),
+        &fits,
+        &call,
+    )
+    .await
+    .expect("batch");
     assert!(
         committed
             .get()
@@ -2355,19 +2378,7 @@ async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
     // exceeds the cap and denies the envelope.
     let items = vec![batch_item(60), batch_item(90)];
     let envelope = idem(OperationType::Debit, "batch", 5);
-    let outcome = storage
-        .apply_batch_debit(
-            &ctx(),
-            &scope(),
-            &EvaluatedBatch {
-                envelope: &envelope,
-                items: &items,
-                user_projection: None,
-                limits: limits(),
-                evaluate: Arc::clone(&call),
-            },
-            &[],
-        )
+    let outcome = run_batch(&storage, &envelope, &items, &call)
         .await
         .expect("a denied envelope is a successful call");
 
@@ -2392,5 +2403,396 @@ async fn a_failed_batch_item_discards_every_effect_of_the_items_before_it() {
     assert!(
         storage.period_rows(id).iter().all(|row| row.consumed == 0),
         "the period row the first item filled was rolled back"
+    );
+}
+
+// --- lease accounting under expiry -----------------------------------------
+
+#[tokio::test]
+async fn an_expired_hold_is_returned_once_by_whoever_touches_the_counter_first() {
+    // The sequence that a read-side correction alone gets wrong: a credit that
+    // floors, a fresh debit, and only then the sweeper. If the sweeper returned
+    // the hold a second time it would erase the debit that came after it.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(1000)).await;
+
+    storage
+        .apply_debit_plan_for(20, &idem(OperationType::Debit, "d1", 1))
+        .await
+        .expect("debit");
+    let held = storage
+        .acquire_lease_for(
+            80,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&held);
+    assert_eq!(storage.consumed(id), 100, "20 debited plus 80 held");
+
+    storage.expire_leases();
+    assert_eq!(
+        storage.consumed(id),
+        20,
+        "an expired hold stops counting the moment its TTL passes (I4)"
+    );
+
+    storage
+        .apply_credit(&ctx(), &scope(), id, 50, &partial("c1", 2), &[])
+        .await
+        .expect("credit");
+    assert_eq!(storage.consumed(id), 0, "a credit floors at zero");
+
+    storage
+        .apply_debit_plan_for(30, &idem(OperationType::Debit, "d2", 3))
+        .await
+        .expect("debit after the credit");
+    assert_eq!(storage.consumed(id), 30);
+
+    let reclaimed = storage
+        .reclaim_expired_leases(10, OffsetDateTime::now_utc())
+        .await
+        .expect("sweep");
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(storage.lease_state(token), Some(LeaseState::AutoReleased));
+    assert_eq!(
+        storage.consumed(id),
+        30,
+        "the hold was already returned, so the sweep moves nothing"
+    );
+    assert!(kinds(&storage).contains(&NotificationEventKind::LeaseAutoReleased));
+}
+
+#[tokio::test]
+async fn an_expired_hold_frees_the_cap_and_the_capacity_without_a_sweep() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let ttl = Duration::from_mins(1);
+
+    storage
+        .acquire_lease_for(100, ttl, &idem(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the whole cap is held");
+    assert_eq!(storage.consumed(id), 100);
+    storage.expire_leases();
+
+    // No sweeper has run: the row still reads active, and the capacity is free.
+    let after = storage
+        .acquire_lease_for(100, ttl, &idem(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("acquire against the expired hold's capacity");
+    assert!(
+        after.get().token.is_some(),
+        "an unreclaimed expired hold blocks nothing"
+    );
+    assert_eq!(storage.consumed(id), 100, "only the live hold is counted");
+}
+
+#[tokio::test]
+async fn a_denial_is_a_verdict_even_when_the_active_lease_cap_is_full() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(10)).await;
+    storage
+        .bootstrap(&crate::models::BootstrapBundle {
+            config_defaults: ConfigDefaults {
+                max_active_leases: 1,
+                ..ConfigDefaults::default()
+            },
+            ..crate::models::BootstrapBundle::foundation()
+        })
+        .await
+        .expect("seed a cap of one");
+    let ttl = Duration::from_mins(1);
+
+    storage
+        .acquire_lease_for(10, ttl, &idem(OperationType::Reserve, "r1", 1))
+        .await
+        .expect("the one lease the cap allows");
+
+    // The engine refuses this on capacity. The cap is full too, but the caller
+    // is owed the verdict it asked for, not a 429 about a different limit.
+    let denied = storage
+        .acquire_lease_for(5, ttl, &idem(OperationType::Reserve, "r2", 2))
+        .await
+        .expect("a denial is a successful call");
+    assert!(matches!(
+        denied.get().decision.result,
+        DecisionResult::Denied { .. }
+    ));
+    assert!(denied.get().token.is_none());
+    assert_eq!(storage.consumed(id), 10, "a denial holds nothing");
+}
+
+#[tokio::test]
+async fn a_commit_of_zero_returns_every_hold_and_still_reverses_as_a_no_op() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let acquired = storage
+        .acquire_lease_for(
+            40,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+
+    let committed = storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(0),
+            &partial_idem("c1", 5),
+            &[],
+        )
+        .await
+        .expect("a job that used nothing commits nothing");
+    assert!(matches!(committed, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0, "every hold came back");
+    assert_eq!(storage.lease_state(token), Some(LeaseState::Committed));
+
+    let replay = storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(0),
+            &partial_idem("c1", 5),
+            &[],
+        )
+        .await
+        .expect("the same key replays its success");
+    assert!(matches!(replay, TransitionOutcome::NoOp(_)));
+
+    // The commit is a real operation, so its rollback succeeds; it simply has
+    // nothing to move. A denied debit, which also records no movement, stays
+    // irreversible.
+    let reversed = storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &RollbackTarget {
+                original: IdempotencyScope {
+                    tenant_id: test_tenant(),
+                    subject_key: IdempotencySubjectKey::from_bytes([1; 32]),
+                    operation_type: OperationType::Commit,
+                    key: "c1".to_owned(),
+                },
+                authorized: authorized(),
+            },
+            &idem(OperationType::Rollback, "rb", 6),
+            &[],
+        )
+        .await
+        .expect("a zero commit reverses as a no-op");
+    assert!(matches!(reversed, TransitionOutcome::Applied(_)));
+    assert_eq!(storage.consumed(id), 0);
+}
+
+#[tokio::test]
+async fn a_rollback_reverses_the_namespace_it_names_not_the_other() {
+    // A debit and a lease commit under the same key, subjects and tenant. Only
+    // the operation type on the target tells the plugin which one to reverse.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    // The key the acquisition persisted: the commit reuses it, and the debit
+    // under the same client key resolves to the same one.
+    let subject_key = IdempotencySubjectKey::from_bytes([1; 32]);
+
+    let acquired = storage
+        .acquire_lease_for(
+            30,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "shared", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+    storage
+        .commit_lease(
+            &ctx(),
+            &scope(),
+            token,
+            Some(30),
+            &partial_idem("shared", 5),
+            &[],
+        )
+        .await
+        .expect("commit the whole hold");
+    storage
+        .apply_debit_plan_for(20, &idem(OperationType::Debit, "shared", 7))
+        .await
+        .expect("a debit under the same key");
+    assert_eq!(storage.consumed(id), 50, "30 committed plus 20 debited");
+
+    let scope_for = |operation| RollbackTarget {
+        original: IdempotencyScope {
+            tenant_id: test_tenant(),
+            subject_key,
+            operation_type: operation,
+            key: "shared".to_owned(),
+        },
+        authorized: authorized(),
+    };
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &scope_for(OperationType::Commit),
+            &idem(OperationType::Rollback, "rb-commit", 8),
+            &[],
+        )
+        .await
+        .expect("reverse the commit");
+    assert_eq!(storage.consumed(id), 20, "only the commit was reversed");
+
+    storage
+        .apply_rollback(
+            &ctx(),
+            &scope(),
+            &scope_for(OperationType::Debit),
+            &idem(OperationType::Rollback, "rb-debit", 9),
+            &[],
+        )
+        .await
+        .expect("reverse the debit");
+    assert_eq!(storage.consumed(id), 0);
+}
+
+#[tokio::test]
+async fn a_settlement_refuses_a_token_outside_the_callers_tenant() {
+    let storage = storage_with_policy().await;
+    seeded_quota(&storage, Some(100)).await;
+    let acquired = storage
+        .acquire_lease_for(
+            10,
+            Duration::from_mins(1),
+            &idem(OperationType::Reserve, "r1", 1),
+        )
+        .await
+        .expect("acquire");
+    let token = token_of(&acquired);
+
+    let foreign = PartialIdempotencyWrite {
+        tenant_id: crate::models::TenantId::from(Uuid::from_u128(0xdead_beef)),
+        key: "c1".to_owned(),
+        payload_hash: PayloadHash::from_bytes([5; 32]),
+    };
+    let refused = storage
+        .commit_lease(&ctx(), &scope(), token, None, &foreign, &[])
+        .await
+        .expect_err("another tenant's token is simply absent");
+    assert_eq!(refused, StorageError::LeaseNotFound { token });
+}
+
+#[tokio::test]
+async fn a_denied_item_does_not_stop_the_items_after_it_from_being_evaluated() {
+    // 800 of room: 500 fits, the next 500 does not, and 200 still fits
+    // against what the first left. Every item is reported; nothing moves.
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(800)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
+    let items = vec![batch_item(500), batch_item(500), batch_item(200)];
+    let envelope = idem(OperationType::BatchDebit, "all", 8);
+
+    let outcome = run_batch(&storage, &envelope, &items, &call)
+        .await
+        .expect("a denied batch is a decision");
+
+    let results: Vec<bool> = outcome
+        .get()
+        .iter()
+        .map(|item| matches!(item.decision.result, DecisionResult::Allowed))
+        .collect();
+    assert_eq!(
+        results,
+        [true, false, true],
+        "every item has its own verdict"
+    );
+    assert_eq!(
+        evaluator.calls(),
+        3,
+        "the item after the denial was evaluated"
+    );
+    assert_eq!(storage.consumed(id), 0, "a denied batch moves nothing");
+
+    let record = storage
+        .lookup_idempotency(&envelope.scope)
+        .await
+        .expect("lookup")
+        .expect("a denied batch records its outcome");
+    let stored: BatchRecord = serde_json::from_value(record.decision_blob).expect("batch record");
+    assert_eq!(stored.version, BatchRecord::VERSION);
+    assert_eq!(stored.decisions.len(), 3);
+}
+
+#[tokio::test]
+async fn a_spent_batch_timer_writes_nothing_and_leaves_the_key_free() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let call = scripted(&evaluator);
+    let envelope = idem(OperationType::BatchDebit, "late", 9);
+
+    let outcome = run_batch_within(
+        &storage,
+        &envelope,
+        &[batch_item(1)],
+        &call,
+        Arc::new(BatchTimer::new(Duration::ZERO)),
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Err(StorageError::BatchTimeout)),
+        "{outcome:?}"
+    );
+    assert_eq!(storage.consumed(id), 0);
+    assert!(
+        storage
+            .lookup_idempotency(&envelope.scope)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a timed-out batch records nothing, so its retry runs again"
+    );
+}
+
+#[tokio::test]
+async fn an_engine_running_out_of_time_on_the_last_item_times_the_batch_out() {
+    let storage = storage_with_policy().await;
+    let id = seeded_quota(&storage, Some(100)).await;
+    let evaluator = Arc::new(ScriptedEvaluator::new());
+    let inner = scripted(&evaluator);
+    let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let call: Arc<TransactionEvaluator> = Arc::new(move |context: &EvaluationContext<'_>| {
+        if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            return Err(crate::engine::EvaluationFailure::Engine(
+                crate::engine::EngineError::Timeout,
+            ));
+        }
+        inner(context)
+    });
+
+    let outcome = run_batch(
+        &storage,
+        &idem(OperationType::BatchDebit, "slow", 10),
+        &[batch_item(1), batch_item(1)],
+        &call,
+    )
+    .await;
+
+    assert!(
+        matches!(outcome, Err(StorageError::BatchTimeout)),
+        "{outcome:?}"
+    );
+    assert_eq!(
+        storage.consumed(id),
+        0,
+        "the first item's plan was discarded"
     );
 }
