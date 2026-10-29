@@ -65,6 +65,24 @@ pub(super) fn assessed_results(
     Some(Assessed { by_key, malformed })
 }
 
+/// The Orders reason one producer subresult of a `predicate` row maps to (D-195 registry; F03
+/// §3.1): a failed subresult only to one of the predicate's own `failure_reasons`, an
+/// unevaluable one only to `catalog-predicate-unevaluable` or `catalog-predicates-unavailable`.
+/// Any other token, registered elsewhere in Orders or not at all, is unmapped, so the row is
+/// invalid coverage: unmapped upstream detail never becomes a public reason.
+fn mapped_reason(predicate: P, s: &ProducerResult) -> Option<Reason> {
+    let reason = s.reason.as_deref().and_then(Reason::from_token)?;
+    let owned = match s.verdict {
+        Verdict::Failed => predicate.spec().failure_reasons.contains(&reason),
+        Verdict::Unevaluable => matches!(
+            reason,
+            Reason::CatalogPredicateUnevaluable | Reason::CatalogPredicatesUnavailable
+        ),
+        Verdict::Passed => false,
+    };
+    owned.then_some(reason)
+}
+
 /// Rule (i): one assessed row. Unanswered port: the port reason, except `MarketConsistency`,
 /// whose owner row is missing (F03 §4.2 predicate 4). Uncovered row or a composition error
 /// (duplicate subresult, unmapped reason): invalid coverage (D-195). A malformed envelope never
@@ -85,7 +103,7 @@ pub(super) fn assessed_row(k: OutcomeKey, assessed: Option<&Assessed>) -> Outcom
     let Some(subs) = assessed.by_key.get(&k).filter(|s| !s.is_empty()) else {
         return invalid(k);
     };
-    let reason_of = |s: &ProducerResult| s.reason.as_deref().and_then(Reason::from_token);
+    let reason_of = |s: &ProducerResult| mapped_reason(k.predicate, s);
     let mut o = match compose(k.clone(), Applicability::Required, reason_of, subs.clone()) {
         Ok(o) => o,
         // Every composition refusal is invalid coverage (D-195); listed so a new variant must

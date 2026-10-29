@@ -2968,3 +2968,83 @@ fn report_failures_equal_assessment_failures() {
         .collect();
     assert_eq!(mapped, reported);
 }
+
+/// R2 (D-195, F03 §3.1): a producer reason the row's predicate does not own is unmapped, so the
+/// row is invalid coverage (`catalog-predicates-unavailable`, 503), never a definitive local
+/// refusal that hides an outage nor a `GuardReason` error (500); owned reasons still map.
+#[test]
+fn i_a_producer_reason_outside_the_predicates_own_is_invalid_coverage_d195() {
+    let l2 = line_id(2);
+    let with_market = |verdict: Verdict, token: &str, occupancy_down: bool| {
+        let mut i = base(Operation::Submit);
+        if occupancy_down {
+            i.occupancy = unavailable();
+        }
+        let mut ans = passing_assessment(&two_lines());
+        let mc = ans
+            .results
+            .iter_mut()
+            .find(|r| {
+                r.line_id == l2 && r.result.predicate == PredicateId::MarketConsistency.token()
+            })
+            .unwrap();
+        mc.result.verdict = verdict;
+        mc.result.reason = Some(token.into());
+        i.assessment = PortAnswer::Answered(ans);
+        assess(&i).unwrap()
+    };
+    let foreign = [
+        (Verdict::Failed, "axis-invalid"),
+        (Verdict::Failed, "request-invalid"),
+        (Verdict::Failed, "catalog-predicate-failed"),
+        (Verdict::Failed, "catalog-predicate-unevaluable"),
+        (Verdict::Unevaluable, "axis-invalid"),
+        (Verdict::Unevaluable, "market-inconsistent"),
+    ];
+    for (verdict, token) in foreign {
+        for occupancy_down in [false, true] {
+            let ctx = format!("{verdict:?} {token} occupancy_down={occupancy_down}");
+            let a = with_market(verdict, token, occupancy_down);
+            assert_eq!(
+                vr(row(&a.vector, PredicateId::MarketConsistency, Some(l2))),
+                unevaluable(Reason::CatalogPredicatesUnavailable),
+                "{ctx}"
+            );
+            assert_eq!(
+                a.inputs.get(InputPort::CatalogPredicates),
+                Some(InputState::Unresolvable(
+                    Reason::CatalogPredicatesUnavailable
+                )),
+                "{ctx}"
+            );
+            assert_eq!(
+                settle(&a),
+                Ok(Decision::Unevaluable {
+                    guard: GATE_COMPOSITE,
+                    reason: Reason::CatalogPredicatesUnavailable,
+                    assessment: true,
+                }),
+                "{ctx}"
+            );
+        }
+    }
+    // The predicate's own reasons keep their meaning.
+    let a = with_market(Verdict::Failed, "market-inconsistent", false);
+    assert_eq!(
+        vr(row(&a.vector, PredicateId::MarketConsistency, Some(l2))),
+        failed(Reason::MarketInconsistent)
+    );
+    assert_eq!(
+        settle(&a),
+        Ok(Decision::Guard {
+            guard: GATE_COMPOSITE,
+            reason: Reason::MarketInconsistent,
+            assessment: true,
+        })
+    );
+    let a = with_market(Verdict::Unevaluable, "catalog-predicate-unevaluable", false);
+    assert_eq!(
+        vr(row(&a.vector, PredicateId::MarketConsistency, Some(l2))),
+        unevaluable(Reason::CatalogPredicateUnevaluable)
+    );
+}
