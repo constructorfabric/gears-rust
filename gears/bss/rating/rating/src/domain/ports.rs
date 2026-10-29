@@ -26,8 +26,12 @@ pub enum Dependency {
     Pdp,
     /// The Cluster leader-election backend.
     Cluster,
-    /// The types registry (GTS label registration).
+    /// The types registry (GTS label registration, meter declarations).
     TypesRegistry,
+    /// The usage-collector feed.
+    UsageFeed,
+    /// The tenant hierarchy (tenant-resolver), asked whether a tenant lies in a configured scope.
+    TenantHierarchy,
     /// The database.
     Database,
 }
@@ -40,6 +44,8 @@ impl Dependency {
             Self::Pdp => "pdp",
             Self::Cluster => "cluster",
             Self::TypesRegistry => "types_registry",
+            Self::UsageFeed => "usage_feed",
+            Self::TenantHierarchy => "tenant_hierarchy",
             Self::Database => "database",
         }
     }
@@ -55,6 +61,8 @@ pub enum FailureCode {
     EvaluationFailed,
     /// A database statement or transaction failed.
     StorageFailed,
+    /// A read of the dependency could not be answered.
+    Unavailable,
 }
 
 impl FailureCode {
@@ -65,6 +73,7 @@ impl FailureCode {
             Self::LeadershipUnavailable => "leadership_unavailable",
             Self::EvaluationFailed => "evaluation_failed",
             Self::StorageFailed => "storage_failed",
+            Self::Unavailable => "unavailable",
         }
     }
 }

@@ -49,6 +49,7 @@ sea-orm-migration = { workspace = true }
 # PEP (`PolicyEnforcer`, `ResourceType`, `AccessRequest`) and the GTS label registration.
 authz-resolver-sdk = { workspace = true }
 types-registry-sdk = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
 # Gear crates named by `#[toolkit::gear(deps = [types_registry, authz_resolver])]`.
 authz-resolver = { workspace = true }
 types-registry = { workspace = true }
@@ -73,6 +74,8 @@ tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test
 tower = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }
+# The collector's quantity pattern, which `Quantity::parse` is checked against.
+regex = { workspace = true }
 # The tests bind `FakeClusterLeaders` through the real cluster wiring over the standalone
 # in-memory cache, as the cluster SDK resolves backends only through a process client. Test-only:
 # the gear itself depends on `cluster-sdk` alone.
