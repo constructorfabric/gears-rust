@@ -1,6 +1,8 @@
 //! The nine gate ports whose providers are not delivered (D-227 item 1), typed by the Task 6a
 //! request and answer types (`domain::gate::answers`). Each method reads as the given principal
-//! under the run's budget and answers `PortAnswer::Unavailable` instead of failing; the
+//! (the identity, contracts, overlap, occupancy, evaluation and tax ports take the caller's `ctx`;
+//! the D-194 service-principal reads, billing terms, acceptance policy and assessment, take none
+//! and name the seller in their query) under the run's budget and answers `PortAnswer::Unavailable` instead of failing; the
 //! production adapters are the fail-closed `*Unavailable` structs (`unavailable.rs`) until each
 //! provider lands.
 use super::budget::RunBudget;
@@ -99,12 +101,16 @@ pub trait OccupancyReads: Send + Sync {
 }
 
 /// Subscriptions: pre-subscription billing terms per line (D-193; S3-04).
+///
+/// D-194 (R08 matrix): a service-principal read with no buyer-context fallback. The port takes
+/// no caller context; a delivered adapter resolves the seller's Orders service principal from
+/// each query's `seller_tenant_id` through `CommercialAuthority` (as `PricingCatalogReads`).
 #[async_trait]
 pub trait BillingTermsReads: Send + Sync {
-    /// The port's answer, read as `ctx` under `run` and `cancel`.
+    /// The port's answer, read as the queries' seller's service principal under `run` and
+    /// `cancel`.
     async fn resolve(
         &self,
-        ctx: &SecurityContext,
         queries: &[BillingTermsQuery],
         run: &RunBudget,
         cancel: &CancellationToken,
@@ -112,12 +118,14 @@ pub trait BillingTermsReads: Send + Sync {
 }
 
 /// Pricing: the seller's acceptance policy; `None` is an answered missing policy (D-191; S3-05).
+///
+/// D-194 (R08 matrix): a service-principal read with no buyer-context fallback; the adapter
+/// resolves the principal from `query.seller_tenant_id` (as `PricingCatalogReads`).
 #[async_trait]
 pub trait AcceptancePolicyReads: Send + Sync {
-    /// The port's answer, read as `ctx` under `run` and `cancel`.
+    /// The port's answer, read as the seller's service principal under `run` and `cancel`.
     async fn policy(
         &self,
-        ctx: &SecurityContext,
         query: &AcceptancePolicyQuery,
         run: &RunBudget,
         cancel: &CancellationToken,
@@ -125,12 +133,14 @@ pub trait AcceptancePolicyReads: Send + Sync {
 }
 
 /// Pricing: the purchase assessment of predicates 2, 7 and 8 (D-189; S3-03).
+///
+/// D-194 (R08 matrix): a service-principal read with no buyer-context fallback; the adapter
+/// resolves the principal from `query.seller_tenant_id` (as `PricingCatalogReads`).
 #[async_trait]
 pub trait AssessmentReads: Send + Sync {
-    /// The port's answer, read as `ctx` under `run` and `cancel`.
+    /// The port's answer, read as the seller's service principal under `run` and `cancel`.
     async fn assess(
         &self,
-        ctx: &SecurityContext,
         query: &AssessmentQuery,
         run: &RunBudget,
         cancel: &CancellationToken,

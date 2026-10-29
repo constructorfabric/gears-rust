@@ -282,7 +282,7 @@ mod with_feature {
             seller_tenant_id: SELLER,
         };
         let hit = AcceptancePolicyStub::new(fixture())
-            .policy(&ctx, &policy_query, &run, &cancel)
+            .policy(&policy_query, &run, &cancel)
             .await;
         assert_eq!(
             hit,
@@ -290,7 +290,7 @@ mod with_feature {
         );
         missing(
             &AcceptancePolicyStub::new(empty())
-                .policy(&ctx, &policy_query, &run, &cancel)
+                .policy(&policy_query, &run, &cancel)
                 .await,
         );
     }
@@ -352,20 +352,14 @@ mod with_feature {
             contract_id: None,
         };
         let terms = BillingTermsStub::new(fixture());
-        let hit = terms
-            .resolve(&ctx, &[terms_query(REVISION)], &run, &cancel)
-            .await;
+        let hit = terms.resolve(&[terms_query(REVISION)], &run, &cancel).await;
         let hit = hit.answered().unwrap();
         assert_eq!(hit[0].line_id, LINE, "the answer carries the query's line");
         assert_eq!(
             hit[0].billing_terms,
             fixture().terms[&REVISION].billing_terms
         );
-        missing(
-            &terms
-                .resolve(&ctx, &[terms_query(OTHER)], &run, &cancel)
-                .await,
-        );
+        missing(&terms.resolve(&[terms_query(OTHER)], &run, &cancel).await);
     }
 
     /// A request of `(line, plan revision)` pairs.
@@ -538,11 +532,11 @@ mod with_feature {
         };
         missing(
             &AssessmentStub::new(empty())
-                .assess(&ctx, &query, &run, &cancel)
+                .assess(&query, &run, &cancel)
                 .await,
         );
         let answer = AssessmentStub::new(fixture())
-            .assess(&ctx, &query, &run, &cancel)
+            .assess(&query, &run, &cancel)
             .await;
         let profile = answer.answered().unwrap();
         assert_eq!(

@@ -326,7 +326,6 @@ impl OccupancyReads for OccupancyStub {
 impl BillingTermsReads for BillingTermsStub {
     async fn resolve(
         &self,
-        _ctx: &SecurityContext,
         queries: &[BillingTermsQuery],
         _run: &RunBudget,
         _cancel: &CancellationToken,
@@ -350,7 +349,6 @@ impl BillingTermsReads for BillingTermsStub {
 impl AcceptancePolicyReads for AcceptancePolicyStub {
     async fn policy(
         &self,
-        _ctx: &SecurityContext,
         _query: &AcceptancePolicyQuery,
         _run: &RunBudget,
         _cancel: &CancellationToken,
@@ -408,7 +406,6 @@ pub fn passing_results(query: &AssessmentQuery, profile: &str) -> Vec<ProducerRe
 impl AssessmentReads for AssessmentStub {
     async fn assess(
         &self,
-        _ctx: &SecurityContext,
         query: &AssessmentQuery,
         _run: &RunBudget,
         _cancel: &CancellationToken,

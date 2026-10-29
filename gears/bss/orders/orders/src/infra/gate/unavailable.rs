@@ -97,7 +97,6 @@ pub struct BillingTermsUnavailable;
 impl BillingTermsReads for BillingTermsUnavailable {
     async fn resolve(
         &self,
-        _ctx: &SecurityContext,
         _queries: &[BillingTermsQuery],
         _run: &RunBudget,
         _cancel: &CancellationToken,
@@ -114,7 +113,6 @@ pub struct AcceptancePolicyUnavailable;
 impl AcceptancePolicyReads for AcceptancePolicyUnavailable {
     async fn policy(
         &self,
-        _ctx: &SecurityContext,
         _query: &AcceptancePolicyQuery,
         _run: &RunBudget,
         _cancel: &CancellationToken,
@@ -131,7 +129,6 @@ pub struct AssessmentUnavailable;
 impl AssessmentReads for AssessmentUnavailable {
     async fn assess(
         &self,
-        _ctx: &SecurityContext,
         _query: &AssessmentQuery,
         _run: &RunBudget,
         _cancel: &CancellationToken,

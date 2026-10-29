@@ -177,39 +177,36 @@ impl OccupancyReads for Counted<OccupancyStub> {
 impl BillingTermsReads for Counted<BillingTermsStub> {
     async fn resolve(
         &self,
-        ctx: &SecurityContext,
         q: &[BillingTermsQuery],
         run: &RunBudget,
         cancel: &CancellationToken,
     ) -> PortAnswer<Vec<ResolvedTerms>> {
         self.hit(GatePort::BillingTerms, cancel).await;
-        self.inner.resolve(ctx, q, run, cancel).await
+        self.inner.resolve(q, run, cancel).await
     }
 }
 #[async_trait]
 impl AcceptancePolicyReads for Counted<AcceptancePolicyStub> {
     async fn policy(
         &self,
-        ctx: &SecurityContext,
         q: &AcceptancePolicyQuery,
         run: &RunBudget,
         cancel: &CancellationToken,
     ) -> PortAnswer<Option<AcceptancePolicy>> {
         self.hit(GatePort::AcceptancePolicy, cancel).await;
-        self.inner.policy(ctx, q, run, cancel).await
+        self.inner.policy(q, run, cancel).await
     }
 }
 #[async_trait]
 impl AssessmentReads for Counted<AssessmentStub> {
     async fn assess(
         &self,
-        ctx: &SecurityContext,
         q: &AssessmentQuery,
         run: &RunBudget,
         cancel: &CancellationToken,
     ) -> PortAnswer<AssessmentAnswer> {
         self.hit(GatePort::Assessment, cancel).await;
-        self.inner.assess(ctx, q, run, cancel).await
+        self.inner.assess(q, run, cancel).await
     }
 }
 #[async_trait]
@@ -672,7 +669,6 @@ struct DownAssessment;
 impl AssessmentReads for DownAssessment {
     async fn assess(
         &self,
-        _ctx: &SecurityContext,
         _q: &AssessmentQuery,
         _run: &RunBudget,
         _cancel: &CancellationToken,
@@ -703,6 +699,84 @@ async fn an_unavailable_port_and_an_unevaluable_run_are_signalled() {
         )),
         "{seen:?}"
     );
+}
+
+/// R11 (D-194 R08 matrix): the policy, terms and assessment reads are service-principal reads
+/// with no buyer-context fallback. The ports take no caller context; each is asked for the
+/// basket's seller only, whose principal the adapter resolves (as `PricingCatalogReads` does).
+#[derive(Default)]
+struct SellerReads(Mutex<Vec<(GatePort, Uuid)>>);
+#[async_trait]
+impl AcceptancePolicyReads for SellerReads {
+    async fn policy(
+        &self,
+        q: &AcceptancePolicyQuery,
+        _run: &RunBudget,
+        _cancel: &CancellationToken,
+    ) -> PortAnswer<Option<AcceptancePolicy>> {
+        self.0
+            .lock()
+            .push((GatePort::AcceptancePolicy, q.seller_tenant_id));
+        PortAnswer::Unavailable(Unavailable::Missing)
+    }
+}
+#[async_trait]
+impl BillingTermsReads for SellerReads {
+    async fn resolve(
+        &self,
+        q: &[BillingTermsQuery],
+        _run: &RunBudget,
+        _cancel: &CancellationToken,
+    ) -> PortAnswer<Vec<ResolvedTerms>> {
+        self.0.lock().extend(
+            q.iter()
+                .map(|q| (GatePort::BillingTerms, q.seller_tenant_id)),
+        );
+        PortAnswer::Unavailable(Unavailable::Missing)
+    }
+}
+#[async_trait]
+impl AssessmentReads for SellerReads {
+    async fn assess(
+        &self,
+        q: &AssessmentQuery,
+        _run: &RunBudget,
+        _cancel: &CancellationToken,
+    ) -> PortAnswer<AssessmentAnswer> {
+        self.0
+            .lock()
+            .push((GatePort::Assessment, q.seller_tenant_id));
+        PortAnswer::Unavailable(Unavailable::Missing)
+    }
+}
+
+#[tokio::test]
+async fn service_principal_reads_are_asked_for_the_seller_with_no_caller_context() {
+    let reads = Arc::new(SellerReads::default());
+    let bound = Arc::clone(&reads);
+    let h = harness_with(
+        fixture(),
+        false,
+        Arc::new(Budget::baseline()),
+        move |ports| {
+            ports.acceptance_policy = bound.clone();
+            ports.billing_terms = bound.clone();
+            ports.assessment = bound;
+        },
+    );
+    run(&h, &basket(Operation::Preview)).await.unwrap();
+    let seen = reads.0.lock().clone();
+    for port in [
+        GatePort::AcceptancePolicy,
+        GatePort::BillingTerms,
+        GatePort::Assessment,
+    ] {
+        assert!(
+            seen.contains(&(port, SELLER)),
+            "{port:?} not asked for the seller: {seen:?}"
+        );
+    }
+    assert!(seen.iter().all(|(_, seller)| *seller == SELLER), "{seen:?}");
 }
 
 #[tokio::test]

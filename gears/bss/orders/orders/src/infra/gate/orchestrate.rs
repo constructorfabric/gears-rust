@@ -414,9 +414,7 @@ impl Orchestrator {
                 &run,
                 cancel,
             ),
-            ports
-                .acceptance_policy
-                .policy(ctx, &plan.policy, &run, cancel),
+            ports.acceptance_policy.policy(&plan.policy, &run, cancel),
         );
         down.note(GatePort::IdentityProfile, &identity);
         checkpoint(cancel)?;
@@ -449,12 +447,7 @@ impl Orchestrator {
                 } else if plan.terms.is_empty() {
                     Some(PortAnswer::Answered(Vec::new()))
                 } else {
-                    Some(
-                        ports
-                            .billing_terms
-                            .resolve(ctx, &plan.terms, &run, cancel)
-                            .await,
-                    )
+                    Some(ports.billing_terms.resolve(&plan.terms, &run, cancel).await)
                 }
             },
             async {
@@ -509,7 +502,7 @@ impl Orchestrator {
             acceptance_policy.answered().and_then(Option::as_ref),
         );
         let (assessment, evaluation) =
-            tokio::join!(ports.assessment.assess(ctx, &query, &run, cancel), async {
+            tokio::join!(ports.assessment.assess(&query, &run, cancel), async {
                 match request.as_ref() {
                     Some(request) => {
                         let answer = ports.evaluation.evaluate(ctx, request, &run, cancel).await;
