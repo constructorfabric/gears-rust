@@ -129,6 +129,13 @@ impl ExceptionReason {
         bounded("reason_code", reason_code.into()).map(Self)
     }
 
+    /// A reason code this crate names as a constant, taken as it is: each such constant is checked
+    /// against [`Self::parse`] by its owner's tests, so no runtime path can refuse it.
+    #[must_use]
+    pub(crate) fn from_code(code: &'static str) -> Self {
+        Self(code.to_owned())
+    }
+
     /// The code as text.
     #[must_use]
     pub fn as_str(&self) -> &str {

@@ -26,7 +26,8 @@ use super::{
 use crate::authz::ServiceGrant;
 use crate::domain::error::DomainError;
 use crate::domain::exception::{ExceptionSweeper, SweepReport};
-use crate::domain::ports::{Dependency, FailureCode, RatingMetricsPort, SweepOutcome, TenantGrant};
+use crate::domain::ports::{Dependency, FailureCode, SweepOutcome, TenantGrant};
+use crate::domain::usage::metrics::UsageMetricsPort;
 use crate::infra::storage::repo::exception_repo::OrmExceptionRepo;
 use crate::test_providers::{FakeClusterLeaders, FakePdp, MetricSample, RecordingMetrics};
 use crate::test_support::LeadersWiring;
@@ -291,7 +292,7 @@ async fn serve_runs_the_queues_and_the_exception_sweeper_leadership_until_stoppe
     let wiring = LeadersWiring::bind(&leaders, &boot.hub);
     let metrics = Arc::new(RecordingMetrics::default());
     let gear = Arc::new(BssRatingGear {
-        metrics: Some(Arc::clone(&metrics) as Arc<dyn RatingMetricsPort>),
+        metrics: Some(Arc::clone(&metrics) as Arc<dyn UsageMetricsPort>),
         ..BssRatingGear::default()
     });
     gear.init(&boot.ctx).await.unwrap();
@@ -529,4 +530,277 @@ async fn an_unconfigured_gear_stays_inactive() {
     let openapi = OpenApiRegistryImpl::new();
     let _router = gear.register_rest(&ctx, Router::new(), &openapi).unwrap();
     assert!(openapi.operation_specs.is_empty());
+}
+
+mod usage_readers {
+    //! The usage feed readers `serve` starts (feature 04 §2.1 `inst-rp-lock`).
+
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use tenant_resolver_sdk::{
+        GetAncestorsOptions, GetAncestorsResponse, GetDescendantsOptions, GetDescendantsResponse,
+        GetTenantsOptions, IsAncestorOptions, TenantId, TenantInfo, TenantResolverClient,
+        TenantResolverError,
+    };
+    use tokio_util::sync::CancellationToken;
+    use toolkit::Gear;
+    use toolkit::client_hub::ClientHub;
+    use toolkit_security::SecurityContext;
+    use uuid::Uuid;
+
+    use super::{boot, sample};
+    use crate::BssRatingGear;
+    use crate::domain::error::DomainError;
+    use crate::domain::leadership::LeadershipName;
+    use crate::domain::ports::{Dependency, FailureCode};
+    use crate::domain::usage::declarations::MeterDeclarations;
+    use crate::domain::usage::feed::UsageFeedPort;
+    use crate::domain::usage::metrics::UsageMetricsPort;
+    use crate::domain::usage::source::SourceDefinition;
+    use crate::gear::{bound, until_ok};
+    use crate::test_providers::usage::{RecordSpec, meter, record_entry, sum_declaration};
+    use crate::test_providers::{
+        FakeClusterLeaders, FakeMeterDeclarations, FakeUsageFeed, MetricSample, RecordingMetrics,
+    };
+    use crate::test_support::LeadersWiring;
+
+    const ROOT: Uuid = Uuid::from_u128(0x10);
+
+    /// A tenant directory the readers never need to ask: every entry here is of a root.
+    struct NoDirectory;
+
+    fn not_asked() -> TenantResolverError {
+        TenantResolverError::Internal("the root needs no question".to_owned())
+    }
+
+    #[async_trait]
+    impl TenantResolverClient for NoDirectory {
+        async fn get_tenant(
+            &self,
+            _ctx: &SecurityContext,
+            _id: TenantId,
+        ) -> Result<TenantInfo, TenantResolverError> {
+            Err(not_asked())
+        }
+
+        async fn get_root_tenant(
+            &self,
+            _ctx: &SecurityContext,
+        ) -> Result<TenantInfo, TenantResolverError> {
+            Err(not_asked())
+        }
+
+        async fn get_tenants(
+            &self,
+            _ctx: &SecurityContext,
+            _ids: &[TenantId],
+            _options: &GetTenantsOptions,
+        ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+            Err(not_asked())
+        }
+
+        async fn get_ancestors(
+            &self,
+            _ctx: &SecurityContext,
+            _id: TenantId,
+            _options: &GetAncestorsOptions,
+        ) -> Result<GetAncestorsResponse, TenantResolverError> {
+            Err(not_asked())
+        }
+
+        async fn get_descendants(
+            &self,
+            _ctx: &SecurityContext,
+            _id: TenantId,
+            _options: &GetDescendantsOptions,
+        ) -> Result<GetDescendantsResponse, TenantResolverError> {
+            Err(not_asked())
+        }
+
+        async fn is_ancestor(
+            &self,
+            _ctx: &SecurityContext,
+            _ancestor_id: TenantId,
+            _descendant_id: TenantId,
+            _options: &IsAncestorOptions,
+        ) -> Result<bool, TenantResolverError> {
+            Err(not_asked())
+        }
+    }
+
+    fn subscribed() -> serde_json::Value {
+        serde_json::json!({
+            "usage_feed": {
+                "subscriptions": [{"meters": [meter("hours").as_str()], "tenant_scope": [ROOT]}],
+                "poll_interval_secs": 1,
+            }
+        })
+    }
+
+    fn served_gear(metrics: &Arc<RecordingMetrics>) -> Arc<BssRatingGear> {
+        Arc::new(BssRatingGear {
+            metrics: Some(Arc::clone(metrics) as Arc<dyn UsageMetricsPort>),
+            ..BssRatingGear::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn serve_reconciles_the_sources_and_reads_each_under_its_leadership() {
+        let boot = boot(subscribed()).await;
+        let feed = Arc::new(FakeUsageFeed::new());
+        let registry = Arc::new(FakeMeterDeclarations::new());
+        registry.declare(&meter("hours"), sum_declaration("h", &[]));
+        boot.hub
+            .register::<dyn UsageFeedPort>(Arc::clone(&feed) as Arc<dyn UsageFeedPort>);
+        boot.hub
+            .register::<dyn MeterDeclarations>(registry as Arc<dyn MeterDeclarations>);
+        boot.hub.register::<dyn TenantResolverClient>(
+            Arc::new(NoDirectory) as Arc<dyn TenantResolverClient>
+        );
+        feed.push([record_entry(&RecordSpec::hourly(
+            ROOT,
+            &meter("hours"),
+            "k1",
+            "2026-10-08T10:00:00Z",
+        ))]);
+        let leaders = FakeClusterLeaders::new();
+        let wiring = LeadersWiring::bind(&leaders, &boot.hub);
+        let metrics = Arc::new(RecordingMetrics::default());
+        let gear = served_gear(&metrics);
+        gear.init(&boot.ctx).await.unwrap();
+        let stop = CancellationToken::new();
+        let serving = tokio::spawn(Arc::clone(&gear).serve(stop.clone()));
+        let source = SourceDefinition::new(
+            crate::domain::usage::feed::FeedSubscription::new([meter("hours")]).unwrap(),
+            crate::domain::usage::source::TenantScope::new([ROOT]).unwrap(),
+        )
+        .source_id();
+        let leaf = LeadershipName::UsageFeed(source.uuid()).scoped();
+        leaders.wait_for_candidates(&leaf, 1).await;
+        assert_eq!(feed.reads(), 0, "no read before the leadership");
+        leaders.grant(&leaf, 0).await;
+        sample(&metrics, |s| {
+            matches!(s, MetricSample::FeedPage(id, report) if *id == source && report.captured == 1)
+        })
+        .await;
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(30), serving)
+            .await
+            .expect("serve stops when cancelled")
+            .unwrap()
+            .unwrap();
+        wiring.stop().await;
+    }
+
+    #[tokio::test]
+    async fn without_a_bound_feed_no_reader_starts_and_the_feed_is_reported_once() {
+        let boot = boot(subscribed()).await;
+        let leaders = FakeClusterLeaders::new();
+        let wiring = LeadersWiring::bind(&leaders, &boot.hub);
+        let metrics = Arc::new(RecordingMetrics::default());
+        let gear = served_gear(&metrics);
+        gear.init(&boot.ctx).await.unwrap();
+        let stop = CancellationToken::new();
+        let serving = tokio::spawn(Arc::clone(&gear).serve(stop.clone()));
+        let feed_missing =
+            MetricSample::DependencyError(Dependency::UsageFeed, FailureCode::Unavailable);
+        sample(&metrics, |s| *s == feed_missing).await;
+        // The sweeper still runs; the readers do not retry a client no gear will ever bind.
+        leaders
+            .wait_for_candidates("bss-rating/exception-sweep", 1)
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            metrics
+                .samples()
+                .iter()
+                .filter(|s| **s == feed_missing)
+                .count(),
+            1
+        );
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(30), serving)
+            .await
+            .expect("serve stops when cancelled")
+            .unwrap()
+            .unwrap();
+        wiring.stop().await;
+    }
+
+    #[test]
+    fn a_client_not_bound_is_an_unavailable_dependency() {
+        let hub = ClientHub::new();
+        let missing = bound::<dyn UsageFeedPort>(&hub, Dependency::UsageFeed, "usage feed")
+            .err()
+            .unwrap();
+        assert!(
+            matches!(
+                missing,
+                DomainError::DependencyUnavailable {
+                    dependency: Dependency::UsageFeed,
+                    ..
+                }
+            ),
+            "{missing:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn until_ok_retries_with_growing_pauses_and_returns_the_first_success() {
+        let metrics = RecordingMetrics::default();
+        let stop = CancellationToken::new();
+        let started: Mutex<Vec<tokio::time::Instant>> = Mutex::new(Vec::new());
+        let attempt = || async {
+            let mut started = started.lock().unwrap();
+            started.push(tokio::time::Instant::now());
+            if started.len() < 4 {
+                return Err(DomainError::DependencyUnavailable {
+                    dependency: Dependency::Database,
+                    detail: "down".to_owned(),
+                    cause: None,
+                });
+            }
+            Ok(started.len())
+        };
+        let value = until_ok(&stop, Duration::from_secs(4), &metrics, attempt).await;
+        assert_eq!(value, Some(4));
+        let started = started.into_inner().unwrap();
+        let gaps: Vec<Duration> = started.windows(2).map(|w| w[1] - w[0]).collect();
+        for (gap, full) in gaps.iter().zip([1, 2, 4]) {
+            let full = Duration::from_secs(full);
+            assert!(
+                *gap >= full / 2 && *gap <= full,
+                "{gap:?} outside [{full:?}/2, {full:?}]"
+            );
+        }
+        assert_eq!(
+            metrics
+                .samples()
+                .iter()
+                .filter(|s| **s
+                    == MetricSample::DependencyError(
+                        Dependency::Database,
+                        FailureCode::Unavailable
+                    ))
+                .count(),
+            3
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn until_ok_gives_up_when_stopped() {
+        let metrics = RecordingMetrics::default();
+        let stop = CancellationToken::new();
+        let attempt = || async {
+            stop.cancel();
+            Err::<(), _>(DomainError::Coordination("no backend".to_owned(), None))
+        };
+        assert_eq!(
+            until_ok(&stop, Duration::from_secs(4), &metrics, attempt).await,
+            None
+        );
+        assert!(metrics.samples().is_empty(), "a stop is no failure");
+    }
 }

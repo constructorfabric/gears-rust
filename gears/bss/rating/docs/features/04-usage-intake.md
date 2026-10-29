@@ -71,9 +71,10 @@ finality instead of silently under-billing (T-D-61, T-D-62).
 - **PRD**: [PRD.md](../PRD.md) §6.4 (meter mapping, dimension population), §7.1, §13 (usage feed).
 - **Architecture**: [DESIGN.md](../DESIGN.md) §3.6 Flow A (page transaction, contribution state machine), Flow B (invalidation), §3.7 (`bss_rating__source_checkpoint`, `bss_rating__usage_record`, `bss_rating__source_loss`), §4.2, §4.4; namespace [12](../DESIGN.md#contract-12) — [mapping](../DESIGN.md#contract-12-4-1), [attribution rule](../DESIGN.md#contract-12-4-2), [dedup](../DESIGN.md#contract-12-4-3), [usage type declarations](../DESIGN.md#contract-12-4-7). Complete runtime procedures are in [§7](#7-detailed-behavior-contracts).
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) §2.4.
-- **Dependencies**: [Foundation](01-foundation.md) (`cpt-cf-bss-rating-feature-foundation`): exception register, Cluster lease port, tenancy scopes, the feed contract fake.
+- **Dependencies**: [Foundation](01-foundation.md) (`cpt-cf-bss-rating-feature-foundation`): exception register, Cluster lease port, tenancy scopes, the `rating.child_work` queue whose depth drives backpressure. This feature adds Rating's own feed port and its fake (`FakeUsageFeed`) and the meter declaration port and its fake (T-D-84).
 - **Consumers**: [Attribution and Window Counters](05-attribution-counters.md) attributes and counts what this feature stores; [Operations](11-operations.md) reconciles, retries and resolves.
 - **Upstream**: `cpt-cf-bss-rating-upreq-usage-feed-v1`, `cpt-cf-bss-rating-upreq-usage-feed-scope-digest`, `cpt-cf-bss-rating-upreq-usage-type-declaration-read`, `cpt-cf-bss-rating-upreq-dimension-encoding` ([UPSTREAM_REQS](../UPSTREAM_REQS.md) §2.1, §2.3, §2.4).
+- **Collector contract**: the usage-collector's version 2 SDK (`UsageCollectorClientV2::read_usage_feed`, PR #5359, approved, not merged; the gear serves the route from stage 2 of its rollout). Its words are used here: a raw usage type is a **meter**, a GTS type derived from `gts.cf.core.uc.usage_record.v2~` and declared in types-registry; an entry covers `[window_start, window_end)`; an invalidation carries `invalidates` and `reason_code`, and the collector derives `invalidates` from the invalidation's own identity. Rating reads the feed through its own port until the adapter over the SDK lands (T-D-84).
 
 **UI applicability**: none; this feature has no endpoint and no user interface. Operator surfaces are in [Operations](11-operations.md).
 
@@ -83,7 +84,7 @@ finality instead of silently under-billing (T-D-61, T-D-62).
 
 ### 2.1 Read and capture one feed page
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-intake-read-page`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-flow-intake-read-page`
 
 **Actor**: `cpt-cf-bss-rating-actor-rating` (feed reader for one canonical source)
 
@@ -92,21 +93,21 @@ finality instead of silently under-billing (T-D-61, T-D-62).
 **Error Scenarios**: feed unavailable (backoff); `InvalidArgument(CursorBeyondRetention)` (source loss and restart from `Oldest`, under the cursor CAS); Rating's grant no longer covers the source's configured tenant scope (the page is not committed and the source pauses); the types registry is unavailable (backoff before the transaction; nothing is rejected); lost lease (checkpoint CAS fails, rollback); queue depth above the backpressure threshold (reader pauses).
 
 **Steps**:
-1. [ ] - `p1` - Hold the Cluster leadership `usage-feed-{source_uuid}` (`LeaderElectionV1`, scoped `bss-rating`) for the canonical source; without it, do not read - `inst-rp-lock`
-2. [ ] - `p1` - Read the checkpoint and call `read_usage_feed(subscription, Oldest | After(cursor), until = None, limit ≤ 1 000)` outside the transaction - `inst-rp-read`
-3. [ ] - `p1` - **IF** the collector answers `InvalidArgument(CursorBeyondRetention)` - `inst-rp-retention`
-   1. [ ] - `p1` - In one restart transaction, lock the checkpoint row with the same cursor CAS as a page transaction (roll back on a mismatch, so a stale leader neither resets the cursor nor opens a loss), open one source loss against the source scope (its configured tenant scope × type set; §3.4) and reset the cursor so the next read starts at `Oldest` - `inst-rp-open-loss`
-4. [ ] - `p1` - Before the transaction, resolve the usage type declarations of the page's distinct GTS types (cached; declarations are immutable) and check that Rating's grant still covers the source's configured tenant scope (§3.3); on a transient registry or PDP error, back off without opening the transaction, so nothing is rejected and the cursor stays; **IF** the grant no longer covers the scope, do not commit the page: pause the source and raise `usage_grant_narrowed` ([12 §4.6](#contract-12-4-6)) - `inst-rp-prepare`
-5. [ ] - `p1` - BEGIN; lock the checkpoint row and check the cursor (CAS) - `inst-rp-cas`
-6. [ ] - `p1` - **FOR EACH** entry in feed order: capture it (§3.1), then interpret the stored row (§3.2) or apply it as an invalidation (§2.2) - `inst-rp-each`
-7. [ ] - `p1` - Advance the checkpoint cursor; COMMIT - `inst-rp-commit`
-8. [ ] - `p1` - **IF** the page is short or empty, poll again after `rating.usage_feed.poll_interval` - `inst-rp-poll`
+1. [x] - `p1` - Hold the Cluster leadership `usage-feed-{source_uuid}` (`LeaderElectionV1`, scoped `bss-rating`) for the canonical source; without it, do not read. A source found `retired` ends the term and its leadership is resigned, never held idle; the instance leads it again only once a reconciliation makes it readable - `inst-rp-lock`
+2. [x] - `p1` - Read the checkpoint and call `read_usage_feed(subscription, Oldest | After(cursor), until = None, limit ≤ 1 000)` outside the transaction; the subscription is the source's sorted meters. A call to the feed, the meter registry or the tenant hierarchy that does not answer within `rating.usage_feed.call_timeout_secs` is given up and backed off from; a page holding more entries than the limit is refused, never applied - `inst-rp-read`
+3. [x] - `p1` - **IF** the collector answers `InvalidArgument(CursorBeyondRetention)` - `inst-rp-retention`
+   1. [x] - `p1` - In one restart transaction, lock the checkpoint row with the same cursor CAS as a page transaction (roll back on a mismatch, so a stale leader neither resets the cursor nor opens a loss), open one source loss against the source scope (its configured tenant scope × type set; §3.4) and reset the cursor so the next read starts at `Oldest` - `inst-rp-open-loss`
+4. [x] - `p1` - Before the transaction, sort the page's entries: an entry of a meter the source does not subscribe to, or of a tenant outside its configured scope (a root or a descendant of one, barriers ignored, as tenant-resolver answers), is set aside — the collector sent what the source never asked for. Then resolve the declarations of the remaining entries' distinct meters (cached; declarations are immutable), bind the service scope of each tenant they name, and check that Rating's grant still covers the source's configured tenant scope (§3.3); on a transient registry, hierarchy or PDP error, back off without opening the transaction, so nothing is rejected and the cursor stays; **IF** the grant no longer covers the scope, or a tenant inside the scope is outside the grant, do not commit the page: pause the source and raise `usage_grant_narrowed` ([12 §4.6](#contract-12-4-6)) - `inst-rp-prepare`
+5. [x] - `p1` - BEGIN; lock the checkpoint row and check the cursor (CAS) - `inst-rp-cas`
+6. [x] - `p1` - Read the stored digests of the page's entries, one query per tenant; **FOR EACH** entry in feed order: compare a stored one by its digest alone (§3.1), else capture it with its interpretation (§3.2) or apply it as an invalidation (§2.2) - `inst-rp-each`
+7. [x] - `p1` - Advance the checkpoint cursor; COMMIT - `inst-rp-commit`
+8. [x] - `p1` - **IF** the page is short or empty, poll again after `rating.usage_feed.poll_interval` - `inst-rp-poll`
 
 The page transaction is canonical in [12 §3.6](#contract-12-3-6) (DESIGN §3.6 Flow A is its sequence); this flow names the steps this feature implements.
 
 ### 2.2 Apply an invalidation entry
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-intake-invalidation`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-flow-intake-invalidation`
 
 **Actor**: `cpt-cf-bss-rating-actor-rating` (feed reader)
 
@@ -115,12 +116,12 @@ The page transaction is canonical in [12 §3.6](#contract-12-3-6) (DESIGN §3.6 
 **Error Scenarios**: target not captured yet (`invalidation_target_unknown`, withdrawn on later capture); replayed invalidation (absorbed by its unique key).
 
 **Steps**:
-1. [ ] - `p1` - Capture the invalidation entry like any entry, unique on `(tenant_id, invalidates_id)` - `inst-iv-capture`
-2. [ ] - `p1` - Withdraw the target with the conditional update on its full key, `WHERE tenant_id = inv.tenant_id AND usage_record_id = inv.invalidates_id AND withdrawn_by IS NULL`, returning its previous state and recorded coordinates; a target is only ever looked up in the invalidation's own tenant - `inst-iv-withdraw`
-3. [ ] - `p1` - **IF** the previous state was `counted`, hand the coordinates to the counter decrement of [Attribution and Window Counters](05-attribution-counters.md) in the same transaction - `inst-iv-decrement`
-4. [ ] - `p1` - **IF** the target is not stored, keep the invalidation and open `invalidation_target_unknown` - `inst-iv-unknown`
-5. [ ] - `p1` - Set the invalidation row `applied` in the same transaction, whether or not its target is stored: an invalidation has no contribution of its own, so it never holds a window open (DESIGN [14 §4.5](../DESIGN.md#contract-14-4-5) condition 6) - `inst-iv-applied`
-6. [ ] - `p1` - **RETURN** with no delta computed: corrections become new revisions downstream - `inst-iv-return`
+1. [x] - `p1` - Capture the invalidation entry like any entry, unique on `(tenant_id, invalidates_id)`; `invalidates` is the collector's derivation of the target's id from the invalidation's own identity (same tenant, meter, idempotency key and covered period, `entry_type = record`), so Rating never derives it - `inst-iv-capture`
+2. [x] - `p1` - Withdraw the target with the conditional update on its full key, `WHERE tenant_id = inv.tenant_id AND usage_record_id = inv.invalidates_id AND withdrawn_by IS NULL AND contribution_state <> 'applied'`, after reading its previous state and recorded coordinates; a target is only ever looked up in the invalidation's own tenant; a target withdrawn while `rejected` has its rejection exception resolved - `inst-iv-withdraw`
+3. [x] - `p1` - Undo what the previous state did, deciding for every state: a `rejected` target's exception is resolved; a target in one of [Attribution and Window Counters](05-attribution-counters.md)' states (`counted`, or a deferred state) is handed to its contribution step in the same transaction — the counter decrement of a `counted` record, the exception of a deferred one; a `captured` target needs nothing - `inst-iv-decrement`
+4. [x] - `p1` - **IF** the target is not stored, keep the invalidation and open `invalidation_target_unknown` - `inst-iv-unknown`
+5. [x] - `p1` - Set the invalidation row `applied` in the same transaction, whether or not its target is stored: an invalidation has no contribution of its own, so it never holds a window open (DESIGN [14 §4.5](../DESIGN.md#contract-14-4-5) condition 6) - `inst-iv-applied`
+6. [x] - `p1` - **RETURN** with no delta computed: corrections become new revisions downstream - `inst-iv-return`
 
 Canonical: DESIGN §3.6 Flow B steps 1–2 and [12 §4.4](#contract-12-4-4).
 
@@ -140,49 +141,55 @@ The flows of the former slice documents that this feature implements are defined
 
 ### 3.1 Capture before interpretation
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-capture`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-capture`
 
 **Input**: one wire entry from a feed page, the canonical `source_id`.
 
 **Output**: a captured row, an "already captured" no-op, a content-conflict alarm, or a capture reject.
 
-1. [ ] - `p1` - **IF** the entry has no readable `id` or `tenant_id`, insert `bss_rating__usage_capture_reject (source_id, raw_sha256, raw)` and open a source loss of kind `unidentifiable_entry` over the source scope - `inst-cap-unidentifiable`
-2. [ ] - `p1` - Insert `bss_rating__usage_record` with `raw_entry` (the complete entry as received), `raw_sha256` and `raw_digest_version` (the digest over the pinned field list of [12 §4.1](../DESIGN.md#contract-12-4-1), never over the whole entry), `contribution_state = captured`, `ON CONFLICT DO NOTHING` - `inst-cap-insert`
-3. [ ] - `p1` - **IF** not inserted, digest the re-read entry under the stored row's `raw_digest_version`; **IF** that equals the stored `raw_sha256`, stop: the entry has no further effect (an optional field the collector added since is outside the pinned list, so it is no conflict) - `inst-cap-duplicate`
-4. [ ] - `p1` - **IF** not inserted and the digest differs, raise `usage_content_conflict`; the stored row wins - `inst-cap-conflict`
-5. [ ] - `p1` - **RETURN** the stored row for interpretation in the same transaction - `inst-cap-return`
+The entry is interpreted (§3.2) in memory, and one insert stores it complete together with that
+outcome: an interpretation failure never prevents the capture (the row is stored `rejected` with
+its raw entry), and every later stage and retry reads the stored row, never the collector. One
+statement instead of an insert and an update keeps a natural-key conflict from aborting the page
+without a savepoint, which the gear's secure transaction does not offer (T-D-84).
+
+1. [x] - `p1` - **IF** the entry has no readable `id` or `tenant_id`, insert `bss_rating__usage_capture_reject (source_id, raw_sha256, raw, reason = unidentifiable)` and open a source loss of kind `unidentifiable_entry` over the source scope, unless a replay finds the entry set aside already; an entry outside the source's subscription (§2.1 `inst-rp-prepare`) is set aside the same way with `reason = outside_subscription`, an alarm and no loss — nothing of the source is lost - `inst-cap-unidentifiable`
+2. [x] - `p1` - Insert `bss_rating__usage_record` with `raw_entry` (the complete entry as received; above 64 KiB of JSON, a stub holding its size and first kilobyte, the row `rejected(usage_malformed)`), `raw_sha256` and `raw_digest_version` (the digest over the pinned field list of [12 §4.1](../DESIGN.md#contract-12-4-1), never over the whole entry; taken from the entry as received, so a stub's re-read is still recognized), and the interpretation's normalized columns and `contribution_state`, `ON CONFLICT (tenant_id, usage_record_id) DO NOTHING` - `inst-cap-insert`
+3. [x] - `p1` - **IF** not inserted, digest the re-read entry under the stored row's `raw_digest_version`; **IF** that equals the stored `raw_sha256`, stop: the entry has no further effect (an optional field the collector added since is outside the pinned list, so it is no conflict) - `inst-cap-duplicate`
+4. [x] - `p1` - **IF** not inserted and the digest differs, raise `usage_content_conflict`; the stored row wins - `inst-cap-conflict`
+5. [x] - `p1` - **RETURN** the stored row; its interpretation's effects (exceptions, withdrawal, the attribution step) run in the same transaction - `inst-cap-return`
 
 ### 3.2 Interpret a stored entry
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-normalize`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-normalize`
 
-**Input**: a stored `bss_rating__usage_record` row (from capture, or from an operator retry).
+**Input**: an entry being captured (§3.1), or a stored `bss_rating__usage_record` row (an operator retry).
 
 **Output**: a normalized record handed to attribution, or `rejected(reason)` with an exception.
 
-1. [ ] - `p1` - **IF** a stored invalidation of this tenant already names this record (`(tenant_id, invalidates_id = id)`), set `withdrawn` and stop - `inst-norm-prewithdrawn`
-2. [ ] - `p1` - Map the entry per [12 §4.1](../DESIGN.md#contract-12-4-1): interval, quantity (exact, ≤ 28 fractional digits), `gts_type`, `idempotency_key`, resource and subject references, metadata, origin - `inst-norm-map`
-3. [ ] - `p1` - **IF** the entry is malformed, has no interval or names a GTS type the registry answers as not declared, set `rejected(usage_malformed | interval_missing)` and open an exception - `inst-norm-malformed`
-4. [ ] - `p1` - **IF** another stored entry already holds the natural key `(tenant_id, gts_type, idempotency_key, interval_start, interval_end, entry_type)`, set `rejected(usage_natural_key_conflict)`, raise the alarm and stop; the stored entry stands. The normalized columns are written under a savepoint, so a concurrent writer's unique violation on `uq_…__natural_key` rolls back to it and takes this branch instead of aborting the page ([12 §4.3](../DESIGN.md#contract-12-4-3)) - `inst-norm-natural-key`
-5. [ ] - `p1` - Keep the usage type declaration resolved before the transaction (§2.1 `inst-rp-prepare`) with the record; only a definitive "not declared" answer rejects an entry, and an unavailable registry never does, because the page is not committed until every declaration it needs is resolved. A raw type whose fold is not `SUM` is **not** rejected: its records are captured and counted, and evaluation decides (a `Sum` input of such a type fails the child `usage_type_not_chargeable`; a `Peak` / `TimeWeighted` input fails it `unsupported_input_fold` until R-06; [12 §4.7](../DESIGN.md#contract-12-4-7)) - `inst-norm-fold`
-6. [ ] - `p1` - Keep `gts_type` as the record's **raw input usage type** (a usage SKU sells a Products derived usage type whose inputs are raw GTS types, products P-D-259; T-D-76) and derive no dimension value from metadata at launch: the record counts toward its item's one rated cell, the value the fact's accepted binding names (DESIGN [03 §4.2](../DESIGN.md#contract-03-4-2)); the metadata mapping waits for R-16 - `inst-norm-dimension`
-7. [ ] - `p1` - **RETURN** the normalized record to the attribution step of [Attribution and Window Counters](05-attribution-counters.md) - `inst-norm-return`
+1. [x] - `p1` - **IF** a stored invalidation of this tenant already names this record (`(tenant_id, invalidates_id = id)`), set `withdrawn` and stop - `inst-norm-prewithdrawn`
+2. [x] - `p1` - Map the entry per [12 §4.1](../DESIGN.md#contract-12-4-1): covered period (`window_start`, `window_end` → `interval_start`, `interval_end`), quantity (≤ 28 significant and 28 fractional digits, kept as its canonical decimal text), meter (`gts_type_id` → `gts_type`), `idempotency_key`, resource and subject references, metadata, origin, and the entry type (`invalidation` exactly when `invalidates` is present; an `entry_type` field, where the wire carries one, must agree) - `inst-norm-map`
+3. [x] - `p1` - **IF** the entry is malformed, has no covered period, names a meter the registry answers as not declared or carries metadata keys outside the meter's declared set, set `rejected(usage_malformed | interval_missing)` and open an exception - `inst-norm-malformed`
+4. [x] - `p1` - **IF** another stored entry already holds the natural key `(tenant_id, gts_type, idempotency_key, interval_start, interval_end, entry_type)` (or, for an invalidation, another invalidation names the same target), set `rejected(usage_natural_key_conflict)`, raise the alarm and stop; the stored entry stands. The collector derives the id from exactly this key, so a conforming collector never reaches this branch; it is a safety net. The key is checked before the insert; a concurrent writer's unique violation on `uq_…__natural_key` aborts the page once, and its re-read finds the stored key and takes this branch ([12 §4.3](../DESIGN.md#contract-12-4-3)) - `inst-norm-natural-key`
+5. [x] - `p1` - Use the meter declaration resolved before the transaction (§2.1 `inst-rp-prepare`); only a definitive "not declared" answer rejects an entry, and an unavailable registry never does, because the page is not committed until every declaration it needs is resolved. A meter whose fold is not `SUM` is **not** rejected: its records are captured and counted, and evaluation decides (a `Sum` input of such a meter fails the child `usage_type_not_chargeable`; a `Peak` / `TimeWeighted` input fails it `unsupported_input_fold` until R-06; [12 §4.7](../DESIGN.md#contract-12-4-7)) - `inst-norm-fold`
+6. [x] - `p1` - Keep the meter as the record's **raw input usage type** (a usage SKU sells a Products derived usage type whose inputs are raw meters, products P-D-259; T-D-76) and derive no dimension value from metadata at launch: the record counts toward its item's one rated cell, the value the fact's accepted binding names (DESIGN [03 §4.2](../DESIGN.md#contract-03-4-2)); the metadata mapping waits for R-16 - `inst-norm-dimension`
+7. [x] - `p1` - **RETURN** the normalized record to the attribution step of [Attribution and Window Counters](05-attribution-counters.md) - `inst-norm-return`
 
 A rejection never blocks the feed: the raw entry is already stored, so a later retry re-runs this process without the collector ([12 §4.5](#contract-12-4-5)).
 
 ### 3.3 Maintain the canonical source and its checkpoint
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-source-identity`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-intake-source-identity`
 
-**Input**: the configured feed subscription (sorted GTS types and its configured tenant scope, `rating.usage_feed.subscriptions[*].tenant_scope`) and Rating's service identity.
+**Input**: the configured feed subscription (its sorted meters and its configured tenant scope, `rating.usage_feed.subscriptions[*].tenant_scope`) and Rating's service identity.
 
 **Output**: one `source_id` naming the configuration, the Cluster leadership `usage-feed-{source_uuid}`, the checkpoint, metrics and losses.
 
-1. [ ] - `p1` - Compute `source_id = "usage:" + UUIDv5(NS_RATING_SOURCE, canonical JSON {sorted gts_type_ids, service_identity, configured tenant scope})`; the tenant scope is configuration, never inferred from what the feed returns - `inst-src-id`
-2. [ ] - `p1` - **IF** the type set or the configured tenant scope changed, create the new source from `Oldest` and drain the old one to its current end, then retire it; a source whose scope was narrowed on purpose is retired without draining (its grant no longer covers it) - `inst-src-change`
-3. [ ] - `p1` - **IF** a widened scope exposes history already past the retention floor, open `scope_widened_beyond_retention` for that tenant - `inst-src-widened`
-4. [ ] - `p1` - Before each read and again before each page commit, evaluate Rating's grant on the feed read with the platform PDP; **IF** it no longer covers the configured tenant scope, commit nothing and pause the source with `usage_grant_narrowed` until it does or the operator narrows the configured scope ([12 §4.6](#contract-12-4-6)) - `inst-src-grant`
-5. [ ] - `p1` - Never send a cursor with any subscription other than the one that produced it - `inst-src-cursor`
+1. [x] - `p1` - Compute `source_id = "usage:" + UUIDv5(NS_RATING_SOURCE, canonical JSON {sorted gts_type_ids, service_identity, configured tenant scope})`; the tenant scope is configuration, never inferred from what the feed returns - `inst-src-id`
+2. [x] - `p1` - **IF** the meter set or the configured tenant scope changed, create the new source from `Oldest` and drain the old one to its current end, then retire it; a source whose scope was narrowed on purpose (a configured source has its meters and a strict subset of its roots) is retired without draining (its grant no longer covers it). Every instance reconciles the stored sources with its configuration when it starts: its configured sources are made `active`, every other `active` source is set `draining` or `retired`, and a draining source's reader keeps the stored definition, so a rolling deployment reads an extra source for a while and never loses one. The reconciliation is ordered by `rating.usage_feed.config_generation`, raised with every change of the subscriptions: it locks the stored rows, and an instance whose generation is older than the one they were last reconciled under changes nothing and reads the stored sources, so an old instance restarting mid-rollout cannot revert a newer plan - `inst-src-change`
+3. [x] - `p1` - **IF** a widened scope exposes a tenant the source with the same meters did not cover, open `scope_widened_beyond_retention` for that tenant: `Oldest` is past the retention floor for its history - `inst-src-widened`
+4. [x] - `p1` - Before each read and again before each page commit, evaluate Rating's grant on the feed read with the platform PDP — the collector's `read_feed` action on `gts.cf.core.uc.usage_record.v2~` for Rating's service identity, once per root tenant of the configured scope; **IF** it no longer covers the configured tenant scope, commit nothing and pause the source with `usage_grant_narrowed` until it does or the operator narrows the configured scope ([12 §4.6](#contract-12-4-6)) - `inst-src-grant`
+5. [x] - `p1` - Never send a cursor with any subscription other than the one that produced it - `inst-src-cursor`
 
 Details: [12 §4.6](#contract-12-4-6).
 
@@ -200,14 +207,14 @@ Details: [12 §4.6](#contract-12-4-6).
 
 ### 3.5 Apply backpressure
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-algo-intake-backpressure`
+- [x] `p2` - **ID**: `cpt-cf-bss-rating-algo-intake-backpressure`
 
 **Input**: `rating.child_work` queue depth.
 
 **Output**: the reader pauses or resumes; nothing is dropped.
 
-1. [ ] - `p1` - **IF** depth exceeds `max_queue_depth` (default 1 000 000), stop fetching pages - `inst-bp-stop`
-2. [ ] - `p1` - **IF** depth falls below 80 % of the threshold, resume from the stored cursor - `inst-bp-resume`
+1. [x] - `p1` - **IF** depth exceeds `max_queue_depth` (default 1 000 000), stop fetching pages - `inst-bp-stop`
+2. [x] - `p1` - **IF** depth falls below 80 % of the threshold, resume from the stored cursor - `inst-bp-resume`
 
 <a id="register-procedures"></a>
 
@@ -228,19 +235,19 @@ The normative procedures of the former slice documents that this feature impleme
 
 ### 4.1 Capture side of the contribution state
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-state-intake-capture`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-state-intake-capture`
 
 **States**: `captured`, `rejected`, `withdrawn`, `applied` (this feature's transitions of the contribution state machine defined in DESIGN §3.6 Flow A; deferred states and `counted` belong to [Attribution and Window Counters](05-attribution-counters.md)).
 
 **Initial State**: `captured`.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** — **TO** `captured` **WHEN** an entry is stored for the first time - `inst-st-capture`
-2. [ ] - `p1` - **FROM** `captured` **TO** `rejected(reason)` **WHEN** normalization fails, including `usage_natural_key_conflict` (a `Peak` / `TimeWeighted` input is not a rejection: the record stays counted and only its child fails, R-06) - `inst-st-reject`
-3. [ ] - `p1` - **FROM** `captured` **TO** `applied` **WHEN** the entry is an invalidation: set by Flow B step 2 in its capture transaction, whether or not its target is stored; `applied` is terminal and never blocks finality - `inst-st-applied`
-4. [ ] - `p1` - **FROM** `rejected` **TO** `captured` **WHEN** an operator retry (`usage × retry`, audited) re-interprets the stored raw entry; it then follows the transitions of [Attribution and Window Counters](05-attribution-counters.md) - `inst-st-retry`
-5. [ ] - `p1` - **FROM** any non-`withdrawn` state of a record **TO** `withdrawn` **WHEN** its invalidation is applied (`withdrawn_by` set once) - `inst-st-withdraw`
-6. [ ] - `p1` - **FROM** — **TO** `withdrawn` **WHEN** a record is captured after its invalidation - `inst-st-late-target`
+1. [x] - `p1` - **FROM** — **TO** `captured` **WHEN** an entry is stored for the first time - `inst-st-capture`
+2. [x] - `p1` - **FROM** `captured` **TO** `rejected(reason)` **WHEN** normalization fails, including `usage_natural_key_conflict` (a `Peak` / `TimeWeighted` input is not a rejection: the record stays counted and only its child fails, R-06) - `inst-st-reject`
+3. [x] - `p1` - **FROM** `captured` **TO** `applied` **WHEN** the entry is an invalidation: set by Flow B step 2 in its capture transaction, whether or not its target is stored; `applied` is terminal and never blocks finality - `inst-st-applied`
+4. [x] - `p1` - **FROM** `rejected` **TO** `captured` **WHEN** an operator retry (`usage × retry`, audited) re-interprets the stored raw entry; it then follows the transitions of [Attribution and Window Counters](05-attribution-counters.md) - `inst-st-retry`
+5. [x] - `p1` - **FROM** any non-`withdrawn` state of a record **TO** `withdrawn` **WHEN** its invalidation is applied (`withdrawn_by` set once) - `inst-st-withdraw`
+6. [x] - `p1` - **FROM** — **TO** `withdrawn` **WHEN** a record is captured after its invalidation - `inst-st-late-target`
 
 ### 4.2 Source loss
 
@@ -261,7 +268,7 @@ The normative procedures of the former slice documents that this feature impleme
 
 ### 5.1 Lossless, idempotent page capture
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-capture`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-capture`
 
 The system **MUST** store every feed entry complete with its SHA-256 before interpreting it, commit a page's captures, their effects and the checkpoint advance in one transaction with the cursor CAS, and treat an already-captured entry with the same digest as having no effect at all.
 
@@ -273,7 +280,7 @@ The system **MUST** store every feed entry complete with its SHA-256 before inte
 
 ### 5.2 Retryable normalization and invalidation intake
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-normalize`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-normalize`
 
 The system **MUST** interpret only stored entries, reject malformed, interval-less, undeclared-type and natural-key-conflicting entries into the exception register without blocking the feed (an unavailable registry rejects nothing), populate `meter` and `dimension_key` per [12 §4.1](../DESIGN.md#contract-12-4-1), and apply invalidations through the conditional withdrawal on the target's full key so a withdrawn record can never contribute again, setting each invalidation row `applied` in the same transaction.
 
@@ -285,7 +292,7 @@ The system **MUST** interpret only stored entries, reject malformed, interval-le
 
 ### 5.3 Source identity, source loss and backpressure
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-source-loss`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-intake-source-loss`
 
 The system **MUST** derive one canonical `source_id` per feed subscription and its configured tenant scope, start a changed subscription as a new source from `Oldest`, commit no page while Rating's grant does not cover the configured scope, open a durable source loss for `CursorBeyondRetention` (under the cursor CAS, tainting the days the removed entries can belong to), unidentifiable entries and widened scopes, keep it open until reconciliation of days the collector still holds or an audited resolution closes it, and pause reading under backpressure without dropping anything.
 
@@ -299,16 +306,16 @@ Observability: this feature emits `rating_feed_lag_seconds`, `rating_feed_cursor
 
 ## 6. Acceptance Criteria
 
-- [ ] A re-read entry with a different digest under its stored `raw_digest_version` raises `usage_content_conflict` and keeps the stored row; an optional field the collector adds later is no conflict.
-- [ ] A malformed entry is `rejected` and the cursor advances past it; the feed is never blocked by an exception.
-- [ ] An entry with a new id but a stored entry's natural key is `rejected(usage_natural_key_conflict)` and the page commits past it.
-- [ ] An unavailable types registry rejects nothing: no transaction is opened and the cursor stays until the declarations resolve.
-- [ ] A re-read entry with the same digest is not normalized again.
+- [x] A re-read entry with a different digest under its stored `raw_digest_version` raises `usage_content_conflict` and keeps the stored row; an optional field the collector adds later is no conflict.
+- [x] A malformed entry is `rejected` and the cursor advances past it; the feed is never blocked by an exception.
+- [x] An entry with a new id but a stored entry's natural key is `rejected(usage_natural_key_conflict)` and the page commits past it.
+- [x] An unavailable types registry rejects nothing: no transaction is opened and the cursor stays until the declarations resolve.
+- [x] A re-read entry with the same digest is not normalized again.
 - [ ] A record of a non-`SUM` raw type is captured and counted, never rejected; its child fails `usage_type_not_chargeable` (a `Sum` input) or `unsupported_input_fold` (a `Peak` / `TimeWeighted` input, R-06); a record of an item on a dimensional entry counts toward the item's one rated cell (V56); an accepted binding that names more than one value for one item fails `unsupported_primitive` until R-16 is decided.
 - [ ] An invalidation of a counted record withdraws it once and is itself `applied`; a replayed invalidation is a no-op; an invalidation whose target is captured later withdraws the target on capture; an invalidation never holds a window open.
-- [ ] `InvalidArgument(CursorBeyondRetention)` under any evidence mode opens a source loss under the cursor CAS and restarts from `Oldest`; the loss stays `open` after the restart and taints only the days the removed entries can belong to.
-- [ ] While Rating's grant does not cover the source's configured tenant scope, no page is committed; once it does, the same pages are read again and nothing is skipped.
-- [ ] Above `max_queue_depth` the reader stops fetching and resumes below 80 %; no entry is dropped.
+- [x] `InvalidArgument(CursorBeyondRetention)` under any evidence mode opens a source loss under the cursor CAS and restarts from `Oldest`; the loss stays `open` after the restart and taints only the days the removed entries can belong to.
+- [x] While Rating's grant does not cover the source's configured tenant scope, no page is committed; once it does, the same pages are read again and nothing is skipped.
+- [x] Above `max_queue_depth` the reader stops fetching and resumes below 80 %; no entry is dropped.
 
 Acceptance vectors owned by this feature (DESIGN §4.13 index):
 
@@ -364,33 +371,39 @@ The following sections keep the runtime procedures of these namespaces — their
                                      last_good_at = cp.updated_at, restart_cursor = NULL)  -- NULL = Oldest
               UPDATE bss_rating__source_checkpoint SET cursor = NULL, updated_at = now()
             COMMIT; read again from Oldest
-  decls = declaration of each distinct gts_type of the page (cache, else types-registry)  -- outside tx
+  decls = declaration of each distinct meter of the page (cache, else types-registry)  -- outside tx
           transient error → back off; no transaction, cursor unchanged, nothing rejected
+  scopes = service scope of each tenant the page names                            -- outside tx (PDP)
   grant_covers(source.tenant_scope) or pause; nothing committed  -- usage_grant_narrowed (12 §4.6)
   BEGIN
     SELECT … FROM bss_rating__source_checkpoint WHERE source_id = … FOR UPDATE  -- CAS: cursor = cp.cursor
     for e in page.entries (feed order; an invalidation follows its target):
-      -- 1. capture, before any interpretation
       id, tenant unreadable → INSERT bss_rating__usage_capture_reject (source_id, raw_sha256, raw);
                               SourceLossTracker.open(source_id, unidentifiable_entry,
                                 last_good_cursor = cp.cursor, restart_cursor = page.next_cursor); continue
+      -- 1. interpret in memory the entry about to be stored (12 §4.1)
+      n = normalize(e, decls)  malformed / no covered period / meter not declared
+                              → outcome rejected(usage_malformed | interval_missing)
+      e is a record, exists invalidation (tenant_id = e.tenant_id, invalidates_id = e.id)
+                              → outcome withdrawn (withdrawn_by = that invalidation)
+      natural key (or, for an invalidation, its target) held by another id  -- safety net, 12 §4.3
+                              → outcome rejected(usage_natural_key_conflict), no normalized columns
+      -- 2. capture: one insert stores the complete entry with its outcome
       INSERT bss_rating__usage_record (tenant_id, usage_record_id, raw_entry,
              raw_sha256 = digest_v(e, current), raw_digest_version = current,
-             contribution_state = captured) ON CONFLICT (tenant_id, usage_record_id) DO NOTHING
+             normalized columns, contribution_state = outcome)
+             ON CONFLICT (tenant_id, usage_record_id) DO NOTHING
         not inserted, digest_v(e, stored.raw_digest_version) = stored.raw_sha256
                                            → continue            -- already captured: no effect at all
         not inserted, different            → alarm usage_content_conflict; continue
-      -- 2. interpret the stored row (same transaction)
-      e.entry_type = invalidation → Flow B step 2 (target WHERE tenant_id = e.tenant_id AND
-                                    usage_record_id = e.invalidates); state of e = applied; continue
-      exists invalidation (tenant_id = e.tenant_id, invalidates_id = e.id) → state = withdrawn; continue
-      n = normalize(raw, decls) malformed / no interval / type not declared
-                              → state = rejected(usage_malformed | interval_missing)
-                              (exception opened; the raw row is the retry input)          ; continue
-      SAVEPOINT; write n's normalized columns                                 -- uq_…__natural_key
-        natural key held by another id (found first, or 23505 from a concurrent writer)
-                              → ROLLBACK TO SAVEPOINT; state = rejected(usage_natural_key_conflict),
-                                alarm; continue
+        23505 on uq_…__natural_key (a concurrent writer) → the page aborts; its re-read takes the
+                                           natural-key branch above
+      -- 3. effects of the outcome (same transaction)
+      rejected                → exception opened (the raw row is the retry input); alarm for a
+                                natural-key conflict; continue
+      withdrawn               → invalidation_target_unknown of e resolved; continue
+      e.entry_type = invalidation (state applied) → Flow B step 2 (target WHERE tenant_id =
+                                    e.tenant_id AND usage_record_id = e.invalidates); continue
       a = attribute(n)        none → awaiting_attribution; ambiguous → quarantined; continue
                               interval crosses a segment boundary → boundary_split_required; continue
       count(e, a)             -- once per record, under its raw GTS type: usage-policy projection,
@@ -405,17 +418,18 @@ The following sections keep the runtime procedures of these namespaces — their
   Example (hourly cloudlets):
 
   ```text
-  entry   id=0192…a1  entry_type=record  tenant=T10  gts_type_id=gts.cf.oss.cloudlet_hours.v1~ (illustrative)
-          resource_ref={ct-7f3a, container}  window=[2026-10-08T10:00Z, 2026-10-08T11:00Z)
+  entry   id=0192…a1 (no invalidates: a record)  tenant=T10
+          gts_type_id=gts.cf.core.uc.usage_record.v2~cf.oss.cloudlet_hours.v1~ (illustrative meter)
+          resource_ref={ct-7f3a, container}  window_start=2026-10-08T10:00Z  window_end=2026-10-08T11:00Z
           quantity="8"  accepted_at=2026-10-08T11:00:07Z  origin=live
   attribution ct-7f3a @ window → segment SEG-4 v2 → subscription S42, sub_line_key plan#1,
           payer C1, seller S1
   capture bss_rating__usage_record(T10, 0192…a1) raw_entry, raw_sha256, state captured
   stored  contrib_counter_key_digest=digest(CounterKey), contrib_input_usage_type=
-          gts.cf.oss.cloudlet_hours.v1~, contrib_layout_version=1,
+          gts.cf.core.uc.usage_record.v2~cf.oss.cloudlet_hours.v1~, contrib_layout_version=1,
           contrib_part_start=2026-10-08T10:00Z, contrib_granule_start=2026-10-08T10:00Z,
           dimension_key="", state counted
-  counter CounterKey{S1,C1,T10,S42,plan#1,"",subscription_line} input gts.cf.oss.cloudlet_hours.v1~
+  counter CounterKey{S1,C1,T10,S42,plan#1,"",subscription_line} input …cloudlet_hours.v1~
           layout 1, part [10:00, 11:00), granule 10:00, q 0 → 8, q_version 0 → 1
   work    the line's usage binding sells products.derived/cloudlets@1 (one Sum input, CalendarHour
           policy): enqueue child wk1|F-USAGE-OCT|2026-10-08T10:00:00Z|agg(meter=products.derived/cloudlets@1)
@@ -441,9 +455,12 @@ The following sections keep the runtime procedures of these namespaces — their
 
 **Contract**: `cpt-cf-bss-rating-algo-correction-intake-ing` (`p1`), defined in [§3 migrated procedures](#register-procedures).
 
-- An invalidation is a faithful copy of its target with `entry_type = invalidation`, a server-stamped
-  `invalidates` and a `reason_code`; its quantity is an echo, not a negation (usage-collector
-  DESIGN:589-590). Rating captures it (unique `(tenant_id, invalidates_id)`), sets it `applied` in
+- An invalidation is a faithful copy of its target — the same tenant, meter, idempotency key and
+  covered period — with a `reason_code` and an `invalidates` the collector derives: the id its own
+  identity has with `entry_type = record` (usage-collector v2 `schemas/usage_record.v2.schema.json`
+  `invalidates`, DESIGN:580). On the SDK's `UsageRecord` the pair is one field and the entry type is
+  read from it; the REST schema also carries `entry_type`. Its quantity is an echo, not a negation
+  (usage-collector DESIGN:589-590). Rating captures it (unique `(tenant_id, invalidates_id)`), sets it `applied` in
   the same transaction (an invalidation contributes nothing itself and never holds a window open)
   and withdraws the target, keyed `(tenant_id = the invalidation's, usage_record_id = invalidates)`,
   through the contribution state machine (DESIGN §3.6 Flow A, Flow B): `withdrawn_by` is set
@@ -482,8 +499,8 @@ collector.
 |---|---|---|---|
 | `usage_unidentifiable` (no readable `id` / `tenant_id`) | yes — raw row in `bss_rating__usage_capture_reject` | no | opens a source loss over the whole source scope (§4.6), resolved through `source_losses:resolve`; a collector fix stops new ones but cannot change bytes already stored |
 | `usage_malformed` (`rejected`) | yes | operator, re-interpreting the stored raw entry | a **Rating-side** fix (the usage type declaration, the mapping or a stale cache), then `POST /exceptions/{id}:retry`; or the emitter invalidates the entry and sends a replacement — the invalidation withdraws the rejected row and closes its exception, and the replacement is captured as a new record. A collector fix cannot change the outcome: the raw row is never changed, the collector modifies no accepted entry (usage-collector DESIGN:584) and a re-sent entry is either the same id (the stored row wins) or a new key |
-| `interval_missing` (`rejected`) | yes | operator | the emitter re-emits under the collector's target V1 record (intervals): an invalidation withdraws the stored row |
-| `usage_natural_key_conflict` (`rejected`; a new id with a stored entry's natural key) | yes | no | investigation (alarm `rating_usage_natural_key_conflict_total`); the stored entry stands, as for a content conflict (12 §4.3) |
+| `interval_missing` (`rejected`; no `window_start` / `window_end`, which a v2 entry always carries) | yes | operator | the emitter re-emits with a covered period: an invalidation withdraws the stored row |
+| `usage_natural_key_conflict` (`rejected`; a new id with a stored entry's natural key — impossible from a conforming collector, which derives the id from that key) | yes | no | investigation (alarm `rating_usage_natural_key_conflict_total`); the stored entry stands, as for a content conflict (12 §4.3) |
 | `usage_type_not_chargeable` (child `failed`, the record stays counted) | yes | on declaration change | a derived type takes a raw type whose fold is not `SUM` as a `Sum` input (§4.7) |
 | `awaiting_attribution` (state, exception after 1 h) | yes | on segment arrival, every 15 min | automatic |
 | `usage_ambiguous_attribution` | yes | no | Subscriptions fix |
@@ -534,11 +551,15 @@ the feed.
   opened for that tenant.
 - **Narrowed authorization scope**: the collector skips the entries a caller may no longer read "as
   the cursor advances, with no error raised", and a scope change "is never a `FILTER_MISMATCH`"
-  (usage-collector DESIGN:911-913, 1411-1413). A narrowing therefore changes neither the source nor
-  the cursor, and reading on would lose the dropped tenants' usage for good. Before each read and
-  again before committing the page, the reader evaluates its own grant with the platform PDP: the
-  subject, action and resource type the collector evaluates for the feed read (the action's name is
-  asked of the collector, `…-upreq-usage-feed-scope-digest`). If the grant no longer covers the
+  (usage-collector DESIGN:911-913, 1411-1413; v2 DESIGN:907-914, 1471-1474). A narrowing therefore
+  changes neither the source nor the cursor, and reading on would lose the dropped tenants' usage for
+  good. Before each read and again before committing the page, the reader evaluates its own grant
+  with the platform PDP: the subject, action and resource type the collector evaluates for the feed
+  read — Rating's service identity, the v2 action `read_feed` (a verb of its own, distinct from
+  `list`; v2 DESIGN:2082-2091) on `gts.cf.core.uc.usage_record.v2~` — for each root tenant of the
+  configured scope, which must lie inside the compiled scope. A tenant carved out of a root's
+  subtree is not visible to that check; the scope digest asked of the collector closes it
+  (`…-upreq-usage-feed-scope-digest`). If the grant no longer covers the
   configured tenant scope, the reader commits nothing and pauses the source with
   `usage_grant_narrowed` (`rating_feed_paused{reason = grant_narrowed}`, page). Nothing is skipped:
   the cursor has not moved, so once the grant covers the scope again the same pages are read again,
@@ -599,7 +620,7 @@ the feed.
 - **Backpressure**: a reader stops fetching while `rating.child_work` depth exceeds
   `max_queue_depth` (default 1 000 000) and resumes below 80 %; nothing is dropped.
 - **Reconciliation**: daily per `(tenant, gts_type)` against the collector's reconciliation metadata
-  (`GET /usage-collector/v1/reconciliation`: accepted count, quantity summary, watermarks); it is
+  (`GET /usage-collector/v2/reconciliation`: accepted count, quantity summary, watermarks); it is
   also the evidence that narrows a source loss, for days the collector still holds in full. The
   route is REST-only and operator-scoped; whether Rating's service identity may call it is UNKNOWN /
   EXTERNAL CONTRACT REQUIRED (`…-upreq-usage-reconciliation-access`). Two paths therefore feed one

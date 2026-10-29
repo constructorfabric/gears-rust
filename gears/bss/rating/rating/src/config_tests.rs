@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use super::{
-    ConfigError, MAX_LEADER_STOP_SECS, MAX_LEADER_TTL_SECS, MAX_PRODUCER_LEN,
-    MAX_RESOLVE_RETRY_SECS, MAX_SWEEP_INTERVAL_SECS, RatingConfig,
+    ConfigError, MAX_CALL_TIMEOUT_SECS, MAX_FEED_BACKOFF_SECS, MAX_LEADER_STOP_SECS,
+    MAX_LEADER_TTL_SECS, MAX_POLL_INTERVAL_SECS, MAX_PRODUCER_LEN, MAX_RESOLVE_RETRY_SECS,
+    MAX_RETENTION_FLOOR_DAYS, MAX_SUBSCRIPTIONS, MAX_SWEEP_INTERVAL_SECS, RatingConfig,
+    ResolvedConfig,
 };
 use crate::domain::error::Cause;
 use crate::domain::inbox::{InboxSource, ProducerPolicy};
+use crate::domain::usage::feed::{MAX_PAGE_LIMIT, MeterId};
 use crate::infra::queues::MAX_FEED_EPOCHS;
 
 fn parse(json: serde_json::Value) -> RatingConfig {
@@ -229,5 +232,163 @@ fn a_producer_identity_is_refused_when_empty_padded_long_or_controlled() {
     assert_eq!(
         config.producer_policy(),
         Err(ConfigError::ContractNotAdopted("fact".to_owned()))
+    );
+}
+
+const HOURS: &str = "gts.cf.core.uc.usage_record.v2~cf.test.hours.v1~";
+const GB: &str = "gts.cf.core.uc.usage_record.v2~cf.test.gb.v1~";
+const ROOT: &str = "00000000-0000-0000-0000-000000000010";
+const OTHER_ROOT: &str = "00000000-0000-0000-0000-000000000020";
+
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "each call builds its value in place"
+)]
+fn usage_feed(feed: serde_json::Value) -> Result<ResolvedConfig, ConfigError> {
+    parse(serde_json::json!({ "usage_feed": feed })).resolve()
+}
+
+#[test]
+fn the_usage_feed_reads_nothing_by_default() {
+    let resolved = usage_feed(serde_json::json!({})).unwrap();
+    assert!(resolved.usage.sources.is_empty());
+    assert_eq!(resolved.usage.config_generation, 0);
+    let reader = resolved.usage.reader;
+    assert_eq!(reader.page_limit(), MAX_PAGE_LIMIT);
+    assert_eq!(reader.poll_interval(), Duration::from_secs(30));
+    assert_eq!(reader.backoff_cap(), Duration::from_secs(300));
+    assert_eq!(reader.call_timeout(), Duration::from_secs(30));
+    assert_eq!(reader.max_queue_depth(), 1_000_000);
+    assert_eq!(
+        resolved.usage.retention_floor,
+        Duration::from_hours(125 * 24)
+    );
+}
+
+#[test]
+fn a_subscription_resolves_to_its_source_and_the_retention_floor_to_seconds() {
+    let resolved = usage_feed(serde_json::json!({
+        "subscriptions": [{"meters": [GB, HOURS], "tenant_scope": [OTHER_ROOT, ROOT]}],
+        "config_generation": 7,
+        "retention_floor_days": 2,
+    }))
+    .unwrap();
+    assert_eq!(resolved.usage.config_generation, 7);
+    assert_eq!(resolved.usage.retention_floor, Duration::from_hours(48));
+    let [source] = resolved.usage.sources.as_slice() else {
+        panic!("one source, got {:?}", resolved.usage.sources);
+    };
+    let meters: Vec<&str> = source
+        .subscription()
+        .meters()
+        .iter()
+        .map(MeterId::as_str)
+        .collect();
+    assert_eq!(meters, [GB, HOURS], "sorted");
+    assert_eq!(source.tenant_scope().owner().to_string(), ROOT);
+}
+
+#[test]
+fn the_page_limit_is_one_to_a_thousand() {
+    for limit in [0, MAX_PAGE_LIMIT + 1] {
+        assert_eq!(
+            usage_feed(serde_json::json!({"page_limit": limit})).map(drop),
+            Err(ConfigError::PageLimit(limit))
+        );
+    }
+    for limit in [1, MAX_PAGE_LIMIT] {
+        assert!(usage_feed(serde_json::json!({"page_limit": limit})).is_ok());
+    }
+}
+
+#[test]
+fn the_queue_depth_limit_is_at_least_one() {
+    assert_eq!(
+        usage_feed(serde_json::json!({"max_queue_depth": 0})).map(drop),
+        Err(ConfigError::QueueDepth)
+    );
+}
+
+#[test]
+fn every_usage_feed_duration_is_at_least_one_second_and_at_most_its_bound() {
+    for (field, max) in [
+        ("poll_interval_secs", MAX_POLL_INTERVAL_SECS),
+        ("backoff_max_secs", MAX_FEED_BACKOFF_SECS),
+        ("retention_floor_days", u64::from(MAX_RETENTION_FLOOR_DAYS)),
+        ("call_timeout_secs", MAX_CALL_TIMEOUT_SECS),
+    ] {
+        for value in [0, max + 1] {
+            let refused = usage_feed(serde_json::json!({ field: value })).map(drop);
+            assert!(
+                matches!(refused, Err(ConfigError::DurationOutOfRange { value: v, max: m, .. }) if v == value && m == max),
+                "{field} = {value}: {refused:?}"
+            );
+        }
+        assert!(
+            usage_feed(serde_json::json!({ field: max })).is_ok(),
+            "{field} = {max}"
+        );
+    }
+}
+
+#[test]
+fn a_subscription_listed_twice_in_another_order_is_refused() {
+    let refused = usage_feed(serde_json::json!({
+        "subscriptions": [
+            {"meters": [HOURS, GB], "tenant_scope": [ROOT, OTHER_ROOT]},
+            {"meters": [GB, HOURS], "tenant_scope": [OTHER_ROOT, ROOT]},
+        ],
+    }));
+    assert_eq!(
+        refused.map(drop),
+        Err(ConfigError::DuplicateSubscription { index: 1 })
+    );
+}
+
+#[test]
+fn a_malformed_subscription_is_refused_with_its_index() {
+    for (subscription, what) in [
+        (
+            serde_json::json!({"meters": ["gts.other~"], "tenant_scope": [ROOT]}),
+            "a malformed meter",
+        ),
+        (
+            serde_json::json!({"meters": [], "tenant_scope": [ROOT]}),
+            "no meter",
+        ),
+        (
+            serde_json::json!({"meters": [HOURS], "tenant_scope": []}),
+            "no root",
+        ),
+    ] {
+        let refused = usage_feed(serde_json::json!({
+            "subscriptions": [{"meters": [GB], "tenant_scope": [ROOT]}, subscription],
+        }));
+        assert!(
+            matches!(refused, Err(ConfigError::FeedSubscription { index: 1, .. })),
+            "{what}: {refused:?}"
+        );
+    }
+}
+
+#[test]
+fn at_most_thirty_two_subscriptions_are_read() {
+    let subscriptions = |count: usize| -> Vec<serde_json::Value> {
+        (0..count)
+            .map(|n| {
+                serde_json::json!({
+                    "meters": [format!("gts.cf.core.uc.usage_record.v2~cf.test.m{n}.v1~")],
+                    "tenant_scope": [ROOT],
+                })
+            })
+            .collect()
+    };
+    assert!(
+        usage_feed(serde_json::json!({"subscriptions": subscriptions(MAX_SUBSCRIPTIONS)})).is_ok()
+    );
+    assert_eq!(
+        usage_feed(serde_json::json!({"subscriptions": subscriptions(MAX_SUBSCRIPTIONS + 1)}))
+            .map(drop),
+        Err(ConfigError::TooManySubscriptions(MAX_SUBSCRIPTIONS + 1))
     );
 }

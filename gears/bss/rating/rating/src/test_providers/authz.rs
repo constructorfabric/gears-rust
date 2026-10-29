@@ -96,6 +96,38 @@ impl FakePdp {
             .insert(tenant);
     }
 
+    /// Allows `action` on `resource_type` again after [`Self::deny`].
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test double: a poisoned lock means a test already panicked"
+    )]
+    pub fn allow(&self, resource_type: &str, action: &str) {
+        self.denied_actions
+            .lock()
+            .expect("fake PDP lock")
+            .remove(&(resource_type.to_owned(), action.to_owned()));
+    }
+
+    /// Grants a subject whose home tenant is `tenant` again after [`Self::put_outside_grant`].
+    ///
+    /// # Panics
+    ///
+    /// If the lock is poisoned.
+    #[expect(
+        clippy::expect_used,
+        reason = "a test double: a poisoned lock means a test already panicked"
+    )]
+    pub fn bring_inside_grant(&self, tenant: Uuid) {
+        self.outside_tenants
+            .lock()
+            .expect("fake PDP lock")
+            .remove(&tenant);
+    }
+
     /// Makes every evaluation fail as an unreachable PDP does.
     pub fn set_unavailable(&self, unavailable: bool) {
         self.unavailable.store(unavailable, Ordering::SeqCst);

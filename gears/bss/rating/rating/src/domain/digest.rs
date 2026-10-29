@@ -74,6 +74,16 @@ impl fmt::Display for Sha256Hex {
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
+/// The canonical JSON text [`Sha256Hex::of_json`] digests: object members sorted by key at every
+/// depth, arrays in order, no insignificant whitespace. The name a usage source's id is derived
+/// from (feature 04 §3.3).
+#[must_use]
+pub fn canonical_json_text(value: &Value) -> String {
+    let mut text = String::new();
+    canonical_json(value, &mut text);
+    text
+}
+
 fn canonical_json(value: &Value, out: &mut String) {
     match value {
         Value::Object(map) => {
