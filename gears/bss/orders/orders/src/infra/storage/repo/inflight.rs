@@ -9,9 +9,11 @@
 //! Count unit (F03 predicate 7): the lines carrying the key on each holder's current version. A
 //! claim is reached only through an inner join on its `order_id` foreign key from the orders the
 //! scope admits (as `claims::visible_holder` reads holders), counted when its `version` is at or
-//! below the holder's `current_version` (a retained claim keeps its earlier version, as
-//! [`held_same_tuple`] reads it), and joined to the holder's current-version `order_line` rows
-//! carrying the key; every row counted is reached through the secured select.
+//! below the holder's `current_version`, and joined to the holder's current-version
+//! `order_line` rows carrying the key; every row counted is reached through the secured select.
+//! A retained claim keeps its earlier version and counts, agreeing with [`held_same_tuple`] on
+//! retained claims; unlike that read, which has no version bound, a claim above the holder's
+//! current version (an uncommitted candidate) never counts here.
 use super::{DBRunner, EntityTrait, QuerySelect, ScopeError, SecureEntityExt, order};
 use crate::domain::overlap::ClaimParties;
 use crate::infra::storage::entity::inflight_overlap_claim as claim;

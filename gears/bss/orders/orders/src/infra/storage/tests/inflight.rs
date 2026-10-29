@@ -141,8 +141,9 @@ async fn the_addend_counts_other_resource_tenants_lines_only() -> anyhow::Result
     let n = count(&db, 12, &["k2"], Some(2)).await?;
     assert_eq!(n.get("k2"), Some(&0), "the current order is excluded");
     // Order 5 (resource 13) holds only a released claim on `released`; order 6 (resource 14)
-    // a live claim on `stale` at version 3 while its current version stays 2, and a line at
-    // version 3 carrying the key (so the join would find it). Neither counts.
+    // holds its only live claim on `stale` at version 3 (an uncommitted candidate) while its
+    // current version stays 2, with a current-version line carrying the key (so the join on the
+    // holder's current version finds it) and a version-3 line. Neither order counts.
     for (order, resource) in [(5, 13), (6, 14)] {
         create_for(&db, order, 30, resource).await?;
         entity::order_version::Entity::insert(version(order, 2, Some(1)).into_active_model())
@@ -166,6 +167,7 @@ async fn the_addend_counts_other_resource_tenants_lines_only() -> anyhow::Result
         })
     })
     .await?;
+    line_on(&pg, 6, 6_002, "stale").await?;
     line_at(&pg, 6, 3, 6_001, "stale").await?;
     claim_at(&pg, 6, 30, 14, "stale", 3, false).await?;
     let n = count(&db, 10, &["released", "stale"], Some(1)).await?;
@@ -173,10 +175,11 @@ async fn the_addend_counts_other_resource_tenants_lines_only() -> anyhow::Result
     assert_eq!(
         n.get("stale"),
         Some(&0),
-        // Guards both the `claim.version <= order.current_version` filter and the join on the
-        // holder's current version in `repo/inflight.rs`: a claim above the current version is
-        // never counted, and the version-3 line is never joined.
-        "a claim above the holder's current version never counts"
+        // Guards the `claim.version <= order.current_version` filter in `repo/inflight.rs`:
+        // without it order 6's current-version line would be joined and counted. The join on
+        // the holder's current version is guarded by
+        // `a_retained_claim_counts_the_holders_current_version_lines`.
+        "a live claim above the holder's current version never counts its lines"
     );
     Ok(())
 }
@@ -215,7 +218,9 @@ async fn a_retained_claim_counts_the_holders_current_version_lines() -> anyhow::
     pg.sql(&format!("UPDATE bss_orders__order SET current_version=3,version_allocation_high_water=3 WHERE order_id='{}'", u(2))).await?;
     line_at(&pg, 2, 3, 2_101, "kept").await?;
     line_at(&pg, 2, 3, 2_102, "kept").await?;
-    // From resource 10: the two current-version lines count, never the version-2 line.
+    // From resource 10: the two current-version lines count, never the version-2 line. Guards
+    // the join on `order.current_version` (a join on the claim's version counts 1) and the `<=`
+    // in the claim filter (an `=` filter drops the retained claim: 0).
     let n = count(&db, 10, &["kept"], None).await?;
     assert_eq!(n.get("kept"), Some(&2), "{n:?}");
     // The same tuple is held for predicate 9 too: both reads agree on retained claims.
