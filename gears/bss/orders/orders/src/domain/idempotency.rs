@@ -327,8 +327,10 @@ const AUTHORIZATION_FACTS_PREFIX: &str = "af1:";
 
 /// The authorization-fact fingerprint a D-188 attempt freezes: SHA-256 over the tagged canonical
 /// document of the order and the authorized tenant axes it was prepared under, the same
-/// canonical form and provider as the request fingerprint. A recovery or a commit of the attempt
-/// compares it with the facts it rechecks under the aggregate lock; a moved axis never matches.
+/// canonical form and provider as the request fingerprint. It is recorded evidence and no path
+/// compares it: the request fingerprint hashes the same three axes (`engine::axes`), so a
+/// same-key retry after an axis moved is an `idempotency-mismatch` before any attempt resumes,
+/// and a resumed attempt's commit rechecks the current axes under the aggregate lock (D-188).
 ///
 /// # Errors
 /// [`RegistryRuleError::NonCanonical`] only if the document cannot be written.
