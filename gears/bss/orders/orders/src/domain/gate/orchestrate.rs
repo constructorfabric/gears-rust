@@ -766,3 +766,27 @@ pub fn verify_evaluation(
     }
     Ok(())
 }
+
+/// Verify the billing-terms answer before any consumer uses it (D-193, D-197), as
+/// [`verify_evaluation`] does for Rating: every entry names a line the run asked, and no line is
+/// answered twice. The readers disagree on a duplicated line's winner (the assessment query and
+/// the Rating request take the first entry, the frozen Pricing query the last), so the whole
+/// answer is unusable. A line the answer omits stays per-line missing terms (`pin_row`).
+///
+/// # Errors
+/// `Malformed` for an entry naming an unasked line or a second entry for one line.
+pub fn verify_terms(
+    queries: &[BillingTermsQuery],
+    answer: &[ResolvedTerms],
+) -> Result<(), Unavailable> {
+    let asked: BTreeSet<Uuid> = queries.iter().map(|q| q.line_id).collect();
+    let mut seen = BTreeSet::new();
+    if answer
+        .iter()
+        .all(|t| asked.contains(&t.line_id) && seen.insert(t.line_id))
+    {
+        Ok(())
+    } else {
+        Err(Unavailable::Malformed)
+    }
+}

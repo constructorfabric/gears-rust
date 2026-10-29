@@ -1510,3 +1510,30 @@ fn gate_target_order_id_follows_operation() {
         assert_eq!(target.order_id(), order_id, "{target:?} order id");
     }
 }
+
+/// R3: a terms answer that states one line twice (the readers would disagree on which entry
+/// wins) or names an unasked line is malformed; an omitted line stays per-line missing terms.
+#[test]
+fn a_terms_answer_naming_a_line_twice_or_an_unasked_line_is_malformed() {
+    use bss_orders::domain::gate::orchestrate::verify_terms;
+    let b = basket(Operation::Submit, two_lines());
+    let queries = plan(&b).terms;
+    let exact = vec![terms(line_id(1)), terms(line_id(2))];
+    assert_eq!(verify_terms(&queries, &exact), Ok(()));
+    assert_eq!(
+        verify_terms(&queries, &exact[..1]),
+        Ok(()),
+        "omission is per line"
+    );
+    let mut twice = exact.clone();
+    let mut second = terms(line_id(1));
+    second.term = EvaluationTerm::FixedPeriods { count: 24 };
+    twice.push(second);
+    assert_eq!(verify_terms(&queries, &twice), Err(Unavailable::Malformed));
+    let mut foreign = exact;
+    foreign.push(terms(line_id(9)));
+    assert_eq!(
+        verify_terms(&queries, &foreign),
+        Err(Unavailable::Malformed)
+    );
+}

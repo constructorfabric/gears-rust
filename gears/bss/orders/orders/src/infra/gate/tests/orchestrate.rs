@@ -1210,6 +1210,61 @@ async fn malformed_or_missing_item_batches_never_feed_occupancy_or_counts() {
     }
 }
 
+/// R3: the billing-terms port states the first line twice with different terms.
+struct DuplicatedTerms(Arc<StubFixture>);
+#[async_trait]
+impl BillingTermsReads for DuplicatedTerms {
+    async fn resolve(
+        &self,
+        queries: &[BillingTermsQuery],
+        run: &RunBudget,
+        cancel: &CancellationToken,
+    ) -> PortAnswer<Vec<ResolvedTerms>> {
+        let PortAnswer::Answered(mut terms) = BillingTermsStub::new(Arc::clone(&self.0))
+            .resolve(queries, run, cancel)
+            .await
+        else {
+            panic!("the stub answers the fixture terms")
+        };
+        let mut second = terms[0].clone();
+        second.term = crate::domain::gate::answers::EvaluationTerm::FixedPeriods { count: 24 };
+        terms.push(second);
+        PortAnswer::Answered(terms)
+    }
+}
+
+#[tokio::test]
+async fn a_duplicated_terms_entry_is_malformed_and_never_frozen() {
+    let h = harness_with(fixture(), false, Arc::new(Budget::baseline()), |ports| {
+        ports.billing_terms = Arc::new(DuplicatedTerms(Arc::new(fixture())));
+    });
+    let resolved = run(&h, &basket(Operation::Submit)).await.unwrap();
+    assert!(
+        resolved
+            .unavailable_kinds
+            .contains(&(GatePort::BillingTerms, Unavailable::Malformed)),
+        "{:?}",
+        resolved.unavailable_kinds
+    );
+    assert!(
+        resolved.terms.is_empty(),
+        "no entry reaches the frozen query"
+    );
+    assert!(
+        resolved.evaluation_request.is_none(),
+        "no entry reaches Rating"
+    );
+    assert!(
+        resolved
+            .assessment
+            .failures
+            .iter()
+            .any(|f| f.reason == Reason::CatalogPinCompositionUnavailable),
+        "{:?}",
+        resolved.assessment.failures
+    );
+}
+
 #[tokio::test]
 async fn protected_serialized_fixture_reaches_real_orchestration_and_refuses_foreign_tuple() {
     use crate::domain::gate::predicates::PredicateId;

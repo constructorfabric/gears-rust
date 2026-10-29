@@ -447,7 +447,10 @@ impl Orchestrator {
                 } else if plan.terms.is_empty() {
                     Some(PortAnswer::Answered(Vec::new()))
                 } else {
-                    Some(ports.billing_terms.resolve(&plan.terms, &run, cancel).await)
+                    Some(
+                        resolve_terms(ports.billing_terms.as_ref(), &plan.terms, &run, cancel)
+                            .await,
+                    )
                 }
             },
             async {
@@ -738,5 +741,24 @@ impl InflightClaims for InMemoryInflightClaims {
             })
             .map(|(_, _, k, _)| k.clone())
             .collect())
+    }
+}
+
+/// Ask the billing-terms port and refuse an answer that names a line twice or an unasked line
+/// (R3, `verify_terms`) as `Unavailable(Malformed)` before any consumer reads it.
+async fn resolve_terms(
+    port: &dyn crate::infra::gate::ports::BillingTermsReads,
+    queries: &[crate::domain::gate::answers::BillingTermsQuery],
+    run: &RunBudget,
+    cancel: &CancellationToken,
+) -> PortAnswer<Vec<ResolvedTerms>> {
+    match port.resolve(queries, run, cancel).await {
+        PortAnswer::Answered(terms) => {
+            match crate::domain::gate::orchestrate::verify_terms(queries, &terms) {
+                Ok(()) => PortAnswer::Answered(terms),
+                Err(kind) => PortAnswer::Unavailable(kind),
+            }
+        }
+        other => other,
     }
 }
