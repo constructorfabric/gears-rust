@@ -804,10 +804,7 @@ async fn a_revoked_seller_grant_is_publicly_unavailable_and_operator_only_denied
         scopes: Vec::new(),
     };
     let authority: Arc<dyn CommercialAuthority> = Arc::new(AuthnAuthority::new(
-        Arc::new(FakeResolver::new(
-            Uuid::from_u128(0x0bd5),
-            Uuid::from_u128(0x40e),
-        )),
+        Arc::new(FakeResolver::new(Uuid::from_u128(0x0bd5), SELLER)),
         &[identity],
     ));
     let catalog = PricingCatalogReads::new(

@@ -166,7 +166,7 @@ impl PricingCatalogReads {
     /// (warned once per seller, naming the seller only), an outage for a failed exchange.
     fn without_authority(&self, seller: Uuid, e: &AuthorityError) -> CatalogAnswer {
         match e {
-            AuthorityError::NotProvisioned => {
+            AuthorityError::NotProvisioned | AuthorityError::Misprovisioned => {
                 if self.warned.first(seller) {
                     tracing::warn!(
                         target: "orders.gate.authority",

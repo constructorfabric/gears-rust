@@ -29,7 +29,6 @@ use uuid::Uuid;
 
 const SELLER: Uuid = Uuid::from_u128(0x5e11);
 const SERVICE: Uuid = Uuid::from_u128(0x0bd5);
-const ORDERS_HOME: Uuid = Uuid::from_u128(0x40e);
 const PLAN: Uuid = Uuid::from_u128(1);
 const REVISION: Uuid = Uuid::from_u128(2);
 const ITEM_A: Uuid = Uuid::from_u128(3);
@@ -79,7 +78,7 @@ fn pricing() -> FakePricing {
 }
 
 fn authority() -> Arc<dyn CommercialAuthority> {
-    authority_over(FakeResolver::new(SERVICE, ORDERS_HOME))
+    authority_over(FakeResolver::new(SERVICE, SELLER))
 }
 
 fn authority_over(resolver: FakeResolver) -> Arc<dyn CommercialAuthority> {
@@ -236,7 +235,7 @@ fn outage() -> ReadFailure {
 
 #[tokio::test]
 async fn a_failed_exchange_is_an_outage_everywhere_and_never_calls_pricing() {
-    let mut resolver = FakeResolver::new(SERVICE, ORDERS_HOME);
+    let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.failure = Some(|| AuthNResolverError::Unauthorized("no".to_owned()));
     let (pricing, products) = (Arc::new(pricing()), Arc::new(FakeProducts::default()));
     let answer = read(&reads(&pricing, &products, authority_over(resolver))).await;
@@ -249,7 +248,7 @@ async fn a_failed_exchange_is_an_outage_everywhere_and_never_calls_pricing() {
 
 #[tokio::test(start_paused = true)]
 async fn a_hung_exchange_is_unavailable_deadline_at_the_authority_deadline() {
-    let mut resolver = FakeResolver::new(SERVICE, ORDERS_HOME);
+    let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.stall = true;
     let (pricing, products) = (Arc::new(pricing()), Arc::new(FakeProducts::default()));
     let reads = reads(&pricing, &products, authority_over(resolver));
@@ -269,7 +268,7 @@ async fn a_hung_exchange_is_unavailable_deadline_at_the_authority_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn cancellation_during_the_exchange_is_an_outage() {
-    let mut resolver = FakeResolver::new(SERVICE, ORDERS_HOME);
+    let mut resolver = FakeResolver::new(SERVICE, SELLER);
     resolver.stall = true;
     let (pricing, products) = (Arc::new(pricing()), Arc::new(FakeProducts::default()));
     let reads = reads(&pricing, &products, authority_over(resolver));
@@ -348,7 +347,7 @@ fn the_warned_set_stops_growing_at_its_cap() {
 
 /// The authority over a resolver the test keeps, to count the exchanges.
 fn counted_authority() -> (Arc<FakeResolver>, Arc<dyn CommercialAuthority>) {
-    let resolver = Arc::new(FakeResolver::new(SERVICE, ORDERS_HOME));
+    let resolver = Arc::new(FakeResolver::new(SERVICE, SELLER));
     let identity = CommercialIdentityConfig {
         seller_tenant_id: SELLER,
         client_id: "orders-gate".to_owned(),

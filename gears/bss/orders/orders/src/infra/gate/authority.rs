@@ -17,6 +17,9 @@ use std::time::Duration as StdDuration;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
+/// The platform service-subject type every commercial principal must carry (D-194 R08).
+pub const SERVICE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
+
 /// The baseline deadline of the one `AuthN` exchange per `PricingCatalogReads::read_lines` call:
 /// the baseline of a gate port (250 ms; D-227 item 5 is unratified), so a hung `IdP` cannot stall
 /// an assessment (F03 §3.3). `gate.authority_exchange_deadline_ms` overrides it.
@@ -63,6 +66,10 @@ pub enum AuthorityError {
     /// No commercial identity is configured for the seller (`gate.commercial_identities`).
     #[error("no commercial identity is provisioned for the seller")]
     NotProvisioned,
+    /// The exchange answered a principal that is not a service subject of the seller tenant
+    /// (D-194 R08): the configured identity is misprovisioned.
+    #[error("the exchanged principal is not a service subject of the seller tenant")]
+    Misprovisioned,
     /// The `AuthN` resolver refused or failed the client-credentials exchange.
     #[error("commercial identity exchange failed")]
     Exchange(#[source] AuthNResolverError),
@@ -207,7 +214,24 @@ impl CommercialAuthority for AuthnAuthority {
                     other => AuthorityError::Exchange(other),
                 }
             })?;
-        Ok(result.security_context)
+        let ctx = result.security_context;
+        // D-194 R08: the trusted result supplies the subject's tenant and type; the seller's
+        // principal is a service subject homed in the seller tenant, as phase B compares
+        // (`submit.rs` `commercial_subject`). Nothing of the context is logged but the seller.
+        if ctx.subject_tenant_id() != seller_tenant_id
+            || ctx.subject_type() != Some(SERVICE_SUBJECT_TYPE)
+        {
+            if self.warned.first(seller_tenant_id) {
+                tracing::warn!(
+                    target: "orders.gate.authority",
+                    seller_tenant_id = %seller_tenant_id,
+                    "the seller's commercial identity exchanged a principal that is not a \
+                     service subject of the seller tenant; refused (D-194)"
+                );
+            }
+            return Err(AuthorityError::Misprovisioned);
+        }
+        Ok(ctx)
     }
 }
 

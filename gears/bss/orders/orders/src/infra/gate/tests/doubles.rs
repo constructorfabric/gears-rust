@@ -33,6 +33,8 @@ pub struct PlanResource;
 pub struct FakeResolver {
     pub subject: Uuid,
     pub subject_tenant: Uuid,
+    /// The subject type the exchanged context carries; `None` builds an untyped context.
+    pub subject_type: Option<&'static str>,
     pub failure: Option<fn() -> AuthNResolverError>,
     /// The exchange never answers within any deadline.
     pub stall: bool,
@@ -45,6 +47,7 @@ impl FakeResolver {
         Self {
             subject,
             subject_tenant,
+            subject_type: Some(crate::infra::gate::authority::SERVICE_SUBJECT_TYPE),
             failure: None,
             stall: false,
             exchanges: AtomicUsize::new(0),
@@ -76,12 +79,14 @@ impl AuthNResolverClient for FakeResolver {
             return Err(failure());
         }
         // The double stands in for the AuthN plugin, which is what builds the context.
-        let security_context = SecurityContext::builder()
+        let mut builder = SecurityContext::builder()
             .subject_id(self.subject)
             .subject_tenant_id(self.subject_tenant)
-            .bearer_token("service-token")
-            .build()
-            .unwrap();
+            .bearer_token("service-token");
+        if let Some(subject_type) = self.subject_type {
+            builder = builder.subject_type(subject_type);
+        }
+        let security_context = builder.build().unwrap();
         Ok(AuthenticationResult { security_context })
     }
 }
@@ -407,10 +412,7 @@ pub fn pricing_catalog(
     };
     let authority: std::sync::Arc<dyn CommercialAuthority> =
         std::sync::Arc::new(AuthnAuthority::new(
-            std::sync::Arc::new(FakeResolver::new(
-                Uuid::from_u128(0x0bd5),
-                Uuid::from_u128(0x40e),
-            )),
+            std::sync::Arc::new(FakeResolver::new(Uuid::from_u128(0x0bd5), seller)),
             &[identity],
         ));
     crate::infra::gate::pricing_read::PricingCatalogReads::new(
