@@ -604,7 +604,7 @@ async fn intake_asks_for_the_record_resource_with_the_named_tenant() {
     assert_eq!(
         asked,
         vec![(
-            crate::domain::record_intake::RECORD_TYPE.to_owned(),
+            "gts.cf.connectors.core.record.v1~".to_owned(),
             "send".to_owned(),
             Some(tenant),
             Some(tenant.to_string()),

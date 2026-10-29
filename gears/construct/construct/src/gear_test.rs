@@ -175,3 +175,31 @@ async fn a_worker_that_panicked_makes_stop_fail() {
         "{err:#}"
     );
 }
+
+#[tracing_test::traced_test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_within_the_grace() {
+    let gear = ConstructGear::default();
+    // A worker blocked in a call that never yields, so the abort cannot
+    // reach it.
+    let handle = tokio::spawn(async {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+    });
+    *lock(&gear.running) = Some(Running {
+        token: CancellationToken::new(),
+        handle,
+        load: WorkerLoad::new(Weak::new()),
+    });
+    let deadline = CancellationToken::new();
+    deadline.cancel();
+    let started = std::time::Instant::now();
+
+    gear.stop(deadline).await.unwrap();
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(2500),
+        "stop returns after the grace, not when the worker ends: {:?}",
+        started.elapsed()
+    );
+    assert!(logs_contain("did not end after it was aborted"));
+}

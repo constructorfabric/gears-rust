@@ -44,6 +44,17 @@ async fn get(
     facts: Vec<StoredFact>,
     uri: &str,
 ) -> (StatusCode, Option<String>, Value) {
+    get_as(resolver, facts, uri, Uuid::new_v4(), Uuid::new_v4()).await
+}
+
+/// [`get`] as the caller `caller` of the tenant `tenant`.
+async fn get_as(
+    resolver: Arc<dyn AuthZResolverApi>,
+    facts: Vec<StoredFact>,
+    uri: &str,
+    caller: Uuid,
+    tenant: Uuid,
+) -> (StatusCode, Option<String>, Value) {
     let db = inmem_db().await;
     let intake = Arc::new(IntakeFixture::default().build(&db));
     let settings = Arc::new(settings_service(&db, Arc::clone(&resolver), true));
@@ -61,7 +72,7 @@ async fn get(
         settings,
         profile,
     )
-    .layer(Extension(context_of(Uuid::new_v4(), Uuid::new_v4())));
+    .layer(Extension(context_of(caller, tenant)));
     let response = router
         .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
         .await
@@ -198,13 +209,41 @@ async fn a_fact_without_a_produced_at_has_no_such_key() {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn a_refused_read_is_logged_with_the_caller_the_subject_and_the_tenant() {
-    let subject = Uuid::new_v4();
+    let (subject, caller, home, named) = (
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    );
 
-    let (status, _, _) = get(Arc::new(DenyResolver), vec![rust_skill()], &path(subject)).await;
+    let (own, _, _) = get_as(
+        Arc::new(DenyResolver),
+        vec![rust_skill()],
+        &path(subject),
+        caller,
+        home,
+    )
+    .await;
+    let (other, _, _) = get_as(
+        Arc::new(DenyResolver),
+        vec![rust_skill()],
+        &format!("{}?tenant={named}", path(subject)),
+        caller,
+        home,
+    )
+    .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(own, StatusCode::NOT_FOUND);
+    assert_eq!(other, StatusCode::NOT_FOUND);
     assert!(logs_contain("construct profile read refused"));
     assert!(logs_contain(&format!("subject_id={subject}")));
-    assert!(logs_contain("caller="));
-    assert!(logs_contain("tenant_id="));
+    assert!(logs_contain(&format!("caller={caller}")));
+    assert!(
+        logs_contain(&format!("tenant_id={home}")),
+        "the caller's own tenant"
+    );
+    assert!(
+        logs_contain(&format!("tenant_id={named}")),
+        "the tenant the read named"
+    );
 }

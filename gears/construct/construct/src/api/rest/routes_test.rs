@@ -265,3 +265,39 @@ async fn until_the_planner_exists_a_record_gets_202_and_a_resend_200() {
     assert_eq!(again.status, StatusCode::OK, "body: {}", again.body);
     assert_eq!(fixture.events.dropped.lock().unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn every_record_answer_carries_the_security_headers() {
+    let router = router_with(&IntakeFixture::default()).await;
+    let received = chat_record(Uuid::new_v4(), "p", "v");
+    let mut refused = chat_record(Uuid::new_v4(), "p", "w");
+    refused["payload"]["role"] = json!("system");
+
+    for (record, status) in [
+        (received, StatusCode::ACCEPTED),
+        (refused, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("{PATH}?tenant={}", Uuid::new_v4()))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(record.to_string()))
+            .unwrap();
+        let response = router.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), status);
+        for (name, value) in [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+            (header::X_FRAME_OPTIONS, "DENY"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_DNS_PREFETCH_CONTROL, "off"),
+        ] {
+            assert_eq!(
+                response.headers().get(&name).and_then(|v| v.to_str().ok()),
+                Some(value),
+                "{name} on {status}"
+            );
+        }
+    }
+}

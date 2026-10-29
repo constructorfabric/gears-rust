@@ -26,8 +26,8 @@ pub struct ConstructConfig {
     pub connectors_off: Vec<Uuid>,
     /// Construct's processing service account: the identity Construct reads
     /// and writes the profiles in graph storage as, in every tenant. Without
-    /// it the profile read answers unavailable and received records are
-    /// dropped.
+    /// it the profile read answers 501, not configured, and received records
+    /// are dropped. The nil UUID is refused.
     #[serde(default)]
     pub processing_identity: Option<Uuid>,
     /// The model the planner calls. Without it, received records are dropped
@@ -141,6 +141,12 @@ impl Default for AdmissionConfig {
 
 /// The most times a record may be planned again after a write conflict.
 pub const MAX_RERUNS: u32 = 10;
+/// The most model rounds the planner may be capped at for one record.
+pub const MAX_ROUNDS: u32 = 64;
+/// The most tokens the planner may be capped at for one record.
+pub const MAX_TOKENS: u64 = 1_000_000;
+/// The longest one model call may be allowed to take, in seconds.
+pub const MAX_MODEL_TIMEOUT_SECS: u64 = 600;
 /// The most records the processing queue may hold.
 pub const MAX_QUEUE_CAPACITY: usize = 100_000;
 /// The most records that may be processed at once.
@@ -156,16 +162,37 @@ pub const MAX_VALUE_CHARS_LIMIT: usize = 100_000;
 pub struct InvalidConfig(pub String);
 
 /// A [`ConstructConfig`] that passed [`ConstructConfig::validated`]. The gear
-/// builds only from one, so no unchecked value reaches the pipeline.
+/// builds only from one, so no unchecked value reaches the pipeline; the
+/// values are read through [`ValidConfig::config`], and the processing
+/// identity, which needs its category check, through
+/// [`ValidConfig::identity`].
 #[derive(Debug, Clone)]
-pub struct ValidConfig(ConstructConfig);
+pub struct ValidConfig {
+    config: ConstructConfig,
+    identity: Option<ProcessingIdentity>,
+}
 
-impl std::ops::Deref for ValidConfig {
-    type Target = ConstructConfig;
-
-    fn deref(&self) -> &ConstructConfig {
-        &self.0
+impl ValidConfig {
+    /// The checked values.
+    #[must_use]
+    pub fn config(&self) -> &ConstructConfig {
+        &self.config
     }
+
+    /// The processing identity with the category check it requires, none
+    /// when the deployment configures no identity.
+    #[must_use]
+    pub fn identity(&self) -> Option<ProcessingIdentity> {
+        self.identity
+    }
+}
+
+/// Construct's processing identity and the category check the profile read
+/// runs with it: the two settings only work together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProcessingIdentity {
+    pub id: Uuid,
+    pub category_check: CategoryCheckConfig,
 }
 
 impl ConstructConfig {
@@ -178,7 +205,14 @@ impl ConstructConfig {
     /// [`InvalidConfig`] naming the first bad value.
     pub fn validated(self) -> Result<ValidConfig, InvalidConfig> {
         self.check()?;
-        Ok(ValidConfig(self))
+        let identity = self
+            .processing_identity
+            .zip(self.profile_category_check)
+            .map(|(id, category_check)| ProcessingIdentity { id, category_check });
+        Ok(ValidConfig {
+            config: self,
+            identity,
+        })
     }
 
     fn check(&self) -> Result<(), InvalidConfig> {
@@ -200,6 +234,31 @@ impl ConstructConfig {
                 "processing.max_reruns must be at most {MAX_RERUNS}, not {}",
                 processing.max_reruns
             )));
+        }
+        if processing.max_rounds.get() > MAX_ROUNDS {
+            return Err(InvalidConfig(format!(
+                "processing.max_rounds must be from 1 to {MAX_ROUNDS}, not {}",
+                processing.max_rounds
+            )));
+        }
+        if processing.max_tokens.get() > MAX_TOKENS {
+            return Err(InvalidConfig(format!(
+                "processing.max_tokens must be from 1 to {MAX_TOKENS}, not {}",
+                processing.max_tokens
+            )));
+        }
+        if let Some(model) = &self.model
+            && model.timeout_secs.get() > MAX_MODEL_TIMEOUT_SECS
+        {
+            return Err(InvalidConfig(format!(
+                "model.timeout_secs must be from 1 to {MAX_MODEL_TIMEOUT_SECS}, not {}",
+                model.timeout_secs
+            )));
+        }
+        if self.processing_identity == Some(Uuid::nil()) {
+            return Err(InvalidConfig(
+                "processing_identity must not be the nil UUID".to_owned(),
+            ));
         }
         if self.processing_identity.is_some() && self.profile_category_check.is_none() {
             return Err(InvalidConfig(
@@ -552,5 +611,74 @@ mod tests {
         let upper = id.to_string().to_uppercase();
         let config = parse(serde_json::json!({ "connectors_off": [upper] })).expect("a UUID");
         assert_eq!(config.connectors_off, vec![id]);
+    }
+
+    #[test]
+    fn the_model_spend_caps_are_bounded_at_both_ends() {
+        for (json, ok) in [
+            (
+                serde_json::json!({ "processing": { "max_rounds": MAX_ROUNDS } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "processing": { "max_rounds": MAX_ROUNDS + 1 } }),
+                false,
+            ),
+            (
+                serde_json::json!({ "processing": { "max_tokens": MAX_TOKENS } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "processing": { "max_tokens": MAX_TOKENS + 1 } }),
+                false,
+            ),
+            (
+                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout_secs": MAX_MODEL_TIMEOUT_SECS } }),
+                true,
+            ),
+            (
+                serde_json::json!({ "model": { "upstream_alias": "llm", "model": "m", "timeout_secs": MAX_MODEL_TIMEOUT_SECS + 1 } }),
+                false,
+            ),
+        ] {
+            assert_eq!(valid(json.clone()).is_ok(), ok, "{json}");
+        }
+    }
+
+    #[test]
+    fn a_nil_processing_identity_is_refused() {
+        let nil = serde_json::json!({
+            "processing_identity": Uuid::nil(),
+            "profile_category_check": "per_category",
+        });
+
+        let refused = valid(nil).unwrap_err();
+
+        assert!(refused.0.contains("nil"), "{refused}");
+    }
+
+    #[test]
+    fn the_identity_comes_with_its_category_check_or_not_at_all() {
+        let id = Uuid::new_v4();
+        let with = parse(serde_json::json!({
+            "processing_identity": id,
+            "profile_category_check": "one_call",
+        }))
+        .unwrap()
+        .validated()
+        .unwrap();
+        let without = parse(serde_json::json!({ "profile_category_check": "one_call" }))
+            .unwrap()
+            .validated()
+            .unwrap();
+
+        assert_eq!(
+            with.identity(),
+            Some(ProcessingIdentity {
+                id,
+                category_check: CategoryCheckConfig::OneCall,
+            })
+        );
+        assert_eq!(without.identity(), None);
     }
 }

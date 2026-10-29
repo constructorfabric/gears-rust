@@ -886,3 +886,51 @@ async fn a_profile_too_large_to_read_is_the_gears_own_failure_not_a_precondition
         "{result:?}"
     );
 }
+
+#[tokio::test]
+async fn an_allow_without_constraints_is_a_refusal_not_a_grant_of_every_profile() {
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let service = profile_service(
+        &db,
+        Arc::new(FixedScope(Vec::new())),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let result = service
+        .read(&caller_in(tenant), Some(tenant), subject)
+        .await;
+
+    assert!(
+        matches!(result, Err(DomainError::NotVisible(_))),
+        "the read requires constraints: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_category_the_platform_names_that_construct_does_not_know_grants_nothing() {
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let service = profile_service(
+        &db,
+        Arc::new(FixedScope(vec![vec![
+            tenant_is(tenant),
+            category_is("skills"),
+        ]])),
+        facts(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+    );
+
+    let view = service
+        .read(&caller_in(tenant), Some(tenant), subject)
+        .await
+        .unwrap();
+
+    assert!(
+        view.categories.is_empty(),
+        "`skills` is no category, so nothing is readable: {view:?}"
+    );
+}
