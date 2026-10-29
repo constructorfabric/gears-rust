@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-github-mirror"
-version = "0.1.1"
+version = "0.1.2"
 publish = true
 edition.workspace = true
 license.workspace = true
@@ -23,7 +23,7 @@ workspace = true
 integration = ["toolkit-db/pg", "toolkit-db/mysql"]
 
 [dependencies]
-github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.2.1", path = "../github-mirror-sdk" }
+github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.2.2", path = "../github-mirror-sdk" }
 
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }

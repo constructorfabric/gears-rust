@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-clickhouse-usage-collector-plugin"
 description = "ClickHouse Usage Collector storage backend plugin"
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry"
-version = "0.5.1"
+version = "0.5.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -22,7 +22,7 @@ doctest = false
 # SDK - public API, models, and errors. `#[toolkit::provides(transports = [local, rest])]`
 # compiles its REST arm and validates the REST binding descriptors whatever the wiring, so
 # both transport features are needed here, with `toolkit-contract` for its generated code.
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.1", path = "../types-registry-sdk", features = ["rest-client", "rest-server"] }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.2", path = "../types-registry-sdk", features = ["rest-client", "rest-server"] }
 toolkit-contract = { workspace = true }
 
 # GTS types (from git dependency)
