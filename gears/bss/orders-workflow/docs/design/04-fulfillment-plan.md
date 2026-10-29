@@ -182,6 +182,38 @@ definition arm, not an Orders timer: the `listen` on `OrderAcceptanceRecorded`, 
 `evaluate-payment-auth-eligibility`, which re-reads the outcome by request. The process-lifetime
 ceiling (`01 §4.2`) and Lifecycle's own order expiry bound an authorization that never settles.
 
+**Pending-payment continuation (S4-11, decision D-240; design note, not implemented).** The poll
+`wait` above is only as durable as the execution engine. The full continuation waits on the
+durable-execution platform choice (Lifecycle's Q-10; this gear's substrate is `ADR/0011`, but its
+timer, restart-recovery and conformance evidence is not yet available to this gear), and on Payments
+read-by-request, which has no owner (Lifecycle `UPSTREAM_REQS.md` §2.5). Until both exist this
+gear **MUST NOT** claim it. When it is built it **MUST**:
+
+1. **Checkpoint before relying on a timer**: request identity, order id and version, process
+   correlation, the first-pending instant, the next-check deadline and the remaining
+   elapsed and retry budgets. A positive finite pending interval and elapsed budget is required to
+   enable the path.
+2. **Poll the same request** (read-by-request); never issue a replacement while the earlier
+   request is unknown or pending. Recover an unknown authorization after restart before any new
+   request.
+3. **Outage is not payment failure**: a Payments outage consumes the dependency retry budget and
+   is never forwarded as a decline.
+4. **Deduplicate timer deliveries and recover overdue checkpoints after restart.**
+5. **Re-read Orders before each wake and before forwarding**: terminal or superseded stops the
+   continuation; a hold suspends it and **preserves** the deadline and budgets across resume; only a
+   matching current `approved` order may receive a conclusive `authorized` or `failed`.
+6. **Never read or cache seller tolerance** (D-89): a conclusive `failed` is forwarded once the
+   other prerequisites hold, and Lifecycle alone decides.
+7. **Exhaustion creates one correlated manual task or alert**, escalating before any order TTL
+   expiry and without needing a buyer-acceptance event. It does **not** authorize, decline or
+   fabricate a cancellation.
+8. Use the selected durable engine, not an in-process worker, for the timers.
+
+Exit evidence: pending to authorized with no acceptance event; repeated pending raising one
+escalation; uncertainty before and after the provider commit; duplicate timer; restart;
+hold and resume; amendment while asleep; terminalization; conclusive failure handled only by
+Lifecycle. Real providers and the durable engine are required for sign-off.
+
 **ADRs**: none — this is a direct PRD requirement (`cpt-cf-bss-orders-workflow-fr-owf-payment-auth`),
 not an independent architecture trade-off.
 

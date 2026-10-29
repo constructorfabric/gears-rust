@@ -7197,6 +7197,30 @@ settled 503, which a status-based classifier would retry forever under the same 
 `inst-bf-if-withheld`); `design/02-triggers-and-start.md` (intake table, `OrderAcceptanceRecorded`);
 `DESIGN.md` §3.4 (Orders Lifecycle row).
 
+### D-240 (M) Pending-payment continuation is specified as requirements and waits on the durable engine (Q-10)
+
+**Accepted (2026-10-29).** *(mirrors Lifecycle Stage 4 S4-11; refines D-89, D-239)*
+
+**Decision**:
+
+1. **It waits.** The durable pending-payment continuation is not implemented and not claimed. It
+   waits on the durable-execution platform choice (Lifecycle Q-10) and on a Payments capability with
+   idempotent authorize and read-by-request, which has no owner (Lifecycle `UPSTREAM_REQS.md` §2.5).
+2. **Requirements** are recorded in `design/04` §2.1 (*Pending and Failed Are Distinct Outcomes*, *Pending-payment continuation*): checkpoint
+   request identity, order and version, correlation, first-pending instant, next-check deadline and
+   budgets; poll the same request; an outage consumes the retry budget and is not a payment failure;
+   deduplicate timers; recover overdue checkpoints after restart; re-read Orders before each wake
+   and forward; a hold preserves budgets; tolerance is never read or cached; exhaustion raises
+   one correlated manual task or alert; the gear never authorizes, declines or fabricates a
+   cancellation.
+3. **No behaviour changes today.** The existing poll `wait` and wake-up arms stand as
+   specified; this decision adds no operation, event or reason.
+
+**Rationale**: Lifecycle has no payment port and no timer (Lifecycle D-249), so the continuation is
+this gear's. Recording the contract now keeps Stage 4 from being read as having delivered it.
+
+**Propagated**: `design/04-fulfillment-plan.md` (*Pending-payment continuation*).
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7556,6 +7580,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
 | D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
+| D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
@@ -7770,6 +7795,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-237 | M Lifecycle Stage 3 mirrored: gate refusals and `assessment` decode but never reach this gear's calls (*a 5xx* if they do); Preview and `assessment_id` not consumed; re-check conforms to Lifecycle's 22 frozen vectors, requires `count_scope` and the limit, asks every stored key, skips keyless lines; protected v2 vectors are the target | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-208, D-227, D-231 |
 | D-238 | M Lifecycle Stage 4 mirrored: `OrderAmended` emitted and a fresh verdict per new version (PRD §6.2); acceptance is version-bound; `OrderSubmitted.acceptance` on self-service submit; stale results are `version-conflict`; amend is the operator's cure, not this gear's call | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` |
 | D-239 | M Lifecycle Stage 4 wave 3 mirrored: `OrderAcceptanceRecorded` emitted, consent per version; Lifecycle decides begin-fulfillment consent then payment and tolerance; `acceptance-requirement-unevaluable` is a settled 503 → `withheld`, not retried; tolerance evidence is `authorization_failure_tolerated_at`; `get_version` on `OrdersV1` | `design/04`; `design/02`; `DESIGN.md` §3.4 |
+| D-240 | M Pending-payment continuation (S4-11) is specified as requirements in `design/04` and waits on the durable engine (Q-10) and a Payments owner; no behaviour change | `design/04` §2.1 |
 
-Highest decision number used: **D-239**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-240**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
