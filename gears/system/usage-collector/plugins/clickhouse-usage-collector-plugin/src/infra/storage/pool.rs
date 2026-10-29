@@ -618,6 +618,7 @@ pub async fn ensure_insert_dedup_window(
 
 /// The `system.tables` columns [`check_cluster_schema`] inspects.
 #[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
 pub(crate) struct SystemTableRow {
     pub name: String,
     pub engine: String,

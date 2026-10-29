@@ -952,69 +952,11 @@ mod integration {
 // ---------------------------------------------------------------------------
 
 mod cluster_schema {
-    use super::super::{SystemTableRow, check_cluster_schema, engine_args};
+    use super::super::{check_cluster_schema, engine_args};
+    use crate::infra::storage::test_mock::{
+        cluster_topology as topology, good_cluster_rows as good_rows,
+    };
     use crate::infra::storage::topology::Topology;
-
-    fn topology() -> Topology {
-        Topology::Cluster {
-            name: "uc".to_owned(),
-            records_local: "usage_records_local".to_owned(),
-            catalog_local: "usage_type_catalog_local".to_owned(),
-            insert_quorum: None,
-        }
-    }
-
-    fn row(
-        name: &str,
-        engine: &str,
-        engine_full: &str,
-        sorting: &str,
-        partition: &str,
-    ) -> SystemTableRow {
-        SystemTableRow {
-            name: name.to_owned(),
-            engine: engine.to_owned(),
-            engine_full: engine_full.to_owned(),
-            sorting_key: sorting.to_owned(),
-            partition_key: partition.to_owned(),
-            create_table_query: String::new(),
-        }
-    }
-
-    /// The rows `system.tables` reports for the reference cluster DDL.
-    fn good_rows() -> Vec<SystemTableRow> {
-        vec![
-            row(
-                "usage_records_local",
-                "ReplicatedReplacingMergeTree",
-                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) \
-                 PARTITION BY toYYYYMM(created_at) ORDER BY (gts_id, tenant_id, created_at, id)",
-                "gts_id, tenant_id, created_at, id",
-                "toYYYYMM(created_at)",
-            ),
-            row(
-                "usage_type_catalog_local",
-                "ReplicatedReplacingMergeTree",
-                "ReplicatedReplacingMergeTree('/clickhouse/tables/{uuid}/{shard}', '{replica}', version) ORDER BY gts_id",
-                "gts_id",
-                "",
-            ),
-            row(
-                "usage_records",
-                "Distributed",
-                "Distributed('uc', 'db', 'usage_records_local', cityHash64(tenant_id))",
-                "",
-                "",
-            ),
-            row(
-                "usage_type_catalog",
-                "Distributed",
-                "Distributed('uc', 'db', 'usage_type_catalog_local', cityHash64(gts_id))",
-                "",
-                "",
-            ),
-        ]
-    }
 
     #[test]
     fn reference_schema_passes() {
@@ -1057,6 +999,18 @@ mod cluster_schema {
         let problems = check_cluster_schema(&rows, &topology(), "db");
         assert!(
             problems.iter().any(|p| p.contains("ORDER BY")),
+            "{problems:?}"
+        );
+    }
+
+    /// A monthly partition is what the whole-partition TTL drop is sized for.
+    #[test]
+    fn wrong_partition_key_is_rejected() {
+        let mut rows = good_rows();
+        rows[0].partition_key = "toYYYYMMDD(created_at)".to_owned();
+        let problems = check_cluster_schema(&rows, &topology(), "db");
+        assert!(
+            problems.iter().any(|p| p.contains("PARTITION BY")),
             "{problems:?}"
         );
     }
@@ -1168,5 +1122,324 @@ mod cluster_schema {
             check_cluster_schema(&rows, &topology(), "db"),
             Vec::<String>::new()
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Startup DDL against a mocked server
+//
+// `clickhouse::test::Mock` answers each request with the next queued handler
+// and fails the test on an extra request or an unused handler, so each test
+// below pins the exact request sequence: an `ALTER` that must not be sent is
+// proven absent by not queuing a handler for it.
+// ---------------------------------------------------------------------------
+
+mod mocked {
+    use std::time::Duration;
+
+    use clickhouse::test::Mock;
+
+    use super::super::{
+        INSERT_DEDUP_WINDOW_BLOCKS, ensure_insert_dedup_window, ensure_retention_ttl,
+        validate_cluster_schema,
+    };
+    use crate::infra::storage::test_mock::{
+        capture, client, cluster_topology, create_sql, fail, good_cluster_rows, ok, rows, ttl,
+        valid_cluster_probes,
+    };
+    use crate::infra::storage::topology::Topology;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+    const RETENTION: u64 = 31_536_000;
+
+    // ── ensure_retention_ttl ──────────────────────────────────────────────
+
+    /// A live TTL on the bare column with the configured interval is left
+    /// alone: the read is the only request.
+    #[tokio::test]
+    async fn retention_ttl_that_already_matches_is_not_altered() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql(&ttl(RETENTION), None)]);
+
+        ensure_retention_ttl(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect("a matching TTL needs no ALTER");
+    }
+
+    #[tokio::test]
+    async fn retention_ttl_with_a_different_interval_is_altered() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql(&ttl(86_400), None)]);
+        let alter = capture(&mock);
+
+        ensure_retention_ttl(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect("the TTL is reconciled");
+
+        assert_eq!(
+            alter.query().await.trim(),
+            format!(
+                "ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL {RETENTION} SECOND DELETE"
+            )
+        );
+    }
+
+    /// The legacy `toDateTime(created_at)` clause saturates at 2106, so it is
+    /// rewritten even when its interval already matches.
+    #[tokio::test]
+    async fn retention_ttl_on_the_legacy_cast_is_altered_even_when_the_interval_matches() {
+        let mock = Mock::new();
+        rows(
+            &mock,
+            [create_sql(
+                &format!("toDateTime(created_at) + toIntervalSecond({RETENTION})"),
+                None,
+            )],
+        );
+        let alter = capture(&mock);
+
+        ensure_retention_ttl(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect("the legacy TTL is rewritten");
+
+        assert!(
+            alter
+                .query()
+                .await
+                .contains("MODIFY TTL created_at + INTERVAL")
+        );
+    }
+
+    /// A table with no TTL at all gets one. A short window also takes the
+    /// whole-partition overshoot warning branch.
+    #[tokio::test]
+    async fn retention_ttl_is_added_to_a_table_without_one() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql("", None)]);
+        let alter = capture(&mock);
+
+        ensure_retention_ttl(&client(&mock), &Topology::SingleNode, 86_400, DEADLINE)
+            .await
+            .expect("the TTL is added");
+
+        assert!(alter.query().await.contains("INTERVAL 86400 SECOND DELETE"));
+    }
+
+    /// On a cluster the TTL lives on the shard-local table, altered on every
+    /// host.
+    #[tokio::test]
+    async fn retention_ttl_on_a_cluster_alters_the_local_table_on_cluster() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql("", None)]);
+        let alter = capture(&mock);
+
+        ensure_retention_ttl(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect("the TTL is reconciled");
+
+        assert!(
+            alter
+                .query()
+                .await
+                .starts_with("ALTER TABLE usage_records_local ON CLUSTER uc MODIFY TTL"),
+        );
+    }
+
+    #[tokio::test]
+    async fn retention_ttl_reports_a_failed_alter_with_its_statement() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql("", None)]);
+        fail(&mock);
+
+        let err = ensure_retention_ttl(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect_err("a rejected ALTER fails startup");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("failed to apply retention TTL"), "{msg}");
+        assert!(msg.contains("MODIFY TTL"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn retention_ttl_reports_a_failed_metadata_read() {
+        let mock = Mock::new();
+        fail(&mock);
+
+        let err = ensure_retention_ttl(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect_err("an unreadable table fails startup");
+
+        assert!(
+            format!("{err:#}")
+                .contains("failed to read usage_records create_table_query from system.tables"),
+            "{err:#}"
+        );
+    }
+
+    // ── ensure_insert_dedup_window ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn dedup_window_that_is_already_set_is_not_altered() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql("", Some(INSERT_DEDUP_WINDOW_BLOCKS))]);
+
+        ensure_insert_dedup_window(&client(&mock), DEADLINE)
+            .await
+            .expect("a matching window needs no ALTER");
+    }
+
+    #[tokio::test]
+    async fn dedup_window_is_retrofitted_onto_a_table_without_it() {
+        for window in [None, Some(100)] {
+            let mock = Mock::new();
+            rows(&mock, [create_sql("", window)]);
+            let alter = capture(&mock);
+
+            ensure_insert_dedup_window(&client(&mock), DEADLINE)
+                .await
+                .expect("the window is reconciled");
+
+            assert_eq!(
+                alter.query().await.trim(),
+                format!(
+                    "ALTER TABLE usage_records MODIFY SETTING \
+                     non_replicated_deduplication_window = {INSERT_DEDUP_WINDOW_BLOCKS}"
+                ),
+                "{window:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn dedup_window_reports_a_failed_alter() {
+        let mock = Mock::new();
+        rows(&mock, [create_sql("", None)]);
+        fail(&mock);
+
+        let err = ensure_insert_dedup_window(&client(&mock), DEADLINE)
+            .await
+            .expect_err("a rejected ALTER fails startup");
+
+        assert!(
+            format!("{err:#}").contains("failed to apply insert dedup window"),
+            "{err:#}"
+        );
+    }
+
+    // ── validate_cluster_schema ───────────────────────────────────────────
+
+    /// A single node has no cluster schema to check, and nothing is asked.
+    #[tokio::test]
+    async fn validation_is_a_no_op_on_a_single_node() {
+        let mock = Mock::new();
+
+        validate_cluster_schema(&client(&mock), &Topology::SingleNode, RETENTION, DEADLINE)
+            .await
+            .expect("nothing to validate");
+    }
+
+    #[tokio::test]
+    async fn validation_passes_on_a_usable_cluster() {
+        let mock = Mock::new();
+        valid_cluster_probes(&mock, 2, RETENTION);
+
+        validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect("the reference schema is usable");
+    }
+
+    /// A TTL drift on an operator-provisioned cluster is only warned about:
+    /// fixing it would be DDL the plugin does not run there.
+    #[tokio::test]
+    async fn validation_passes_with_only_a_warning_when_the_ttl_differs() {
+        let mock = Mock::new();
+        valid_cluster_probes(&mock, 2, 86_400);
+
+        validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect("a TTL drift does not fail startup");
+    }
+
+    #[tokio::test]
+    async fn validation_fails_when_the_cluster_is_not_declared() {
+        let mock = Mock::new();
+        rows(&mock, ["db".to_owned()]);
+        rows(&mock, [0_u64]);
+
+        let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect_err("an undeclared cluster fails startup");
+
+        assert!(
+            format!("{err:#}").contains("is not declared in system.clusters"),
+            "{err:#}"
+        );
+    }
+
+    /// A deviating schema fails with every problem and the DDL that fixes it.
+    #[tokio::test]
+    async fn validation_fails_with_the_problems_and_the_ddl_on_a_deviating_schema() {
+        let mock = Mock::new();
+        rows(&mock, ["db".to_owned()]);
+        rows(&mock, [2_u64]);
+        rows(&mock, good_cluster_rows().into_iter().skip(1));
+        rows(&mock, [8_u64]);
+
+        let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect_err("a missing local table fails startup");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("set cluster.manage_schema"), "{msg}");
+        assert!(
+            msg.contains("local table `usage_records_local` does not exist"),
+            "{msg}"
+        );
+        assert!(msg.contains("CREATE TABLE IF NOT EXISTS"), "{msg}");
+    }
+
+    /// The connected node can hold every table while a replica lacks some.
+    #[tokio::test]
+    async fn validation_fails_when_a_replica_lacks_tables() {
+        let mock = Mock::new();
+        rows(&mock, ["db".to_owned()]);
+        rows(&mock, [2_u64]);
+        rows(&mock, good_cluster_rows());
+        rows(&mock, [6_u64]);
+
+        let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect_err("a replica missing tables fails startup");
+
+        assert!(
+            format!("{err:#}").contains("only 6 of 8 expected tables exist across the 2 replicas"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_names_the_probe_that_failed() {
+        let mock = Mock::new();
+        fail(&mock);
+
+        let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect_err("a failed probe fails startup");
+
+        assert!(
+            format!("{err:#}").contains("reading currentDatabase() failed"),
+            "{err:#}"
+        );
+    }
+
+    /// Statements that only need a success answer still go through `ok`.
+    #[tokio::test]
+    async fn exec_statement_succeeds_on_an_accepted_statement() {
+        let mock = Mock::new();
+        ok(&mock);
+
+        super::super::exec_statement(&client(&mock), "SELECT 1", DEADLINE)
+            .await
+            .expect("an accepted statement succeeds");
     }
 }

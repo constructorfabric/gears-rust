@@ -101,6 +101,185 @@ fn cluster_tracker_is_replicated_to_every_host() {
     );
 }
 
+// ── Runs against a mocked server ─────────────────────────────────────────────
+//
+// `clickhouse::test::Mock` serves one queued answer per request, in order, and
+// fails the test on an extra request or an unused answer, so each test pins
+// the exact statement sequence of a run. A fresh single-node run is: tracker
+// DDL, read of the recorded steps, then per step its statements followed by
+// the tracker `INSERT`.
+
+mod mocked {
+    use std::time::Duration;
+
+    use clickhouse::test::Mock;
+
+    use super::super::{MigrationOptions, migration_names, run_migrations};
+    use crate::infra::storage::pool::INSERT_DEDUP_WINDOW_BLOCKS;
+    use crate::infra::storage::test_mock::{
+        capture, client, cluster_topology, create_sql, fail, ok, rows,
+    };
+    use crate::infra::storage::topology::Topology;
+
+    const DEADLINE: Duration = Duration::from_secs(5);
+    const OPTS: MigrationOptions = MigrationOptions {
+        retention_period_secs: 31_536_000,
+    };
+
+    fn recorded(mock: &Mock, names: &[&str]) {
+        rows(mock, names.iter().map(|n| (*n).to_owned()));
+    }
+
+    #[tokio::test]
+    async fn a_fresh_single_node_runs_and_records_every_step() {
+        let mock = Mock::new();
+        let tracker = capture(&mock);
+        recorded(&mock, &[]);
+        let catalog = capture(&mock);
+        let records = capture(&mock);
+        let first = capture(&mock);
+        rows(&mock, [create_sql("", Some(INSERT_DEDUP_WINDOW_BLOCKS))]);
+        let second = capture(&mock);
+
+        let ran = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect("a fresh database migrates");
+
+        assert_eq!(ran, migration_names());
+        let tracker = tracker.query().await;
+        assert!(
+            tracker.contains("CREATE TABLE IF NOT EXISTS usage_collector_migrations"),
+            "{tracker}"
+        );
+        assert!(tracker.contains("ReplacingMergeTree"), "{tracker}");
+        assert!(!tracker.contains("ON CLUSTER"), "{tracker}");
+        assert!(catalog.query().await.contains("usage_type_catalog"));
+        assert!(records.query().await.contains("usage_records"));
+        assert!(first.query().await.contains("'m0001_init'"));
+        assert!(second.query().await.contains("'m0002_insert_dedup_window'"));
+    }
+
+    /// Nothing pending: the tracker DDL and the read are the whole run.
+    #[tokio::test]
+    async fn an_up_to_date_schema_runs_nothing() {
+        let mock = Mock::new();
+        ok(&mock);
+        recorded(&mock, &migration_names());
+
+        let ran = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect("an up-to-date schema is a no-op");
+
+        assert!(ran.is_empty(), "{ran:?}");
+    }
+
+    /// Only the steps the tracker lacks run, and the reconciling step alters
+    /// a table that predates the dedup window.
+    #[tokio::test]
+    async fn only_the_pending_steps_run() {
+        let mock = Mock::new();
+        ok(&mock);
+        recorded(&mock, &["m0001_init"]);
+        rows(&mock, [create_sql("", None)]);
+        let alter = capture(&mock);
+        ok(&mock);
+
+        let ran = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect("the pending step runs");
+
+        assert_eq!(ran, ["m0002_insert_dedup_window"]);
+        assert!(
+            alter
+                .query()
+                .await
+                .contains("MODIFY SETTING non_replicated_deduplication_window")
+        );
+    }
+
+    /// On a cluster the replicated local tables deduplicate on their own, so
+    /// the reconciling step sends nothing; the tracker is replicated `ON
+    /// CLUSTER`.
+    #[tokio::test]
+    async fn a_fresh_cluster_runs_every_step_on_cluster() {
+        let mock = Mock::new();
+        let tracker = capture(&mock);
+        recorded(&mock, &[]);
+        // m0001: a local and a Distributed table per logical table.
+        let creates: Vec<_> = (0..4).map(|_| capture(&mock)).collect();
+        ok(&mock);
+        // m0002: nothing but its record.
+        ok(&mock);
+
+        let ran = run_migrations(&client(&mock), &cluster_topology(), OPTS, DEADLINE)
+            .await
+            .expect("a fresh cluster migrates");
+
+        assert_eq!(ran, migration_names());
+        let tracker = tracker.query().await;
+        assert!(tracker.contains("ON CLUSTER uc"), "{tracker}");
+        assert!(
+            tracker.contains("ReplicatedReplacingMergeTree"),
+            "{tracker}"
+        );
+        for create in creates {
+            let sql = create.query().await;
+            assert!(sql.contains("ON CLUSTER uc"), "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tracker_that_cannot_be_created_fails_the_run() {
+        let mock = Mock::new();
+        fail(&mock);
+
+        let err = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect_err("no tracker, no run");
+
+        assert!(
+            format!("{err:#}").contains("failed to create the migration tracking table"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_step_is_named_and_not_recorded() {
+        let mock = Mock::new();
+        ok(&mock);
+        recorded(&mock, &[]);
+        fail(&mock);
+
+        let err = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect_err("a failing step fails the run");
+
+        assert!(
+            format!("{err:#}").contains("schema migration m0001_init failed"),
+            "{err:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_that_cannot_be_recorded_fails_the_run() {
+        let mock = Mock::new();
+        ok(&mock);
+        recorded(&mock, &[]);
+        ok(&mock);
+        ok(&mock);
+        fail(&mock);
+
+        let err = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect_err("an unrecorded step fails the run");
+
+        assert!(
+            format!("{err:#}").contains("recording an applied migration failed"),
+            "{err:#}"
+        );
+    }
+}
+
 // ── Live single-node runs ────────────────────────────────────────────────────
 
 // Run with: cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse

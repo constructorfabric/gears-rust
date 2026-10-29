@@ -630,3 +630,225 @@ async fn ch_cluster_managed_schema_provisions_a_bare_cluster() {
     let shards = rows_per_shard(&client, "usage_records_local").await;
     assert_eq!(shards.len(), 2, "both shards hold rows: {shards:?}");
 }
+
+// ── `Gear::init` on a real cluster ───────────────────────────────────────────
+
+mod gear_init {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+    use toolkit::client_hub::ClientScope;
+    use toolkit::gts::PluginV1;
+    use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
+    use toolkit_canonical_errors::CanonicalError;
+    use types_registry_sdk::{
+        GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
+        TypesRegistryClient,
+    };
+    use usage_collector_sdk::{UsageCollectorPluginSpecV1, UsageCollectorPluginV1};
+    use uuid::Uuid;
+
+    use clickhouse_usage_collector_plugin::ClickHouseUsageCollectorPlugin;
+    use clickhouse_usage_collector_plugin::config::ClickHousePluginConfig;
+
+    use super::{CLUSTER, Cluster, DATABASE, PASSWORD, boot_bare_or_skip, tracker_rows_everywhere};
+
+    struct StaticConfig(serde_json::Value);
+
+    impl ConfigProvider for StaticConfig {
+        fn get_gear_config(&self, _gear_name: &str) -> Option<&serde_json::Value> {
+            Some(&self.0)
+        }
+    }
+
+    /// Accepts every registration; `init` calls nothing else.
+    struct RegistryStub;
+
+    #[async_trait]
+    impl TypesRegistryClient for RegistryStub {
+        async fn register(
+            &self,
+            entities: Vec<serde_json::Value>,
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
+            Ok(entities
+                .iter()
+                .map(|e| RegisterResult::Ok {
+                    gts_id: e["id"].as_str().unwrap_or_default().to_owned(),
+                })
+                .collect())
+        }
+        async fn register_type_schemas(
+            &self,
+            _type_schemas: Vec<serde_json::Value>,
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_type_schema(&self, _type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_type_schema_by_uuid(
+            &self,
+            _type_uuid: Uuid,
+        ) -> Result<GtsTypeSchema, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_type_schemas(
+            &self,
+            _type_ids: Vec<String>,
+        ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
+            unreachable!()
+        }
+        async fn get_type_schemas_by_uuid(
+            &self,
+            _type_uuids: Vec<Uuid>,
+        ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
+            unreachable!()
+        }
+        async fn list_type_schemas(
+            &self,
+            _query: TypeSchemaQuery,
+        ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
+            unreachable!()
+        }
+        async fn register_instances(
+            &self,
+            _instances: Vec<serde_json::Value>,
+        ) -> Result<Vec<RegisterResult>, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
+            unreachable!()
+        }
+        async fn get_instances(
+            &self,
+            _ids: Vec<String>,
+        ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
+            unreachable!()
+        }
+        async fn get_instances_by_uuid(
+            &self,
+            _uuids: Vec<Uuid>,
+        ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
+            unreachable!()
+        }
+        async fn list_instances(
+            &self,
+            _query: InstanceQuery,
+        ) -> Result<Vec<GtsInstance>, CanonicalError> {
+            unreachable!()
+        }
+    }
+
+    /// Run `Gear::init` against `cluster` with the plugin managing the schema
+    /// under `retention_secs`; returns the hub it registered into.
+    async fn init(cluster: &Cluster, retention_secs: u64) -> anyhow::Result<Arc<ClientHub>> {
+        let hub = Arc::new(ClientHub::default());
+        hub.register::<dyn TypesRegistryClient>(Arc::new(RegistryStub));
+        let config = json!({ "config": {
+            "database_url": format!(
+                "http://default:{PASSWORD}@127.0.0.1:{}/{DATABASE}", cluster.port
+            ),
+            "allow_insecure_http": true,
+            "async_insert": false,
+            "retention_period_secs": retention_secs,
+            "cluster": {
+                "name": CLUSTER,
+                "manage_schema": true,
+                "migration_statement_timeout_secs": 120,
+            },
+        }});
+        let ctx = GearCtx::new(
+            "clickhouse-usage-collector-plugin",
+            Uuid::from_u128(30),
+            Arc::new(StaticConfig(config)),
+            Arc::clone(&hub),
+            CancellationToken::new(),
+        );
+        drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+        ClickHouseUsageCollectorPlugin.init(&ctx).await?;
+        Ok(hub)
+    }
+
+    /// The `usage_records_local` TTL clause of every host, polled until each
+    /// names `secs` (or the budget runs out).
+    async fn local_ttls_everywhere(client: &clickhouse::Client, secs: u64) -> Vec<String> {
+        let sql = format!(
+            "SELECT create_table_query FROM clusterAllReplicas('{CLUSTER}', system.tables) \
+             WHERE database = '{DATABASE}' AND name = 'usage_records_local'"
+        );
+        let names = |q: &String| {
+            q.contains(&format!("toIntervalSecond({secs})"))
+                || q.contains(&format!("INTERVAL {secs} SECOND"))
+        };
+        let mut seen = Vec::new();
+        for _ in 0..60 {
+            seen = client
+                .query(&sql)
+                .fetch_all::<String>()
+                .await
+                .expect("local tables across the cluster");
+            if seen.len() == 2 && seen.iter().all(names) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        seen
+    }
+
+    /// The whole startup sequence on a bare cluster: `init` provisions it,
+    /// passes its own validation gate and registers the adapter; a restart
+    /// with another retention reconciles the TTL `ON CLUSTER` on every host.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires Docker (testcontainers)"]
+    async fn ch_cluster_gear_init_provisions_and_reconciles_a_bare_cluster() {
+        let Some(cluster) = boot_bare_or_skip().await else {
+            return;
+        };
+        let admin = clickhouse::Client::default()
+            .with_url(format!("http://127.0.0.1:{}", cluster.port))
+            .with_user("default")
+            .with_password(PASSWORD);
+
+        let one_year = 31_536_000;
+        let hub = init(&cluster, one_year)
+            .await
+            .expect("init provisions a bare managed cluster");
+
+        let cfg = ClickHousePluginConfig::default();
+        let (instance_id, _) = PluginV1::<UsageCollectorPluginSpecV1>::build_registration(
+            "cf.core._.clickhouse_usage_collector.v1",
+            cfg.vendor,
+            cfg.priority,
+        )
+        .expect("registration payload");
+        assert!(
+            hub.try_get_scoped::<dyn UsageCollectorPluginV1>(&ClientScope::gts_id(&instance_id))
+                .is_some(),
+            "init registers the storage adapter"
+        );
+        // Two steps on each of two hosts.
+        assert_eq!(tracker_rows_everywhere(&admin, 4).await, 4);
+
+        let two_years = 2 * one_year;
+        init(&cluster, two_years)
+            .await
+            .expect("a restart with another retention succeeds");
+        let ttls = local_ttls_everywhere(&admin, two_years).await;
+        assert_eq!(ttls.len(), 2, "both hosts hold the local table: {ttls:?}");
+        assert!(
+            ttls.iter()
+                .all(|q| q.contains(&format!("toIntervalSecond({two_years})"))
+                    || q.contains(&format!("INTERVAL {two_years} SECOND"))),
+            "the TTL is reconciled on every host: {ttls:?}"
+        );
+        // No step re-ran on restart.
+        assert_eq!(tracker_rows_everywhere(&admin, 4).await, 4);
+    }
+}

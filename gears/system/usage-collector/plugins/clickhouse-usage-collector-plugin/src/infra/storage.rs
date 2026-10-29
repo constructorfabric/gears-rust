@@ -22,3 +22,8 @@ pub mod topology;
 #[cfg(all(test, feature = "clickhouse"))]
 #[cfg_attr(coverage_nightly, coverage(off))]
 pub(crate) mod test_ch_server;
+
+/// `clickhouse::test::Mock` helpers for the Docker-free startup-path tests.
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+pub(crate) mod test_mock;

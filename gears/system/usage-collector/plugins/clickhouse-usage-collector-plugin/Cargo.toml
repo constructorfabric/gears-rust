@@ -79,6 +79,13 @@ inventory = { workspace = true }
 
 [dev-dependencies]
 toolkit-security = { workspace = true }
+# `test-util` adds the crate's in-process mock server (`clickhouse::test::Mock`),
+# which the Docker-free unit tests of the startup DDL, migrations and
+# `Gear::init` run against. It only changes clients built with a mock URL.
+clickhouse = { workspace = true, features = ["test-util"] }
+# `CanonicalError` for the types-registry stub in the `Gear::init` tests;
+# `toolkit` does not re-export it.
+toolkit-canonical-errors = { workspace = true }
 tokio = { workspace = true }
 uuid = { workspace = true }
 # Unconditional: [dev-dependencies] can't be optional; usage is #![cfg(feature="clickhouse")]-gated.

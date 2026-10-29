@@ -2478,6 +2478,7 @@ dependencies = [
  "bigdecimal",
  "cf-gears-test-containers",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-security",
