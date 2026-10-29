@@ -58,7 +58,7 @@ use graph_storage_sdk::models::{
     RemainingBudget, SearchMode, SearchRequest,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreV1, StoreCtx, VectorArm,
+    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
 };
 use sea_orm_migration::MigratorTrait;
 use testcontainers::runners::AsyncRunner as _;
@@ -907,4 +907,128 @@ async fn a_producer_sized_batch_lands_inside_its_budget() {
         "nfr-ingest-throughput: 10k nodes + 20k edges took {:.1} s",
         elapsed.as_secs_f64()
     );
+}
+
+/// Overlapping ingest batches, the shape of gears-rust #5042: writers that
+/// upsert random subsets of one shared key pool, with edges between the keys
+/// each names, all at once. Two shapes, the two the issue measured on the
+/// Studio stand.
+///
+/// Every batch's outcome is counted -- committed, `Serialization` (a
+/// deadlock or a lock timeout the server broke), another conflict, the
+/// deadline -- and the latency of every attempt is timed, committed or not.
+/// One `RESULT` line per shape for the latency and one `CONTENTION` line for
+/// the counts. Asserts nothing: a regression here is a number against the
+/// previous run (gears-rust #5517), and the conformance case
+/// `overlapping_batches_all_land` is what holds the contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn overlapping_ingest_batches() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let repeats = repeats();
+    let tenant = Uuid::now_v7();
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
+    let mut types = conformance::ontology_batch();
+    types.retain(|registration| registration.type_id != conformance::OWNED);
+    types.push(seeded_type());
+    stand
+        .store
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers");
+
+    // (keys in the pool, nodes per batch, writers, batches per writer)
+    for (pool, per_batch, writers, rounds) in [(200, 50, 8, 10), (60, 40, 16, 6)] {
+        for repeat in 0..repeats {
+            let scenario =
+                format!("overlapping ingest: {writers} writers x {per_batch} of {pool} keys");
+            let started = Instant::now();
+            let tasks: Vec<_> = (0..writers)
+                .map(|writer| {
+                    let store = Arc::clone(&stand.store);
+                    tokio::spawn(async move {
+                        let scope = AccessScope::for_tenant(tenant);
+                        let base = conformance::ctx(tenant, &scope, None);
+                        let coordinator = conformance::coordinator();
+                        let mut attempts = Vec::with_capacity(rounds);
+                        for round in 0..rounds {
+                            let seed = (repeat * 1_000 + writer) * 1_000 + round;
+                            let mut keys: Vec<usize> = (0..pool).collect();
+                            for i in (1..keys.len()).rev() {
+                                keys.swap(i, mix(seed * 131 + i) % (i + 1));
+                            }
+                            keys.truncate(per_batch);
+                            let edges = keys
+                                .windows(2)
+                                .map(|pair| EdgeSpec {
+                                    type_id: conformance::LINK.to_owned(),
+                                    src_node_key: format!("perf-{}", pair[0]),
+                                    dst_node_key: format!("perf-{}", pair[1]),
+                                    ..EdgeSpec::default()
+                                })
+                                .collect();
+                            let request = IngestRequest {
+                                nodes: keys.iter().map(|&k| seeded_node(k)).collect(),
+                                edges,
+                                options: IngestOptions {
+                                    embed: Some(false),
+                                    ..IngestOptions::default()
+                                },
+                                replace_scope: None,
+                                idempotency_key: None,
+                            };
+                            // The interactive deadline a REST caller gets.
+                            let ctx = StoreCtx {
+                                budget: RemainingBudget::starting_now(Duration::from_secs(10)),
+                                ..fresh(&base)
+                            };
+                            let plan = plan_for(store.as_ref(), &ctx, &request, &coordinator).await;
+                            let attempt = Instant::now();
+                            let outcome = store.ingest(&ctx, request, plan).await;
+                            attempts.push((attempt.elapsed(), outcome.err()));
+                        }
+                        attempts
+                    })
+                })
+                .collect();
+
+            let (mut committed, mut serialization, mut conflict, mut deadline, mut other) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let mut samples = Vec::new();
+            for task in tasks {
+                for (elapsed, error) in task.await.expect("the writer does not panic") {
+                    samples.push(elapsed);
+                    match error {
+                        None => committed += 1,
+                        Some(GraphStoreError::Serialization) => serialization += 1,
+                        Some(GraphStoreError::Conflict { .. }) => conflict += 1,
+                        Some(GraphStoreError::Deadline) => deadline += 1,
+                        Some(error) => {
+                            other += 1;
+                            eprintln!("{scenario}: {error}");
+                        }
+                    }
+                }
+            }
+            let wall = started.elapsed();
+            let runs = samples.len();
+            let measured = Measured {
+                p50: percentile(&mut samples, 0.50),
+                p95: percentile(&mut samples, 0.95),
+                worst: *samples.last().expect("at least one batch"),
+                runs,
+            };
+            report(repeat, 0.0, "-", &scenario, &measured);
+            println!(
+                "CONTENTION rep={repeat} scenario=\"{scenario}\" committed={committed} \
+                 serialization={serialization} conflict={conflict} deadline={deadline} \
+                 other={other} wall_s={:.1} committed_nodes_per_s={:.0}",
+                wall.as_secs_f64(),
+                u32::try_from(committed * per_batch).map_or(f64::NAN, f64::from)
+                    / wall.as_secs_f64()
+            );
+        }
+    }
 }
