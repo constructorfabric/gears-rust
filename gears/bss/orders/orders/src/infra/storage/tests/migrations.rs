@@ -40,6 +40,92 @@ async fn every_forward_prefix_installs_and_preserves_old_audit_and_order_rows() 
     }
     Ok(())
 }
+/// D-242: a database `main` migrated (every Orders migration before the item-keys one, which
+/// `migrations_shipped_on_main_are_unchanged` pins byte-identical to `main`) upgrades through
+/// `m20261027_000011_orders_item_keys`. Main's pinned scalar line survives unchanged; the
+/// keyless and item-keys lines the gate commits (`infra/gate/commit.rs`, `admitted`) are then
+/// admitted; a line carrying both evidence forms is still refused.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_main_database_upgrades_through_item_keys_and_admits_keyless_lines() -> anyhow::Result<()>
+{
+    use sea_orm::{EntityTrait, IntoActiveModel};
+    const ITEM_KEYS: &str = "m20261027_000011_orders_item_keys";
+    const SNAPSHOT: &str = r#"{"service_activation_required":false,"acceptance_due_required":false,"scope":"platform_default","resource_tenant_id":null,"policy_id":"00000000-0000-0000-0000-000000000121","revision":1}"#;
+    let pg = Pg::bare().await?;
+    let main: Vec<_> = migrations::all()
+        .into_iter()
+        .take_while(|m| m.name() != ITEM_KEYS)
+        .collect();
+    assert_eq!(main.len() + 1, migrations::all().len());
+    toolkit_db::migration_runner::run_migrations_for_testing(&pg.db, main).await?;
+    create(&pg.db, 1).await?;
+    entity::order_version::Entity::insert(version(1, 2, Some(1)).into_active_model())
+        .exec(&pg.raw)
+        .await?;
+    pg.sql(&format!(
+        "UPDATE bss_orders__order SET current_version=2,version_allocation_high_water=2 WHERE order_id='{}'",
+        u(1)
+    ))
+    .await?;
+    let attempt = pinned_fixture_attempt(&pg, 1, 2).await?;
+    let line = |line: u128, extra_columns: &str, extra_values: &str| {
+        format!(
+            "INSERT INTO bss_orders__order_line_identity VALUES('{o}','{l}',now()); \
+             INSERT INTO bss_orders__order_line(order_id,version,line_id,plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_kind,authored_term,billing_cycle,date_policy_switch_state,commercial_attempt_id,pricing_acceptance_id,pricing_request_digest,pricing_terms_digest,order_pin{extra_columns}) \
+             VALUES('{o}',2,'{l}','{p}','{r}','[]','USD',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,'rolling','{{\"kind\":\"rolling\"}}','month','{SNAPSHOT}','{attempt}','{l}','{d}','{d}','{{}}'{extra_values})",
+            o = u(1),
+            l = u(line),
+            p = u(200),
+            r = u(201),
+            d = "00".repeat(32),
+        )
+    };
+    // Main's pinned line carries the scalar scope key its `ck_bss_orders__order_line__2` requires;
+    // main refuses a keyless pinned line (the statement batch rolls back as one).
+    pg.sql(&line(501, ",overlap_scope_key", ",'k'")).await?;
+    assert!(pg.sql(&line(502, "", "")).await.is_err());
+    let upgrade =
+        toolkit_db::migration_runner::run_migrations_for_testing(&pg.db, migrations::all()).await?;
+    assert_eq!(upgrade.applied_names, [ITEM_KEYS.to_owned()]);
+    assert_eq!(
+        pg.scalar(&format!(
+            "SELECT count(*) AS n FROM bss_orders__order_line WHERE line_id='{}' AND overlap_scope_key='k' \
+             AND catalog_subscription_product_key IS NULL AND overlap_item_keys IS NULL",
+            u(501)
+        ))
+        .await?,
+        1
+    );
+    // Keyless, keyless with a product, and item-keys lines commit after the upgrade.
+    pg.sql(&line(502, "", "")).await?;
+    pg.sql(&line(
+        503,
+        ",catalog_subscription_product_key",
+        ",'product'",
+    ))
+    .await?;
+    pg.sql(&line(504, ",overlap_item_keys", ",'[]'::jsonb"))
+        .await?;
+    assert!(
+        pg.sql(&line(
+            505,
+            ",overlap_item_keys,overlap_scope_key",
+            ",'[]'::jsonb,'k'"
+        ))
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        pg.scalar(
+            "SELECT count(*) AS n FROM pg_constraint WHERE conname='ck_bss_orders__order_line__2' \
+             AND pg_get_constraintdef(oid) LIKE '%overlap_scope_key%'"
+        )
+        .await?,
+        0
+    );
+    Ok(())
+}
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn manifest_matches_every_actual_column_type_nullability_key_and_guard() -> anyhow::Result<()>
