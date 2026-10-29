@@ -375,6 +375,158 @@ pub fn line_requests_value(
     Ok(Value::Object(lines.into_iter().collect()))
 }
 
+/// D-197 exact acceptance-input equality: one line's frozen Pricing `query` against the frozen
+/// Rating `request` the attempt's totals were evaluated from (selection, quantity, market,
+/// revision, start, term, cycle, billing terms, axes and hold policy). Members a legacy request
+/// snapshot omits (plan, start, resolved terms, axes, policy) are not compared and never
+/// fabricated ([`FrozenOrder::evaluation_request`]).
+///
+/// # Errors
+/// The static name of the first member that differs.
+pub fn verify_evaluated_query(
+    query: &NewSaleQuery,
+    request: &OrderEvaluationRequest,
+) -> Result<(), &'static str> {
+    let mut lines = request.lines.iter().filter(|l| l.line_id == query.line_id);
+    let (Some(line), None) = (lines.next(), lines.next()) else {
+        return Err("evaluated line");
+    };
+    if request.market.currency != query.market.currency
+        || query.market.region.as_deref() != Some(request.market.region.as_str())
+    {
+        return Err("evaluated market");
+    }
+    if request.tenant_axes.as_ref().is_some_and(|a| {
+        (a.seller, a.payer, a.resource)
+            != (
+                query.tenant_axes.seller_tenant_id,
+                query.tenant_axes.payer_tenant_id,
+                query.tenant_axes.resource_tenant_id,
+            )
+    }) {
+        return Err("evaluated tenant axes");
+    }
+    if request
+        .acceptance_policy
+        .as_ref()
+        .is_some_and(|p| positive(&p.version) != Some(query.hold_policy_version))
+    {
+        return Err("evaluated hold policy version");
+    }
+    if line.plan_revision_id != query.plan_revision_id
+        || line.plan_id.is_some_and(|p| p != query.plan_id)
+    {
+        return Err("evaluated revision");
+    }
+    if term(line.term) != query.term {
+        return Err("evaluated term");
+    }
+    if line.start_at.is_some_and(|s| s != query.start_at) {
+        return Err("evaluated start");
+    }
+    let cycle = match query.billing_terms.cycle {
+        BillingCycle::Month => EvaluationCycle::Month,
+        BillingCycle::Year => EvaluationCycle::Year,
+    };
+    if line.cycle != cycle {
+        return Err("evaluated cycle");
+    }
+    if line.resolved_terms.as_ref().is_some_and(|t| {
+        t.term != line.term || t.billing_terms.digest != digest_hex(&query.billing_terms.digest)
+    }) {
+        return Err("evaluated billing terms");
+    }
+    if line.items.len() != query.selections.len()
+        || !line
+            .items
+            .iter()
+            .zip(&query.selections)
+            .all(|(item, selection)| {
+                item.item_id == selection.item_id
+                    && matches!(
+                        item.chains.as_slice(),
+                        [chain] if chain.dim_value == selection.dimension_value
+                    )
+                    && bss_money::parse_decimal(&item.quantity).is_ok_and(|q| q == query.quantity)
+            })
+    {
+        return Err("evaluated selections");
+    }
+    Ok(())
+}
+
+/// D-197: the issued receipt's `bindings` are the ones the frozen Rating `request` evaluated for
+/// `query`'s line, one per selected item. A legacy request binding without its native member is
+/// compared on the projected identity only.
+///
+/// # Errors
+/// `"evaluated line"` when the request does not price the line; `"evaluated bindings"` for any
+/// other difference.
+pub fn verify_evaluated_bindings(
+    query: &NewSaleQuery,
+    bindings: &[bss_pricing_sdk::read::AcceptedBinding],
+    request: &OrderEvaluationRequest,
+) -> Result<(), &'static str> {
+    let line = request
+        .lines
+        .iter()
+        .find(|l| l.line_id == query.line_id)
+        .ok_or("evaluated line")?;
+    if bindings.len() != line.items.len() {
+        return Err("evaluated bindings");
+    }
+    for item in &line.items {
+        let [chain] = item.chains.as_slice() else {
+            return Err("evaluated bindings");
+        };
+        let issued = bindings
+            .iter()
+            .find(|b| b.item_id == item.item_id)
+            .ok_or("evaluated bindings")?;
+        let mut expected =
+            super::orchestrate::evaluation_binding(issued).map_err(|_| "evaluated bindings")?;
+        if chain.binding.native_binding.is_none() {
+            expected.native_binding = None;
+        }
+        if expected != chain.binding {
+            return Err("evaluated bindings");
+        }
+    }
+    Ok(())
+}
+
+/// The attempt's `line_requests` for `candidate`: [`build_line_requests`], each request checked
+/// against the frozen Rating request when the order carries one ([`verify_evaluated_query`]),
+/// then [`line_requests_value`]. A legacy order without a request is built as before.
+///
+/// # Errors
+/// The first line whose request cannot be frozen, differs from the evaluated request
+/// (`Mismatch`, naming the member), or cannot be encoded.
+pub fn frozen_line_requests(
+    facts: &CommercialFacts<'_>,
+    candidate: i32,
+    order: &FrozenOrder,
+) -> Result<Value, CommercialError> {
+    let requests = build_line_requests(facts, candidate)?;
+    if let Some(evaluated) = &order.evaluation_request {
+        if evaluated.lines.len() != requests.len() {
+            return Err(CommercialError::Mismatch {
+                line_id: requests.first().map_or(Uuid::nil(), |r| r.line_id),
+                what: "evaluated lines",
+            });
+        }
+        for r in &requests {
+            verify_evaluated_query(&r.query, evaluated).map_err(|what| {
+                CommercialError::Mismatch {
+                    line_id: r.line_id,
+                    what,
+                }
+            })?;
+        }
+    }
+    line_requests_value(&requests, order)
+}
+
 /// Decode a stored attempt's `line_requests` ([`line_requests_value`]).
 ///
 /// # Errors

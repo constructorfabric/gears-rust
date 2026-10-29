@@ -8,7 +8,7 @@ use crate::domain::dates::DateBasis;
 use crate::domain::gate::answers::{AcceptancePolicy, Market, ResolvedTerms};
 use crate::domain::gate::assess::BasketLine;
 use crate::domain::gate::commercial::{
-    CommercialError, CommercialFacts, FrozenOrder, build_line_requests, line_requests_value,
+    CommercialError, CommercialFacts, FrozenOrder, frozen_line_requests,
 };
 use crate::domain::gate::orchestrate::TenantAxes;
 use bss_pricing_sdk::read::ResolvedBindings;
@@ -79,6 +79,6 @@ impl FrozenLineInputs {
     /// # Errors
     /// A line whose request cannot be frozen or encoded.
     pub fn line_requests(&self, candidate: i32) -> Result<Value, CommercialError> {
-        line_requests_value(&build_line_requests(&self.facts(), candidate)?, &self.order)
+        frozen_line_requests(&self.facts(), candidate, &self.order)
     }
 }

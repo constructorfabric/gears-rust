@@ -2527,6 +2527,26 @@ async fn legacy_scalar_multirecurring_recovery_fails_without_changing_frozen_evi
     assert_eq!(f.t.n(&format!("SELECT count(*) AS n FROM bss_orders__inflight_overlap_claim WHERE order_id='{order}' AND released_at IS NULL")).await,0);
 }
 
+/// D-197 / R3: a frozen query that differs from the frozen Rating request never commits, even
+/// on recovery; nothing is written.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_frozen_query_that_differs_from_the_evaluated_request_never_commits() {
+    let f = setup(fixture(), 10).await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    assert!(matches!(
+        submit(&f, &buyer(), &v, "c2-evaluated").await,
+        Err(OrdersError::Unavailable)
+    ));
+    f.t.env.pg.sql(&format!("SET session_replication_role = replica; UPDATE bss_orders__commercial_attempt SET line_requests = jsonb_set(line_requests, '{{order,evaluation_request,market,region}}', '\"elsewhere\"'::jsonb) WHERE order_id='{order}'; SET session_replication_role = origin")).await.unwrap();
+    lapse_leases(&f, order).await;
+    assert!(matches!(
+        submit_with(&rebind(&f), &buyer(), &v, "c2-evaluated").await,
+        Err(OrdersError::Integration)
+    ));
+    assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
+}
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 #[tracing_test::traced_test]

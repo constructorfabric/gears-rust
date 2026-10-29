@@ -16,16 +16,17 @@ use bss_orders::domain::error::EngineError;
 use bss_orders::domain::gate::answers::{
     AcceptancePolicy, Amount, Availability, BillingTermsRef, BillingTermsSnapshot,
     EvaluationChargeKind, EvaluationCycle, EvaluationTerm, ExactMoney, LineEvaluation, Market,
-    OrderEvaluation, ResolvedTerms, Tcv, TcvBasis, TermsAnchor, TermsProvenance,
-    TermsSnapshotSource, Totals, TotalsDeclaration,
+    OrderEvaluation, OrderEvaluationRequest, ResolvedTerms, Tcv, TcvBasis, TermsAnchor,
+    TermsProvenance, TermsSnapshotSource, Totals, TotalsDeclaration,
 };
 use bss_orders::domain::gate::assess::BasketLine;
 use bss_orders::domain::gate::commercial::{
     CONTRACT_DEFECT_REFUSALS, CommercialError, CommercialFacts, FrozenOrder, LineRequest,
     ORDER_MEMBER, RECORDED_REFUSALS, RECORDED_TERMS_REFUSALS, ReceiptResult, RefusalDisposition,
     SUBMIT_COMMAND, build_line_requests, command_key, contract_defect, decode_line_requests,
-    decode_receipt_result, line_requests_value, receipt_result_value, recorded_refusal,
-    refusal_disposition, version_capacity, version_row_bytes,
+    decode_receipt_result, frozen_line_requests, line_requests_value, receipt_result_value,
+    recorded_refusal, refusal_disposition, verify_evaluated_bindings, verify_evaluated_query,
+    version_capacity, version_row_bytes,
 };
 use bss_orders::domain::gate::orchestrate::TenantAxes;
 use bss_orders::domain::gate::predicates::PredicateId;
@@ -974,6 +975,173 @@ fn the_stub_receipt_pins_round_trip_and_verify_against_the_frozen_request() {
             Err(CodecError::Mismatch)
         );
     }
+}
+
+/// The Rating request the gate builds for `inputs` (the orchestrator's `evaluation_request`).
+fn evaluated_request(inputs: &Inputs) -> OrderEvaluationRequest {
+    use bss_orders::domain::gate::answers::TermIntentInput;
+    use bss_orders::domain::gate::orchestrate::{
+        Basket, GateTarget, LineTermIntent, LineTerms, evaluation_request,
+    };
+    let basket = Basket {
+        assessed_at: anchor_at(),
+        target: GateTarget::Submit { order_id: ORDER },
+        assessment_id: Uuid::from_u128(70),
+        axes: axes(),
+        contract_id: None,
+        lines: inputs.lines.clone(),
+        terms: inputs
+            .lines
+            .iter()
+            .map(|l| {
+                (
+                    l.line_id,
+                    LineTerms {
+                        intent: LineTermIntent::Stated(TermIntentInput::Fixed { months: 12 }),
+                        cycle: Some(EvaluationCycle::Month),
+                    },
+                )
+            })
+            .collect(),
+        resolve_date: day(),
+        dates: inputs.basis.clone(),
+    };
+    let bindings = inputs
+        .bindings
+        .iter()
+        .map(|(line, resolved)| {
+            (
+                *line,
+                resolved
+                    .cells
+                    .iter()
+                    .map(|c| c.binding.clone().unwrap())
+                    .collect(),
+            )
+        })
+        .collect();
+    let terms: Vec<ResolvedTerms> = inputs.terms.values().cloned().collect();
+    evaluation_request(
+        &basket,
+        &bindings,
+        Some(&terms),
+        inputs.market.as_ref(),
+        Some(&inputs.policy),
+    )
+    .unwrap()
+    .unwrap()
+}
+
+/// D-197 / R3: each frozen query equals the Rating request its totals were evaluated from;
+/// members a legacy snapshot omits are not compared and never fabricated.
+#[test]
+fn frozen_requests_must_equal_the_evaluated_request() {
+    let inputs = two_lines();
+    let evaluated = evaluated_request(&inputs);
+    let requests = build_line_requests(&inputs.facts(), CANDIDATE).unwrap();
+    for r in &requests {
+        assert_eq!(
+            verify_evaluated_query(&r.query, &evaluated),
+            Ok(()),
+            "{}",
+            r.line_id
+        );
+    }
+    // R3: Rating priced 12 periods; the frozen query says 24.
+    let mut longer = two_lines();
+    longer.terms.get_mut(&line_id(1)).unwrap().term = EvaluationTerm::FixedPeriods { count: 24 };
+    let longer_requests = build_line_requests(&longer.facts(), CANDIDATE).unwrap();
+    assert_eq!(
+        verify_evaluated_query(&longer_requests[0].query, &evaluated),
+        Err("evaluated term")
+    );
+    let differs = |f: &dyn Fn(&mut OrderEvaluationRequest), what: &'static str| {
+        let mut request = evaluated.clone();
+        f(&mut request);
+        assert_eq!(
+            verify_evaluated_query(&requests[0].query, &request),
+            Err(what)
+        );
+    };
+    differs(&|r| r.market.currency = "EUR".into(), "evaluated market");
+    differs(&|r| r.market.region = "EU".into(), "evaluated market");
+    differs(
+        &|r| r.lines.retain(|l| l.line_id != line_id(1)),
+        "evaluated line",
+    );
+    differs(
+        &|r| r.lines[0].plan_revision_id = Uuid::nil(),
+        "evaluated revision",
+    );
+    differs(
+        &|r| r.lines[0].cycle = EvaluationCycle::Year,
+        "evaluated cycle",
+    );
+    differs(
+        &|r| r.lines[0].items[0].quantity = "9".into(),
+        "evaluated selections",
+    );
+    differs(
+        &|r| r.acceptance_policy.as_mut().unwrap().version = "8".into(),
+        "evaluated hold policy version",
+    );
+    let mut legacy = evaluated.clone();
+    legacy.tenant_axes = None;
+    legacy.acceptance_policy = None;
+    for line in &mut legacy.lines {
+        line.plan_id = None;
+        line.start_at = None;
+        line.resolved_terms = None;
+    }
+    for r in &requests {
+        assert_eq!(
+            verify_evaluated_query(&r.query, &legacy),
+            Ok(()),
+            "legacy {}",
+            r.line_id
+        );
+    }
+    // The pre-reservation build refuses the mismatch; a legacy order without a request builds.
+    let mut order = frozen_order(&inputs.lines);
+    order.evaluation_request = Some(evaluated);
+    assert!(frozen_line_requests(&inputs.facts(), CANDIDATE, &order).is_ok());
+    assert!(matches!(
+        frozen_line_requests(&longer.facts(), CANDIDATE, &order),
+        Err(CommercialError::Mismatch { line_id: l, what: "evaluated term" }) if l == line_id(1)
+    ));
+    order.evaluation_request = None;
+    assert!(frozen_line_requests(&longer.facts(), CANDIDATE, &order).is_ok());
+}
+
+/// D-197: the issued receipt's bindings are the evaluated ones; a legacy binding without its
+/// native member compares the projected identity.
+#[test]
+fn the_issued_bindings_must_be_the_evaluated_bindings() {
+    let inputs = two_lines();
+    let evaluated = evaluated_request(&inputs);
+    let requests = build_line_requests(&inputs.facts(), CANDIDATE).unwrap();
+    let query = &requests[0].query;
+    let receipt = stub_receipt(&inputs, line_id(1), CANDIDATE);
+    assert_eq!(
+        verify_evaluated_bindings(query, &receipt.bindings, &evaluated),
+        Ok(())
+    );
+    let mut legacy = evaluated.clone();
+    legacy.lines[0].items[0].chains[0].binding.native_binding = None;
+    assert_eq!(
+        verify_evaluated_bindings(query, &receipt.bindings, &legacy),
+        Ok(())
+    );
+    let mut other = receipt.bindings;
+    other[0].sku_version += 1;
+    assert_eq!(
+        verify_evaluated_bindings(query, &other, &evaluated),
+        Err("evaluated bindings")
+    );
+    assert_eq!(
+        verify_evaluated_bindings(query, &[], &evaluated),
+        Err("evaluated bindings")
+    );
 }
 
 #[test]

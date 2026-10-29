@@ -15,7 +15,9 @@
 //! 4. every receipt becomes the line's schema-2 pin ([`OrderPin::new`], the only constructor),
 //!    bound to the committed row `(order, candidate, line)` and verified against the frozen
 //!    query, the frozen request digest and the terms digest recomputed over the receipt's
-//!    bindings ([`OrderPin::verify_selection`]); any mismatch fails closed (`Integration`, D-192);
+//!    bindings ([`OrderPin::verify_selection`]) and, when the attempt froze the Rating request,
+//!    against that request ([`verify_evaluated_query`], [`verify_evaluated_bindings`], D-197);
+//!    any mismatch fails closed (`Integration`, D-192);
 //! 5. the admitted line rows ([`admitted_line`] plus the commercial columns, the encoded pin and
 //!    the claimed overlap key) and the `resolved_total` rows ([`total_rows`]) are built; an
 //!    evaluation that cannot be stored refuses `evaluation-unavailable`, and one not in the
@@ -37,7 +39,8 @@ use crate::domain::contributions::{AggregateContribution, VersionContribution};
 use crate::domain::dates::DateBasis;
 use crate::domain::gate::commercial::{
     FrozenLine, FrozenRequests, ReceiptResult, RefusalDisposition, decode_receipt_result,
-    digest_hex, persisted, refusal_disposition, version_capacity, version_row_bytes,
+    digest_hex, persisted, refusal_disposition, verify_evaluated_bindings, verify_evaluated_query,
+    version_capacity, version_row_bytes,
 };
 use crate::domain::gate::totals::{TotalRow, total_rows};
 use crate::domain::guards::{GATE_COMPOSITE, GUARDS, InputPort};
@@ -430,6 +433,19 @@ impl SubmitPreparation {
             },
         )
         .map_err(|_| integration(ids, "the receipt does not match the frozen request (D-192)"))?;
+        // D-197: the receipt equals what Rating evaluated (selection, quantity, market, terms,
+        // bindings); a legacy attempt without the frozen request is not compared.
+        if let Some(evaluated) = &order.evaluation_request {
+            verify_evaluated_query(&line.query, evaluated)
+                .and_then(|()| verify_evaluated_bindings(&line.query, &bindings, evaluated))
+                .map_err(|what| {
+                    integration_with(
+                        ids,
+                        "the receipt does not match the evaluated request (D-197)",
+                        &what,
+                    )
+                })?;
+        }
         let encoded = pin
             .encode()
             .map_err(|_| integration(ids, "the pin does not encode"))?;

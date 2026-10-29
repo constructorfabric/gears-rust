@@ -463,7 +463,7 @@ const fn charge_kind(k: &ChargeKind) -> EvaluationChargeKind {
 ///
 /// # Errors
 /// The schema-2 codec's refusal of a binding it cannot write (an out-of-range scalar).
-fn evaluation_binding(b: &AcceptedBinding) -> Result<EvaluationBinding, CodecError> {
+pub(super) fn evaluation_binding(b: &AcceptedBinding) -> Result<EvaluationBinding, CodecError> {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let money_digest = b
         .price
