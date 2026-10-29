@@ -927,21 +927,27 @@ async fn overlapping_ingest_batches() {
         return;
     };
     let repeats = repeats();
-    let tenant = Uuid::now_v7();
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-    let mut types = conformance::ontology_batch();
-    types.retain(|registration| registration.type_id != conformance::OWNED);
-    types.push(seeded_type());
-    stand
-        .store
-        .register_types(&ctx, types)
-        .await
-        .expect("the ontology registers");
 
     // (keys in the pool, nodes per batch, writers, batches per writer)
     for (pool, per_batch, writers, rounds) in [(200, 50, 8, 10), (60, 40, 16, 6)] {
         for repeat in 0..repeats {
+            // A tenant of its own per repeat, so every repeat starts with no
+            // key of the pool stored: the first batches then race to create
+            // keys, the later ones to update them, in every repeat alike.
+            let tenant = Uuid::now_v7();
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = conformance::ctx(tenant, &scope, None);
+            graph_storage::infra::store::ingest::ensure_meta(stand.store.as_ref(), tenant, &scope)
+                .await
+                .expect("meta rows exist");
+            let mut types = conformance::ontology_batch();
+            types.retain(|registration| registration.type_id != conformance::OWNED);
+            types.push(seeded_type());
+            stand
+                .store
+                .register_types(&ctx, types)
+                .await
+                .expect("the ontology registers");
             let scenario =
                 format!("overlapping ingest: {writers} writers x {per_batch} of {pool} keys");
             let started = Instant::now();
@@ -997,13 +1003,17 @@ async fn overlapping_ingest_batches() {
             let (mut committed, mut serialization, mut conflict, mut deadline, mut other) =
                 (0usize, 0usize, 0usize, 0usize, 0usize);
             let mut samples = Vec::new();
+            let mut reasons = std::collections::BTreeMap::new();
             for task in tasks {
                 for (elapsed, error) in task.await.expect("the writer does not panic") {
                     samples.push(elapsed);
                     match error {
                         None => committed += 1,
                         Some(GraphStoreError::Serialization) => serialization += 1,
-                        Some(GraphStoreError::Conflict { .. }) => conflict += 1,
+                        Some(GraphStoreError::Conflict { reason }) => {
+                            conflict += 1;
+                            *reasons.entry(reason).or_insert(0usize) += 1;
+                        }
                         Some(GraphStoreError::Deadline) => deadline += 1,
                         Some(error) => {
                             other += 1;
@@ -1021,6 +1031,11 @@ async fn overlapping_ingest_batches() {
                 runs,
             };
             report(repeat, 0.0, "-", &scenario, &measured);
+            for (reason, times) in &reasons {
+                println!(
+                    "CONFLICT rep={repeat} scenario=\"{scenario}\" times={times} reason=\"{reason}\""
+                );
+            }
             println!(
                 "CONTENTION rep={repeat} scenario=\"{scenario}\" committed={committed} \
                  serialization={serialization} conflict={conflict} deadline={deadline} \
