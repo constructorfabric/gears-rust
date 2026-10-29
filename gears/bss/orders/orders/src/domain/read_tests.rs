@@ -417,3 +417,25 @@ fn line_cursor_version_comes_from_the_validated_decode() {
     let plain = encode_cursor(lines, position()).unwrap();
     assert_eq!(decode_cursor_bound(&plain, lines).unwrap().version, None);
 }
+
+/// D-242: `main` issued line tokens without the version member, and `main` never committed a
+/// version, so such a token is bound to the creation version; a bound token keeps its own.
+#[test]
+fn a_version_less_line_token_is_bound_to_the_creation_version() {
+    let hash = no_filters_hash();
+    let lines = CursorBinding {
+        collection: Collection::Lines,
+        parent: Some(u(9)),
+        ..binding(&hash)
+    };
+    let main = decode_cursor_bound(&encode_cursor(lines, position()).unwrap(), lines).unwrap();
+    assert_eq!(main.version, None);
+    assert_eq!(main.line_version(), 1);
+    assert_eq!(main.line_version(), MAIN_LINE_CURSOR_VERSION);
+    let bound = decode_cursor_bound(
+        &encode_cursor_version(lines, position(), Some(4)).unwrap(),
+        lines,
+    )
+    .unwrap();
+    assert_eq!(bound.line_version(), 4);
+}

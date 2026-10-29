@@ -431,10 +431,11 @@ impl ReadService {
             .targeted(&parts, caller, operation, order_id, &load)
             .await?;
         ensure_readable(&snapshot.row)?;
-        // A line continuation is bound to the version it was issued at; one without a binding
-        // or at another version is refused (D-64: `current_version` is set from creation).
+        // A line continuation is bound to the version it was issued at; one at another version
+        // is refused (D-64: `current_version` is set from creation). A token `main` issued
+        // carries no binding and was issued at the creation version (D-242).
         if let Some(decoded) = decoded
-            && decoded.version != Some(snapshot.row.current_version)
+            && decoded.line_version() != snapshot.row.current_version
         {
             return Err(OrdersError::Refused(Reason::CursorInvalid));
         }

@@ -213,6 +213,11 @@ pub fn decode_cursor(
     decode_cursor_bound(cursor, binding).map(|decoded| decoded.position)
 }
 
+/// The version a line token issued by `main` is bound to (D-242). `main`'s token had no version
+/// member, and `main` never committed a version, so every line token it issued was at the
+/// creation version.
+pub const MAIN_LINE_CURSOR_VERSION: i32 = 1;
+
 /// A validated continuation token: where to continue and the commercial version it is bound to.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -220,9 +225,18 @@ pub struct DecodedCursor {
     /// The position to continue strictly after.
     pub position: Position,
     /// The version binding, read from the same validated decode; `None` for an order-list
-    /// token. A token without a binding is not a line token; the line path refuses it
-    /// (`cursor-invalid`).
+    /// token and for a line token `main` issued, which [`Self::line_version`] binds to
+    /// [`MAIN_LINE_CURSOR_VERSION`].
     pub version: Option<i32>,
+}
+
+impl DecodedCursor {
+    /// The commercial version a line token is bound to: its own binding, or
+    /// [`MAIN_LINE_CURSOR_VERSION`] for a token `main` issued without one (D-242).
+    #[must_use]
+    pub fn line_version(self) -> i32 {
+        self.version.unwrap_or(MAIN_LINE_CURSOR_VERSION)
+    }
 }
 
 /// [`decode_cursor`] that also returns the token's version binding, so a caller never decodes
