@@ -24,10 +24,13 @@ use super::subject_settings::{SubjectKey, SubjectSettingsReader};
 /// The policy property that names a profile category.
 pub const CATEGORY_PROPERTY: &str = "category";
 
+/// The GTS type a policy names a subject's profile by.
+pub(crate) const PROFILE_TYPE: &str = toolkit_gts::gts_id!("cf.construct.subject.profile.v1~");
+
 /// Authorization resource type for a subject's profile, scoped by tenant, by
 /// subject and by category.
 pub(crate) const PROFILE_RESOURCE: ResourceType = ResourceType::from_static(
-    "construct.profile",
+    PROFILE_TYPE,
     &[
         pep_properties::OWNER_TENANT_ID,
         pep_properties::RESOURCE_ID,
@@ -153,24 +156,6 @@ fn profile_request(key: SubjectKey, category: Option<Category>) -> AccessRequest
     }
 }
 
-/// Who asks for a profile: the subject itself, in its own tenant, or anyone
-/// else, such as an agent or application acting for the subject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Reader {
-    Owner,
-    Other,
-}
-
-impl Reader {
-    fn of(ctx: &SecurityContext, key: SubjectKey) -> Self {
-        if ctx.subject_id() == key.subject_id && ctx.subject_tenant_id() == key.tenant_id {
-            Self::Owner
-        } else {
-            Self::Other
-        }
-    }
-}
-
 /// The categories a category filter names; a value that names no category
 /// names nothing.
 fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> HashSet<Category> {
@@ -189,17 +174,12 @@ fn named_categories<'a>(values: impl IntoIterator<Item = &'a ScopeValue>) -> Has
 /// memory (a group or tenant-subtree filter) grants nothing, and so does a
 /// filter on a property the profile has not.
 ///
-/// Only the subject reads its profile on a constraint that limits the tenant
-/// alone. Anyone else needs a constraint that names the subject: a tenant
-/// constraint says which tenant's resources a caller reaches, not that it may
-/// act for every subject in it.
-fn granted_by(
-    constraint: &ScopeConstraint,
-    reader: Reader,
-    key: SubjectKey,
-) -> Option<HashSet<Category>> {
+/// Reading profiles is a permission of its own, which the platform grants to
+/// the applications and agents that act for the tenant's subjects: a
+/// constraint that reaches the tenant lets the caller read every subject in
+/// it. A policy may narrow that to named subjects with a resource id filter.
+fn granted_by(constraint: &ScopeConstraint, key: SubjectKey) -> Option<HashSet<Category>> {
     let mut named: Option<HashSet<Category>> = None;
-    let mut names_subject = false;
     for filter in constraint.filters() {
         if !filter.is_representable_in_memory() {
             return None;
@@ -209,8 +189,7 @@ fn granted_by(
         match filter.property() {
             pep_properties::OWNER_TENANT_ID if !holds(key.tenant_id) => return None,
             pep_properties::RESOURCE_ID if !holds(key.subject_id) => return None,
-            pep_properties::OWNER_TENANT_ID => {}
-            pep_properties::RESOURCE_ID => names_subject = true,
+            pep_properties::OWNER_TENANT_ID | pep_properties::RESOURCE_ID => {}
             CATEGORY_PROPERTY => {
                 let these = named_categories(&values);
                 named = Some(match named {
@@ -220,9 +199,6 @@ fn granted_by(
             }
             _ => return None,
         }
-    }
-    if reader == Reader::Other && !names_subject {
-        return None;
     }
     Some(named.unwrap_or_else(|| Category::ALL.into_iter().collect()))
 }
@@ -234,15 +210,15 @@ fn granted_by(
 ///
 /// The read asks with constraints required, so the enforcer never answers
 /// with an unconstrained scope; one that does is the platform allowing
-/// everything, and grants every category to any reader.
-fn granted(scope: &AccessScope, reader: Reader, key: SubjectKey) -> Option<HashSet<Category>> {
+/// everything, and grants every category.
+fn granted(scope: &AccessScope, key: SubjectKey) -> Option<HashSet<Category>> {
     if scope.is_unconstrained() {
         return Some(Category::ALL.into_iter().collect());
     }
     scope
         .constraints()
         .iter()
-        .filter_map(|constraint| granted_by(constraint, reader, key))
+        .filter_map(|constraint| granted_by(constraint, key))
         .reduce(|mut all, these| {
             all.extend(these);
             all
@@ -393,7 +369,6 @@ impl ProfileReadService {
             tenant_id: Self::tenant_of(ctx, tenant),
             subject_id,
         };
-        let reader = Reader::of(ctx, key);
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -405,7 +380,7 @@ impl ProfileReadService {
             )
             .await
             .map_err(not_visible)?;
-        let Some(granted) = granted(&scope, reader, key) else {
+        let Some(granted) = granted(&scope, key) else {
             return Err(DomainError::NotVisible(
                 "the policy scope does not reach the subject".to_owned(),
             ));
@@ -430,9 +405,7 @@ impl ProfileReadService {
         let readable = match (served, self.check) {
             (false, _) => HashSet::new(),
             (true, CategoryCheck::OneCall) => granted,
-            (true, CategoryCheck::PerCategory) => {
-                self.readable_one_by_one(ctx, reader, key).await?
-            }
+            (true, CategoryCheck::PerCategory) => self.readable_one_by_one(ctx, key).await?,
         };
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-categories
 
@@ -463,7 +436,6 @@ impl ProfileReadService {
     async fn readable_one_by_one(
         &self,
         ctx: &SecurityContext,
-        reader: Reader,
         key: SubjectKey,
     ) -> Result<HashSet<Category>, DomainError> {
         let decisions = join_all(Category::ALL.into_iter().map(|category| async move {
@@ -485,8 +457,7 @@ impl ProfileReadService {
         for (category, decided) in decisions {
             match decided {
                 Ok(scope) => {
-                    if granted(&scope, reader, key)
-                        .is_some_and(|categories| categories.contains(&category))
+                    if granted(&scope, key).is_some_and(|categories| categories.contains(&category))
                     {
                         readable.insert(category);
                     }
@@ -558,16 +529,43 @@ mod tests {
     }
 
     #[test]
-    fn an_unconstrained_scope_grants_every_category_to_any_reader() {
-        for reader in [Reader::Owner, Reader::Other] {
-            let categories = granted(&AccessScope::allow_all(), reader, key());
+    fn an_unconstrained_scope_grants_every_category() {
+        assert_eq!(
+            granted(&AccessScope::allow_all(), key()),
+            Some(Category::ALL.into_iter().collect())
+        );
+    }
 
-            assert_eq!(
-                categories,
-                Some(Category::ALL.into_iter().collect()),
-                "{reader:?}"
-            );
-        }
+    #[test]
+    fn a_tenant_constraint_grants_every_subject_in_the_tenant_and_no_other_tenant() {
+        let key = key();
+        let tenant = AccessScope::for_tenant(key.tenant_id);
+
+        assert_eq!(
+            granted(&tenant, key),
+            Some(Category::ALL.into_iter().collect())
+        );
+        let elsewhere = SubjectKey {
+            tenant_id: Uuid::new_v4(),
+            ..key
+        };
+        assert_eq!(granted(&tenant, elsewhere), None);
+    }
+
+    #[test]
+    fn a_resource_id_filter_narrows_the_grant_to_the_subjects_it_names() {
+        let key = key();
+        let scope = AccessScope::single(path_to(key, &[Category::Skill]));
+
+        assert_eq!(
+            granted(&scope, key),
+            Some([Category::Skill].into_iter().collect())
+        );
+        let other = SubjectKey {
+            subject_id: Uuid::new_v4(),
+            ..key
+        };
+        assert_eq!(granted(&scope, other), None);
     }
 
     /// One path to the profile at `key`, granting `categories`.
@@ -594,7 +592,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            granted(&scope, Reader::Other, key),
+            granted(&scope, key),
             Some([Category::Skill, Category::Role].into_iter().collect())
         );
     }
