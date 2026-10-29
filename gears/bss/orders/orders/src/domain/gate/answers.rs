@@ -705,6 +705,22 @@ impl TryFrom<ExactMoneyWire> for ExactMoney {
     }
 }
 
+/// The canonical text of `numerator / denominator` reduced to lowest terms by the money
+/// library, when both parts are canonical integer text and the denominator is positive; `None`
+/// otherwise. Only the stored-attempt decode uses it (D-242): an attempt frozen before D-241 may
+/// hold a pair with a common factor, while [`ExactMoney::new`] keeps refusing one on the wire.
+pub(crate) fn reduced_fraction(numerator: &str, denominator: &str) -> Option<(String, String)> {
+    ExactAmount::parse_fraction("1", denominator).ok()?;
+    let numerator = ExactAmount::parse_fraction(numerator, "1").ok()?;
+    let denominator = ExactAmount::parse_fraction(denominator, "1").ok()?;
+    Some(
+        numerator
+            .checked_div(&denominator)
+            .ok()?
+            .canonical_fraction(),
+    )
+}
+
 /// An exact amount with its display text (#5390).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

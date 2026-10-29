@@ -34,6 +34,7 @@
 use super::answers::{
     AcceptancePolicy, BillingTermsSnapshot, EvaluationCycle, EvaluationTerm, Market,
     OrderEvaluation, OrderEvaluationRequest, ResolvedTerms, TermsAnchor, TermsSnapshotSource,
+    reduced_fraction,
 };
 use super::assess::BasketLine;
 use super::orchestrate::TenantAxes;
@@ -536,13 +537,15 @@ pub fn decode_line_requests(value: &Value) -> Result<FrozenRequests, MalformedRe
     let members = value
         .as_object()
         .ok_or(MalformedRequests::member("not an object"))?;
-    let order: FrozenOrder = serde_json::from_value(
-        members
-            .get(ORDER_MEMBER)
-            .cloned()
-            .ok_or(MalformedRequests::member("order"))?,
-    )
-    .map_err(|_| MalformedRequests::member("order"))?;
+    let mut order_value = members
+        .get(ORDER_MEMBER)
+        .cloned()
+        .ok_or(MalformedRequests::member("order"))?;
+    if let Some(evaluation) = order_value.get_mut("evaluation") {
+        reduce_stored_money(evaluation);
+    }
+    let order: FrozenOrder =
+        serde_json::from_value(order_value).map_err(|_| MalformedRequests::member("order"))?;
     let mut lines = Vec::with_capacity(members.len().saturating_sub(1));
     for (member, entry) in members {
         if member == ORDER_MEMBER {
@@ -633,6 +636,39 @@ pub fn decode_line_requests(value: &Value) -> Result<FrozenRequests, MalformedRe
         return Err(MalformedRequests::member("no lines"));
     }
     Ok(FrozenRequests { lines, order })
+}
+
+/// Rewrite every stored exact-money object (`{numerator, denominator, currency,
+/// currency_scale}`) under a frozen evaluation to its reduced fraction (D-242). Attempts frozen
+/// before D-241 may hold a pair with a common factor that Orders then accepted and reduced when
+/// rendering totals, so the reduced pair commits the same totals. A pair whose parts are not
+/// canonical integer text is left as stored, and the strict [`ExactMoney`] decode refuses it.
+///
+/// [`ExactMoney`]: super::answers::ExactMoney
+fn reduce_stored_money(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            let money = map.len() == 4
+                && map.contains_key("currency")
+                && map.contains_key("currency_scale");
+            let reduced = if money {
+                match (map.get("numerator"), map.get("denominator")) {
+                    (Some(Value::String(n)), Some(Value::String(d))) => reduced_fraction(n, d),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            if let Some((numerator, denominator)) = reduced {
+                map.insert("numerator".to_owned(), Value::String(numerator));
+                map.insert("denominator".to_owned(), Value::String(denominator));
+                return;
+            }
+            map.values_mut().for_each(reduce_stored_money);
+        }
+        Value::Array(items) => items.iter_mut().for_each(reduce_stored_money),
+        _ => {}
+    }
 }
 
 /// 64 lowercase hexadecimal digits as a digest ([`digest_hex`]'s inverse).

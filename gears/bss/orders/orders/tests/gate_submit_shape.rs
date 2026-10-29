@@ -2197,6 +2197,59 @@ fn frozen_order_decodes_a_report_written_as_value() {
     );
 }
 
+/// D-242: an attempt frozen before D-241 may hold an exact pair with a common factor, which
+/// Orders then accepted and reduced when rendering totals. The stored decode reduces it, so the
+/// attempt still recovers with the same totals instead of failing as `Integration` on every
+/// retry; a part that was never canonical still refuses, and the wire stays strict.
+#[test]
+fn a_stored_unreduced_exact_pair_decodes_reduced() {
+    let reference = decode_line_requests(&serde_json::from_str(LEGACY_ATTEMPT).unwrap()).unwrap();
+    let mut value: serde_json::Value = serde_json::from_str(LEGACY_ATTEMPT).unwrap();
+    let evaluation = &mut value[ORDER_MEMBER]["evaluation"];
+    evaluation["order_totals"]["gross"]["exact"]["numerator"] = serde_json::json!("40");
+    evaluation["order_totals"]["gross"]["exact"]["denominator"] = serde_json::json!("2");
+    evaluation["lines"][0]["totals"]["net"]["exact"]["numerator"] = serde_json::json!("30");
+    evaluation["lines"][0]["totals"]["net"]["exact"]["denominator"] = serde_json::json!("3");
+    evaluation["tcv"]["exact"]["numerator"] = serde_json::json!("480");
+    evaluation["tcv"]["exact"]["denominator"] = serde_json::json!("2");
+    let decoded = decode_line_requests(&value).unwrap();
+    assert_eq!(decoded.order.evaluation, reference.order.evaluation);
+    assert_eq!(
+        decoded
+            .order
+            .evaluation
+            .order_totals
+            .gross
+            .exact
+            .numerator(),
+        "20"
+    );
+    assert_eq!(
+        decoded
+            .order
+            .evaluation
+            .order_totals
+            .gross
+            .exact
+            .denominator(),
+        "1"
+    );
+    // A part that is not canonical integer text is not a legacy pair: still unreadable evidence.
+    value[ORDER_MEMBER]["evaluation"]["order_totals"]["gross"]["exact"]["numerator"] =
+        serde_json::json!("040");
+    assert_eq!(
+        decode_line_requests(&value).map(|_| ()),
+        Err(bss_orders::domain::gate::commercial::MalformedRequests::member("order"))
+    );
+    // The port wire stays strict (money ADR rule 6, D-241 item 2).
+    assert!(
+        serde_json::from_value::<ExactMoney>(serde_json::json!({
+            "numerator": "40", "denominator": "2", "currency": "USD", "currency_scale": 2
+        }))
+        .is_err()
+    );
+}
+
 #[test]
 fn line_requests_value_is_byte_stable_with_typed_digest() {
     let inputs = two_lines();
