@@ -26,14 +26,14 @@ description: Seed, uninstall, schema reads, and operation reads run on the platf
 
 ## Context and Problem Statement
 
-The gear manages applications installed into the whole environment, so its records belong to the platform, not to a tenant. Seeding callers are deploy jobs and other platform workloads, while operators read history and the application list with their own login. The platform separates tenant-scoped work, which uses a tenant `SecurityContext` and the PDP, from platform work, which uses a `PlatformSecurityContext` that the PDP never evaluates (`cpt-cf-adr-two-plane-auth`). Which plane does each action use, who grants it, and how are the records scoped?
+The gear manages applications installed into the whole environment, so its records belong to the platform, not to a tenant. Seeding callers are deploy jobs and other platform workloads, while operators read history and the application list with their own login. The platform separates tenant-scoped work, which uses a tenant `SecurityContext` and the PDP, from platform work, which uses a `PlatformSecurityContext` that the PDP never evaluates ([two-plane auth ADR](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)). Which plane does each action use, who grants it, and how are the records scoped?
 
 ## Decision Drivers
 
 * `cpt-cf-application-manager-fr-authorization`, `cpt-cf-application-manager-fr-authentication`
 * `cpt-cf-application-manager-nfr-platform-scope`, `cpt-cf-application-manager-nfr-authorized-before-plugin`
 * `cpt-cf-application-manager-fr-list-applications`, `cpt-cf-application-manager-fr-history-read`
-* `cpt-cf-adr-two-plane-auth`
+* [Two-plane auth ADR](../../../../../docs/arch/toolkit-oop/ADR/0008-cpt-cf-adr-two-plane-auth.md)
 
 ## Considered Options
 
