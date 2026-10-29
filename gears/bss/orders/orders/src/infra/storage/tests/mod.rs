@@ -70,6 +70,23 @@ impl Pg {
 fn u(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
+/// The line token `main` issued at the same position: this branch's validated token without the
+/// version member `r` it added (D-242). `main`'s `Token` had no `r`; key order aside, this is
+/// its token.
+fn main_line_cursor(token: &bss_orders_sdk::reads::Cursor) -> bss_orders_sdk::reads::Cursor {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(token.as_str()).unwrap()).unwrap();
+    assert!(
+        value.as_object_mut().unwrap().remove("r").is_some(),
+        "a line token carries its version"
+    );
+    bss_orders_sdk::reads::Cursor::try_from(
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap()),
+    )
+    .unwrap()
+}
 /// The server's answer to a refused statement, by SQLSTATE and constraint name: never the
 /// (localized) message text or a `Debug` layout.
 fn database_error(error: &sea_orm::DbErr) -> Option<&dyn sea_orm::sqlx::error::DatabaseError> {

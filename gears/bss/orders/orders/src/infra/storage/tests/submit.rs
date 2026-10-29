@@ -2749,6 +2749,39 @@ async fn submitted_line_read_rejects_a_cursor_from_the_draft_version() {
     ));
 }
 
+/// D-242: a line token `main` issued is bound to the creation version, so once the draft commits
+/// it is refused like any token from the draft version.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_line_cursor_issued_by_main_is_refused_after_the_draft_commits() {
+    use bss_orders_sdk::reads::{LineList, PageSize};
+    let f = setup_with(two_line_fixture(), 10, true).await;
+    let v = draft(&f, 2).await;
+    let reads = f.t.reads();
+    let request = |cursor| LineList {
+        limit: Some(PageSize::try_from(1).unwrap()),
+        cursor,
+    };
+    let first = reads
+        .list_lines(&buyer(), v.order.order_id, &request(None))
+        .await
+        .unwrap();
+    let main_token = main_line_cursor(first.page_info.next_cursor.as_ref().unwrap());
+    assert_eq!(
+        submit(&f, &buyer(), &v, "main-cursor-submit")
+            .await
+            .unwrap()
+            .outcome,
+        SettledOutcome::Committed
+    );
+    assert!(matches!(
+        reads
+            .list_lines(&buyer(), v.order.order_id, &request(Some(main_token)))
+            .await,
+        Err(OrdersError::Refused(Reason::CursorInvalid))
+    ));
+}
+
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn submitted_reads_hide_denied_orders_and_reject_inconsistent_committed_selection() {

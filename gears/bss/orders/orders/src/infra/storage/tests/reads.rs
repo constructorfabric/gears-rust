@@ -450,6 +450,35 @@ async fn line_tokens_bind_principal_parent_and_collection() {
     assert_eq!(r.log_count().await, 0, "input validation appends no row");
 }
 
+/// D-242: a line token `main` issued (no version member) keeps paging the draft it was issued
+/// for: `main` could only have issued it at the creation version.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_line_cursor_issued_by_main_continues_the_draft_page() {
+    let r = R::new().await;
+    let (id, lines) = r.draft("p", 3).await;
+    let request = |cursor: Option<Cursor>| LineList {
+        limit: Some(PageSize::try_from(2).unwrap()),
+        cursor,
+    };
+    let first = r
+        .reads
+        .list_lines(&buyer(), id, &request(None))
+        .await
+        .unwrap();
+    let token = first.page_info.next_cursor.expect("a third line follows");
+    let page = r
+        .reads
+        .list_lines(&buyer(), id, &request(Some(main_line_cursor(&token))))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|l| l.line_id).collect::<Vec<_>>(),
+        lines[2..]
+    );
+    assert_eq!(i64::from(page.current_version), 1);
+}
+
 /// §4.4 rows 2–3 and the refused row on the point/child reads: a supplied proof on an own-tenant
 /// read logs; direct seller and payer reads log with a NULL proof; the delegated partner logs
 /// the proof PDP accepted; the partner without it is `order-not-found` with the classified
