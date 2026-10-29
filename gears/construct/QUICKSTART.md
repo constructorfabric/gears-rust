@@ -14,7 +14,9 @@ Record intake for connectors and the profile read for applications and agents. A
 - `GET /construct/v1/subjects/{subject_id}/profile`: the subject's facts by category, for a caller the platform grants the permission to read profiles (`gts.cf.construct.subject.profile.v1~` / `read`), in the caller's tenant or the one named in `tenant`. A category the caller may not read is not listed
 - An in-process client, `ConstructClientV1::submit_record` and `read_profile`, runs the same operations
 - The gear needs graph storage in its host
-- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, and read or change one's own personalization settings. The tenant grants each in its policy engine
+- `GET /construct/v1/subjects/{subject_id}/facts`, `GET` and `DELETE …/facts/{fact_id}`: the subject's own facts, paged (`limit` up to 200, `cursor`, `$filter`, `$orderby`), one fact, and its soft delete; owner only, another subject answers `404`
+- `GET /construct/v1/subjects/{subject_id}/export`: all of a subject's data in the caller's tenant as a JSON attachment, for the data protection officer
+- Construct declares its permissions as GTS permission instances: send records, read profiles, manage facts, read or change one's own personalization settings, read or delete one's own facts, and export a subject's data. The tenant grants each in its policy engine
 
 Full API documentation: <http://127.0.0.1:8087/cf/docs>
 
