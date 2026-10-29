@@ -25,7 +25,10 @@
 //! 6. the guards: `gate.has-lines`, the shared structural guards, `gate.binding-admission`
 //!    (a recorded lapsed hold, a single pin or the whole version over the byte limit, then
 //!    every receipt's exclusive `hold_until` against the transition time),
-//!    `capture.date-basis` and the composite gate;
+//!    `capture.date-basis` and the composite gate. A single pin's size is judged when step 4
+//!    builds it, before that receipt's selection verification: an oversized receipt settles
+//!    `purchase-capacity-exceeded` even if it would also fail D-192/D-197 verification, and
+//!    nothing commits either way (D-242 item 15);
 //!    the version contribution names the reserved candidate, the claims are the frozen keys,
 //!    the event is `OrderSubmitted`; the settlement carries the frozen gate report and the
 //!    engine writes the frozen outcome vector as the run's diagnostics, whether this call

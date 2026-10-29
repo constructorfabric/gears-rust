@@ -138,7 +138,7 @@ pub fn validated_line_keys(
     result
 }
 
-/// The keys the gate reads occupancy and the in-flight lookups for, flattened in line order, or
+/// The keys the gate reads occupancy and the in-flight lookups for, flattened in line-id order, or
 /// `None` when the answer is rejected before reads (`SUBSCRIPTIONS_CONTRACT.md` exact coverage: an
 /// omitted, extra, foreign, duplicate, mismatched or conflicting answer): a foreign or extra
 /// entry, or any requested line without a validated collection. The orchestrator reads nothing

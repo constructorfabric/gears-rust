@@ -1017,6 +1017,9 @@ pub struct Tcv {
 }
 
 /// The order evaluation answer (#5175).
+///
+/// Persisted in frozen attempts: a new [`ExactMoney`] member must also be reduced by
+/// `commercial::reduce_stored_money` on the stored decode (D-242 item 2).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderEvaluation {
