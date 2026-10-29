@@ -810,7 +810,7 @@ projection loses it nothing.
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
 - **Residual ask**: confirm the projection schema of each of the eleven events against the members
   the start trigger and every `listen` keep (`design/10-process-definition.md` §2.2), and confirm that
-  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `acceptance` member (`accepted_version`, `accepted_at`; present only on a self-service submit, Lifecycle D-243; decision D-238)
+  `OrderCompleted`'s per-line line-to-subscription mapping and `OrderSubmitted`'s `acceptance` member (`accepted_version`, `accepted_at`; present only on a self-service submit, Lifecycle D-244; decision D-238)
   stay out of the projection or are accepted in engine history by the data owner. Until confirmed,
   the first route of ADR-0013 *Trigger inputs and consumed events*
   (`…-upreq-serverless-runtime-consumed-event-member-storage`, §2.9) still closes the residual on its

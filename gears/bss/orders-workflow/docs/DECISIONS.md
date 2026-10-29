@@ -7126,31 +7126,31 @@ overlap-presence read).
 
 ### D-238 (M) Lifecycle's Stage 4 amendment and consent contract is mirrored: a fresh verdict per new version, version-bound acceptance, no new calls
 
-**Accepted (2026-10-29).** *(mirrors Lifecycle D-240, D-241, D-243, D-244 and D-245 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-231, D-237)*
+**Accepted (2026-10-29).** *(mirrors Lifecycle D-241, D-242, D-244, D-245 and D-246 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-231, D-237)*
 
 **Decision**:
 
 1. **`OrderAmended` is now emitted.** Lifecycle sends one `OrderAmended { supersedes_version }`
-   per committed amendment (rows 18–20, Lifecycle D-245) and none on a refusal. This gear's
+   per committed amendment (rows 18–20, Lifecycle D-246) and none on a refusal. This gear's
    handling is unchanged (`design/03` §3.2): the prior instance terminates and the new version's
    invocation obtains its verdict from scratch.
 2. **The fresh verdict is now a PRD requirement.** PRD §6.2 states that `OrderAmended` re-runs
    verdict retrieval and reflection for the new `orderVersion`, as on `OrderSubmitted`, and never
    carries the prior verdict forward. This closes `design/03` Disclosure 2 and `UPSTREAM_REQS.md`
    §4 item 2.
-3. **Acceptance is version-bound** (Lifecycle OL-26, D-241). Begin-fulfillment's acceptance guard
+3. **Acceptance is version-bound** (Lifecycle OL-26, D-242). Begin-fulfillment's acceptance guard
    is satisfied only by acceptance recorded on the version being fulfilled; acceptance on a
    superseded version never counts (PRD §6.3).
 4. **`OrderSubmitted.acceptance`.** A self-service submit now carries
-   `acceptance { accepted_version, accepted_at }` (Lifecycle D-243); partner and delegated submits
+   `acceptance { accepted_version, accepted_at }` (Lifecycle D-244); partner and delegated submits
    carry none. The projection question of `UPSTREAM_REQS.md` §2.4 now names this member.
 5. **Stale results.** A result naming a version an amendment superseded is refused
-   `version-conflict` naming the current version (Lifecycle D-245). `design/03` §4.4 already maps it
+   `version-conflict` naming the current version (Lifecycle D-246). `design/03` §4.4 already maps it
    to `moved`; no row changes.
 6. **The amend operation exists, but this gear does not call it.** `POST
    /bss-orders/v1/orders/{orderId}/amendments` is the Seller Operator's cure for
    `order-binding-expired` (PRD §6.3). Lifecycle's amendment reasons (`amendment-cap-exhausted`,
-   `line-not-found`, `no-lines`, D-244) and the removed `payer-rebinding-requires-seller` (D-240)
+   `line-not-found`, `no-lines`, D-245) and the removed `payer-rebinding-requires-seller` (D-241)
    reach none of this gear's calls.
 
 **Rationale**: Lifecycle's Stage 4 waves 1–2 change four things this gear reads: the amendment

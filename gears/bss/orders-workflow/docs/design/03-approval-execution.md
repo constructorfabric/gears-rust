@@ -1544,7 +1544,7 @@ a settled success of its round too, and the only way on from it is an operator r
 **Expected version and refusals from Lifecycle.** Every `approval-reflection` call **MUST** carry
 `expected_version = orderVersion`, the process `correlationId`, the `verdict`, one named
 `deciding_authority` and, on `denied` only, the `denial_reason` (§3.6 `inst-rv3-call`). A Lifecycle
-`version-conflict` (Lifecycle D-245: a result naming a superseded version), and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
+`version-conflict` (Lifecycle D-246: a result naming a superseded version), and a `not-admissible` refusal of an order the Lifecycle read shows terminal,
 mean the order moved on while the reflection was in flight — except the terminal `rejected` a
 `reflect-approval-denied` of this version already reached, which is the reflection applied (below)
 — and they **MUST** answer `moved` with the
