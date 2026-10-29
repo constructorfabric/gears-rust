@@ -111,8 +111,9 @@ impl Gear for ConstructGear {
                 .context("construct-sdk record base schema")?,
         );
         // @cpt-begin:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
-        let defaults = SettingsServiceDefaults::new(Arc::clone(&hub), cfg.personalization_default)
-            .context("personalization default setting key")?;
+        let defaults =
+            SettingsServiceDefaults::new(Arc::clone(&hub), cfg.config().personalization_default)
+                .context("personalization default setting key")?;
         let settings = Arc::new(SubjectSettingsService::new(
             Arc::clone(&db),
             Arc::new(SeaOrmSubjectSettingsRepository::new()),
@@ -135,13 +136,16 @@ impl Gear for ConstructGear {
             .set(Arc::clone(&settings))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         // @cpt-end:cpt-cf-construct-algo-subject-settings-start:p1:inst-settings-start
+        let profile = pipeline.profile;
         self.profile
-            .set(pipeline.profile)
+            .set(Arc::clone(&profile))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *lock(&self.worker) = pipeline.worker;
         let ports = IntakePorts {
             types,
-            switch: Arc::new(ConfigConnectorSwitch::new(cfg.connectors_off.clone())),
+            switch: Arc::new(ConfigConnectorSwitch::new(
+                cfg.config().connectors_off.clone(),
+            )),
             hand_off: pipeline.hand_off,
         };
         let intake = Arc::new(RecordIntakeService::new(
@@ -157,11 +161,6 @@ impl Gear for ConstructGear {
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-service
 
         // @cpt-begin:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-client
-        let profile = self
-            .profile
-            .get()
-            .map(Arc::clone)
-            .ok_or_else(|| anyhow::anyhow!("Profile read not initialized"))?;
         let client: Arc<dyn ConstructClientV1> = Arc::new(LocalClient::new(intake, profile));
         ctx.client_hub().register(client);
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-client
