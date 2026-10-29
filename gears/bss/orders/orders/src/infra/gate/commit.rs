@@ -23,8 +23,9 @@
 //!    evaluation that cannot be stored refuses `evaluation-unavailable`, and one not in the
 //!    frozen market currency is an integration failure (D-216);
 //! 6. the guards: `gate.has-lines`, the shared structural guards, `gate.binding-admission`
-//!    (a recorded lapsed hold, the version byte limit, then every receipt's exclusive
-//!    `hold_until` against the transition time), `capture.date-basis` and the composite gate;
+//!    (a recorded lapsed hold, a single pin or the whole version over the byte limit, then
+//!    every receipt's exclusive `hold_until` against the transition time),
+//!    `capture.date-basis` and the composite gate;
 //!    the version contribution names the reserved candidate, the claims are the frozen keys,
 //!    the event is `OrderSubmitted`; the settlement carries the frozen gate report and the
 //!    engine writes the frozen outcome vector as the run's diagnostics, whether this call
@@ -99,12 +100,21 @@ struct AdmittedLine {
     hold_until: OffsetDateTime,
 }
 
+/// One accepted line's admission: its row, or a pin no version can hold.
+enum Admission {
+    Admitted(Box<AdmittedLine>),
+    /// The line's schema-2 pin alone exceeds the version limit (`CodecError::TooLarge`).
+    OverCapacity,
+}
+
 /// A recorded refusal or a commercial input the commit cannot admit, with where it settles.
 #[derive(Clone, Copy)]
 enum Blocked {
     Pricing(RefusalDisposition),
     /// The evaluation cannot be stored (D-216).
     Totals,
+    /// One line's schema-2 pin alone exceeds the version byte limit (D-231 item 7).
+    Capacity,
 }
 
 fn integration(ids: Ids, what: &'static str) -> PrepareError {
@@ -204,33 +214,36 @@ impl Preparation for SubmitPreparation {
                 let draft = drafts.get(&line.line_id).ok_or_else(|| {
                     integration(ids.line(line.line_id), "a frozen line without its draft")
                 })?;
-                lines.push(self.admitted(
-                    line,
-                    draft,
-                    receipt,
-                    facts.resource_tenant_id,
-                    &basis,
-                )?);
-            }
-            let line_ids: Vec<Uuid> = self.requests.lines.iter().map(|l| l.line_id).collect();
-            match total_rows(&self.requests.order.evaluation, &line_ids, &market.currency) {
-                Ok(rows) => totals = rows,
-                Err(error) if error.is_contract_defect() => {
-                    return Err(integration_with(
-                        ids,
-                        "the frozen evaluation is not in the market currency (D-216)",
-                        &error,
-                    ));
+                match self.admitted(line, draft, receipt, facts.resource_tenant_id, &basis)? {
+                    Admission::Admitted(admitted) => lines.push(*admitted),
+                    Admission::OverCapacity => {
+                        lines.clear();
+                        blocked = Some(Blocked::Capacity);
+                        break;
+                    }
                 }
-                Err(error) => {
-                    // D-216: a fraction without a terminating decimal, or a display finer than
-                    // the currency scale.
-                    tracing::warn!(
-                        target: "orders.gate.submit",
-                        error = %error,
-                        "bss-orders: the frozen evaluation cannot be stored as submit totals"
-                    );
-                    blocked = Some(Blocked::Totals);
+            }
+            if blocked.is_none() {
+                let line_ids: Vec<Uuid> = self.requests.lines.iter().map(|l| l.line_id).collect();
+                match total_rows(&self.requests.order.evaluation, &line_ids, &market.currency) {
+                    Ok(rows) => totals = rows,
+                    Err(error) if error.is_contract_defect() => {
+                        return Err(integration_with(
+                            ids,
+                            "the frozen evaluation is not in the market currency (D-216)",
+                            &error,
+                        ));
+                    }
+                    Err(error) => {
+                        // D-216: a fraction without a terminating decimal, or a display finer
+                        // than the currency scale.
+                        tracing::warn!(
+                            target: "orders.gate.submit",
+                            error = %error,
+                            "bss-orders: the frozen evaluation cannot be stored as submit totals"
+                        );
+                        blocked = Some(Blocked::Totals);
+                    }
                 }
             }
         }
@@ -382,7 +395,7 @@ impl SubmitPreparation {
         receipt: bss_pricing_sdk::acceptance::AcceptanceReceipt,
         resource_tenant_id: Uuid,
         basis: &DateBasis,
-    ) -> Result<AdmittedLine, PrepareError> {
+    ) -> Result<Admission, PrepareError> {
         let order = &self.requests.order;
         let ids = Ids {
             order_id: Some(line.query.order_id),
@@ -402,7 +415,7 @@ impl SubmitPreparation {
         let terms = terms_digest(&line.query, &receipt.bindings);
         let (acceptance_id, hold_until) = (receipt.acceptance_id, receipt.hold_until);
         let bindings = receipt.bindings.clone();
-        let pin = OrderPin::new(
+        let pin = match OrderPin::new(
             AssessmentRef {
                 assessment_id: order.assessment_id,
                 assessed_at: order.assessed_at,
@@ -414,15 +427,26 @@ impl SubmitPreparation {
                 line_id: line.line_id,
             },
             receipt,
-        )
-        .map_err(|error| match error {
-            CodecError::TooLarge => integration(ids, "a single pin exceeds the version limit"),
-            _ => integration_with(
-                ids,
-                "the receipt is not a valid schema-2 pin (D-192)",
-                &error,
-            ),
-        })?;
+        ) {
+            Ok(pin) => pin,
+            Err(CodecError::TooLarge) => {
+                tracing::warn!(
+                    target: "orders.gate.submit",
+                    order_id = %line.query.order_id,
+                    attempt_id = %self.attempt_id,
+                    line_id = %line.line_id,
+                    "bss-orders: a single pin exceeds the version limit"
+                );
+                return Ok(Admission::OverCapacity);
+            }
+            Err(error) => {
+                return Err(integration_with(
+                    ids,
+                    "the receipt is not a valid schema-2 pin (D-192)",
+                    &error,
+                ));
+            }
+        };
         pin.verify_selection(
             &line.query,
             SelectionEvidence {
@@ -491,11 +515,11 @@ impl SubmitPreparation {
         row.catalog_subscription_product_key
             .clone_from(&line.catalog_subscription_product_key);
         let bytes = line_row_bytes(&row);
-        Ok(AdmittedLine {
+        Ok(Admission::Admitted(Box::new(AdmittedLine {
             row,
             bytes,
             hold_until,
-        })
+        })))
     }
 
     /// Row 4's guards over the commit's facts (module doc, step 6).
@@ -511,6 +535,7 @@ impl SubmitPreparation {
             Some(Blocked::Pricing(RefusalDisposition::BindingAdmission(reason))) => {
                 GuardVerdict::Fail(reason)
             }
+            Some(Blocked::Capacity) => GuardVerdict::Fail(Reason::PurchaseCapacityExceeded),
             Some(
                 Blocked::Pricing(
                     RefusalDisposition::Composite(_) | RefusalDisposition::Unevaluable(_),
@@ -527,7 +552,8 @@ impl SubmitPreparation {
                 Blocked::Pricing(
                     RefusalDisposition::BindingAdmission(_) | RefusalDisposition::Unevaluable(_),
                 )
-                | Blocked::Totals,
+                | Blocked::Totals
+                | Blocked::Capacity,
             )
             | None => GuardVerdict::Pass,
         };

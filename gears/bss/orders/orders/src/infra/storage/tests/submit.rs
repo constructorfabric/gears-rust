@@ -182,6 +182,8 @@ impl CommercialAuthority for Authority {
 struct FixedBindings {
     kinds: Mutex<BTreeMap<Uuid, bss_pricing_sdk::read::ChargeKind>>,
     multikey: bool,
+    /// When set, every binding's SKU name (an oversized pin).
+    sku_name: Option<String>,
 }
 impl FixedBindings {
     fn answer(&self, line: Uuid) -> crate::domain::gate::pricing_map::CatalogAnswer {
@@ -199,6 +201,11 @@ impl FixedBindings {
                 sku.id = u(0xd2);
             }
             answer.skus.insert(u(0xd2), sku);
+        }
+        if let Some(name) = &self.sku_name {
+            for cell in &mut Arc::make_mut(answer.resolved.as_mut().unwrap()).cells {
+                cell.binding.as_mut().unwrap().sku_name.clone_from(name);
+            }
         }
 
         if let Some(kind) = self.kinds.lock().get(&line) {
@@ -1661,6 +1668,37 @@ async fn an_expired_receipt_refuses_order_binding_expired() {
     );
     assert_eq!(attempt_status(&f, order).await, json!("refused"));
     assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
+}
+
+/// D-231 item 7 (R6): a receipt whose schema-2 pin alone exceeds the version byte limit
+/// refuses `purchase-capacity-exceeded` through `gate.binding-admission`, as an oversized
+/// version does; nothing commercial is written and the same key replays the settled refusal.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_single_oversized_pin_refuses_purchase_capacity_exceeded() {
+    let f = setup_with_bindings(
+        fixture(),
+        10,
+        true,
+        Some(Arc::new(FixedBindings {
+            sku_name: Some("x".repeat(bss_orders_sdk::commercial::MAX_VERSION_BYTES)),
+            ..Default::default()
+        })),
+    )
+    .await;
+    let v = draft(&f, 1).await;
+    let order = v.order.order_id;
+    let settled = submit(&f, &buyer(), &v, "c8-oversized-pin").await.unwrap();
+    assert_eq!(
+        settled.outcome,
+        SettledOutcome::Refused(Some(Reason::PurchaseCapacityExceeded)),
+        "{settled:?}"
+    );
+    assert_eq!(attempt_status(&f, order).await, json!("refused"));
+    assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
+    let replay = submit(&f, &buyer(), &v, "c8-oversized-pin").await.unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.response, settled.response);
 }
 
 /// D-179/D-188 step 17: a second order of the same payer, resource and overlap key submitted
