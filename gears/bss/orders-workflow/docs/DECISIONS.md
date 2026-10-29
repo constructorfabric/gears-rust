@@ -7162,6 +7162,41 @@ disclosed.
 `fr-owf-fulfillment-plan`); `DESIGN.md` §3.4 (Orders Lifecycle row); `design/03` Disclosure 2 and
 the §4.4 expected-version paragraph; `UPSTREAM_REQS.md` §2.4 and §4 item 2.
 
+### D-239 (M) Lifecycle's Stage 4 consent recording and begin-fulfillment guards are mirrored: classify refusals by reason, consent per version
+
+**Accepted (2026-10-29).** *(mirrors Lifecycle D-247, D-248 and D-249 on Lifecycle's Stage 4 branch `bss/orders-stage4`; refines D-89, D-193, D-238)*
+
+**Decision**:
+
+1. **`OrderAcceptanceRecorded` is now emitted** (Lifecycle D-248), once per recorded consent, with
+   `accepted_version`, `accepted_at`, `recording_actor` and `requirement_source`. This gear's
+   handling is unchanged (`design/02` §3.3 intake table): it re-runs
+   `evaluate-payment-auth-eligibility`. Consent is bound to `accepted_version`; consent on a
+   superseded version never satisfies the version being fulfilled (D-238 item 3).
+2. **Lifecycle decides begin-fulfillment's guards** (Lifecycle D-249): missing required consent on
+   the current version refuses `acceptance-required-not-recorded` before any payment branch;
+   `pending` refuses `authorization-pending`; a conclusive `failed` is tolerated only by the
+   seller's, then the platform's, election (unset false), else `authorization-failed`. D-89 stands:
+   this gear carries the outcome and never evaluates tolerance itself.
+3. **Classify by reason, not status.** An unreadable requirement or tolerance input refuses
+   `acceptance-requirement-unevaluable` as a 503 that Lifecycle settles under the call's key, so a
+   same-key retry replays it. `design/04` `inst-bf-if-withheld` treats it as `withheld`, never as
+   the transient row `inst-bf-if-transient`; a wake-up re-invokes under a new attempt.
+4. **Tolerance evidence.** A tolerated admission sets the order's
+   `authorization_failure_tolerated_at` once; it is never cleared. That column is the risk flag
+   `design/04` refers to.
+5. **`get_version`.** Lifecycle delivers it on `OrdersV1` and as a production REST read
+   (D-247). The seam trait `OrdersLifecycleWorkflowV1` this gear names (D-193) does not yet exist
+   in the Lifecycle SDK; the operation and its authorization (`order × read`) are the same.
+
+**Rationale**: Lifecycle's Stage 4 wave 3 makes the consent event real and moves the begin-
+fulfillment guards into its engine. This gear already routed both; the one behavioural trap is a
+settled 503, which a status-based classifier would retry forever under the same key.
+
+**Propagated**: `design/04-fulfillment-plan.md` (`principle-pending-failed-distinct`,
+`inst-bf-if-withheld`); `design/02-triggers-and-start.md` (intake table, `OrderAcceptanceRecorded`);
+`DESIGN.md` §3.4 (Orders Lifecycle row).
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7521,6 +7556,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-231 | cross-cutting (Lifecycle D-219, D-220 mirror, 2026-10-22) | `DESIGN.md` §3.4; `design/06` §4.9 |
 | D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
+| D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
 | D-226–D-230 | cross-cutting (PR #4787 proposal, this gear's side, 2026-10-21) | `design/01` §3.7, §4.9; `design/03` §3.2, §3.3, §3.6, §3.7; `design/04` §2.1, §3.3, §3.6, §3.7; `design/06` §3.6; `design/07` §3.3, §4.4; `design/08` §3.3; `design/09` §3.1; `design/10` §3.6; `UPSTREAM_REQS.md` §2.1–§2.5 |
 | D-220–D-225 | cross-cutting (PR #4787 proposal of 2026-10-18, received 2026-10-21) | `design/03` §2.2, §3.3; `design/04` §3.5, §3.7; `design/05` §3.2, §3.3, §3.7, §4.1, §4.2, §4.4; `design/09` §3.3; `UPSTREAM_REQS.md` §2.1–§2.5, §4 item 22; Q-11 |
@@ -7733,6 +7769,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-236 | H PRD states this gear's side now and the owners' parts as named assumptions (§14) | `PRD.md`; `UPSTREAM_REQS.md` §4 items 22, 23 |
 | D-237 | M Lifecycle Stage 3 mirrored: gate refusals and `assessment` decode but never reach this gear's calls (*a 5xx* if they do); Preview and `assessment_id` not consumed; re-check conforms to Lifecycle's 22 frozen vectors, requires `count_scope` and the limit, asks every stored key, skips keyless lines; protected v2 vectors are the target | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-208, D-227, D-231 |
 | D-238 | M Lifecycle Stage 4 mirrored: `OrderAmended` emitted and a fresh verdict per new version (PRD §6.2); acceptance is version-bound; `OrderSubmitted.acceptance` on self-service submit; stale results are `version-conflict`; amend is the operator's cure, not this gear's call | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` |
+| D-239 | M Lifecycle Stage 4 wave 3 mirrored: `OrderAcceptanceRecorded` emitted, consent per version; Lifecycle decides begin-fulfillment consent then payment and tolerance; `acceptance-requirement-unevaluable` is a settled 503 → `withheld`, not retried; tolerance evidence is `authorization_failure_tolerated_at`; `get_version` on `OrdersV1` | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 
-Highest decision number used: **D-238**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-239**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.
