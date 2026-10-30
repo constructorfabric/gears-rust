@@ -1,6 +1,6 @@
 // Append `sccache --show-stats` to the job summary. Never fails the job.
-const { execFileSync } = require("child_process");
-const fs = require("fs");
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
 
 // Absolute path, exported by setup.sh when it started the server.
 const sccache = process.env.CI_CACHE_SCCACHE;

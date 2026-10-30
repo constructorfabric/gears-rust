@@ -45,7 +45,7 @@ inputs:
 
 outputs:
   mode:
-    description: "none (no key on this runner), read or write"
+    description: "none (no key on this runner, or the endpoint does not answer), read or write"
     value: ${{ steps.setup.outputs.mode }}
 
 runs:
