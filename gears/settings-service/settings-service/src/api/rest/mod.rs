@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! REST surface.
 
 /// The `If-Match` tag a mutation presents, read the same way on every
@@ -49,12 +48,14 @@ pub(crate) fn audit_request_id(headers: &axum::http::HeaderMap) -> String {
 pub mod access_dto;
 pub mod access_handlers;
 pub mod access_routes;
+pub mod browse_narrowing;
 pub mod declaration_dto;
 pub mod declaration_handlers;
 pub mod declaration_routes;
 pub mod dto;
 pub mod handlers;
 pub mod page_dto;
+pub mod revival_handlers;
 pub mod routes;
 pub mod search_dto;
 pub mod search_handlers;
@@ -131,6 +132,10 @@ mod if_match_tests;
 mod read_surface_tests;
 
 #[cfg(test)]
+#[path = "browse_narrowing_tests.rs"]
+mod browse_narrowing_tests;
+
+#[cfg(test)]
 #[path = "category_surface_tests.rs"]
 mod category_surface_tests;
 
@@ -143,5 +148,13 @@ mod access_surface_tests;
 mod declaration_surface_tests;
 
 #[cfg(test)]
+#[path = "revival_surface_tests.rs"]
+mod revival_surface_tests;
+
+#[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "boundary_surface_tests.rs"]
+mod boundary_surface_tests;

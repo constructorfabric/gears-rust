@@ -19,8 +19,11 @@ pub use domain::{
     Actor, ConsumptionStore, FoundationStore, QuotaStore, SeedReport, StoragePlugin, StoreError,
 };
 pub use gear::StoragePluginGear;
+#[cfg(any(test, feature = "test-util"))]
+pub use infra::outbox::start_undelivered_outbox;
 pub use infra::outbox::{
-    NOTIFICATION_PARTITIONS, NOTIFICATION_QUEUE, NotificationEnqueuer, QeOutbox, start_outbox,
+    NOTIFICATION_PARTITIONS, NOTIFICATION_QUEUE, NotificationEnqueuer, NotificationOutbox,
+    QeOutbox, SqlNotificationPipeline, start_notification_pipeline,
 };
 pub use infra::storage::{
     OUTBOX_TABLE_PREFIX, SqlConsumptionStore, SqlFoundationStore, SqlPolicyStore, SqlQuotaStore,

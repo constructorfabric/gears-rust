@@ -71,12 +71,19 @@ impl Gear for FileStorageGear {
         );
 
         // `cfg.validate()` already rejected an absent/empty secret.
+        // Grace for a slow upload outlasting the token TTL; `validate()` caps it, `unwrap_or` is a fallback.
+        let finalize_token_grace = time::Duration::seconds(
+            i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
+        );
         let secret = cfg
             .finalize_internal_secret
             .as_ref()
             .map(|s| s.expose().to_owned())
             .ok_or_else(|| anyhow::anyhow!("finalize_internal_secret is required"))?;
-        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(secret));
+        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
+            secret,
+            finalize_token_grace,
+        ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
             .map_err(|_| {
@@ -142,6 +149,8 @@ impl Gear for FileStorageGear {
         // Needed by both services before `svc_cfg` is moved.
         let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
         let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+        // Multipart sessions use their own, longer TTL.
+        let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO: wire the quota-enforcement client once the Quota Enforcement gear
         // exposes an SDK crate; until then no quota checks are performed.
@@ -176,6 +185,10 @@ impl Gear for FileStorageGear {
                 Arc::clone(&issuer),
                 sidecar_base_url,
                 url_ttl_secs,
+            )
+            .with_session_ttl_secs(session_ttl_secs)
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
             )
             .with_metrics(Arc::clone(&metrics))
             .with_usage_reporter(None), // see TODO above

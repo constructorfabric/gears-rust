@@ -12,51 +12,20 @@ use uuid::Uuid;
 
 use crate::api::rest::routes::test_router;
 use crate::api::rest::state::HandlerState;
-use crate::domain::backend::{BackendResolver, SingleBackendResolver};
+use crate::domain::backend::BackendResolver;
 use crate::domain::delivery::DeliveryService;
 use crate::domain::ingest::IngestService;
 use crate::domain::local_broker::LocalBroker;
-use crate::domain::outbox::INGEST_QUEUE_NAME;
+use crate::domain::outbox::{INGEST_QUEUE_NAME, OUTBOX_TABLE_PREFIX, OutboxPartitions};
 use crate::domain::specification::SpecificationManager;
+use crate::infra::metrics::IngestMetrics;
 use crate::infra::specification::TypesRegistrySpecificationManager;
 use crate::infra::storage::Storage;
 use crate::infra::workers::IngestOutboxHandler;
-use sqlite_event_broker_plugin::{EventLogPath, SqliteEventBackend};
-
-/// A fresh temp-file `SQLite` DB (`SQLite` has no row-level locking, so this
-/// stays single-process, matching `eb-single-process-implementation` D3),
-/// migrated with every table this crate owns (`SpecificationManager`'s
-/// cache, `Storage`'s durable namespaces, the `SQLite` `EventBrokerBackend`,
-/// the ingest outbox) via the same `Migrator`
-/// `EventBrokerModule::migrations()` runs in production. One shared
-/// connection pool (`max_conns: 1`) for every table family - `Storage` and
-/// the backend are two different types over the *same* underlying `SQLite`
-/// file, matching production (`module.rs::init()` resolves one `db` and
-/// hands it to both).
-async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-eb-harness-{}.db", Uuid::now_v7().simple()));
-    let mut file = path.to_string_lossy().replace('\\', "/");
-    if !file.starts_with('/') {
-        file.insert(0, '/');
-    }
-    let dsn = format!("sqlite://{file}?mode=rwc");
-    let opts = toolkit_db::ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = toolkit_db::connect_db(&dsn, opts)
-        .await
-        .expect("connect sqlite");
-    toolkit_db::migration_runner::run_migrations_for_testing(
-        &db,
-        <crate::infra::storage::migrations::Migrator as sea_orm_migration::MigratorTrait>::migrations(),
-    )
-    .await
-    .expect("migrations");
-    Arc::new(toolkit_db::DBProvider::new(db))
-}
+use crate::test_support::SingleBackendResolver;
+use crate::test_support::gear_db::GearDb;
+use event_broker_sdk::backend::Backend;
+use memory_event_broker_plugin::MemoryBackend;
 
 /// Seeds a `TypesRegistrySpecificationManager` from `registry`'s
 /// `Topic`/`EventType` fixtures via a `MockTypesRegistryClient`, run through
@@ -67,7 +36,19 @@ async fn test_db() -> Arc<toolkit_db::DBProvider<toolkit_db::DbError>> {
 async fn seeded_spec_manager(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
     registry: Option<super::type_registry::StaticTypesRegistry>,
+    live: Option<(
+        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        crate::config::EventBrokerConfig,
+    )>,
 ) -> Arc<dyn SpecificationManager> {
+    // A caller-supplied registry client (for example the real `types-registry` service another
+    // gear registered its contract into) is loaded unchanged, under that deployment's config.
+    if let Some((client, config)) = live {
+        crate::infra::specification::bulk_load(&client, &db, &config)
+            .await
+            .expect("SpecificationManager bulk-load must not fail");
+        return Arc::new(TypesRegistrySpecificationManager::new(db));
+    }
     let mut instances = Vec::new();
     let (schemas, config) = if let Some(registry) = registry {
         for document in registry.topics {
@@ -91,57 +72,69 @@ async fn seeded_spec_manager(
     Arc::new(TypesRegistrySpecificationManager::new(db))
 }
 
-/// The real, permanent `SQLite` `EventBrokerBackend` (eb-single-process-
-/// implementation D3) wrapped in a `SingleBackendResolver`, plus the ingest
-/// outbox pipeline draining into it - the harness's `Storage` is wired to
+/// `backend` wrapped in a `SingleBackendResolver`, every
+/// registered topic provisioned on it the way the specification refresh
+/// provisions them in production, plus the ingest outbox pipeline draining
+/// into it - the harness's `Storage` is wired to
 /// the same outbox handle via `Storage::set_outbox`, matching
 /// `EventBrokerModule::serve()`'s production sequencing. The returned
 /// `OutboxHandle` MUST be kept alive for the harness's lifetime - unlike a
 /// `ClusterHandle`, dropping an `OutboxHandle` without calling `.stop()`
 /// does not leave it harmlessly running: its own doc comment states
 /// `TaskSet::Drop` cancels the pipeline's cancellation token on drop,
-/// stopping every background worker immediately (discovered the hard way -
-/// a dropped-at-function-return handle here meant nothing ever drained).
+/// stopping every background worker immediately.
 async fn start_outbox(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
+    backend: Arc<dyn Backend>,
     spec_manager: Arc<dyn SpecificationManager>,
     storage: &Storage,
-    cluster_cache: cluster_sdk::ClusterCacheV1,
-) -> (
-    Arc<dyn event_broker_sdk::EventBrokerBackend>,
-    Arc<dyn BackendResolver>,
-    toolkit_db::outbox::OutboxHandle,
-) {
-    // The backend's own event log, not the harness's `db`: that database keeps
-    // the metadata behind `Storage` and the ingest outbox, and events are not
-    // metadata. In memory, because a harness outlives no process.
-    let backend = Arc::new(
-        SqliteEventBackend::open(&EventLogPath::InMemory)
-            .await
-            .expect("an in-memory event log must open"),
-    );
-    let backend_resolver: Arc<dyn BackendResolver> = Arc::new(SingleBackendResolver::new(
-        Arc::clone(&backend) as Arc<dyn event_broker_sdk::EventBrokerBackend>,
-    ));
+    provisioning: Provisioning,
+    outbox_partitions: OutboxPartitions,
+) -> (Arc<dyn BackendResolver>, toolkit_db::outbox::OutboxHandle) {
+    let backend_resolver: Arc<dyn BackendResolver> = Arc::new(SingleBackendResolver::new(backend));
+    if provisioning == Provisioning::AtStart {
+        spec_manager
+            .provision_topics(backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .await;
+    }
 
+    let outbox_id = storage
+        .outbox_identity(INGEST_QUEUE_NAME)
+        .await
+        .expect("ingest outbox identity");
     let handle = Outbox::builder(db.db())
-        .queue(INGEST_QUEUE_NAME, Partitions::of(4))
+        .table_prefix(OUTBOX_TABLE_PREFIX)
+        .expect("the default group's prefix is valid")
+        .queue(INGEST_QUEUE_NAME, Partitions::of(outbox_partitions.get()))
         .leased(IngestOutboxHandler::new(
             Arc::clone(&spec_manager),
             Arc::clone(&backend_resolver),
-            cluster_cache,
+            outbox_id,
+            IngestMetrics::global(INGEST_QUEUE_NAME),
         ))
         .start()
         .await
         .expect("outbox start");
     storage.set_outbox(Arc::clone(handle.outbox()));
 
-    (
-        Arc::clone(&backend) as Arc<dyn event_broker_sdk::EventBrokerBackend>,
-        backend_resolver,
-        handle,
-    )
+    (backend_resolver, handle)
 }
+
+/// Whether the harness provisions every registered topic as it starts, the
+/// way a booting instance's first specification refresh does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum Provisioning {
+    #[default]
+    AtStart,
+    /// Left to the test, through [`EventBrokerHarness::provision_topics`].
+    Deferred,
+}
+
+const PROVISIONING_LIMITS: crate::domain::specification::ProvisioningLimits =
+    crate::domain::specification::ProvisioningLimits {
+        call_timeout: std::time::Duration::from_secs(5),
+        attempt_timeout: std::time::Duration::from_mins(5),
+    };
 
 use super::api_v1::ApiV1;
 use super::authz_doubles::AllowAllAuthZ;
@@ -282,15 +275,17 @@ pub struct EventBrokerHarness {
     /// `start_outbox`'s doc comment for why dropping it early breaks
     /// draining. Never read after construction, hence `_`-prefixed.
     _outbox_handle: toolkit_db::outbox::OutboxHandle,
+    /// The metadata database's DSN, so a test can read the outbox's own
+    /// bookkeeping over a connection of its own.
+    dsn: String,
     /// The caches the loader fills and a session reads. Exposed so a test can
     /// assert on residency without reaching through the delivery service.
     topics: Arc<crate::infra::loader::topics::TopicManager>,
     /// Stream exclusion, so a test can assert a denied open left no lease held.
     leases: Arc<crate::domain::streaming::lease::InProcessStreamLeases>,
-    /// The storage the events actually land in. Exposed because retention is
-    /// the backend's own business: a test that needs a prefix-erased or an
-    /// emptied partition has to ask the backend to run a pass.
-    backend: Arc<dyn event_broker_sdk::EventBrokerBackend>,
+    /// The storage the events actually land in, for a test that reads back
+    /// what was stored.
+    backend: Arc<dyn Backend>,
     /// Cancels the loader on drop, so a test's loader does not outlive it and
     /// keep fetching against a closing pool.
     loader_shutdown: tokio_util::sync::CancellationToken,
@@ -302,6 +297,9 @@ pub struct EventBrokerHarness {
     client_hub: Arc<ClientHub>,
     /// Arms the publish-path fault injection wrapped around `ingest`.
     publish_faults: PublishFaultHandle,
+    /// What [`EventBrokerHarness::provision_topics`] drives.
+    spec_manager: Arc<dyn SpecificationManager>,
+    backend_resolver: Arc<dyn BackendResolver>,
 }
 
 impl Drop for EventBrokerHarness {
@@ -323,11 +321,19 @@ impl EventBrokerHarness {
         &self.leases
     }
 
-    /// The backend behind every topic here, for a test that has to run a
-    /// retention pass or read what storage holds.
+    /// The backend behind every topic here, for a test that reads what
+    /// storage holds. A test that truncates a memory partition builds the
+    /// harness [`with_backend`](EventBrokerHarnessBuilder::with_backend) and
+    /// keeps its own handle to it.
     #[must_use]
-    pub fn backend(&self) -> &Arc<dyn event_broker_sdk::EventBrokerBackend> {
-        &self.backend
+    pub fn backend(&self) -> Arc<dyn Backend> {
+        Arc::clone(&self.backend)
+    }
+
+    /// How many partitions the `default` outbox group's queue is registered
+    /// with, read from the outbox's own table.
+    pub async fn outbox_queue_partitions(&self) -> i64 {
+        crate::test_support::outbox_queue_partitions(&self.dsn).await
     }
 
     #[must_use]
@@ -395,6 +401,15 @@ impl EventBrokerHarness {
         self.publish_faults.set_rate_limited(on);
     }
 
+    /// Runs one provisioning pass over every registered topic, as the
+    /// specification refresh does - for a harness built
+    /// [`without_provisioning`](EventBrokerHarnessBuilder::without_provisioning).
+    pub async fn provision_topics(&self) {
+        self.spec_manager
+            .provision_topics(self.backend_resolver.as_ref(), PROVISIONING_LIMITS)
+            .await;
+    }
+
     pub fn router(&self) -> &axum::Router {
         &self.router
     }
@@ -422,15 +437,81 @@ impl EventBrokerHarness {
 #[derive(Default)]
 pub struct EventBrokerHarnessBuilder {
     type_registry: Option<StaticTypesRegistry>,
+    types_registry_client: Option<(
+        Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        crate::config::EventBrokerConfig,
+    )>,
     policy_enforcer: Option<PolicyEnforcer>,
     heartbeat: Option<std::time::Duration>,
+    provisioning: Provisioning,
+    outbox_partitions: Option<OutboxPartitions>,
+    gear_db: GearDb,
+    backend: Option<Arc<dyn Backend>>,
 }
 
 impl EventBrokerHarnessBuilder {
+    /// Where the gear's own metadata lives (default: [`GearDb::Sqlite`]).
+    #[must_use]
+    pub fn with_gear_db(mut self, gear_db: GearDb) -> Self {
+        self.gear_db = gear_db;
+        self
+    }
+
+    /// The storage backend every topic is routed to, in place of a fresh
+    /// in-process memory backend. A backend that has startup work is passed
+    /// already started.
+    #[must_use]
+    pub fn with_backend(mut self, backend: Arc<dyn Backend>) -> Self {
+        self.backend = Some(backend);
+        self
+    }
+
+    /// The `default` outbox group's partitions, as `outbox_groups.default.
+    /// partitions` sets them in production: the one count both the outbox
+    /// queue and the ingest service use. Unset, the group's default of 16.
+    #[must_use]
+    pub fn with_outbox_partitions(mut self, partitions: OutboxPartitions) -> Self {
+        self.outbox_partitions = Some(partitions);
+        self
+    }
+
     /// Seeds `Topic`/`EventType` fixtures from a [`StaticTypesRegistry`].
     #[must_use]
     pub fn with_type_registry(mut self, registry: StaticTypesRegistry) -> Self {
         self.type_registry = Some(registry);
+        self
+    }
+
+    /// Loads topics and event types from `client` - typically the real `types-registry`
+    /// service a producing gear registered its own contract into - through the same startup
+    /// bulk-load production runs, instead of from static fixtures. `topic_partitions` is the
+    /// deployment's per-topic partition configuration, since a topic carries no count.
+    ///
+    /// # Panics
+    /// Panics if the partition configuration does not deserialize.
+    #[must_use]
+    pub fn with_types_registry_client(
+        mut self,
+        client: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+        topic_partitions: &[(&str, u32)],
+    ) -> Self {
+        let topics: serde_json::Map<String, serde_json::Value> = topic_partitions
+            .iter()
+            .map(|(topic, partitions)| {
+                (
+                    (*topic).to_owned(),
+                    serde_json::json!({ "partitions": partitions }),
+                )
+            })
+            .collect();
+        let config = serde_json::from_value(serde_json::json!({
+            "mode": "standalone",
+            "backends": { "main": { "type": "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~" } },
+            "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
+            "topics": topics,
+        }))
+        .expect("harness topic configuration deserializes");
+        self.types_registry_client = Some((client, config));
         self
     }
 
@@ -441,6 +522,15 @@ impl EventBrokerHarnessBuilder {
     #[must_use]
     pub fn with_heartbeat(mut self, heartbeat: std::time::Duration) -> Self {
         self.heartbeat = Some(heartbeat);
+        self
+    }
+
+    /// Leaves every registered topic unprovisioned until the test calls
+    /// [`EventBrokerHarness::provision_topics`]: the window between a topic's
+    /// registration and its first provisioning pass.
+    #[must_use]
+    pub fn without_provisioning(mut self) -> Self {
+        self.provisioning = Provisioning::Deferred;
         self
     }
 
@@ -458,8 +548,14 @@ impl EventBrokerHarnessBuilder {
             .policy_enforcer
             .unwrap_or_else(|| PolicyEnforcer::new(Arc::new(AllowAllAuthZ)));
 
-        let db = test_db().await;
-        let spec_manager = seeded_spec_manager(Arc::clone(&db), self.type_registry).await;
+        let crate::test_support::gear_db::MigratedGearDb { db, dsn } =
+            self.gear_db.migrated().await;
+        let spec_manager = seeded_spec_manager(
+            Arc::clone(&db),
+            self.type_registry,
+            self.types_registry_client,
+        )
+        .await;
 
         let (_hub, cluster) = crate::test_support::standalone_event_broker_cluster().await;
         let storage = Arc::new(Storage::new(
@@ -467,13 +563,23 @@ impl EventBrokerHarnessBuilder {
             Arc::clone(&spec_manager),
             Uuid::new_v4(),
         ));
-        storage.set_cache(cluster.cache.clone());
+        storage.set_cache(cluster.cache);
 
-        let (backend, backend_resolver, outbox_handle) = start_outbox(
+        let outbox_partitions = self.outbox_partitions.unwrap_or_default();
+        // The backend's own event log, not the harness's `db`: that database
+        // keeps the metadata behind `Storage` and the ingest outbox, and events
+        // are not metadata. In memory unless the test names one, because a
+        // harness outlives no process.
+        let backend = self
+            .backend
+            .unwrap_or_else(|| Arc::new(MemoryBackend::new()));
+        let (backend_resolver, outbox_handle) = start_outbox(
             Arc::clone(&db),
+            Arc::clone(&backend),
             Arc::clone(&spec_manager),
             &storage,
-            cluster.cache,
+            self.provisioning,
+            outbox_partitions,
         )
         .await;
 
@@ -515,12 +621,13 @@ impl EventBrokerHarnessBuilder {
         let HandlerState { ingest, delivery } = crate::infra::wiring::build_handler_state(
             Arc::clone(&storage),
             policy_enforcer,
-            spec_manager,
-            backend_resolver,
+            Arc::clone(&spec_manager),
+            Arc::clone(&backend_resolver),
             attacher,
             Arc::clone(&groups),
             Arc::clone(&leases),
             crate::config::BatchConfig::default(),
+            outbox_partitions,
             // Short cadences so idle behaviour is testable without real waits.
             // Everything else is the production default.
             crate::config::StreamingConfig {
@@ -571,6 +678,7 @@ impl EventBrokerHarnessBuilder {
             ctx,
             router,
             _outbox_handle: outbox_handle,
+            dsn,
             topics,
             leases,
             backend,
@@ -578,6 +686,8 @@ impl EventBrokerHarnessBuilder {
             _loader_handle: loader_handle,
             client_hub,
             publish_faults,
+            spec_manager,
+            backend_resolver,
         }
     }
 }

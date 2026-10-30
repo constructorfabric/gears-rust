@@ -139,7 +139,7 @@ async fn classifies_every_endpoint_to_the_correct_role() {
 
     let (hub, _cluster) = crate::test_support::standalone_event_broker_cluster().await;
     let directory = crate::test_support::test_directory_client(&hub);
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
 
     for (method, path, expected_role) in cases.iter().cloned() {
         let router = build_router(Arc::clone(&state));
@@ -168,7 +168,7 @@ async fn forwards_to_the_registered_instance() {
     let mock =
         crate::test_support::mock_instance(&directory, "event-broker-ingest", mock_router).await;
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 
@@ -188,7 +188,7 @@ async fn random_selection_reaches_both_registered_instances() {
     let mock_b =
         crate::test_support::mock_instance(&directory, "event-broker-delivery", router_b).await;
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let (mut seen_a, mut seen_b) = (false, false);
     for _ in 0..40 {
         let router = build_router(Arc::clone(&state));
@@ -238,7 +238,7 @@ async fn returns_503_with_distinct_detail_when_resolved_instance_is_unreachable(
         .await
         .expect("registering an instance address must not fail");
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 
@@ -293,6 +293,7 @@ async fn returns_503_within_the_timeout_when_a_resolved_instance_accepts_but_nev
 
     let state = Arc::new(
         DispatcherState::new(directory)
+            .expect("dispatcher state")
             .with_connect_timeout(Duration::from_millis(150))
             .with_idle_timeout(Duration::from_millis(150)),
     );
@@ -344,8 +345,11 @@ async fn idle_timeout_closes_connection_after_silence_but_not_between_heartbeats
     // Heartbeats arrive every 30ms; a 150ms idle window must survive each
     // one but close shortly after they stop (spec "Idle-timeout on proxied
     // streaming connections").
-    let state =
-        Arc::new(DispatcherState::new(directory).with_idle_timeout(Duration::from_millis(150)));
+    let state = Arc::new(
+        DispatcherState::new(directory)
+            .expect("dispatcher state")
+            .with_idle_timeout(Duration::from_millis(150)),
+    );
     let router = build_router(state);
     let request = Request::builder()
         .method(Method::GET)
@@ -443,7 +447,7 @@ async fn hostname_advertised_endpoint_resolves_and_forwards() {
     let (server, shutdown) =
         mock_instance_with_hostname_endpoint(&directory, "event-broker-ingest", mock_router).await;
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 
@@ -477,7 +481,7 @@ async fn unresolvable_hostname_returns_503_without_panicking_and_logs_the_failur
         .await
         .expect("registering an unresolvable-hostname instance must not fail");
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 
@@ -536,7 +540,7 @@ async fn https_advertised_endpoint_is_rejected_without_connecting() {
         .await
         .expect("registering an https-advertised instance must not fail");
 
-    let state = Arc::new(DispatcherState::new(directory));
+    let state = Arc::new(DispatcherState::new(directory).expect("dispatcher state"));
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 
@@ -569,7 +573,11 @@ async fn oversized_proxied_body_is_rejected_and_a_body_at_the_limit_forwards() {
         Router::new().route("/event-broker/v1/producers", post(|| async { "accepted" }));
     let mock =
         crate::test_support::mock_instance(&directory, "event-broker-ingest", mock_router).await;
-    let state = Arc::new(DispatcherState::new(directory).with_max_request_body_bytes(LIMIT));
+    let state = Arc::new(
+        DispatcherState::new(directory)
+            .expect("dispatcher state")
+            .with_max_request_body_bytes(LIMIT),
+    );
 
     let oversized = vec![0u8; LIMIT + 1];
     let router = build_router(Arc::clone(&state));
@@ -662,9 +670,10 @@ impl DirectoryClient for AlwaysErroringDirectory {
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn directory_backend_failure_is_logged_and_differs_from_not_found() {
-    let state = Arc::new(DispatcherState::new(
-        Arc::new(AlwaysErroringDirectory) as Arc<dyn DirectoryClient>
-    ));
+    let state = Arc::new(
+        DispatcherState::new(Arc::new(AlwaysErroringDirectory) as Arc<dyn DirectoryClient>)
+            .expect("dispatcher state"),
+    );
     let router = build_router(state);
     let (status, body) = response_text(router, Method::GET, "/event-broker/v1/topics").await;
 

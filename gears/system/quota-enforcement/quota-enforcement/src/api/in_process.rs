@@ -203,4 +203,59 @@ impl quota_enforcement_sdk::QuotaEnforcementClientV1 for InProcessQuotaEnforceme
     ) -> Result<quota_enforcement_sdk::DecisionPreview, QuotaEnforcementError> {
         Ok(self.service.operations()?.preview(ctx, request).await?)
     }
+
+    async fn acquire_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::AcquireLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::AcquireLeaseOutcome, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .acquire_lease(ctx, request)
+            .await?)
+    }
+
+    async fn commit_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::CommitLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .commit_lease(ctx, request)
+            .await?)
+    }
+
+    async fn release_lease(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::ReleaseLeaseRequest,
+    ) -> Result<quota_enforcement_sdk::Decision, QuotaEnforcementError> {
+        Ok(self
+            .service
+            .operations()?
+            .release_lease(ctx, request)
+            .await?)
+    }
+
+    async fn batch_debit(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::BatchDebitRequest,
+    ) -> Result<quota_enforcement_sdk::BatchDecision, QuotaEnforcementError> {
+        Ok(self.service.operations()?.batch_debit(ctx, request).await?)
+    }
+
+    async fn snapshot(
+        &self,
+        ctx: &SecurityContext,
+        request: quota_enforcement_sdk::SnapshotRequest,
+    ) -> Result<
+        quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>,
+        QuotaEnforcementError,
+    > {
+        Ok(self.service.operations()?.snapshot(ctx, request).await?)
+    }
 }

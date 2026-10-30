@@ -584,7 +584,8 @@ impl ApiGateway {
         // 3.5) Structured access log (runs after push_req_id populates XRequestId extension)
         router = router.layer(from_fn(middleware::access_log::access_log_middleware));
 
-        // 3) Record request_id into span + extensions (requires span to exist first => must be inner to Trace)
+        // 3) Record request_id into span + extensions and scope it for outbound
+        // propagation (requires span to exist first => must be inner to Trace)
         router = router.layer(from_fn(middleware::request_id::push_req_id_to_extensions));
 
         // 2) Trace (outer to push_req_id_to_extensions)

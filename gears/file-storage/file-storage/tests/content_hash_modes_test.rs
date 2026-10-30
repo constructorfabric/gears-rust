@@ -58,6 +58,14 @@ impl StorageBackend for CountingBackend {
     fn capabilities(&self) -> BackendCapabilities {
         self.inner.capabilities()
     }
+    async fn publish_exclusive(
+        &self,
+        path: &str,
+        stream: futures::stream::BoxStream<'_, std::io::Result<Bytes>>,
+        max_size: Option<u64>,
+    ) -> Result<file_storage::infra::backend::PublishOutcome, DomainError> {
+        self.inner.publish_exclusive(path, stream, max_size).await
+    }
     async fn put(&self, path: &str, bytes: Bytes) -> Result<(), DomainError> {
         self.inner.put(path, bytes).await
     }
@@ -197,12 +205,12 @@ fn new_file() -> NewFile {
 #[allow(clippy::type_complexity)]
 async fn drive_multipart(
     svc: &FileService,
-    msvc: &MultipartService,
+    msvc: &Arc<MultipartService>,
     store: &Store,
     backend: &Arc<dyn StorageBackend>,
     ctx: &SecurityContext,
 ) -> (Uuid, Uuid, Uuid, MultipartPlan, Vec<u8>) {
-    let ticket = svc.create_file(ctx, new_file(), None).await.unwrap();
+    let ticket = svc.create_file(ctx, new_file(), None, false).await.unwrap();
     let file_id = ticket.file_id;
 
     let part_size = 5 * 1024 * 1024usize;
@@ -222,7 +230,7 @@ async fn drive_multipart(
             "application/octet-stream",
             declared_size,
             None,
-            None,
+            false,
         )
         .await
         .unwrap();

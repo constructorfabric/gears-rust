@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Category operations.
 //!
 //! Generic over the repository rather than holding a trait object: the
@@ -11,7 +10,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -92,6 +91,7 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
             key.as_str(),
             None,
             actor.ctx.subject_id().to_string(),
+            ActorTenant::of(actor.ctx.subject_tenant_id()),
             operation,
             actor.request_id,
         );

@@ -6,7 +6,7 @@
 //! `SpecificationManager`-resolved integer surrogate (D1), not the raw GTS
 //! id string - resolved by the repo implementation before every read/write,
 //! not stored redundantly as a string here. `tenant_id` is denormalized from
-//! the owning `ConsumerGroup` at write time (decision log entry 28) - no
+//! the owning `ConsumerGroup` at write time - no
 //! independent owner/resource dimension for this entity.
 
 use chrono::{DateTime, Utc};

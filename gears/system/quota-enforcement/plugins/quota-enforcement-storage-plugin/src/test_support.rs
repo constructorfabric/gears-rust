@@ -20,14 +20,14 @@ use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use time::OffsetDateTime;
 use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::outbox::{OutboxHandle, OutboxMessageId};
+use toolkit_db::outbox::{OutboxHandle, Wake};
 use toolkit_db::secure::{DBRunner, SecureEntityExt};
 use toolkit_db::{ConnectOpts, Db, connect_db};
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use crate::domain::ports::{Actor, PolicyStore, QuotaStore, StoreError};
-use crate::infra::outbox::{EnqueueError, NotificationEnqueuer, QeOutbox, start_outbox};
+use crate::infra::outbox::{EnqueueError, NotificationOutbox, QeOutbox, start_undelivered_outbox};
 use crate::infra::storage::Migrator;
 
 /// The `llm_gateway` user projection the gear's fixtures use.
@@ -59,7 +59,9 @@ pub async fn test_db() -> Db {
 /// The outbox pipeline on `db` with the notification queue registered, and
 /// a bound handle over it. Stop the handle at the end of the test.
 pub async fn bound_outbox(db: &Db) -> (OutboxHandle, Arc<QeOutbox>) {
-    let handle = start_outbox(db.clone()).await.expect("start outbox");
+    let handle = start_undelivered_outbox(db.clone())
+        .await
+        .expect("start outbox");
     let outbox = Arc::new(QeOutbox::new());
     outbox.bind(Arc::clone(handle.outbox())).expect("bind once");
     (handle, outbox)
@@ -180,12 +182,12 @@ pub async fn count_rows<E: EntityTrait + toolkit_db::secure::ScopableEntity>(db:
 pub struct FailingEnqueuer;
 
 #[async_trait]
-impl NotificationEnqueuer for FailingEnqueuer {
-    async fn enqueue_all(
+impl NotificationOutbox for FailingEnqueuer {
+    async fn enqueue(
         &self,
         _runner: &(dyn DBRunner + Sync),
         _events: &[NotificationEvent],
-    ) -> Result<Vec<OutboxMessageId>, EnqueueError> {
+    ) -> Result<Wake, EnqueueError> {
         Err(EnqueueError::Serialize("injected".to_owned()))
     }
 }
@@ -458,6 +460,19 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn apply_batch_debit(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _batch: &quota_enforcement_sdk::EvaluatedBatch<'_>,
+        _events: &[NotificationEvent],
+    ) -> Result<
+        quota_enforcement_sdk::TransitionOutcome<Vec<quota_enforcement_sdk::EvaluatedDebit>>,
+        StorageError,
+    > {
+        Err(unreached())
+    }
+
     async fn apply_credit(
         &self,
         _ctx: &SecurityContext,
@@ -496,6 +511,17 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
         Err(unreached())
     }
 
+    async fn bulk_read_quota_snapshot(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _pairs: &[quota_enforcement_sdk::ApplicableQuotas],
+        _page: quota_enforcement_sdk::PageRequest,
+    ) -> Result<quota_enforcement_sdk::PageResult<quota_enforcement_sdk::QuotaSnapshot>, StorageError>
+    {
+        Err(unreached())
+    }
+
     async fn lookup_idempotency(
         &self,
         _scope_of: &quota_enforcement_sdk::IdempotencyScope,
@@ -522,4 +548,63 @@ impl crate::domain::ConsumptionStore for FakeConsumptionStore {
 
 fn unreached() -> StorageError {
     StorageError::Internal("the consumption store is not part of this test".to_owned())
+}
+
+/// A lease store that answers nothing, for the bootstrap and CRUD tests that
+/// construct a plugin but never take a hold. The lease paths have their own
+/// suites against the real adapter.
+#[derive(Default)]
+pub struct FakeLeaseStore;
+
+#[async_trait]
+impl crate::domain::ports::LeaseStore for FakeLeaseStore {
+    async fn acquire_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        _mutation: &quota_enforcement_sdk::EvaluatedMutation<'_>,
+        _ttl: std::time::Duration,
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::EvaluatedLease>, StorageError> {
+        Err(StorageError::Internal(
+            "no lease store in this test".to_owned(),
+        ))
+    }
+
+    async fn commit_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        token: quota_enforcement_sdk::LeaseToken,
+        _actual_amount: Option<u64>,
+        _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::AppliedMutation>, StorageError> {
+        Err(StorageError::LeaseNotFound { token })
+    }
+
+    async fn release_lease(
+        &self,
+        _ctx: &SecurityContext,
+        _scope: &AccessScope,
+        token: quota_enforcement_sdk::LeaseToken,
+        _idempotency: &quota_enforcement_sdk::PartialIdempotencyWrite,
+        _events: &[NotificationEvent],
+    ) -> Result<TransitionOutcome<quota_enforcement_sdk::AppliedMutation>, StorageError> {
+        Err(StorageError::LeaseNotFound { token })
+    }
+
+    async fn reclaim_expired_leases(
+        &self,
+        _batch_size: u32,
+        _before: time::OffsetDateTime,
+    ) -> Result<Vec<quota_enforcement_sdk::ExpiredLease>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    async fn count_expired_unreclaimed_leases(
+        &self,
+        _before: time::OffsetDateTime,
+    ) -> Result<Vec<(quota_enforcement_sdk::MetricId, u64)>, StorageError> {
+        Ok(Vec::new())
+    }
 }

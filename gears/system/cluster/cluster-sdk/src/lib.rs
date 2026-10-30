@@ -81,12 +81,11 @@ mod scope;
 // proxy-wiring phase (item `K3`, §4.9.3). Behind the feature because the only
 // thing it can register is the remote client; a Profile 1 process needs no
 // registration at all - its local client wins by being there first.
-/// A configurable `ClusterClient` stub the SDK's own tests resolve through.
-///
-/// Test-only and unexported: `K6`'s `cluster_sdk::testing` feature is what makes
-/// an equivalent available to consumers, over a real wired hub rather than stubs.
-#[cfg(test)]
-mod test_support;
+/// A configurable `ClusterClient` stub over hand-supplied backends. The SDK's own
+/// tests resolve through it; consumers' tests get it with the `test-util` feature,
+/// so they bind a profile without linking the cluster gear.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 #[cfg(feature = "grpc-client")]
 pub mod wiring;
 

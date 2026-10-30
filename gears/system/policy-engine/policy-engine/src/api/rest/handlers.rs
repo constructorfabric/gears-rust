@@ -2,13 +2,20 @@
 //! Every handler is a thin projection over [`PolicyManagementClientV1`]: it
 //! authenticates the caller, calls exactly one trait method, and maps the
 //! result onto [`dto`](super::dto) types. No domain logic lives here.
+//!
+//! The publish operations take `?dry_run=true`: the handler then calls
+//! [`PolicyManagementClientV1::check_publish`] instead, answering `204` when
+//! the operation would succeed and the operation's own problem otherwise.
 
 use std::sync::Arc;
 
 use axum::extract::Extension;
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
-use policy_engine_sdk::management::{AssignmentId, BundleId, PolicyManagementClientV1, VersionId};
+use policy_engine_sdk::management::{
+    AssignmentId, BundleId, PolicyManagementClientV1, PublishOperation, VersionId,
+};
+use serde::Deserialize;
 use toolkit::api::canonical_prelude::*;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -17,13 +24,30 @@ use super::dto::{
     PolicyEngineAssignmentDto, PolicyEngineBundleDto, PolicyEngineCreateAssignmentRequestDto,
     PolicyEngineCreateBundleRequestDto, PolicyEngineCreateDraftVersionRequestDto,
     PolicyEngineReplaceDraftContentRequestDto, PolicyEngineUpdateAssignmentRequestDto,
-    PolicyEngineUpdateBundleRequestDto, PolicyEngineValidationReportDto,
-    PolicyEngineVersionDetailDto, PolicyEngineVersionDto,
+    PolicyEngineUpdateBundleRequestDto, PolicyEngineVersionDetailDto, PolicyEngineVersionDto,
 };
 use super::error::{self, ApiResult, OptionalJson};
 
 /// Concrete client alias for handler signatures.
 type Client = Arc<dyn PolicyManagementClientV1>;
+
+/// The `dry_run` query parameter of the publish operations.
+#[derive(Debug, Default, Deserialize)]
+pub struct DryRunParam {
+    /// `true`: run the operation's checks and write nothing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+/// Dry-runs `operation`: `204` when it would succeed.
+async fn dry_run(
+    client: &Client,
+    ctx: &SecurityContext,
+    operation: PublishOperation,
+) -> ApiResult<Response> {
+    client.check_publish(ctx, operation).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
+}
 
 // ---------------------------------------------------------------------------
 // Bundles
@@ -157,12 +181,12 @@ pub async fn validate_version(
     ctx: Option<Extension<SecurityContext>>,
     Extension(client): Extension<Client>,
     extract::Path((bundle_id, version_id)): extract::Path<(Uuid, Uuid)>,
-) -> ApiResult<Json<PolicyEngineValidationReportDto>> {
+) -> ApiResult<StatusCode> {
     let ctx = error::require_context(ctx)?;
     let bundle_id = BundleId(bundle_id);
     let version_id = VersionId(version_id);
-    let report = client.validate_version(&ctx, bundle_id, version_id).await?;
-    Ok(Json(report.into()))
+    client.validate_version(&ctx, bundle_id, version_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// `POST /policy-engine/v1/bundles/{id}/versions/{version}/activate`.
@@ -171,12 +195,20 @@ pub async fn activate_version(
     ctx: Option<Extension<SecurityContext>>,
     Extension(client): Extension<Client>,
     extract::Path((bundle_id, version_id)): extract::Path<(Uuid, Uuid)>,
-) -> ApiResult<Json<PolicyEngineVersionDto>> {
+    extract::Query(param): extract::Query<DryRunParam>,
+) -> ApiResult<Response> {
     let ctx = error::require_context(ctx)?;
     let bundle_id = BundleId(bundle_id);
     let version_id = VersionId(version_id);
+    if param.dry_run {
+        let operation = PublishOperation::Activate {
+            bundle_id,
+            version_id,
+        };
+        return dry_run(&client, &ctx, operation).await;
+    }
     let version = client.activate_version(&ctx, bundle_id, version_id).await?;
-    Ok(Json(version.into()))
+    Ok(Json(PolicyEngineVersionDto::from(version)).into_response())
 }
 
 /// `DELETE /policy-engine/v1/bundles/{id}/versions/{version}`: the only
@@ -206,9 +238,13 @@ pub async fn assign(
     uri: Uri,
     ctx: Option<Extension<SecurityContext>>,
     Extension(client): Extension<Client>,
+    extract::Query(param): extract::Query<DryRunParam>,
     extract::Json(body): extract::Json<PolicyEngineCreateAssignmentRequestDto>,
 ) -> ApiResult<Response> {
     let ctx = error::require_context(ctx)?;
+    if param.dry_run {
+        return dry_run(&client, &ctx, PublishOperation::Assign(body.into())).await;
+    }
     let assignment = client.assign(&ctx, body.into()).await?;
     let id = assignment.id.to_string();
     Ok(created_json(PolicyEngineAssignmentDto::from(assignment), &uri, &id).into_response())
@@ -228,20 +264,37 @@ pub async fn get_assignment(
     ))
 }
 
+/// `GET /policy-engine/v1/assignments`.
+#[tracing::instrument(skip_all)]
+pub async fn list_assignments(
+    ctx: Option<Extension<SecurityContext>>,
+    Extension(client): Extension<Client>,
+    OData(query): OData,
+) -> ApiResult<Json<toolkit_odata::Page<PolicyEngineAssignmentDto>>> {
+    let ctx = error::require_context(ctx)?;
+    let page = client.list_assignments(&ctx, &query).await?;
+    Ok(Json(page.map_items(PolicyEngineAssignmentDto::from)))
+}
+
 /// `PATCH /policy-engine/v1/assignments/{id}`.
 #[tracing::instrument(skip_all)]
 pub async fn update_assignment(
     ctx: Option<Extension<SecurityContext>>,
     Extension(client): Extension<Client>,
     extract::Path(assignment_id): extract::Path<Uuid>,
+    extract::Query(param): extract::Query<DryRunParam>,
     extract::Json(body): extract::Json<PolicyEngineUpdateAssignmentRequestDto>,
-) -> ApiResult<Json<PolicyEngineAssignmentDto>> {
+) -> ApiResult<Response> {
     let ctx = error::require_context(ctx)?;
     let assignment_id = AssignmentId(assignment_id);
+    if param.dry_run {
+        let operation = PublishOperation::UpdateAssignment { assignment_id };
+        return dry_run(&client, &ctx, operation).await;
+    }
     let assignment = client
         .update_assignment(&ctx, assignment_id, body.enforce)
         .await?;
-    Ok(Json(assignment.into()))
+    Ok(Json(PolicyEngineAssignmentDto::from(assignment)).into_response())
 }
 
 /// `DELETE /policy-engine/v1/assignments/{id}`.
@@ -250,9 +303,13 @@ pub async fn unassign(
     ctx: Option<Extension<SecurityContext>>,
     Extension(client): Extension<Client>,
     extract::Path(assignment_id): extract::Path<Uuid>,
-) -> ApiResult<StatusCode> {
+    extract::Query(param): extract::Query<DryRunParam>,
+) -> ApiResult<Response> {
     let ctx = error::require_context(ctx)?;
     let assignment_id = AssignmentId(assignment_id);
+    if param.dry_run {
+        return dry_run(&client, &ctx, PublishOperation::Unassign { assignment_id }).await;
+    }
     client.unassign(&ctx, assignment_id).await?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }

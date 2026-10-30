@@ -1,0 +1,18 @@
+{
+  "$id": "gts://gts.cf.core.tasks.entry.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task entry type base. Abstract: a task entry is an append-only record attached to a task during execution (PRD cpt-cf-task-engine-fr-task-entries). Derived entry kinds narrow `payload` with their own JSON Schema; the engine ships entry_work, entry_observation, entry_issue, entry_note, and entry_measurement, and consuming gears MAY register further kinds. The engine stores entry metadata (id, task, type, creator, tenant, timestamp) in te_task_entries columns and `payload` as compressed JSON (DESIGN cpt-cf-task-engine-design-gts-types).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "payload": {
+      "description": "Entry payload. Derived entry kinds narrow this with their own JSON Schema; the engine validates it against the resolved entry type's schema at creation.",
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "required": [
+    "payload"
+  ],
+  "x-gts-abstract": true
+}

@@ -11,6 +11,7 @@ import httpx
 
 
 GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
+PLATFORM_API = "types-registry/v2/platform"
 # Every request carries this valid W3C `traceparent`, so the wire `trace_id` the
 # canonical error layer echoes is deterministic. `extract_trace_id` prefers the
 # live OTel span, but the request span continues this inbound `traceparent`, so

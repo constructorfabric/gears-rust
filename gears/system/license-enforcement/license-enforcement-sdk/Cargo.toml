@@ -1,0 +1,55 @@
+[package]
+name = "cf-gears-license-enforcement-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "SDK for license_enforcement gear: management contract, grant model, admission plugin and evaluator traits"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "licensing"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "license_enforcement_sdk"
+
+[lints]
+workspace = true
+
+[features]
+# Generated REST client (`LicenseEnforcementApiRestClient` + resolving wrapper).
+rest-client = ["toolkit-contract/rest-client", "dep:toolkit-http", "dep:secrecy"]
+# Generated server route registration, used by the license-enforcement gear.
+rest-server = ["toolkit-contract/rest-server", "dep:axum"]
+
+[dependencies]
+async-trait = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+utoipa = { workspace = true }
+time = { workspace = true, features = ["serde-well-known"] }
+inventory = { workspace = true }
+
+gts = { workspace = true }
+toolkit-gts = { workspace = true }
+
+toolkit = { workspace = true }
+toolkit-contract = { workspace = true }
+toolkit-odata = { workspace = true, features = ["with-utoipa"] }
+toolkit-odata-macros = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-security = { workspace = true }
+
+license-resolver-sdk = { workspace = true }
+
+toolkit-http = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
+time = { workspace = true, features = ["macros"] }

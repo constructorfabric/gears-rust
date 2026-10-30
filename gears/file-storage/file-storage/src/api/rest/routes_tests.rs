@@ -77,7 +77,10 @@ async fn registry_with_routes() -> OpenApiRegistryImpl {
         3600,
     ));
     let policy_service = Arc::new(PolicyService::new(policy_store, authorizer, 25, 200));
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new("test-secret".to_owned()));
+    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
+        "test-secret".to_owned(),
+        time::Duration::ZERO,
+    ));
 
     let registry = OpenApiRegistryImpl::new();
     let _router = register_routes(

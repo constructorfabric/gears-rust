@@ -87,7 +87,8 @@ and it adds a registry call to the check path.
 
 * The gear ships a default evaluator crate. DESIGN §3.1 describes what it matches.
 * A new evaluation logic is a new evaluator crate and a new build. The gear does not change.
-* The denial reasons stay a closed enum in the SDK. An evaluator returns only these reasons.
+* The denial reasons stay a closed enum in the SDK. An evaluator returns only its own subset of them, and the gear
+  owns the full list.
 * The evaluator defines the form of conditions and recipient rules. It validates them at write time and evaluates
   them at check time and at delegation. Thus one implementation does both.
 * The store indexes the grants by tenant, resource type, binding type, and binding id.

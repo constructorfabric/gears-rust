@@ -313,7 +313,7 @@ async fn files_cursor_rejects_a_different_owner() {
         .await
         .expect_err("a cursor issued for a different owner must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -372,7 +372,7 @@ async fn files_backward_cursor_rejects_a_different_owner() {
         .await
         .expect_err("a backward cursor issued for a different owner must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -402,7 +402,7 @@ async fn build_files_harness() -> (Arc<FileService>, SecurityContext, Uuid) {
     ));
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
-    svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+    svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
         .await
         .expect("seed one file");
     (svc, ctx(tenant, owner), owner)
@@ -482,6 +482,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, created_at: OffsetDateTime) -> F
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at,
+        bound_on_finalize: false,
     }
 }
 
@@ -653,8 +654,60 @@ async fn versions_cursor_rejects_a_different_file() {
         .await
         .expect_err("a cursor issued for a different file must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
+    );
+}
+
+/// A caller who cannot see the file gets the same answer as without a cursor, even when the cursor
+/// was issued for another file: access is checked before the cursor is parsed.
+#[tokio::test]
+async fn versions_with_manifests_checks_access_before_the_cursor() {
+    let db = build_db().await;
+    let store = Store::new(Arc::clone(&db));
+    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
+    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
+    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
+    let authorizer: Arc<dyn Authorizer> = Arc::new(TenantOnlyAuthorizer);
+    let svc = FileService::new(
+        store.clone(),
+        backends,
+        issuer,
+        authorizer,
+        base_config(),
+        None,
+        None,
+    );
+
+    let tenant = Uuid::now_v7();
+    let owner = Uuid::now_v7();
+    let now = OffsetDateTime::now_utc();
+    let (file_a, _) = seed_file_and_versions(&db, tenant, owner, &[now, now]).await;
+    let (file_b, _) = seed_file_and_versions(&db, tenant, owner, &[now]).await;
+
+    let page = svc
+        .list_versions(&ctx(tenant, owner), file_a, Some(1), None)
+        .await
+        .expect("first page");
+    let foreign_cursor = page.page_info.next_cursor.expect("more pages remain");
+
+    let outsider = ctx(Uuid::now_v7(), Uuid::now_v7());
+    let without_cursor = svc
+        .list_versions_with_manifests(&outsider, file_b, Some(1), None)
+        .await
+        .expect_err("an outsider must not see the file");
+    let with_cursor = svc
+        .list_versions_with_manifests(&outsider, file_b, Some(1), Some(cur(&foreign_cursor)))
+        .await
+        .expect_err("an outsider must not see the file");
+    assert!(
+        !matches!(with_cursor, DomainError::Pagination(_)),
+        "access must be checked before the cursor, got {with_cursor:?}"
+    );
+    assert_eq!(
+        std::mem::discriminant(&with_cursor),
+        std::mem::discriminant(&without_cursor),
+        "with a cursor: {with_cursor:?}, without: {without_cursor:?}"
     );
 }
 
@@ -702,7 +755,7 @@ async fn versions_backward_cursor_rejects_a_different_file() {
         .await
         .expect_err("a backward cursor issued for a different file must be rejected");
     assert!(
-        matches!(err, DomainError::Cursor(_)),
+        matches!(err, DomainError::Pagination(_)),
         "expected a cursor error, got {err:?}"
     );
 }
@@ -944,7 +997,7 @@ async fn retention_rules_cursor_with_wrong_order_field_is_rejected() {
         .list_retention_rules(&ctx(tenant, subject), Some(2), Some(cur(&bogus)))
         .await
         .expect_err("a cursor built for a different listing's order must be rejected");
-    assert!(matches!(err, DomainError::Cursor(_)));
+    assert!(matches!(err, DomainError::Pagination(_)));
 }
 
 /// Same as above for a backward cursor.
@@ -963,7 +1016,7 @@ async fn retention_rules_backward_cursor_with_wrong_order_field_is_rejected() {
         .list_retention_rules(&ctx(tenant, subject), Some(2), Some(cur(&bogus)))
         .await
         .expect_err("a backward cursor built for a different listing's order must be rejected");
-    assert!(matches!(err, DomainError::Cursor(_)));
+    assert!(matches!(err, DomainError::Pagination(_)));
 }
 
 // --- REST query-string contract: `$top`/`$skiptoken` synonyms and rejected options ---
@@ -1025,7 +1078,7 @@ async fn files_top_is_a_synonym_of_limit() {
 #[tokio::test]
 async fn files_skiptoken_is_a_synonym_of_cursor() {
     let (svc, subject, owner) = build_files_harness().await;
-    svc.create_file(&subject, new_file(owner), None)
+    svc.create_file(&subject, new_file(owner), None, false)
         .await
         .expect("seed a second file");
     let router = files_router(subject, svc);
@@ -1056,14 +1109,35 @@ async fn files_both_spellings_of_one_parameter_are_rejected() {
     let both_limits = assert_rejected(
         &router,
         format!("{BASE}/files?owner_kind=user&owner_id={owner}&limit=1&$top=1"),
-        &[("query", "INVALID_QUERY_PARAMS")],
+        &[("$top", "INVALID_QUERY_PARAMS")],
     )
     .await;
     assert_eq!(both_limits["status"], 400);
     assert_rejected(
         &router,
         format!("{BASE}/files?owner_kind=user&owner_id={owner}&cursor=X&$skiptoken=X"),
-        &[("query", "INVALID_QUERY_PARAMS")],
+        &[("$skiptoken", "INVALID_QUERY_PARAMS")],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn files_repeated_page_parameters_are_reported_with_other_violations() {
+    let (svc, subject, owner) = build_files_harness().await;
+    let router = files_router(subject, svc);
+    assert_rejected(
+        &router,
+        format!("{BASE}/files?owner_kind=user&owner_id={owner}&$top=1&$top=2&$filter=x"),
+        &[
+            ("$top", "INVALID_QUERY_PARAMS"),
+            ("$filter", "UNSUPPORTED_QUERY_PARAM"),
+        ],
+    )
+    .await;
+    assert_rejected(
+        &router,
+        format!("{BASE}/files?owner_kind=user&owner_id={owner}&limit=1&limit=2"),
+        &[("$top", "INVALID_QUERY_PARAMS")],
     )
     .await;
 }
@@ -1252,7 +1326,7 @@ async fn build_storages_harness() -> (Router, Uuid) {
     let tenant = Uuid::now_v7();
     let owner = Uuid::now_v7();
     for _ in 0..2 {
-        svc.create_file(&ctx(tenant, owner), new_file(owner), None)
+        svc.create_file(&ctx(tenant, owner), new_file(owner), None, false)
             .await
             .expect("seed file");
     }

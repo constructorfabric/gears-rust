@@ -1,0 +1,33 @@
+[package]
+name = "cf-gears-event-broker-backend-conformance"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Conformance suite for event-broker storage backends: one set of scenarios every backend plugin runs against its own medium"
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["development-tools::testing"]
+publish = false
+
+[lib]
+name = "event_broker_backend_conformance"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The contract under test. The suite depends on the SDK only: every scenario
+# is generic over `backend::Backend`.
+event-broker-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+futures-util = { workspace = true, features = ["std"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }

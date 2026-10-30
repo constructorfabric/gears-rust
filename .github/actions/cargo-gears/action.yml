@@ -1,0 +1,43 @@
+name: Cached cargo-gears
+description: >-
+  Install the pinned cargo-gears executable, cached per OS and architecture.
+  The executable does not link the compiler, so toolchain bumps keep the cache.
+  Only main writes the cache.
+inputs:
+  version:
+    description: cargo-gears version to install, e.g. from env.CARGO_GEARS_VERSION
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Restore executable
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/cargo-gears
+        key: cargo-gears-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+    # A cached executable that does not run is reinstalled, not passed to the lint.
+    - name: Install on miss or broken cache
+      id: install
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        bin="$RUNNER_TEMP/cargo-gears/bin/cargo-gears"
+        if [[ -x "$bin" ]] && "$bin" gears --version > /dev/null 2>&1; then
+          echo "installed=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "::notice::installing cargo-gears $VERSION"
+        rm -rf "$RUNNER_TEMP/cargo-gears"
+        cargo install --locked "cargo-gears@$VERSION" --root "$RUNNER_TEMP/cargo-gears"
+        echo "installed=true" >> "$GITHUB_OUTPUT"
+    - name: Add to PATH
+      shell: bash
+      run: echo "$RUNNER_TEMP/cargo-gears/bin" >> "$GITHUB_PATH"
+    - name: Save executable
+      if: steps.install.outputs.installed == 'true' && steps.cache.outputs.cache-hit != 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+      with:
+        path: ${{ runner.temp }}/cargo-gears
+        key: cargo-gears-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}

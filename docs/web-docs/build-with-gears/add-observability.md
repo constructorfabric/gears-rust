@@ -94,8 +94,9 @@ With tracing enabled the gateway and toolkit give you, without per-gear wiring:
 
 - a **span per request** (method, route, `request_id`, `trace_id`);
 - **W3C trace-context** propagation in and out (`traceparent`);
-- a **request id** correlated across logs and injected as a response header
-  (`inject_request_id_header`);
+- a **request id** correlated across logs, echoed as an `x-request-id` response
+  header, and forwarded on downstream contract calls — every gear a request
+  touches logs the same `request_id` on its request span;
 - health endpoints **`/healthz`** (liveness, shallow "ok"), **`/readyz`** (readiness,
   200/503), and **`/health`** (detailed per-component JSON) exposed by the API Gateway. All
   three are public (no auth) and run on the gateway's middleware surface.

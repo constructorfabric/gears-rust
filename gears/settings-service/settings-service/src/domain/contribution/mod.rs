@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Module-contributed declarations: the reconciler behind the SDK's
 //! `SettingsContributionClient`.
 //!

@@ -67,6 +67,8 @@ def test_localfs_single_part_full_lifecycle(
         "name": f"lifecycle-test-{uuid.uuid4()}.bin",
         "gts_file_type": gts_file_type,
         "mime_type": "application/octet-stream",
+        # Keep the explicit `POST /bind` flow; the default (`auto`) binds on upload.
+        "bind": "manual",
     }
     r = client.post(f"{API_BASE}/files", json=create_body)
     assert r.status_code == 201, (

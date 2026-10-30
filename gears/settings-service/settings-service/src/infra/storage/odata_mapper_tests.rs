@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for the category `OData` surface.
 //!
 //! Acceptance: FEATURE `category-management.md` §6 and CDSL `inst-cat-list-4` /
@@ -151,6 +150,7 @@ fn the_review_cursor_values_are_the_row_models_ids() {
         created_at: now,
         updated_at: now,
         set_by: "admin".to_owned(),
+        set_by_tenant: None,
     };
 
     for (field, id) in [

@@ -78,6 +78,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-oauth2-client-credentials-auth-plugin` — OAuth2 Client Credentials auth plugin with internal token cache
 - `cpt-cf-oagw-adr-required-headers-guard-plugin` — Stateless builtin `GuardPlugin` enforcing required request/response headers, fail-open when unconfigured
 - `cpt-cf-oagw-adr-optional-persistence` — Opt-in database persistence with in-memory fallback, using the storage schema from the start
+- `cpt-cf-oagw-adr-upstream-proxy-engine` — Upstream forwarding through the in-house `toolkit-http-proxy` engine instead of the Pingora bridge
 
 ### 1.3 Architecture Layers
 
@@ -87,7 +88,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 |---|---|---|
 | **Transport** (`api/rest/`) | HTTP handling, request parsing, response serialization | Axum handlers, DTOs, extractors, OperationBuilder route registration |
 | **Domain** (`domain/`) | Business logic, service traits, repository contracts | `ControlPlaneService`, `DataPlaneService`, `AuthPlugin` trait, domain models |
-| **Infrastructure** (`infra/`) | External integrations, persistence, proxy engine | SeaORM repositories, Pingora proxy bridge, plugin registry, type provisioning |
+| **Infrastructure** (`infra/`) | External integrations, persistence, proxy engine | SeaORM repositories, upstream proxy engine adapter, plugin registry, type provisioning |
 | **SDK** (`oagw-sdk/`) | Public API for inter-gear communication | `ServiceGatewayClientV1` trait, SDK models, error types |
 
 The gear follows DDD-Light layering: domain layer has no infrastructure dependencies; infrastructure implements domain traits; transport layer maps between HTTP and domain types.
@@ -98,7 +99,7 @@ The gear follows DDD-Light layering: domain layer has no infrastructure dependen
 |---|---|
 | Rust / Axum | HTTP transport, async runtime |
 | SeaORM + `toolkit-db` | Database persistence (PostgreSQL, MySQL, SQLite) |
-| Pingora | Reverse-proxy engine (connection pooling, HTTP/2, load balancing) |
+| `toolkit-http-proxy` | Upstream proxy engine (connection pooling, HTTP/1.1 + HTTP/2 with ALPN, FIPS-hardened TLS, load balancing, health checks) |
 | Starlark | Custom plugin sandboxed execution |
 | `toolkit-auth` | Bearer token authentication & authorization |
 | `cred_store` | Secret material retrieval by URI reference |
@@ -129,7 +130,7 @@ graph TB
 
 **ID**: `cpt-cf-oagw-principle-no-retry`
 
-**No automatic retries**: OAGW never retries failed upstream requests. Retry logic is the client's responsibility.
+**No automatic retries**: OAGW never retries failed upstream requests; a failure is returned to the client, which owns retry logic. The only resend is the upstream proxy engine's, at most once per request and only at the connection level: a request that never left, a request the upstream refused over HTTP/2 (`REFUSED_STREAM`, `HTTP_1_1_REQUIRED`), and an idempotent request whose connection closed before the answer ([ADR-0019](./ADR/0019-upstream-proxy-engine.md)).
 
 **ID**: `cpt-cf-oagw-principle-no-cache`
 
@@ -360,7 +361,7 @@ gears/system/oagw/
         │   │              # RegistryRowRepository: the registry reconcile's rows only)
         │   └── error.rs   # DomainError
         └── infra/         # Infrastructure implementations
-            ├── proxy/     # DataPlaneServiceImpl (Pingora in-memory bridge)
+            ├── proxy/     # DataPlaneServiceImpl, engine adapter, endpoint selector, WebSocket relay
             ├── storage/   # Repository impls: in-memory (no database) and SeaORM (database configured)
             ├── plugin/    # AuthPluginRegistry + built-in plugins (ApiKey, NoOp)
             └── type_provisioning.rs  # GTS type registration
@@ -784,7 +785,7 @@ Header may be stripped by intermediaries. For critical error handling, clients s
 | `api_ingress` | Internal | REST API hosting |
 | `toolkit-db` | Internal | Optional database persistence (SeaORM, multi-backend); absent configuration selects in-memory storage |
 | `toolkit-auth` | Internal | Authentication & authorization |
-| `pingora` | External | Reverse-proxy engine (connection pooling, load balancing) |
+| `toolkit-http-proxy` | Internal | Upstream proxy engine (connection pooling, ALPN, FIPS-hardened TLS, load balancing, health checks) |
 
 ### 3.5 Interactions & Sequences
 
@@ -902,7 +903,7 @@ OAGW does not cache upstream responses. Caching is client/upstream responsibilit
 
 Config caching (in-memory caching of effective upstream/route configuration to avoid DB reads on every proxy request) is not implemented. With a configured database, each proxy request issues three queries regardless of tenant hierarchy depth: the upstreams with the alias across the whole tenant chain joined with their plugin rows, the enabled HTTP routes of the selected upstream and its ancestor upstreams that allow the request method, with only the columns matching reads, and the winning route in full with its path, method and plugin rows (re-checked against the request; a request that raced a configuration write selects once more, two more queries). The proxy never reads tags and does not load them; the SDK's `resolve_proxy_target` does, with two more queries. [ADR: Control Plane Caching](./ADR/0007-data-plane-caching.md) and [ADR: State Management](./ADR/0008-state-management.md) define the caching to add on top of [ADR: Optional Persistence](./ADR/0018-optional-persistence.md).
 
-The Pingora endpoint selector caches each upstream's endpoint pool and rebuilds it whenever the upstream's configured endpoints differ from the cached list. This keeps every replica current when several replicas share one database, without cross-instance invalidation.
+The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint pool and rebuilds it whenever the upstream's configured endpoints differ from the cached list. This keeps every replica current when several replicas share one database, without cross-instance invalidation.
 
 ### 4.2 Metrics and Observability
 
@@ -1029,3 +1030,4 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 | [0014 gRPC Support](./ADR/0014-grpc-support.md) | `cpt-cf-oagw-interface-api` |
 | [0015 Rust ABI Client Library](./ADR/0015-rust-abi-client-library.md) | `cpt-cf-oagw-tech-dependencies` |
 | [0018 Optional Persistence](./ADR/0018-optional-persistence.md) | `cpt-cf-oagw-db-schema` |
+| [0019 Upstream Proxy Engine](./ADR/0019-upstream-proxy-engine.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |

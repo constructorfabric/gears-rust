@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-value-schema:p1
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-scope-invariants:p1
 //! The `setting_values` table.

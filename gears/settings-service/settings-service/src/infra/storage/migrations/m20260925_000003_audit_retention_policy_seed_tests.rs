@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 //! The seed is the platform minimum, and applying it twice leaves one row.
 
 use sea_orm_migration::MigratorTrait;

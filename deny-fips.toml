@@ -109,7 +109,7 @@ deny = [
 #
 # Candidates to ban once their pull-through is eliminated:
 #
-#   { name = "ring",          reason = "ring is not our FIPS backend; transitive via pingora-rustls / ureq" },
+#   { name = "ring",          reason = "ring is not our FIPS backend; a direct dependency of file-storage, and rustls's `ring` feature via ureq (build-time only, api-gateway)" },
 #   { name = "aws-lc-rs",     reason = "non-FIPS aws-lc-rs reaches the binary via rustls's default features; replace with rustls/fips on Linux, dropped via shim on macOS/Windows" },
 #   { name = "chacha20",      reason = "stream cipher; not FIPS-approved; transitive via rand ecosystem" },
 #   { name = "md-5",          reason = "MD5 is not FIPS-approved; transitive via TBD (likely JWT / hash-id helper)" },

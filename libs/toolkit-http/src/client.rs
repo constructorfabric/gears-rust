@@ -645,6 +645,76 @@ mod tests {
         }
     }
 
+    /// `x-request-id` set by an inbound middleware's `with_request_id` scope is
+    /// forwarded on the outbound request, so a downstream gear sees the edge id.
+    #[tokio::test]
+    async fn test_request_id_forwarded_when_in_scope() {
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/test")
+                .header("x-request-id", "req-42");
+            then.status(200);
+        });
+
+        let client = test_client();
+        let url = format!("{}/test", server.base_url());
+
+        let resp = toolkit_trace_context::with_request_id(
+            Some("req-42".to_owned()),
+            client.get(&url).send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+    }
+
+    /// An explicit `x-request-id` header set by the caller wins over the
+    /// scoped id — the carrier must never overwrite a deliberate choice.
+    #[tokio::test]
+    async fn test_request_id_explicit_header_wins_over_scope() {
+        let server = MockServer::start();
+        let _m = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/test")
+                .header("x-request-id", "explicit-id");
+            then.status(200);
+        });
+
+        let client = test_client();
+        let url = format!("{}/test", server.base_url());
+
+        let resp = toolkit_trace_context::with_request_id(
+            Some("scoped-id".to_owned()),
+            client
+                .get(&url)
+                .header("x-request-id", "explicit-id")
+                .send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+    }
+
+    /// Outside a request scope nothing is minted: the header stays absent, so
+    /// background/startup calls don't invent request ids.
+    #[tokio::test]
+    async fn test_request_id_absent_outside_scope() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(Method::GET)
+                .path("/test")
+                .header_missing("x-request-id");
+            then.status(200);
+        });
+
+        let client = test_client();
+        let url = format!("{}/test", server.base_url());
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), hyper::StatusCode::OK);
+        mock.assert_async().await;
+    }
+
     /// Test small buffer capacity with fail-fast behavior
     ///
     /// With fail-fast buffer semantics, some requests may fail with Overloaded

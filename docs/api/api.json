@@ -965,7 +965,11 @@
             "type": "string"
           },
           "actor_masked": {
-            "description": "Whether `actor` carries the mask token.",
+            "description": "Whether `actor` carries the mask token, whether because the caller lacks\nthe unmasked-PII entitlement or because the boundary withheld it\n(`actor_withheld` tells the two apart).",
+            "type": "boolean"
+          },
+          "actor_withheld": {
+            "description": "Whether `actor` is withheld by the upward disclosure boundary, whatever\nthe entitlement: its tenant is not on the path from the reader tenant to\nthe record's.",
             "type": "boolean"
           },
           "change_set_id": {
@@ -1331,6 +1335,14 @@
         ],
         "type": "object"
       },
+      "BindModeDto": {
+        "description": "Bind mode of `POST /files`: `auto` (default) or `manual`. Closed set.",
+        "enum": [
+          "auto",
+          "manual"
+        ],
+        "type": "string"
+      },
       "BindReq": {
         "description": "Request body for `POST /files/{id}/bind`.",
         "properties": {
@@ -1343,6 +1355,15 @@
           "version_id"
         ],
         "type": "object"
+      },
+      "BindStateDto": {
+        "description": "Bind outcome of an upload; the same closed vocabulary is used by the single-part\n`X-FS-Bound` response header and the multipart `complete` `bind_state` field.",
+        "enum": [
+          "bound",
+          "conflict",
+          "manual"
+        ],
+        "type": "string"
       },
       "BranchDto": {
         "description": "GitHub-shaped branch.",
@@ -3043,6 +3064,15 @@
       "CreateFileReq": {
         "description": "Request to create a file (`POST /files`).",
         "properties": {
+          "bind": {
+            "default": "auto",
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/BindModeDto",
+                "description": "Bind mode for the first content: `\"auto\"` (default; the upload itself binds under a\n`content_id IS NULL` CAS) or `\"manual\"` (an explicit `POST /files/{id}/bind`\nafterwards). Not part of the idempotency request hash."
+              }
+            ]
+          },
           "custom_metadata": {
             "items": {
               "$ref": "#/components/schemas/MetadataEntryDto"
@@ -3053,7 +3083,7 @@
             "type": "string"
           },
           "idempotency_key": {
-            "description": "Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with\nthe same key returns the original response without creating a new file.",
+            "description": "Optional idempotency key: within the same `(owner_kind, owner_id)`, a retry with\nthe same key returns the original response without creating a new file.\nNot supported together with `multipart` (rejected with 400).",
             "type": [
               "string",
               "null"
@@ -3061,6 +3091,17 @@
           },
           "mime_type": {
             "type": "string"
+          },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CreateMultipartIntentDto",
+                "description": "Optional multipart intent. When the server-computed plan has **two or more parts**,\nthe response carries the parts plan (`UploadTicketDto::multipart`) instead of a\nsingle-part `upload_url`; a one-part plan falls back to `upload_url`."
+              }
+            ]
           },
           "name": {
             "type": "string"
@@ -3125,6 +3166,30 @@
         "required": [
           "type",
           "name"
+        ],
+        "type": "object"
+      },
+      "CreateMultipartIntentDto": {
+        "description": "Multipart intent on `POST /files`: opens the multipart session and returns the parts plan\nin the same response, saving the separate `POST /files/{id}/multipart` round-trip.",
+        "properties": {
+          "declared_size": {
+            "description": "Declared total file size in bytes (validated against policy/quota at create time).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preferred_part_size": {
+            "description": "Preferred part size in bytes (hint); the server-computed plan is authoritative.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "declared_size"
         ],
         "type": "object"
       },
@@ -4739,12 +4804,16 @@
             "type": "string"
           },
           "supplied_by": {
-            "description": "The tenant whose row supplies it; absent for `overridable`.",
+            "description": "The tenant whose row supplies it; absent for `overridable`, and absent\nwhen that tenant is above the reader tenant.",
             "format": "uuid",
             "type": [
               "string",
               "null"
             ]
+          },
+          "supplied_from_above": {
+            "description": "Set when the supplying tenant is above the reader tenant, so it is\nnot named: the access is inherited from above.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -6857,15 +6926,6 @@
       "InitiateMultipartReq": {
         "description": "Request to initiate a multipart upload (`POST /files/{id}/multipart`).\n\nThe server answers with a parts plan containing one signed upload URL per part.",
         "properties": {
-          "concurrency": {
-            "description": "Advisory upload concurrency; does not change the parts plan.",
-            "format": "int32",
-            "minimum": 0,
-            "type": [
-              "integer",
-              "null"
-            ]
-          },
           "declared_mime": {
             "description": "Declared MIME type for the file content.",
             "type": "string"
@@ -8557,23 +8617,44 @@
         "type": "object"
       },
       "MultipartCompleteDto": {
-        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the bound version,\nits size, and the composite content hash. `manifest` lets a client re-verify the hash.",
+        "description": "Response of `POST /files/{id}/multipart/{upload_id}/complete`: the version, its size,\nthe content hash and the bind outcome. `manifest` lets a client re-verify the hash.",
         "properties": {
+          "bind_state": {
+            "$ref": "#/components/schemas/BindStateDto",
+            "description": "Bind outcome, the same closed vocabulary as the single-part `X-FS-Bound` header:\n`bound` (`etag` is the new content `ETag`), `conflict` (auto-bind lost its CAS; the\nupload succeeded and `current_etag` is the `If-Match` for a manual rebind), or\n`manual` (the client binds explicitly)."
+          },
           "content_hash": {
-            "description": "Hex-encoded composite hash (`sha256` of the manifest).",
+            "description": "Hex-encoded content hash: `sha256` of the manifest for two or more parts, or of\nthe object bytes for a one-part plan.",
             "type": "string"
+          },
+          "current_etag": {
+            "description": "Current content `ETag` when the bind CAS was lost (`bind_state == \"conflict\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "etag": {
+            "description": "Content `ETag` after a successful bind (`bind_state == \"bound\"` only).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "hash_algorithm": {
             "description": "Always `\"SHA-256\"`.",
             "type": "string"
           },
           "hash_mode": {
-            "description": "Always `\"multipart-composite-sha256\"` for this endpoint.",
+            "description": "`\"multipart-composite-sha256\"` for two or more parts, `\"whole-sha256\"` for one part.",
             "type": "string"
           },
           "manifest": {
-            "description": "Part manifest text the composite hash is computed over.",
-            "type": "string"
+            "description": "Part manifest text the composite hash is computed over. Omitted for a one-part\nplan (`whole-sha256` has no manifest).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "part_count": {
             "format": "int32",
@@ -8595,9 +8676,35 @@
           "content_hash",
           "hash_mode",
           "part_count",
-          "manifest"
+          "bind_state"
         ],
         "type": "object"
+      },
+      "MultipartCompletingDto": {
+        "description": "`202 Accepted` body of `POST .../complete` while another caller holds the completion\nlease; the client re-issues the idempotent `complete` after `retry_after_secs`.",
+        "properties": {
+          "retry_after_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "state": {
+            "$ref": "#/components/schemas/MultipartCompletingStateDto",
+            "description": "Always `completing`."
+          }
+        },
+        "required": [
+          "state",
+          "retry_after_secs"
+        ],
+        "type": "object"
+      },
+      "MultipartCompletingStateDto": {
+        "description": "State carried by the `202` body of `complete`: always `completing`.",
+        "enum": [
+          "completing"
+        ],
+        "type": "string"
       },
       "MultipartPartPlanDto": {
         "description": "One part in the parts plan.",
@@ -8768,6 +8875,26 @@
         },
         "required": [
           "settings"
+        ],
+        "type": "object"
+      },
+      "NeedsReviewDto": {
+        "description": "A review verdict on one value: whether it is flagged, and why.",
+        "properties": {
+          "needs_review": {
+            "description": "Whether a revive would flag the value: it no longer validates against\nthe type. A secret is never flagged, and a value flagged earlier that\nvalidates again is reported clear.",
+            "type": "boolean"
+          },
+          "needs_review_detail": {
+            "description": "Why, when `needs_review`; absent whenever the value is masked.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "needs_review"
         ],
         "type": "object"
       },
@@ -11188,7 +11315,9 @@
           "ref_type": {
             "type": "string"
           },
-          "snapshot": {},
+          "snapshot": {
+            "description": "The content the review reads, as stored at submit. Each price of a prices snapshot, in\n`before` and `after`, carries its `currency` and `currency_scale` (D-539), so a review\nrenders its money from the unit alone; `book { id, code, name, currency }` is put beside\neach book id at read (D-516)."
+          },
           "state": {
             "$ref": "#/components/schemas/PricingUnitState"
           },
@@ -17962,6 +18091,10 @@
             "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
             "type": "string"
           },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement: its tenant is not on the path from the\nreader tenant down to the restricted tenant.",
+            "type": "boolean"
+          },
           "tenant_id": {
             "description": "The tenant restricted.",
             "format": "uuid",
@@ -18553,8 +18686,12 @@
             "type": "string"
           },
           "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII, and the mask token with `set_by_withheld`\nwhen its tenant is not on the path from the reader tenant to the row's\ntenant.",
             "type": "string"
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
           },
           "tenant_id": {
             "description": "The tenant whose override is flagged.",
@@ -18631,6 +18768,95 @@
           "comments_count"
         ],
         "type": "object"
+      },
+      "RevivalReportDto": {
+        "description": "What a revive of a retired declaration would do to the values it retained:\nadvisory, stored nowhere, and not consulted by the revive.",
+        "properties": {
+          "complete": {
+            "description": "`false` when the subtree node budget cut the walk: the counts are then\nlower bounds.",
+            "type": "boolean"
+          },
+          "declaration_id": {
+            "description": "The retired declaration's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "key": {
+            "description": "The declaration's key.",
+            "type": "string"
+          },
+          "scanned": {
+            "description": "How many tenants were walked, the caller's own included.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "description": "How many retained values were found, listed or not.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_needs_review": {
+            "description": "How many of them a revive would flag.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "values": {
+            "description": "The first `limit` retained values within the caller's administration,\nin the walk's breadth-first order.",
+            "items": {
+              "$ref": "#/components/schemas/RevivalValueDto"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "declaration_id",
+          "values",
+          "total",
+          "total_needs_review",
+          "scanned",
+          "complete"
+        ],
+        "type": "object"
+      },
+      "RevivalValueDto": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/NeedsReviewDto",
+            "description": "Whether a revive would flag the value, and why; the detail is\nwithheld whenever the value is masked."
+          },
+          {
+            "properties": {
+              "masked": {
+                "description": "Whether the value is the mask token rather than the stored value.",
+                "type": "boolean"
+              },
+              "scope": {
+                "description": "Its scope path: `/` for the root tenant, `/tenants/{id}` otherwise.",
+                "type": "string"
+              },
+              "tenant_id": {
+                "description": "The tenant the value is stored at.",
+                "format": "uuid",
+                "type": "string"
+              },
+              "value": {
+                "description": "The stored value, or the mask token when `masked`."
+              }
+            },
+            "required": [
+              "tenant_id",
+              "scope",
+              "value",
+              "masked"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "One retained value a revive of the retired declaration would re-validate."
       },
       "RouteResponse": {
         "properties": {
@@ -21250,6 +21476,10 @@
       "TrailEntryDto": {
         "description": "One scope on the inheritance trail, with the setter identity and\ntimestamp the administrative read is allowed to show.",
         "properties": {
+          "above": {
+            "description": "Set on the one leading entry that stands for every scope above the\nreader tenant: it carries `provided_value`, `has_override` and\n`needs_review`, the last always `false` — a flagged ancestor row is\nnot the reader's to see.",
+            "type": "boolean"
+          },
           "has_override": {
             "description": "Whether an override row exists here.",
             "type": "boolean"
@@ -21270,25 +21500,33 @@
             "type": "boolean"
           },
           "scope": {
-            "description": "`/` or `/tenants/{id}`.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
+            "description": "`/` or `/tenants/{id}`; absent on the collapsed entry that stands for\nevery scope above the reader tenant.",
             "type": [
               "string",
               "null"
             ]
           },
+          "set_by": {
+            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII, and the mask token with\n`set_by_withheld` when its tenant is not on the path from the reader\ntenant down to this scope.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
+          },
           "tenant_id": {
-            "description": "The tenant inspected.",
+            "description": "The tenant inspected; absent on the collapsed entry.",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "scope",
-          "tenant_id",
           "has_override",
           "provided_value",
           "needs_review"
@@ -22035,14 +22273,29 @@
         "type": "object"
       },
       "UploadTicketDto": {
-        "description": "Result of create / presign: identity + the signed upload URL.",
+        "description": "Result of create / presign: identity plus exactly one of a single-part signed upload\nURL or a multipart parts plan (`multipart` only when requested and the plan has >=2 parts).",
         "properties": {
           "file_id": {
             "format": "uuid",
             "type": "string"
           },
+          "multipart": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/MultipartPlanDto",
+                "description": "Multipart plan (absent on the single-part path); same shape as the\n`POST /files/{id}/multipart` response."
+              }
+            ]
+          },
           "upload_url": {
-            "type": "string"
+            "description": "Single-part signed sidecar URL (absent when `multipart` is present).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "version_id": {
             "format": "uuid",
@@ -22051,8 +22304,7 @@
         },
         "required": [
           "file_id",
-          "version_id",
-          "upload_url"
+          "version_id"
         ],
         "type": "object"
       },
@@ -22649,6 +22901,13 @@
           },
           "is_current": {
             "type": "boolean"
+          },
+          "manifest": {
+            "description": "Part manifest text of a `multipart-composite-sha256` version (as returned by\n`complete`), so a client can re-verify `hash`. Omitted for `whole-sha256`.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "mime_type": {
             "type": "string"
@@ -27268,7 +27527,7 @@
     },
     "/api/file-storage/v1/files": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
+        "description": "Keyset pagination in either direction: `limit` and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, file_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_files",
         "parameters": [
           {
@@ -27290,7 +27549,7 @@
             }
           },
           {
-            "description": "Page size (default 25, max 200); alias `$top`",
+            "description": "Page size, capped at the configured maximum; alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -27424,6 +27683,16 @@
             },
             "description": "Forbidden"
           },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
           "500": {
             "content": {
               "application/problem+json": {
@@ -27433,6 +27702,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -27440,7 +27719,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Create a file and presign its first content upload",
+        "summary": "Create a file and presign its first content upload (single-part URL, or the multipart parts plan with the `multipart` block)",
         "tags": [
           "File Storage"
         ]
@@ -27510,6 +27789,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "summary": "Finalize a pending version (token-authenticated, sidecar s2s callback)",
@@ -28168,6 +28457,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28267,6 +28566,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28363,6 +28672,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28463,7 +28782,7 @@
     },
     "/api/file-storage/v1/files/{id}/multipart/{upload_id}/complete": {
       "post": {
-        "description": "Returns the bound version id, size, and ADR-0006 composite hash/manifest (item 3.3). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400.",
+        "description": "Returns the version id, size, ADR-0006 hash (composite root + manifest for plans of two or more parts; plain whole-sha256 with no manifest for a one-part plan), and the bind outcome (`bind_state`: bound/conflict/manual — auto-bind sessions bind here, in the same transaction as the finalize). Optional If-Match carries the current content ETag; `*`/absent is unconditional, a mismatch is a 400. Idempotent: a retry of an already-completed session replays the stored result; while another caller holds the completion lease the response is `202 completing` (poll by re-issuing the same call).",
         "operationId": "file_storage.complete_multipart",
         "parameters": [
           {
@@ -28494,7 +28813,17 @@
                 }
               }
             },
-            "description": "Completed — version id, size, composite hash, manifest"
+            "description": "Completed — version id, size, composite hash, manifest, bind outcome"
+          },
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MultipartCompletingDto"
+                }
+              }
+            },
+            "description": "Another caller is completing — poll by re-issuing the same complete"
           },
           "400": {
             "content": {
@@ -28555,6 +28884,16 @@
               }
             },
             "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
           }
         },
         "security": [
@@ -28562,7 +28901,7 @@
             "bearerAuth": []
           }
         ],
-        "summary": "Finalize a multipart upload (assemble all parts)",
+        "summary": "Finalize a multipart upload (assemble all parts; idempotent)",
         "tags": [
           "File Storage"
         ]
@@ -28669,7 +29008,7 @@
     },
     "/api/file-storage/v1/files/{id}/versions": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, version_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
+        "description": "Keyset pagination in either direction: `limit` and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, version_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400. Each `multipart-composite-sha256` version carries its `manifest`; a page may return fewer than `limit` items (with the cursor in the paging direction still set) when the ADR-0006 manifest-byte budget truncates it -- see docs/api.md.",
         "operationId": "file_storage.list_versions",
         "parameters": [
           {
@@ -28682,7 +29021,7 @@
             }
           },
           {
-            "description": "Page size (default 25, max 200); alias `$top`",
+            "description": "Page size, capped at the configured maximum; alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -29184,11 +29523,11 @@
     },
     "/api/file-storage/v1/retention-rules": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, rule_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
+        "description": "Keyset pagination in either direction: `limit` and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `created_at desc, rule_id desc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_retention_rules",
         "parameters": [
           {
-            "description": "Page size (default 25, max 200); alias `$top`",
+            "description": "Page size, capped at the configured maximum; alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -29423,11 +29762,11 @@
     },
     "/api/file-storage/v1/storages": {
       "get": {
-        "description": "Keyset pagination in either direction: `limit` (default 25, max 200) and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `id asc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
+        "description": "Keyset pagination in either direction: `limit` and the opaque `cursor` from the previous page's `page_info.next_cursor` or `page_info.prev_cursor`. The response carries `next_cursor` and `prev_cursor`. Canonical order is `id asc` -- see docs/api.md. `$top` and `$skiptoken` are synonyms of `limit` and `cursor`; `$filter`, `$orderby`, `$select` and every other `$` parameter are rejected with 400.",
         "operationId": "file_storage.list_storages",
         "parameters": [
           {
-            "description": "Page size (default 25, max 200); alias `$top`",
+            "description": "Page size, capped at the configured maximum; alias `$top`",
             "in": "query",
             "name": "limit",
             "required": false,
@@ -39021,7 +39360,7 @@
     },
     "/bss-pricing/v1/currencies": {
       "get": {
-        "description": "Returns every currency a price book can use, with the number of decimal places a new price in that currency uses: the active ISO 4217 codes, and the codes the deployment's currency_scales config adds (iso false). The list is sorted by code and is the same for every tenant; the settings' currencies limit only which currency a new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved with (D-531). A caller without config read gets 403.",
+        "description": "Returns every currency a price book can use, with the number of decimal places a new price in that currency uses: the active ISO 4217 codes, and the codes the deployment's currency_scales config adds (iso false). The list is sorted by code and is the same for every tenant; the settings' currencies limit only which currency a new book can use (D-438, D-529, D-537). A saved price keeps the scale it was saved with (D-531). Any authenticated caller reads the table: it holds no tenant data, so no permission is asked.",
         "operationId": "bss_pricing.list_currencies",
         "responses": {
           "200": {
@@ -62669,6 +63008,145 @@
         ]
       }
     },
+    "/settings-service/v1/declarations/revival-preview": {
+      "post": {
+        "description": "Advisory: takes the body of the create that would revive a retired declaration and reports the values it retained at the caller's tenant and its descendants, each re-validated as the revive would re-validate it, without changing anything. Nothing is stored, no step-up is asked, no audit record is written and no cache is touched, and a revive neither requires a report nor consults one. The coverage is the caller's own administration: the caller's tenant and its descendants under the subtree node budget, standalone descendants and their subtrees left out of the list and the counts; `complete` is `false` when the budget cut the walk, and the counts are then lower bounds. `values` lists the first `limit` (default 100, above 500 clamped, below 1 refused) in the walk's breadth-first order, `total` and `total_needs_review` count every value found. A value is masked by the strictest of its row's own classification, the declaration's and the one the body derives, and its detail is withheld whenever it is masked. A body the create's JSON extractor refuses is answered as the create answers it (`400`, `415`, `422`), once both decisions are made; the create's own refusals are answered in the create's order; a body that would not revive a retired declaration, or a retired declaration the caller may not read, is `404` with the code `nothing_to_revive`, the same answer either way. Reactivation is a separate request: `POST` of the same body to the declarations collection, which needs step-up, and values written in between are not in the report. A standalone tenant is a barrier: its subtree is administered from within, and an administrator above it neither sees nor is told of values stored there, though the revive re-validates them too.",
+        "operationId": "settings_service.report_revival",
+        "parameters": [
+          {
+            "description": "How many values to list",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeclarationRequest"
+              }
+            }
+          },
+          "description": "The declaration body a revive would be sent",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevivalReportDto"
+                }
+              }
+            },
+            "description": "The retained values a revive would re-validate"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is not sent as `application/json`, as the create answers it"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The body is JSON but not a declaration to create, as the create answers it"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Report what reviving a retired declaration would do to its values",
+        "tags": [
+          "settings-declarations"
+        ]
+      }
+    },
     "/settings-service/v1/declarations/{id}": {
       "delete": {
         "description": "Retire a declaration: a soft delete that sets `status` to `retired` and answers `200` with the retired body, not `204`. Every stored value is retained and merely excluded from resolution, recoverable by re-declaring the key. Retire drops a live setting out of resolution at once, so it requires step-up; a gear's contributed declaration is refused with a conflict. Requires `If-Match`.",
@@ -63227,13 +63705,22 @@
     },
     "/settings-service/v1/settings": {
       "get": {
-        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. Values are masked by classification.",
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. `q` narrows the page to the settings whose declaration text or shown value contains it; a value masked for the caller never matches. Under `q`, a dependency that is unavailable for a setting whose value the caller could have matched answers 503, since the narrowing cannot be decided; a page already full still answers, with a cursor. A cursor continues only the listing it was minted for: bound to the $filter, the target tenant and `q`, it answers 400 under another. Values are masked by classification.",
         "operationId": "settings_service.browse_settings",
         "parameters": [
           {
             "description": "Target tenant id; omitted, the caller's own tenant",
             "in": "query",
             "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Free text that narrows the page: at least two and at most two hundred characters after trimming; keeps the settings whose key, display name, description, category name, Schema Default, effective value or fallback value contains it, case-insensitively; combines with $filter; the cursor is bound to it beside the $filter and the target, and a page it narrows carries no total_count",
+            "in": "query",
+            "name": "q",
             "required": false,
             "schema": {
               "type": "string"
@@ -63285,7 +63772,7 @@
                 }
               }
             },
-            "description": "A page of per-key outcomes with its pagination cursors and the total of settings the listing holds under its filter"
+            "description": "A page of per-key outcomes with its pagination cursors and, unless q narrows it, the total of settings the listing holds under its filter"
           },
           "400": {
             "content": {
@@ -66989,10 +67476,487 @@
         "tags": [
           "Types Registry"
         ]
+      }
+    },
+    "/types-registry/v2/entities/{entity_key}": {
+      "get": {
+        "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
+        "operationId": "types_registry.get_entity",
+        "parameters": [
+          {
+            "description": "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry Reference UUID",
+            "in": "path",
+            "name": "entity_key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "An earlier `ETag` of this key under the same `$select`, or `*`",
+            "in": "header",
+            "name": "If-None-Match",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 select expression",
+            "in": "query",
+            "name": "$select",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityDto"
+                }
+              }
+            },
+            "description": "The requested entity",
+            "headers": {
+              "ETag": {
+                "description": "The validator of this key under this `$select`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The If-None-Match validator is current",
+            "headers": {
+              "ETag": {
+                "description": "The validator of this key under this `$select`",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Get a GTS entity by identifier or Registry Reference",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/entities:batchGet": {
+      "post": {
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "operationId": "types_registry.batch_get_entities",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BatchGetRequest"
+              }
+            }
+          },
+          "description": "Keys to read",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityLookupsDto"
+                }
+              }
+            },
+            "description": "One result per requested key"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Payload Too Large"
+          },
+          "415": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unsupported Media Type"
+          },
+          "422": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unprocessable Entity"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a set of GTS entities by key",
+        "tags": [
+          "Types Registry"
+        ]
+      }
+    },
+    "/types-registry/v2/platform/entities": {
+      "get": {
+        "description": "Return one bounded page of entities, ordered by canonical identifier, with a cursor only when another match remains; a page with a cursor is full. `lifecycle_status` is `active` (default), `deleted` (tombstones only) or `all`. Each item is projected by `$select` exactly as GET /types-registry/v2/platform/entities/{entity_key} projects it; absent, the document-free default; `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned. A page never carries a validator. `depth` bounds the number of identifier segments and `kind` narrows to Type Schemas or Instances; `lifecycle_status`, `depth` and `kind` intersect with `pattern` before the page limit. `limit` (alias `$top`) defaults to 50 and may not exceed 100; a caller selecting documents should page smaller. `cursor` (alias `$skiptoken`) is opaque, versioned and bound to the pattern, `depth`, `kind`, `lifecycle_status` and the normalized `$select` it was issued for: resuming under any of them changed, or with a token of another version, is a 400, while an absent and an explicit default value of `$select` or `lifecycle_status` are interchangeable. Any other query parameter is refused.",
+        "operationId": "types_registry.platform.list_entities",
+        "parameters": [
+          {
+            "description": "A GTS identifier pattern (GTS spec section 10), with or without a wildcard. With one trailing `*`, starting at a segment token or the version, it matches every identifier under that prefix, derived types and Instances included (e.g. gts.acme.core.*, gts.acme.core.events.user_created.v1~*). Without `*` it must be a valid GTS identifier: a Type Schema identifier matches itself, every type derived from it and every Instance of them (e.g. gts.acme.core.events.user_created.v1~); an Instance identifier matches that Instance. In either form a segment that gives only a major version (`v1`) matches every minor of that major (`v1`, `v1.0`, `v1.3`), while a given minor matches only itself. A pattern that does not parse is a 400",
+            "in": "query",
+            "name": "pattern",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Inclusive maximum number of GTS identifier segments, 1 to 255: a one-segment root has depth 1 and each derived type or Instance tail adds one. Applies with or without `pattern`",
+            "in": "query",
+            "name": "depth",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only entities of this kind: `type_schema` or `instance`. Absent means both; any other value is a 400",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "`active` (default), `deleted` (tombstones only) or `all` (both). Any other value, empty or repeated, is a 400",
+            "in": "query",
+            "name": "lifecycle_status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page size, 1 to 100. Defaults to 50. Alias: $top",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "minimum": 1,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "The previous page's page_info.next_cursor, under the same pattern, depth, kind, lifecycle_status and $select. Absent starts at the beginning. Alias: $skiptoken",
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "OData v4 select expression",
+            "in": "query",
+            "name": "$select",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EntityPageDto"
+                }
+              }
+            },
+            "description": "One page and, while more remains, its cursor"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "429": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Too Many Requests"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "internalToken": []
+          }
+        ],
+        "summary": "Discover GTS entities",
+        "tags": [
+          "Types Registry"
+        ]
       },
       "post": {
-        "description": "Submit one or more GTS entities for admission. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-candidate outcome. A replay of a terminal operation returns 200. An Idempotency-Key header is required: a replay with the same body returns the same operation, and a different body under the same key is a conflict.",
-        "operationId": "types_registry.submit_entities",
+        "description": "Submit one or more GTS entities for admission. Returns 202 with the operation's Location; poll GET /types-registry/v2/platform/operations/{operation_id} for the per-candidate outcome. A replay of a terminal operation returns 200. An Idempotency-Key header is required: a replay with the same body returns the same operation, and a different body under the same key is a conflict.",
+        "operationId": "types_registry.platform.submit_entities",
         "parameters": [
           {
             "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
@@ -67183,7 +68147,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Submit GTS entities for registration",
@@ -67192,10 +68156,10 @@
         ]
       }
     },
-    "/types-registry/v2/entities/{entity_key}": {
+    "/types-registry/v2/platform/entities/{entity_key}": {
       "delete": {
-        "description": "Delete a single entity named by canonical GTS identifier or Registry Reference UUID, spelled as GET /types-registry/v2/entities/{entity_key} takes it and resolved by the worker. One item's worth of :batchDelete. Returns 202 with the operation's Location; a stale version is reported as a terminal `precondition_failed` item rather than a 412, and If-Match is refused rather than ignored.",
-        "operationId": "types_registry.delete_entity",
+        "description": "Delete a single entity named by canonical GTS identifier or Registry Reference UUID, spelled as GET /types-registry/v2/platform/entities/{entity_key} takes it and resolved by the worker. One item's worth of :batchDelete. Returns 202 with the operation's Location; a stale version is reported as a terminal `precondition_failed` item rather than a 412, and If-Match is refused rather than ignored.",
+        "operationId": "types_registry.platform.delete_entity",
         "parameters": [
           {
             "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
@@ -67374,7 +68338,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Delete one GTS entity",
@@ -67384,7 +68348,7 @@
       },
       "get": {
         "description": "Return one entity, projected by `$select`. The key is either a canonical GTS identifier or the Registry Reference UUID derived from it; a key over 1024 bytes is a 400, and any other key naming no entity is a 404. Absent `$select` is the document-free default `gts_id,gts_uuid,kind,origin,lifecycle_status`; documents are selected individually from `content`, `resolved_schema`, `effective_traits` and `effective_traits_schema` (the last three Type Schemas only), plus the `provenance` group of a Type Schema (omitted on an Instance). Names are case-insensitive; an empty, duplicate, unknown or nested name is a 400. `gts_id`, `gts_uuid`, `kind` and `lifecycle_status` are always returned, whether or not `$select` names them, so a deleted entity is still readable and reports it. No other query parameter is accepted. The `ETag` is scoped to the `$select`; `If-None-Match` with a current one returns a bodyless 304.",
-        "operationId": "types_registry.get_entity",
+        "operationId": "types_registry.platform.get_entity",
         "parameters": [
           {
             "description": "A GTS identifier (e.g. gts.acme.core.events.user_created.v1~) or a Registry Reference UUID",
@@ -67527,7 +68491,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Get a GTS entity by identifier or Registry Reference",
@@ -67536,10 +68500,10 @@
         ]
       }
     },
-    "/types-registry/v2/entities:batchDelete": {
+    "/types-registry/v2/platform/entities:batchDelete": {
       "post": {
-        "description": "Submit one or more entities for deletion. Each item names its target in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it) and carries a required positive `expected_resource_version`. Returns 202 with the operation's Location; poll GET /types-registry/v2/operations/{operation_id} for the per-item outcome. Outcomes are reported in request order and echo each key as `entity_key`, a Registry Reference in canonical lowercase hyphenated form; a Registry Reference naming no entity fails only its own item. A stale version is not a 412: it is reported as a terminal `precondition_failed` item on the operation, and If-Match is refused rather than ignored.",
-        "operationId": "types_registry.batch_delete_entities",
+        "description": "Submit one or more entities for deletion. Each item names its target in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it) and carries a required positive `expected_resource_version`. Returns 202 with the operation's Location; poll GET /types-registry/v2/platform/operations/{operation_id} for the per-item outcome. Outcomes are reported in request order and echo each key as `entity_key`, a Registry Reference in canonical lowercase hyphenated form; a Registry Reference naming no entity fails only its own item. A stale version is not a 412: it is reported as a terminal `precondition_failed` item on the operation, and If-Match is refused rather than ignored.",
+        "operationId": "types_registry.platform.batch_delete_entities",
         "parameters": [
           {
             "description": "Caller-supplied key scoping the retry of this submission. A replay with the same body returns the same operation; a different body under the same key is a conflict.",
@@ -67730,7 +68694,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Submit GTS entities for deletion",
@@ -67739,10 +68703,10 @@
         ]
       }
     },
-    "/types-registry/v2/entities:batchGet": {
+    "/types-registry/v2/platform/entities:batchGet": {
       "post": {
-        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
-        "operationId": "types_registry.batch_get_entities",
+        "description": "Read up to 100 entities in one round trip. Each item names one entity in `entity_key` (a canonical GTS identifier or the Registry Reference UUID derived from it), resolved exactly as GET /types-registry/v2/platform/entities/{entity_key} resolves it. A top-level `$select` string applies to every key and follows that route's `$select` rules; absent, the document-free default. Tombstones are `found`. Returns 200 with one result per distinct requested key, in no contractual order, echoing the key it was asked by, a Registry Reference in canonical lowercase hyphenated form: `found` with the selected fields, exactly as the exact read returns them and always including `gts_id`, `gts_uuid`, `kind` and `lifecycle_status`, or `not_found`. Every result but `not_found` carries the key's `etag`; an item whose `if_none_match` is still current answers `unchanged` without the entity. Query parameters are refused, `$select` included. A key named twice, in any UUID spelling, collapses onto its first mention and its condition; the identifier and the Registry Reference of one entity are two keys and get two results. An absent key is not a 404: one missing key must not lose the answers for the others. The If-None-Match header is refused rather than ignored: validators are per key and belong in each item's `if_none_match`.",
+        "operationId": "types_registry.platform.batch_get_entities",
         "requestBody": {
           "content": {
             "application/json": {
@@ -67878,7 +68842,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Read a set of GTS entities by key",
@@ -67887,10 +68851,10 @@
         ]
       }
     },
-    "/types-registry/v2/operations/{operation_id}": {
+    "/types-registry/v2/platform/operations/{operation_id}": {
       "get": {
         "description": "Return one operation and the durable per-candidate outcomes. `status` is progress only: `completed` means every item is terminal, and the outcomes are on the items.",
-        "operationId": "types_registry.get_operation",
+        "operationId": "types_registry.platform.get_operation",
         "parameters": [
           {
             "description": "The operation UUID returned by a submission",
@@ -67996,7 +68960,7 @@
         },
         "security": [
           {
-            "bearerAuth": []
+            "internalToken": []
           }
         ],
         "summary": "Get an admission operation",

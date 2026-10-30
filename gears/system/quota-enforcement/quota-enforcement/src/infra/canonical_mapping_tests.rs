@@ -83,6 +83,24 @@ fn every_variant_family_maps_to_its_documented_status() {
         (DomainError::LeaseContentionTimeout, 409),
         (DomainError::LeaseInflightLimitExceeded, 429),
         (
+            DomainError::InvalidBatchItem {
+                index: 1,
+                field: "amount",
+                reason: "INVALID_AMOUNT",
+            },
+            400,
+        ),
+        (DomainError::BulkTooLarge { items: 2, max: 1 }, 400),
+        (
+            DomainError::InvalidSnapshot {
+                index: Some(0),
+                field: "id",
+                reason: "SNAPSHOT_TENANT_MISMATCH",
+            },
+            400,
+        ),
+        (DomainError::BatchTimeout, 504),
+        (
             DomainError::NotReady {
                 dependency: Dependency::Storage,
             },
@@ -251,6 +269,58 @@ fn not_yet_implemented_is_unimplemented_with_the_token_leading_the_detail() {
     );
     let rendered = serde_json::to_string(&problem).expect("json");
     assert!(rendered.contains(QUOTA_RESOURCE), "{rendered}");
+}
+
+#[test]
+fn batch_rejections_name_the_item_and_lead_with_their_tokens() {
+    let item = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::InvalidBatchItem {
+            index: 3,
+            field: "amount",
+            reason: "INVALID_AMOUNT",
+        },
+    )))
+    .expect("json");
+    assert!(item.contains("items[3].amount"), "{item}");
+    assert!(item.contains("INVALID_AMOUNT"), "{item}");
+    let size = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::BulkTooLarge { items: 2, max: 1 },
+    )))
+    .expect("json");
+    assert!(size.contains("BULK_TOO_LARGE"), "{size}");
+    let timeout = Problem::from(CanonicalError::from(DomainError::BatchTimeout));
+    assert!(
+        timeout.detail.starts_with("BATCH_TIMEOUT:"),
+        "the token leads the detail: {}",
+        timeout.detail
+    );
+}
+
+#[test]
+fn snapshot_rejections_name_the_subject_or_the_request_field() {
+    let subject = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::InvalidSnapshot {
+            index: Some(2),
+            field: "kind",
+            reason: "SUBJECT_KIND_INVALID",
+        },
+    )))
+    .expect("json");
+    assert!(subject.contains("subjects[2].kind"), "{subject}");
+    assert!(subject.contains("SUBJECT_KIND_INVALID"), "{subject}");
+    let request = serde_json::to_string(&Problem::from(CanonicalError::from(
+        DomainError::InvalidSnapshot {
+            index: None,
+            field: "limit",
+            reason: "SNAPSHOT_LIMIT_OUT_OF_RANGE",
+        },
+    )))
+    .expect("json");
+    assert!(request.contains("\"limit\""), "{request}");
+    assert!(
+        request.contains(QUOTA_RESOURCE),
+        "a snapshot reads Quotas: {request}"
+    );
 }
 
 #[test]

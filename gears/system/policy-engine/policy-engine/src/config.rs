@@ -18,9 +18,16 @@ pub struct PolicyEngineConfig {
     /// duration such as `5ms`.
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub evaluation_timeout: Duration,
-    /// Bound on each tenant-hierarchy call (`humantime`).
+    /// Bound on each tenant-hierarchy call of the decision path
+    /// (`humantime`).
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub hierarchy_timeout: Duration,
+    /// Bound on each tenant-hierarchy call of the management surface, which
+    /// reads the caller's whole subtree to list assignments (`humantime`).
+    /// Kept apart from `hierarchy_timeout` so a slow listing never loosens
+    /// the decision path's bound.
+    #[serde(with = "toolkit_utils::humantime_serde")]
+    pub management_hierarchy_timeout: Duration,
     /// Bound on the types-registry lookup at validation time (`humantime`).
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub registry_timeout: Duration,
@@ -84,6 +91,7 @@ impl Default for PolicyEngineConfig {
             engine_plugin: EnginePluginConfig::default(),
             evaluation_timeout: Duration::from_millis(5),
             hierarchy_timeout: Duration::from_millis(20),
+            management_hierarchy_timeout: Duration::from_secs(1),
             registry_timeout: Duration::from_millis(500),
             store_timeout: Duration::from_millis(100),
             compile_cache_capacity: 256,
@@ -124,11 +132,13 @@ pub enum ConfigError {
 }
 
 /// The longest accepted `evaluation_timeout`, `hierarchy_timeout`,
-/// `registry_timeout` and `store_timeout`, in that order: a decision runs on
-/// the admission path, so none of its bounds may grow without limit.
-const MAX_DURATIONS: [Duration; 4] = [
+/// `management_hierarchy_timeout`, `registry_timeout` and `store_timeout`,
+/// in that order: a decision runs on the admission path, so none of its
+/// bounds may grow without limit, and a management call holds a request.
+const MAX_DURATIONS: [Duration; 5] = [
     Duration::from_secs(1),
     Duration::from_secs(10),
+    Duration::from_secs(60),
     Duration::from_secs(60),
     Duration::from_secs(10),
 ];
@@ -149,6 +159,10 @@ impl PolicyEngineConfig {
         let durations = [
             ("evaluation_timeout", self.evaluation_timeout),
             ("hierarchy_timeout", self.hierarchy_timeout),
+            (
+                "management_hierarchy_timeout",
+                self.management_hierarchy_timeout,
+            ),
             ("registry_timeout", self.registry_timeout),
             ("store_timeout", self.store_timeout),
         ];

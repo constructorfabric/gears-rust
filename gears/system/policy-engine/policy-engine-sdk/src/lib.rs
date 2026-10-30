@@ -4,9 +4,8 @@
 //!
 //! - [`management`] - [`PolicyManagementClientV1`], the administration surface
 //!   (content lifecycle, assignments, validation), its models and reason codes.
-//! - [`gts`] - GTS identifiers this gear owns: resource types, the admission
-//!   engine plugin instance id, the management permission catalog and the
-//!   policy entrypoint.
+//! - [`gts`] - GTS types and instances this gear owns: the resource type
+//!   schemas, the management permission catalog and the policy entrypoint.
 //! - [`error`] - reason codes of decisions.
 //!
 //! The engine itself is consumed only as an admission-control engine plugin.

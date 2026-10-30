@@ -5,6 +5,7 @@
 
 use async_trait::async_trait;
 use time::OffsetDateTime;
+use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -17,12 +18,56 @@ use crate::domain::policy::{
     PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope, StoredPolicy, StoredRetentionRule,
 };
 
+/// Bind a just-finalized version as the file's content in the SAME transaction as the finalize
+/// (single-part `bind=auto`), under the same optimistic CAS as a manual `bind`.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct AutoBindOnFinalize {
+    pub expected_content_id: Option<Uuid>,
+    pub audit: AuditEntry,
+    pub event: Option<FileEvent>,
+}
+
+/// Result of `finalize_version`.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct FinalizeVersionOutcome {
+    pub updated: bool,
+    pub bound: bool,
+}
+
+/// Completion facts known before the bind outcome (everything but `bind_state`/`etag`/`current_etag`).
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct MultipartFinishSnapshot {
+    pub upload_id: Uuid,
+    pub version_id: Uuid,
+    pub size: i64,
+    pub content_hash: Vec<u8>,
+    pub hash_mode: crate::infra::content::hash_mode::HashMode,
+    pub part_count: Option<i32>,
+    pub session_audit: AuditEntry,
+}
+
+/// Result of [`MultipartStore::finalize_multipart_version`].
+#[domain_model]
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone)]
+pub struct FinalizeMultipartOutcome {
+    pub updated: bool,
+    pub bound: bool,
+    /// The terminal `completing -> completed` CAS won in this transaction; `false` when `updated` is
+    /// `false` or the lease was taken over (the caller re-checks and converges).
+    pub session_completed: bool,
+    /// Current content `ETag` when the auto-bind CAS lost (`Some` only then). Read in this
+    /// transaction so it agrees with the persisted snapshot, not a later read.
+    pub current_etag: Option<String>,
+}
+
 /// Persistence port for the cleanup engine.
 #[async_trait]
 pub trait CleanupStore: Send + Sync {
     /// List pending versions older than `older_than`, excluding any backing a live
-    /// `in_progress` multipart session (`expires_at > now`). Versions of expired
-    /// sessions are not excluded; they become reclaimable once the session is aborted.
     async fn list_abandoned_pending_versions(
         &self,
         older_than: OffsetDateTime,
@@ -47,7 +92,7 @@ pub trait CleanupStore: Send + Sync {
         audit: AuditEntry,
     ) -> Result<bool, DomainError>;
 
-    /// List `in_progress` multipart sessions whose `expires_at` is before `now`.
+    /// List `in_progress` (or lease-lapsed `completing`) sessions with `expires_at` before `now`.
     async fn list_expired_multipart_uploads(
         &self,
         now: OffsetDateTime,
@@ -86,10 +131,10 @@ pub trait CleanupStore: Send + Sync {
     /// Fetch a file by id (unscoped -- the sweep runs across all tenants).
     async fn get_file(&self, file_id: Uuid) -> Result<Option<File>, DomainError>;
 
-    /// Whether `file_id` has any `in_progress` multipart session (regardless of
-    /// `expires_at`). Guards the orphan-file delete: deleting the file would
-    /// `ON DELETE CASCADE` a still-live session.
-    async fn has_in_progress_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
+    /// Whether `file_id` has an active (`in_progress` or `completing`) session, regardless of
+    /// `expires_at`/`lease_until`. Guards orphan-file delete (the file would `ON DELETE CASCADE` a
+    /// live session); only the expired-multipart sweep's CAS may declare a stuck lease abandoned.
+    async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError>;
 
     /// Delete a file row, optionally enqueue a file-event, and audit — all in
     /// one transaction. Returns `true` if a row was removed.
@@ -152,9 +197,12 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: &str,
+        backend_path: &str,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError>;
@@ -171,6 +219,8 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
     ) -> Result<Option<FileVersion>, DomainError>;
+
+    async fn get_version_manifest(&self, version_id: Uuid) -> Result<Option<String>, DomainError>;
 
     /// Insert or replace a multipart upload part.
     #[allow(clippy::too_many_arguments)]
@@ -195,6 +245,9 @@ pub trait MultipartStore: Send + Sync {
     /// `hash_mode`/`part_count`/`manifest` (ADR-0006) are persisted transactionally with
     /// the version row; `manifest` is `Some` only for `multipart-composite-sha256`.
     /// `validated_mime` is the sniffed MIME type stored in place of the declared one.
+    ///
+    /// `auto_bind`, when `Some`, binds in the same transaction under the same CAS as a manual `bind`;
+    /// a lost CAS is reported in `bound`, not an error.
     #[allow(clippy::too_many_arguments)]
     async fn finalize_version(
         &self,
@@ -207,13 +260,47 @@ pub trait MultipartStore: Send + Sync {
         manifest: Option<String>,
         validated_mime: Option<String>,
         audit: AuditEntry,
-    ) -> Result<bool, DomainError>;
+        auto_bind: Option<AutoBindOnFinalize>,
+    ) -> Result<FinalizeVersionOutcome, DomainError>;
 
-    /// Mark a multipart session as `completed` + audit in one transaction.
+    /// Finalize a multipart version AND move its session `completing -> completed` (with snapshot)
+    /// in one transaction with the auto-bind CAS, so a crash cannot leave no snapshot.
+    #[allow(clippy::too_many_arguments)]
+    async fn finalize_multipart_version(
+        &self,
+        file_id: Uuid,
+        manifest: Option<String>,
+        validated_mime: Option<String>,
+        finalize_audit: AuditEntry,
+        auto_bind: Option<AutoBindOnFinalize>,
+        finish: MultipartFinishSnapshot,
+    ) -> Result<FinalizeMultipartOutcome, DomainError>;
+
+    /// Terminal `completing -> completed` + snapshot (`result_json`) + audit in one transaction,
+    /// for the takeover/converge paths. `lease_owner` must still match.
     async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
         audit: AuditEntry,
+    ) -> Result<bool, DomainError>;
+
+    /// Acquire (or take over an expired) completion lease with one conditional UPDATE.
+    /// `false` = a live lease exists or the session is terminal.
+    async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError>;
+
+    /// Release a held lease back to `in_progress`, scoped to `owner`.
+    async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
     ) -> Result<bool, DomainError>;
 
     /// Mark a multipart session as `aborted` + audit in one transaction.
@@ -229,6 +316,15 @@ pub trait MultipartStore: Send + Sync {
         file_id: Uuid,
         version_id: Uuid,
         audit: AuditEntry,
+    ) -> Result<bool, DomainError>;
+
+    /// Delete an orphan `files` row, re-verifying **in the same transaction** that it has zero
+    /// versions and a `NULL` `content_id`. Returns `true` if removed.
+    async fn delete_orphan_file_with_event(
+        &self,
+        file_id: Uuid,
+        audit: AuditEntry,
+        event: Option<FileEvent>,
     ) -> Result<bool, DomainError>;
 }
 

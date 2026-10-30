@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Rendering rules: masking, recency, the review pair and the state tag.
 
 use serde_json::json;
@@ -6,7 +5,8 @@ use settings_service_sdk::EffectiveSource;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-use super::{ABSENT_STATE_TAG, mask, render};
+use super::{ABSENT_STATE_TAG, Reader, mask, render};
+use crate::domain::resolution::cache::tests_entry;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN, OwnRow, TrailEntry};
 
 fn at(seconds: i64) -> OffsetDateTime {
@@ -14,19 +14,13 @@ fn at(seconds: i64) -> OffsetDateTime {
 }
 
 fn effective(classification: &str) -> EffectiveValue {
-    let tenant = Uuid::new_v4();
     EffectiveValue {
-        key: "k".to_owned(),
-        declaration_id: Uuid::nil(),
-        scope: format!("/tenants/{tenant}"),
-        tenant_id: tenant,
         value: json!("hello"),
         source: EffectiveSource::Inherited,
         source_scope: Some("/".to_owned()),
         fallback: json!("hello"),
         fallback_source: EffectiveSource::Inherited,
         fallback_scope: Some("/".to_owned()),
-        traits: json!({}),
         trail: vec![TrailEntry {
             tenant_id: Uuid::nil(),
             scope: "/".to_owned(),
@@ -34,14 +28,13 @@ fn effective(classification: &str) -> EffectiveValue {
             provided_value: true,
             needs_review: false,
             set_by: Some("root-admin".to_owned()),
+            set_by_tenant: None,
             last_change_at: Some(at(200)),
         }],
         data_classification: classification.to_owned(),
-        domain_affinity: None,
-        secret_backed: false,
         declaration_last_change_at: at(100),
         resolved_row_last_change_at: Some(at(200)),
-        own_row: None,
+        ..tests_entry("k", Uuid::new_v4())
     }
 }
 
@@ -64,28 +57,28 @@ fn the_fallback_is_masked_by_the_one_decision_made_for_the_value() {
         e.fallback = json!("parent");
         e
     };
-    let secret = render(&with_own("secret"), true);
+    let secret = render(&with_own("secret"), true, Reader::Platform, &[]);
     assert_eq!(
         (secret.value, secret.fallback),
         (json!(MASK_TOKEN), json!(MASK_TOKEN))
     );
     assert!(secret.masked);
 
-    let pii_hidden = render(&with_own("pii"), false);
+    let pii_hidden = render(&with_own("pii"), false, Reader::Platform, &[]);
     assert_eq!(
         (pii_hidden.value, pii_hidden.fallback),
         (json!(MASK_TOKEN), json!(MASK_TOKEN))
     );
     assert!(pii_hidden.masked);
 
-    let pii_shown = render(&with_own("pii"), true);
+    let pii_shown = render(&with_own("pii"), true, Reader::Platform, &[]);
     assert_eq!(
         (pii_shown.value, pii_shown.fallback),
         (json!("own"), json!("parent"))
     );
     assert!(!pii_shown.masked);
 
-    let public = render(&with_own("public"), false);
+    let public = render(&with_own("public"), false, Reader::Platform, &[]);
     assert_eq!(
         (public.value, public.fallback),
         (json!("own"), json!("parent"))
@@ -97,27 +90,27 @@ fn the_fallback_is_masked_by_the_one_decision_made_for_the_value() {
 
 #[test]
 fn recency_is_the_later_of_the_declaration_and_the_resolved_row() {
-    let dto = render(&effective("public"), false);
+    let dto = render(&effective("public"), false, Reader::Platform, &[]);
     assert_eq!(dto.last_change_at, "1970-01-01T00:03:20Z");
 
     let mut older_row = effective("public");
     older_row.resolved_row_last_change_at = Some(at(50));
     assert_eq!(
-        render(&older_row, false).last_change_at,
+        render(&older_row, false, Reader::Platform, &[]).last_change_at,
         "1970-01-01T00:01:40Z"
     );
 
     let mut default = effective("public");
     default.resolved_row_last_change_at = None;
     assert_eq!(
-        render(&default, false).last_change_at,
+        render(&default, false, Reader::Platform, &[]).last_change_at,
         "1970-01-01T00:01:40Z"
     );
 }
 
 #[test]
 fn the_review_pair_appears_only_when_the_own_row_is_flagged_and_the_tag_follows_the_row() {
-    let plain = render(&effective("public"), false);
+    let plain = render(&effective("public"), false, Reader::Platform, &[]);
     assert_eq!(
         (plain.needs_review, plain.needs_review_detail),
         (None, None)
@@ -134,7 +127,7 @@ fn the_review_pair_appears_only_when_the_own_row_is_flagged_and_the_tag_follows_
         last_change_at: at(300),
         updated_at: at(300),
     });
-    let dto = render(&flagged, false);
+    let dto = render(&flagged, false, Reader::Platform, &[]);
     assert_eq!(dto.needs_review, Some(true));
     assert_eq!(
         dto.needs_review_detail.as_deref(),
@@ -150,13 +143,13 @@ fn the_review_pair_appears_only_when_the_own_row_is_flagged_and_the_tag_follows_
 
 #[test]
 fn the_administrative_trail_keeps_setter_identity_and_time() {
-    let dto = render(&effective("public"), true);
+    let dto = render(&effective("public"), true, Reader::Platform, &[]);
     assert_eq!(
         dto.inheritance_trail[0].set_by.as_deref(),
         Some("root-admin")
     );
     // Without the entitlement the entry stays, but not who set it.
-    let masked = render(&effective("public"), false);
+    let masked = render(&effective("public"), false, Reader::Platform, &[]);
     assert_eq!(
         masked.inheritance_trail[0].set_by.as_deref(),
         Some(MASK_TOKEN)
@@ -187,6 +180,7 @@ mod history {
             operation: AuditOperation::Change,
             actor: "admin@acme".to_owned(),
             actor_classification: actor,
+            actor_tenant_id: None,
             pre_image: Some(AuditValue::Clear(json!("old"))),
             post_image: Some(AuditValue::Masked),
             outcome: AuditOutcome::Success,
@@ -199,23 +193,23 @@ mod history {
 
     #[test]
     fn a_pii_actor_is_masked_without_the_entitlement_and_shown_with_it() {
-        let hidden = render_record(&record(ActorClassification::Pii), false, false);
+        let hidden = render_record(&record(ActorClassification::Pii), false, false, true);
         assert_eq!(
             (hidden.actor.as_str(), hidden.actor_masked),
             (MASK_TOKEN, true)
         );
-        let shown = render_record(&record(ActorClassification::Pii), false, true);
+        let shown = render_record(&record(ActorClassification::Pii), false, true, true);
         assert_eq!(
             (shown.actor.as_str(), shown.actor_masked),
             ("admin@acme", false)
         );
-        let module = render_record(&record(ActorClassification::Public), false, false);
+        let module = render_record(&record(ActorClassification::Public), false, false, true);
         assert_eq!(module.actor, "admin@acme");
     }
 
     #[test]
     fn recorded_values_follow_the_setting_classification_and_secrets_stay_masked() {
-        let public = render_record(&record(ActorClassification::Public), false, false);
+        let public = render_record(&record(ActorClassification::Public), false, false, true);
         assert_eq!(public.pre_value, Some(json!("old")));
         assert_eq!(
             public.post_value,
@@ -224,10 +218,10 @@ mod history {
         );
         assert!(!public.values_masked);
 
-        let pii = render_record(&record(ActorClassification::Public), true, false);
+        let pii = render_record(&record(ActorClassification::Public), true, false, true);
         assert_eq!(pii.pre_value, Some(json!(MASK_TOKEN)));
         assert!(pii.values_masked);
-        let entitled = render_record(&record(ActorClassification::Public), true, true);
+        let entitled = render_record(&record(ActorClassification::Public), true, true, true);
         assert_eq!(entitled.pre_value, Some(json!("old")));
     }
 }
@@ -259,6 +253,7 @@ mod browse_entry {
             last_change_at: at(200),
             updated_at: at(300),
             set_by: "tenant-admin".to_owned(),
+            set_by_tenant: None,
         }
     }
 
@@ -373,6 +368,7 @@ mod browse_entry {
             needs_review_detail: Some("no longer a port".to_owned()),
             last_change_at: "1970-01-01T00:03:20Z".to_owned(),
             set_by: "tenant-admin".to_owned(),
+            set_by_withheld: false,
             etag: "200000000000".to_owned(),
         };
 
@@ -407,11 +403,19 @@ mod browse_entry {
         let tenant = Uuid::from_u128(4);
         let root = Uuid::from_u128(1);
 
-        let shown = render_flagged("k", "standard", &stored("public", tenant), root, true);
+        let shown = render_flagged("k", "standard", &stored("public", tenant), root, true, true);
         assert_eq!(shown.value, json!("kept"));
         assert!(!shown.masked);
         assert_eq!(
-            render_flagged("k", "standard", &stored("public", tenant), root, false).set_by,
+            render_flagged(
+                "k",
+                "standard",
+                &stored("public", tenant),
+                root,
+                false,
+                true
+            )
+            .set_by,
             MASK_TOKEN,
             "the setter is masked without the entitlement"
         );
@@ -427,7 +431,7 @@ mod browse_entry {
 
         // A flagged secret is still a secret: the review listing shows that
         // one exists and needs attention, never what it holds.
-        let secret = render_flagged("k", "standard", &stored("secret", tenant), root, true);
+        let secret = render_flagged("k", "standard", &stored("secret", tenant), root, true, true);
         assert_eq!(secret.value, json!(MASK_TOKEN));
         assert!(secret.masked);
         assert_eq!(
@@ -446,10 +450,133 @@ mod browse_entry {
         row.value = None;
         row.secret_ref = Some("settings/abc/def".to_owned());
 
-        let dto = render_flagged("k", "standard", &row, Uuid::from_u128(1), true);
+        let dto = render_flagged("k", "standard", &row, Uuid::from_u128(1), true, true);
         assert_eq!(dto.value, json!(MASK_TOKEN));
         assert!(dto.masked);
         let wire = serde_json::to_string(&dto).expect("serializes");
         assert!(!wire.contains("settings/abc/def"), "{wire}");
     }
+}
+
+#[test]
+fn a_reader_the_target_chain_does_not_hold_is_shown_nothing_above_the_target() {
+    // Fail closed: the reader tenant is on neither the chain nor the trail, so
+    // every entry but the target's collapses and no identity is on a path,
+    // whatever the setter's recorded tenant.
+    let root = Uuid::from_u128(1);
+    let a = Uuid::from_u128(2);
+    let b = Uuid::from_u128(3);
+    let stranger = Uuid::from_u128(9);
+    let mut value = effective("public");
+    value.tenant_id = b;
+    value.scope = format!("/tenants/{b}");
+    value.source_scope = Some("/".to_owned());
+    value.fallback_scope = Some("/".to_owned());
+    let entry = |tenant: Uuid, scope: &str| TrailEntry {
+        tenant_id: tenant,
+        scope: scope.to_owned(),
+        has_override: true,
+        provided_value: true,
+        needs_review: false,
+        set_by: Some("someone".to_owned()),
+        set_by_tenant: Some(tenant),
+        last_change_at: Some(at(200)),
+    };
+    value.trail = vec![entry(root, "/"), entry(b, &format!("/tenants/{b}"))];
+
+    let dto = render(&value, true, Reader::Tenant(stranger), &[root, a, b]);
+    assert_eq!(dto.inheritance_trail.len(), 2, "{dto:?}");
+    let first = &dto.inheritance_trail[0];
+    assert!(first.above && first.scope.is_none() && first.tenant_id.is_none());
+    assert!(first.set_by.is_none() && first.last_change_at.is_none());
+    let target = &dto.inheritance_trail[1];
+    assert_eq!(target.tenant_id, Some(b));
+    assert_eq!(target.set_by.as_deref(), Some(MASK_TOKEN));
+    assert!(
+        target.set_by_withheld,
+        "no identity is on a path: {target:?}"
+    );
+    assert_eq!(dto.source_scope, None);
+    assert_eq!(dto.fallback_scope, None);
+}
+
+#[test]
+fn a_trail_entry_off_the_fresh_chain_is_collapsed_as_stale() {
+    // The cache holds the trail as it was resolved; `a` has since been moved
+    // under `n`. `old` is on no chain of the target any more, so it is above
+    // the reader as far as anyone can tell: collapsed, and nothing of it named.
+    let (root, old, n, a) = (
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(3),
+        Uuid::from_u128(4),
+    );
+    let mut value = effective("public");
+    value.tenant_id = a;
+    value.scope = format!("/tenants/{a}");
+    value.source_scope = Some(format!("/tenants/{old}"));
+    value.fallback_scope = Some(format!("/tenants/{old}"));
+    let entry = |tenant: Uuid, scope: String| TrailEntry {
+        tenant_id: tenant,
+        scope,
+        has_override: true,
+        provided_value: tenant == old,
+        needs_review: false,
+        set_by: Some("someone".to_owned()),
+        set_by_tenant: Some(tenant),
+        last_change_at: Some(at(200)),
+    };
+    value.trail = vec![
+        entry(root, "/".to_owned()),
+        entry(old, format!("/tenants/{old}")),
+        entry(a, format!("/tenants/{a}")),
+    ];
+
+    let dto = render(&value, true, Reader::Tenant(a), &[root, n, a]);
+    assert_eq!(dto.inheritance_trail.len(), 2, "{dto:?}");
+    let first = &dto.inheritance_trail[0];
+    assert!(first.above && first.provided_value, "{first:?}");
+    assert!(first.scope.is_none() && first.tenant_id.is_none() && first.set_by.is_none());
+    assert_eq!(dto.inheritance_trail[1].tenant_id, Some(a));
+    assert_eq!(dto.source_scope, None);
+    assert_eq!(dto.fallback_scope, None);
+    assert!(
+        !format!("{dto:?}").contains(&old.to_string()),
+        "nothing of `old` is named: {dto:?}"
+    );
+}
+
+#[test]
+fn above_the_reader_is_read_off_the_chain_and_fails_closed() {
+    let (root, a, b, off) = (
+        Uuid::from_u128(1),
+        Uuid::from_u128(2),
+        Uuid::from_u128(3),
+        Uuid::from_u128(9),
+    );
+    let chain = [root, a, b];
+    // Nothing is above a caller of the root tenant, on the chain or off it.
+    assert!(!Reader::Platform.is_above(root, &chain));
+    assert!(!Reader::Platform.is_above(off, &chain));
+    // Strictly above the reader tenant on the chain, not the reader itself.
+    let reader = Reader::Tenant(a);
+    assert!(reader.is_above(root, &chain));
+    assert!(!reader.is_above(a, &chain));
+    assert!(!reader.is_above(b, &chain));
+    // A tenant off the chain is stale after a re-parent: above.
+    assert!(reader.is_above(off, &chain));
+    // A reader the chain does not hold sees everything but the target above.
+    let stranger = Reader::Tenant(off);
+    assert!(stranger.is_above(root, &chain));
+    assert!(stranger.is_above(a, &chain));
+    assert!(!stranger.is_above(b, &chain));
+}
+
+#[test]
+fn the_collapsed_entry_carries_its_two_facts_and_nothing_else() {
+    let entry = super::TrailEntryDto::above(true, false);
+    assert!(entry.above && entry.has_override && !entry.provided_value);
+    assert!(!entry.needs_review && !entry.set_by_withheld);
+    assert!(entry.scope.is_none() && entry.tenant_id.is_none());
+    assert!(entry.set_by.is_none() && entry.last_change_at.is_none());
 }

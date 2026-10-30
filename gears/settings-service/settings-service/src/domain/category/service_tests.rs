@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Tests for the category service's decidable rules.
 //!
 //! # Why this file is small

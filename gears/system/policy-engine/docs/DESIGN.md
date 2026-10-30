@@ -80,6 +80,7 @@ a failure, never a permit.
 | `cpt-cf-policy-engine-fr-evaluation-isolation` | `cpt-cf-policy-engine-component-evaluator` on a blocking task under the request's evaluation budget; the shared library's guards and denylists; hierarchy and registry calls bounded. |
 | `cpt-cf-policy-engine-fr-denial-versus-failure` | `cpt-cf-policy-engine-seq-fail-closed`. |
 | `cpt-cf-policy-engine-fr-admin-authorization` | `cpt-cf-policy-engine-component-management` asks the platform enforcer for one of three permissions per call. |
+| `cpt-cf-policy-engine-fr-publish-dry-run` | `cpt-cf-policy-engine-component-management` splits each publish operation into a plan that only reads and a write; the dry run is the plan without the write. |
 | `cpt-cf-policy-engine-fr-retry-safe-management` | Store uniqueness turns retries into conflicts; activate and unassign are no-ops when already done; unassign reports success only for a row it deleted, that does not exist, or that is invisible to the caller; a row the caller sees but may not remove is refused. |
 | `cpt-cf-policy-engine-fr-administration-audit` (p2) | Deferred; a full trail depends on the future platform Audit gear. Meanwhile assignments store `created_by`/`updated_by`, versions `activated_by`, and assign, update-assignment and unassign log the actor (see 4). |
 | `cpt-cf-policy-engine-fr-idempotent-management` (p2), `cpt-cf-policy-engine-fr-deprecation` (p2), `cpt-cf-policy-engine-fr-barrier-guardrail-reach` (p2) | Deferred; no design in this release. Platform-wide guardrails are built-in policies. |
@@ -173,7 +174,7 @@ Built-in policies exist only in the gear's configuration; no runtime API reads o
 
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-constraint-hierarchy-external`
 
-The ancestor chain comes from `tenant-resolver` on every decision (one call), and reachability on management calls; there is no hierarchy cache.
+The ancestor chain comes from `tenant-resolver` on every decision (one call), and reachability and the caller's subtree on management calls; there is no hierarchy cache.
 
 #### Evaluation Is In-Process and Capability-Free
 
@@ -324,13 +325,20 @@ as absence.
 
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-component-management`
 
-Bundle, version and assignment operations, each authorized for one of three permissions, run in a transaction.
+Bundle, version and assignment operations, each authorized for one of three permissions, run in a transaction. Each
+publish operation first runs a plan - every check, reading only - then writes what it decided; its dry run is the plan
+alone.
 Enforces draft-only writes, limits, and the barrier-respecting reachability of an assignment's target tenant. Records
 the acting subject on assignments (`created_by`, `updated_by`) and emits an info-level structured log line for assign,
 update-assignment and unassign with the actor, assignment id, bundle id and target tenant. A dormant assignment (its
 owner no longer in the target's barrier-respecting chain) may also be withdrawn by an administrator holding `publish`
 on the target tenant, reachable from the caller with barriers respected, so an assignment orphaned by a new barrier
-can be removed; its owner above the barrier gets `TENANT_BOUNDARY`. Unassign reports success only for a row it deleted
+can be removed; its owner above the barrier gets `TENANT_BOUNDARY`. Listing and reading assignments show a caller the
+assignments of bundles it may read at its tenants (barriers ignored) made from its side of every barrier, and the
+dormant assignments it may withdraw, each with a `dormant` flag. Both are decided from one barrier-ignoring subtree read
+(with each tenant's barrier flag) and one ancestor-chain read of the caller's tenant, and two collection
+authorizations (read, publish), never per row: every tenant the caller reaches shares its chain above it, so "the owner
+is on the far side of a barrier" is one SQL condition. Unassign reports success only for a row it deleted
 or that is absent (or invisible to the caller); a row the caller sees but whose grant does not cover it is refused
 with `CAPABILITY_DENIED`. A version's documents are read and written only through a version row the caller's scope
 admitted, so a grant constrained to a version's identity covers that version's whole content.
@@ -348,8 +356,10 @@ document content), once per request, and the document content of active versions
 
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-component-hierarchy-client`
 
-Adapter over `tenant-resolver`, always respecting barriers: the ancestor chain for decisions (the only call per request)
-and reachability for management calls; each call bounded.
+Adapter over `tenant-resolver`: the barrier-respecting ancestor chain for decisions (the only call per request), and for
+management calls reachability (barriers respected, or ignored to tell a tenant behind a barrier from one outside) and the
+caller's subtree (barriers ignored, each tenant with its barrier flag, so barrier-respecting reachability within it is
+derived in memory); each call bounded - by `hierarchy_timeout` on the decision path and by `management_hierarchy_timeout` on the management surface.
 
 #### REST API
 
@@ -375,18 +385,24 @@ The management client (`cpt-cf-policy-engine-interface-management-client`) and t
 | Bundle | get, list | `read` | unstable |
 | Version | create, replace and delete a draft; validate a draft | `author` | unstable |
 | Version | get, list | `read` | unstable |
-| Version | activate | `publish` | unstable |
-| Assignment | assign, update the enforce flag, unassign | `publish` | unstable |
-| Assignment | get | `read` | unstable |
+| Version | activate, and its dry run | `publish` | unstable |
+| Assignment | assign, update the enforce flag, unassign, and their dry runs | `publish` | unstable |
+| Assignment | get, list | `read`; `publish` for dormant assignments at the caller's tenants | unstable |
 
-Lists are paged with the platform's OData conventions: bundles and versions are cursor-paged (`$top` and cursor, default page 25, maximum 100), versions newest ordinal first. No decision operation exists outside the engine plugin.
+Lists are paged with the platform's OData conventions: bundles, versions and assignments are cursor-paged (`$top` and cursor, default page 25, maximum 100), bundles filterable by `name` (`eq`, `ne`, `in`, `contains`, `startswith`, `endswith`) and `owner_tenant_id` (`eq`, `ne`, `in`), versions newest ordinal first, assignments by identity and filterable by `bundle_id` and `tenant_id` (`eq`, `ne`, `in`). A listing's visibility is applied in the query, so pages come back full; it binds the caller's subtree and chain as `IN` lists, within the backend's bind budget (`max_bind_params_for`, less a reserve for the filter and cursor). It binds up to five values per tenant of the caller's subtree, depending on its grants; a caller beyond the budget (in the worst case roughly 5,800 tenants on SQLite and 11,800 on PostgreSQL) is refused with `SUBTREE_TOO_LARGE`, never answered partially. Reading one assignment decides the same rule by point checks on its owner and target and reads no subtree, so it is not limited. The management surface's hierarchy calls are bounded by `management_hierarchy_timeout` (default 1 s), apart from the decision path's `hierarchy_timeout`, so a slow subtree read never loosens the decision path. A local tenant-closure projection, or a paged descendants read from the tenant resolver, would lift the limit; neither exists yet. No decision operation exists outside the engine plugin.
+
+A dry run (`check_publish`; `dry_run=true` on the operation's route) answers `204` when the operation would succeed
+and the operation's own problem otherwise. Validation answers the same way: `204` for valid content, otherwise the
+`VALIDATION_FAILED` problem activation would return, with every finding.
+
 Errors are the SDK's [typed management error](../policy-engine-sdk/src/management/error.rs), a contract error: on
 the wire it is an RFC 9457 problem carrying the management error domain and the variant's stable `error_code`, with
 the variant's fields as its data. Clients match on the code or rebuild the typed error, never on messages. The same
 SDK module holds the fixed content bounds.
 
-The engine plugin instance, the three resource types and the three permission instances are declared in the SDK's
-[GTS catalog](../policy-engine-sdk/src/gts.rs).
+The three resource types (id-only type schemas) and the three permission instances are declared in the SDK's
+[GTS catalog](../policy-engine-sdk/src/gts.rs) and reach `types-registry` through the `toolkit-gts` inventory. The
+engine plugin instance carries the configured vendor and priority, so the gear builds it and registers it at init.
 
 ### 3.4 Internal Dependencies
 
@@ -394,14 +410,14 @@ The engine plugin instance, the three resource types and the three permission in
 |------------|-----|
 | `admission-control-sdk` | Engine plugin contract and result building |
 | `toolkit-policy-evaluation` | Rego compilation with guards and denylist screen; evaluation budget |
-| `policy-engine-sdk` | Management client, models, typed management errors, GTS ids |
+| `policy-engine-sdk` | Management client, models, typed management errors, GTS types and ids |
 
 ### 3.5 External Dependencies
 
 | Dependency | Use |
 |------------|-----|
-| `tenant-resolver` | Ancestor chain (decisions) and reachability (management), barriers respected |
-| `types-registry` | Concrete type id existence at startup, validate and activate |
+| `tenant-resolver` | Ancestor chain (decisions, barriers respected), reachability and subtree (management) |
+| `types-registry` | Concrete type id existence at startup, validate and activate; registration of the engine plugin instance |
 | `authz-resolver` | Management permission decisions |
 | `toolkit-db` | Postgres or SQLite |
 
@@ -527,7 +543,7 @@ Documents of a version, deleted with it. A document name is unique within its ve
 
 Assignments of bundles to tenants with their enforce flag, timestamps and the acting subjects (`created_by`,
 `updated_by`). Rows are hard-deleted on unassign. A bundle is assigned to a tenant at most once; the
-decision path reads assignments by tenant.
+decision path reads assignments by tenant, the listing by bundle or tenant (both indexed).
 
 ### 3.8 Deployment Topology
 
@@ -558,7 +574,7 @@ Working assumptions, to be revisited with production data; the limits are enforc
 ## 4. Additional context
 
 Operators configure the built-in policies, the plugin's vendor and priority, the evaluation budget, the bounds on
-hierarchy calls, store reads and registry calls, the compile cache size, the content limits and the database; the
+hierarchy calls (decision and management apart), store reads and registry calls, the compile cache size, the content limits and the database; the
 keys, defaults and accepted maxima are defined in the [gear configuration](../policy-engine/src/config.rs). Unknown
 keys, a zero or oversized bound or limit, and any validation finding on a built-in policy fail startup. Every log line
 of a decision carries the request's correlation id; a dependency failure is logged with its cause.

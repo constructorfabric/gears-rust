@@ -1,6 +1,7 @@
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::subject_settings::SubjectSettings;
 
@@ -82,4 +83,89 @@ impl SubjectSettingsDto {
 pub struct PutSubjectSettingsRequest {
     /// Turn personalization on or off. Applies from the next request.
     pub personalization_enabled: bool,
+}
+
+/// The longest `message` a manage-facts call takes, in characters.
+pub const MESSAGE_LIMIT: usize = 4_000;
+/// The longest `conversation` a manage-facts call takes, in characters. It is sent again in every round of the agent
+/// loop, so it is bounded by the token cap over ten rounds.
+pub const CONVERSATION_LIMIT: usize = 16_000;
+
+/// What the subject told an agent, for the gear to decide on and store.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct ManageFactsRequest {
+    /// What the subject said, at most 4 000 characters.
+    #[schema(max_length = 4000)]
+    pub message: String,
+    /// The agent's recent conversation, which shows what the message refers to, at most 16 000 characters. No fact is
+    /// taken from it alone.
+    #[serde(default)]
+    #[schema(max_length = 16000)]
+    pub conversation: String,
+}
+
+impl ManageFactsRequest {
+    /// The first field longer than its limit, with the limit.
+    #[must_use]
+    pub fn field_past_its_limit(&self) -> Option<(&'static str, usize)> {
+        [
+            ("message", &self.message, MESSAGE_LIMIT),
+            ("conversation", &self.conversation, CONVERSATION_LIMIT),
+        ]
+        .into_iter()
+        .find(|(_, text, limit)| text.chars().count() > *limit)
+        .map(|(field, _, limit)| (field, limit))
+    }
+}
+
+/// Whether a manage-facts call stored anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum ManageOutcomeDto {
+    /// The changes are stored.
+    Stored,
+    /// Nothing is stored; `reason` says why.
+    NothingChanged,
+}
+
+/// What a manage-facts call did.
+///
+/// @cpt-dod:cpt-cf-construct-dod-planner-manage-route:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ManageFactsResponse {
+    pub outcome: ManageOutcomeDto,
+    /// Why nothing was stored: `no_change`, `timeout`, or a drop reason such as `personalization_off`. It never names
+    /// a blocked value.
+    pub reason: Option<String>,
+    pub added: usize,
+    pub replaced: usize,
+    pub removed: usize,
+}
+
+impl From<Managed> for ManageFactsResponse {
+    fn from(managed: Managed) -> Self {
+        match managed {
+            Managed::Stored(Changes {
+                added,
+                replaced,
+                removed,
+            }) => Self {
+                outcome: ManageOutcomeDto::Stored,
+                reason: None,
+                added,
+                replaced,
+                removed,
+            },
+            Managed::NothingStored(nothing) => Self {
+                outcome: ManageOutcomeDto::NothingChanged,
+                reason: Some(nothing.name().to_owned()),
+                added: 0,
+                replaced: 0,
+                removed: 0,
+            },
+        }
+    }
 }

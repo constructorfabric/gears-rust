@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Tests for the precondition-violation vocabulary.
 //!
 //! Mirrors `gts_tests.rs`: the two typed sub-enums carry the same

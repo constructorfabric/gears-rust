@@ -190,7 +190,6 @@ pub(crate) async fn enqueue_typed<E: TypedEvent>(
                 "occurred_at": time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).map_err(|e| EventsError::Serialize(e.to_string()))?,
                 "trace_parent": event.trace_parent(),
                 "data": serde_json::to_value(&event).map_err(|e| EventsError::Serialize(e.to_string()))?,
-                "broker_partition": 0,
                 "producer_mode": "stateless",
                 "diagnostic_metadata": {"sdk_client_agent": crate::infra::broker::SOURCE}
             });

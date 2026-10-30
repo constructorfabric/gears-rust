@@ -1,0 +1,28 @@
+{
+  "id": "gts.cf.core.tasks.queue.v1~cf.core.tasks.system.v1",
+  "description": "Queue for engine-internal and platform system tasks. Bounded concurrency and depth keep high-volume housekeeping work from starving tenant workloads.",
+  "global_concurrency_limit": 100,
+  "per_tenant_concurrency_limit": 20,
+  "default_priority": 50,
+  "timeouts": {
+    "queue_timeout_secs": null,
+    "assignment_timeout_secs": 120,
+    "execution_timeout_secs": 600,
+    "heartbeat_timeout_secs": 30,
+    "lifetime_timeout_secs": 3600
+  },
+  "retry_policy": {
+    "max_retries": 5,
+    "max_liveness_requeues": 10,
+    "strategy": "exponential",
+    "base_interval_secs": 2,
+    "max_interval_secs": 120,
+    "jitter_factor": 0.2,
+    "non_retryable_codes": []
+  },
+  "queue_max_queue_depth": 100000,
+  "progress_events": "none",
+  "tenant_fairness": "round_robin",
+  "operated_by": "platform",
+  "dead_letter_queue": "gts.cf.core.tasks.queue.v1~cf.core.tasks.dead_letter.v1"
+}

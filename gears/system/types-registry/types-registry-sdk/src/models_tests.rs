@@ -1,7 +1,13 @@
+use std::num::NonZeroU8;
+
 use gts::GtsId;
 use uuid::Uuid;
 
-use super::{EntityField, EntityKey, EntityKind, FieldSelection, IdempotencyKey, Projection};
+use super::{
+    BatchGetEntitiesRequest, BatchGetItem, Cursor, EntityField, EntityFilter, EntityKey,
+    EntityKind, FieldSelection, IdempotencyKey, LifecycleFilter, ListEntitiesRequest, PageRequest,
+    Projection, ReadOptions, Validator,
+};
 
 fn id(s: &str) -> GtsId {
     GtsId::try_new(s).expect("valid GTS identifier")
@@ -370,4 +376,141 @@ mod publisher_version {
                 text
             })
     }
+}
+
+fn pattern(s: &str) -> gts::GtsIdPattern {
+    gts::GtsIdPattern::try_new(s).expect("valid GTS pattern")
+}
+
+/// Every filter, projection and page field set away from its default.
+fn populated_query() -> ListEntitiesRequest {
+    ListEntitiesRequest {
+        filter: EntityFilter {
+            pattern: Some(pattern("gts.cf.example.*")),
+            max_chain_depth: NonZeroU8::new(2),
+            kind: Some(EntityKind::TypeSchema),
+            lifecycle: LifecycleFilter::All,
+        },
+        projection: Projection::Select(FieldSelection::full()),
+        page: PageRequest {
+            limit: Some(7),
+            cursor: Some(Cursor::from_token("c1")),
+        },
+    }
+}
+
+#[test]
+fn each_setter_builds_its_own_field_of_the_literal() {
+    let built = ListEntitiesRequest::new()
+        .with_cursor(Cursor::from_token("c1"))
+        .with_lifecycle(LifecycleFilter::All)
+        .with_projection(FieldSelection::full())
+        .with_kind(EntityKind::TypeSchema)
+        .with_limit(7)
+        .with_max_chain_depth(NonZeroU8::new(2).expect("non-zero"))
+        .with_pattern(pattern("gts.cf.example.*"));
+    assert_eq!(built, populated_query());
+    assert_eq!(
+        ListEntitiesRequest::matching(pattern("gts.cf.example.*")),
+        ListEntitiesRequest {
+            filter: EntityFilter {
+                pattern: Some(pattern("gts.cf.example.*")),
+                ..EntityFilter::default()
+            },
+            ..ListEntitiesRequest::default()
+        },
+        "matching narrows the pattern only: any kind, active, default projection, first page"
+    );
+}
+
+#[test]
+fn narrowing_a_built_query_again_keeps_its_other_settings() {
+    let mut expected = populated_query();
+    expected.filter.pattern = Some(pattern("gts.cf.other.*"));
+    expected.page.cursor = Some(Cursor::from_token("c2"));
+    assert_eq!(
+        populated_query()
+            .with_pattern(pattern("gts.cf.other.*"))
+            .with_cursor(Cursor::from_token("c2")),
+        expected,
+        "kind, depth, lifecycle, projection and limit survive"
+    );
+
+    let mut expected = populated_query();
+    expected.page.limit = Some(0);
+    assert_eq!(
+        populated_query().with_limit(0),
+        expected,
+        "the limit is passed through unclamped and the cursor kept"
+    );
+}
+
+#[test]
+fn an_explicit_selection_stays_explicit_through_the_builders() {
+    let light = Projection::Select(FieldSelection::light());
+    assert_eq!(
+        ListEntitiesRequest::new()
+            .with_projection(FieldSelection::light())
+            .projection,
+        light
+    );
+    assert_eq!(
+        ReadOptions::new()
+            .with_projection(FieldSelection::with(&EntityField::DEFAULT))
+            .projection,
+        Projection::Select(FieldSelection::with(&EntityField::DEFAULT)),
+        "a selection equal to the default fields is not `Default`"
+    );
+    assert_eq!(ListEntitiesRequest::new().projection, Projection::Default);
+}
+
+#[test]
+fn read_options_build_the_cache_policy_and_projection_independently() {
+    assert_eq!(ReadOptions::new(), ReadOptions::default());
+    assert_eq!(
+        ReadOptions::new()
+            .with_fresh(true)
+            .with_projection(FieldSelection::full()),
+        ReadOptions {
+            projection: Projection::Select(FieldSelection::full()),
+            fresh: true,
+        }
+    );
+}
+
+#[test]
+fn a_batch_read_keeps_its_keys_in_order_and_conditions_only_the_asked_key() {
+    let first = EntityKey::from(id("gts.cf.example.batch.thing.v1~"));
+    let second = EntityKey::from(Uuid::nil());
+    let validator = Validator::from_bytes(b"etag".to_vec());
+    let request = BatchGetEntitiesRequest::new([
+        BatchGetItem::new(first.clone()),
+        BatchGetItem::new(second.clone()).with_if_none_match(validator.clone()),
+    ]);
+    assert_eq!(
+        request,
+        BatchGetEntitiesRequest {
+            items: vec![
+                BatchGetItem {
+                    key: first.clone(),
+                    if_none_match: None,
+                },
+                BatchGetItem {
+                    key: second,
+                    if_none_match: Some(validator),
+                },
+            ],
+            projection: Projection::Default,
+            fresh: false,
+        }
+    );
+    let keyed = BatchGetEntitiesRequest::new([first.clone()].map(BatchGetItem::new))
+        .with_fresh(true)
+        .with_projection(FieldSelection::light());
+    assert_eq!(keyed.items, vec![BatchGetItem::from(first)]);
+    assert!(keyed.fresh);
+    assert_eq!(
+        keyed.projection,
+        Projection::Select(FieldSelection::light())
+    );
 }

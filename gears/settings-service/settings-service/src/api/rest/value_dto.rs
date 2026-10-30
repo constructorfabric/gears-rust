@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Wire shapes of the write surface.
 
 use serde_json::Value;
@@ -376,8 +375,14 @@ pub struct ValidationReportDto {
 
 /// Render the validation report.
 #[must_use]
-pub fn render_validation(report: &ValidationReport, may_read_pii: bool) -> ValidationReportDto {
-    let effective = crate::api::rest::setting_dto::render(&report.effective, may_read_pii);
+pub fn render_validation(
+    report: &ValidationReport,
+    may_read_pii: bool,
+    reader: crate::api::rest::setting_dto::Reader,
+    chain: &[uuid::Uuid],
+) -> ValidationReportDto {
+    let effective =
+        crate::api::rest::setting_dto::render(&report.effective, may_read_pii, reader, chain);
     let impact = report
         .impact
         .as_ref()

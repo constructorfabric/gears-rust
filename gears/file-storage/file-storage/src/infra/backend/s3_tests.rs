@@ -5,9 +5,11 @@ use std::net::SocketAddr;
 use bytes::Bytes;
 use file_storage_sdk::ByteRange;
 use futures::stream::{self, BoxStream};
+use rusty_s3::S3Action;
 use tempfile::TempDir;
 
-use super::S3Backend;
+use super::{S3Backend, StatusCode, conflict_message};
+use crate::domain::error::DomainError;
 use crate::infra::backend::StorageBackend;
 use crate::infra::backend::backend_tests::assert_backend_contract;
 use crate::infra::content::hash;
@@ -220,10 +222,71 @@ async fn s3_is_ready_err_against_closed_port() {
     )
     .expect("construct S3Backend");
 
-    backend
+    let err = backend
         .is_ready()
         .await
         .expect_err("is_ready must fail against an unreachable endpoint");
+    assert!(
+        matches!(err, DomainError::BackendUnavailable { .. }),
+        "a transport failure is transient, got {err:?}"
+    );
+}
+
+/// Status classification: 5xx overload is transient, 4xx is permanent.
+#[test]
+fn s3_error_classifies_transient_and_permanent_statuses() {
+    let endpoint: url::Url = "http://127.0.0.1:1".parse().expect("valid endpoint url");
+    let backend = S3Backend::new("s3-test", endpoint, "us-east-1", "b", "k", "s")
+        .expect("construct S3Backend");
+    let slow_down = b"<Error><Code>SlowDown</Code><Message>slow</Message></Error>";
+    for status in [500u16, 502, 503, 504] {
+        let status = StatusCode::from_u16(status).unwrap();
+        assert!(
+            matches!(
+                backend.s3_error(status, slow_down),
+                DomainError::BackendUnavailable { .. }
+            ),
+            "{status} must be transient"
+        );
+    }
+    let timeout = b"<Error><Code>RequestTimeout</Code><Message>slow</Message></Error>";
+    assert!(
+        matches!(
+            backend.s3_error(StatusCode::BAD_REQUEST, timeout),
+            DomainError::BackendUnavailable { .. }
+        ),
+        "400 RequestTimeout must be transient"
+    );
+    for code in ["OperationAborted", "InternalError", "ServiceUnavailable"] {
+        let body = format!("<Error><Code>{code}</Code><Message>m</Message></Error>");
+        assert!(
+            matches!(
+                backend.s3_error(StatusCode::CONFLICT, body.as_bytes()),
+                DomainError::BackendUnavailable { .. }
+            ),
+            "{code} must be transient"
+        );
+    }
+    let no_bucket = b"<Error><Code>NoSuchBucket</Code><Message>m</Message></Error>";
+    assert!(
+        matches!(
+            backend.s3_error(StatusCode::NOT_FOUND, no_bucket),
+            DomainError::Backend { .. }
+        ),
+        "404 NoSuchBucket must be permanent"
+    );
+    for status in [400u16, 403, 404, 409] {
+        let status = StatusCode::from_u16(status).unwrap();
+        assert!(
+            matches!(backend.s3_error(status, b""), DomainError::Backend { .. }),
+            "{status} must be permanent in the generic classifier"
+        );
+    }
+    let message = conflict_message(
+        StatusCode::CONFLICT,
+        b"<Error><Code>ConditionalRequestConflict</Code><Message>m</Message></Error>",
+    );
+    assert!(message.contains("ConditionalRequestConflict"));
 }
 
 /// `is_ready` must fail when the bucket does not exist: `NoSuchBucket` from `ListObjectsV2`
@@ -519,4 +582,111 @@ async fn s3_backend_put_stream_enforces_max_size_mid_stream() {
     // Nothing may be left behind: no object, and the multipart session was aborted.
     assert!(!backend.exists(path).await.unwrap());
     assert!(backend.get(path).await.is_err());
+}
+
+/// One-shot mock S3: answers the first request with `status` and `body`.
+async fn mock_s3_once(status: u16, body: &'static str) -> S3Backend {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .expect("bind mock s3");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        }
+    });
+    let endpoint: url::Url = format!("http://{addr}")
+        .parse()
+        .expect("valid endpoint url");
+    S3Backend::new("s3-test", endpoint, "us-east-1", "b", "k", "s").expect("construct S3Backend")
+}
+
+#[tokio::test]
+async fn s3_abort_multipart_404_only_ok_for_no_such_upload() {
+    let backend = mock_s3_once(
+        404,
+        "<Error><Code>NoSuchUpload</Code><Message>m</Message></Error>",
+    )
+    .await;
+    backend
+        .abort_multipart("/f/v", "handle")
+        .await
+        .expect("an already-gone upload is a success");
+
+    let backend = mock_s3_once(
+        404,
+        "<Error><Code>NoSuchBucket</Code><Message>m</Message></Error>",
+    )
+    .await;
+    let err = backend
+        .abort_multipart("/f/v", "handle")
+        .await
+        .expect_err("a missing bucket is not a successful abort");
+    assert!(matches!(err, DomainError::Backend { .. }), "got {err:?}");
+}
+
+/// Runs `send_and_check_created` against a mock answering `status`/`body`.
+async fn created_against(
+    status: u16,
+    body: &'static str,
+    exclusive: bool,
+) -> Result<bool, DomainError> {
+    let backend = mock_s3_once(status, body).await;
+    let url = backend
+        .bucket
+        .put_object(None, "k")
+        .sign(super::SIGN_DURATION);
+    backend
+        .send_and_check_created(backend.http.put(url), exclusive)
+        .await
+}
+
+#[tokio::test]
+async fn s3_send_and_check_created_classifies_412_and_409() {
+    let cond = "<Error><Code>ConditionalRequestConflict</Code><Message>m</Message></Error>";
+    assert!(
+        !created_against(412, "", true)
+            .await
+            .expect("412 is created:false")
+    );
+
+    let err = created_against(409, cond, true)
+        .await
+        .expect_err("a conditional 409 is a lost race");
+    assert!(matches!(err, DomainError::BackendUnavailable { .. }));
+    assert!(err.to_string().contains("lost a race"), "got {err}");
+
+    let other = "<Error><Code>BucketAlreadyOwnedByYou</Code><Message>m</Message></Error>";
+    let err = created_against(409, other, false)
+        .await
+        .expect_err("an unconditional 409 is an ordinary error");
+    assert!(matches!(err, DomainError::Backend { .. }), "got {err:?}");
+    assert!(!err.to_string().contains("lost a race"), "got {err}");
+}
+
+/// A builder error (no network) is a configuration problem, not a transient outage.
+#[tokio::test]
+async fn s3_transport_err_builder_error_is_permanent() {
+    let endpoint: url::Url = "http://127.0.0.1:1".parse().expect("valid endpoint url");
+    let backend = S3Backend::new("s3-test", endpoint, "us-east-1", "b", "k", "s")
+        .expect("construct S3Backend");
+    let e = backend
+        .http
+        .get("http://[invalid")
+        .send()
+        .await
+        .expect_err("invalid URL must fail to build");
+    assert!(e.is_builder());
+    assert!(matches!(
+        backend.transport_err(&e),
+        DomainError::Backend { .. }
+    ));
 }

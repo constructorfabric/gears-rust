@@ -410,7 +410,7 @@ async fn no_operation_declares_a_422() {
 // GET /price-books/{id}/export price_book:read false false
 // GET /settings config:read false false
 // PUT /settings config:settings true false
-// GET /currencies config:read false false (D-537)
+// GET /currencies authenticated false false (D-537: no permission, no PDP call)
 // GET /dimension-keys config:read false false
 // PUT /dimension-keys config:settings true false
 

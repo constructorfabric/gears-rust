@@ -129,8 +129,9 @@ impl Default for Limits {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WorkerSettings {
-    /// Positive wall-clock admission budget. Expiry causes redelivery.
-    /// This does not guarantee spawned work finishes before gear shutdown.
+    /// Positive wall-clock admission budget; expiry triggers redelivery. Spawned work
+    /// may outlive gear shutdown. Also bounds the entire startup seed set, including
+    /// all batches and passes; expiry fails boot (SPEC §8.1).
     #[serde(with = "toolkit_utils::humantime_serde")]
     pub operation_timeout: Duration,
     /// Revalidation attempts before failure; `1` allows no retry.

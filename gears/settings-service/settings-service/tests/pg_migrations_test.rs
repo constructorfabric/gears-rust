@@ -1,5 +1,4 @@
 #![cfg(feature = "integration")]
-// Created: 2026-10-02 by Virtuozzo International GmbH
 // The fixture, the seed and the reader are plain helpers, which
 // `allow-expect-in-tests` does not reach; a failed expectation there is the
 // test failing, as in the sibling PostgreSQL suites.
@@ -275,4 +274,46 @@ async fn the_display_name_column_and_its_trigram_index_exist_after_the_chain() {
         .await
         .expect("readable");
     assert_eq!(index.len(), 1, "the trigram index on display_name exists");
+}
+
+/// The setter-tenant migration on the backend it is written for: each of the
+/// three columns is a nullable `uuid`, so a row written before it reads
+/// `NULL` and the upward disclosure boundary withholds its identity.
+#[tokio::test]
+async fn the_setter_tenant_columns_are_nullable_uuids_after_the_chain() {
+    let Some(fixture) = pg_fixture().await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies on an empty database");
+
+    for (table, column) in [
+        ("setting_values", "set_by_tenant"),
+        ("tenant_permissions", "set_by_tenant"),
+        ("audit_records", "actor_tenant_id"),
+    ] {
+        let found = fixture
+            .conn
+            .query_one_raw(Statement::from_string(
+                fixture.conn.get_database_backend(),
+                format!(
+                    "SELECT data_type, is_nullable FROM information_schema.columns
+                     WHERE table_name = '{table}' AND column_name = '{column}'"
+                ),
+            ))
+            .await
+            .expect("readable")
+            .unwrap_or_else(|| panic!("`{table}.{column}` exists after the chain"));
+        assert_eq!(
+            found.try_get::<String>("", "data_type").expect("a type"),
+            "uuid",
+            "`{table}.{column}`"
+        );
+        assert_eq!(
+            found.try_get::<String>("", "is_nullable").expect("a flag"),
+            "YES",
+            "`{table}.{column}` must be nullable"
+        );
+    }
 }

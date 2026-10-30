@@ -219,9 +219,9 @@ pub(crate) async fn bind_producer(
                 .source(SOURCE)
                 // **No version here.** `ProducerRegistration::validate_matches`
                 // compares the stored `client_agent` against the supplied one and
-                // returns `InvalidProducerOptions` on any difference — before
-                // `on_missing`/`on_unknown` are consulted, so neither policy is an
-                // escape. A version in this string would make an ordinary
+                // returns `InvalidProducerOptions` on any difference at build
+                // time, before any producer id is registered or replaced, so
+                // neither recovery path is an escape. A version in this string would make an ordinary
                 // `version = "0.1.0"` in the manifest an unbootable gear against
                 // an existing registration row, recoverable only by hand-editing
                 // the SDK's table. The crate is at `0.0.0` today, so the version
@@ -235,8 +235,6 @@ pub(crate) async fn bind_producer(
         .deduplication(
             event_broker_sdk::DbDeduplication::managed(event_broker_sdk::ProducerMode::Monotonic)
                 .key(SOURCE)
-                .on_missing(event_broker_sdk::MissingProducerRegistration::RegisterNew)
-                .on_unknown(event_broker_sdk::UnknownProducerRegistration::RegisterNew)
                 .build()?,
         )
         .topics([TOPIC])

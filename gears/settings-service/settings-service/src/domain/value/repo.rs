@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Persistence port over `setting_values`.
 
 use async_trait::async_trait;
@@ -8,7 +7,7 @@ use uuid::Uuid;
 
 use toolkit_odata::Page;
 
-use super::{ReviewRequest, StoredValue, ValueDraft};
+use super::{DistinctValue, ListedValue, ReviewRequest, StoredValue, ValueDraft};
 use crate::domain::error::DomainError;
 
 /// Persistence operations on stored values.
@@ -41,6 +40,64 @@ pub trait ValueRepository: Send + Sync {
         conn: &C,
         scope: &AccessScope,
         declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError>;
+
+    /// How many rows of one declaration sit at `tenant_ids` — the count of
+    /// what [`Self::find_in_tenants`] would return, without the rows.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn count_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, DomainError>;
+
+    /// The distinct `(value, classification)` pairs of the rows
+    /// [`Self::find_in_tenants`] would return, each with its multiplicity — one
+    /// grouped read that moves the distinct values, not the rows.
+    ///
+    /// Secret rows (no inline value) form their own groups. A backend that
+    /// groups JSON textually may return one equal value in two groups; the
+    /// caller merges by value.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn distinct_values_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<DistinctValue>, DomainError>;
+
+    /// The tenant, value and classification of the rows
+    /// [`Self::find_in_tenants`] would return, and only those columns.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn list_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<ListedValue>, DomainError>;
+
+    /// The rows of several declarations whose tenant is in `tenant_ids` — a
+    /// browse batch's one read, where [`Self::find_in_tenants`] is one
+    /// declaration's.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
     ) -> Result<Vec<StoredValue>, DomainError>;
 
@@ -166,6 +223,7 @@ pub trait ValueRepository: Send + Sync {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError>;
 

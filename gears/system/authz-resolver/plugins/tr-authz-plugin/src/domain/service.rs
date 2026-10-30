@@ -147,6 +147,27 @@ impl Service {
             return Self::deny();
         }
 
+        // A decision-only CREATE (`require_constraints = false`, per the request
+        // model) on no particular resource keeps the tenant/hierarchy decision
+        // above but drops the owner predicate the PEP declared it cannot
+        // compile. Any other action, a single-resource request, and any request
+        // naming a group selector keep their constraints and fail closed as
+        // before: a PEP that sends these flags on a list or a GET still gets
+        // its row fence.
+        if response.decision
+            && request.action.name == "create"
+            && request.resource.id.is_none()
+            && !request.context.require_constraints
+            && request.context.supported_properties.is_empty()
+            && !request.resource.properties.contains_key("group_ids")
+            && !request
+                .resource
+                .properties
+                .contains_key("ancestor_group_ids")
+        {
+            response.context.constraints.clear();
+        }
+
         response
     }
 

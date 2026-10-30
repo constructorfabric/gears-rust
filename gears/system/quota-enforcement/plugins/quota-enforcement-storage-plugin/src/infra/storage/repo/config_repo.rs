@@ -211,3 +211,58 @@ pub async fn read_idempotency_retention(
     }
     Ok(None)
 }
+
+/// The contention timeout that applies to `metric`: its own row, else the
+/// platform default. `0` is fail-fast, which is the shipped default (I8).
+///
+/// # Errors
+///
+/// Returns the database error of the read.
+pub async fn read_contention_timeout(
+    runner: &impl DBRunner,
+    metric: &str,
+) -> Result<Option<i64>, ScopeError> {
+    for key in [metric, DEFAULT_KEY] {
+        let row = contention_timeout_config::Entity::find_by_id(key.to_owned())
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .one(runner)
+            .await?;
+        if let Some(row) = row {
+            return Ok(Some(row.timeout_ms));
+        }
+    }
+    Ok(None)
+}
+
+/// The active-lease cap for `(tenant, metric)`: the most specific configured
+/// row of `(t, m)`, `(t, *)`, `(*, m)`, `(*, *)` (I7).
+///
+/// # Errors
+///
+/// Returns the database error of the read.
+pub async fn read_lease_capacity(
+    runner: &impl DBRunner,
+    tenant_id: &str,
+    metric: &str,
+) -> Result<Option<i32>, ScopeError> {
+    for (tenant_key, metric_key) in [
+        (tenant_id, metric),
+        (tenant_id, DEFAULT_KEY),
+        (DEFAULT_KEY, metric),
+        (DEFAULT_KEY, DEFAULT_KEY),
+    ] {
+        let row = lease_capacity_config::Entity::find_by_id((
+            tenant_key.to_owned(),
+            metric_key.to_owned(),
+        ))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .one(runner)
+        .await?;
+        if let Some(row) = row {
+            return Ok(Some(row.max_active_leases));
+        }
+    }
+    Ok(None)
+}

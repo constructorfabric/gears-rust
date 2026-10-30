@@ -811,10 +811,19 @@ The span code is routed through a `#[doc(hidden)] pub use tracing as __tracing;`
 by its `trace_id` (the W3C `traceparent` 32-hex trace-id), propagated automatically via `traceparent`
 (above). The server-side error envelope derives that `trace_id` from the live `OTel` span context,
 falling back to the inbound W3C `traceparent` (`toolkit::api::extract_trace_id`, in
-`libs/toolkit-trace-context/src/lib.rs`). This is **distinct** from the platform's `x-request-id` —
-the gateway's per-request id, used by the access log, audit records, and response headers — which the
-client neither reads nor forwards; the two are different identifiers with different owners and
-lifetimes. No separate request-context type is introduced.
+`libs/toolkit-trace-context/src/lib.rs`).
+
+Separately, the platform's `x-request-id` — the gateway's per-request id, used by the access log,
+audit records, and response headers — is **forwarded** on outbound `toolkit-http` requests
+made inline while the caller is serving a request that carried one: inbound middleware installs it
+as a task-local (`toolkit_trace_context::with_request_id`) and the transport re-attaches it
+(`inject_request_id`). The two identifiers stay distinct — `trace_id` tracks the span tree,
+`x-request-id` the external request — but a gear-to-gear hop now joins both: the same
+`request_id` appears in every gear's request span, and unlike `traceparent` injection this works
+with or without the `otel` feature. Gears never mint the id themselves. Being a task-local, the id
+is forwarded only on calls made inline in the serving task; `tokio::spawn` / `spawn_blocking` and
+streamed bodies polled after the handler returns are uncorrelated unless the id is re-installed
+there (see the `with_request_id` docs).
 
 **Metrics.** RED metrics (`http.client.request.duration`, labeled by `client_type` = the projection
 trait name) are **feature-gated on `otel`**. The `toolkit-contract` `otel` feature forwards

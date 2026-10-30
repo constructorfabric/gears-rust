@@ -1382,6 +1382,9 @@ than a transcription:
   caller's own retry loop composes. Unbounded internal retry was rejected: a hot key
   under heavy contention would turn one `put` into an unbounded write storm against
   the API server, which is the failure mode §12 is most concerned with.
+  If the key is deleted between the `GET` and the guarded `PUT` (`Replaced::Gone`,
+  §10), `put` creates it again at `version: 1` within the same budget, as it does
+  when the read finds no entry.
 
 A `put` with a byte-identical value still bumps `spec.version`, because we always
 write `version: prev + 1`. That matters: the API server treats an identical-spec
@@ -1930,6 +1933,7 @@ extends it with the HTTP statuses that column does not enumerate.
 | `409 Conflict` | **Not a `Provider` error.** Classified per primitive: `LockContended` on lock acquisition (§5.2), an internal re-read-and-retry on renewal (§4.2) and on `put` (§6.1, bounded), `CasConflict` on a cache `compare_and_swap` whose guarded write lost the race, `Ok(())` on resign and guarded release (§4.4, §5.4), `Ok(false)` on a guarded delete (§6.1). The single place a 409 is classified is `guarded.rs`, so no call site can get it wrong independently |
 | `409 AlreadyExists` on a create | Not an error, and distinct from `409 Conflict` despite sharing a status code — the `reason` field separates them. `put_if_absent` → `Ok(None)`; every other create path falls through to its guarded-replace branch |
 | `404 Not Found` on a get | Not an error: "no claim exists" / "no entry", handled by each primitive's create path. On a cache `delete`, `Ok(false)` / `Ok(())` |
+| `404 NotFound` naming the object, on a guarded `PUT` | Not an error: the object was deleted between the read and the write (`guarded::Replaced::Gone`). Kubernetes ≥ 1.34 answers this with a `404` for a custom resource (`ClusterCacheEntry`); a built-in `Lease`, and any object on ≤ 1.33, answers with a `409` UID-precondition failure. Every guarded `PUT` handles both, so the `Lease` paths stay correct if a later release answers `404` for them too. Cache `put` → create again (§6.1); `compare_and_swap` → re-read → `CasConflict`; lock claim → create; renew/release/resign → re-read, as after a `404` read; leader renewal → claim lost. A `404` that names no object is the CRD row below |
 | `410 Gone` on a watch | Not surfaced as an error: `kube`'s watcher re-lists and the consumer observes `Reset` (§4.3, §6.3) |
 | `404` naming the **resource** rather than an object, on a cache call | `InvalidConfig` naming `deploy/crd.yaml` — the CRD is not installed or not served (§6.7). Normally unreachable, since the startup canary catches it, but a CRD deleted under a running plugin lands here and must not read as "the entry is missing" |
 | `422 Unprocessable Entity` on a cache write | `InvalidConfig` naming `deploy/crd.yaml` — the installed CRD's schema rejects what this plugin version writes, i.e. version skew on a cluster-scoped singleton (§6.7). Deliberately **not** `Other`: the fix is an operator action on a manifest, not a bug report |

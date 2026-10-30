@@ -38,6 +38,9 @@ env:
   # CARGO_* variable in its cache keys, so changing one rebuilds everything.
   # Usually better determinism and smaller cache churn in CI.
   CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
+  # The one cargo-gears pin for CI; gears.mk reads it from the environment too.
+  CARGO_GEARS_VERSION: 0.0.8
   # Pinned nightly toolchain used by the coverage job. Independent of the pin in
   # shear-nightly.yml — they happen to match today but need not.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
@@ -98,6 +101,7 @@ jobs:
             fips:
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
+              - 'libs/toolkit-http-proxy/**'
               - 'libs/rustls-*/**'
             magika:
               - 'gears/file-parser/**'
@@ -161,7 +165,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -177,7 +181,7 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-hack
 
@@ -187,9 +191,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-clippy-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         # Reused below as `*sccache-inputs`.
         with: &sccache-inputs
@@ -217,6 +223,11 @@ jobs:
       # their code (E0308, DE0904, clippy::...) when the command fails.
       - name: cargo clippy
         run: tools/scripts/with_rust_annotations.sh make clippy
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   # Python checks of repo files. They need no Rust toolchain, so they run in
   # their own short job.
@@ -301,7 +312,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -317,7 +328,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest
 
@@ -327,6 +338,7 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-integration-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
@@ -357,6 +369,16 @@ jobs:
       - name: Test postgres-cluster-plugin (pg integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
+
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
 
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -420,6 +442,13 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=ledger-pg
 
+      # bss-orders' Postgres tier: the engine, sealed audit, idempotency, claims, role-isolation
+      # and gear-boot proofs all run against a real PostgreSQL. Without this step the tier
+      # compiles here and runs nowhere.
+      - name: Test bss-orders with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
+
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-redis
@@ -436,16 +465,8 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pg
 
-      - name: Test toolkit-db (pgq unit + PG19 integration)
+      - name: Test toolkit-db (pgq)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
-        # Compiles and runs everything behind the `pgq` feature — the secure
-        # graph builder, its unit suites and the trybuild guards — and the
-        # PostgreSQL 19 integration suite. Locally that suite skips itself while
-        # the pre-GA PG19 image is unavailable; here the skip is a failure, so
-        # the isolation suite cannot pass green and empty (see
-        # libs/test-containers::graph_lane_required).
-        env:
-          GEARS_TEST_PG_GRAPH_REQUIRED: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=toolkit-db-pgq
 
       - name: Test toolkit-db (mysql integration)
@@ -472,6 +493,11 @@ jobs:
           path: test-results/*.xml
           if-no-files-found: warn
           retention-days: 14
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.setup.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   test-fips:
     name: FIPS verification (${{ matrix.os }})
@@ -514,7 +540,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -532,7 +558,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: nextest
 
@@ -544,9 +570,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-fips
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         with: *sccache-inputs
 
@@ -564,29 +592,35 @@ jobs:
         run: |
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
+          cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
       # Windows: build-verify the CNG provider path. Compile-only is sufficient —
       # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
       - name: FIPS build check (Windows / CNG)
         if: runner.os == 'Windows'
         shell: bash
-        run: cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+        run: |
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
 
-  # The gear's whole suite against a real PostgreSQL 19 with pgvector, and its
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
+
+  # The gear's whole suite against a real PostgreSQL with pgvector, and its
   # own coverage floor, in one pass.
   #
-  # Two things make this job exist. The lane needs a server that has both
-  # SQL/PGQ and pgvector, and no published image carries both, so the image is
-  # built here from the gear's own Dockerfile (`test-containers` should publish
-  # one; until it does, this is a `docker build`, not a blocked lane). And
-  # `nfr-code-coverage` asks for 85% line coverage "enforced in CI": the
+  # Two things make this job exist. The lane needs a server with pgvector, so
+  # it runs on the published pgvector image. And `nfr-code-coverage` asks for
+  # 85% line coverage "enforced in CI": the
   # workspace coverage job reports to Codecov and gates on nothing per crate,
   # while the shared script's project-wide threshold is 80. Without the
   # PostgreSQL lane the figure is ~55%, because the built-in store is the half
   # of the gear only a real server exercises — so measuring and running are the
   # same job or neither is honest.
   test-graph-storage:
-    name: graph-storage (PostgreSQL 19 + pgvector, coverage floor)
+    name: graph-storage (PostgreSQL 18 + pgvector, coverage floor)
     needs: changes
     if: >-
       !cancelled()
@@ -631,23 +665,15 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # The same pin as the workspace coverage job: the v2.70.3 one installed
       # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
       # then found no object files to report on.
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-llvm-cov, nextest
-
-      # PostgreSQL 19 plus a pinned pgvector, on the official base so the
-      # stock entrypoint and server arguments testcontainers drives are intact.
-      - name: Build the PostgreSQL 19 + pgvector image
-        run: |
-          docker build \
-            -f gears/graph-storage/deploy/docker/pg19-pgvector.Dockerfile \
-            -t pg19-pgvector:ci \
-            gears/graph-storage/deploy/docker
 
       # REQUIRED turns a skip into a failure: this lane exists to run against
       # a real server, and a green run that quietly skipped it proves nothing.
@@ -680,7 +706,7 @@ jobs:
           # both directories are.
           CARGO_LLVM_COV_TARGET_DIR: llvm-cov-target
           CARGO_LLVM_COV_BUILD_DIR: llvm-cov-build
-          GEARS_TEST_PG_GRAPH_IMAGE: "pg19-pgvector:ci"
+          GEARS_TEST_PG_GRAPH_IMAGE: "pgvector/pgvector:0.8.7-pg18"
           GEARS_TEST_PG_GRAPH_REQUIRED: "1"
         run: |
           cargo llvm-cov nextest \
@@ -751,9 +777,10 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -825,6 +852,7 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-onnx
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Fetch ONNX Runtime shared library
         shell: bash
@@ -924,9 +952,11 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-magika
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       # Only main writes to the cache. See .github/actions/sccache.
       - name: Set up sccache
+        id: sccache
         uses: ./.github/actions/sccache
         with: *sccache-inputs
 
@@ -944,6 +974,11 @@ jobs:
         shell: bash
         timeout-minutes: 10
         run: cargo test -p cf-gears-file-parser --features magika
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats
 
   cfs:
     name: CFS
@@ -970,7 +1005,7 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-deny@0.20.2
 
@@ -1006,7 +1041,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -1027,9 +1062,10 @@ jobs:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-nightly-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-llvm-cov
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -1151,7 +1187,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -1161,7 +1197,21 @@ jobs:
           toolchain: stable
 
       - name: Install cargo-gears
-        run: cargo install --locked cargo-gears@0.0.8
+        uses: ./.github/actions/cargo-gears
+        with:
+          version: ${{ env.CARGO_GEARS_VERSION }}
+
+      # rust-lang/rust-clippy renamed `master` to `main`, but dylint (up to 6.2.0) clones it and
+      # checks out `master`, so building the dylint driver fails. Serve that clone from a local
+      # mirror whose default branch `master` is `main`. Remove once dylint checks out `main`.
+      - name: Work around dylint's hard-coded rust-clippy `master`
+        shell: bash
+        run: |
+          mirror="$RUNNER_TEMP/rust-clippy.git"
+          git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+          git -C "$mirror" branch -f master main
+          git -C "$mirror" symbolic-ref HEAD refs/heads/master
+          git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
         run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint

@@ -424,9 +424,31 @@ pub fn native_roots_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfi
 /// [`build_client_config`]). This is the FIPS-conformant counterpart to the
 /// `hyper_rustls::HttpsConnectorBuilder::with_provider_and_webpki_roots`
 /// one-liner — we must build the config ourselves so we can flip the EMS bit.
+///
+/// # Errors
+///
+/// See [`custom_roots_client_config`].
 pub fn webpki_roots_client_config(tls: &TlsConfig) -> Result<rustls::ClientConfig, TlsConfigError> {
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    build_client_config(root_store, tls)
+}
+
+/// Build a rustls `ClientConfig` trusting exactly `root_store` (e.g. a
+/// private CA for internal upstreams).
+///
+/// Same provider selection and FIPS hardening as the other builders.
+///
+/// # Errors
+///
+/// [`TlsConfigError::NoCryptoProvider`] under `fips` when no provider was
+/// installed, [`TlsConfigError::FipsHardeningFailed`] when the config does
+/// not report FIPS mode, or [`TlsConfigError::Other`] for an invalid
+/// protocol-version or client-certificate setup.
+pub fn custom_roots_client_config(
+    root_store: rustls::RootCertStore,
+    tls: &TlsConfig,
+) -> Result<rustls::ClientConfig, TlsConfigError> {
     build_client_config(root_store, tls)
 }
 

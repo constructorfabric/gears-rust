@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-grpc-hub"
-version = "0.3.2"
+version = "0.4.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -45,6 +45,10 @@ http = { workspace = true }
 
 # gRPC server
 tonic = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# The effective uid, to replace only a stale socket this service owns.
+rustix = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

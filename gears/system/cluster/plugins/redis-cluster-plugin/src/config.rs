@@ -75,6 +75,22 @@ pub fn default_wait_timeout() -> u64 {
     1_000
 }
 
+/// Default capacity of the subscriber client's event streams, in messages
+/// (DESIGN.md §4.3, §8).
+///
+/// `fred`'s default of 32 is too small: every lock release under the prefix
+/// shares the pub/sub stream with cache events, and a burst of more than 32
+/// lags the fan-out and resets every watcher. 4096 slots cost a few MB per
+/// plugin instance.
+#[must_use]
+pub fn default_subscriber_buffer_capacity() -> u32 {
+    4_096
+}
+
+/// The largest `subscriber_buffer_capacity` accepted — a typo guard, since the
+/// buffer is preallocated.
+pub const MAX_SUBSCRIBER_BUFFER_CAPACITY: u32 = 1 << 20;
+
 /// Operator hint for the server topology (DESIGN.md §8).
 ///
 /// If omitted, the plugin detects the topology from `INFO replication` at
@@ -221,6 +237,12 @@ pub struct RedisClusterConfig {
     /// an operator should have to opt into.
     #[serde(default)]
     pub manage_keyspace_notifications: bool,
+
+    /// Capacity, in messages, of the subscriber client's event streams
+    /// (DESIGN.md §4.3). A burst larger than this resets every watcher.
+    /// Default: 4096; must be 1..=[`MAX_SUBSCRIBER_BUFFER_CAPACITY`].
+    #[serde(default = "default_subscriber_buffer_capacity")]
+    pub subscriber_buffer_capacity: u32,
 }
 
 impl fmt::Debug for RedisClusterConfig {
@@ -241,6 +263,10 @@ impl fmt::Debug for RedisClusterConfig {
             .field(
                 "manage_keyspace_notifications",
                 &self.manage_keyspace_notifications,
+            )
+            .field(
+                "subscriber_buffer_capacity",
+                &self.subscriber_buffer_capacity,
             )
             .finish()
     }
@@ -278,6 +304,21 @@ fn reject_zero_duration(value: u64, field: &str) -> Result<(), ClusterError> {
     Ok(())
 }
 
+/// Rejects a zero `subscriber_buffer_capacity` (`tokio` panics on a
+/// zero-capacity broadcast channel) or one past
+/// [`MAX_SUBSCRIBER_BUFFER_CAPACITY`].
+fn check_subscriber_buffer_capacity(value: u32) -> Result<(), ClusterError> {
+    if value == 0 || value > MAX_SUBSCRIBER_BUFFER_CAPACITY {
+        return Err(ClusterError::InvalidConfig {
+            reason: format!(
+                "subscriber_buffer_capacity must be between 1 and \
+                 {MAX_SUBSCRIBER_BUFFER_CAPACITY}, got {value}"
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl RedisClusterConfig {
     /// Validates the config values that can only fail at startup, before any
     /// pool, subscriber, or background task is constructed. Called at the top
@@ -285,12 +326,20 @@ impl RedisClusterConfig {
     ///
     /// # Errors
     /// [`ClusterError::InvalidConfig`] for a zero `pool_size`,
-    /// `command_timeout_ms`, or `wait_timeout_ms`.
+    /// `command_timeout_ms`, or `wait_timeout_ms`, or an out-of-range
+    /// `subscriber_buffer_capacity`.
     pub fn validate(&self) -> Result<(), ClusterError> {
         reject_zero_pool_size(self.pool_size)?;
         reject_zero_duration(self.command_timeout_ms, "command_timeout_ms")?;
         reject_zero_duration(self.wait_timeout_ms, "wait_timeout_ms")?;
+        check_subscriber_buffer_capacity(self.subscriber_buffer_capacity)?;
         Ok(())
+    }
+
+    /// `subscriber_buffer_capacity` as the `usize` `fred` takes.
+    #[must_use]
+    pub fn subscriber_buffer_capacity(&self) -> usize {
+        usize::try_from(self.subscriber_buffer_capacity).unwrap_or(usize::MAX)
     }
 
     /// The per-command timeout as a [`Duration`].
@@ -352,6 +401,11 @@ pub struct RedisLockConfig {
     /// See [`RedisClusterConfig::wait_timeout_ms`].
     #[serde(default = "default_wait_timeout")]
     pub wait_timeout_ms: u64,
+
+    /// See [`RedisClusterConfig::subscriber_buffer_capacity`]. Here a lag
+    /// delays blocked `lock()` calls until their next heartbeat.
+    #[serde(default = "default_subscriber_buffer_capacity")]
+    pub subscriber_buffer_capacity: u32,
 }
 
 impl fmt::Debug for RedisLockConfig {
@@ -367,6 +421,10 @@ impl fmt::Debug for RedisLockConfig {
             .field("durability", &self.durability)
             .field("wait_replicas", &self.wait_replicas)
             .field("wait_timeout_ms", &self.wait_timeout_ms)
+            .field(
+                "subscriber_buffer_capacity",
+                &self.subscriber_buffer_capacity,
+            )
             .finish()
     }
 }
@@ -378,12 +436,20 @@ impl RedisLockConfig {
     ///
     /// # Errors
     /// [`ClusterError::InvalidConfig`] for a zero `pool_size`,
-    /// `command_timeout_ms`, or `wait_timeout_ms`.
+    /// `command_timeout_ms`, or `wait_timeout_ms`, or an out-of-range
+    /// `subscriber_buffer_capacity`.
     pub fn validate(&self) -> Result<(), ClusterError> {
         reject_zero_pool_size(self.pool_size)?;
         reject_zero_duration(self.command_timeout_ms, "command_timeout_ms")?;
         reject_zero_duration(self.wait_timeout_ms, "wait_timeout_ms")?;
+        check_subscriber_buffer_capacity(self.subscriber_buffer_capacity)?;
         Ok(())
+    }
+
+    /// See [`RedisClusterConfig::subscriber_buffer_capacity`].
+    #[must_use]
+    pub fn subscriber_buffer_capacity(&self) -> usize {
+        usize::try_from(self.subscriber_buffer_capacity).unwrap_or(usize::MAX)
     }
 
     /// The per-command timeout as a [`Duration`].

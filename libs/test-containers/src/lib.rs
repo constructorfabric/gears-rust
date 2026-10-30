@@ -31,6 +31,7 @@
 //! | `GEARS_TEST_MARIADB_TAG` | [`MARIADB_TAG`] |
 //! | `GEARS_TEST_CLICKHOUSE_TAG` | [`CLICKHOUSE_TAG`] |
 //! | `GEARS_TEST_REDIS_TAG` | [`REDIS_TAG`] |
+//! | `GEARS_TEST_KAFKA_TAG` | [`KAFKA_TAG`] |
 //!
 //! An unset *or empty* variable means "use the constant".
 //!
@@ -63,19 +64,15 @@
 //! ```
 
 use testcontainers::{ContainerRequest, GenericImage, ImageExt};
-use testcontainers_modules::{mysql::Mysql, postgres::Postgres, redis::Redis};
+use testcontainers_modules::{
+    kafka::apache::Kafka, mysql::Mysql, postgres::Postgres, redis::Redis,
+};
 
 /// Tag of the official `postgres` image. The workspace floor.
 pub const POSTGRES_TAG: &str = "18-alpine";
 
-/// Tag of the `postgres` image for the future graph-storage gear, which needs
-/// `SQL/PGQ` (`GRAPH_TABLE`) — `PostgreSQL` 19 only.
-///
-/// Reserved: nothing consumes this yet. Pre-`GA`, so it names a beta build;
-/// replace it with `19-alpine` once `PostgreSQL` 19 ships (expected
-/// September/October 2026, see `docs/arch/secure-orm/ADR/0002`). Beta tags are
-/// routinely withdrawn from Docker Hub after `GA`, which is why
-/// [`graph_lane_required()`] defaults to `false`.
+/// Tag of the `postgres` image for `toolkit-db`'s `SQL/PGQ` suite. A beta on
+/// purpose: 19 GA ships without `SQL/PGQ` (gears-rust #5343).
 pub const POSTGRES_GRAPH_TAG: &str = "19beta3-alpine";
 
 /// Tag of the official `mysql` image.
@@ -121,6 +118,11 @@ pub const CLICKHOUSE_TAG: &str = "25.6";
 /// Tag of the official `redis` image.
 pub const REDIS_TAG: &str = "8-alpine";
 
+/// Tag of the official `apache/kafka` (JVM) image, run as a single `KRaft`
+/// node. Its `Kafka Server started` log line is what the image module waits
+/// on.
+pub const KAFKA_TAG: &str = "4.3.1";
+
 /// Environment variable overriding [`POSTGRES_TAG`].
 pub const ENV_POSTGRES_TAG: &str = "GEARS_TEST_PG_TAG";
 /// Environment variable overriding [`POSTGRES_GRAPH_TAG`].
@@ -135,6 +137,8 @@ pub const ENV_MARIADB_TAG: &str = "GEARS_TEST_MARIADB_TAG";
 pub const ENV_CLICKHOUSE_TAG: &str = "GEARS_TEST_CLICKHOUSE_TAG";
 /// Environment variable overriding [`REDIS_TAG`].
 pub const ENV_REDIS_TAG: &str = "GEARS_TEST_REDIS_TAG";
+/// Environment variable overriding [`KAFKA_TAG`].
+pub const ENV_KAFKA_TAG: &str = "GEARS_TEST_KAFKA_TAG";
 
 /// Environment variable turning an unavailable `PostgreSQL` 19 image into a
 /// failure instead of a skip. See [`graph_lane_required()`].
@@ -211,6 +215,12 @@ pub fn redis_tag() -> String {
     tag_from(env_override(ENV_REDIS_TAG), REDIS_TAG)
 }
 
+/// Kafka tag in effect, honoring `GEARS_TEST_KAFKA_TAG`.
+#[must_use]
+pub fn kafka_tag() -> String {
+    tag_from(env_override(ENV_KAFKA_TAG), KAFKA_TAG)
+}
+
 /// A `PostgreSQL` container request on the pinned tag.
 ///
 /// Chain `ImageExt` methods (`with_env_var`, `with_mount`, …) onto the result
@@ -248,8 +258,7 @@ pub fn postgres_tagged(fallback: &str) -> ContainerRequest<Postgres> {
     ContainerRequest::from(Postgres::default()).with_tag(tag)
 }
 
-/// A `PostgreSQL` 19 container request, for the graph-storage gear's `SQL/PGQ`
-/// suite. Reserved — nothing consumes it yet; see [`POSTGRES_GRAPH_TAG`].
+/// A `PostgreSQL` 19 beta container request; see [`POSTGRES_GRAPH_TAG`].
 pub fn postgres_graph() -> ContainerRequest<Postgres> {
     ContainerRequest::from(Postgres::default()).with_tag(postgres_graph_tag())
 }
@@ -257,6 +266,24 @@ pub fn postgres_graph() -> ContainerRequest<Postgres> {
 /// A `MySQL` container request on the pinned tag.
 pub fn mysql() -> ContainerRequest<Mysql> {
     ContainerRequest::from(Mysql::default()).with_tag(mysql_tag())
+}
+
+/// A single-node `KRaft` Kafka container request on the pinned tag, its
+/// plaintext listener on `testcontainers_modules::kafka::apache::KAFKA_PORT`.
+///
+/// Set up for tests that own their topics: topics are never auto-created, the
+/// broker checks retention every second, and the transaction state log and
+/// offsets topic need one replica, so transactional producers and consumer
+/// groups work on one broker.
+pub fn kafka() -> ContainerRequest<Kafka> {
+    ContainerRequest::from(Kafka::default().with_jvm_image())
+        .with_tag(kafka_tag())
+        .with_env_var("KAFKA_NODE_ID", "1")
+        .with_env_var("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false")
+        .with_env_var("KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS", "1000")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1")
+        .with_env_var("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1")
+        .with_env_var("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1")
 }
 
 /// A `Redis` container request on the pinned tag.
@@ -289,13 +316,12 @@ pub fn clickhouse() -> GenericImage {
     GenericImage::new(CLICKHOUSE_IMAGE.to_owned(), clickhouse_tag())
 }
 
-/// Whether an unavailable `PostgreSQL` 19 image must fail the run rather than
-/// skip it.
+/// Whether an unavailable `PostgreSQL` 19 beta image must fail the run rather
+/// than skip it.
 ///
-/// Defaults to `false` while the image is pre-`GA`: the tag can disappear from
-/// Docker Hub at `GA`, and no lane should go red for that. `CI` sets
-/// `GEARS_TEST_PG_GRAPH_REQUIRED=1` once the lane is meant to be mandatory —
-/// the same shape as `RG_PG_REQUIRE_DOCKER` in resource-group's smoke test.
+/// Off by default: the beta tags can disappear from Docker Hub, and `CI` does
+/// not set it (gears-rust #5343). Set `GEARS_TEST_PG_GRAPH_REQUIRED=1` for a
+/// run that must exercise the `SQL/PGQ` suite.
 #[must_use]
 pub fn graph_lane_required() -> bool {
     flag_from(env_override(ENV_GRAPH_LANE_REQUIRED))
@@ -373,6 +399,7 @@ mod tests {
         assert_eq!(CLICKHOUSE_IMAGE, "clickhouse/clickhouse-server");
         assert_eq!(CLICKHOUSE_TAG, "25.6");
         assert_eq!(REDIS_TAG, "8-alpine");
+        assert_eq!(KAFKA_TAG, "4.3.1");
     }
 
     /// Known floating-alias words. Checked per component (split on `-`/`_`),
@@ -397,6 +424,7 @@ mod tests {
             MARIADB_TAG,
             CLICKHOUSE_TAG,
             REDIS_TAG,
+            KAFKA_TAG,
         ] {
             assert!(
                 !is_floating_alias(tag),
@@ -442,6 +470,7 @@ mod tests {
         assert_eq!(ENV_MARIADB_TAG, "GEARS_TEST_MARIADB_TAG");
         assert_eq!(ENV_CLICKHOUSE_TAG, "GEARS_TEST_CLICKHOUSE_TAG");
         assert_eq!(ENV_REDIS_TAG, "GEARS_TEST_REDIS_TAG");
+        assert_eq!(ENV_KAFKA_TAG, "GEARS_TEST_KAFKA_TAG");
         assert_eq!(ENV_GRAPH_LANE_REQUIRED, "GEARS_TEST_PG_GRAPH_REQUIRED");
     }
 
@@ -453,7 +482,7 @@ mod tests {
         /// (environment variable, accessor it must reach, constant it falls back to)
         type AccessorCase = (&'static str, fn() -> String, &'static str);
 
-        let cases: [AccessorCase; 7] = [
+        let cases: [AccessorCase; 8] = [
             (ENV_POSTGRES_TAG, postgres_tag, POSTGRES_TAG),
             (
                 ENV_POSTGRES_GRAPH_TAG,
@@ -465,6 +494,7 @@ mod tests {
             (ENV_MARIADB_TAG, mariadb_tag, MARIADB_TAG),
             (ENV_CLICKHOUSE_TAG, clickhouse_tag, CLICKHOUSE_TAG),
             (ENV_REDIS_TAG, redis_tag, REDIS_TAG),
+            (ENV_KAFKA_TAG, kafka_tag, KAFKA_TAG),
         ];
         for (var, accessor, default) in cases {
             temp_env::with_var(var, Some("sentinel-value"), || {
@@ -497,6 +527,10 @@ mod tests {
         assert_eq!(mysql().descriptor(), format!("mysql:{}", mysql_tag()));
         assert_eq!(redis().descriptor(), format!("redis:{}", redis_tag()));
         assert_eq!(
+            kafka().descriptor(),
+            format!("apache/kafka:{}", kafka_tag())
+        );
+        assert_eq!(
             postgres_named("cluster_test").descriptor(),
             format!("postgres:{}", postgres_tag())
         );
@@ -518,6 +552,9 @@ mod tests {
         temp_env::with_var(ENV_REDIS_TAG, Some("tag-under-test"), || {
             assert_eq!(redis().descriptor(), "redis:tag-under-test");
         });
+        temp_env::with_var(ENV_KAFKA_TAG, Some("tag-under-test"), || {
+            assert_eq!(kafka().descriptor(), "apache/kafka:tag-under-test");
+        });
     }
 
     #[test]
@@ -529,6 +566,43 @@ mod tests {
         assert_eq!(mariadb().tag(), mariadb_tag());
         assert_eq!(clickhouse().name(), CLICKHOUSE_IMAGE);
         assert_eq!(clickhouse().tag(), clickhouse_tag());
+    }
+
+    /// The broker settings the event-broker Kafka tests rely on: a topic a
+    /// test did not create must not appear, retention must act within
+    /// seconds, and one broker must host the transaction state log.
+    #[test]
+    fn kafka_is_configured_for_tests_that_own_their_topics() {
+        let request = kafka();
+        let env: std::collections::BTreeMap<String, String> = request
+            .env_vars()
+            .map(|(name, value)| (name.into_owned(), value.into_owned()))
+            .filter(|(name, _)| {
+                [
+                    "KAFKA_NODE_ID",
+                    "KAFKA_AUTO_CREATE_TOPICS_ENABLE",
+                    "KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS",
+                    "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR",
+                    "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR",
+                    "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR",
+                ]
+                .contains(&name.as_str())
+            })
+            .collect();
+        assert_eq!(
+            env,
+            [
+                ("KAFKA_AUTO_CREATE_TOPICS_ENABLE", "false"),
+                ("KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS", "1000"),
+                ("KAFKA_NODE_ID", "1"),
+                ("KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR", "1"),
+                ("KAFKA_TRANSACTION_STATE_LOG_MIN_ISR", "1"),
+                ("KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR", "1"),
+            ]
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.to_owned()))
+            .collect()
+        );
     }
 
     /// `postgres_tagged` exists so a higher local floor does not cost the
@@ -632,6 +706,22 @@ mod tests {
                 ("TIMESCALEDB_IMAGE", TIMESCALEDB_IMAGE),
                 ("TIMESCALEDB_TAG", TIMESCALEDB_TAG),
                 ("ENV_TIMESCALEDB_TAG", ENV_TIMESCALEDB_TAG),
+            ],
+            "PostgreSQL majors",
+        );
+    }
+
+    /// Same contract for the plain `PostgreSQL` image the Rust integration
+    /// suites run (`postgres()`): a self-managed `PostgreSQL` E2E
+    /// lane must exercise the same major, or its migrations and role grants are
+    /// validated against one server and run against another.
+    #[test]
+    fn e2e_sidecar_pins_the_same_postgres_image() {
+        assert_sidecar_pins(
+            &[
+                ("POSTGRES_IMAGE", "postgres"),
+                ("POSTGRES_TAG", POSTGRES_TAG),
+                ("ENV_POSTGRES_TAG", ENV_POSTGRES_TAG),
             ],
             "PostgreSQL majors",
         );

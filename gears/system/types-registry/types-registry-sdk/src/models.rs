@@ -90,12 +90,27 @@ pub struct BatchGetItem {
     pub if_none_match: Option<Validator>,
 }
 
-impl From<EntityKey> for BatchGetItem {
-    fn from(key: EntityKey) -> Self {
+impl BatchGetItem {
+    /// An unconditional read of `key`.
+    #[must_use]
+    pub fn new(key: impl Into<EntityKey>) -> Self {
         Self {
-            key,
+            key: key.into(),
             if_none_match: None,
         }
+    }
+
+    /// Makes this key's read conditional on `validator`.
+    #[must_use]
+    pub fn with_if_none_match(mut self, validator: Validator) -> Self {
+        self.if_none_match = Some(validator);
+        self
+    }
+}
+
+impl From<EntityKey> for BatchGetItem {
+    fn from(key: EntityKey) -> Self {
+        Self::new(key)
     }
 }
 
@@ -109,6 +124,34 @@ pub struct BatchGetEntitiesRequest {
     pub projection: Projection,
     /// Bypass any client cache for an authoritative read. Not sent on the wire.
     pub fresh: bool,
+}
+
+impl BatchGetEntitiesRequest {
+    /// A batch read of `items`, kept in their order, under [`Projection::Default`] and
+    /// through any cache.
+    #[must_use]
+    pub fn new(items: impl IntoIterator<Item = BatchGetItem>) -> Self {
+        Self {
+            items: items.into_iter().collect(),
+            projection: Projection::Default,
+            fresh: false,
+        }
+    }
+
+    /// Answer every key under `projection` instead of the current one.
+    #[must_use]
+    pub fn with_projection(mut self, projection: impl Into<Projection>) -> Self {
+        self.projection = projection.into();
+        self
+    }
+
+    /// With `true`, bypass any client cache for an authoritative read; it is not sent on
+    /// the wire and has no effect when the client has no cache.
+    #[must_use]
+    pub fn with_fresh(mut self, fresh: bool) -> Self {
+        self.fresh = fresh;
+        self
+    }
 }
 
 /// A selectable or mandatory entity field.
@@ -235,6 +278,13 @@ impl Projection {
     }
 }
 
+/// An explicit selection; it stays explicit even when equal to the default fields.
+impl From<FieldSelection> for Projection {
+    fn from(selection: FieldSelection) -> Self {
+        Self::Select(selection)
+    }
+}
+
 /// Projection and client-cache policy for single and batch typed read helpers.
 ///
 /// The default uses [`Projection::Default`] and `fresh: false`.
@@ -245,6 +295,29 @@ pub struct ReadOptions {
     /// Bypass any client cache for this read. Not sent on the wire.
     /// Has no effect when the client has no cache.
     pub fresh: bool,
+}
+
+impl ReadOptions {
+    /// [`Projection::Default`], through any client cache.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Read under `projection` instead of the current one.
+    #[must_use]
+    pub fn with_projection(mut self, projection: impl Into<Projection>) -> Self {
+        self.projection = projection.into();
+        self
+    }
+
+    /// With `true`, bypass any client cache for this read; it is not sent on the wire
+    /// and has no effect when the client has no cache.
+    #[must_use]
+    pub fn with_fresh(mut self, fresh: bool) -> Self {
+        self.fresh = fresh;
+        self
+    }
 }
 
 // results.
@@ -475,11 +548,73 @@ pub struct PageRequest {
     pub cursor: Option<Cursor>,
 }
 
+/// The default lists every active entity under [`Projection::Default`] from the first page.
+/// Each `with_*` sets one leaf field and keeps the others; replace a whole `filter` or
+/// `page` through its public field.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ListEntitiesRequest {
     pub filter: EntityFilter,
     pub projection: Projection,
     pub page: PageRequest,
+}
+
+impl ListEntitiesRequest {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lists what `pattern` matches.
+    #[must_use]
+    pub fn matching(pattern: GtsIdPattern) -> Self {
+        Self::new().with_pattern(pattern)
+    }
+
+    #[must_use]
+    pub fn with_pattern(mut self, pattern: GtsIdPattern) -> Self {
+        self.filter.pattern = Some(pattern);
+        self
+    }
+
+    /// The kind-narrowed list helpers set this themselves.
+    #[must_use]
+    pub fn with_kind(mut self, kind: EntityKind) -> Self {
+        self.filter.kind = Some(kind);
+        self
+    }
+
+    #[must_use]
+    pub fn with_max_chain_depth(mut self, depth: NonZeroU8) -> Self {
+        self.filter.max_chain_depth = Some(depth);
+        self
+    }
+
+    #[must_use]
+    pub fn with_lifecycle(mut self, lifecycle: LifecycleFilter) -> Self {
+        self.filter.lifecycle = lifecycle;
+        self
+    }
+
+    #[must_use]
+    pub fn with_projection(mut self, projection: impl Into<Projection>) -> Self {
+        self.projection = projection.into();
+        self
+    }
+
+    /// Passed to the registry as given; it rejects an out-of-range limit.
+    #[must_use]
+    pub fn with_limit(mut self, limit: u32) -> Self {
+        self.page.limit = Some(limit);
+        self
+    }
+
+    /// Resumes only the query that issued `cursor`: the registry refuses it under another
+    /// filter or projection.
+    #[must_use]
+    pub fn with_cursor(mut self, cursor: Cursor) -> Self {
+        self.page.cursor = Some(cursor);
+        self
+    }
 }
 
 /// One bounded page; `next` is absent on the last one.

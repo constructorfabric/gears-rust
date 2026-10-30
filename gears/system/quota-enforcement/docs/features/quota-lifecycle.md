@@ -130,7 +130,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 5. [x] - `p1` - Validate the draft's explicit `subject_id` against the declared scope discriminator of the resolved contract (`gts.cf.core.qe.scope.v1~`, P1 well-known instances `user` and `tenant`, per ADR-0007); a `subject_id` that violates the declared scope is rejected before persistence (`cpt-cf-quota-enforcement-fr-quota-lifecycle`) - `inst-qcr-subject-scope`
 6. [x] - `p1` - Run `cpt-cf-quota-enforcement-algo-quota-metadata-validation` when the draft carries `metadata`; snapshot the accepted contract id/version - `inst-qcr-metadata`
 7. [x] - `p1` - All validation above completes outside the storage transaction, so the database lock is held for the minimum window - `inst-qcr-outside-tx`
-8. [x] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7 `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter rows are created lazily on first evaluate), enqueue `quota-changed (change_kind='created')` in the outbox (I11), append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
+8. [x] - `p1` - DB: `create_quota` in a single transaction: insert the `quotas` row (server-assigned UUIDv7 `quota_id`, status `active`), insert the `quota_allocation_counters` row for allocation type (consumption counter rows are created lazily by the first mutating operation), enqueue `quota-changed (change_kind='created')` in the outbox (I11), append the `operation_log` entry, and commit the transaction - `inst-qcr-persist`
 9. [x] - `p1` - **IF** the registry-reported metric mode is `Direct` - `inst-qcr-direct-if`
    1. [x] - `p1` - Accept the Quota anyway (a metric's mode can flip over time, PRD §3.2); it is inert until the flip and is surfaced through the `quota_for_direct_metric_total` gauge - `inst-qcr-direct`
 10. [x] - `p1` - **RETURN** `201` with the Quota body; the SDK path returns `QuotaId` from `QuotaManagerClientV1::create_quota` - `inst-qcr-return`
@@ -172,7 +172,7 @@ Realises `cpt-cf-quota-enforcement-seq-quota-create`.
 
 ### Quota Deactivation Cascade
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-deactivate`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-flow-quota-deactivate`
 
 Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
@@ -188,11 +188,11 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 - The Quota is already deactivated: `QUOTA_DEACTIVATED`; no second cascade runs
 
 **Steps**:
-1. [ ] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas/{id}/deactivate` - `inst-qde-request`
-2. [ ] - `p1` - DB: `deactivate_quota(quota_id, events)` in a single transaction: lock the `quotas` row while its status is still `active`, mark the Quota deactivated, lock the active leases on this quota, mark each such lease resolved-by-deactivation, decrement `lease_capacity_counters`, return held capacity to the acquisition-period counters, and append the `operation_log` entry (I1) - `inst-qde-cascade`
-3. [ ] - `p1` - Enqueue `quota-changed (change_kind='deactivated')` plus one `lease-resolved-by-deactivation` event per affected lease, carrying the lease ID, owning subject context, held amount, and the deactivated `quota_id`, all in the same transaction (I11); commit the transaction - `inst-qde-events`
-4. [ ] - `p1` - The cascade never partially completes: either every active lease for the Quota is resolved or none is; subsequent `commit` or `release` calls against a resolved lease return `LEASE_NOT_ACTIVE` (lease operations are owned by the lease-operations feature); the deactivation timestamp serves as the implicit lease-resolve event - `inst-qde-atomic`
-5. [ ] - `p1` - **RETURN** `200` with the `DeactivateOutcome { resolved_leases }` summary so the gateway can attribute telemetry - `inst-qde-return`
+1. [x] - `p1` - Caller sends `POST /v1/quota-enforcement/quotas/{id}/deactivate` - `inst-qde-request`
+2. [x] - `p1` - DB: `deactivate_quota(quota_id, events)` in a single transaction: lock the `quotas` row while its status is still `active`, mark the Quota deactivated, lock the active leases on this quota, mark each such lease resolved-by-deactivation, decrement `lease_capacity_counters`, return held capacity to the acquisition-period counters, and append the `operation_log` entry (I1) - `inst-qde-cascade`
+3. [x] - `p1` - Enqueue `quota-changed (change_kind='deactivated')` plus one `lease-resolved-by-deactivation` event per affected lease, carrying the lease ID, owning subject context, held amount, and the deactivated `quota_id`, all in the same transaction (I11); commit the transaction - `inst-qde-events`
+4. [x] - `p1` - The cascade never partially completes: either every active lease for the Quota is resolved or none is; subsequent `commit` or `release` calls against a resolved lease return `LEASE_NOT_ACTIVE` (lease operations are owned by the lease-operations feature); the deactivation timestamp serves as the implicit lease-resolve event - `inst-qde-atomic`
+5. [x] - `p1` - **RETURN** `200` with the `DeactivateOutcome { resolved_leases }` summary so the gateway can attribute telemetry - `inst-qde-return`
 
 ### Quota Read and List
 
@@ -299,15 +299,15 @@ Realises `cpt-cf-quota-enforcement-seq-quota-deactivate-cascade`.
 
 ### Quota State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-state-quota-lifecycle`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-state-quota-lifecycle`
 
 **States**: Active, Deactivated
 
 **Initial State**: Active
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** Active **TO** Active **WHEN** a non-breaking update commits; the quota ID and subject reference are preserved and a `quota-changed (updated)` event is enqueued same-tx - `inst-qst-update`
-2. [ ] - `p1` - **FROM** Active **TO** Deactivated **WHEN** `deactivate_quota` commits; the atomic cascade of `cpt-cf-quota-enforcement-flow-quota-deactivate` resolves every active lease in the same transaction - `inst-qst-deactivate`
+1. [x] - `p1` - **FROM** Active **TO** Active **WHEN** a non-breaking update commits; the quota ID and subject reference are preserved and a `quota-changed (updated)` event is enqueued same-tx - `inst-qst-update`
+2. [x] - `p1` - **FROM** Active **TO** Deactivated **WHEN** `deactivate_quota` commits; the atomic cascade of `cpt-cf-quota-enforcement-flow-quota-deactivate` resolves every active lease in the same transaction - `inst-qst-deactivate`
 
 Deactivated is terminal in P1: no reactivation endpoint exists in the DESIGN interface inventory, and a breaking
 change is expressed as deactivate-plus-create. A Deactivated Quota stops accepting new debits or leases, remains
@@ -391,7 +391,7 @@ stable while emitting a `quota-changed` event.
 
 ### Deactivation Cascade
 
-- [ ] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-deactivation-cascade`
+- [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-deactivation-cascade`
 
 The system **MUST** implement `deactivate_quota` as one atomic transaction that marks the Quota deactivated, marks
 every active lease against it resolved-by-deactivation, decrements the active-lease counters, returns held capacity

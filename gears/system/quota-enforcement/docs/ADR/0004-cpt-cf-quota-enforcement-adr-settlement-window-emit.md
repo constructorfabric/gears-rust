@@ -60,8 +60,8 @@ subscriber discipline stays uniform across event kinds.
   `quota-counter-adjusted` or `threshold-crossed` events.
 - `period-rollover` event is emitted once, after the last active lease attributed to the closing period resolves;
   carries `closing_consumed` and `closing_cap` for sinks to reconstruct closing state.
-- **Known P1 limitation (idle Quotas).** Because P1 detects period rollover lazily on the first evaluate observing
-  `now() >= period_end` (see DESIGN.md §3.6 / sequence `cpt-cf-quota-enforcement-seq-period-rollover`), the
+- **Known P1 limitation (idle Quotas).** Because P1 detects period rollover lazily on the first mutating operation
+  observing `now() >= period_end` (see DESIGN.md §3.6 / sequence `cpt-cf-quota-enforcement-seq-period-rollover`), the
   `period-rollover` event — and the consolidated `closing_consumed` payload it carries — does not emit until the next
   operation against the Quota. For Quotas with no activity in the new period, the closing-state signal arrives
   arbitrarily late or not at all within any bounded window. Sinks needing bounded-delay closing state for idle Quotas

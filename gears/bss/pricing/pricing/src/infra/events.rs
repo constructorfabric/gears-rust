@@ -333,7 +333,6 @@ pub(crate) fn interim_envelope<E: TypedEvent>(
             .map_err(|e| serialize(e.to_string()))?,
         "trace_parent": event.trace_parent(),
         "data": serde_json::to_value(event).map_err(|e| serialize(e.to_string()))?,
-        "broker_partition": 0,
         "producer_mode": "stateless",
         "diagnostic_metadata": {"sdk_client_agent": SOURCE},
     }))

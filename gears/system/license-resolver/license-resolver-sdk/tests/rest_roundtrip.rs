@@ -54,7 +54,7 @@ impl LicenseResolverApi for Unavailable {
 
 fn request(resource_id: &str) -> LicenseCheckRequest {
     let subject = serde_json::from_value(serde_json::json!({
-        "type": gts_id!("cf.core.lic.subj.v1~cf.core.lic.user.v1~"),
+        "type": gts_id!("cf.core.lic.subj.v1~cf.core.lic.tenant.v1~"),
         "id": "u1",
         "metadata": {},
     }))

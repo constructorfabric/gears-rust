@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Guards on how the declaration routes are declared.
 //!
 //! The same rule the category routes carry, asserted separately because

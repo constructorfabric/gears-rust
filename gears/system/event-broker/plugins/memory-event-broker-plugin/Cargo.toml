@@ -1,0 +1,45 @@
+[package]
+name = "cf-gears-memory-event-broker-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "In-process storage backend plugin for the event-broker gear: the backend contract without external infrastructure, for tests and a standalone run"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["data-structures"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "memory_event_broker_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+# The `backend::Backend` contract this crate implements and its provider seam.
+# This crate depends on the SDK only, never on the gear.
+event-broker-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+futures-util = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+
+[dev-dependencies]
+# Path only, no version: the suite is not published, and a path-only
+# dev-dependency is dropped when this crate is.
+event-broker-backend-conformance = { package = "cf-gears-event-broker-backend-conformance", path = "../event-broker-backend-conformance" }
+# Path only, no version, for the same reason.
+event-broker-backend-bench = { package = "cf-gears-event-broker-backend-bench", path = "../event-broker-backend-bench" }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+uuid = { workspace = true, features = ["v4"] }
+
+[[bench]]
+name = "backend"
+harness = false

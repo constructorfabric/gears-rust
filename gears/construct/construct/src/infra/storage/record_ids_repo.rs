@@ -1,5 +1,4 @@
 use async_trait::async_trait;
-use aws_lc_rs::digest::{Context, SHA256};
 use sea_orm::{ActiveValue, EntityTrait, SqlErr};
 use time::OffsetDateTime;
 use toolkit_db::secure::{DBRunner, ScopeError, SecureInsertExt};
@@ -23,21 +22,6 @@ impl SeaOrmRecordIdRepository {
     }
 }
 
-/// The key of a record identity: the SHA-256, in hex, of its connector,
-/// provenance and version, each preceded by its length in bytes (8 bytes,
-/// big-endian). The lengths make the encoding injective, so no two different
-/// identities hash the same input, whatever bytes the parts hold, NUL included.
-#[must_use]
-pub fn record_key(id: &RecordId) -> String {
-    let mut hash = Context::new(&SHA256);
-    for part in [&id.connector, &id.provenance, &id.version] {
-        let bytes = part.as_bytes();
-        hash.update(&(bytes.len() as u64).to_be_bytes());
-        hash.update(bytes);
-    }
-    hex::encode(hash.finish())
-}
-
 fn is_unique_violation(err: &ScopeError) -> bool {
     matches!(
         err,
@@ -55,10 +39,8 @@ impl RecordIdRepository for SeaOrmRecordIdRepository {
     ) -> Result<IdInsert, DomainError> {
         let row = entity::ActiveModel {
             tenant_id: ActiveValue::Set(id.tenant_id),
-            record_key: ActiveValue::Set(record_key(&id)),
+            record_key: ActiveValue::Set(id.key.as_str().to_owned()),
             connector: ActiveValue::Set(id.connector),
-            provenance: ActiveValue::Set(id.provenance),
-            version: ActiveValue::Set(id.version),
             subject_id: ActiveValue::Set(id.subject_id),
             received_at: ActiveValue::Set(OffsetDateTime::now_utc()),
         };
