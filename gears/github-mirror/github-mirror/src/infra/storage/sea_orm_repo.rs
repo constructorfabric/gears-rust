@@ -19,7 +19,7 @@ use github_mirror_sdk::{
     Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
     PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, WorkflowJob, WorkflowRun,
+    ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun,
 };
 use sea_orm::prelude::DateTimeUtc;
 use sea_orm::sea_query::{Alias, Expr, Func, LikeExpr};
@@ -673,6 +673,17 @@ impl CommentRepository for SeaOrmCommentRepository {
         let conn = self.db.conn()?;
         comment_list_by_issue_in(&conn, scope, repo_id, issue_number, window).await
     }
+
+    async fn list_by_repo(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        window: PageWindow,
+        filter: ListingFilter,
+    ) -> Result<Vec<Comment>, DomainError> {
+        let conn = self.db.conn()?;
+        comment_list_by_repo_in(&conn, scope, repo_id, window, filter).await
+    }
 }
 
 pub struct SeaOrmReviewCommentRepository {
@@ -1137,6 +1148,7 @@ impl WorkflowRunRepository for SeaOrmWorkflowRunRepository {
         &self,
         scope: &AccessScope,
         repo_id: i64,
+        workflow_id: Option<i64>,
         window: PageWindow,
     ) -> Result<(Vec<WorkflowRun>, u64), DomainError> {
         let scope = scope.clone();
@@ -1144,8 +1156,11 @@ impl WorkflowRunRepository for SeaOrmWorkflowRunRepository {
             .db()
             .transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
-                    let items = workflow_run_list_by_repo_in(tx, &scope, repo_id, window).await?;
-                    let total = workflow_run_count_by_repo_in(tx, &scope, repo_id).await?;
+                    let items =
+                        workflow_run_list_by_repo_in(tx, &scope, repo_id, workflow_id, window)
+                            .await?;
+                    let total =
+                        workflow_run_count_by_repo_in(tx, &scope, repo_id, workflow_id).await?;
                     Ok((items, total))
                 })
             })
@@ -1169,7 +1184,54 @@ impl WorkflowRunRepository for SeaOrmWorkflowRunRepository {
         window: PageWindow,
     ) -> Result<Vec<WorkflowRun>, DomainError> {
         let conn = self.db.conn()?;
-        workflow_run_list_by_repo_in(&conn, scope, repo_id, window).await
+        workflow_run_list_by_repo_in(&conn, scope, repo_id, None, window).await
+    }
+
+    async fn workflows_by_repo(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+    ) -> Result<Vec<Workflow>, DomainError> {
+        #[derive(sea_orm::FromQueryResult)]
+        struct WorkflowName {
+            workflow_id: i64,
+            name: Option<String>,
+            last_run_at: Option<String>,
+        }
+
+        let conn = self.db.conn()?;
+        let mut rows: Vec<WorkflowName> = WorkflowRunEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(sea_orm::Condition::all().add(workflow_runs::Column::RepoId.eq(repo_id)))
+            .project_all(&conn, |select| {
+                select
+                    .select_only()
+                    .column(workflow_runs::Column::WorkflowId)
+                    .column(workflow_runs::Column::Name)
+                    .column_as(
+                        Expr::col(workflow_runs::Column::CreatedAt).max(),
+                        "last_run_at",
+                    )
+                    .group_by(workflow_runs::Column::WorkflowId)
+                    .group_by(workflow_runs::Column::Name)
+                    .into_model::<WorkflowName>()
+            })
+            .await
+            .map_err(map_scope_error)?;
+        rows.sort_by(|a, b| {
+            a.workflow_id
+                .cmp(&b.workflow_id)
+                .then_with(|| b.last_run_at.cmp(&a.last_run_at))
+        });
+        rows.dedup_by_key(|row| row.workflow_id);
+        Ok(rows
+            .into_iter()
+            .map(|row| Workflow {
+                id: row.workflow_id,
+                name: row.name,
+            })
+            .collect())
     }
 }
 
@@ -2674,6 +2736,45 @@ async fn comment_list_by_issue_in<C: DBRunner>(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+async fn comment_list_by_repo_in<C: DBRunner>(
+    conn: &C,
+    scope: &AccessScope,
+    repo_id: i64,
+    window: PageWindow,
+    filter: ListingFilter,
+) -> Result<Vec<Comment>, DomainError> {
+    let mut condition = sea_orm::Condition::all().add(comments::Column::RepoId.eq(repo_id));
+    if let Some(since) = filter.since {
+        condition = condition.add(comments::Column::UpdatedAt.gte(github_instant(since)));
+    }
+    let sort_column = match filter.sort {
+        ListingSort::Created => comments::Column::CreatedAt,
+        ListingSort::Updated => comments::Column::UpdatedAt,
+    };
+    let direction = match filter.direction {
+        ListingDirection::Asc => Order::Asc,
+        ListingDirection::Desc => Order::Desc,
+    };
+    let rows = CommentEntity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(condition)
+        .order_by(sort_column, direction)
+        .order_by(comments::Column::Id, Order::Asc)
+        .filter(window_cutoffs(
+            comments::Column::ExtractedAt,
+            Some(comments::Column::UpdatedAt),
+            window,
+        ))
+        .limit(window.limit())
+        .offset(window.offset())
+        .all(conn)
+        .await
+        .map_err(map_scope_error)?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 async fn review_comment_delete_stale_in<C: DBRunner>(
     conn: &C,
     scope: &AccessScope,
@@ -3445,15 +3546,24 @@ async fn contributor_list_by_ids_in<C: DBRunner>(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+fn workflow_runs_of(repo_id: i64, workflow_id: Option<i64>) -> sea_orm::Condition {
+    let mut condition = sea_orm::Condition::all().add(workflow_runs::Column::RepoId.eq(repo_id));
+    if let Some(workflow_id) = workflow_id {
+        condition = condition.add(workflow_runs::Column::WorkflowId.eq(workflow_id));
+    }
+    condition
+}
+
 async fn workflow_run_count_by_repo_in<C: DBRunner>(
     conn: &C,
     scope: &AccessScope,
     repo_id: i64,
+    workflow_id: Option<i64>,
 ) -> Result<u64, DomainError> {
     WorkflowRunEntity::find()
         .secure()
         .scope_with(scope)
-        .filter(sea_orm::Condition::all().add(workflow_runs::Column::RepoId.eq(repo_id)))
+        .filter(workflow_runs_of(repo_id, workflow_id))
         .count(conn)
         .await
         .map_err(map_scope_error)
@@ -3521,12 +3631,13 @@ async fn workflow_run_list_by_repo_in<C: DBRunner>(
     conn: &C,
     scope: &AccessScope,
     repo_id: i64,
+    workflow_id: Option<i64>,
     window: PageWindow,
 ) -> Result<Vec<WorkflowRun>, DomainError> {
     let rows = WorkflowRunEntity::find()
         .secure()
         .scope_with(scope)
-        .filter(sea_orm::Condition::all().add(workflow_runs::Column::RepoId.eq(repo_id)))
+        .filter(workflow_runs_of(repo_id, workflow_id))
         .order_by(workflow_runs::Column::CreatedAt, Order::Desc)
         // Unique tie-break: equal sort keys must not shuffle page windows.
         .order_by(workflow_runs::Column::Id, Order::Asc)

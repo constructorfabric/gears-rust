@@ -11,7 +11,7 @@ use github_mirror_sdk::{
     Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
     MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review,
-    ReviewComment, ReviewThread, SyncSummary, Tag, WorkflowJob, WorkflowRun,
+    ReviewComment, ReviewThread, SyncSummary, Tag, Workflow, WorkflowJob, WorkflowRun,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -1578,6 +1578,51 @@ impl Service {
         ))
     }
 
+    /// # Errors
+    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
+    /// as usual.
+    pub async fn list_repo_comments(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        window: PageWindow,
+        filter: ListingFilter,
+    ) -> Result<Page<Comment>, DomainError> {
+        let scope = self
+            .policy_enforcer
+            .access_scope_with(
+                ctx,
+                &COMMENT_RESOURCE,
+                actions::LIST,
+                None,
+                &AccessRequest::new()
+                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
+            )
+            .await?;
+
+        let full_name = repo_full_name(owner, name)?;
+        let repository = self
+            .repo
+            .find_by_full_name(&scope, &full_name)
+            .await?
+            .ok_or(DomainError::NotFound)?;
+
+        let items = self
+            .comments
+            .list_by_repo(&scope, repository.id, window, filter)
+            .await?;
+
+        Ok(Page::new(
+            items,
+            PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit: window.limit(),
+            },
+        ))
+    }
+
     /// Insert or update a mirrored comment row for the caller's tenant.
     ///
     /// # Errors
@@ -2231,6 +2276,61 @@ impl Service {
         name: &str,
         window: PageWindow,
     ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
+        self.workflow_runs_page(ctx, owner, name, None, window).await
+    }
+
+    /// # Errors
+    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
+    /// as usual.
+    pub async fn list_workflow_runs_of_workflow(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        workflow_id: i64,
+        window: PageWindow,
+    ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
+        self.workflow_runs_page(ctx, owner, name, Some(workflow_id), window).await
+    }
+
+    /// # Errors
+    /// `NotFound` when the repository is not mirrored; `Forbidden`/`Database`
+    /// as usual.
+    pub async fn list_workflows(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        window: PageWindow,
+    ) -> Result<(Page<Workflow>, u64), DomainError> {
+        let (scope, repo_id) = self.workflow_runs_repository(ctx, owner, name).await?;
+        let workflows = self.workflow_runs.workflows_by_repo(&scope, repo_id).await?;
+        let total = workflows.len() as u64;
+        let items = workflows
+            .into_iter()
+            .skip(usize::try_from(window.offset()).unwrap_or(usize::MAX))
+            .take(usize::try_from(window.limit()).unwrap_or(usize::MAX))
+            .collect();
+
+        Ok((
+            Page::new(
+                items,
+                PageInfo {
+                    next_cursor: None,
+                    prev_cursor: None,
+                    limit: window.limit(),
+                },
+            ),
+            total,
+        ))
+    }
+
+    async fn workflow_runs_repository(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+    ) -> Result<(AccessScope, i64), DomainError> {
         let scope = self
             .policy_enforcer
             .access_scope_with(
@@ -2250,12 +2350,25 @@ impl Service {
             .await?
             .ok_or(DomainError::NotFound)?;
 
+        Ok((scope, repository.id))
+    }
+
+    async fn workflow_runs_page(
+        &self,
+        ctx: &SecurityContext,
+        owner: &str,
+        name: &str,
+        workflow_id: Option<i64>,
+        window: PageWindow,
+    ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
+        let (scope, repo_id) = self.workflow_runs_repository(ctx, owner, name).await?;
+
         // Both statements run on one transaction, and on the scope and
         // repository already resolved above: the total describes the page it
         // is returned with, and one policy evaluation covers both.
         let (items, total) = self
             .workflow_runs
-            .page_by_repo(&scope, repository.id, window)
+            .page_by_repo(&scope, repo_id, workflow_id, window)
             .await?;
 
         Ok((

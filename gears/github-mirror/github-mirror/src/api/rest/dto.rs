@@ -10,7 +10,7 @@ use github_mirror_sdk::{
     Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef, Milestone,
     PullRequest, PullRequestCommit, PullRequestFile, Release, ReleaseAsset, Repo, Review,
-    ReviewComment, ReviewThread, Tag, WorkflowJob, WorkflowRun, WorkflowStep,
+    ReviewComment, ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun, WorkflowStep,
 };
 use github_mirror_sdk::{CountDrift, MirrorStatus, SyncSummary};
 
@@ -362,11 +362,18 @@ pub struct CommentDto {
     #[schema(format = DateTime)]
     pub updated_at: String,
     pub html_url: Option<String>,
+    pub issue_url: String,
 }
 
-impl From<Comment> for CommentDto {
-    fn from(c: Comment) -> Self {
+fn issue_api_url(owner: &str, name: &str, number: i64) -> String {
+    format!("https://api.github.com/repos/{owner}/{name}/issues/{number}")
+}
+
+impl CommentDto {
+    #[must_use]
+    pub fn new(c: Comment, owner: &str, name: &str) -> Self {
         Self {
+            issue_url: issue_api_url(owner, name, c.issue_number),
             id: c.id,
             user: actor(c.author_login),
             body: c.body,
@@ -868,6 +875,29 @@ impl From<WorkflowRun> for WorkflowRunDto {
 pub struct WorkflowRunsPageDto {
     pub total_count: i64,
     pub workflow_runs: Vec<WorkflowRunDto>,
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct WorkflowDto {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
+impl From<Workflow> for WorkflowDto {
+    fn from(w: Workflow) -> Self {
+        Self {
+            id: w.id,
+            name: w.name,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct WorkflowsPageDto {
+    pub total_count: i64,
+    pub workflows: Vec<WorkflowDto>,
 }
 
 /// GitHub-shaped contributor.

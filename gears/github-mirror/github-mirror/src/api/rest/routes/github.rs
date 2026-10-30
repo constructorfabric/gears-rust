@@ -24,6 +24,7 @@ const USER: &str = "/user";
 const USER_REPOS: &str = "/user/repos";
 const REPO_ISSUES: &str = "/repos/{owner}/{name}/issues";
 const REPO_ISSUES_ITEM_COMMENTS: &str = "/repos/{owner}/{name}/issues/{number}/comments";
+const REPO_ISSUES_COMMENTS: &str = "/repos/{owner}/{name}/issues/comments";
 const REPO_BRANCHES: &str = "/repos/{owner}/{name}/branches";
 const REPO_CONTRIBUTORS: &str = "/repos/{owner}/{name}/contributors";
 const REPO_ISSUES_ITEM_EVENTS: &str = "/repos/{owner}/{name}/issues/{number}/events";
@@ -49,6 +50,9 @@ const REPO_MILESTONES: &str = "/repos/{owner}/{name}/milestones";
 const REPO_LABELS: &str = "/repos/{owner}/{name}/labels";
 const REPO_ACTIONS_RUNS: &str = "/repos/{owner}/{name}/actions/runs";
 const REPO_ACTIONS_RUNS_ITEM_JOBS: &str = "/repos/{owner}/{name}/actions/runs/{run_id}/jobs";
+const REPO_ACTIONS_WORKFLOWS: &str = "/repos/{owner}/{name}/actions/workflows";
+const REPO_ACTIONS_WORKFLOWS_ITEM_RUNS: &str =
+    "/repos/{owner}/{name}/actions/workflows/{workflow_id}/runs";
 
 pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = register_user_routes(router, openapi);
@@ -58,6 +62,7 @@ pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Rou
     router = register_item_routes(router, openapi);
     router = register_pull_routes(router, openapi);
     router = register_metadata_routes(router, openapi);
+    router = register_workflow_routes(router, openapi);
 
     router
 }
@@ -152,6 +157,43 @@ fn register_repo_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Ro
         .query_param("page", false, PAGE_DOC)
         .query_param("per_page", false, PER_PAGE_DOC)
         .handler(handlers::list_comments)
+        .json_array_response_with_schema::<dto::CommentDto>(
+            openapi,
+            StatusCode::OK,
+            "GitHub-shaped list of issue comments",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get(REPO_ISSUES_COMMENTS)
+        .operation_id("github_mirror.compat.list_repo_comments")
+        .summary("List issue comments for a repository (GitHub-compatible)")
+        .description(
+            "List the comments on every issue and pull request of a repository, served entirely from the locally mirrored store in GitHub's JSON shape - the mirror never calls live GitHub to answer. List responses paginate with `page`/`per_page` and a `Link` header, exactly as GitHub's API does. Data is as fresh as the repository's last sync.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repo owner login")
+        .path_param("name", "Repo name")
+        .query_param("page", false, PAGE_DOC)
+        .query_param("per_page", false, PER_PAGE_DOC)
+        .query_param("sort", false, "`created` (default) or `updated`")
+        .query_param(
+            "direction",
+            false,
+            "`asc` or `desc`; ignored without `sort`",
+        )
+        .query_param(
+            "since",
+            false,
+            "Only comments updated at or after this ISO 8601 timestamp",
+        )
+        .handler(handlers::list_repo_comments)
         .json_array_response_with_schema::<dto::CommentDto>(
             openapi,
             StatusCode::OK,
@@ -829,6 +871,63 @@ fn register_metadata_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -
             openapi,
             StatusCode::OK,
             "GitHub-shaped workflow jobs page",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router
+}
+
+fn register_workflow_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    router = OperationBuilder::get(REPO_ACTIONS_WORKFLOWS)
+        .operation_id("github_mirror.compat.list_workflows")
+        .summary("List workflows (GitHub-compatible)")
+        .description(
+            "List the workflows that have mirrored runs, served entirely from the locally mirrored store in GitHub's JSON shape - the mirror never calls live GitHub to answer. List responses paginate with `page`/`per_page` and a `Link` header, exactly as GitHub's API does. Data is as fresh as the repository's last sync.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repo owner login")
+        .path_param("name", "Repo name")
+        .query_param("page", false, PAGE_DOC)
+        .query_param("per_page", false, PER_PAGE_DOC)
+        .handler(handlers::list_workflows)
+        .json_response_with_schema::<dto::WorkflowsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "GitHub-shaped workflows page",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get(REPO_ACTIONS_WORKFLOWS_ITEM_RUNS)
+        .operation_id("github_mirror.compat.list_workflow_runs_of_workflow")
+        .summary("List workflow runs of a workflow (GitHub-compatible)")
+        .description(
+            "List the runs of one workflow, served entirely from the locally mirrored store in GitHub's JSON shape - the mirror never calls live GitHub to answer. List responses paginate with `page`/`per_page` and a `Link` header, exactly as GitHub's API does. Data is as fresh as the repository's last sync.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repo owner login")
+        .path_param("name", "Repo name")
+        .path_param("workflow_id", "Workflow id")
+        .query_param("page", false, PAGE_DOC)
+        .query_param("per_page", false, PER_PAGE_DOC)
+        .handler(handlers::list_workflow_runs_of_workflow)
+        .json_response_with_schema::<dto::WorkflowRunsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "GitHub-shaped workflow runs page",
         )
         .error_400(openapi)
         .error_401(openapi)

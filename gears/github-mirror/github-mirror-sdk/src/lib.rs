@@ -25,6 +25,6 @@ pub use models::{
     Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     CountDrift, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef,
     Milestone, MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release,
-    ReleaseAsset, Repo, Review, ReviewComment, ReviewThread, SyncSummary, Tag, WorkflowJob,
-    WorkflowRun, WorkflowStep,
+    ReleaseAsset, Repo, Review, ReviewComment, ReviewThread, SyncSummary, Tag, Workflow,
+    WorkflowJob, WorkflowRun, WorkflowStep,
 };

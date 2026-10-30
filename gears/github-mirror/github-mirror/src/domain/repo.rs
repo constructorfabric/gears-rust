@@ -6,7 +6,7 @@ use github_mirror_sdk::{
     Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
     Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
     PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, WorkflowJob, WorkflowRun,
+    ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
@@ -626,6 +626,14 @@ pub trait CommentRepository: Send + Sync {
         issue_number: i64,
         window: PageWindow,
     ) -> Result<Vec<Comment>, DomainError>;
+
+    async fn list_by_repo(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        window: PageWindow,
+        filter: ListingFilter,
+    ) -> Result<Vec<Comment>, DomainError>;
     /// Hard-delete this repo's rows whose `extracted_at` predates
     /// `extracted_before` — rows the sync that set the watermark did not
     /// see. Only called for a listing fetched to completion; a truncated or
@@ -1056,6 +1064,7 @@ pub trait WorkflowRunRepository: Send + Sync {
         &self,
         scope: &AccessScope,
         repo_id: i64,
+        workflow_id: Option<i64>,
         window: PageWindow,
     ) -> Result<(Vec<WorkflowRun>, u64), DomainError>;
     async fn upsert(
@@ -1071,6 +1080,12 @@ pub trait WorkflowRunRepository: Send + Sync {
         repo_id: i64,
         window: PageWindow,
     ) -> Result<Vec<WorkflowRun>, DomainError>;
+
+    async fn workflows_by_repo(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+    ) -> Result<Vec<Workflow>, DomainError>;
 }
 
 /// Write-side record for a mirrored pull-request file.

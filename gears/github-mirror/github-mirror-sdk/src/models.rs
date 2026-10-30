@@ -475,6 +475,13 @@ pub struct WorkflowRun {
     pub actor_login: Option<String>,
 }
 
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Workflow {
+    pub id: i64,
+    pub name: Option<String>,
+}
+
 /// A mirrored changed file of one pull request (read-slice shape).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
