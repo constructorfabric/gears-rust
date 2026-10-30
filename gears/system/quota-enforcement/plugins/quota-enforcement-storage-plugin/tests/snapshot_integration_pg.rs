@@ -26,15 +26,14 @@ use std::time::Duration;
 
 use gts::GtsTypeId;
 use quota_enforcement_sdk::engine::{
-    EvaluationContext, EvaluationLimits, EvaluationOutcome, PolicySchemaSnapshot,
-    TransactionEvaluator,
+    EvaluationContext, PolicySchemaSnapshot, TransactionEvaluator,
 };
 use quota_enforcement_sdk::testing::quota_draft;
 use quota_enforcement_sdk::{
-    ApplicableQuotas, AttributionDigest, CapPatch, Decision, EvaluatedMutation, IdempotencyScope,
+    ApplicableQuotas, AttributionDigest, CapPatch, EvaluatedMutation, IdempotencyScope,
     IdempotencySubjectKey, IdempotencyWrite, MetricId, OperationType, PageRequest, PageResult,
-    PayloadHash, PeriodType, PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft, QuotaId,
-    QuotaPatch, QuotaSnapshot, QuotaType, StorageError, SubjectRef, TenantId,
+    PayloadHash, PeriodType, PolicyDraft, PolicyScope, QuotaDraft, QuotaId, QuotaPatch,
+    QuotaSnapshot, QuotaType, StorageError, SubjectRef, TenantId,
 };
 use sea_orm::EntityTrait as _;
 use sea_orm_migration::prelude::*;
@@ -59,6 +58,10 @@ use quota_enforcement_storage_plugin::{
     Actor, ConsumptionStore, NotificationOutbox, QeOutbox, QuotaStore, SqlConsumptionStore,
     SqlPolicyStore, SqlQuotaStore, start_undelivered_outbox,
 };
+
+mod common;
+
+use common::{allow_all, limits};
 
 const USER_PROJECTION: &str = "gts.cf.core.qe.subj.v1~cf.genai.llm_gateway.user.v1~";
 const METRIC_TOKENS: &str = "gts.cf.core.qe.metric_type.v1~cf.genai.llm_gateway.ai_tokens_input.v1";
@@ -117,35 +120,6 @@ fn consumption(tenant: TenantId, holder: &str, cap: u64) -> QuotaDraft {
         period: Some(PeriodType::Day),
         ..allocation(tenant, holder, cap)
     }
-}
-
-fn limits() -> EvaluationLimits {
-    EvaluationLimits {
-        upper_timeout_ms: std::num::NonZeroU64::new(500).expect("nonzero"),
-        cost_limit: std::num::NonZeroU64::new(100_000).expect("nonzero"),
-    }
-}
-
-/// Allow the requested amount against every applicable Quota.
-fn allow_all() -> Arc<TransactionEvaluator> {
-    Arc::new(move |context: &EvaluationContext<'_>| {
-        let plan = context
-            .quotas
-            .iter()
-            .map(|quota| {
-                (
-                    quota.snapshot.quota_id,
-                    QuotaDebitPlan {
-                        amount: context.amount,
-                    },
-                )
-            })
-            .collect();
-        Ok(EvaluationOutcome::validate(
-            Decision::allowed_with_plan(plan),
-            context,
-        )?)
-    })
 }
 
 async fn wait_for_tcp(port: u16) {
