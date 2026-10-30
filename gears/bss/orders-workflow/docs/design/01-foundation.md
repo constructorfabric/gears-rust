@@ -1039,6 +1039,8 @@ this table is the index the validation hook of `10 §2.2` and the envelope's cou
 | `rebuild-wave1` (05) | `rebuildRound` → `nextRebuildRound` | `…:rebuild-wave1:{planRef}:{rebuildRound}` |
 | `reconcile-intent` (05) | `sweepRound` → `nextSweepRound` | `…:reconcile-intent:{sweepRound}` |
 | `report-spawn-signal` (05) | `round` → `nextRound` | `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, step and Lifecycle alike |
+| `replace-fulfillment-grant` (05) | `round` → `nextRound`, the definition's `grantRound` | step `…:replace-fulfillment-grant:{planRef}:{round}`; Lifecycle `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}`, one per predecessor generation (D-243) |
+| `settle-receiver-pause` (08), per control | `round` → `nextRound`, the definition's `pauseRound`, 0 for each new `controlRef` | step `…:settle-receiver-pause:{controlRef}:{round}`; Lifecycle report `{tenant}:{orderId}:{orderVersion}:control:{controlId}` (D-243) |
 | `compensate-order` (06) | `pass` → `nextPass` | `…:compensate-order:{pass}` |
 | `report-outcome` (06) | `round` → `nextRound` | step `…:report-outcome:{round}`; Lifecycle `…:{trigger}:{round}` |
 | `resolve-manual-task` `sla-check` (07) | `slaRound` → `slaRound` | `…:resolve-manual-task:sla:{slaRound}` |
@@ -2986,6 +2988,8 @@ example — and they are stated once so no slice chooses them again.
 | `financial-readiness-withdrawn` | `04-fulfillment-plan` (D-226) | `FINANCIAL_READINESS_WITHDRAWN` | FailedPrecondition | 400 |
 | `payment-wait-expired` | `04-fulfillment-plan` (D-228) | `PAYMENT_WAIT_EXPIRED` | FailedPrecondition | 400 |
 | `draft-activated-externally` | `05-provisioning-intents` (D-233) | `DRAFT_ACTIVATED_EXTERNALLY` | FailedPrecondition | 400 |
+| `grant-replacement-refused` | `05-provisioning-intents` (D-243) | `GRANT_REPLACEMENT_REFUSED` | FailedPrecondition | 400 |
+| `receiver-control-abandoned` | `08-hold-and-cancel` (D-243) | `RECEIVER_CONTROL_ABANDONED` | FailedPrecondition | 400 |
 | `assignee-unresolved` | `03-approval-execution` (D-229) | `ASSIGNEE_UNRESOLVED` | FailedPrecondition | 400 |
 | `not-assignee` | `03-approval-execution` (D-229) | `NOT_ASSIGNEE` | PermissionDenied | 403 |
 | `stale-generation` | `03-approval-execution` (D-229) | `STALE_GENERATION` | Aborted | 409 |

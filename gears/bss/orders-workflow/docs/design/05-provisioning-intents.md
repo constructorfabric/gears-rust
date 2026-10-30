@@ -318,6 +318,7 @@ and in `owf_fulfillment_task`.
 | `ActivationBarrierTimer` | **Retired by ADR-0011.** Responsibility now: the time half is the definition's `waitExpected` over the instant `construct-and-freeze-plan` returns (`10 §3.6` (b)); the conjunction is `evaluate-activation-eligibility` (04) re-evaluated on every contributing signal; the run-time re-assertion is inside `dispatch-wave2-activate` (§3.3). No `owf_durable_timer` row is written. | none |
 | `ReconciliationSweepEntry` | The sweep's per-intent tracking state: ladder, rung, read count, next re-read, key expiry. | [`3.7`](#37-database-schemas--tables) `owf_provisioning_intent` (embedded sweep columns) |
 | `DispatchAllowance` | The admission state one seller's dispatches and the gear's aggregate dispatches serialize on: a row lock plus a token bucket; in-flight counts are computed, not stored. | [`3.7`](#37-database-schemas--tables) `owf_dispatch_admission` |
+| `FulfillmentGrant` | This gear's copy of a Lifecycle dispatch grant (Lifecycle D-198): the grant identifier and generation Lifecycle committed for the order version's fulfillment attempt, its predecessor, how it was issued (`spawn`, `resume`, `replace`) and when this gear saw its generation closed. Activation is sent only under the current grant (decision D-243). | [`3.7`](#37-database-schemas--tables) `owf_fulfillment_grant` |
 
 **Relationships**:
 - `FulfillmentTask` (slice 04) → `ProvisioningIntent`: one task drives at most one non-terminal
@@ -329,6 +330,9 @@ and in `owf_fulfillment_task`.
   reads (on-demand reads continue, §4.2).
 - `ProvisioningIntent` → `DispatchAllowance`: every non-terminal intent counts against its
   seller's allowance and the aggregate cap until it is terminal.
+- `FulfillmentGrant` → `ProvisioningIntent`: every activation intent records the grant generation
+  it was sent under; a grant's roster names every line's create and activation key, and a
+  post-spawn draft-create is sent only for a key the current grant's roster carries (D-243).
 
 ### 3.2 Component Model
 
@@ -351,7 +355,8 @@ graph LR
     DLR -->|status read| SUB
     RS -->|status read| SUB
     RS -->|stuck step key| SFL[settle-from-lookup — 01]
-    SSR -->|spawn-signal| OL[Orders Lifecycle]
+    SSR -->|spawn-signal / replace-fulfillment-grant| OL[Orders Lifecycle]
+    SSR -->|close attempt generation| SUB
     CO[compensate-order — 06] -->|draft-void / activated-cancel| ID
     ID -.->|NEVER direct call| OSS[OSS Provisioning]
 ```
@@ -547,10 +552,42 @@ instant on the step record. A replay under the same key returns Lifecycle's stor
 Lifecycle's 24-hour window it answers `spawn-signal-already-recorded`, which this operation
 settles `already-recorded` (§3.3, decision D-188).
 
+**It also keeps the dispatch grant** (Lifecycle D-198, D-201; decision D-243). The spawn request
+carries the typed contribution Lifecycle verifies against its committed line and receipt roster:
+the plan's `fulfillment_attempt_id` and, per line, the order line, the receiver Subscriptions named
+on the draft-create acceptance (`receiver_ref`, §3.7), the draft's `subscription_id`, the current
+`draft_create` intent key and the activation intent key wave 2 will send. Lifecycle commits a
+dispatch grant with the signal and returns its `grant_id` and `generation`, which this component
+records in `owf_fulfillment_grant` (`source = spawn`). The `fulfillment_attempt_id` is derived,
+not minted: a name-based UUID over `(tenant, orderId, orderVersion, planRef)`, so a replay, a
+worker restart or a platform re-drive presents the same attempt and never a new one (Lifecycle
+D-198: "a worker restart does not invent a new fulfillment attempt"). A later grant of the same
+attempt is recorded by two other writers only: `apply-resume` (slice 08) records the successor
+grant Lifecycle's resume transaction committed (`source = resume`), and `replace-fulfillment-grant`
+below records a rebuild's replacement (`source = replace`).
+
+Owns `replace-fulfillment-grant` (§3.3), the post-spawn half of the wave-1 rebuild. Once the spawn
+signal is recorded, the receivers hold the grant's frozen roster and refuse a create key outside
+it (Lifecycle D-198), so a successor draft needs a new grant before `dispatch-wave1-create` may send
+it. The operation (i) refuses while any activation intent of the current generation is
+`submitted` or `unresolved`, because Lifecycle requires authoritative settlement of every old key
+and uncertain external effects block a replacement; (ii) closes the current generation at every
+receiver of its roster and collects each receiver's attestation of its closed inventory (the
+receiver ask `…-upreq-receiver-attempt-ledger`, `UPSTREAM_REQS.md` §2.1); and (iii) calls
+Lifecycle's internal `replace_fulfillment_grant` with the expected committed version, the
+predecessor `grant_id`, that closure and settlement proof and the proposed roster — active members
+unchanged, rebuilt lines under their new create keys — and records the new grant
+(`source = replace`). Lifecycle checks the same closure itself and refuses a mismatch; this
+operation never infers closure from absence, an expired lease or a larger generation of its own.
+A rebuild before the spawn signal has no grant to replace and never calls it: the first spawn
+binds the current roster (Lifecycle D-201).
+
 ##### Responsibility boundaries
 
 Reports once per order version; a draft-create acceptance is never reported. Does not dispatch
-activation; `dispatch-wave2-activate` refuses until this operation's settlement is recorded.
+activation; `dispatch-wave2-activate` refuses until this operation's settlement is recorded and a
+current grant is held. Never writes a grant Lifecycle did not commit, never reopens a closed
+generation, and never calls Lifecycle's `resume` to obtain one.
 
 ##### Related components (by ID)
 
@@ -630,7 +667,7 @@ in `unresolved` and a manual task created by the definition's failure arm.
 
 - **Contracts**: `cpt-cf-bss-orders-workflow-contract-owf-provisioning-intent`,
   `cpt-cf-bss-orders-workflow-contract-step-invocation`
-- **Technology**: six step operations on the internal surface
+- **Technology**: seven step operations on the internal surface
   `POST /bss-orders-workflow/v1/steps/{operation}` of [`01 §3.3`](./01-foundation.md#33-api-contracts),
   callable only by the `serverless-runtime` service principal and authorized as
   `gts.cf.bss.orders_workflow.process_step.v1~` × `execute` with `operation = {name}`; outbound
@@ -648,6 +685,7 @@ in `unresolved` and a manual task created by the definition's failure arm.
 | `dispatch-wave1-create` | `protected` | Intent Dispatcher | `wave1` |
 | `dispatch-wave2-activate` | `protected` | Intent Dispatcher | `wave2` |
 | `report-spawn-signal` | `protected` | Spawn Signal Reporter | `spawnSignal` |
+| `replace-fulfillment-grant` | `protected` | Spawn Signal Reporter | `replaceGrant` — after `rebuild-wave1` on a walk where the pinned `spawned` is true, before `dispatch-wave1-create` (§4.5 item 5, D-243) |
 | `reread-draft-liveness` | `composable` | Draft-Liveness Re-reader | none — the canonical version does not call it, because the gate is inside `wave2`; a version **MAY** place it after `waitExpected` as an early read (§4.5) |
 | `rebuild-wave1` | `composable` | Wave-1 Rebuilder | the lapsed-line arm (§4.5) |
 | `reconcile-intent` | `composable` | Reconciliation Sweep | `reconcilePoll` (poll arm), `reconcileHint` (confirmation arm), `wave1Reread` and `wave2Reread` (after a dispatch 409) (§4.5); in-process from the `reconciliation-sweep` worker |
@@ -688,7 +726,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `report-spawn-signal` (`10 §4.1`); the only route to `report-outcome` with `outcome: completed` |
 | `input` | `ref`, `planRef`, `lineRefs[]` (the eligible set `evaluate-activation-eligibility` returned; empty is permitted and is the completion check), `dispatchRound`, `attemptKey` (nullable; as for wave 1, this operation's own family, `wave2AttemptKey`) |
-| `intent payload` (per line, resolved inside; decision D-195) | the draft's `subscription_id` and expected draft version from the intent record; the same source tuple `(orderId, orderVersion, orderLineId)` as the initial-binding reference Subscriptions compares against the accepted `chains[]` it reads through `get_version` (Lifecycle D-162); no start instant — Subscriptions stamps it at the `activate` commit (`SUB-O10` as reshaped, D-209); `correlationId`; the intent key below |
+| `intent payload` (per line, resolved inside; decision D-195) | the draft's `subscription_id` and expected draft version from the intent record; the same source tuple `(orderId, orderVersion, orderLineId)` as the initial-binding reference Subscriptions compares against the accepted `chains[]` it reads through `get_version` (Lifecycle D-162); no start instant — Subscriptions stamps it at the `activate` commit (`SUB-O10` as reshaped, D-209); `correlationId`; the intent key below; the current grant's `grant_id` and `generation` (`owf_fulfillment_grant`, D-243), which the receiver checks against its attempt fence at admission and again at confirmation (Lifecycle D-198) |
 | `output` | `accepted[]`, `activated[]`, `failed[]` (lineRef + reason code), `pending[]`, `lapsed[]`, `externallyActivated[]` (lines whose draft the re-read found active without an activation of this gear, D-233; routed to the unwind, never a retry or a rebuild), `deferred[]` (all lineRef; `activated[]` names the lines the record already shows `activated`, reported by recorded state, §3.6 `inst-pi-skip-existing` — this operation never moves a task to `activated`, because an activation submit settles only as an acceptance or a synchronous refusal, `inst-pi-settle`), `deferReason`, `retryAfterMs` (advisory, as for wave 1; never a `wait` value), `due: true\|false` on a non-empty `deferred[]` — database time against the deferral instant this operation records with the round (`now + retryAfterMs`), the answer the definition's `PT1M` deferral re-check loop switches on (`10 §3.6` (b)); a call before that instant re-defers with `due: false`, `nextDispatchRound`. `pending[]` names **every** plan line not yet recorded `activated` or `failed` — in flight, not yet eligible, lapsed or deferred — so an empty `pending[]` and an empty `failed[]` together mean the order is complete; `lapsed[]` and `deferred[]` are subsets of `pending[]` that name why; `bindingExpired: true\|false` — `true` when the guard found the plan's `activation_deadline_at` elapsed (§3.6 `inst-pi-wave2-guard`, decision D-194): nothing was submitted, every list is empty, and the definition routes the answer to the unwind under either policy (`10 §3.6` (b)) |
 | `idempotency_key` | step key, instance-scoped: `{tenant}:{correlationId}:dispatch-wave2-activate:{planRef}:{dispatchRound}[:{attempt}]`; per line, the intent key `{tenant}:{orderId}:{orderVersion}:{orderLineId}:wave2_activate:activation[:{wave_attempt}]`, the line's `owf_fulfillment_task.wave2_attempt` appended when above 1 |
 | `declared_event` | `OrderFulfillmentStepCompleted`, one per line a synchronous refusal moves `draft_created → failed`; none for an accepted line or a line in `activated[]`, whose event was enqueued in the unit of work that recorded its activation (`reconcile-intent`, §3.6 `inst-ri-terminal`, 04's terminal-state rule) |
@@ -703,8 +741,8 @@ operation's round. Every step key is recomposed server-side from the body
 | Field | Value |
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
-| `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders/docs/features/06-workflow-seam.md#contract-06-4-3)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
+| `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`); the contribution (attempt, roster) is resolved inside from the record, never passed |
+| `output` | `grantRef` (the recorded `owf_fulfillment_grant` row; on `already-recorded` the grant the Lifecycle read returns, `…-upreq-lifecycle-current-grant-read`, D-243), `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders/docs/features/06-workflow-seam.md#contract-06-4-3)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
@@ -712,6 +750,21 @@ operation's round. Every step key is recomposed server-side from the body
 | `audit_kind` | `step-completion` |
 | `retry_class` | `retryable-on: transient` |
 | `deadline` | 10 s |
+
+##### `replace-fulfillment-grant`
+
+| Field | Value |
+|-------|-------|
+| `protection` | `protected` — Waves stage: after `rebuild-wave1`, before `dispatch-wave1-create`, on every walk where the pinned `spawned` is true (`10 §4.1`, D-243) |
+| `input` | `ref`, `planRef`, `round` (0 on first entry, else the previous answer's `nextRound`) |
+| `output` | `grantOutcome` ∈ `granted` (Lifecycle committed the replacement; `grantRef` names it) · `not-needed` (no spawn signal is recorded, or every rebuilt line's create key is already on the current grant — a replay, or a pre-spawn rebuild) · `predecessor-unsettled` (an activation intent of the current generation is `submitted` or `unresolved`, a receiver has not attested its closed inventory, or Lifecycle refused `grant-predecessor-unsettled`: a settled success; the definition re-calls after the barrier loop's next reconciliation under `nextRound`) · `held` (Lifecycle refused `not-admissible` and the order read shows `on_hold`, or answered `still-processing` while a staged control of this order is open, slice 08) · `not-dispatchable` (the order read shows a terminal state) · `refused` (Lifecycle refused `grant-source-mismatch` or `grant-generation-exhausted`; `reason` = `grant-replacement-refused`, routed to the unwind under either policy, never to a retry); `grantRef`, `nextRound` |
+| `idempotency_key` | step key instance-scoped `{tenant}:{correlationId}:replace-fulfillment-grant:{planRef}:{round}`; the Lifecycle key `{tenant}:{orderId}:{orderVersion}:replace-fulfillment-grant:{predecessorGeneration}`, one replacement per predecessor generation, in Lifecycle's workflow retention class (at least 30 days, Lifecycle D-203); each receiver close `{tenant}:{orderId}:{orderVersion}:receiver-close:{predecessorGeneration}:{receiverRef}` |
+| `declared_event` | none — Lifecycle emits no public event for the continuation (Lifecycle D-201) |
+| `compensation` | none — a closed generation is never reopened; the new grant authorizes only the dispatch that follows |
+| `reasons` | `grant-replacement-refused` (registered in `01 §4.9`), `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict`, `not-found` |
+| `audit_kind` | `step-completion` |
+| `retry_class` | `retryable-on: transient` |
+| `deadline` | 10 s per outbound call; one call per receiver, then one Lifecycle call |
 
 ##### `reread-draft-liveness`
 
@@ -887,14 +940,14 @@ draft-create acceptance.
 **Algorithm: dispatch-wave1-create and dispatch-wave2-activate (inside the envelope)**
 
 1. [ ] - `p1` - Resolve `planRef` and each `lineRef` to the frozen plan and its `FulfillmentTask` rows under the instance's `resource_tenant_id`; a line not on the plan is refused `not-found`; a terminal instance is `version-mismatch` - `inst-pi-resolve`
-2. [ ] - `p1` - **IF** `dispatch-wave2-activate`: **IF** the record does not show every plan task at `draft_created` or beyond, **OR** `expectedFulfillmentAt` is after database time, **OR** no `report-spawn-signal` settlement exists for this order version, refuse the whole call `activation-precondition-unmet` (409, retryable); **THEN IF** at least one line of `lineRefs` would be submitted by this call — not skipped by step 3 as already carrying an intent row under its current attempt — **AND** the plan's `activation_deadline_at` (`04 §3.7`, the earliest accepted-binding deadline across the version's lines, an exclusive instant) is at or before database time: submit nothing, settle the call with `bindingExpired: true` and empty lists, and leave the fence to find the cause in the record — the definition routes it to the unwind under either policy (`10 §3.6` (b)), which voids the drafts, cancels any line already activated and reports `fulfillment_failed` with `order-binding-expired` (`06 §4.8`); the deadline is an early check only, and Subscriptions enforces it again at each activation (Lifecycle D-162; decision D-194). A call that would submit nothing — every named line already carried by the record, or the empty `lineRefs[]` the definition sends for the completion answer once every line is activated — is answered by recorded state alone, whatever the deadline: an activation accepted before the deadline and confirmed after it is an applied outcome, not an expired binding, and refusing it `bindingExpired` would compensate a successfully activated order (decision D-213) - `inst-pi-wave2-guard`
-3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt` (the task row's `wave1_attempt` or `wave2_attempt`), unless that row carries `not_found_at`; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe). A line an operator retried after its intent was recorded `failed` has a new attempt and no row under it, so it is sent; a line whose row is `submitted` or `unresolved` keeps its attempt and is skipped, because that intent may be live downstream (§4.4) - `inst-pi-skip-existing`
-4. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true for the instance (read under the instance row lock; not `owf_process_suspension`, whose rows are slice 08's record), defer every remaining line with `deferReason = held`; a same-key re-issue of a call already settled is absorbed as usual while suspended - `inst-pi-held`
+2. [ ] - `p1` - **IF** `dispatch-wave2-activate`: **IF** the record does not show every plan task at `draft_created` or beyond, **OR** `expectedFulfillmentAt` is after database time, **OR** no `report-spawn-signal` settlement exists for this order version, **OR** no open grant (`owf_fulfillment_grant` row with `closed_at` null) is recorded for it, refuse the whole call `activation-precondition-unmet` (409, retryable); **THEN IF** at least one line of `lineRefs` would be submitted by this call — not skipped by step 3 as already carrying an intent row under its current attempt — **AND** the plan's `activation_deadline_at` (`04 §3.7`, the earliest accepted-binding deadline across the version's lines, an exclusive instant) is at or before database time: submit nothing, settle the call with `bindingExpired: true` and empty lists, and leave the fence to find the cause in the record — the definition routes it to the unwind under either policy (`10 §3.6` (b)), which voids the drafts, cancels any line already activated and reports `fulfillment_failed` with `order-binding-expired` (`06 §4.8`); the deadline is an early check only, and Subscriptions enforces it again at each activation (Lifecycle D-162; decision D-194). A call that would submit nothing — every named line already carried by the record, or the empty `lineRefs[]` the definition sends for the completion answer once every line is activated — is answered by recorded state alone, whatever the deadline: an activation accepted before the deadline and confirmed after it is an applied outcome, not an expired binding, and refusing it `bindingExpired` would compensate a successfully activated order (decision D-213). **IF** `dispatch-wave1-create` **AND** a spawn signal is recorded for this order version: refuse the whole call `activation-precondition-unmet` (409, retryable) unless the open grant's roster carries the create key of every line the call would send — a post-spawn successor draft is sent only under the replacement grant `replace-fulfillment-grant` committed, because a receiver refuses a create key outside its frozen roster (Lifecycle D-198, D-201; decision D-243) - `inst-pi-wave2-guard`
+3. [ ] - `p1` - Skip every line that already has an intent row of this wave and kind under its current `wave_attempt` (the task row's `wave1_attempt` or `wave2_attempt`), unless that row carries `not_found_at`; a `wave2_activate` row recorded `fenced` under a generation older than the open grant's is not skipped: the line is sent under its next `wave2_attempt`, minted in this call's pre-dispatch unit of work (the third minting site beside `rebuild-wave1` and an operator's retry, D-119 as amended by D-243), because the receiver attested that the fenced admission can no longer commit; report a skipped line by its recorded state (this is what makes the platform's same-key re-run of an `open` key safe). A line an operator retried after its intent was recorded `failed` has a new attempt and no row under it, so it is sent; a line whose row is `submitted` or `unresolved` keeps its attempt and is skipped, because that intent may be live downstream (§4.4) - `inst-pi-skip-existing`
+4. [ ] - `p1` - **IF** `owf_process_instance.suspended` is true for the instance (read under the instance row lock; not `owf_process_suspension`, whose rows are slice 08's record), **OR** a pause control of slice 08 is open for the order version (`owf_fulfillment_control.state` not terminal, D-243), defer every remaining line with `deferReason = held`; a same-key re-issue of a call already settled is absorbed as usual while suspended - `inst-pi-held`
 5. [ ] - `p1` - For each remaining line, ask Dispatch Admission Control (§4.3); a line not admitted joins `deferred[]` with the hint - `inst-pi-admit`
 6. [ ] - `p1` - **IF** `dispatch-wave2-activate`: for each admitted line, immediately before its row is written and its activation submitted, run the Draft-Liveness Re-reader; `lapsed` → record the line's draft row `lapsed` with the observed void, send nothing for the line and add it to `lapsed[]`; active with no activation intent of this gear → stamp `external_activation_observed_at`, send nothing for the line and add it to `externallyActivated[]` (D-233) — a line that carries this gear's activation intent never reaches this step, because step 3 skips it; unevaluable → send nothing further and answer the canonical 503 for the call after settling what was already submitted (fail-closed) - `inst-pi-reread-gate`
 7. [ ] - `p1` - Per admitted line, commit the pre-dispatch unit of work: one `owf_provisioning_intent` row at `status = submitted`, `transition_request_id` null, with intent key, envelope, `attempt_id`, `step_idempotency_key` and the ladder of §4.2 initialised — for a `draft_create` whose line has a `lapsed` predecessor under the previous `wave1_attempt`, with `predecessor_intent_id` set to that row and the create naming the predecessor's `transition_request_id` and `subscription_id` (`SUB-O18`, D-232); a line whose existing row carries `not_found_at` (§4.4) reuses that row and clears the marker - `inst-pi-pre-dispatch`
 8. [ ] - `p1` - Submit to Subscriptions with the effective deadline propagated; at most 8 of the order's intents in flight at once; on a throttle signal stop submitting, defer the rest with `deferReason = throttle` and `retryAfterMs = min(hint, 60 s)` - `inst-pi-submit`
-9. [ ] - `p1` - In the settlement unit of work: record acceptance (`transition_request_id`, `accepted_at`, `execution_seq` from the per-order sequence); apply a synchronous refusal to the intent (`failed`, with `handed_off_at` stamped, because this call's `failed[]` lists it, D-125) and, through 04's rule, to the task, enqueuing `OrderFulfillmentStepCompleted` — a refusal of an activation because the signup resolve on the activation date no longer matches the accepted `chains[]` of the version, or because the accepted SKU roster is no longer protected (Lifecycle D-162, D-164), is such a refusal, recorded `wave2-activation-failed` with Subscriptions' closed refusal kind kept on the row as its cause (`06 §4.8` maps it); on a client-side timeout leave the row `submitted` for the sweep — never infer success - `inst-pi-settle`
+9. [ ] - `p1` - In the settlement unit of work: record acceptance (`transition_request_id`, `accepted_at`, `execution_seq` from the per-order sequence); apply a synchronous refusal to the intent (`failed`, with `handed_off_at` stamped, because this call's `failed[]` lists it, D-125) and, through 04's rule, to the task, enqueuing `OrderFulfillmentStepCompleted` — a refusal of an activation because the signup resolve on the activation date no longer matches the accepted `chains[]` of the version, or because the accepted SKU roster is no longer protected (Lifecycle D-162, D-164), is such a refusal, recorded `wave2-activation-failed` with Subscriptions' closed refusal kind kept on the row as its cause (`06 §4.8` maps it); a receiver refusal that names a paused, revoked or superseded generation is **not** a line failure: the line is deferred `held` and its row removed as never accepted, and the next call runs under whatever grant is then open (D-243); on a client-side timeout leave the row `submitted` for the sweep — never infer success - `inst-pi-settle`
 10. [ ] - `p1` - **RETURN** the lists of §3.3 and `nextDispatchRound` - `inst-pi-return`
 
 #### Wave-1 Rebuild on Auto-Voided Draft
@@ -911,6 +964,7 @@ sequenceDiagram
     participant OP as Operations of slice 05
     participant DB as owf_provisioning_intent / owf_fulfillment_task
     participant SUB as Subscriptions
+    participant OL as Orders Lifecycle
     PL ->> OP: dispatch-wave2-activate (or reread-draft-liveness)
     OP ->> SUB: draft status read
     SUB -->> OP: voided (hold | platform TTL | other)
@@ -919,6 +973,12 @@ sequenceDiagram
     PL ->> OP: rebuild-wave1 (lapsed lineRefs)
     OP ->> DB: wave_attempt + 1; task draft_created → pending (reason draft-voided)
     OP -->> PL: rebuilt[], nextRebuildRound
+    opt spawn signal already recorded (pinned spawned = true)
+        PL ->> OP: replace-fulfillment-grant (round n)
+        OP ->> SUB: close the current generation at every roster receiver; read attestations
+        OP ->> OL: replace_fulfillment_grant (predecessor grant, closure proof, proposed roster)
+        OL -->> OP: grant_id, generation + 1
+    end
     PL ->> OP: dispatch-wave1-create (rebuilt lineRefs, wave 1's own next round)
     OP ->> SUB: draft-create under the new intent key (attempt 2)
     Note over PL: back through the barrier; the join must complete again before wave 2
@@ -930,7 +990,11 @@ goes through the one dispatcher that stamps envelope, key and admission. A `laps
 terminal and distinct from `voided`: compensation (06) has nothing to void for it. The
 `draft_created → pending` transition with reason `draft-voided` is a machine transition slice
 04's table must carry (decision D-95: 04 §3.7 gains `draft_created →
-pending`, reason `draft-voided`, driven only by `rebuild-wave1`).
+pending`, reason `draft-voided`, driven only by `rebuild-wave1`). A rebuild found inside wave 2
+runs after the spawn signal, so the receivers already hold the grant's roster: the replacement
+grant comes before the successor's create, and the old generation is closed first, with every
+activation already accepted under it settled. Lines already activated keep their subscription,
+receiver and keys on the new grant and are never dispatched again (Lifecycle D-201; D-243).
 
 **Algorithm: rebuild-wave1**
 
@@ -1044,7 +1108,7 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `accepted_at` | timestamptz nullable | Database time of acceptance. |
 | `execution_seq` | bigint nullable | Monotonic per-order ordinal assigned at **acceptance**; 06's `compensation_sequence` is fed from it. ADR-0005 says "assigned … when the intent is dispatched"; acceptance is the refinement, because an intent never accepted created nothing to compensate. Where the dispatcher's settlement was lost, `reconcile-intent` assigns it at the read that recovers the acceptance (`inst-ri-read`, D-214); that one row's ordinal then reflects discovery order, which the walk tolerates because acquisition lines are independent (`06`, D-196). |
 | `subscription_id` | text nullable | The subscription created or acted on, from the status read; mirrored onto `owf_fulfillment_task.subscription_id`. |
-| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read **observed** voided by a cause not this gear's: a historical success, created and later voided, never `failed` (D-232); `unresolved` — the sweep floor reached with no known outcome, or a not-found answer past the key lifetime (§4.4, D-220); replaces `dead_lettered`. |
+| `status` | enum(`submitted`, `draft_created`, `activated`, `voided`, `cancelled`, `lapsed`, `fenced`, `failed`, `unresolved`) | `lapsed` — a `draft_create` whose draft the re-read **observed** voided by a cause not this gear's: a historical success, created and later voided, never `failed` (D-232); `fenced` — an `activation` the receiver admitted under a generation it has since paused, and attested can no longer commit active (slice 08's pause barrier, D-243): not a failure, no event, nothing to compensate for the activation itself, and the line is sent again under its next attempt once a later grant is open; `unresolved` — the sweep floor reached with no known outcome, or a not-found answer past the key lifetime (§4.4, D-220); replaces `dead_lettered`. |
 | `sweep_ladder` | enum(`in_sla`, `general`) | Selected by `(wave, intent_kind)`: `in_sla` only for `intent_kind = activation` (§4.2). |
 | `sweep_tier` | integer | Current rung. |
 | `sweep_reads` | integer | Status reads performed; the floor trips on it. |
@@ -1054,6 +1118,8 @@ by row locks, not an in-memory controller). It writes no `owf_durable_timer` row
 | `void_observed_at` | timestamptz nullable | Database time the Draft-Liveness Re-reader **observed** the draft `voided` and recorded the row `lapsed`; the authorization `rebuild-wave1` requires (D-232). NOT NULL exactly when `status = lapsed`. |
 | `void_cause` | text nullable | The observed void's cause from the read: `hold`, `platform-ttl` or `other`; carried to the rebuild's audit entry. |
 | `external_activation_observed_at` | timestamptz nullable | Database time the re-read found this `draft_create`'s subscription active with no activation intent of this gear; the cause the cancellation fence finds for `draft-activated-externally` (`06 §3.6`, D-233). The row's `subscription_id` makes it a subject of the freeze, so the walk cancels it. |
+| `grant_generation` | integer nullable | On an `activation` row: the generation of the grant it was sent under (D-243); what a receiver's pause or revoke attestation is matched against. Null on every other kind. |
+| `receiver_ref` | text nullable | On a `draft_create` row: the receiver Subscriptions named on acceptance (`…-upreq-receiver-attempt-ledger`); carried into the grant roster and addressed by the pause, revoke and close commands. Null until acceptance. |
 | `predecessor_intent_id` | uuid nullable | On a `draft_create` row after a rebuild: the `lapsed` row of the previous `wave1_attempt` for the same line, which this row succeeds; the create names that predecessor to Subscriptions (`SUB-O18`, D-232). Null on a first attempt and on every other kind. |
 | `deferred_failure_reason` | text nullable | A catalogue reason (`wave1-create-failed` or `wave2-activation-failed`) for a terminal failure `reconcile-intent` read while the instance was suspended; the task is not advanced. Taken and cleared through this slice's deferral port by `apply-resume` (slice 08), in its settlement transaction. |
 | `handed_off_at` | timestamptz nullable | Database time a definition-called `reconcile-intent` round, a dispatch operation listing its synchronous refusal in its own `failed[]`, or `apply-resume` through the deferral port first listed this forward intent's failure or floor trip to the definition; null while a `failed` or `unresolved` status has not reached it — the worker's in-process run never sets it (`inst-ri-handoff`, D-125). Cleared by the re-arm port (§3.2) when an operator's retry re-arms an `unresolved` row. |
@@ -1109,6 +1175,40 @@ D-104).
 | `ord-123` | `3` | `wave1_create` | `draft_create` | `1` | `lapsed` | `general` |
 | `ord-123` | `3` | `wave1_create` | `draft_create` | `2` | `draft_created` | `general` |
 | `ord-123` | `3` | `wave2_activate` | `activation` | `1` | `submitted` | `in_sla` |
+
+#### Table: owf_fulfillment_grant
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-fulfillment-grant`
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `grant_id` | uuid | Lifecycle's `orders_fulfillment_grant.grant_id`, as its committed response returned it; never minted here. |
+| `order_id` | text | Frozen order identity. |
+| `order_version` | integer | The committed order version the grant belongs to. |
+| `correlation_id` | uuid | The instance. |
+| `resource_tenant_id` | uuid | Isolation column. |
+| `fulfillment_attempt_id` | uuid | The plan's attempt, derived as §3.2 states; equal on every grant of the version. |
+| `generation` | integer | Lifecycle's dispatch generation. |
+| `predecessor_grant_id` | uuid nullable | The grant this one succeeds; null for the spawn grant. |
+| `source` | enum(`spawn`, `resume`, `replace`) | The Lifecycle transaction that committed it: the spawn signal, a post-spawn resume, or the D-201 replacement. |
+| `roster_digest` | text | Lifecycle's roster digest, carried verbatim so a receiver attestation can be matched to it. |
+| `recorded_at` | timestamptz | Database time this gear recorded the grant. |
+| `closed_at` | timestamptz nullable | Database time this gear recorded the generation closed — paused (slice 08), revoked (slice 06) or closed for a replacement (§3.3) — from receiver attestations; never from absence. |
+| `close_kind` | enum(`paused`, `revoked`, `closed`) nullable | Which. NOT NULL exactly when `closed_at` is. |
+
+**PK**: `grant_id`
+
+**Constraints**: `UNIQUE(order_id, order_version, generation)`; at most one row per order version
+with `closed_at` null (partial unique index), the **open grant** every dispatch reads.
+
+**Additional info**: **Ownership**: inserted by `report-spawn-signal`, `replace-fulfillment-grant`
+and, through this slice's grant port `record_grant`, by `apply-resume` (slice 08); `closed_at`
+written by `replace-fulfillment-grant`, by slice 08's `settle-receiver-pause` and by slice 06's
+`compensate-order` through the same port. No other component writes it (decision D-243).
+**Mutability**: append-only except `closed_at` / `close_kind`, written once. **Tenant axis**:
+`resource_tenant_id`. **Retention**: as `owf_provisioning_intent`.
 
 #### Table: owf_dispatch_admission
 
@@ -1382,6 +1482,14 @@ throttle-induced delay never extends the per-operation deadline (`01 §4.12`).
   `externallyActivated[]`, and the definition **MUST** route it to the unwind under either policy
   with reason `draft-activated-externally`; the walk cancels that subscription with the other
   subjects, because a subscription this gear did not activate is not adopted.
+- **Dispatch authority is the open grant** (decision D-243; Lifecycle D-198, D-201). After the
+  spawn signal, an activation **MUST** carry the open grant's `grant_id` and `generation`, and a
+  draft-create **MUST** be sent only for a create key on that grant's roster. A larger generation of
+  this gear's own, a lease or a checkpoint is never authority: only a grant Lifecycle committed and
+  this gear recorded. A generation closed by a pause, a revoke or a replacement **MUST NOT** be used
+  again, and a closure **MUST** be recorded only from the receivers' attestations. A rebuild after
+  the spawn signal **MUST** obtain the replacement grant before the successor's create, and **MUST
+  NOT** request it while an activation of the current generation is `submitted` or `unresolved`.
 - **Refusal codes.** Only the reasons listed per operation in §3.3 may be raised; the per-line wave
   discriminators ride `failed[]` and the manual task, never free text.
 
@@ -1399,8 +1507,8 @@ slice operations (D-80, D-81).
    **<** `report-spawn-signal` **<** `dispatch-wave2-activate` (the Waves row of `10 §4.1`), and
    every `dispatch-wave2-activate` **MUST** follow both the expected-fulfillment `wait` and an
    `evaluate-activation-eligibility` that returned `released` (ADR-0004 rule).
-2. **No swallowing catch.** `dispatch-wave1-create`, `dispatch-wave2-activate` and
-   `report-spawn-signal` **MUST NOT** sit in a `catch` that returns normally after their permanent
+2. **No swallowing catch.** `dispatch-wave1-create`, `dispatch-wave2-activate`,
+   `report-spawn-signal` and `replace-fulfillment-grant` **MUST NOT** sit in a `catch` that returns normally after their permanent
    failure (`10 §4.6`); a `catch.retry` retries only 429, 503, 504 and 409.
 3. **A 409 is followed by a read.** After a 409 from a dispatch operation (which may be
    `idempotency-lease-expired`, Q-11 (ii)) the definition **MUST** call `reconcile-intent` before
@@ -1422,7 +1530,12 @@ slice operations (D-80, D-81).
    `due` is `false`.
 5. **Lapsed routes to rebuild, rebuild routes to wave 1.** A non-empty `lapsed[]` **MUST** route to
    `rebuild-wave1`, and its `rebuilt[]` to `dispatch-wave1-create` and back through the barrier;
-   never directly to `dispatch-wave2-activate` †.
+   never directly to `dispatch-wave2-activate` †. Where the pinned `spawned` is true the walk
+   **MUST** pass `replace-fulfillment-grant` between them (D-243): `granted` and `not-needed` go on
+   to `dispatch-wave1-create`; `predecessor-unsettled` returns to the barrier loop and calls again
+   under `nextRound` after its next reconciliation; `held` goes to the held wait; `not-dispatchable`
+   to the barrier loop, whose lifecycle arm consumes the terminal event; `refused` to the unwind
+   under either policy with reason `grant-replacement-refused` and no manual task.
 5a. **An externally activated draft routes to the unwind** (decision D-233). A non-empty
    `externallyActivated[]` from `dispatch-wave2-activate` or `reread-draft-liveness` **MUST** route
    to the unwind under either policy, with no manual task and no rebuild, ahead of every other case

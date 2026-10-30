@@ -137,7 +137,7 @@ rather than one task, fails closed before a definition can be executed, and stil
   > compensation path's next pass and the supersession wait.
 
   > **Amended 2026-09-26 by D-135 and D-136**: **Rule 1** also requires the `p1` composables on
-  > their paths, which stay `composable` (22 `protected`, 13 `composable` are unchanged): on an
+  > their paths, which stay `composable` (22 `protected`, 13 `composable` are unchanged; 25 `protected` since D-243): on an
   > `unobtainable` verdict, `park` and a park loop calling `arm-park-escalation` with a route to
   > `raise-overdue-escalation` (`park`); on a pending-approval reflection, `open-gates` before
   > `record-decision` and a gate wait carrying the decision `listen` and the `escalate-gate` fire
@@ -204,7 +204,9 @@ rather than one task, fails closed before a definition can be executed, and stil
   `escalate-gate`, `evaluate-activation-eligibility`, `reread-draft-liveness`, `rebuild-wave1`,
   `reconcile-intent` (sweep), `resolve-manual-task`, `verify-override`,
   `raise-overdue-escalation`. The list is **22 `protected` and 13 `composable`** operations,
-  35 in all, and matches the `protection` field each slice's §3.3 declares (slice 03: only
+  35 in all *(amended by D-228 and D-243: `request-prefulfillment-cancel`,
+  `replace-fulfillment-grant` and `settle-receiver-pause` are also `protected` — 25 `protected`,
+  38 in all)*, and matches the `protection` field each slice's §3.3 declares (slice 03: only
   `obtain-verdict`, `reflect-verdict` and `record-decision` protected; slice 05: `reread-draft-liveness`,
   `rebuild-wave1` and `reconcile-intent` composable; slice 07: only `create-manual-task`
   protected). A `protected` operation may be ordered by a definition; it may never be omitted or
@@ -323,7 +325,7 @@ the publish job's behavioural gate must pass before any production publish.
 ### Review-only fence
 
 * Good, because a reviewer can judge suitability, which no rule can.
-* Bad, because a human cannot reliably check a nesting inequality, a reference schema or the presence of twenty-two protected operations in order across a long document; the checks that matter most are the mechanical ones.
+* Bad, because a human cannot reliably check a nesting inequality, a reference schema or the presence of twenty-five protected operations in order across a long document; the checks that matter most are the mechanical ones.
 * Bad, because the platform's review/approval governance does not exist yet (NEXT_ADR_SCOPE.md line 48), so the fence would be procedural until it does, with no artifact a test can assert.
 
 ### Validation-hook fence (chosen)

@@ -113,7 +113,7 @@ Requirements that significantly influence architecture decisions.
 | `cpt-cf-bss-orders-workflow-adr-manual-task-dead-letter-separation` | Keeps the manual-task/incident path (step failure) structurally separate from the dead-letter path (poisoned inbound delivery); as amended, the inbound dead letter is the platform trigger path's and Orders writes no dead-letter row. |
 | `cpt-cf-bss-orders-workflow-adr-platform-pdp-authorization` | Delegates every authorization decision to the platform PDP through one shared `PolicyEnforcer` adapter over a registered resource/action catalogue; as amended, the step routes are `process_step × execute` for the serverless-runtime service principal only, with the operation name as a resource property. |
 | `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | The order process flow is a versioned Serverless Workflow definition registered in serverless-runtime and executed by its Temporal plugin; Orders provides step operations and the process record; timers, retry policy, waits and signals are the platform's; Q-01 is answered in two parts. |
-| `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | Fences a published definition: 22 `protected` and 13 `composable` operations, six validation rules (eight numbered checks in `design/10` §2.2, D-67) run by a pre-publish hook and a CI test, run-time precondition guards inside every protected operation, instance pinning through `owf_definition_binding`, platform-operator publish today. |
+| `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | Fences a published definition: 25 `protected` and 13 `composable` operations (D-243), six validation rules (eight numbered checks in `design/10` §2.2, D-67) run by a pre-publish hook and a CI test, run-time precondition guards inside every protected operation, instance pinning through `owf_definition_binding`, platform-operator publish today. |
 | `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | Task inputs and outputs carry identifiers and small closed enums only, and the start trigger and every `listen` keep only references of what they consume; every operation reads commercial data inside this gear under the PDP; the residual — identifiers in engine history, and the consumed events as published until the member-storage or thin-event ask lands — is bounded by upstream asks. |
 
 ### 1.3 Architecture Layers
@@ -560,7 +560,7 @@ graph TB
 | Provisioning intents | `05 §3.2` | **intent dispatcher**, **dispatch admission control**, **draft-liveness re-reader**, **wave-1 rebuilder**, **spawn signal reporter**, **reconciliation sweep**; retired: **activation barrier timer owner** |
 | Saga and compensation | `06 §3.2` | **compensation-execution component**, **cancellation-fencing component**, **outcome-report component** |
 | Manual tasks | `07 §3.2` | **manual-task creator**, **incident recorder**, **override verifier**, **escalation router**, **operator task queue**, **overdue escalation monitor** |
-| Hold and cancel | `08 §3.2` | **suspension controller**, **resume coordinator**, **cancel mediator**; retired: **dependency retry governor** |
+| Hold and cancel | `08 §3.2` | **suspension controller**, **resume coordinator**, **cancel mediator**, **receiver pause coordinator** (D-243); retired: **dependency retry governor** |
 | Read and authorization | `09 §3.2` | **authorization adapter (permission evaluator)**, **control operation gateway**, **progress read projector**, **progress projection writer**, **audit trail reader** (D-186) |
 
 Component names in the right-hand column are **names, not identifiers**: the identifier is minted
@@ -602,8 +602,8 @@ definition's arm — never the gateway — calls the operation that applies it.
    `owf_step_operation`, callable **only** by the serverless-runtime service principal
    (`subject_type` service, `token_scopes` naming this gear), authorized as
    `gts.cf.bss.orders_workflow.process_step.v1~` × `execute` with the operation name as a resource
-   property. Thirty-five operations are registered — **22 `protected`, 13 `composable`**
-   (ADR-0012) — and thirty-three are granted to the platform principal; `settle-from-lookup` runs
+   property. Thirty-eight operations are registered — **25 `protected`, 13 `composable`**
+   (ADR-0012, D-243) — and thirty-six are granted to the platform principal; `settle-from-lookup` runs
    only inside `reconcile-intent`, `compensate-order` and the sweep, and `retry-step` runs only inside `resolve-manual-task` (D-108; its minting effect also inside an `invocation-dead` retry and the dead-instance unwind for an aged-out successor, D-185), both in-process
    and denied to every caller. Every call after `start-instance` is bound to the instance's
    invocation (`01 §3.3` step 3, D-106). Each operation is declared once, in
@@ -1030,6 +1030,7 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_fulfillment_task` | `04 §3.7` | fulfillment-plan — progress tracker | **mutable** — state advances through `pending / draft_created / activated / failed`, including `draft_created → pending` on rebuild and the operator-driven re-entry from `failed` |
 | `owf_provisioning_intent` | `05 §3.7` | provisioning-intents — intent dispatcher | **mutable** — `status`, acceptance columns, `subscription_id` and sweep columns settle in place; the composed key and `intent_kind` never change |
 | `owf_dispatch_admission` | `05 §3.7` | provisioning-intents — dispatch admission control | **mutable** — per-seller admission state serialized by row locks; no history |
+| `owf_fulfillment_grant` | `05 §3.7` | provisioning-intents — spawn signal reporter (with `apply-resume` and the closure writers through its grant port) | **append-only** except the one-time closure stamp; this gear's copy of Lifecycle's dispatch grants (D-243) |
 | `owf_compensation_record` | `06 §3.7` | saga-and-compensation — compensation-execution component | **mutable** — resolution, outcome, counters and `attempt_id` settle in place; no DELETE grant but the retention purge's |
 | `owf_cancellation_fence` | `06 §3.7` | saga-and-compensation — cancellation-fencing component | **mutable** — fencing-step stamps, promotion, pass counter, report stamps, `reauthorization_required_at`; a stamp once set never changes, except the re-authorization mark: `reauthorization_required_at`, set by `compensate-order`, is cleared, and `cancel_request_ref` replaced, only when `run-cancellation-fence` absorbs a newly authorized cancel against the run (`06 §4.3`, D-182) |
 | `owf_manual_task` | `07 §3.7` | manual-tasks — manual-task creator | **mutable** — assignment and resolution advance; `sla_deadline` is reset on reopen; carries `row_version` |
@@ -1038,6 +1039,7 @@ additionally carry `seller_tenant_id`, and per-tenant fairness and back-pressure
 | `owf_overdue_escalation` | `07 §3.7` | manual-tasks — overdue-escalation monitor | **mutable** — only to settle `outcome` |
 | `owf_dead_letter_triage` | `07 §3.7` | manual-tasks — operator task queue | **pending** — created only if the platform exposes its trigger-path dead letters to operators (`UPSTREAM_REQS.md` §2.9); **mutable** if created, retired if the ask is declined |
 | `owf_process_suspension` | `08 §3.7` | hold-and-cancel — suspension controller | **mutable** — `state` settles through `open / resume_ahead / closed`; a partial unique index enforces at most one unsettled row per order |
+| `owf_fulfillment_control` | `08 §3.7` | hold-and-cancel — receiver pause coordinator | **mutable** — a staged pause control settles `staged → pausing → reported → resumed`, or `abandoned` / `superseded` (D-243) |
 | `owf_process_progress_view` | `09 §3.7` | read-and-authz — progress projection writer (sole writer; the read projector only reads) | **mutable** — materialised projection, one row per order, refreshed in the same transaction as the change it reflects |
 | `owf_cancel_request` | `09 §3.7` | read-and-authz — control operation gateway | **mutable** in `delivery_state`, `last_recheck_point` and `updated_at` only, forward only; append-only otherwise |
 | `owf_read_access_log` | `09 §3.7` | read-and-authz — audit trail reader (sole writer) | append-only — one row per audit-read request, served or refused; no UPDATE grant, DELETE to the retention purge only (D-191) |
@@ -1073,6 +1075,7 @@ what the `retention-purge` worker of §3.8 does with it:
 | `owf_compensation_record`, `owf_cancellation_fence` (`06 §3.7`) | ≥ 400 days | purged through the index each names |
 | `owf_manual_task`, `owf_task_resolution_request`, `owf_incident`, `owf_overdue_escalation`, `owf_dead_letter_triage` (pending) (`07 §3.7`) | ≥ 400 days | purged through the index each names |
 | `owf_process_suspension` (`08 §3.7`) | ≥ 400 days | purged through its `created_at` index |
+| `owf_fulfillment_control` (`08 §3.7`), `owf_fulfillment_grant` (`05 §3.7`) | ≥ 400 days | purged row-wise by creation time |
 | `owf_cancel_request` (`09 §3.7`) | ≥ 400 days, never ahead of the audit entry that names it | purged through a `decided_at` index |
 | `owf_read_access_log` (`09 §3.7`) | 90 days from `accessed_at`, whatever the instance's state — Lifecycle's read-access-log value (Lifecycle `08 §4.5`, D-191) | purged through its `accessed_at` index |
 
