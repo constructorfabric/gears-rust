@@ -27,13 +27,14 @@ use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
 use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 
 use super::dto::{
-    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
-    CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto,
-    DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto,
-    IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto,
-    RepoDto, RepoSyncStatusDto, ResumeAcceptedDto, ResumeFailureDto, ReviewCommentDto, ReviewDto,
-    ReviewThreadDto, SyncAcceptedDto, SyncSessionDto, TagDto, WorkflowDto, WorkflowJobDto,
-    WorkflowJobsPageDto, WorkflowRunDto, WorkflowRunsPageDto, WorkflowsPageDto,
+    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto,
+    CheckRunsPageDto, CommentDto, CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto,
+    CommitStatusDto, ContributorDto, DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto,
+    IssueReactionDto, IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto,
+    PullRequestFileDto, ReleaseDto, RepoDto, RepoSyncStatusDto, ResumeAcceptedDto,
+    ResumeFailureDto, ReviewCommentDto, ReviewDto, ReviewThreadDto, SyncAcceptedDto,
+    SyncSessionDto, TagDto, WorkflowDto, WorkflowJobDto, WorkflowJobsPageDto, WorkflowRunDto,
+    WorkflowRunsPageDto, WorkflowsPageDto,
 };
 
 const DEFAULT_PER_PAGE: u64 = 30;

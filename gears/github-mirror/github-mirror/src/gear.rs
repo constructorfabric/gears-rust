@@ -28,18 +28,17 @@ use crate::infra::github::client::{GithubClient, TokenSource};
 use crate::infra::storage::fs_cache::FilesystemHttpCache;
 use crate::infra::storage::sea_orm_repo::{
     SeaOrmActiveSyncRepository, SeaOrmArtifactRepository, SeaOrmBranchRepository,
-    SeaOrmCheckRunRepository,
-    SeaOrmCommentRepository, SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository,
-    SeaOrmCommitRepository, SeaOrmCommitStatusRepository, SeaOrmContributorRepository,
-    SeaOrmConversationRepository, SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository,
-    SeaOrmHttpCache, SeaOrmIssueEventRepository, SeaOrmIssueReactionRepository,
-    SeaOrmIssueRepository, SeaOrmIssueTimelineRepository, SeaOrmLabelRepository,
-    SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository, SeaOrmPullRequestFileRepository,
-    SeaOrmPullRequestRepository, SeaOrmReleaseRepository, SeaOrmRepoRepository,
-    SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository, SeaOrmReviewRepository,
-    SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository, SeaOrmSyncWatermarkRepository,
-    SeaOrmSyncWriter, SeaOrmTagRepository, SeaOrmWorkflowJobRepository,
-    SeaOrmWorkflowRunRepository,
+    SeaOrmCheckRunRepository, SeaOrmCommentRepository, SeaOrmCommitCommentRepository,
+    SeaOrmCommitFileRepository, SeaOrmCommitRepository, SeaOrmCommitStatusRepository,
+    SeaOrmContributorRepository, SeaOrmConversationRepository, SeaOrmDeploymentRepository,
+    SeaOrmEntityFingerprintRepository, SeaOrmHttpCache, SeaOrmIssueEventRepository,
+    SeaOrmIssueReactionRepository, SeaOrmIssueRepository, SeaOrmIssueTimelineRepository,
+    SeaOrmLabelRepository, SeaOrmMilestoneRepository, SeaOrmPullRequestCommitRepository,
+    SeaOrmPullRequestFileRepository, SeaOrmPullRequestRepository, SeaOrmReleaseRepository,
+    SeaOrmRepoRepository, SeaOrmRepoSyncStatusRepository, SeaOrmReviewCommentRepository,
+    SeaOrmReviewRepository, SeaOrmReviewThreadRepository, SeaOrmSyncSessionRepository,
+    SeaOrmSyncWatermarkRepository, SeaOrmSyncWriter, SeaOrmTagRepository,
+    SeaOrmWorkflowJobRepository, SeaOrmWorkflowRunRepository,
 };
 use crate::infra::telemetry_sink::JsonlTelemetrySink;
 

@@ -9,10 +9,9 @@ use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use chrono::{DateTime, Utc};
 use github_mirror_sdk::{
     Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
-    Contributor,
-    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
-    MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review,
-    ReviewComment, ReviewThread, SyncSummary, Tag, Workflow, WorkflowJob, WorkflowRun,
+    Contributor, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label,
+    Milestone, MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release, Repo,
+    Review, ReviewComment, ReviewThread, SyncSummary, Tag, Workflow, WorkflowJob, WorkflowRun,
 };
 use tokio::sync::{Mutex, mpsc};
 use tokio_util::sync::CancellationToken;
@@ -29,8 +28,7 @@ use super::ports::github::{
 use super::ports::telemetry_sink::TelemetrySink;
 use super::repo::{
     ActiveSyncRecord, ActiveSyncRepository, ArtifactRepository, BranchRecord, BranchRepository,
-    CheckRunRecord,
-    CheckRunRepository, CommentRecord, CommentRepository, CommitCommentRecord,
+    CheckRunRecord, CheckRunRepository, CommentRecord, CommentRepository, CommitCommentRecord,
     CommitCommentRepository, CommitFileRecord, CommitFileRepository, CommitRecord,
     CommitRepository, CommitStatusRecord, CommitStatusRepository, ContributorRecord,
     ContributorRepository, ConversationComments, ConversationRepository, DeploymentRecord,
@@ -1600,28 +1598,12 @@ impl Service {
         window: PageWindow,
         filter: ListingFilter,
     ) -> Result<Page<Comment>, DomainError> {
-        let scope = self
-            .policy_enforcer
-            .access_scope_with(
-                ctx,
-                &COMMENT_RESOURCE,
-                actions::LIST,
-                None,
-                &AccessRequest::new()
-                    .resource_property(pep_properties::OWNER_TENANT_ID, ctx.subject_tenant_id()),
-            )
+        let (scope, repo_id) = self
+            .mirrored_repository(ctx, &COMMENT_RESOURCE, owner, name)
             .await?;
-
-        let full_name = repo_full_name(owner, name)?;
-        let repository = self
-            .repo
-            .find_by_full_name(&scope, &full_name)
-            .await?
-            .ok_or(DomainError::NotFound)?;
-
         let items = self
             .comments
-            .list_by_repo(&scope, repository.id, window, filter)
+            .list_by_repo(&scope, repo_id, window, filter)
             .await?;
 
         Ok(Page::new(
@@ -2287,7 +2269,8 @@ impl Service {
         name: &str,
         window: PageWindow,
     ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
-        self.workflow_runs_page(ctx, owner, name, None, window).await
+        self.workflow_runs_page(ctx, owner, name, None, window)
+            .await
     }
 
     /// # Errors
@@ -2301,7 +2284,8 @@ impl Service {
         workflow_id: i64,
         window: PageWindow,
     ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
-        self.workflow_runs_page(ctx, owner, name, Some(workflow_id), window).await
+        self.workflow_runs_page(ctx, owner, name, Some(workflow_id), window)
+            .await
     }
 
     /// # Errors
@@ -2314,8 +2298,13 @@ impl Service {
         name: &str,
         window: PageWindow,
     ) -> Result<(Page<Workflow>, u64), DomainError> {
-        let (scope, repo_id) = self.workflow_runs_repository(ctx, owner, name).await?;
-        let workflows = self.workflow_runs.workflows_by_repo(&scope, repo_id).await?;
+        let (scope, repo_id) = self
+            .mirrored_repository(ctx, &WORKFLOW_RUN_RESOURCE, owner, name)
+            .await?;
+        let workflows = self
+            .workflow_runs
+            .workflows_by_repo(&scope, repo_id)
+            .await?;
         let total = workflows.len() as u64;
         let items = workflows
             .into_iter()
@@ -2336,9 +2325,10 @@ impl Service {
         ))
     }
 
-    async fn workflow_runs_repository(
+    async fn mirrored_repository(
         &self,
         ctx: &SecurityContext,
+        resource: &ResourceType,
         owner: &str,
         name: &str,
     ) -> Result<(AccessScope, i64), DomainError> {
@@ -2346,7 +2336,7 @@ impl Service {
             .policy_enforcer
             .access_scope_with(
                 ctx,
-                &WORKFLOW_RUN_RESOURCE,
+                resource,
                 actions::LIST,
                 None,
                 &AccessRequest::new()
@@ -2372,7 +2362,9 @@ impl Service {
         workflow_id: Option<i64>,
         window: PageWindow,
     ) -> Result<(Page<WorkflowRun>, u64), DomainError> {
-        let (scope, repo_id) = self.workflow_runs_repository(ctx, owner, name).await?;
+        let (scope, repo_id) = self
+            .mirrored_repository(ctx, &WORKFLOW_RUN_RESOURCE, owner, name)
+            .await?;
 
         // Both statements run on one transaction, and on the scope and
         // repository already resolved above: the total describes the page it
