@@ -250,19 +250,11 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
     let overlap = Overlap::new(input, &mapped);
     let overlap_required = input.lines.iter().any(|l| !overlap.is_keyless(l.line_id));
     let mut down = unavailable_ports(input, withheld.is_some(), overlap_required);
-    // The first unavailable port a predicate reads, as that port's reason (rule b).
-    let blocked = |p: P| {
-        p.spec()
-            .ports
-            .iter()
-            .find(|g| down.contains(g))
-            .map(|g| unevaluable(g.unavailable_reason()))
-    };
     let mut out = vec![
         row(
             P::AxisValidity,
             None,
-            blocked(P::AxisValidity).unwrap_or_else(|| axis(input)),
+            blocked(&down, P::AxisValidity).unwrap_or_else(|| axis(input)),
         ),
         row(
             P::ContractActive,
@@ -315,32 +307,14 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
         } else {
             assessed_row(key(P::MarketConsistency, some), assessed.as_ref())
         });
-        // A missing key decides the in-flight row even when occupancy did not answer.
-        let (unique, in_flight) = if overlap.is_keyless(id) {
-            overlap.rows(id, input)
-        } else if let Some(w) = &withheld {
-            (w.clone(), w.clone())
-        } else {
-            let (mut unique, in_flight) = match blocked(P::InFlightPerKey) {
-                Some(e) => (e.clone(), e),
-                None => overlap.rows(id, input),
-            };
-            if let Some(e) = blocked(P::OverlapUniqueness) {
-                unique = e;
-            }
-            (unique, in_flight)
-        };
+        let (unique, in_flight) = overlap_rows(input, &overlap, id, withheld.as_ref(), &down);
         out.push(row(P::OverlapUniqueness, some, unique));
         out.push(row(P::InFlightPerKey, some, in_flight));
-        // A line the basis does not cover is a caller error: it fails closed.
-        let dates = if date_failures.contains(&id) {
-            failed(Reason::DateCascadeInvalid)
-        } else if input.dates.lines.contains_key(&id) {
-            PASS
-        } else {
-            unevaluable(Reason::DateCascadeInvalid)
-        };
-        out.push(row(P::DatesResolvable, some, dates));
+        out.push(row(
+            P::DatesResolvable,
+            some,
+            dates_resolvable(input, &date_failures, id),
+        ));
         out.push(pin_row(input, id, &mapped.pin, withheld.as_ref()));
         pins.insert(id, mapped.pin.clone());
     }
@@ -348,6 +322,72 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
     let failures = vector.failure_list();
     let primary = vector.primary(input.operation).cloned();
     let definitive = primary.as_ref().is_some_and(definitive_local);
+    mark_unusable_answers(&vector, &mut down);
+    let mut resolved_inputs = inputs(&down, withheld.is_some(), definitive);
+    if !definitive
+        && withheld.is_none()
+        && let PortAnswer::Skipped(reason) = &input.evaluation
+    {
+        resolved_inputs =
+            resolved_inputs.with(InputPort::Evaluation, InputState::Unresolvable(*reason));
+    }
+    Ok(Assessment {
+        vector,
+        failures,
+        inputs: resolved_inputs,
+        pins,
+        primary,
+    })
+}
+
+/// The first unavailable port a predicate reads, as that port's reason (rule b).
+fn blocked(down: &BTreeSet<GatePort>, p: P) -> Option<Eval> {
+    p.spec()
+        .ports
+        .iter()
+        .find(|g| down.contains(g))
+        .map(|g| unevaluable(g.unavailable_reason()))
+}
+
+/// One line's overlap-uniqueness and in-flight verdicts, in that order.
+fn overlap_rows(
+    input: &AssessmentInput,
+    overlap: &Overlap<'_>,
+    id: Uuid,
+    withheld: Option<&Eval>,
+    down: &BTreeSet<GatePort>,
+) -> (Eval, Eval) {
+    // A missing key decides the in-flight row even when occupancy did not answer.
+    if overlap.is_keyless(id) {
+        overlap.rows(id, input)
+    } else if let Some(w) = withheld {
+        (w.clone(), w.clone())
+    } else {
+        let (mut unique, in_flight) = match blocked(down, P::InFlightPerKey) {
+            Some(e) => (e.clone(), e),
+            None => overlap.rows(id, input),
+        };
+        if let Some(e) = blocked(down, P::OverlapUniqueness) {
+            unique = e;
+        }
+        (unique, in_flight)
+    }
+}
+
+/// One line's dates verdict.
+fn dates_resolvable(input: &AssessmentInput, date_failures: &BTreeSet<Uuid>, id: Uuid) -> Eval {
+    // A line the basis does not cover is a caller error: it fails closed.
+    if date_failures.contains(&id) {
+        failed(Reason::DateCascadeInvalid)
+    } else if input.dates.lines.contains_key(&id) {
+        PASS
+    } else {
+        unevaluable(Reason::DateCascadeInvalid)
+    }
+}
+
+/// Marks down the ports that answered but whose answer cannot resolve the engine input.
+fn mark_unusable_answers(vector: &Vector, down: &mut BTreeSet<GatePort>) {
     // An answered but invalid assessment cannot resolve the engine's catalog input.
     // Use the same input path as an unavailable port, including definitive-refusal
     // and payer-withholding precedence, while keeping the complete diagnostic vector.
@@ -368,21 +408,6 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
     }) {
         down.insert(GatePort::Occupancy);
     }
-    let mut resolved_inputs = inputs(&down, withheld.is_some(), definitive);
-    if !definitive
-        && withheld.is_none()
-        && let PortAnswer::Skipped(reason) = &input.evaluation
-    {
-        resolved_inputs =
-            resolved_inputs.with(InputPort::Evaluation, InputState::Unresolvable(*reason));
-    }
-    Ok(Assessment {
-        vector,
-        failures,
-        inputs: resolved_inputs,
-        pins,
-        primary,
-    })
 }
 
 /// One line's catalog mapping. A line whose request names another line, or whose items state

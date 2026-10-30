@@ -168,7 +168,8 @@ def test_authoring_round_trip_keeps_identities_revisions_and_persisted_membershi
     ) == "1|4"
     read = api.get(path)
     assert read.status_code == 200
-    assert read.json()["draft_revision"] == 4 and read.json()["lines"] == []
+    assert read.json()["draft_revision"] == 4
+    assert read.json()["lines"] == []
 
 
 def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
@@ -182,7 +183,8 @@ def test_retry_and_conflict_wire_behavior(env: OrdersEnv, buyer: Buyer):
     first = api.post(lines, json=body, headers=write_headers(1, key))
     assert first.status_code == 200, first.text
     replay = api.post(lines, json=body, headers=write_headers(1, key))
-    assert replay.status_code == 200 and replay.json() == first.json()
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
     assert replay.headers["etag"] == first.headers["etag"]
     # Only the replay is marked; the stored response is returned unchanged.
     assert "idempotency-replayed" not in first.headers
@@ -253,7 +255,9 @@ def test_reads_compose_from_the_store_page_in_sql_and_log_before_disclosure(env:
     assert page1.status_code == 200, page1.text
     assert [line["line_id"] for line in page1.json()["items"]] == ids[:2]
     info1 = page1.json()["page_info"]
-    assert page1.json()["current_version"] == 1 and info1.get("next_cursor") and info1["limit"] == 2
+    assert page1.json()["current_version"] == 1
+    assert info1.get("next_cursor")
+    assert info1["limit"] == 2
     page2 = api.get(f"{path}/lines", params={"limit": 2, "cursor": info1["next_cursor"]})
     assert page2.status_code == 200
     assert [line["line_id"] for line in page2.json()["items"]] == ids[2:]
@@ -379,7 +383,9 @@ def test_service_principals_need_finite_explicit_constraints(env: OrdersEnv, buy
     assert r.status_code == 500, r.text
     assert r.headers["content-type"].startswith(PROBLEM)
     # Sanitized: no tenant, policy or path detail beyond the request's own instance URL.
-    assert SELLER_TENANT not in r.text and "seller_tenant_id" not in r.text and "rule" not in r.text
+    assert SELLER_TENANT not in r.text
+    assert "seller_tenant_id" not in r.text
+    assert "rule" not in r.text
     # Service-only Workflow seams are not mounted: unreachable from any token.
     for seam in ("begin-fulfillment", "spawn-signal", "approval-reflection", "workflow-cancel", "cancel", "hold"):
         r = workflow.post(f"{path}/{seam}", json={}, headers=write_headers(1))
@@ -468,7 +474,8 @@ def test_gateway_caller_zone_throttles_before_the_engine(env: OrdersEnv, buyer: 
     assert len(gateway) + len(edge) == len(throttled), descriptions
     assert gateway, "the gateway caller zone rejected with its own violation"
     for r in gateway:
-        assert "ratelimit-policy" in r.headers and "ratelimit-remaining" not in r.headers
+        assert "ratelimit-policy" in r.headers
+        assert "ratelimit-remaining" not in r.headers
         assert r.json()["detail"] == "throttling limit exceeded (rate_limit)"
     # The gateway admitted its burst (20 plus the refill); everything it admitted beyond the edge
     # limiter's budget was refused by the fallback, never by the engine.
@@ -524,7 +531,8 @@ def test_required_log_failure_serves_no_protected_data(env: OrdersEnv, buyer: Bu
         assert r.headers["content-type"].startswith(PROBLEM)
         body = r.json()
         assert body["detail"] == "read-store-unavailable", body
-        assert "permission denied" not in r.text and "order_number" not in r.text, body
+        assert "permission denied" not in r.text, body
+        assert "order_number" not in r.text, body
         assert "etag" not in r.headers
     finally:
         env.psql("GRANT INSERT ON bss_orders__read_access_log TO bss_orders_runtime")
@@ -543,7 +551,8 @@ def test_failed_audit_rolls_back_the_admitted_write_over_http(env: OrdersEnv, bu
         r = api.post(lines, json=line_body(0), headers=write_headers(1, key))
         assert r.status_code in (500, 503), r.text
         assert r.headers["content-type"].startswith(PROBLEM)
-        assert "transition_audit" not in r.text and "permission denied" not in r.text
+        assert "transition_audit" not in r.text
+        assert "permission denied" not in r.text
     finally:
         env.psql("GRANT INSERT ON bss_orders__transition_audit TO bss_orders_runtime")
     assert env.count(

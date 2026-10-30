@@ -7,7 +7,7 @@ use authz_resolver_sdk::{
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use super::*;
+use super::Policy;
 use crate::config::{ConfigError, OrdersTestAuthZPluginConfig};
 
 const BUYER: &str = "11111111-6a88-4768-9dfc-6bcd5187d9ed";

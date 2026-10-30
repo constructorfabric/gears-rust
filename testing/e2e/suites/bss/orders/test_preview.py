@@ -113,9 +113,12 @@ def _assert_money(money: dict, currency: str) -> None:
     given currency, and a display text."""
     exact = money["exact"]
     assert exact["currency"] == currency, money
-    assert exact["numerator"].lstrip("-").isdigit() and exact["denominator"].isdigit(), money
-    assert int(exact["denominator"]) > 0 and isinstance(exact["currency_scale"], int), money
-    assert isinstance(money["display"], str) and money["display"], money
+    assert exact["numerator"].lstrip("-").isdigit(), money
+    assert exact["denominator"].isdigit(), money
+    assert int(exact["denominator"]) > 0, money
+    assert isinstance(exact["currency_scale"], int), money
+    assert isinstance(money["display"], str), money
+    assert money["display"], money
 
 
 def _preview_per_minute() -> int:
@@ -143,7 +146,8 @@ def test_preview_happy_path_returns_lines_totals_and_tcv_and_writes_only_diagnos
     assert assessment["failures"] == [], assessment["failures"]
     assert assessment["mapping_version"], assessment
     required = [o for o in assessment["outcomes"] if o["applicability"] == "required"]
-    assert required and all(o["verdict"] == "passed" for o in required), required
+    assert required, required
+    assert all(o["verdict"] == "passed" for o in required), required
 
     # One line, its pin composed on the seeded revision (the pin-composition row of that line
     # passed), and no unexpected wire member.
@@ -160,7 +164,8 @@ def test_preview_happy_path_returns_lines_totals_and_tcv_and_writes_only_diagnos
     assert total["exclusions"] == {}
     assert result["tcv_basis"] == "rolling_annualized"
     assert total["currency"] == catalog.currency
-    assert isinstance(total["currency_scale"], int) and isinstance(total["usage_flagged"], bool)
+    assert isinstance(total["currency_scale"], int)
+    assert isinstance(total["usage_flagged"], bool)
     assert total["discount"]["kind"] in ("available", "unavailable"), total
     for money in (total["gross"], total["net"], result["tcv"]):
         _assert_money(money, catalog.currency)
@@ -210,7 +215,8 @@ def test_preview_withholds_tcv_when_a_line_has_no_term(env: OrdersEnv, buyer: Bu
     # outcome still passed (a tcv-only row may be unevaluable and listed in `failures`, which
     # names every outcome that did not pass, blocking or not).
     required = [o for o in result["assessment"]["outcomes"] if o["applicability"] == "required"]
-    assert required and all(o["verdict"] == "passed" for o in required), required
+    assert required, required
+    assert all(o["verdict"] == "passed" for o in required), required
     assert _gate_rows(env, result["assessment_id"]) == len(result["assessment"]["outcomes"])
 
 

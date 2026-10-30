@@ -1,10 +1,15 @@
 //! The committed read path over plain rows (lib tier): one valid submitted order and line built
 //! from the SDK's golden schema-2 pin, then single-field corruptions of the independently
 //! selected row, each of which must refuse as `Integration` without composing a line.
+use bss_orders_sdk::OrdersError;
+use bss_orders_sdk::authoring::DraftLine;
+use bss_orders_sdk::catalog::OrderState;
 use serde_json::{Value, json};
 use time::macros::date;
+use uuid::Uuid;
 
-use super::*;
+use super::{committed_line, committed_total, compose_committed_lines, validate_totals};
+use crate::infra::storage::entity::{order, order_line, order_line_identity, resolved_total};
 
 /// The SDK's golden schema-2 pin (`orders-sdk/tests/fixtures`), the commercial conformance
 /// vector every codec test decodes.

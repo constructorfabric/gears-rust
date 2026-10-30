@@ -1,4 +1,6 @@
-use super::*;
+use uuid::Uuid;
+
+use super::{ConfigError, OrdersTestAuthZPluginConfig, Rule, UUID_PROPERTIES};
 
 /// The Orders E2E suite config; its `gears.bss-orders-test-authz-plugin.config` block is the
 /// policy the live suite boots with.

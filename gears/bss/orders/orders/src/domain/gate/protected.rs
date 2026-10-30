@@ -153,7 +153,8 @@ pub struct ProtectedOccupancy {
     pub order_reserved_count: u32,
     /// Required number or explicit null.
     pub max_concurrent_active: MaxConcurrentActive,
-    /// Required null for no reusable context; complete object for recheck.
+    /// Required null for no reusable context; complete object for recheck. The custom
+    /// deserializer keeps the member required: a missing member is refused, `null` is accepted.
     #[serde(deserialize_with = "Option::<OwnMembership>::deserialize")]
     pub own_membership: Option<OwnMembership>,
 }

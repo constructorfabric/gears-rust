@@ -500,7 +500,8 @@ def test_submit_replays_the_same_key_without_new_rows_or_events(
     # enqueue commits with the transition, so a new message would already be queued or counted).
     assert _counts(env, order_id) == before
     assert env.count(PROCESSED) == processed + 1
-    assert env.count(INCOMING) == 0 and env.count(UNACKNOWLEDGED) == 0
+    assert env.count(INCOMING) == 0
+    assert env.count(UNACKNOWLEDGED) == 0
     assert env.psql(
         "SELECT status || '|' || outcome FROM bss_orders__idempotency"
         f" WHERE order_id = '{order_id}' AND operation = 'submit'"
@@ -587,7 +588,8 @@ def test_submit_refuses_a_stale_draft_revision_and_a_stale_version(
     assert body["context"]["data"] == {"current_version": CREATED_VERSION, "draft_revision": 1}, body
     assert "idempotency-replayed" not in stale.headers
     replay = submit(buyer, order_id, CREATED_VERSION, 0, key)
-    assert replay.status_code == stale.status_code and replay.content == stale.content
+    assert replay.status_code == stale.status_code
+    assert replay.content == stale.content
     assert replay.headers["idempotency-replayed"] == "true"
     assert _refused_audits(env, order_id, "version-conflict") == 1
     assert _counts(env, order_id) == {
@@ -723,7 +725,8 @@ def test_an_open_overlap_claim_blocks_a_second_commit_on_the_same_scope(
         data = body["context"]["data"]
         report = data["assessment"]
         rows = [o for o in report["outcomes"] if o["predicate"] == "orders.in-flight-per-key"]
-        assert rows and all((o["verdict"], o.get("reason")) == ("failed", "order-in-flight-for-key") for o in rows), rows
+        assert rows, rows
+        assert all((o["verdict"], o.get("reason")) == ("failed", "order-in-flight-for-key") for o in rows), rows
         assert env.count(
             "SELECT count(*) FROM bss_orders__gate_outcome"
             f" WHERE order_id = '{contender}' AND predicate = 'orders.in-flight-per-key'"
@@ -867,7 +870,8 @@ def test_submit_refuses_an_unsellable_line_with_the_gate_report(
         o for o in report["outcomes"]
         if o["predicate"] == "catalog.sku-sellable" and o.get("line_id") == line_id
     ]
-    assert sellable and all((o["verdict"], o.get("reason")) == ("failed", reason) for o in sellable), sellable
+    assert sellable, sellable
+    assert all((o["verdict"], o.get("reason")) == ("failed", reason) for o in sellable), sellable
     assert any(
         f["predicate"] == "catalog.sku-sellable" and f["reason"] == reason and f.get("line_id") == line_id
         for f in report["failures"]
@@ -1106,9 +1110,12 @@ def test_proposed_protected_occupancy_admission(env: OrdersEnv, buyer: Buyer, ca
             body = _refused(result, reason)
             rows = body["context"]["data"]["assessment"]["outcomes"]
             overlap = [r for r in rows if r["predicate"] == "orders.overlap-uniqueness" and r.get("line_id") == line_id]
-            assert len(overlap) == 1 and overlap[0]["reason"] == reason, overlap
+            assert len(overlap) == 1, overlap
+            assert overlap[0]["reason"] == reason, overlap
             counts = _counts(env, order_id)
-            assert counts["versions"] == 1 and counts["attempts"] == counts["claims"] == 0, counts
+            assert counts["versions"] == 1, counts
+            assert counts["attempts"] == 0, counts
+            assert counts["claims"] == 0, counts
     finally:
         env.gate_fixture.write_bytes(original)
         env.server.restart()

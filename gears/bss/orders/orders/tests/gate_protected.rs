@@ -7,7 +7,7 @@
 use bss_orders::domain::gate::answers::{OccupancyObservation, OccupancyQuery, PayerProfile};
 use bss_orders::domain::gate::ports::PortAnswer;
 use bss_orders::domain::gate::protected::{
-    OwnContext, ProtectedBatch, ProtectedInvalid, validate_batch,
+    OwnContext, ProtectedBatch, ProtectedInvalid, ProtectedOccupancy, validate_batch,
 };
 use bss_orders::domain::gate::recheck::{
     Recheck, RecheckInput, StoredLine, StoredVersion, occupancy_queries, recheck,
@@ -114,6 +114,19 @@ fn protected_wire_requires_every_field_including_nullable_fields_and_discriminat
     explicit_null["own_membership"] = Value::Null;
     explicit_null["max_concurrent_active"] = Value::Null;
     assert!(serde_json::from_value::<OccupancyObservation>(explicit_null).is_ok());
+}
+
+/// `own_membership` stays required on purpose (no `#[serde(default)]`): a row that omits it is
+/// refused, while an explicit `null` is the no-reusable-context answer.
+#[test]
+fn protected_row_own_membership_is_required_and_null_means_none() {
+    let mut missing = observation("a");
+    missing.as_object_mut().unwrap().remove("own_membership");
+    assert!(serde_json::from_value::<ProtectedOccupancy>(missing).is_err());
+    let mut explicit_null = observation("a");
+    explicit_null["own_membership"] = Value::Null;
+    let row: ProtectedOccupancy = serde_json::from_value(explicit_null).unwrap();
+    assert_eq!(row.own_membership, None);
 }
 
 #[test]
