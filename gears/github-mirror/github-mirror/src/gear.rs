@@ -27,7 +27,8 @@ use crate::infra::github::cache::HttpCache;
 use crate::infra::github::client::{GithubClient, TokenSource};
 use crate::infra::storage::fs_cache::FilesystemHttpCache;
 use crate::infra::storage::sea_orm_repo::{
-    SeaOrmActiveSyncRepository, SeaOrmBranchRepository, SeaOrmCheckRunRepository,
+    SeaOrmActiveSyncRepository, SeaOrmArtifactRepository, SeaOrmBranchRepository,
+    SeaOrmCheckRunRepository,
     SeaOrmCommentRepository, SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository,
     SeaOrmCommitRepository, SeaOrmCommitStatusRepository, SeaOrmContributorRepository,
     SeaOrmConversationRepository, SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository,
@@ -164,6 +165,7 @@ impl Gear for GithubMirrorGear {
         let commit_comments = Arc::new(SeaOrmCommitCommentRepository::new(Arc::clone(&db)));
         let issue_events = Arc::new(SeaOrmIssueEventRepository::new(Arc::clone(&db)));
         let deployments = Arc::new(SeaOrmDeploymentRepository::new(Arc::clone(&db)));
+        let artifacts = Arc::new(SeaOrmArtifactRepository::new(Arc::clone(&db)));
         let pull_request_commits =
             Arc::new(SeaOrmPullRequestCommitRepository::new(Arc::clone(&db)));
         let commit_statuses = Arc::new(SeaOrmCommitStatusRepository::new(Arc::clone(&db)));
@@ -216,6 +218,7 @@ impl Gear for GithubMirrorGear {
             commit_comments,
             issue_events,
             deployments,
+            artifacts,
             pull_request_commits,
             commit_statuses,
             workflow_jobs,

@@ -53,6 +53,7 @@ const REPO_ACTIONS_RUNS_ITEM_JOBS: &str = "/repos/{owner}/{name}/actions/runs/{r
 const REPO_ACTIONS_WORKFLOWS: &str = "/repos/{owner}/{name}/actions/workflows";
 const REPO_ACTIONS_WORKFLOWS_ITEM_RUNS: &str =
     "/repos/{owner}/{name}/actions/workflows/{workflow_id}/runs";
+const REPO_ACTIONS_ARTIFACTS: &str = "/repos/{owner}/{name}/actions/artifacts";
 
 pub fn register_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -> Router {
     router = register_user_routes(router, openapi);
@@ -928,6 +929,32 @@ fn register_workflow_routes(mut router: Router, openapi: &dyn OpenApiRegistry) -
             openapi,
             StatusCode::OK,
             "GitHub-shaped workflow runs page",
+        )
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_500(openapi)
+        .register(router, openapi);
+
+    router = OperationBuilder::get(REPO_ACTIONS_ARTIFACTS)
+        .operation_id("github_mirror.compat.list_artifacts")
+        .summary("List artifacts (GitHub-compatible)")
+        .description(
+            "List workflow artifacts, served entirely from the locally mirrored store in GitHub's JSON shape - the mirror never calls live GitHub to answer. List responses paginate with `page`/`per_page` and a `Link` header, exactly as GitHub's API does. Data is as fresh as the repository's last sync.",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .path_param("owner", "Repo owner login")
+        .path_param("name", "Repo name")
+        .query_param("page", false, PAGE_DOC)
+        .query_param("per_page", false, PER_PAGE_DOC)
+        .handler(handlers::list_artifacts)
+        .json_response_with_schema::<dto::ArtifactsPageDto>(
+            openapi,
+            StatusCode::OK,
+            "GitHub-shaped artifacts page",
         )
         .error_400(openapi)
         .error_401(openapi)

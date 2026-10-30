@@ -1,12 +1,16 @@
 use sea_orm_migration::prelude::*;
 
 pub mod m0001_initial;
+pub mod m0002_artifacts;
 
 pub struct Migrator;
 
 #[async_trait::async_trait]
 impl MigratorTrait for Migrator {
     fn migrations() -> Vec<Box<dyn MigrationTrait>> {
-        vec![Box::new(m0001_initial::Migration)]
+        vec![
+            Box::new(m0001_initial::Migration),
+            Box::new(m0002_artifacts::Migration),
+        ]
     }
 }

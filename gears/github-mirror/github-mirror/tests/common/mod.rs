@@ -25,7 +25,8 @@ use github_mirror::domain::repo::{
 use github_mirror::domain::service::{Service, ServiceConfig, SyncJob};
 use github_mirror::infra::storage::migrations::Migrator;
 use github_mirror::infra::storage::sea_orm_repo::{
-    SeaOrmActiveSyncRepository, SeaOrmBranchRepository, SeaOrmCheckRunRepository,
+    SeaOrmActiveSyncRepository, SeaOrmArtifactRepository, SeaOrmBranchRepository,
+    SeaOrmCheckRunRepository,
     SeaOrmCommentRepository, SeaOrmCommitCommentRepository, SeaOrmCommitFileRepository,
     SeaOrmCommitRepository, SeaOrmCommitStatusRepository, SeaOrmContributorRepository,
     SeaOrmConversationRepository, SeaOrmDeploymentRepository, SeaOrmEntityFingerprintRepository,
@@ -387,6 +388,7 @@ impl GithubPort for FakeGithub {
         Ok(ActionsListing {
             workflow_runs: f.workflow_runs.clone(),
             deployments: f.deployments.clone(),
+            artifacts: Vec::new(),
         })
     }
 
@@ -559,6 +561,7 @@ pub fn service_with_deadline(
         Arc::new(SeaOrmCommitCommentRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmIssueEventRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmDeploymentRepository::new(Arc::clone(&db))),
+        Arc::new(SeaOrmArtifactRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmPullRequestCommitRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmCommitStatusRepository::new(Arc::clone(&db))),
         Arc::new(SeaOrmWorkflowJobRepository::new(Arc::clone(&db))),

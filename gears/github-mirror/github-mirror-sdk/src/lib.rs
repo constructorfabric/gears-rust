@@ -22,9 +22,9 @@ pub mod models;
 
 pub use api::GithubMirrorClientV1;
 pub use models::{
-    Actor, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
-    CountDrift, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, LabelRef,
-    Milestone, MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile, Release,
-    ReleaseAsset, Repo, Review, ReviewComment, ReviewThread, SyncSummary, Tag, Workflow,
+    Actor, Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
+    Contributor, CountDrift, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent,
+    Label, LabelRef, Milestone, MirrorStatus, PullRequest, PullRequestCommit, PullRequestFile,
+    Release, ReleaseAsset, Repo, Review, ReviewComment, ReviewThread, SyncSummary, Tag, Workflow,
     WorkflowJob, WorkflowRun, WorkflowStep,
 };

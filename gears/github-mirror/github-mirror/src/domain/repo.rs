@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use github_mirror_sdk::{
-    Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus, Contributor,
-    Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label, Milestone,
-    PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review, ReviewComment,
-    ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun,
+    Artifact, Branch, CheckRun, Comment, Commit, CommitComment, CommitFile, CommitStatus,
+    Contributor, Deployment, Issue, IssueEvent, IssueReaction, IssueTimelineEvent, Label,
+    Milestone, PullRequest, PullRequestCommit, PullRequestFile, Release, Repo, Review,
+    ReviewComment, ReviewThread, Tag, Workflow, WorkflowJob, WorkflowRun,
 };
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
@@ -1326,6 +1326,32 @@ pub trait DeploymentRepository: Send + Sync {
         repo_id: i64,
         window: PageWindow,
     ) -> Result<Vec<Deployment>, DomainError>;
+}
+
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactRecord {
+    pub id: i64,
+    pub repo_id: i64,
+    pub name: String,
+    pub size_in_bytes: i64,
+    pub expired: bool,
+    pub workflow_run_id: Option<i64>,
+    pub head_branch: Option<String>,
+    pub head_sha: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub expires_at: Option<String>,
+}
+
+#[async_trait]
+pub trait ArtifactRepository: Send + Sync {
+    async fn page_by_repo(
+        &self,
+        scope: &AccessScope,
+        repo_id: i64,
+        window: PageWindow,
+    ) -> Result<(Vec<Artifact>, u64), DomainError>;
 }
 
 /// Write-side record for a commit of one pull request.

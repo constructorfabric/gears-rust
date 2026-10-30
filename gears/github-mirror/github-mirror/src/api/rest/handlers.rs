@@ -27,7 +27,7 @@ use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
 use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 
 use super::dto::{
-    AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
+    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
     CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto,
     DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto,
     IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto,
@@ -791,6 +791,30 @@ pub async fn list_workflows(
         Json(WorkflowsPageDto {
             total_count,
             workflows,
+        }),
+    ))
+}
+
+pub async fn list_artifacts(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<GithubPageQuery>,
+) -> ApiResult<(HeaderMap, JsonBody<ArtifactsPageDto>)> {
+    validate_repo_path(&owner, &name)?;
+    let page = query.normalized()?;
+    let (items, total) = svc
+        .list_artifacts(&ctx, &owner, &name, page.window())
+        .await?;
+    let artifacts: Vec<ArtifactDto> = GithubPage::convert(items.items);
+    let path = format!("/repos/{owner}/{name}/actions/artifacts");
+    let headers = page.link_header_with_total(&path, artifacts.len(), Some(total));
+    let total_count = i64::try_from(total).unwrap_or(i64::MAX);
+    Ok((
+        headers,
+        Json(ArtifactsPageDto {
+            total_count,
+            artifacts,
         }),
     ))
 }
