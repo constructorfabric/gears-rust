@@ -11,13 +11,13 @@
 //! re-verify under the lock, instead of locking the lease before it knows
 //! whether it may.
 
-use sea_orm::sea_query::{Expr, LockBehavior, LockType};
+use sea_orm::sea_query::{Expr, LockBehavior, LockType, SelectStatement};
 
 pub use super::RowWait;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue, ColumnTrait, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter, QueryOrder,
-    QuerySelect, QueryTrait,
+    ActiveValue, ColumnTrait, Condition, DbErr, EntityTrait, FromQueryResult, Order, QueryFilter,
+    QueryOrder, QuerySelect, QueryTrait,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -278,19 +278,9 @@ pub async fn unreturned_expired_holds(
     period_id: Option<Uuid>,
     now: OffsetDateTime,
 ) -> Result<Vec<lease_hold::Model>, ScopeError> {
-    // A subquery, not a bound token list: the expired backlog has no upper bound.
-    let expired = lease::Entity::find()
-        .filter(lease::Column::State.eq(STATE_ACTIVE))
-        .filter(lease::Column::ExpiryAt.lte(now))
-        .secure()
-        .scope_with(scope)
-        .into_inner()
-        .select_only()
-        .column(lease::Column::Token)
-        .into_query();
     let mut query = lease_hold::Entity::find()
         .filter(lease_hold::Column::QuotaId.eq(quota_id))
-        .filter(lease_hold::Column::LeaseToken.in_subquery(expired))
+        .filter(lease_hold::Column::LeaseToken.in_subquery(expired_tokens(scope, now)))
         .filter(lease_hold::Column::ReturnedAt.is_null());
     query = match period_id {
         Some(period_id) => query.filter(lease_hold::Column::PeriodId.eq(period_id)),
@@ -302,6 +292,49 @@ pub async fn unreturned_expired_holds(
         .scope_with(scope)
         .all(runner)
         .await
+}
+
+/// Every unreturned hold on `quota_ids` whose lease has expired, on one of
+/// `period_ids` or on no period: what a snapshot read subtracts from the
+/// counters of a whole page. Takes no lock.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn unreturned_expired_holds_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_ids: &[Uuid],
+    period_ids: &[Uuid],
+    now: OffsetDateTime,
+) -> Result<Vec<lease_hold::Model>, ScopeError> {
+    lease_hold::Entity::find()
+        .filter(lease_hold::Column::QuotaId.is_in(quota_ids.iter().copied()))
+        .filter(
+            Condition::any()
+                .add(lease_hold::Column::PeriodId.is_in(period_ids.iter().copied()))
+                .add(lease_hold::Column::PeriodId.is_null()),
+        )
+        .filter(lease_hold::Column::LeaseToken.in_subquery(expired_tokens(scope, now)))
+        .filter(lease_hold::Column::ReturnedAt.is_null())
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await
+}
+
+/// The tokens of active leases expired by `now`, as a subquery: the expired
+/// backlog has no upper bound, so it is never bound as a list.
+fn expired_tokens(scope: &AccessScope, now: OffsetDateTime) -> SelectStatement {
+    lease::Entity::find()
+        .filter(lease::Column::State.eq(STATE_ACTIVE))
+        .filter(lease::Column::ExpiryAt.lte(now))
+        .secure()
+        .scope_with(scope)
+        .into_inner()
+        .select_only()
+        .column(lease::Column::Token)
+        .into_query()
 }
 
 /// Active leases holding `quota_id` that have not expired, locked in token

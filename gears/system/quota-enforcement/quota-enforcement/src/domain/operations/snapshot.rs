@@ -1,7 +1,7 @@
 //! The snapshot read: the per-Quota state of explicit targets in one tenant.
 //!
 //! The gear owns the request's shape, its authorization and its catalogue
-//! mapping; storage owns the read, the page and the I3 exception. A consuming
+//! mapping; storage owns the read and the page, and writes nothing. A consuming
 //! product serves its end-user views through this same S2S call, naming the
 //! user and tenant it authenticated; end users never reach QE directly.
 //!

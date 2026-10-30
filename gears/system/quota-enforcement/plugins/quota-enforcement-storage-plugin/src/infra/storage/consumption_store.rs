@@ -1082,6 +1082,12 @@ impl LockedCounter {
             window: None,
         }
     }
+
+    /// The current period row this counter reads, `None` for an allocation
+    /// row or a period with no row yet.
+    pub(super) fn period_id(&self) -> Option<Uuid> {
+        self.period_id
+    }
 }
 
 /// Lock every counter row of `quota` that a write in this transaction can
@@ -1110,10 +1116,7 @@ pub(super) async fn lock_counters_of(
 }
 
 /// The snapshot of `quota` from its `counter`, less the expired holds nobody
-/// has returned yet: the per-Quota state every snapshot read returns and every
-/// evaluation sees.
-// @cpt-algo:cpt-cf-quota-enforcement-algo-snapshot-state:p1
-// @cpt-dod:cpt-cf-quota-enforcement-dod-snapshot-state-contract:p1
+/// has returned yet: the per-Quota state every evaluation sees.
 pub(super) async fn snapshot_of_locked(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -1121,6 +1124,20 @@ pub(super) async fn snapshot_of_locked(
     counter: &LockedCounter,
     now: OffsetDateTime,
 ) -> Result<QuotaSnapshot, TxError> {
+    let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), counter.period_id, now).await?;
+    Ok(snapshot_from(quota, counter, owed, now))
+}
+
+/// The snapshot of `quota` from its `counter`, less `owed`, what its expired
+/// holds still occupy: the per-Quota state every snapshot read returns.
+// @cpt-algo:cpt-cf-quota-enforcement-algo-snapshot-state:p1
+// @cpt-dod:cpt-cf-quota-enforcement-dod-snapshot-state-contract:p1
+pub(super) fn snapshot_from(
+    quota: &Quota,
+    counter: &LockedCounter,
+    owed: u64,
+    now: OffsetDateTime,
+) -> QuotaSnapshot {
     // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
     let (quota_id, subject, metric, quota_type) = (
         quota.id,
@@ -1131,7 +1148,6 @@ pub(super) async fn snapshot_of_locked(
     // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-identity
     // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-amounts
     // @cpt-begin:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
-    let owed = unreturned_expired(tx, scope, quota.id.as_uuid(), counter.period_id, now).await?;
     let consumed = counter.stored.saturating_sub(owed);
     // @cpt-end:cpt-cf-quota-enforcement-algo-lazy-expiry:p1:inst-lzy-capacity
     let remaining = quota.cap.map(|cap| cap.saturating_sub(consumed));
@@ -1166,7 +1182,7 @@ pub(super) async fn snapshot_of_locked(
     // @cpt-begin:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
     // One Quota's own state: the type has no field for policy attribution
     // and nothing here sums across Quotas.
-    Ok(QuotaSnapshot {
+    QuotaSnapshot {
         quota_id,
         subject,
         metric,
@@ -1179,7 +1195,7 @@ pub(super) async fn snapshot_of_locked(
         metadata,
         validity_window,
         currently_within_window,
-    })
+    }
     // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-return
     // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noheadline
     // @cpt-end:cpt-cf-quota-enforcement-algo-snapshot-state:p1:inst-sst-noattr

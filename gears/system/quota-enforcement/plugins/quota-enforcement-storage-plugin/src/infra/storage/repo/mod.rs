@@ -23,7 +23,7 @@ pub mod policy_repo;
 /// and the primitive retries under its budget, so none of their transactions
 /// ever queues behind another and a wait can never run past the budget. The
 /// paths I8 does not cover (Quota lifecycle, the deactivation cascade, the
-/// sweeper, the snapshot read's period materialization) keep queueing.
+/// sweeper) keep queueing.
 ///
 /// `SQLite` has no row locks and drops the clause either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

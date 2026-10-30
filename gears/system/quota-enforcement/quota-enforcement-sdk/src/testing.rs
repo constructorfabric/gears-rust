@@ -1010,8 +1010,7 @@ impl InMemoryStorage {
     /// when the Quota has none or its current row has elapsed.
     ///
     /// Materialization only creates the successor row. Settling the row it
-    /// succeeds, and emitting that row's rollover event, belongs to a mutating
-    /// primitive, so a snapshot read enqueues nothing.
+    /// succeeds, and emitting that row's rollover event, is the caller's.
     fn ensure_current_row(
         st: &mut StorageState,
         quota_id: QuotaId,
@@ -1603,23 +1602,10 @@ impl InMemoryStorage {
         }
     }
 
-    /// Snapshots of `ids`, in that order. The I3 exception: a consumption
-    /// Quota within its validity window gets its current window's row;
-    /// nothing is settled and no event is emitted. A Quota outside its window
-    /// gets no row, and an elapsed row reads as zero.
-    fn read_snapshots(st: &mut StorageState, ids: &[QuotaId]) -> Vec<QuotaSnapshot> {
-        let now = Self::now(st);
-        for id in ids {
-            let valid_consumption = st.quotas.get(id).is_some_and(|quota| {
-                quota.quota_type == QuotaType::Consumption
-                    && quota
-                        .validity_window
-                        .is_none_or(|window| window.contains(now))
-            });
-            if valid_consumption {
-                Self::ensure_current_row(st, *id, now);
-            }
-        }
+    /// Snapshots of `ids`, in that order. A read writes nothing (I3): a
+    /// missing or elapsed row reads as zero, and the next mutation creates
+    /// the current one.
+    fn read_snapshots(st: &StorageState, ids: &[QuotaId]) -> Vec<QuotaSnapshot> {
         ids.iter()
             .filter_map(|id| st.quotas.get(id).cloned())
             .map(|quota| Self::snapshot(st, &quota))

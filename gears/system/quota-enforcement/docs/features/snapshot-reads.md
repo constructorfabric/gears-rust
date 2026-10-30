@@ -54,9 +54,8 @@ read-only Decision Preview of the consumption-operations feature instead
 **Scope**: `POST /v1/quota-enforcement/snapshot` for explicit caller-supplied tenant/subject/metric filters with cursor pagination
 (operator-configured page size, default 100 entries per page); the per-Quota state contract shared by all three
 cases; S2S consumer reads used by product backends to render self-service views; manager/operator reads with explicit
-targets; lazy period-row materialization as the single read-path write
-exception (the semantics are owned by the consumption-operations feature and invoked here); the
-`QuotaEnforcementClientV1::snapshot` SDK method.
+targets; the read-only guarantee (I3), under which a consumption Quota without a row for its current window reads as
+zero; the `QuotaEnforcementClientV1::snapshot` SDK method.
 
 **Out of scope**: admission verdicts (served by `evaluate_preview` in the consumption-operations feature), the Quota
 CRUD read endpoints (`GET /v1/quota-enforcement/quotas*`, owned by the quota-lifecycle feature), Policy attribution
@@ -132,11 +131,9 @@ reads are PRD requirement surfaces without a dedicated use case)
 2. [x] - `p1` - Treat single and bulk as degenerate cases of the one request shape: `subjects.len() == 1` realises `cpt-cf-quota-enforcement-fr-quota-snapshot-read`, `subjects.len() >= 1` realises `cpt-cf-quota-enforcement-fr-bulk-quota-snapshot-read`; reject malformed public target/filter shape before PDP; there is no separate REST path - `inst-snp-shape`
 3. [x] - `p1` - PDP authorizes the complete structurally valid explicit target against the authenticated principal - `inst-snp-authz`
 4. [x] - `p1` - QE maps each authorized `(metric, kind)` through the catalogue, then calls `bulk_read_quota_snapshot(pairs, page)` under the returned `AccessScope` per `cpt-cf-quota-enforcement-algo-pdp-constraint-composition` (foundation), reading the `quotas` rows and their counter rows; the read is read-only (I3) - `inst-snp-read`
-5. [x] - `p1` - **IF** a consumption Quota within its validity window has no row for its current window (the row is missing, or `now() >= period_end`) - `inst-snp-lazy-if`
-   1. [x] - `p1` - Create only the current window's period row (`consumed = 0`, no threshold marker), the single permitted I3 write exception on this read path; nothing is settled and no event is emitted, because closing the elapsed period (settlement and the `period-rollover` event with its closing figures) belongs to the mutating operation that crosses the boundary per `cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature); a Quota outside its validity window gets no row; the snapshot reflects the fresh period - `inst-snp-lazy`
-6. [x] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state` - `inst-snp-assemble`
-7. [x] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
-8. [x] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty page; the SDK path is `QuotaEnforcementClientV1::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
+5. [x] - `p1` - Assemble each returned Quota's state per `cpt-cf-quota-enforcement-algo-snapshot-state`; a consumption Quota with no row for its current window (the row is missing, or `now() >= period_end`) reads as zero over that window, and the read creates no row: opening the new period, settling the elapsed one and emitting its `period-rollover` event belong to the next mutating operation per `cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature) - `inst-snp-assemble`
+6. [x] - `p1` - Apply `cpt-cf-quota-enforcement-algo-snapshot-pagination` to the result set - `inst-snp-page`
+7. [x] - `p1` - **RETURN** `200` with the `PageResult<QuotaSnapshot>` page; an empty applicable set returns an empty page; the SDK path is `QuotaEnforcementClientV1::snapshot(req)` returning `PageResult<QuotaSnapshot>` - `inst-snp-return`
 
 ### Consumer-Backed Self-Service Snapshot
 
@@ -162,7 +159,7 @@ calls Quota Enforcement directly)
 3. [x] - `p1` - PDP authorizes the complete structurally valid target tuple; QE then maps the authorized tenant and user kinds through the catalogue - `inst-eus-fix`
 4. [x] - `p1` - **IF** any target lies outside the backend's authorized scope - `inst-eus-broaden-if`
    1. [x] - `p1` - **RETURN** canonical `PermissionDenied` before storage - `inst-eus-broaden`
-5. [x] - `p1` - DB: the gateway and storage pipeline are otherwise identical to `cpt-cf-quota-enforcement-flow-snapshot-read`, including the lazy period materialization and the read-only guarantee - `inst-eus-read`
+5. [x] - `p1` - DB: the gateway and storage pipeline are otherwise identical to `cpt-cf-quota-enforcement-flow-snapshot-read`, including the read-only guarantee - `inst-eus-read`
 6. [x] - `p1` - Return every applicable active Quota under that scope, and only Quotas applicable to that set: Quotas that govern a subject's consumption are transparent to that subject, and no per-Quota or per-key invisibility primitive exists - `inst-eus-all`
 7. [x] - `p1` - The per-Quota state shape is identical to the operator-side call and carries no Policy attribution; the applicable-Quotas filter is the only difference between the two cases (`cpt-cf-quota-enforcement-fr-end-user-quota-snapshot-read`) - `inst-eus-shape`
 8. [x] - `p1` - **RETURN** the `PageResult<QuotaSnapshot>` page for Quota Manager to render; the end-user authentication and rate-limit story is owned by Quota Manager, not by QE - `inst-eus-return`
@@ -182,7 +179,7 @@ calls Quota Enforcement directly)
 2. [x] - `p1` - Populate `cap` (numeric, or `null` for unbounded Quotas per the quota-lifecycle cap semantics), the current consumed amount (or the in-flight amount for allocation type), and `remaining` (numeric, or `null` when `cap` is `null`) - `inst-sst-amounts`
 3. [x] - `p1` - Populate `enforcement_mode` (per `cpt-cf-quota-enforcement-fr-enforcement-mode`, owned by the quota-lifecycle feature) - `inst-sst-mode`
 4. [x] - `p1` - **IF** the quota type is `consumption` - `inst-sst-period-if`
-   1. [x] - `p1` - Populate the period boundary and the next reset timestamp of the current window: from its counter row when one exists, otherwise from the window the Quota's period type gives for the read's time, with the consumed amount reading zero (a valid Quota's row is created by this read, an out-of-window Quota's is not); the next reset is that window's end - `inst-sst-period`
+   1. [x] - `p1` - Populate the period boundary and the next reset timestamp of the current window: from its counter row when one exists, otherwise from the window the Quota's period type gives for the read's time, with the consumed amount reading zero (the read creates no row; the next mutating operation does); the next reset is that window's end - `inst-sst-period`
 5. [x] - `p1` - **ELSE** - `inst-sst-noperiod-else`
    1. [x] - `p1` - Report "no period"; allocation Quotas have no period dimension - `inst-sst-noperiod`
 6. [x] - `p1` - Populate the Quota's `metadata` map in full, subject to PDP scoping (`cpt-cf-quota-enforcement-fr-quota-metadata` return rule, owned by the quota-lifecycle feature) - `inst-sst-metadata`
@@ -211,7 +208,7 @@ entries per page), the optional continuation cursor from a prior page
 
 This feature introduces no entity and no lifecycle state of its own: it is a read-only composition over state owned
 elsewhere. The Quota lifecycle states it reads are defined by `cpt-cf-quota-enforcement-state-quota-lifecycle`
-(quota-lifecycle feature), and the consumption period states its lazy materialization step touches are defined by
+(quota-lifecycle feature), and the consumption period states it reads are defined by
 `cpt-cf-quota-enforcement-state-consumption-period` (consumption-operations feature). Neither is re-specified here.
 
 ## 5. Definitions of Done
@@ -298,12 +295,12 @@ presentation, and rate limiting stay with the consuming product.
 
 - [x] `p1` - **ID**: `cpt-cf-quota-enforcement-dod-snapshot-read-only`
 
-The snapshot read path **MUST** write no persistent state (I3): no counter mutation, no idempotency record, no
-operation-log entry, and no outbox event of its own. The single permitted exception is the lazy materialization of a
-fresh consumption period row when the read observes a crossed boundary or a missing row, for a Quota within its
-validity window only, with `consumed = 0` and no threshold marker (I13). The read **MUST NOT** settle the elapsed
-period or emit its `period-rollover` event: both belong to the mutating operation that crosses the boundary per
-`cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature).
+The snapshot read path **MUST** write no persistent state (I3): no period row, no counter mutation, no idempotency
+record, no operation-log entry, and no outbox event. A read that observes a crossed boundary or a missing row reports
+the current window as zero; creating the new period row, settling the elapsed period and emitting its
+`period-rollover` event all belong to the next mutating operation per
+`cpt-cf-quota-enforcement-algo-period-rollover` (consumption-operations feature). The read **MUST NOT** take a row
+lock, so it never waits on a writer and never makes a writer wait or fail.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-flow-snapshot-read`
@@ -312,7 +309,7 @@ period or emit its `period-rollover` event: both belong to the mutating operatio
 
 **Touches**:
 - API: no new endpoint (a property of the snapshot read path)
-- DB: `quota_consumption_counters` (lazy materialization only; all other access read-only)
+- DB: `quotas`, `quota_consumption_counters`, `quota_allocation_counters`, `leases`, `lease_holds` (read-only)
 - Entities: `Counter` (consumption)
 
 ## 6. Acceptance Criteria
@@ -335,10 +332,11 @@ period or emit its `period-rollover` event: both belong to the mutating operatio
   envelope and never a Decision shape
 - [ ] An operator-side bulk read never returns rows outside the caller's tenant or `AccessScope`; such rows are
   absent, not errors (PDP-scoped filtering through `SecureConn` scope compilation)
-- [ ] After a snapshot read, storage holds no new idempotency record, operation-log entry, outbox event, or counter
-  mutation, except the new consumption period row of a Quota within its validity window, with `consumed = 0` and
-  `highest_crossed_threshold_pct = NULL`; no closing-period settlement and no `period-rollover` event, which the next
-  mutating operation across the boundary produces
+- [ ] After a snapshot read, storage holds no new period row, counter mutation, idempotency record, operation-log
+  entry, or outbox event, even across a period boundary; the next mutating operation opens the new period, settles
+  the elapsed one and emits its `period-rollover` event
+- [ ] A snapshot read never waits on a debit that holds the Quota row, and a debit is never refused because a
+  snapshot read is in flight
 - [ ] A Quota whose `validity_end` has passed is still returned while active, with `currently_within_window = false`
   and its stored `validity_window` intact
 - [ ] Metrics scrape shows no new gear-specific instrument from this feature and no high-cardinality label
@@ -353,9 +351,10 @@ period or emit its `period-rollover` event: both belong to the mutating operatio
   follows the DECOMPOSITION assignment, and the component-description alignment is a tracked upstream DESIGN item.
 - **Single-read subject language**: single and bulk reads use the same explicit logical subject filters under PDP
   scope; QE maps scope kinds to concrete projections before storage lookup.
-- **I3 exception naming**: DESIGN invariant I3 names both snapshot reads, `read_quota_snapshot` and
-  `bulk_read_quota_snapshot(pairs, page)`, as carriers of the lazy-materialization exception, which DECOMPOSITION §2.8
-  grants to this feature's read path.
+- **No read-path write**: the snapshot reads do not create the current window's period row. Under `PostgreSQL` that
+  insert's foreign-key check would wait on the Quota row a debit holds, deadlocking the debit's own insert of the same
+  row, or would refuse a debit at the default contention budget; and the row would carry nothing the read does not
+  already report.
 - **`currently_within_window` hand-off**: the quota-lifecycle feature owns validity-window storage and the
   `cpt-cf-quota-enforcement-algo-validity-window` computation and surfaces the boolean on its Quota read endpoints;
   this feature surfaces the same two fields on Quota Snapshots per the PRD §5.10 grant, computing the boolean
@@ -376,7 +375,8 @@ period or emit its `period-rollover` event: both belong to the mutating operatio
   same schema major version, and disabling the route removes the read surface without touching stored state.
 - **Test layering**: state assembly (field population, `remaining` derivation, window boolean) and pagination get
   unit tests; PDP scoping, the end-user restriction, the broadening rejection, and the read-only guarantee get
-  integration tests against the storage plugin, including the boundary-crossing materialization case.
+  integration tests against the storage plugin, including a read across a period boundary and a read concurrent with
+  a debit in both lock orders.
 - **Non-applicable review domains**: UX/accessibility is not applicable; the end-user rendering surface is owned by
   Quota Manager. Data protection: responses carry Quota Metadata, which is Platform Operational Data per PRD §6.2
   and must not contain PII by the quota-lifecycle write-path rule; the read path adds no further handling.

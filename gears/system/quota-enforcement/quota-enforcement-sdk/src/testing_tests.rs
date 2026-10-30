@@ -2287,7 +2287,7 @@ async fn a_rollback_replay_returns_the_stored_outcome() {
 }
 
 #[tokio::test]
-async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
+async fn a_snapshot_read_writes_nothing_and_the_next_mutation_opens_the_period() {
     let (storage, id) = consumption_storage(Some(100), Vec::new()).await;
     storage
         .apply_debit_plan_for(10, &idem(OperationType::Debit, "k1", 1))
@@ -2301,29 +2301,24 @@ async fn a_snapshot_read_materializes_the_current_row_and_settles_nothing() {
         .await
         .expect("read");
 
-    assert_eq!(snapshots[0].consumed, 0, "the new period starts empty");
+    assert_eq!(snapshots[0].consumed, 0, "the new period reads as empty");
     let rows = storage.period_rows(id);
-    assert_eq!(rows.len(), 2, "the successor row was materialized");
-    assert!(!rows[0].settled, "a read settles nothing");
+    assert_eq!(rows.len(), 1, "the read created no row (I3)");
+    assert!(!rows[0].settled, "and settled nothing");
     assert_eq!(
         storage.events().len(),
         events_before,
         "a read enqueues nothing, so a preview never writes an outbox row"
     );
 
-    // Repeating the read writes nothing further.
-    storage
-        .read_quota_snapshot(&ctx(), &scope(), &applicable())
-        .await
-        .expect("read again");
-    assert_eq!(storage.period_rows(id).len(), 2);
-
-    // The next mutation is what settles and emits.
+    // The next mutation opens the new period, settles the old one and emits.
     storage
         .apply_debit_plan_for(1, &idem(OperationType::Debit, "k2", 2))
         .await
         .expect("debit");
-    assert!(storage.period_rows(id)[0].settled);
+    let rows = storage.period_rows(id);
+    assert_eq!(rows.len(), 2);
+    assert!(rows[0].settled);
     assert!(kinds(&storage).contains(&NotificationEventKind::PeriodRollover));
 }
 
@@ -2983,7 +2978,7 @@ async fn an_unsupported_scope_is_refused_even_when_no_row_would_be_read() {
 }
 
 #[tokio::test]
-async fn a_read_creates_the_current_row_only_for_a_quota_within_its_validity_window() {
+async fn a_read_creates_no_row_and_still_returns_a_quota_outside_its_window() {
     let (storage, valid) = consumption_storage(Some(100), Vec::new()).await;
     let lapsed = storage
         .create_quota(
@@ -3043,14 +3038,10 @@ async fn a_read_creates_the_current_row_only_for_a_quota_within_its_validity_win
     );
     assert_eq!(
         storage.period_rows(valid).len(),
-        valid_rows + 1,
-        "the valid quota got its current row"
+        valid_rows,
+        "the read created no row (I3)"
     );
-    assert_eq!(
-        storage.period_rows(lapsed).len(),
-        lapsed_rows,
-        "the lapsed quota got none"
-    );
+    assert_eq!(storage.period_rows(lapsed).len(), lapsed_rows);
     assert!(
         storage.period_rows(valid).iter().all(|row| !row.settled),
         "a read settles nothing"
@@ -3069,8 +3060,11 @@ async fn a_read_creates_the_current_row_only_for_a_quota_within_its_validity_win
         .await
         .expect("single read");
     assert_eq!(
-        storage.period_rows(lapsed).len(),
-        lapsed_rows,
+        (
+            storage.period_rows(valid).len(),
+            storage.period_rows(lapsed).len()
+        ),
+        (valid_rows, lapsed_rows),
         "the single read follows the same rule"
     );
 }

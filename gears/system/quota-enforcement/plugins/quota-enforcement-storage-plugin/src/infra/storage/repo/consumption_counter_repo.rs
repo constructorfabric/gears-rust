@@ -6,18 +6,13 @@
 //! on `record_version`, so a row that moved between the read and the write
 //! reports it instead of silently overwriting.
 
-use quota_enforcement_sdk::PeriodWindow;
-use sea_orm::sea_query::OnConflict;
-use sea_orm::{ActiveValue, ColumnTrait, DbErr, EntityTrait, Order, QueryFilter, QueryOrder};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order, QueryFilter, QueryOrder};
 use time::OffsetDateTime;
-use toolkit_db::secure::{
-    DBRunner, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt, secure_insert,
-};
+use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt, SecureUpdateExt, secure_insert};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::RowWait;
-use crate::infra::storage::entity::quota;
 use crate::infra::storage::entity::quota_consumption_counter::{self, Column, Entity};
 
 /// The Quota's most recent period row, locked for update. `None` when the
@@ -159,66 +154,6 @@ pub async fn insert_period(
     .await
 }
 
-/// Materialize the current window's period row of a Quota a snapshot read has
-/// just read (the I3 exception), keeping a row another transaction created
-/// first. Returns whether this call inserted it.
-///
-/// # Precondition: `quota` was read under `scope`, in this transaction
-///
-/// The row's tenant and Quota ids come only from `quota`, never from request
-/// input: the caller passes the Quota row its own transaction read under the
-/// caller's PDP scope, and that read is the authority for the insert. The
-/// scope is carried unchanged but not re-checked in memory, because
-/// `secure_insert` cannot evaluate a tenant-subtree filter against a row and
-/// would refuse the insert under such a grant. This is the plugin's only
-/// unchecked insert, and only the snapshot read path calls it.
-///
-/// No explicit row lock is taken; a conflicting insert of the same period may
-/// still wait for the other transaction to end. The row starts at zero with
-/// no threshold marker (I13), and nothing is settled or emitted.
-///
-/// # Errors
-///
-/// The scope or database error of the insert.
-pub(in crate::infra::storage) async fn insert_current_period_of(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    quota: &quota::Model,
-    window: &PeriodWindow,
-    now: OffsetDateTime,
-) -> Result<bool, ScopeError> {
-    let row = quota_consumption_counter::ActiveModel {
-        period_id: ActiveValue::Set(Uuid::now_v7()),
-        quota_id: ActiveValue::Set(quota.id),
-        tenant_id: ActiveValue::Set(quota.tenant_id),
-        period_start: ActiveValue::Set(window.start),
-        period_end: ActiveValue::Set(window.end),
-        consumed: ActiveValue::Set(0),
-        highest_crossed_threshold_pct: ActiveValue::Set(None),
-        is_settled: ActiveValue::Set(false),
-        record_version: ActiveValue::Set(1),
-        created_at: ActiveValue::Set(now),
-        updated_at: ActiveValue::Set(now),
-    };
-    let keep_existing = OnConflict::columns([Column::QuotaId, Column::PeriodStart])
-        .do_nothing()
-        .to_owned();
-    let inserted = Entity::insert(row)
-        .secure()
-        .scope_unchecked(scope)?
-        // Nothing is updated on conflict, so the tenant cannot change.
-        .on_conflict_raw(keep_existing)
-        .exec(runner)
-        .await;
-    match inserted {
-        Ok(_) => Ok(true),
-        // `DO NOTHING` inserted none, which `SeaORM` reports client-side; the
-        // statement itself succeeded.
-        Err(ScopeError::Db(DbErr::RecordNotInserted)) => Ok(false),
-        Err(error) => Err(error),
-    }
-}
-
 /// The next version; these rows never reset, so the last one wraps to 1.
 fn next_version(version: i32) -> i32 {
     version.checked_add(1).unwrap_or(1)
@@ -297,6 +232,47 @@ pub async fn find_allocation_for_update(
         .secure()
         .scope_with(scope)
         .one(runner)
+        .await
+}
+
+/// The current period rows of `quota_ids` at `now`, unlocked, for a snapshot
+/// read: at most one per Quota, since its windows never overlap.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_current_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_ids: &[Uuid],
+    now: OffsetDateTime,
+) -> Result<Vec<quota_consumption_counter::Model>, ScopeError> {
+    Entity::find()
+        .filter(Column::QuotaId.is_in(quota_ids.iter().copied()))
+        .filter(Column::PeriodStart.lte(now))
+        .filter(Column::PeriodEnd.gt(now))
+        .secure()
+        .scope_with(scope)
+        .all(runner)
+        .await
+}
+
+/// The allocation counter rows of `quota_ids`, unlocked, for a snapshot read.
+///
+/// # Errors
+///
+/// The scope or database error of the read.
+pub async fn find_allocations_of(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    quota_ids: &[Uuid],
+) -> Result<Vec<crate::infra::storage::entity::quota_allocation_counter::Model>, ScopeError> {
+    use crate::infra::storage::entity::quota_allocation_counter as alloc;
+    alloc::Entity::find()
+        .filter(alloc::Column::QuotaId.is_in(quota_ids.iter().copied()))
+        .secure()
+        .scope_with(scope)
+        .all(runner)
         .await
 }
 

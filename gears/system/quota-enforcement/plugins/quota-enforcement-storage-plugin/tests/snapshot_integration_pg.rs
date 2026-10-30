@@ -6,19 +6,21 @@
 //!
 //! - a page is read from one snapshot: writers committing between its page
 //!   query and its assembly change neither a counter nor a Quota row on it;
-//! - a period row a writer commits after the read's snapshot is not
-//!   duplicated: the read's own insert conflicts, the read runs again, and
-//!   reports the committed row;
+//! - a period row a writer commits after the read's snapshot is neither seen
+//!   nor duplicated: the read reports zero and the writer's row stands alone;
 //! - under a tenant-subtree grant, compiled against `tenant_closure` by the
-//!   secure layer, a visible stale Quota gets its row and an invisible one
-//!   does not, through both reads;
-//! - a read creates a row but never settles or emits: the debit that crosses
-//!   the boundary emits the one `period-rollover`.
+//!   secure layer, both reads return the visible Quota and not the other;
+//! - a read writes nothing (I3): across a boundary it opens, settles and
+//!   emits nothing, and the debit that crosses it emits the one
+//!   `period-rollover`;
+//! - a read takes no row lock: it finishes while a debit holds the Quota row,
+//!   and a debit is not refused while a read is in flight;
+//! - a page issues as many statements for twenty Quotas as for two.
 //!
 //! Requires Docker. Run with
 //! `cargo test -p cf-gears-quota-enforcement-storage-plugin --features postgres --test snapshot_integration_pg`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,10 +34,11 @@ use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, CapPatch, Decision, EvaluatedMutation, IdempotencyScope,
     IdempotencySubjectKey, IdempotencyWrite, MetricId, OperationType, PageRequest, PageResult,
     PayloadHash, PeriodType, PolicyDraft, PolicyScope, QuotaDebitPlan, QuotaDraft, QuotaId,
-    QuotaPatch, QuotaSnapshot, QuotaType, SubjectRef, TenantId,
+    QuotaPatch, QuotaSnapshot, QuotaType, StorageError, SubjectRef, TenantId,
 };
 use sea_orm::EntityTrait as _;
 use sea_orm_migration::prelude::*;
+use testcontainers::core::ExecCommand;
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, ImageExt};
 use testcontainers_modules::postgres::Postgres;
@@ -273,7 +276,7 @@ struct PgHarness {
     enqueuer: Arc<dyn NotificationOutbox>,
     clock: Arc<Mutex<OffsetDateTime>>,
     outbox: OutboxHandle,
-    _container: ContainerAsync<Postgres>,
+    container: ContainerAsync<Postgres>,
 }
 
 impl PgHarness {
@@ -344,7 +347,7 @@ impl PgHarness {
             enqueuer,
             clock,
             outbox,
-            _container: container,
+            container,
         }
     }
 
@@ -405,36 +408,25 @@ impl PgHarness {
     }
 
     async fn debit(&self, holder: &str, amount: u64, key: &str) {
-        let applicable = applicable(tenant(), holder);
-        let idempotency = IdempotencyWrite {
-            scope: IdempotencyScope {
-                tenant_id: tenant(),
-                subject_key: IdempotencySubjectKey::of(&applicable.subjects),
-                operation_type: OperationType::Debit,
-                key: key.to_owned(),
-            },
-            payload_hash: PayloadHash::from_bytes([1; 32]),
-        };
-        let null = serde_json::Value::Null;
-        self.store
-            .apply_debit_plan(
-                &ctx(),
-                &scope(),
-                &EvaluatedMutation {
-                    applicable: &applicable,
-                    amount,
-                    request: &null,
-                    resource: &null,
-                    user_projection: None,
-                    limits: limits(),
-                    idempotency: &idempotency,
-                    authorized: AttributionDigest::from_bytes([7; 32]),
-                    evaluate: allow_all(),
-                },
-                &[],
-            )
+        debit_with(Arc::clone(&self.store), holder, amount, key, allow_all())
             .await
             .expect("debit");
+    }
+
+    /// Sessions `PostgreSQL` shows waiting on a lock.
+    async fn lock_waiters(&self) -> u32 {
+        let sql = "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'";
+        let args = ["psql", "-tA", "-U", "user", "-d", "app", "-c", sql];
+        let mut output = self
+            .container
+            .exec(ExecCommand::new(args.map(str::to_owned)))
+            .await
+            .expect("psql runs in the container");
+        let stdout = output.stdout_to_vec().await.expect("psql output");
+        String::from_utf8_lossy(&stdout)
+            .trim()
+            .parse()
+            .expect("a count")
     }
 
     async fn periods(&self, id: QuotaId) -> Vec<quota_consumption_counter::Model> {
@@ -463,6 +455,114 @@ impl PgHarness {
             .filter(|message| message.payload_type == "period-rollover")
             .count()
     }
+}
+
+/// Debit `amount` from `holder`'s Quotas through `evaluate`.
+async fn debit_with(
+    store: Arc<SqlConsumptionStore>,
+    holder: &str,
+    amount: u64,
+    key: &str,
+    evaluate: Arc<TransactionEvaluator>,
+) -> Result<(), StorageError> {
+    let applicable = applicable(tenant(), holder);
+    let idempotency = IdempotencyWrite {
+        scope: IdempotencyScope {
+            tenant_id: tenant(),
+            subject_key: IdempotencySubjectKey::of(&applicable.subjects),
+            operation_type: OperationType::Debit,
+            key: key.to_owned(),
+        },
+        payload_hash: PayloadHash::from_bytes([1; 32]),
+    };
+    let null = serde_json::Value::Null;
+    store
+        .apply_debit_plan(
+            &ctx(),
+            &scope(),
+            &EvaluatedMutation {
+                applicable: &applicable,
+                amount,
+                request: &null,
+                resource: &null,
+                user_projection: None,
+                limits: limits(),
+                idempotency: &idempotency,
+                authorized: AttributionDigest::from_bytes([7; 32]),
+                evaluate,
+            },
+            &[],
+        )
+        .await
+        .map(|_| ())
+}
+
+/// [`allow_all`] whose first call waits on the returned gate. The debit
+/// calls it inside its transaction, after it has locked the Quota rows and
+/// read their counters, and before it writes.
+fn gated_evaluator() -> (Arc<TransactionEvaluator>, GateHandle) {
+    let (reached_tx, reached_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let gate = Gate {
+        armed: AtomicBool::new(true),
+        reached: reached_tx,
+        go: Mutex::new(go_rx),
+    };
+    let allow = allow_all();
+    let evaluate: Arc<TransactionEvaluator> = Arc::new(move |context: &EvaluationContext<'_>| {
+        if gate.armed.swap(false, Ordering::SeqCst) {
+            gate.reached.send(()).expect("announce the gate");
+            tokio::task::block_in_place(|| {
+                gate.go.lock().expect("gate").recv().expect("released");
+            });
+        }
+        allow(context)
+    });
+    (
+        evaluate,
+        GateHandle {
+            reached: reached_rx,
+            go: go_tx,
+        },
+    )
+}
+
+/// Counts the statements `sqlx` reports while it dispatches for one future.
+#[derive(Clone, Default)]
+struct Statements(Arc<AtomicUsize>);
+
+impl Statements {
+    /// `op`'s output and the statements it issued.
+    async fn during<T>(op: impl std::future::Future<Output = T>) -> (T, usize) {
+        use tracing::instrument::WithSubscriber as _;
+        let counter = Self::default();
+        let out = op
+            .with_subscriber(tracing::Dispatch::new(counter.clone()))
+            .await;
+        (out, counter.0.load(Ordering::SeqCst))
+    }
+}
+
+impl tracing::Subscriber for Statements {
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        metadata.target() == "sqlx::query"
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
 }
 
 fn of(page: &PageResult<QuotaSnapshot>, id: QuotaId) -> &QuotaSnapshot {
@@ -535,7 +635,7 @@ async fn a_page_reads_one_snapshot_while_writers_commit_around_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_period_row_committed_after_the_snapshot_is_reread_not_duplicated() {
+async fn a_period_row_committed_after_the_snapshot_is_neither_seen_nor_duplicated() {
     let h = PgHarness::up().await;
     let id = h.create(consumption(tenant(), "u1", 100)).await;
     let (reader, mut gate) = h.gated_reader();
@@ -546,22 +646,20 @@ async fn a_period_row_committed_after_the_snapshot_is_reread_not_duplicated() {
             .await
     });
     gate.wait_until_reached().await;
-    // The reader saw no current row and will insert one; a debit creates it
-    // first and commits.
+    // The reader saw no current row; a debit creates it and commits.
     h.debit("u1", 7, "first").await;
     gate.release();
     let snapshots = read.await.expect("join").expect("the read succeeds");
 
-    assert_eq!(h.periods(id).await.len(), 1, "one row for the window");
-    assert_eq!(
-        snapshots[0].consumed, 7,
-        "the conflicting insert rolled the read back, and the retry saw the row"
-    );
+    assert_eq!(snapshots[0].consumed, 0, "the counter as of the snapshot");
+    let rows = h.periods(id).await;
+    assert_eq!(rows.len(), 1, "one row for the window");
+    assert_eq!(rows[0].consumed, 7);
     h.down().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn under_a_subtree_grant_both_reads_create_rows_only_for_what_they_see() {
+async fn under_a_subtree_grant_both_reads_return_only_what_they_see() {
     let h = PgHarness::up().await;
     let parent = tenant();
     let child = TenantId::new(Uuid::from_u128(0xc41d));
@@ -598,29 +696,25 @@ async fn under_a_subtree_grant_both_reads_create_rows_only_for_what_they_see() {
         .map(|snapshot| snapshot.quota_id)
         .collect();
     assert_eq!(seen, vec![inside]);
-    assert_eq!(h.periods(inside).await.len(), 1);
-    assert!(h.periods(beyond).await.is_empty());
-
-    h.set_now(DAY_TWO);
     let single = h
         .store
         .read_quota_snapshot(&ctx(), &subtree, &pairs[0])
         .await
         .expect("single read under the subtree grant");
     assert_eq!(single.len(), 1);
-    assert_eq!(h.periods(inside).await.len(), 2);
     let none = h
         .store
         .read_quota_snapshot(&ctx(), &subtree, &pairs[1])
         .await
         .expect("single read of an invisible target");
     assert!(none.is_empty());
+    assert!(h.periods(inside).await.is_empty());
     assert!(h.periods(beyond).await.is_empty());
     h.down().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_opens_the_period_but_only_the_crossing_debit_settles_and_emits() {
+async fn a_read_across_the_boundary_writes_nothing_and_the_crossing_debit_settles() {
     let h = PgHarness::up().await;
     let id = h.create(consumption(tenant(), "u1", 100)).await;
     h.debit("u1", 10, "day-one").await;
@@ -632,23 +726,138 @@ async fn a_read_opens_the_period_but_only_the_crossing_debit_settles_and_emits()
         .read_quota_snapshot(&ctx(), &scope(), &applicable(tenant(), "u1"))
         .await
         .expect("read");
-    assert_eq!(read[0].consumed, 0);
+    assert_eq!(read[0].consumed, 0, "day two reads as zero");
     let rows = h.periods(id).await;
-    assert_eq!(rows.len(), 2, "the read opened day two");
-    assert!(
-        rows.iter().all(|row| !row.is_settled),
-        "and settled nothing"
-    );
+    assert_eq!(rows.len(), 1, "the read opened nothing");
+    assert!(!rows[0].is_settled, "and settled nothing");
     assert_eq!(h.rollovers().await, before, "and emitted nothing");
 
     h.debit("u1", 1, "day-two").await;
+    let rows = h.periods(id).await;
+    assert_eq!(rows.len(), 2, "the crossing debit opened day two");
     assert!(
-        h.periods(id)
-            .await
-            .iter()
+        rows.iter()
             .any(|row| row.is_settled && row.period_start < DAY_TWO),
-        "the crossing debit settled day one"
+        "and settled day one"
     );
     assert_eq!(h.rollovers().await, before + 1, "exactly one rollover");
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_read_finishes_while_a_debit_holds_the_quota_and_writes_nothing() {
+    let h = PgHarness::up().await;
+    let id = h.create(consumption(tenant(), "u1", 100)).await;
+    let (evaluate, mut held) = gated_evaluator();
+    let debit = tokio::spawn({
+        let store = Arc::clone(&h.store);
+        async move { debit_with(store, "u1", 5, "held", evaluate).await }
+    });
+    // The debit holds the Quota row and has found no period row.
+    held.wait_until_reached().await;
+
+    let (ctx, scope, target) = (ctx(), scope(), applicable(tenant(), "u1"));
+    let snapshots = {
+        let read = h.store.read_quota_snapshot(&ctx, &scope, &target);
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                done = &mut read => break done.expect("the read succeeds"),
+                () = tokio::time::sleep(Duration::from_millis(50)) => {
+                    assert_eq!(h.lock_waiters().await, 0, "the read waits on the debit's lock");
+                }
+            }
+        }
+    };
+    assert_eq!(snapshots[0].consumed, 0);
+    assert!(
+        h.periods(id).await.is_empty(),
+        "the read wrote no period row"
+    );
+
+    held.release();
+    debit.await.expect("join").expect("the debit succeeds");
+    let rows = h.periods(id).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].consumed, 5);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_debit_is_not_refused_while_a_read_is_in_flight() {
+    let h = PgHarness::up().await;
+    let first = h.create(consumption(tenant(), "u1", 100)).await;
+    let second = h.create(consumption(tenant(), "u2", 100)).await;
+    // A debit holds the second Quota's row, so a read that wrote period rows
+    // would stop there after writing the first one's, still holding it.
+    let (evaluate, mut held) = gated_evaluator();
+    let blocker = tokio::spawn({
+        let store = Arc::clone(&h.store);
+        async move { debit_with(store, "u2", 5, "held", evaluate).await }
+    });
+    held.wait_until_reached().await;
+
+    let read = tokio::spawn({
+        let store = Arc::clone(&h.store);
+        async move {
+            store
+                .bulk_read_quota_snapshot(
+                    &ctx(),
+                    &scope(),
+                    &[applicable(tenant(), "u1"), applicable(tenant(), "u2")],
+                    PageRequest::first(10),
+                )
+                .await
+        }
+    });
+    // Until the read has finished or stopped on a lock.
+    while !read.is_finished() && h.lock_waiters().await == 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // At the 0 ms default a debit meeting a held row is refused at once.
+    debit_with(Arc::clone(&h.store), "u1", 7, "first", allow_all())
+        .await
+        .expect("the debit is not refused");
+    held.release();
+    blocker
+        .await
+        .expect("join")
+        .expect("the held debit succeeds");
+    let page = read.await.expect("join").expect("the read succeeds");
+    assert_eq!(of(&page, first).consumed, 0);
+    assert_eq!(of(&page, second).consumed, 0);
+    assert_eq!(h.periods(first).await[0].consumed, 7);
+    assert_eq!(h.periods(second).await[0].consumed, 5);
+    h.down().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_page_issues_as_many_statements_for_twenty_quotas_as_for_two() {
+    let h = PgHarness::up().await;
+    let holders: Vec<String> = (0..10).map(|i| format!("u{i}")).collect();
+    for holder in &holders {
+        h.create(consumption(tenant(), holder, 100)).await;
+        h.create(allocation(tenant(), holder, 100)).await;
+    }
+    let pairs: Vec<ApplicableQuotas> = holders
+        .iter()
+        .map(|holder| applicable(tenant(), holder))
+        .collect();
+    let (ctx, scope) = (ctx(), scope());
+    let read = |pairs| {
+        h.store
+            .bulk_read_quota_snapshot(&ctx, &scope, pairs, PageRequest::first(100))
+    };
+
+    let (two, small) = Statements::during(read(&pairs[..1])).await;
+    let (twenty, large) = Statements::during(read(&pairs)).await;
+    assert_eq!(two.expect("read").items.len(), 2);
+    assert_eq!(twenty.expect("read").items.len(), 20);
+    assert!(small > 0, "the counter sees the read's statements");
+    assert_eq!(
+        large, small,
+        "a page's statements do not grow with its Quotas"
+    );
     h.down().await;
 }
