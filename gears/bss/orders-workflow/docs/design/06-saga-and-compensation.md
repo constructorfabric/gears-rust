@@ -1219,7 +1219,9 @@ the rows match its variant and reason token, with any variant not listed taking 
 (decision D-231). The composite-gate reasons (`payer-relationship-unconfirmed`,
 `billing-terms-unsupported`, and `order-in-flight-for-key` with an `assessment` report) cannot
 answer either call; one that did would take the *a 5xx* row, and so would a diagnostics payload
-that fails to decode (decision D-237).
+that fails to decode (decision D-237). Such a payload now includes a report outcome that states a
+catalog scope key without a catalog selection, which the Lifecycle SDK refuses to decode (Lifecycle
+D-240 item 34; decision D-241).
 
 | Lifecycle answer | When it can arise | `report-outcome` answers |
 |------------------|-------------------|--------------------------|

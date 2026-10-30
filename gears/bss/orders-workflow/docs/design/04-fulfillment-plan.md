@@ -299,7 +299,12 @@ chosen optional items, included allowances, their quantities and dimension value
 expanded into per-item tasks by this slice. PriceBook refuses a bundle SKU as a plan item
 (pricing `ITEM_BUNDLE_SKU`), so there is no bundle line to expand either; this gear receives the
 order's lines exactly as Orders Lifecycle captured them on the immutable version and builds
-exactly one `FulfillmentTask` per received line (decision D-196, Lifecycle D-156).
+exactly one `FulfillmentTask` per received line (decision D-196, Lifecycle D-156). The items of one
+line state one quantity: Lifecycle refuses two different stated item quantities at authoring
+(`request-invalid`, `quantity`) and fails such a line at assessment (`reference-unresolvable`,
+upstream code `mixed-item-quantities`), so a version committed through Lifecycle's gate carries none. Both rules lift together if
+Lifecycle Q-03 admits per-item quantities. This gear authors no line and runs no assessment, so it
+adds no refusal of its own (Lifecycle D-242 items 13, 14; decision D-241).
 
 **ADRs**: none — this is a received invariant from the upstream order document, not a local
 design trade-off.
