@@ -20,7 +20,7 @@ use sea_orm::{
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
-    DBRunner, DbTx, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
+    DbTx, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -40,35 +40,6 @@ use crate::infra::storage::repo_impl::intents::{
 };
 
 // ── Creates ─────────────────────────────────────────────────────────────────
-
-/// Plain `INSERT` of a prepared row on `runner`. `scope_unchecked`: an INSERT
-/// cannot subtree-clamp on a row that doesn't exist yet.
-async fn insert_row<R: DBRunner + Sync>(
-    runner: &R,
-    scope: &AccessScope,
-    am: entity::secrets::ActiveModel,
-) -> Result<(), DomainError> {
-    entity::secrets::Entity::insert(am)
-        .secure()
-        .scope_unchecked(scope)
-        .map_err(map_scope_err)?
-        .exec(runner)
-        .await
-        .map_err(map_scope_err)?;
-    Ok(())
-}
-
-/// Runs `am`'s plain insert. A unique-index conflict maps to `Conflict`
-/// through the shared classification ladder: an expired own row still holds
-/// the reference, so a create over it is a conflict like any other.
-async fn create_row(
-    repo: &SecretRepoImpl,
-    scope: &AccessScope,
-    am: entity::secrets::ActiveModel,
-) -> Result<(), DomainError> {
-    let conn = repo.db.conn()?;
-    insert_row(&conn, scope, am).await
-}
 
 /// Create step 3 (tx1): ONE transaction retiring the attempt's intent and
 /// inserting the row `active`. The insert is `ON CONFLICT DO NOTHING`: a
@@ -191,7 +162,17 @@ pub(super) async fn insert_declared(
         value_version: ActiveValue::Set(None),
         fallback: ActiveValue::Set(DbFallback::from(new.fallback)),
     };
-    create_row(repo, scope, am).await
+    let conn = repo.db.conn()?;
+    // `scope_unchecked`: an INSERT cannot subtree-clamp on a row that doesn't
+    // exist yet.
+    entity::secrets::Entity::insert(am)
+        .secure()
+        .scope_unchecked(scope)
+        .map_err(map_scope_err)?
+        .exec(&conn)
+        .await
+        .map_err(map_scope_err)?;
+    Ok(())
 }
 
 // ── Pointer switch ──────────────────────────────────────────────────────────
@@ -348,9 +329,8 @@ pub(super) async fn switch_value_tx(
 }
 
 /// Metadata-only update (ADR-0007, "PATCH: merge, never creates", no `secret` key): never
-/// touches `value_version`/`status`. One transaction,
-/// mirroring `switch_value_tx`/`remove_value_tx`: lock + read the row first,
-/// then gate the UPDATE on the version just read under that lock.
+/// touches `value_version`/`status`. One transaction: the compare-and-set
+/// (on `expected_version` when given) and the read of the post-write row.
 pub(super) async fn update_metadata(
     repo: &SecretRepoImpl,
     scope: &AccessScope,
@@ -394,23 +374,10 @@ async fn update_metadata_tx(
 ) -> Result<Option<SecretRow>, DomainError> {
     let now = OffsetDateTime::now_utc();
 
-    let current = entity::secrets::Entity::find()
-        .lock_exclusive()
-        .secure()
-        .scope_with(scope)
-        .filter(Condition::all().add(entity::secrets::Column::Id.eq(id)))
-        .one(tx)
-        .await
-        .map_err(map_scope_err)?;
-    let Some(current) = current else {
-        return Ok(None);
-    };
-    if let Some(expected) = expected_version
-        && current.version != expected
-    {
-        return Ok(None);
+    let mut filter = Condition::all().add(entity::secrets::Column::Id.eq(id));
+    if let Some(expected) = expected_version {
+        filter = filter.add(entity::secrets::Column::Version.eq(expected));
     }
-    let locked_version = current.version;
 
     let rows_affected = entity::secrets::Entity::update_many()
         .col_expr(
@@ -427,17 +394,14 @@ async fn update_metadata_tx(
             Expr::col(entity::secrets::Column::Version).add(1_i64),
         )
         .col_expr(entity::secrets::Column::UpdatedAt, Expr::value(now))
-        .filter(
-            Condition::all()
-                .add(entity::secrets::Column::Id.eq(id))
-                .add(entity::secrets::Column::Version.eq(locked_version)),
-        )
+        .filter(filter)
         .secure()
         .scope_with(scope)
         .exec(tx)
         .await
         .map_err(map_scope_err)?
         .rows_affected;
+    // The version moved, the row is gone, or the scope excludes it.
     if rows_affected == 0 {
         return Ok(None);
     }
@@ -566,7 +530,8 @@ async fn remove_value_tx(
         .map_err(map_scope_err)?
         .rows_affected;
     if rows_affected == 0 {
-        // Belt-and-braces over `lock_exclusive` (a no-op on SQLite).
+        // `lock_exclusive` is a no-op on SQLite, so a concurrent change can
+        // still reach this CAS there.
         return Ok(None);
     }
 

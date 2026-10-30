@@ -84,7 +84,7 @@ impl SecretRepo for SecretRepoImpl {
         scope: &AccessScope,
         tenant: Uuid,
     ) -> Result<bool, DomainError> {
-        Ok(reads::scope_includes_tenant(scope, tenant))
+        Ok(crate::domain::authz::scope_admits_tenant(scope, tenant))
     }
 
     async fn list_tenants_with_other_type(
