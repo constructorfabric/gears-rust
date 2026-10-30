@@ -1811,11 +1811,16 @@ async fn tenant_scoped_produce_denial_has_no_persistence_side_effects() {
     let events = harness
         .backend()
         .read(
-            harness.security_context(),
-            "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
-            0,
+            &event_broker_sdk::backend::TopicPartition::new(
+                event_broker_sdk::GtsInstanceId::try_new(
+                    "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                )
+                .unwrap(),
+                event_broker_sdk::backend::Partition::new(0),
+            ),
             event_broker_sdk::Sequence::NONE,
             10,
+            event_broker_sdk::backend::Wait::No,
         )
         .await
         .unwrap();
