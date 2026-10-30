@@ -403,6 +403,14 @@ jobs:
           SETTINGS_SERVICE_PG_REQUIRE_DOCKER: "1"
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=settings-service-pg
 
+      - name: Test credstore v2 (pg migrations, integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # Same shape as settings-service above: Docker is on this runner, so a
+        # skip here would be a broken daemon passing green.
+        env:
+          CREDSTORE_PG_REQUIRE_DOCKER: "1"
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=credstore-pg
+
       - name: Test github-mirror (PostgreSQL and MariaDB, integration)
         run: make test-github-mirror-db
 

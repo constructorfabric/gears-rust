@@ -2711,15 +2711,19 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "cf-gears-credstore-v2-sdk",
+ "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-db",
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "sea-orm",
  "sea-orm-migration",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tracing",
  "uuid",
 ]
 

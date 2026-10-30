@@ -3,5 +3,7 @@
 //! replaces `cf-gears-credstore` when complete.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+#[doc(hidden)]
 pub mod domain;
+#[doc(hidden)]
 pub mod infra;

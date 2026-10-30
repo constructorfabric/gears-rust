@@ -57,6 +57,7 @@ pub trait SecretRepo: Send + Sync {
     /// or a `tenant` row of `req_tenant`), same resolution predicate and
     /// nearest-tenant order as [`Self::resolve_for_get`]. Private rows, the
     /// caller's own included, never take part.
+    /// Its heal flags are not computed ([`SecretRow::heal`] is the default).
     async fn resolve_non_private(
         &self,
         req_tenant: TenantId,
