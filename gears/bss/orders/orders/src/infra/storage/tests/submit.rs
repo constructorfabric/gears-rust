@@ -1,5 +1,5 @@
 //! Submit on real PostgreSQL (S3-12; D-188 steps 1–6, D-192, D-216, M2-3): the submit service
-//! over the S2-04 engine, the rules PDP, the authorized draft reads and the gate orchestrator
+//! over the S2-04 engine, the policy fake (D-227), the authorized draft reads and the gate orchestrator
 //! over the Task 8b stubs (the counted harness of `infra::gate::tests::orchestrate`), with
 //! Pricing's acceptance answered by the development double (`stubs::SellabilityStub`, accepting
 //! on the harness catalog's bindings) behind a scripted wrapper. Phase A refuses a blocking
@@ -9,8 +9,8 @@
 //! `gate-dev-stubs`. In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
 use super::capture::{BUYER, T, buyer, create_meta, key, s, view, write};
 use super::*;
-use crate::authz::Caller;
-use crate::authz::test_pdp::{RulesProvider, service, user};
+use crate::authz::test_pdp::{FakePdp, Grant, service, user};
+use crate::authz::{Action, Caller};
 use crate::domain::dates::{
     DateBasis, DatePolicySnapshot, PLATFORM_DEFAULT_POLICY_ID, PolicyRow, SuppliedDates,
 };
@@ -62,7 +62,6 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::DbTx;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};
 
-const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
 const RESOURCE: u128 = 10;
 const SELLER: u128 = 20;
 /// The seller's configured Orders service principal (D-194).
@@ -70,25 +69,28 @@ const SERVICE: (u128, u128) = (700, 701);
 /// A principal no rule names.
 const STRANGER: (u128, u128) = (104, 10);
 
-/// The buyer authors and submits on resource tenant 10 (`submit` absent when `revoked`).
-fn policy_with(submit: bool) -> Value {
-    let mut actions = vec!["create", "write", "edit", "read"];
+/// The policy fake (D-227): the buyer authors and submits on resource tenant 10 (`submit`
+/// absent when `revoked`).
+fn policy_with(submit: bool) -> Arc<FakePdp> {
+    let mut actions = vec![
+        Action::OrderCreate,
+        Action::OrderWrite,
+        Action::OrderEdit,
+        Action::OrderRead,
+    ];
     if submit {
-        actions.push("submit");
+        actions.push(Action::OrderSubmit);
     }
-    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "m2-6",
-    "rules": [{
-        "id": "buyer", "subject": {"id": s(u(BUYER.0))}, "resource_type": ORDER_RT,
-        "actions": actions,
-        "paths": [{"predicates": [{"property": "resource_tenant_id",
-            "values": [s(u(RESOURCE))]}]}],
-    }]})
+    FakePdp::new(
+        vec![Grant::new(u(BUYER.0), &actions).path([("resource_tenant_id", vec![u(RESOURCE)])])],
+        &[],
+    )
 }
 
-/// The rules PDP, whose `submit` grant a test can revoke mid-flight.
+/// The policy fake, whose `submit` grant a test can revoke mid-flight.
 struct Revocable {
-    granted: Arc<RulesProvider>,
-    revoked: Arc<RulesProvider>,
+    granted: Arc<FakePdp>,
+    revoked: Arc<FakePdp>,
     is_revoked: AtomicBool,
     /// Every decision asked of this PDP, granted or not.
     evaluations: AtomicUsize,
@@ -96,8 +98,8 @@ struct Revocable {
 impl Revocable {
     fn new() -> Arc<Self> {
         Arc::new(Self {
-            granted: RulesProvider::from_policy(policy_with(true)),
-            revoked: RulesProvider::from_policy(policy_with(false)),
+            granted: policy_with(true),
+            revoked: policy_with(false),
             is_revoked: AtomicBool::new(false),
             evaluations: AtomicUsize::new(0),
         })

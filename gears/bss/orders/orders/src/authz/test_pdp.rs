@@ -1,17 +1,20 @@
 //! Test PDPs: a scripted recording double (proves Orders asks the right question and enforces
-//! the answer) and the real rules provider behind the resolver API. Neither is runtime code.
+//! the answer) and a gear-local policy fake that answers from a small list of grants (D-227).
+//! Neither is runtime code: the module is compiled only under `cfg(test)`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
     reason = "test code: a failed setup or fixture must stop the test at once; `allow`, not \
               `expect`, because not every test in the file unwraps or expects"
 )]
-use super::{Caller, Pep};
+use super::{
+    Action, Caller, DELEGATION_PROOF_REF, DENY_DELEGATION_PROOF_INVALID,
+    DENY_DELEGATION_PROOF_REQUIRED, Pep,
+};
 use crate::domain::audit::{ActorIdentities, Principal, ServiceRole};
 use authz_resolver_sdk::{
-    AuthZResolverApi, AuthZResolverPluginClient, Constraint, DenyReason, EqPredicate,
-    EvaluationRequest, EvaluationResponse, EvaluationResponseContext, InPredicate, PolicyEnforcer,
-    Predicate,
+    AuthZResolverApi, Constraint, DenyReason, EqPredicate, EvaluationRequest, EvaluationResponse,
+    EvaluationResponseContext, InPredicate, PolicyEnforcer, Predicate,
 };
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -56,30 +59,111 @@ impl AuthZResolverApi for ScriptedPdp {
     }
 }
 
-/// The real rules provider, reached through its plugin client like the resolver does.
-pub struct RulesProvider(Arc<dyn AuthZResolverPluginClient>);
-impl RulesProvider {
-    pub fn from_policy(policy: serde_json::Value) -> Arc<Self> {
-        let config: bss_orders_test_authz_plugin::config::OrdersTestAuthZPluginConfig =
-            serde_json::from_value(policy).unwrap();
-        Arc::new(Self(Arc::new(
-            bss_orders_test_authz_plugin::domain::Service::new(
-                bss_orders_test_authz_plugin::domain::Policy::compile(&config).unwrap(),
-            ),
-        )))
+/// One grant of [`FakePdp`]: `subject` may take `actions` on whatever one of `paths` admits.
+/// All predicates of a path must hold, and any one path suffices; each predicate is
+/// `property IN values`.
+pub struct Grant {
+    subject: Uuid,
+    actions: Vec<Action>,
+    paths: Vec<Vec<(String, Vec<Uuid>)>>,
+    delegated: bool,
+}
+impl Grant {
+    pub fn new(subject: Uuid, actions: &[Action]) -> Self {
+        Self {
+            subject,
+            actions: actions.to_vec(),
+            paths: Vec::new(),
+            delegated: false,
+        }
+    }
+    /// Adds one OR path of `property IN values` predicates.
+    pub fn path<'p>(mut self, predicates: impl IntoIterator<Item = (&'p str, Vec<Uuid>)>) -> Self {
+        self.paths.push(
+            predicates
+                .into_iter()
+                .map(|(property, values)| (property.to_owned(), values))
+                .collect(),
+        );
+        self
+    }
+    /// The grant applies only when the request carries a delegation proof the PDP accepts.
+    pub fn delegated(mut self) -> Self {
+        self.delegated = true;
+        self
+    }
+    fn covers(&self, request: &EvaluationRequest) -> bool {
+        self.subject == request.subject.id
+            && self.actions.iter().any(|action| {
+                action.permission().is_ok_and(|p| {
+                    p.resource == request.resource.resource_type && p.action == request.action.name
+                })
+            })
+    }
+    fn constraints(&self) -> impl Iterator<Item = Constraint> + '_ {
+        self.paths.iter().map(|predicates| Constraint {
+            predicates: predicates
+                .iter()
+                .map(|(property, values)| {
+                    Predicate::In(InPredicate::new(property.as_str(), values.iter().copied()))
+                })
+                .collect(),
+        })
+    }
+}
+
+/// A gear-local fake PDP for the in-crate tests (D-227), after Rating's `FakePdp` (PR #5390).
+///
+/// It answers the questions the Orders PEP asks, deny by default: the grants that name the
+/// subject and the exact registered resource/action pair contribute their paths as constraints,
+/// and the answer is an allow with all of them (the PEP and the scoped queries enforce them).
+/// A delegated grant contributes only when the request's `delegation_proof_ref` is one of the
+/// accepted proofs. With nothing contributed the answer is a denial, coded
+/// `delegation_proof_required` / `delegation_proof_invalid` when a delegated grant would have
+/// applied with a (valid) proof. It never evaluates subject tenant, token scopes or tenant
+/// context, and it makes none of the PEP's own checks (finite order IDs, break-glass class).
+pub struct FakePdp {
+    grants: Vec<Grant>,
+    accepted_proofs: Vec<String>,
+}
+impl FakePdp {
+    pub fn new(grants: Vec<Grant>, accepted_proofs: &[&str]) -> Arc<Self> {
+        Arc::new(Self {
+            grants,
+            accepted_proofs: accepted_proofs.iter().map(|p| (*p).to_owned()).collect(),
+        })
+    }
+    fn decide(&self, request: &EvaluationRequest) -> EvaluationResponse {
+        let proof = property(request, DELEGATION_PROOF_REF);
+        let proof_accepted = proof.is_some_and(|p| self.accepted_proofs.iter().any(|a| a == p));
+        let mut constraints = Vec::new();
+        let mut needs_proof = false;
+        for grant in self.grants.iter().filter(|g| g.covers(request)) {
+            if grant.delegated && !proof_accepted {
+                needs_proof = true;
+            } else {
+                constraints.extend(grant.constraints());
+            }
+        }
+        if !constraints.is_empty() {
+            allow(constraints)
+        } else if needs_proof && proof.is_some() {
+            deny(Some(DENY_DELEGATION_PROOF_INVALID))
+        } else if needs_proof {
+            deny(Some(DENY_DELEGATION_PROOF_REQUIRED))
+        } else {
+            deny(None)
+        }
     }
 }
 #[async_trait::async_trait]
-impl AuthZResolverApi for RulesProvider {
+impl AuthZResolverApi for FakePdp {
     async fn evaluate(
         &self,
         _: PlatformSecurityContext,
         request: EvaluationRequest,
     ) -> Result<EvaluationResponse, CanonicalError> {
-        self.0
-            .evaluate(request)
-            .await
-            .map_err(|_| CanonicalError::service_unavailable().create())
+        Ok(self.decide(&request))
     }
 }
 

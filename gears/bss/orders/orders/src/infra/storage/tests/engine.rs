@@ -1,13 +1,13 @@
-//! S2-04 on real PostgreSQL: the transition engine composing the real rules PDP (S2-03), the
-//! registry gate (S2-05), the sealed v3 audit writer (S2-06), step-17 claims (S2-07) and the
-//! real Event Broker managed producer (S2-08), through the restricted runtime role.
+//! S2-04 on real PostgreSQL: the transition engine composing the PEP over the policy fake (S2-03,
+//! D-227), the registry gate (S2-05), the sealed v3 audit writer (S2-06), step-17 claims (S2-07)
+//! and the real Event Broker managed producer (S2-08), through the restricted runtime role.
 //!
 //! Slice guard predicates and contributions are test bindings: the engine owns when and in
 //! what order they run, and the slices that own their logic are later packages.
 use super::events::Env;
 use super::*;
-use crate::authz::test_pdp::{RulesProvider, pep_with, service, user};
-use crate::authz::{Arrangement, Caller};
+use crate::authz::test_pdp::{FakePdp, Grant, pep_with, service, user};
+use crate::authz::{Action, Arrangement, Caller};
 use crate::domain::audit::{
     ActorIdentities, AdminAttribute, AdminChange, AdminField, AdminTextKey, Principal, ServiceRole,
 };
@@ -42,8 +42,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use toolkit_db::DbTx;
 use toolkit_db::secure::ScopeError;
 
-const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
-const ACCEPTANCE_RT: &str = "gts.cf.bss.orders.acceptance.v1~";
 const NEW_SALE: &str = "gts.cf.bss.orders.category.v1~cf.bss.orders.new_sale.v1";
 /// Subjects: buyer/operator user 102 (tenant 10), Workflow service 106 (tenant 99), the
 /// configured system worker 900 (tenant 901).
@@ -53,35 +51,51 @@ const WORKFLOW: (u128, u128) = (106, 99);
 fn s(id: Uuid) -> String {
     id.to_string()
 }
-fn path(pairs: &[(&str, Vec<Uuid>)]) -> Value {
-    json!({"predicates": pairs.iter().map(|(p, v)| json!({
-        "property": p, "values": v.iter().map(|x| s(*x)).collect::<Vec<_>>()
-    })).collect::<Vec<_>>()})
-}
-/// Real rules policy: the buyer may do every user operation on resource tenant 10; Workflow may do the seam operations on exactly the listed orders of seller 20.
-fn policy(workflow_orders: &[Uuid]) -> Value {
-    let mut rules = vec![
-        json!({
-            "id": "buyer", "subject": {"id": s(u(BUYER.0))}, "resource_type": ORDER_RT,
-            "actions": ["create", "write", "edit", "submit", "amend", "cancel", "hold", "resume",
-                        "read", "force_fail_unreconciled"],
-            "paths": [path(&[("resource_tenant_id", vec![u(10)])])],
-        }),
-        json!({
-            "id": "buyer-acceptance", "subject": {"id": s(u(BUYER.0))},
-            "resource_type": ACCEPTANCE_RT, "actions": ["record"],
-            "paths": [path(&[("resource_tenant_id", vec![u(10)])])],
-        }),
+/// Every user operation the buyer holds on resource tenant 10.
+const BUYER_ACTIONS: &[Action] = &[
+    Action::OrderCreate,
+    Action::OrderWrite,
+    Action::OrderEdit,
+    Action::OrderSubmit,
+    Action::OrderAmend,
+    Action::OrderCancel,
+    Action::OrderHold,
+    Action::OrderResume,
+    Action::OrderRead,
+    Action::OrderForceFailUnreconciled,
+];
+/// The policy fake (D-227): the buyer may take `buyer_actions` (and record acceptance) on
+/// resource tenant 10; Workflow may do the seam operations on exactly the listed orders of
+/// seller 20.
+fn grants(workflow_orders: &[Uuid], buyer_actions: &[Action]) -> Arc<FakePdp> {
+    let mut grants = vec![
+        Grant::new(u(BUYER.0), buyer_actions).path([("resource_tenant_id", vec![u(10)])]),
+        Grant::new(u(BUYER.0), &[Action::AcceptanceRecord])
+            .path([("resource_tenant_id", vec![u(10)])]),
     ];
     if !workflow_orders.is_empty() {
-        rules.push(json!({
-            "id": "workflow", "subject": {"id": s(u(WORKFLOW.0))}, "resource_type": ORDER_RT,
-            "actions": ["read", "approval_reflection", "begin_fulfillment", "spawn_signal",
-                        "fulfillment_acknowledgement", "workflow_cancel"],
-            "paths": [path(&[("id", workflow_orders.to_vec()), ("seller_tenant_id", vec![u(20)])])],
-        }));
+        grants.push(
+            Grant::new(
+                u(WORKFLOW.0),
+                &[
+                    Action::OrderRead,
+                    Action::OrderApprovalReflection,
+                    Action::OrderBeginFulfillment,
+                    Action::OrderSpawnSignal,
+                    Action::OrderFulfillmentAcknowledgement,
+                    Action::OrderWorkflowCancel,
+                ],
+            )
+            .path([
+                ("id", workflow_orders.to_vec()),
+                ("seller_tenant_id", vec![u(20)]),
+            ]),
+        );
     }
-    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s2-04", "rules": rules})
+    FakePdp::new(grants, &[])
+}
+fn policy(workflow_orders: &[Uuid]) -> Arc<FakePdp> {
+    grants(workflow_orders, BUYER_ACTIONS)
 }
 fn identities() -> ActorIdentities {
     ActorIdentities::new(
@@ -138,11 +152,11 @@ impl T {
     pub(super) fn engine(&self, workflow_orders: &[Uuid]) -> Engine {
         self.engine_with(policy(workflow_orders))
     }
-    fn engine_with(&self, policy: Value) -> Engine {
+    fn engine_with(&self, policy: Arc<FakePdp>) -> Engine {
         Engine::new(
             EngineParts {
                 db: self.env.db.clone(),
-                pep: pep_with(RulesProvider::from_policy(policy), identities()),
+                pep: pep_with(policy, identities()),
                 sink: self.sink.clone(),
                 identities: identities(),
                 admin_key: Arc::new(AdminTextKey::new("k1", &[7u8; 32]).unwrap()),
@@ -2222,10 +2236,9 @@ async fn administrative_edits_compare_with_the_locked_values() {
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_collision_never_names_the_holder_to_a_caller_without_read_authority() {
     let t = T::new().await;
-    let mut no_read = policy(&[]);
-    let actions = no_read["rules"][0]["actions"].as_array_mut().unwrap();
-    actions.retain(|a| a != "read");
-    let engine = t.engine_with(no_read);
+    let mut actions = BUYER_ACTIONS.to_vec();
+    actions.retain(|a| *a != Action::OrderRead);
+    let engine = t.engine_with(grants(&[], &actions));
     let holder = create(&t, &engine, "nr-holder").await;
     let order = create(&t, &engine, "nr-contender").await;
     let shared = OverlapScopeKey::try_from("sku-no-read".to_owned()).unwrap();

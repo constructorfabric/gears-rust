@@ -1,5 +1,5 @@
 //! Early S6-01/S6-04 on real PostgreSQL: the authorized draft reads through the shared read
-//! service (REST and local SDK), the real rules PDP (S2-03) with a recording PDP for the
+//! service (REST and local SDK), the policy fake (S2-03, D-227) with a recording PDP for the
 //! hidden/missing call pattern, outage and changed-facts cases, scoped keyset SQL pages, and
 //! the `orders_read_access_log` served/refused decision table over the restricted runtime role.
 //! Draft orders are authored through the S2-09 capture service and the S2-04 engine.
@@ -8,8 +8,9 @@ use super::capture::{
 };
 use super::*;
 use crate::api::local_client::LocalOrdersClient;
+use crate::authz::Action;
 use crate::authz::test_pdp::{
-    RulesProvider, ScriptedPdp, allow, deny, eq, is_in, path, service, user, with_proof,
+    FakePdp, Grant, ScriptedPdp, allow, deny, eq, is_in, path, service, user, with_proof,
 };
 use crate::domain::read::ProofDenial;
 use crate::domain::read::{AccessOutcome, Collection, CursorBinding, Position};
@@ -26,7 +27,6 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const ORDER_RT: &str = "gts.cf.bss.orders.order.v1~";
 /// Same-tenant reader whose only path is its own resource tenant (provably confined).
 const CONFINED: (u128, u128) = (110, 10);
 /// Seller operator on seller tenant 20 (direct cross-tenant read, no proof).
@@ -46,71 +46,42 @@ const PROOF: &str = "proof-ok";
 fn s(id: Uuid) -> String {
     id.to_string()
 }
-fn rule(id: &str, subject: u128, actions: &[&str], property: &str, values: &[Uuid]) -> Value {
-    json!({"id": id, "subject": {"id": s(u(subject))}, "resource_type": ORDER_RT,
-        "actions": actions,
-        "paths": [{"predicates": [{"property": property,
-            "values": values.iter().map(|v| s(*v)).collect::<Vec<_>>()}]}]})
+fn rule(subject: u128, actions: &[Action], property: &str, values: &[Uuid]) -> Grant {
+    Grant::new(u(subject), actions).path([(property, values.to_vec())])
 }
-/// The read policy; `workflow_ids` are the explicit finite order IDs of the service principal.
-fn policy(workflow_ids: &[Uuid]) -> Value {
-    let buyer = rule(
-        "buyer",
-        BUYER.0,
-        &["create", "write", "edit", "read"],
-        "resource_tenant_id",
-        &[u(10), u(11)],
-    );
-    let mut partner = rule(
-        "partner-delegated",
-        PARTNER.0,
-        &["read"],
-        "resource_tenant_id",
-        &[u(10)],
-    );
-    partner["delegation"] = json!({"proof_property": "delegation_proof_ref", "accepted": [PROOF]});
-    let mut rules = vec![
-        buyer,
+/// The read policy fake (D-227); `workflow_ids` are the explicit finite order IDs of the
+/// service principal.
+fn policy(workflow_ids: &[Uuid]) -> Arc<FakePdp> {
+    use Action::{
+        OrderCreate as Create, OrderEdit as Edit, OrderHold as Hold, OrderRead as Read,
+        OrderResume as Resume, OrderWrite as Write,
+    };
+    let mut grants = vec![
         rule(
-            "confined",
-            CONFINED.0,
-            &["read"],
+            BUYER.0,
+            &[Create, Write, Edit, Read],
             "resource_tenant_id",
-            &[u(10)],
+            &[u(10), u(11)],
         ),
+        rule(CONFINED.0, &[Read], "resource_tenant_id", &[u(10)]),
         rule(
-            "seller",
             SELLER.0,
-            &["read", "hold", "resume"],
+            &[Read, Hold, Resume],
             "seller_tenant_id",
             &[u(20)],
         ),
-        rule(
-            "payer-reader",
-            PAYER.0,
-            &["read"],
-            "payer_tenant_id",
-            &[u(30)],
-        ),
-        rule(
-            "other-seller",
-            OTHER_SELLER.0,
-            &["read"],
-            "seller_tenant_id",
-            &[u(21)],
-        ),
-        partner,
+        rule(PAYER.0, &[Read], "payer_tenant_id", &[u(30)]),
+        rule(OTHER_SELLER.0, &[Read], "seller_tenant_id", &[u(21)]),
+        rule(PARTNER.0, &[Read], "resource_tenant_id", &[u(10)]).delegated(),
     ];
-    // The service principal's rule exists only with a finite explicit order set (08 §4.3).
+    // The service principal's grant exists only with a finite explicit order set (08 §4.3).
     if !workflow_ids.is_empty() {
-        rules.push(json!({"id": "workflow", "subject": {"id": s(u(WORKFLOW.0))},
-            "resource_type": ORDER_RT, "actions": ["read"],
-            "paths": [{"predicates": [
-                {"property": "id", "values": workflow_ids.iter().map(|v| s(*v)).collect::<Vec<_>>()},
-                {"property": "seller_tenant_id", "values": [s(u(20))]}]}]}));
+        grants.push(Grant::new(u(WORKFLOW.0), &[Read]).path([
+            ("id", workflow_ids.to_vec()),
+            ("seller_tenant_id", vec![u(20)]),
+        ]));
     }
-    json!({"vendor": "constructorfabric", "priority": 10, "policy_revision": "s6-01-draft",
-        "rules": rules})
+    FakePdp::new(grants, &[PROOF])
 }
 
 struct R {
@@ -124,7 +95,7 @@ struct R {
 impl R {
     async fn new() -> Self {
         let t = T::new().await;
-        let provider = RulesProvider::from_policy(policy(&[]));
+        let provider = policy(&[]);
         let capture = Arc::new(T::service_with(t.engine(provider.clone()), 200));
         let reads = Arc::new(t.reads_with(provider));
         Self {
@@ -137,13 +108,12 @@ impl R {
     fn reads_with(&self, api: Arc<dyn authz_resolver_sdk::AuthZResolverApi>) -> ReadService {
         self.t.reads_with(api)
     }
-    /// The real rules PDP with recording signals, so the §3.8 instruments can be asserted.
+    /// The policy fake with recording signals, so the §3.8 instruments can be asserted.
     fn reads_recording(&self) -> (Arc<RecordingSignals>, ReadService) {
         let signals = Arc::new(RecordingSignals::default());
-        let reads = self.t.reads_with_signals(
-            RulesProvider::from_policy(policy(&[])),
-            Arc::clone(&signals) as Arc<dyn ReadSignals>,
-        );
+        let reads = self
+            .t
+            .reads_with_signals(policy(&[]), Arc::clone(&signals) as Arc<dyn ReadSignals>);
         (signals, reads)
     }
     /// The database wall clock, which every evidence timestamp must come from (OL-2).
@@ -1060,7 +1030,7 @@ async fn service_principals_read_only_their_finite_order_ids() {
     // service decision without a finite ID path fails closed as integration.
     let visible = created[0];
     let workflow = service(WORKFLOW.0, WORKFLOW.1);
-    let rules = r.reads_with(RulesProvider::from_policy(policy(&[visible, created[1]])));
+    let rules = r.reads_with(policy(&[visible, created[1]]));
     r.clear_logs().await;
     let wf_page = rules.list(&workflow, &list_all()).await.unwrap();
     assert_eq!(

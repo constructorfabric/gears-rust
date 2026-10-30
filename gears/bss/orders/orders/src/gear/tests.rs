@@ -278,8 +278,9 @@ fn service_principal_identities_are_required_and_fail_closed() {
 
 /// The E2E producer grants name exactly the configured producer principal: an exact unconditional
 /// grant for the concrete submitted event `produce` check and a root-tenant-constrained rule
-/// for the tenant-scope check. The fragment is not a complete policy, so the plugin's required
-/// envelope is supplied here only to validate the grants.
+/// for the tenant-scope check. The test reads the parsed YAML and pins only what Orders owns;
+/// the plugin's schema and `validate` are the plugin's own tests, and the live E2E host loads
+/// this fragment (D-227 item 4, D-248).
 #[test]
 fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
     let text = include_str!("../../../config/e2e-orders.yaml");
@@ -288,41 +289,56 @@ fn e2e_fragment_grants_event_broker_produce_to_exactly_the_orders_producer() {
         .unwrap()
         .producer_settings()
         .unwrap();
-    let mut policy = parsed["bss-orders-test-authz-plugin"]["config"].clone();
-    policy["vendor"] = json!("constructorfabric");
-    policy["priority"] = json!(10);
-    policy["policy_revision"] = json!("orders-e2e-fragment");
-    let policy: bss_orders_test_authz_plugin::config::OrdersTestAuthZPluginConfig =
-        serde_json::from_value(policy).unwrap();
-    policy.validate().unwrap();
-    let [grant] = policy.unconditional_grants.as_slice() else {
+    let policy = &parsed["bss-orders-test-authz-plugin"]["config"];
+    let mut sections: Vec<&str> = policy
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    sections.sort_unstable();
+    assert_eq!(sections, ["rules", "unconditional_grants"]);
+    let uuid = |v: &Value| v.as_str().map(|s| Uuid::parse_str(s).unwrap());
+    let producer = Some((orders.subject_id, orders.tenant_id));
+    let subject = |v: &Value| {
+        Some((
+            uuid(&v["subject"]["id"])?,
+            uuid(&v["subject"]["tenant_id"])?,
+        ))
+    };
+    let Some([grant]) = policy["unconditional_grants"].as_array().map(Vec::as_slice) else {
         panic!("exactly one unconditional grant")
     };
+    assert_eq!(subject(grant), producer);
     assert_eq!(
-        (grant.subject.id, grant.subject.tenant_id),
-        (orders.subject_id, Some(orders.tenant_id))
-    );
-    assert_eq!(
-        (grant.resource_type.as_str(), grant.action.as_str()),
+        (grant["resource_type"].as_str(), grant["action"].as_str()),
         (
-            "gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~",
-            "produce"
+            Some("gts.cf.core.events.event.v1~cf.bss.orders.event.v1~cf.bss.orders.submitted.v1~"),
+            Some("produce")
         )
     );
-    let [rule] = policy.rules.as_slice() else {
+    let Some([rule]) = policy["rules"].as_array().map(Vec::as_slice) else {
         panic!("exactly one tenant-scope rule")
     };
+    assert_eq!(subject(rule), producer);
     assert_eq!(
-        (rule.subject.id, rule.subject.tenant_id),
-        (orders.subject_id, Some(orders.tenant_id))
+        rule["resource_type"].as_str(),
+        Some(event_broker_sdk::gts::REQUEST_RESOURCE_TYPE)
     );
-    assert_eq!(
-        rule.resource_type,
-        event_broker_sdk::gts::REQUEST_RESOURCE_TYPE
+    assert_eq!(rule["actions"], json!(["produce"]));
+    let Some([path]) = rule["paths"].as_array().map(Vec::as_slice) else {
+        panic!("exactly one path")
+    };
+    let Some([predicate]) = path["predicates"].as_array().map(Vec::as_slice) else {
+        panic!("exactly one predicate")
+    };
+    assert_eq!(predicate["property"], json!("owner_tenant_id"));
+    assert!(
+        predicate["values"]
+            .as_array()
+            .is_some_and(|values| values.len() == 1 && uuid(&values[0]).is_some()),
+        "exactly one root tenant"
     );
-    assert_eq!(rule.actions, ["produce"]);
-    assert_eq!(rule.paths.len(), 1);
-    assert_eq!(rule.paths[0].predicates[0].property, "owner_tenant_id");
 }
 
 /// The checked-in live-E2E gear block parses, validates and classifies distinct identities.
