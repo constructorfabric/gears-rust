@@ -676,13 +676,15 @@ impl Default for SnapshotSection {
 /// Retry and timeout bounds of notification dispatch
 /// (`[quota-enforcement.notifications]`).
 ///
-/// An event whose delivery keeps failing transiently is dead-lettered once it
-/// has failed `max_attempts` times: the first delivery counts 0, so that is
-/// `max_attempts + 1` calls in all, spread over `ToolKit`'s retry backoff.
+/// A `Permanent` sink failure dead-letters an event at once. A transient one
+/// is retried over `ToolKit`'s backoff until a delivery fails with the
+/// event's recorded `attempts` at `max_attempts`. `attempts` counts earlier
+/// failures, except that a first failure behind an acknowledged prefix goes
+/// uncounted.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct NotificationsSection {
-    /// Failed deliveries after which a still-failing event is dead-lettered.
+    /// Recorded `attempts` at which a transient failure dead-letters the event.
     pub max_attempts: u16,
     /// Budget, in milliseconds, for one sink to take one event. A call is
     /// also cut short when the outbox lease has less time left.

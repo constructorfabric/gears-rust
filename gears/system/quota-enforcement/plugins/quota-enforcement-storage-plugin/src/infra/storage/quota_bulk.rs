@@ -47,7 +47,7 @@ use toolkit_security::AccessScope;
 
 use super::{PreparedCreate, SqlQuotaStore, TxError, lift};
 use crate::domain::ports::{Actor, StoreError};
-use crate::infra::outbox::{AttemptWakes, SettleWakes};
+use crate::infra::outbox::{AttemptWakes, settling};
 use crate::infra::storage::consumption_store::{DEFAULT_RETENTION_SECS, scope_key_of};
 use crate::infra::storage::entity::quota;
 use crate::infra::storage::locking::{
@@ -360,8 +360,9 @@ impl SqlQuotaStore {
             let owned = Arc::clone(&owned);
             let wakes = AttemptWakes::begin(&self.enqueuer);
             let enqueuer = wakes.enqueuer();
-            self.db
-                .transaction_ref_mapped(move |tx| {
+            settling(
+                wakes,
+                self.db.transaction_ref_mapped(move |tx| {
                     Box::pin(async move {
                         let (envelope, prepared, metrics, actor) = &*owned;
                         lock_scopes::<TxError>(tx, &[&envelope.idempotency.scope]).await?;
@@ -412,8 +413,8 @@ impl SqlQuotaStore {
                         record(tx, &envelope.idempotency, &outcome, now, expires_at).await?;
                         Ok(TransitionOutcome::Applied(outcome))
                     })
-                })
-                .settling(wakes)
+                }),
+            )
         })
         .await
     }
@@ -454,8 +455,9 @@ impl SqlQuotaStore {
             let clock = Arc::clone(&clock);
             let wakes = AttemptWakes::begin(&self.enqueuer);
             let enqueuer = wakes.enqueuer();
-            self.db
-                .transaction_ref_mapped(move |tx| {
+            settling(
+                wakes,
+                self.db.transaction_ref_mapped(move |tx| {
                     Box::pin(async move {
                         let (envelope, updates, actor) = &*owned;
                         let targets: Vec<(QuotaId, &AccessScope)> = envelope
@@ -510,8 +512,8 @@ impl SqlQuotaStore {
                         record(tx, &envelope.idempotency, &outcome, now, expires_at).await?;
                         Ok(TransitionOutcome::Applied(outcome))
                     })
-                })
-                .settling(wakes)
+                }),
+            )
         })
         .await
     }
@@ -544,8 +546,9 @@ impl SqlQuotaStore {
             let owned = Arc::clone(&owned);
             let wakes = AttemptWakes::begin(&self.enqueuer);
             let enqueuer = wakes.enqueuer();
-            self.db
-                .transaction_ref_mapped(move |tx| {
+            settling(
+                wakes,
+                self.db.transaction_ref_mapped(move |tx| {
                     Box::pin(async move {
                         let (envelope, actor) = &*owned;
                         let targets: Vec<(QuotaId, &AccessScope)> = envelope
@@ -605,8 +608,8 @@ impl SqlQuotaStore {
                         // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-return
                         // @cpt-end:cpt-cf-quota-enforcement-state-bulk-envelope:p2:inst-qbs-commit
                     })
-                })
-                .settling(wakes)
+                }),
+            )
         })
         .await
     }

@@ -253,28 +253,33 @@ fn spawn_leader_task(
     tokio::spawn(async move { coordinator.run_while_leader(scope, shutdown, work).await })
 }
 
-/// Wait for a leader task to stop within `budget`; a slow or failed stop is
-/// logged, never an error of the lifecycle entry.
-async fn join_leader_task(name: &str, task: LeaderTask, budget: Duration) {
-    let failure = match tokio::time::timeout(budget, task).await {
+/// Wait for a leader task to stop within `budget`, aborting it after that; a
+/// slow or failed stop is logged, never an error of the lifecycle entry.
+async fn join_leader_task(name: &str, mut task: LeaderTask, budget: Duration) {
+    let failure = match tokio::time::timeout(budget, &mut task).await {
         Ok(Ok(Ok(()))) => return,
         Ok(Ok(Err(err))) => format!("{name} election ended with an error: {err}"),
         Ok(Err(join)) => format!("{name} task did not finish cleanly: {join}"),
-        Err(_elapsed) => format!("{name} task did not stop within {budget:?}"),
+        Err(_elapsed) => {
+            task.abort();
+            format!("{name} task did not stop within {budget:?} and was aborted")
+        }
     };
     tracing::warn!(target: LOG_TARGET, "{failure}");
 }
 
-/// Stop the leader tasks, then notification delivery, each within `budget`.
+/// Stop the leader tasks and notification delivery together, within `budget`.
 async fn stop_background(
     tasks: [(&str, LeaderTask); 3],
     delivery: &crate::domain::notifications::DeliveryLifecycle,
     budget: Duration,
 ) {
-    for (name, task) in tasks {
-        join_leader_task(name, task, budget).await;
-    }
-    stop_delivery(delivery, budget).await;
+    let leaders = futures::future::join_all(
+        tasks
+            .into_iter()
+            .map(|(name, task)| join_leader_task(name, task, budget)),
+    );
+    tokio::join!(leaders, stop_delivery(delivery, budget));
 }
 
 /// Stop notification delivery within `budget`; events it did not finish stay

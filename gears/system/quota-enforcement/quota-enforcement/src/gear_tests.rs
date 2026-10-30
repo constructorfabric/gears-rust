@@ -1,18 +1,23 @@
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverApi;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::{Extension, Router};
 use quota_enforcement_sdk::testing::{DrainReport, InMemoryStorage, RecordingSink, quota_draft};
 use quota_enforcement_sdk::{
-    PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter, QuotaManagerClientV1, SubjectRef,
+    NotificationDeliveryHandle, PageRequest, QuotaEnforcementStoragePluginV1, QuotaFilter,
+    QuotaManagerClientV1, SubjectRef,
 };
 use quota_enforcement_storage_plugin::StoragePluginGear;
 use serde_json::json;
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
 use toolkit::config::ConfigProvider;
@@ -24,7 +29,8 @@ use uuid::Uuid;
 
 use super::QuotaEnforcementGear;
 use crate::api::rest::routes::PATH_PREFIX;
-use crate::domain::{Dependency, ReadinessState};
+use crate::domain::notifications::DeliveryLifecycle;
+use crate::domain::{Dependency, DomainError, ReadinessState};
 use crate::test_support::{
     ClusterFixture, FailingPdp, LLM_MODEL_RESOURCE, LLM_TENANT_PROJECTION, LLM_USER_PROJECTION,
     OtherProfile, PermitTenantsPdp, ctx as security_ctx, hub_with_registry, in_process_registry,
@@ -560,6 +566,50 @@ async fn serve_stops_cleanly_when_cancelled_during_bootstrap() {
     assert!(format!("{err:#}").contains("shutdown"), "{err:#}");
     assert!(rx.await.is_err());
     fixture.stop().await;
+}
+
+/// A pipeline handle that records when its stop began.
+struct StopInstant(Arc<Mutex<Option<Instant>>>);
+
+#[async_trait]
+impl NotificationDeliveryHandle for StopInstant {
+    async fn stop(self: Box<Self>) {
+        *self.0.lock().expect("stop instant") = Some(Instant::now());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_stops_delivery_at_once_and_aborts_leader_tasks_after_one_budget() {
+    let budget = Duration::from_secs(10);
+    let stuck = || tokio::spawn(std::future::pending::<Result<(), DomainError>>());
+    let tasks = [
+        ("gauge", stuck()),
+        ("retention", stuck()),
+        ("lease", stuck()),
+    ];
+    let aborts: Vec<_> = tasks.iter().map(|(_, task)| task.abort_handle()).collect();
+    let delivery = DeliveryLifecycle::default();
+    let stopped_at = Arc::new(Mutex::new(None));
+    assert!(
+        delivery
+            .hold(Box::new(StopInstant(Arc::clone(&stopped_at))))
+            .is_none()
+    );
+
+    let start = Instant::now();
+    super::stop_background(tasks, &delivery, budget).await;
+
+    assert_eq!(
+        *stopped_at.lock().expect("stop instant"),
+        Some(start),
+        "delivery stops without waiting for the leader tasks"
+    );
+    assert!(start.elapsed() <= budget, "took {:?}", start.elapsed());
+    tokio::task::yield_now().await;
+    assert!(
+        aborts.iter().all(AbortHandle::is_finished),
+        "a leader task that overruns its budget is aborted, not detached"
+    );
 }
 
 #[tokio::test]
