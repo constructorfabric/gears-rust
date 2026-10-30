@@ -397,7 +397,7 @@ When several outcome categories apply, the system **MUST** pick one by a fixed p
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-response-content`
 
-Every refusal and every operation report **MUST** carry the outcome category, what to fix, retry, or request, and the request id. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest. The report of an interrupted operation **MUST** say so and give the section outcomes recorded so far.
+Every refusal and every report of a completed operation **MUST** carry the outcome category, what to fix, retry, or request, and the request id. A refusal for conflict **MUST** name the running operation. A report **MUST** give the outcome of each section, or of each section plugin for uninstall, and every problem with its location for invalid manifest. The report of an interrupted operation **MUST** say so and give the section outcomes recorded so far.
 
 - **Rationale**: Per-section results let callers act on partial failures, and the link to the history events supports investigation.
 - **Actors**: `cpt-cf-application-manager-actor-seeding-caller`, `cpt-cf-application-manager-actor-operator`
@@ -793,7 +793,7 @@ The system **MUST** give operators a visible signal for history events that fail
 - [ ] A schema read calls no section plugin, and a read for an unknown section key ends as not found (`cpt-cf-application-manager-fr-discovery`).
 - [ ] Discovery returns the current section keys and schemas, and a manifest built from the combined schema passes validation.
 - [ ] Inspection shows no way to read manifests, no way to resume or cancel an operation, and no manifest content in logs.
-- [ ] Every refusal and every operation report carries the outcome category, what to fix, retry, or request, and the request id (`cpt-cf-application-manager-fr-response-content`).
+- [ ] Every refusal and every report of a completed operation carries the outcome category, what to fix, retry, or request, and the request id (`cpt-cf-application-manager-fr-response-content`).
 - [ ] Each section plugin gets only its own section, unchanged, with the envelope, and no per-section state is kept (`cpt-cf-application-manager-fr-pass-through`).
 - [ ] Application ids are compared as exact text and never parsed, and the version is passed to section plugins unchanged (`cpt-cf-application-manager-fr-application-id`, `cpt-cf-application-manager-fr-opaque-version`).
 - [ ] Discovery returns each schema with its section type (`cpt-cf-application-manager-fr-discovery`).
