@@ -400,6 +400,8 @@ async fn slow_listener_timeout_does_not_block_runtime_delivery_or_handler_proces
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("listener-timeout"))
         .topics([topic(TOPIC)])
+        // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect that legally redelivers the event.
+        .heartbeat_drop_threshold(10_000)
         .listener_settings(ConsumerListenerSettings {
             channel_capacity: 8,
             timeout: Duration::from_millis(1),
