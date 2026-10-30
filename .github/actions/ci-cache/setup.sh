@@ -4,6 +4,7 @@
 # Key: the read-write pair from ci-trusted when the job passed it, else the
 # runner's read-only pair (CI_CACHE_RO_*, set in the runner's environment).
 # Neither: a runner without the caches, so one notice and nothing exported.
+# An endpoint that does not answer is treated the same way, with a warning.
 #
 # Writing needs trusted=true AND the read-write pair. Read mode is enforced
 # here as well as by the key: SCCACHE_S3_RW_MODE=READ_ONLY,
@@ -12,6 +13,9 @@ set -euo pipefail
 
 out() { printf '%s=%s\n' "$1" "$2" >>"$GITHUB_OUTPUT"; }
 env_set() { printf '%s=%s\n' "$1" "$2" >>"$GITHUB_ENV"; }
+# Mode none: nothing exported, so the downloads steps are skipped,
+# ci-cache-buildx-args prints nothing and sccache keeps the local disk cache.
+uncached() { echo "$1"; out mode none; exit 0; }
 
 # Installed first, so a workflow can call it unconditionally: without a
 # BuildKit cache it prints nothing.
@@ -29,9 +33,7 @@ elif [ -n "${CI_CACHE_RO_KEY_ID:-}" ] && [ -n "${CI_CACHE_RO_SECRET:-}" ]; then
     echo "::warning::ci-cache: trusted=true but no read-write key (is the job under ci-trusted?); caches are read only"
   fi
 else
-  echo "::notice::ci-cache: no cache key on this runner; running without the S3 caches"
-  out mode none
-  exit 0
+  uncached "::notice::ci-cache: no cache key on this runner; running without the S3 caches"
 fi
 echo "::add-mask::$key_id"
 echo "::add-mask::$secret"
@@ -54,6 +56,13 @@ for v in endpoint region project; do
 done
 endpoint="${endpoint%/}"
 prefix="$IN_PREFIX"
+
+# Composite steps have no timeout, and a hung S3 connection would stall the
+# downloads and BuildKit steps. Any HTTP answer (403 and 404 included) means
+# reachable; a connect error or timeout means build uncached.
+if ! curl -sS -o /dev/null --connect-timeout 3 --max-time 5 "$endpoint" 2>/dev/null; then
+  uncached "::warning::ci-cache: S3 endpoint unreachable; building without the shared caches"
+fi
 
 out mode "$mode"
 out endpoint "$endpoint"
