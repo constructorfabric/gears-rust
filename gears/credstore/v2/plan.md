@@ -32,6 +32,6 @@
 Before it, diff `main` against the v1 baseline v2 was copied from (`bdf434ebd`) and port or drop every v1 change. Consumers cannot move earlier: the v2 SDK is a different crate, so their client lookup fails while v1 is registered. Afterwards a single version remains:
 
 - **S1:** blocked until the migration of existing v1 data ([#5347](https://github.com/constructorfabric/gears-rust/issues/5347)) is done. Register v2 under the gear name `credstore`; move oagw, settings-service, keycloak-idp-plugin and github-mirror (the gear and its CLI) to the v2 SDK; update `config/*.yaml`, the e2e suites, `docs/api/api.json`, QUICKSTART, the example-server features, the `[workspace.dependencies]` entries and the `credstore-pg` lane. v1 stays in the tree, unlinked.
-- **S2:** delete v1 (deletions only).
+- **S2:** delete v1 and the v2 duplication exclusion in `.sonarcloud.properties` (deletions only).
 - **S3:** move v2 to `gears/credstore/{credstore,credstore-sdk,plugins}`; rename the packages to `cf-gears-credstore*` with versions above the published ones; drop `publish = false`; delete `gears/credstore/v2/` and this file.
 - Operators reissue PDP grants before the deploy: the base type `secret.v1~` becomes `credential.v1~`, with six actions (ADR-0010).
