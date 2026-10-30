@@ -1,11 +1,11 @@
-//! Submit on real PostgreSQL (S3-12; D-188 steps 1–6, D-192, D-216, M2-3): the submit service
-//! over the S2-04 engine, the policy fake (D-227), the authorized draft reads and the gate orchestrator
+//! Submit on real PostgreSQL (S3-12; D-188 steps 1–6, D-192, D-216, M2-3): the submit service over
+//! the S2-04 engine, the policy fake (D-227), the authorized draft reads and the gate orchestrator
 //! over the Task 8b stubs (the counted harness of `infra::gate::tests::orchestrate`), with
-//! Pricing's acceptance answered by the development double (`stubs::SellabilityStub`, accepting
-//! on the harness catalog's bindings) behind a scripted wrapper. Phase A refuses a blocking
-//! assessment without reserving and reserves a passing one; phase B records each line's receipt
-//! under the attempt's fence; phase C commits the candidate through the engine. Each D-188
-//! failure-matrix row this milestone can exercise is one named test. Compiled only with
+//! Pricing's acceptance answered by the development double (`stubs::SellabilityStub`, accepting on
+//! the harness catalog's bindings) behind a scripted wrapper. Phase A refuses a blocking assessment
+//! without reserving and reserves a passing one; phase B records each line's receipt under the
+//! attempt's fence; phase C commits the candidate through the engine. Each D-188 failure-matrix row
+//! this milestone can exercise is one named test. Compiled only with
 //! `gate-dev-stubs`. In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
 use super::capture::{BUYER, T, buyer, create_meta, key, s, view, write};
 use super::*;
