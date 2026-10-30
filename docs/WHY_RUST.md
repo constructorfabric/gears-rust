@@ -138,7 +138,7 @@ caller := loadUser("42")
 fmt.Println(caller.Name) // nil pointer dereference at runtime
 ```
 
-In Rust, the error is part of the type. You must deal with it, and there is no `nil`.
+In Rust, the error is part of the type, and there is no `nil`. Ignoring a `Result` triggers the `unused_must_use` warning. The Gears Clippy gate runs with `-D warnings` and denies `let_underscore_must_use`, so a silently dropped `Result` fails the build. You can still discard an error on purpose, but the code must show it.
 
 ```rust
 // Rust — you cannot accidentally ignore the error or deref a null.
@@ -160,16 +160,16 @@ match load_user("42") {
 Go's race detector is excellent — but it only finds races on code paths you actually execute under instrumentation. Races ship to production all the time.
 
 ```go
-// Go — compiles, runs, and corrupts the map under load. No compile error.
+// Go — compiles, but concurrent map writes may crash the process at runtime.
 counts := map[string]int{}
 for _, ev := range events {
     go func(e Event) {
-        counts[e.Key]++ // concurrent map write -> runtime panic / corruption
+        counts[e.Key]++ // unsynchronized map write; runtime may abort with a fatal error
     }(ev)
 }
 ```
 
-Rust's ownership model and the `Send`/`Sync` traits make unsynchronized shared mutable memory across threads a **compile error**. You're forced to use a proper synchronization primitive.
+In safe Rust, the ownership model and the `Send`/`Sync` traits make unsynchronized shared mutable memory across threads a **compile error**. You're forced to use a proper synchronization primitive.
 
 ```rust
 // Rust — won't compile unless the shared state is actually thread-safe.
@@ -185,7 +185,7 @@ for ev in events {
 }
 ```
 
-"If it compiles, it's free of memory data races" is not a slogan — it's enforced by the borrow checker. This does not eliminate logical races such as TOCTOU bugs, lost updates, deadlocks, or bad transaction boundaries; those still need design, tests, and database constraints. For a platform handling concurrent multi-tenant traffic, Rust shifts an important class of concurrency defects from runtime testing into compilation.
+In safe Rust, "if it compiles, it's free of memory data races" is not a slogan — the compiler enforces it. `unsafe` code and FFI can still introduce data races. Gears forbids `unsafe_code` across the workspace, and the few crates that need it opt out explicitly in their manifest. This does not eliminate logical races such as TOCTOU bugs, lost updates, deadlocks, or bad transaction boundaries; those still need design, tests, and database constraints. For a platform handling concurrent multi-tenant traffic, Rust shifts an important class of concurrency defects from runtime testing into compilation.
 
 ### A.3 No `nil` interfaces, no exceptions-from-anywhere
 
@@ -338,16 +338,18 @@ Serialization, hashing, equality, ordering, and many schema/DB integrations can 
 Rust also uses types to model resource lifetime. Values are dropped deterministically when they leave scope, so transactions, mutex guards, file handles, tracing spans, and pooled connections can release themselves through `Drop` even when a function returns early with `?`.
 
 ```rust
+// `instrument` keeps the span attached to this future across `.await`.
+// Holding an `.entered()` span guard across `.await` would tag other tasks.
+#[tracing::instrument(skip_all, fields(id = %id))]
 async fn update_document(repo: &Repo, id: DocumentId) -> Result<(), RepoError> {
     let tx = repo.begin().await?;
-    let _span = tracing::info_span!("update_document", %id).entered();
 
     repo.lock_document(&tx, id).await?;
     repo.write_document(&tx, id).await?;
 
     tx.commit().await?;
     Ok(())
-} // span exits; uncommitted guards/resources are dropped on every return path
+} // an uncommitted `tx` and other guards are dropped on every return path
 ```
 
 Go's `defer` and C#'s `using` / `IDisposable` are good mechanisms, and experienced teams use them successfully. Rust's advantage is that scoped ownership is the default shape of the language. You can still design a bad transaction boundary or hold a lock too long, but it is harder to forget cleanup code in ordinary control flow.
