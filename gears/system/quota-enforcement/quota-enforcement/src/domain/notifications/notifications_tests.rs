@@ -224,7 +224,7 @@ async fn a_still_failing_event_is_retried_below_the_limit_and_dead_lettered_at_i
     let DeliveryOutcome::Reject(reason) = outcome else {
         panic!("expected a rejection at the limit, got {outcome:?}");
     };
-    assert!(reason.contains("failed 11 times"), "{reason}");
+    assert!(reason.contains("after 10 recorded failures"), "{reason}");
     assert_eq!(metrics.outbox_rejections(), 1);
 }
 

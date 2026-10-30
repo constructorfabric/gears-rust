@@ -15,10 +15,8 @@
 //! attempt commits; a rolled-back or abandoned attempt discards them.
 
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::task::{Context, Poll};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -92,10 +90,10 @@ pub trait NotificationEnqueuer: Send + Sync {
 /// attempt commits.
 ///
 /// A store begins one per attempt and hands its [`Self::enqueuer`] into the
-/// transaction; the attempt's future is wrapped with [`SettleWakes::settling`],
-/// which fires the collected wakes on `Ok` and discards them on `Err` (a
-/// rollback, a lost race, a refused lock that is retried). A retried
-/// operation therefore fires the wakes of its committing attempt only.
+/// transaction; the attempt runs inside [`settling`], which fires the
+/// collected wakes on `Ok` and discards them on `Err` (a rollback, a lost
+/// race, a refused lock that is retried). A retried operation therefore fires
+/// the wakes of its committing attempt only.
 pub struct AttemptWakes {
     outbox: Arc<dyn NotificationOutbox>,
     wake: Mutex<Wake>,
@@ -144,39 +142,21 @@ impl NotificationEnqueuer for AttemptWakes {
     }
 }
 
-/// A transaction attempt that settles its [`AttemptWakes`] when it resolves.
-pub struct Settling<F> {
-    attempt: Pin<Box<F>>,
-    wakes: Option<Arc<AttemptWakes>>,
+/// Run one transaction attempt, firing `wakes` if it commits and discarding
+/// them if not: `toolkit_db::outbox::in_transaction`'s commit-then-fire, for
+/// wakes collected during the transaction.
+///
+/// # Errors
+///
+/// Returns the attempt's error.
+pub async fn settling<T, E>(
+    wakes: Arc<AttemptWakes>,
+    attempt: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let outcome = attempt.await;
+    wakes.settle(outcome.is_ok());
+    outcome
 }
-
-impl<F, T, E> Future for Settling<F>
-where
-    F: Future<Output = Result<T, E>>,
-{
-    type Output = Result<T, E>;
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let outcome = std::task::ready!(self.attempt.as_mut().poll(cx));
-        if let Some(wakes) = self.wakes.take() {
-            wakes.settle(outcome.is_ok());
-        }
-        Poll::Ready(outcome)
-    }
-}
-
-/// Settle an attempt's wakes when its transaction resolves.
-pub trait SettleWakes<T, E>: Future<Output = Result<T, E>> + Sized {
-    /// This attempt, firing `wakes` if it commits and discarding them if not.
-    fn settling(self, wakes: Arc<AttemptWakes>) -> Settling<Self> {
-        Settling {
-            attempt: Box::pin(self),
-            wakes: Some(wakes),
-        }
-    }
-}
-
-impl<F, T, E> SettleWakes<T, E> for F where F: Future<Output = Result<T, E>> {}
 
 /// The outbox handle is bound once the pipeline starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

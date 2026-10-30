@@ -63,7 +63,7 @@ use super::locking::{lock_scopes, with_budget};
 use super::repo::lease_repo;
 use super::repo::lease_repo::RowWait;
 use super::repo::operation_log_repo::{self, Entry};
-use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, SettleWakes};
+use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, settling};
 
 /// Operation-log verbs of the lease primitives.
 const OP_LEASE_ACQUIRE: &str = "lease_acquire";
@@ -108,11 +108,11 @@ impl SqlConsumptionStore {
                 let scope = scope.clone();
                 let metric = metric.clone();
                 let owned = OwnedMutation::of(mutation);
-                self.db
-                    .transaction_ref_mapped(move |tx| {
+                settling(
+                    wakes,
+                    self.db.transaction_ref_mapped(move |tx| {
                         Box::pin(async move {
-                            let scope = &scope;
-                            let owned = &owned;
+                            let (scope, owned) = (&scope, &owned);
                             // Rank 1: the Quota rows of the applicable set.
                             let quotas = SqlConsumptionStore::lock_applicable(
                                 tx,
@@ -297,8 +297,8 @@ impl SqlConsumptionStore {
                             .await?;
                             Ok::<_, TxError>(TransitionOutcome::Applied(acquired))
                         })
-                    })
-                    .settling(wakes)
+                    }),
+                )
             })
             .await;
             match result {
@@ -365,8 +365,9 @@ impl SqlConsumptionStore {
             let write_owned = write.clone();
             let metric = preview.metric.clone();
             let actor = actor.clone();
-            self.db
-                .transaction_ref_mapped(move |tx| {
+            settling(
+                wakes,
+                self.db.transaction_ref_mapped(move |tx| {
                     Box::pin(async move {
                         let scope = &scope_owned;
                         let now = clock();
@@ -581,8 +582,8 @@ impl SqlConsumptionStore {
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-release:p1:inst-lrl-apply
                         // @cpt-end:cpt-cf-quota-enforcement-flow-lease-commit:p1:inst-lcm-apply
                     })
-                })
-                .settling(wakes)
+                }),
+            )
         })
         .await
         .map_err(|error| lift(op_name, error))
@@ -601,8 +602,9 @@ impl SqlConsumptionStore {
         const OPERATION: &str = "reclaim expired leases";
         let wakes = AttemptWakes::begin(&self.enqueuer);
         let enqueuer = wakes.enqueuer();
-        self.db
-            .transaction_ref_mapped(move |tx| {
+        settling(
+            wakes,
+            self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     // The sweeper runs outside any tenant's request, so it
                     // works unscoped, like the other reclamation paths.
@@ -753,10 +755,10 @@ impl SqlConsumptionStore {
                     Ok::<_, TxError>(reclaimed)
                     // @cpt-end:cpt-cf-quota-enforcement-algo-lease-sweep:p1:inst-swp-reclaim
                 })
-            })
-            .settling(wakes)
-            .await
-            .map_err(|error| lift(OPERATION, error))
+            }),
+        )
+        .await
+        .map_err(|error| lift(OPERATION, error))
     }
 
     /// The backlog behind the `lease_unreclaimed_expired` gauge.

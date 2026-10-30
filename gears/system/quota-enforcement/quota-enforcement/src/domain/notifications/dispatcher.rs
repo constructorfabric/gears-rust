@@ -21,7 +21,7 @@ const LOG_TARGET: &str = "qe.notifications";
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DispatchLimits {
-    /// Failed deliveries after which a still-failing event is dead-lettered.
+    /// Recorded `attempts` at which a transient failure dead-letters the event.
     pub max_attempts: u16,
     /// Budget for one sink to take one event.
     pub sink_timeout: Duration,
@@ -165,8 +165,7 @@ impl NotificationDeliveryV1 for NotificationDispatcher {
         if let Some((label, error)) = transient {
             if attempts >= self.limits.max_attempts {
                 return self.reject(format!(
-                    "delivery failed {} times; last: sink {}: {error}",
-                    u32::from(attempts) + 1,
+                    "delivery still failing after {attempts} recorded failures; last: sink {}: {error}",
                     label.as_str()
                 ));
             }

@@ -58,7 +58,7 @@ use super::repo::RowWait;
 use super::repo::operation_log_repo::{self, Entry, OP_BATCH_DEBIT};
 use super::repo::quota_repo;
 use crate::domain::ports::Actor;
-use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, SettleWakes};
+use crate::infra::outbox::{AttemptWakes, NotificationEnqueuer, settling};
 
 const OPERATION: &str = "apply batch debit";
 
@@ -183,8 +183,9 @@ impl SqlConsumptionStore {
                 let scope = scope.clone();
                 let events = events.to_vec();
                 let owned = OwnedBatch::of(batch);
-                self.db
-                    .transaction_ref_mapped(move |tx| {
+                settling(
+                    wakes,
+                    self.db.transaction_ref_mapped(move |tx| {
                         Box::pin(async move {
                             if owned.timer.expired() {
                                 return Err(TxError::Storage(StorageError::BatchTimeout));
@@ -198,8 +199,8 @@ impl SqlConsumptionStore {
                             };
                             Self::batch_in_tx(tx, &env, &owned).await
                         })
-                    })
-                    .settling(wakes)
+                    }),
+                )
             })
             .await;
             match result {
