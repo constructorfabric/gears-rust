@@ -7696,7 +7696,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
 | D-241 | cross-cutting (Lifecycle PR #5536 review mirror, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9 |
-| D-242 | cross-cutting (Lifecycle D-247 renumbering, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
+| D-242 | cross-cutting (Lifecycle D-247 renumbering, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-237, D-241 |
 | D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
