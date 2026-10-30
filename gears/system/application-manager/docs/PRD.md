@@ -122,7 +122,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Envelope | The part of a manifest that names the application by its id and version. |
 | Section | The part of a manifest meant for one section plugin, addressed by its section key. |
 | Section type | A type that one section plugin registers, derived directly from the section base type. It names the section and gives its section key. |
-| Section key | The name of the section type that one section plugin registers, without the section base type or any version, for example `acme.iam.roles`. |
+| Section key | The name of the section type that one section plugin registers, without the section base type or any version, for example `acme.iam.access.roles`. |
 | Section plugin | A platform plugin that registers one section type, which holds the schema for its section, and one priority, and applies and removes sections. It owns all domain logic and any rollback. |
 | Priority | A value that each section plugin registers. It fixes the order of dispatch on seed and of removal on uninstall. No two section plugins share one. |
 | Seed | Submitting a manifest for an application. The system checks it and dispatches each section to its section plugin. |

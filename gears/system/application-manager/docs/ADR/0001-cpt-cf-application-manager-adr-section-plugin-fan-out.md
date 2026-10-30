@@ -51,7 +51,7 @@ Each kind of seeded data is owned by a section plugin, and every section plugin 
 
 Chosen option: "Discovery at startup into a fixed set", because it gives one plugin set and one set of section rules for the process lifetime, makes conflicts, discovery failures, and unusable schemas fail at deploy time, and keeps the types registry and plugin calls off the validation and discovery paths.
 
-* At `start`, the gear lists the instances of the section plugin GTS type and reads each instance's `priority` and `section_type`. The key is the section type's own segment without its version, for example `acme.iam.roles`, and the priority orders the plugins.
+* At `start`, the gear lists the instances of the section plugin GTS type and reads each instance's `priority` and `section_type`. The key is the section type's own segment without its version, for example `acme.iam.access.roles`, and the priority orders the plugins.
 * The gear resolves each section type, compiles its schema as the section's rules (Draft-07, within the regex limits of [DESIGN §3.2](../DESIGN.md#32-component-model)), and resolves each client in ClientHub by exact GTS id. Startup makes no plugin call.
 * The key map, priority order, and compiled section schemas stay fixed until the next start; an empty set is a valid start.
 * Seed validation and discovery read the compiled schemas from memory.

@@ -266,7 +266,7 @@ The plugin-call time limit is `plugin_call_timeout`, exactly as configured, for 
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-outcome-category`
 
-**Section outcome.** `succeeded`, `rejected`, `not_permitted`, or an internal failure: `internal_failure`; `timed_out`, whose effect is unknown; `not_sent`, refused by the in-flight cap; or `not_dispatched`, when the request task failed before the call. Request-level categories are defined only by the outcome table in [§3.3](#33-api-contracts).
+**Section outcome.** `succeeded`, `rejected`, `not_permitted`, or an internal failure: `internal_failure`; `timed_out`, whose effect is unknown; `not_sent`, refused by the in-flight cap; or `not_dispatched`, when the request task failed before the call or the call no longer fit before the run deadline. Request-level categories are defined only by the outcome table in [§3.3](#33-api-contracts).
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-entity-outcome-report`
 
@@ -297,7 +297,7 @@ stateDiagram-v2
     Interrupted --> [*]
 ```
 
-- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)). A plugin call starts only when `plugin_call_timeout` + `storage_call_timeout` still fit before it, so the call and its outcome write end by the deadline.
+- **Run deadline.** Set at acceptance ([§4.2](#42-configuration)) so that every plugin call, its outcome write, and the final transaction fit. A plugin call starts only when `plugin_call_timeout` + 2 × `storage_call_timeout` still fit before it, so the call, its outcome write, and the final transaction end by the deadline. When a call no longer fits, that plugin and every later one get `not_dispatched`, and the final transaction completes the operation as internal failure.
 - **Status guard.** Writes match only an open record before its deadline; the interruption step matches only one past it. The first final write wins.
 - **Interruption step.** One transaction sets interrupted, keeps the section outcomes so far, and inserts the finished event. For a seed, the same transaction writes the application record. The sweeper, the operation read, and the acceptance run it on an expired open operation, which covers a lost task and a failed final transaction.
 - **Supervisor completion.** When a request task fails after acceptance, the operation goes Running, then Completed as internal failure, with `not_dispatched` for plugins not yet called.
@@ -508,7 +508,7 @@ All routes are unstable and `.no_license_required()`. Platform-plane routes are 
 | 5 | Invalid manifest: a section problem (seed) | Operation report | — | — | No; fix the named sections |
 | After dispatch 1 | Not permitted by a section plugin | Operation report | — | — | No; obtain the plugin's permission |
 | After dispatch 2 | Plugin rejected | Operation report | — | — | No; fix the named sections |
-| After dispatch 3 | Internal failure: a plugin fails or times out, a call is `not_sent`, or supervisor completion (`not_dispatched`) | Operation report | — | — | Yes, send again |
+| After dispatch 3 | Internal failure: a plugin fails or times out, a call is `not_sent`, or a plugin is `not_dispatched` (supervisor completion or a call that no longer fit) | Operation report | — | — | Yes, send again |
 | — | Succeeded | Operation report | — | — | Not applicable |
 
 Storage is consulted only for a permitted caller. Sections are checked only inside the operation, so a seed with envelope and section problems ends at rank 4 and lists the section problems once the envelope is valid. An interrupted operation has no category. A gear defect is not ranked: the refused event records internal failure. The seeding documentation publishes the Retriable column as the guidance of `cpt-cf-application-manager-fr-response-content`.
@@ -548,9 +548,9 @@ Error kinds: `Rejected` (detail and optional JSON Pointer location) gives `rejec
 | Field | Holds |
 |---|---|
 | `priority` | The dispatch and removal priority |
-| `properties.section_type` | An `x-gts-ref` to the exact version of the plugin's derived section type |
+| `properties.section_type` | The GTS id of the exact version of the plugin's derived section type, constrained by `x-gts-ref` to `gts.cf.core.application_manager.section.v1~*` |
 
-The section type must be derived directly from the base type, as one segment `<vendor>.<package>.<namespace>.<type>.v<major>[.<minor>]`; any other shape fails startup with `invalid_section_type`. The section key is that segment without its version: `gts.cf.core.application_manager.section.v1~acme.iam.roles.v1.2` gives `acme.iam.roles`. Two instances whose section types differ only in version share a key and fail startup with `duplicate_section_key`. The derived section type is the section schema: it holds the section's content rules as a Draft-07 schema, and the gear reads it once at `start`.
+The section type must be derived directly from the base type, as one segment `<vendor>.<package>.<namespace>.<type>.v<major>[.<minor>]~`; any other shape fails startup with `invalid_section_type`. The section key is that segment without its version and trailing `~`: `gts.cf.core.application_manager.section.v1~acme.iam.access.roles.v1.2~` gives `acme.iam.access.roles`. Two instances whose section types differ only in version share a key and fail startup with `duplicate_section_key`. The derived section type is the section schema: it holds the section's content rules as a Draft-07 schema, and the gear reads it once at `start`.
 
 Additive changes within `v1` are compatible; any other change is a new GTS type version.
 
@@ -647,7 +647,7 @@ sequenceDiagram
     alt invalid
         O ->> R: final transaction: report (rank 5), finished event
     else valid
-        loop each plugin in priority order, while a full call fits before the run deadline
+        loop each plugin in priority order, while the call, its outcome write, and the final transaction fit before the run deadline
             O ->> P: apply(identity, operation id, envelope, section)
             O ->> R: record the section outcome
         end
@@ -655,7 +655,7 @@ sequenceDiagram
     end
 ```
 
-A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record.
+Plugins left when the loop stops early get `not_dispatched`, so the report ranks internal failure. A re-seed takes the same path. A failed section-outcome update keeps the outcome in memory for the final transaction. Every final transaction of a seed, including the interruption step and the supervisor completion, also writes the application record.
 
 #### Uninstall Operation
 
@@ -784,7 +784,7 @@ Replicas share only the database, and each runs its own sweeper under the status
 
 **Metrics** count synchronous answers, operations by category and interruption, durations, plugin call timeouts and cap refusals, allowed-callers refusals by action, request tasks in flight, history events recorded and not recorded, unavailable dependencies, sweeps and purges, and startup failures. Section keys are labels; application and operation ids never are.
 
-**Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unavailable dependency, failing sweeps, request tasks at the cap, a run window margin warning, and a startup failure.
+**Signals** for operator thresholds: history events not recorded, rising interruptions, repeated timeouts or cap refusals per key, an unavailable dependency, failing sweeps, request tasks at the cap, and a startup failure.
 
 **Startup failure reasons**: `types_registry_unreachable`, `plugin_properties_unreadable`, `section_type_unresolved`, `invalid_section_type`, `section_schema_unusable`, `plugin_client_unresolved`, `duplicate_section_key`, `equal_priority`, `invalid_setting`.
 
@@ -797,7 +797,7 @@ Settings live under `gears.application-manager.config`. Each is required with no
 | Setting | Meaning | Validation |
 |---|---|---|
 | `plugin_call_timeout` | Time limit of every plugin call; unit of the run window | Positive duration |
-| `run_window_margin` | Added to the run window | Positive, at least 2 × `storage_call_timeout` |
+| `run_window_margin` | Added to the run window for validation and scheduling delay | Positive duration |
 | `operation_retention` | Lifetime of a final operation record | Positive duration |
 | `plugin_max_in_flight` | Calls in flight per plugin instance | Positive integer |
 | `max_request_tasks` | Seed and uninstall request tasks per replica | Positive integer |
@@ -818,7 +818,7 @@ allowed_callers:
 
 **Synchronous time budget.** At most 3 × `storage_call_timeout` (storage step, acceptance, and refusal or lost-race transaction); `init` fails when this exceeds `GATEWAY_REQUEST_DEADLINE`.
 
-**Run window.** The run deadline is the acceptance commit time plus N × `plugin_call_timeout` for a seed or an uninstall, plus `run_window_margin`, with N the number of plugins. `start` logs a margin warning when the margin is below (N + 2) × `storage_call_timeout`.
+**Run window.** The run deadline is the acceptance commit time plus N × (`plugin_call_timeout` + `storage_call_timeout`) for the plugin calls and their outcome writes, plus 2 × `storage_call_timeout` for mark running and the final transaction, plus `run_window_margin`, with N the number of plugins, for a seed or an uninstall. Every plugin therefore receives its call unless the request task is delayed by more than the margin.
 
 ### 4.3 Platform Deviations
 
