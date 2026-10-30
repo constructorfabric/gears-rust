@@ -10,10 +10,10 @@
 //! - **I2 Idempotency.** Replay returns the original outcome; a different
 //!   payload under the same scope returns
 //!   [`StorageError::IdempotencyPayloadMismatch`].
-//! - **I3 Read-only.** Reads do not mutate state, except snapshot reads may
-//!   materialize the current window's period row of an active Quota within its
-//!   validity window, without settlement or events. Closing an elapsed period
-//!   belongs to the mutating operation that crosses the boundary.
+//! - **I3 Read-only.** Reads do not mutate state, and snapshot reads take no
+//!   row lock. A consumption Quota with no row for its current window reads
+//!   as zero there; the next mutating operation creates the row and closes
+//!   the elapsed period.
 //! - **I4-I5 Lease periods.** Expired leases are treated as released; lease
 //!   settlement and rollback target the acquisition period.
 //! - **I6-I8 Bounds.** Cap updates, active-lease limits, and contention
@@ -784,11 +784,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// Per-Quota state for one applicable set: every active Quota whose
     /// subject is in the set, in `quota_id` order.
     ///
-    /// The I3 exception: a consumption Quota within its validity window whose
-    /// current window has no row yet gets that row, `consumed = 0`, created in
-    /// the read's own transaction. Nothing is settled and no event is
-    /// emitted. A Quota outside its window gets no row, and its current window
-    /// reads as zero.
+    /// Writes nothing and takes no row lock (I3): a consumption Quota whose
+    /// current window has no row yet reads as zero over that window.
     async fn read_quota_snapshot(
         &self,
         ctx: &SecurityContext,
@@ -806,8 +803,8 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
     /// the default). `next_cursor` is opaque and holds only the last
     /// `quota_id` returned, so the next page resumes after it and a walk to
     /// exhaustion yields each row once; it is `None` on the last page. The
-    /// page is read in one transaction and follows the I3 exception of
-    /// [`Self::read_quota_snapshot`].
+    /// page is read in one transaction and, like
+    /// [`Self::read_quota_snapshot`], writes nothing.
     ///
     /// # Errors
     ///

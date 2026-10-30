@@ -1,8 +1,8 @@
 #![allow(clippy::expect_used)]
 //! The two snapshot reads on `SQLite`: the union each Quota once, keyset
-//! pages, the scope (a tenant-subtree grant included), and the I3 exception —
-//! the current window's row for a valid consumption Quota only, with nothing
-//! settled or emitted.
+//! pages, the scope (a tenant-subtree grant included), and I3 — a read
+//! writes nothing, and a Quota without a current row reads as zero over its
+//! computed window.
 
 use std::sync::{Arc, Mutex};
 
@@ -321,10 +321,10 @@ async fn allocation_and_consumption_quotas_report_their_own_shapes() {
     h.down().await;
 }
 
-// --- the I3 exception --------------------------------------------------------------
+// --- I3: a read writes nothing ------------------------------------------------------
 
 #[tokio::test]
-async fn a_read_creates_the_current_row_of_a_valid_quota_only_and_settles_nothing() {
+async fn a_read_writes_nothing_and_reports_the_computed_window() {
     let h = Harness::up().await;
     let valid = h.consumption(tenant(), user("u1")).await;
     let lapsed = h
@@ -337,55 +337,47 @@ async fn a_read_creates_the_current_row_of_a_valid_quota_only_and_settles_nothin
         })
         .await;
     let pairs = [pair(tenant(), vec![user("u1"), user("u2")])];
+    let events = h.events().await;
 
     h.bulk(&scope_for(tenant()), &pairs, PageRequest::first(10))
         .await
         .expect("first read");
-    assert_eq!(
-        h.periods(valid).await.len(),
-        1,
-        "the missing row is created"
-    );
-    assert_eq!(
-        h.periods(lapsed).await.len(),
-        1,
-        "on day one the second quota is still within its window"
-    );
-    let events = h.events().await;
-
     h.set_now(DAY_TWO);
     let page = h
         .bulk(&scope_for(tenant()), &pairs, PageRequest::first(10))
         .await
         .expect("read after the boundary");
-
-    let rows = h.periods(valid).await;
-    assert_eq!(rows.len(), 2, "the next window's row is created");
-    assert!(rows.iter().all(|row| !row.is_settled), "nothing is settled");
-    assert_eq!(h.events().await, events, "and nothing is emitted");
-    assert_eq!(
-        h.periods(lapsed).await.len(),
-        1,
-        "past its validity window it gets no new row"
-    );
-    let lapsed_snapshot = page
-        .items
-        .iter()
-        .find(|snapshot| snapshot.quota_id == lapsed)
-        .expect("an out-of-window quota is still returned");
-    assert!(!lapsed_snapshot.currently_within_window);
-    assert_eq!(lapsed_snapshot.consumed, 0);
-    let window = lapsed_snapshot.period.expect("the computed current window");
-    assert!(window.start <= DAY_TWO && DAY_TWO < window.end);
-
     // The single read behind preview follows the same rule.
-    h.set_now(datetime!(2026-03-19 10:00:00 UTC));
-    h.store
+    let single = h
+        .store
         .read_quota_snapshot(&ctx(), &scope_for(tenant()), &pairs[0])
         .await
         .expect("single read");
-    assert_eq!(h.periods(valid).await.len(), 3);
-    assert_eq!(h.periods(lapsed).await.len(), 1);
+
+    assert!(
+        h.periods(valid).await.is_empty(),
+        "no period row is created"
+    );
+    assert!(h.periods(lapsed).await.is_empty());
+    assert_eq!(h.events().await, events, "and nothing is emitted");
+    assert_eq!(page.items, single);
+    for snapshot in &page.items {
+        assert_eq!(snapshot.consumed, 0);
+        let window = snapshot.period.expect("the computed current window");
+        assert!(window.start <= DAY_TWO && DAY_TWO < window.end);
+    }
+    let within = |id| {
+        page.items
+            .iter()
+            .find(|snapshot| snapshot.quota_id == id)
+            .map(|snapshot| snapshot.currently_within_window)
+    };
+    assert_eq!(within(valid), Some(true));
+    assert_eq!(
+        within(lapsed),
+        Some(false),
+        "an out-of-window quota is still returned"
+    );
     h.down().await;
 }
 
@@ -461,7 +453,7 @@ fn subtree_of(root: TenantId) -> AccessScope {
 }
 
 #[tokio::test]
-async fn under_a_subtree_grant_a_stale_valid_quota_gets_its_row_through_both_reads() {
+async fn under_a_subtree_grant_both_reads_return_only_the_visible_quota() {
     let h = Harness::up().await;
     let parent = tenant();
     let child = TenantId::new(Uuid::from_u128(0xc41d));
@@ -493,206 +485,19 @@ async fn under_a_subtree_grant_a_stale_valid_quota_gets_its_row_through_both_rea
         vec![inside],
         "only the child's quota is visible"
     );
-    assert_eq!(
-        h.periods(inside).await.len(),
-        1,
-        "its current row was created"
-    );
-    assert!(
-        h.periods(beyond).await.is_empty(),
-        "the unseen quota got none"
-    );
-
-    h.set_now(DAY_TWO);
     let single = h
         .store
         .read_quota_snapshot(&ctx(), &subtree_of(parent), &pairs[0])
         .await
         .expect("single read under the subtree grant");
     assert_eq!(single.len(), 1);
-    assert_eq!(
-        h.periods(inside).await.len(),
-        2,
-        "the single read creates it too"
-    );
+    let none = h
+        .store
+        .read_quota_snapshot(&ctx(), &subtree_of(parent), &pairs[1])
+        .await
+        .expect("single read of an invisible target");
+    assert!(none.is_empty());
+    assert!(h.periods(inside).await.is_empty());
     assert!(h.periods(beyond).await.is_empty());
     h.down().await;
-}
-
-// --- SQLite contention -------------------------------------------------------------
-
-/// A file-backed WAL database with two connections, so a reader and a writer
-/// really are concurrent; the in-memory test database has one connection.
-async fn wal_db(path: &std::path::Path) -> Db {
-    let dsn = format!(
-        "sqlite://{}?mode=rwc&journal_mode=WAL&busy_timeout=100",
-        path.display()
-    );
-    let db = toolkit_db::connect_db(
-        &dsn,
-        toolkit_db::ConnectOpts {
-            max_conns: Some(2),
-            ..toolkit_db::ConnectOpts::default()
-        },
-    )
-    .await
-    .expect("connect file sqlite");
-    run_migrations_for_testing(&db, crate::infra::storage::Migrator::migrations())
-        .await
-        .expect("apply storage migrations");
-    db
-}
-
-type Gated = (
-    SqlConsumptionStore,
-    std::sync::mpsc::Receiver<()>,
-    std::sync::mpsc::Sender<()>,
-);
-
-/// A store over `db` whose first `times` clock readings — each taken after an
-/// attempt's page query, so its snapshot is fixed — wait to be released.
-fn gated_reader(db: &Db, enqueuer: &Arc<crate::QeOutbox>, times: u32) -> Gated {
-    let (reached_tx, reached_rx) = std::sync::mpsc::channel::<()>();
-    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
-    let remaining = Arc::new(Mutex::new(times));
-    let go_rx = Arc::new(Mutex::new(go_rx));
-    let reader = SqlConsumptionStore::with_clock(
-        db.clone(),
-        Arc::clone(enqueuer) as _,
-        Arc::new(move || {
-            let held = {
-                let mut left = remaining.lock().expect("counter");
-                let held = *left > 0;
-                *left = left.saturating_sub(1);
-                held
-            };
-            if held {
-                reached_tx.send(()).expect("announce the gate");
-                // Hand this worker's queued tasks to another thread while
-                // waiting, or a task parked in its LIFO slot would starve.
-                tokio::task::block_in_place(|| {
-                    go_rx.lock().expect("gate").recv().expect("released");
-                });
-            }
-            DAY_ONE
-        }),
-    );
-    (reader, reached_rx, go_tx)
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_whose_snapshot_went_stale_before_its_insert_is_retried() {
-    // Declared first so it is dropped last, after every handle on the file.
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = wal_db(&dir.path().join("snapshot.db")).await;
-    let (outbox, enqueuer) = bound_outbox(&db).await;
-    let quotas =
-        SqlQuotaStore::with_clock(db.clone(), Arc::clone(&enqueuer) as _, Arc::new(|| DAY_ONE));
-    let id = quotas
-        .create_quota(
-            &actor(),
-            &scope_for(tenant()),
-            consumption_draft(tenant(), user("u1")),
-            &[],
-        )
-        .await
-        .expect("create quota");
-    let applicable = pair(tenant(), vec![user("u1")]);
-
-    // Reader A stops at its clock, after its snapshot is fixed.
-    let (reader, reached_rx, go_tx) = gated_reader(&db, &enqueuer, 1);
-    let read_a = {
-        let applicable = applicable.clone();
-        tokio::spawn(async move {
-            reader
-                .read_quota_snapshot(&ctx(), &scope_for(tenant()), &applicable)
-                .await
-        })
-    };
-    tokio::task::spawn_blocking(move || reached_rx.recv())
-        .await
-        .expect("join")
-        .expect("reader A reached its clock");
-
-    // Reader B creates the row and commits while A holds its old snapshot.
-    let writer = SqlConsumptionStore::with_clock(
-        db.clone(),
-        Arc::clone(&enqueuer) as _,
-        Arc::new(|| DAY_ONE),
-    );
-    writer
-        .read_quota_snapshot(&ctx(), &scope_for(tenant()), &applicable)
-        .await
-        .expect("reader B");
-    go_tx.send(()).expect("release A");
-    let snapshots = read_a
-        .await
-        .expect("join")
-        .expect("reader A succeeds after a retry");
-
-    assert_eq!(snapshots.len(), 1);
-    let conn = db.conn().expect("connection");
-    let rows = quota_consumption_counter::Entity::find()
-        .secure()
-        .scope_with(&AccessScope::allow_all())
-        .filter(Condition::all().add(quota_consumption_counter::Column::QuotaId.eq(id.as_uuid())))
-        .all(&conn)
-        .await
-        .expect("period rows");
-    assert_eq!(rows.len(), 1, "one row for the window, not two");
-    outbox.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_read_that_keeps_meeting_newer_commits_answers_unavailable() {
-    // Declared first so it is dropped last, after every handle on the file.
-    let dir = tempfile::tempdir().expect("temp dir");
-    let db = wal_db(&dir.path().join("snapshot.db")).await;
-    let (outbox, enqueuer) = bound_outbox(&db).await;
-    let quotas =
-        SqlQuotaStore::with_clock(db.clone(), Arc::clone(&enqueuer) as _, Arc::new(|| DAY_ONE));
-    quotas
-        .create_quota(
-            &actor(),
-            &scope_for(tenant()),
-            consumption_draft(tenant(), user("u1")),
-            &[],
-        )
-        .await
-        .expect("create quota");
-    let (reader, reached_rx, go_tx) = gated_reader(&db, &enqueuer, 3);
-    let reached_rx = Arc::new(Mutex::new(reached_rx));
-    let read = tokio::spawn(async move {
-        reader
-            .read_quota_snapshot(
-                &ctx(),
-                &scope_for(tenant()),
-                &pair(tenant(), vec![user("u1")]),
-            )
-            .await
-    });
-
-    // Every attempt meets a commit made after its snapshot, so every insert
-    // fails to upgrade.
-    for attempt in 0..3 {
-        let reached = Arc::clone(&reached_rx);
-        tokio::task::spawn_blocking(move || reached.lock().expect("gate").recv())
-            .await
-            .expect("join")
-            .expect("the attempt reached its clock");
-        quotas
-            .create_quota(
-                &actor(),
-                &scope_for(tenant()),
-                draft(tenant(), &format!("other-{attempt}"), Some(1)),
-                &[],
-            )
-            .await
-            .expect("a concurrent commit");
-        go_tx.send(()).expect("release the attempt");
-    }
-
-    let error = read.await.expect("join").expect_err("three conflicts");
-    assert!(matches!(error, StorageError::Unavailable(_)), "{error:?}");
-    outbox.stop().await;
 }

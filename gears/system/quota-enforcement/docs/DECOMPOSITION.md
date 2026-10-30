@@ -557,7 +557,7 @@ not here.
 - **Scope**:
   - `POST /v1/quota-enforcement/snapshot` for `1..N` `(subject, metric)` filters with cursor pagination
   - End-user restriction to the forwarded context's own user/tenant projections, returning every applicable Quota
-  - Lazy period-row materialization as the single read-path write exception
+  - The read-only guarantee (I3): a consumption Quota without a current period row reads as zero, and no read creates one
 
 - **Out of scope**:
   - Admission verdicts (served by `evaluate_preview` in feature `consumption-operations`)

@@ -331,9 +331,8 @@ pub trait ConsumptionStore: Send + Sync {
         events: &[NotificationEvent],
     ) -> Result<TransitionOutcome<AppliedMutation>, StorageError>;
 
-    /// Per-Quota state of one applicable set, creating the current window's
-    /// row of a valid consumption Quota that lacks one and nothing else (the
-    /// I3 exception).
+    /// Per-Quota state of one applicable set. Writes nothing and takes no row
+    /// lock (I3).
     ///
     /// # Errors
     ///
@@ -346,7 +345,7 @@ pub trait ConsumptionStore: Send + Sync {
     ) -> Result<Vec<QuotaSnapshot>, StorageError>;
 
     /// One page of the per-Quota state of many applicable sets, each Quota
-    /// once, in `quota_id` order, under the same I3 exception.
+    /// once, in `quota_id` order, writing nothing (I3).
     ///
     /// # Errors
     ///
