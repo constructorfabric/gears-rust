@@ -100,43 +100,51 @@ then. "Requested" means Rating asked; nothing here is agreed unless the row says
 
 ### 2.1 Usage Collector
 
-`gears/system/usage-collector`. Its documents describe a breaking pre-1.0 **target V1** (PRD,
-DESIGN §3.3, 15 accepted ADRs, JSON schemas); its code — SDK, gear and plugins — still implements
-the superseded point-record model. The collector records this itself: "This document is normative,
-and the code is not a second source" (DESIGN:2296); the REST YAML is `x-contract-status:
-unreleased`. References are to the collector's documents unless marked "code".
+`gears/system/usage-collector`. Its documents describe a breaking pre-1.0 target (PRD, DESIGN
+§3.3, ADRs, JSON schemas), and PR #5359 (approved, not merged) turns it into the **version 2 SDK
+contract**: `UsageCollectorClientV2` with `read_usage_feed`, `usage-collector-v2.yaml`
+(`x-contract-status: unreleased`) and `schemas/usage_record.v2.schema.json`. Nothing serves it yet:
+the gateway route is stage 2 of a five-stage rollout (SDK contract, gateway, TimescaleDB plugin,
+ClickHouse plugin, removal of v1; PR description). The code on `main` still implements the
+superseded point-record model. Rating builds against its own feed port and contract fake until the
+adapter over the v2 SDK can land (T-D-84). References are to the collector's v2 documents (PR #5359)
+unless marked "code" or "`main`".
 
 | # | Contract | Direction / mode | Fields / semantics | Evidence | Status |
 |---|---|---|---|---|---|
-| U-1 | **Usage feed** `read_usage_feed(ctx, &FeedSubscription, FeedStart<&CursorV1>, until: Option<&CursorV1>, limit) -> FeedPage`; REST `GET /usage-collector/v1/feed` | UC → Rating, pull | subscription = 1..100 GTS types; `FeedStart::{Oldest, After(cursor)}`; `until` bounds a replay (identical entry for entry); limit 1..1 000; pages carry only settled entries, nothing appears behind a returned cursor; prefix-stable, **no snapshot token**; one deterministic plugin-chosen order, only "an invalidation follows its target"; `next_cursor` never null on a live read | DESIGN:536-600, 919-932, 1127-1142, 1355; ADR-0011; YAML:315-371 | **DOCUMENTED**, not implemented — code `UsageCollectorClientV1` (`usage-collector-sdk/src/api.rs:17-110`) has ten methods (create, create batch, get, aggregate, list, deactivate, and four usage-type methods); no `FeedPage`, `FeedStart`, `read_feed_page` or `entry_type` in any `.rs` file; the REST YAML is `x-contract-status: unreleased` (`docs/usage-collector-v1.yaml:35`) |
+| U-1 | **Usage feed** `UsageCollectorClientV2::read_usage_feed(ctx, &FeedSubscription, FeedStart<&CursorV1>, until: Option<&CursorV1>, limit: Option<u64>) -> FeedPage<CursorV1>`; REST `GET /usage-collector/v2/feed` | UC → Rating, pull | subscription = 1..100 meters, sorted and deduplicated; `FeedStart::{Oldest, After(cursor)}`; `until` bounds a replay (identical entry for entry); limit 1..1 000 (`MAX_PAGE_SIZE`); pages carry only settled entries, nothing appears behind a returned cursor; prefix-stable, **no snapshot token**; one deterministic plugin-chosen order, only "an invalidation follows its target"; `next` present on every page of a live read; `CursorBeyondRetention` is `InvalidArgument` with `ValidationReason::CursorBeyondRetention`; a cursor of another subscription is `CursorRejected` (`FILTER_MISMATCH`) | v2 `api.rs:142-149`, `feed.rs:122-155`, `error.rs:170-205`; DESIGN:601, 907-929, 1398; YAML:399-441; ADR-0011 | **v2 SDK contract APPROVED, not merged** (PR #5359); not served until the collector's stage 2; code on `main`: `UsageCollectorClientV1` has no feed. Rating: own `UsageFeedPort` + `FakeUsageFeed` now, adapter over the v2 trait after the merge (T-D-84) |
 | U-2 | Entry identity + dedup | UC | dedup identity `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`; `id = UUIDv5(NS 56313026-…, that tuple)`, reproducible offline; consumers MUST use it as their dedup and reference key | ADR-0007; DESIGN:578; PRD:547 | DOCUMENTED; code: UUIDv5 over `(tenant, gts_id, created_at, key)` (`id.rs:41-58`) — DOC/CODE DRIFT |
-| U-3 | Corrections | UC → Rating | invalidation = entry with `entry_type = invalidation`, faithful copy, server-stamped `invalidates`, `reason_code`, quantity echoed; at most one per record; no invalidation of an invalidation; replacement = invalidation + fresh record under a new key, **not atomic** — consumers must not treat the in-between state as settled | ADR-0010; DESIGN:579-594; PRD:436-438 | DOCUMENTED; code: `deactivate_usage_record` status flip + `corrects_id` compensation (being removed) |
+| U-3 | Corrections | UC → Rating | invalidation = entry carrying `invalidates` and `reason_code` (both or neither; on the SDK record one `Invalidation` field, from which the entry type is read), a faithful copy of its target — same tenant, meter, idempotency key and covered period — whose `invalidates` the collector derives from that identity with `entry_type = record`; quantity echoed; at most one per record; no invalidation of an invalidation; replacement = invalidation + fresh record under a new key, **not atomic** — consumers must not treat the in-between state as settled | ADR-0010; v2 `models.rs:836-958`; schema `usage_record.v2.schema.json:22-40, 139-145`; DESIGN:579-594; PRD:436-438 | v2 contract APPROVED, not merged; code on `main`: `deactivate_usage_record` status flip + `corrects_id` compensation (being removed) |
 | U-4 | Fold; **only `SUM` is chargeable**; levels pre-integrated at the emitter | types-registry declaration | consumer applies the declared fold; excludes both entries of a withdrawn pair | ADR-0009, ADR-0011; PRD:288 | **CONFLICTING** with Rating T-D-17 (and a legacy pricing "D-44" not in Pricing's current register) — R-06 (Atlas R1 agrees with UC) |
 | U-5 | Aggregate / query paths | UC | eventually consistent, never a charging input ("a consumer that computes money reads entries, not aggregates") | ADR-0011 | not used by Rating |
 | U-6 | Retention floor = backfill window (90 d) + replay horizon (35 d) = 125 days from `window_end`; refusal `InvalidArgument(CursorBeyondRetention)` depends on what the store holds, not cursor age; a polled cursor is never refused | UC | — | PRD:683-699; DESIGN:927-932 | DOCUMENTED; plugin today: one deployment-wide TTL. Rating: a restart from `Oldest` does not repair entries lost before capture, and the feed's order is not event-time order, so Rating records a **source loss** over the days the removed entries can belong to (one retention floor before its last good page to one floor before detection), which blocks the windows that can hold them under every evidence mode; those days are past retention and the backfill window, so neither reconciliation (U-12) nor a backfill (U-13) can prove repair and the loss ends as an audited `accepted_loss` (T-D-62, DESIGN §4.6) |
 | U-7 | Commercial identity is the consumer's | UC | `resource_ref {resource_id, resource_type}`, `subject_ref?`, metadata | PRD:513, 1072 | CONFIRMED by design — **CONFLICTING** with Subscriptions S-PRD:360 (R-25) |
-| U-8 | Interval entries | UC | half-open `[window_start, window_end)` UTC, µs; equal bounds = point event; `accepted_at` and `origin` server-assigned; quantity decimal string ≤ 28 fractional digits (ADR-0013); rounding belongs to the rating consumer (ADR-0013:209) | YAML:649-667, 787-889; DESIGN:547-586 | DOCUMENTED; code record is `UsageRecord{id, gts_id, tenant_id, resource_ref, subject_ref?, metadata, value: Decimal (string), idempotency_key, corrects_id?, status, created_at}` — field `value`, a `created_at` instant only (`usage-collector-sdk/src/models.rs:699-750`); the ClickHouse plugin stores `Decimal128(9)` and refuses more precision (`plugins/clickhouse-usage-collector-plugin/src/infra/storage/entity.rs:116`) against 28 documented — DOC/CODE DRIFT |
-| U-9 | Usage type declarations in types-registry: `aggregation_fold`, `canonical_unit`, `retention`, optional `nominal_sampling_interval`; the collector serves no type reads | types-registry → consumers | — | ADR-0008; `schemas/usage_record.v1.schema.json:44-65`; DESIGN:428-437 | DOCUMENTED; code: the collector's own plugin catalog `UsageType{gts_id, kind: Counter\|Gauge, metadata_fields}` with no unit (`usage-collector-sdk/src/models.rs:574-589`), validated at ingest; Products' usage-type adapter depends on those Phase 1 routes, which the target removes (`gears/bss/products/products/src/infra/usage_types.rs:123, 189, 274`) — DOC/CODE DRIFT |
+| U-8 | Interval entries | UC | half-open covered period `[window_start, window_end)` UTC, µs (finer bounds are refused, not truncated); equal bounds = point event; `accepted_at` and `origin` server-assigned; quantity decimal string ≤ 28 significant and 28 fractional digits, textual equality (ADR-0013); rounding belongs to the rating consumer (ADR-0013:209) | v2 `models.rs:861-942`, `quantity.rs`; YAML:762-798; DESIGN:547-586 | v2 contract APPROVED, not merged; code on `main`: record is `UsageRecord{id, gts_id, tenant_id, resource_ref, subject_ref?, metadata, value: Decimal (string), idempotency_key, corrects_id?, status, created_at}` — field `value`, a `created_at` instant only (`usage-collector-sdk/src/models.rs:699-750`); the ClickHouse plugin stores `Decimal128(9)` and refuses more precision (`plugins/clickhouse-usage-collector-plugin/src/infra/storage/entity.rs:116`) against 28 documented — DOC/CODE DRIFT |
+| U-9 | Meter declarations in types-registry: a meter is `gts.cf.core.uc.usage_record.v2~<segment>~`; traits `aggregation_fold`, `canonical_unit`, `retention`, optional `nominal_sampling_interval`; the declaration closes `metadata`; the collector serves no type reads | types-registry → consumers | — | ADR-0008:115-148; ADR-0015; `schemas/usage_record.v2.schema.json:41-68, 95-98, 151-155` | DOCUMENTED; Rating resolves through its `MeterDeclarations` port + fake until the read lands (T-D-84); code on `main`: the collector's own plugin catalog `UsageType{gts_id, kind: Counter\|Gauge, metadata_fields}` with no unit (`usage-collector-sdk/src/models.rs:574-589`), validated at ingest; Products' usage-type adapter depends on those Phase 1 routes, which the target removes (`gears/bss/products/products/src/infra/usage_types.rs:123, 189, 274`) — DOC/CODE DRIFT |
 | U-15 | Raw usage types are the inputs of Products' derived usage types; a usage SKU never sells a raw GTS type (§2.5 G-10) | UC → Rating via Products | Rating counts raw inputs and evaluates the derived meter (T-D-76) | products P-D-259; `gears/bss/products/products-sdk/src/derived.rs:69-81` | CONFIRMED (Products side) |
-| U-12 | Reconciliation metadata `GET /usage-collector/v1/reconciliation` (`accepted_count`, quantity summary, `accepted_at_watermark`, `window_end_watermark`) | UC → operators | REST-only, operator-scoped, no trait; watermarks "prove nothing about completeness" | DESIGN:1052, 1356-1362; YAML:373-424, 1238-1320; ADR-0011 | DOCUMENTED; Rating's service-identity access UNKNOWN (`…-upreq-usage-reconciliation-access`). It is the evidence that narrows or resolves a source loss for days the collector still holds in full; without access an operator submits the figures (`POST /source-losses/{id}:reconciliation`) |
+| U-12 | Reconciliation metadata `GET /usage-collector/v2/reconciliation` (`accepted_count`, quantity summary, `accepted_at_watermark`, `window_end_watermark`) | UC → operators | REST-only, operator-scoped, no trait; watermarks "prove nothing about completeness" | DESIGN:1052, 1356-1362; YAML:373-424, 1238-1320; ADR-0011 | DOCUMENTED; Rating's service-identity access UNKNOWN (`…-upreq-usage-reconciliation-access`). It is the evidence that narrows or resolves a source loss for days the collector still holds in full; without access an operator submits the figures (`POST /source-losses/{id}:reconciliation`) |
 | U-13 | Backfill route `backfill_usage_records` / `POST /records/backfill` | emitter → UC | live path refuses periods ending > 48 h ago; backfill up to 90 d, `origin = backfill` | DESIGN:665-671, 1082-1086 | DOCUMENTED |
 | U-14 | Consumer obligations | Rating | dedup by entry id across at-least-once delivery; persist the rated usage identity per charge; replay from `Oldest` after a widened authorization scope; stall detection is the consumer's | PRD:547, 669, 749, 1503-1504 | adopted by Rating: every entry is captured raw before it is interpreted (T-D-61); one canonical source identity per feed subscription (its sorted type set and its configured tenant scope) names the checkpoint, the Cluster leadership `usage-feed-{source_uuid}` and the cursor; a changed type set or configured scope is a new source from `Oldest` (DESIGN §3.7) |
-| U-16 | Scope visibility on the feed: a narrowed grant skips entries "with no error raised"; no scope change is signalled | UC → Rating | `FeedPage{entries, page_info}`, no scope digest; the feed read's permission is not named | DESIGN:911-913, 1411-1413; PRD:669; YAML:1067-1086, 1322-1345 | **ABSENT** — Rating checks its grant against the configured scope before each read and commit and pauses the source when it no longer covers it (feature 04 §4.6); `…-upreq-usage-feed-scope-digest` |
+| U-16 | Scope visibility on the feed: a narrowed grant skips entries "with no error raised"; no scope change is signalled | UC → Rating | `FeedPage{entries, next}`, no scope digest; the feed read's permission is now named: action `read_feed` on `gts.cf.core.uc.usage_record.v2~`, evaluated pre-row | v2 DESIGN:907-914, 1464-1474, 2082-2091; PRD:669; YAML:414-417 | **PARTIAL** — the permission is named (v2); the scope digest is still ABSENT. Rating checks `read_feed` for its service identity on each configured root before each read and commit and pauses the source when it no longer covers it (feature 04 §4.6); `…-upreq-usage-feed-scope-digest` |
 
-#### Implement the documented V1 feed
+#### Implement the documented feed
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-upreq-usage-feed-v1`
 
-The usage-collector **MUST** implement its own documented target V1 (DESIGN §3.3): `read_usage_feed`
-with the opaque continuing cursor and `until` (U-1), interval entries (U-8), invalidation entries
-(U-3), the dedup identity behind the entry id (U-2), the backfill route (U-13) and the retention
-floor and `CursorBeyondRetention` refusal (U-6). Nothing in it needs redesign for Rating; the Atlas
-`UsageFeedV1` is not requested (the Atlas Plus overlay withdraws it).
+The usage-collector **MUST** implement its own documented feed, now the version 2 SDK contract
+(DESIGN §3.3, PR #5359): `read_usage_feed` with the opaque continuing cursor and `until` (U-1),
+interval entries (U-8), invalidation entries (U-3), the dedup identity behind the entry id (U-2),
+the backfill route (U-13) and the retention floor and `CursorBeyondRetention` refusal (U-6).
+Nothing in it needs redesign for Rating; the Atlas `UsageFeedV1` is not requested (the Atlas Plus
+overlay withdraws it). The ID keeps its `v1` suffix: it names the ask, not the collector's major
+version.
 
 - **Rationale**: polling `list_usage_records` by `created_at` misses late-accepted records behind the
   cursor and cannot see invalidations; a status flip is an invisible mutation of financial input.
 - **Source**: `gears/bss/rating` — DESIGN §3.6 Flow A, Flow B; feature [`04-usage-intake`](./features/04-usage-intake.md).
-- **Status**: DOCUMENTED, not implemented (U-1…U-3, U-8). **BLOCKER** for usage rating.
+- **Status**: v2 SDK contract APPROVED, not merged (PR #5359); not served until the collector's
+  stage 2 (U-1…U-3, U-8). **BLOCKER** for usage rating. Rating's feature 04 runs against its own
+  port and `FakeUsageFeed` meanwhile (T-D-84).
 - **Register aliases**: J-1; DECISIONS R-01.
 - **Acceptance signal**: a Rating feed reader passes the collector's own feed conformance tests and
   Rating's capture vectors V01, V03 and V04 against the implemented trait instead of the contract fake.
@@ -181,9 +189,10 @@ with the platform PDP.
   the page closes that gap, and the permission name removes a guess from Rating's check.
 - **Source**: `gears/bss/rating` — feature [`04-usage-intake`](./features/04-usage-intake.md) §4.6
   (narrowed authorization scope); vector V72.
-- **Status**: ABSENT — `FeedPage` is `{entries, page_info}` and `PageInfo` is `{next_cursor,
-  prev_cursor, limit}` (usage-collector YAML:1067-1086, 1322-1345); the feed read names no
-  permission.
+- **Status**: PARTIAL — the v2 contract names the permission (action `read_feed` on
+  `gts.cf.core.uc.usage_record.v2~`, DESIGN:2082-2091), which Rating's check now uses; the scope
+  digest is ABSENT: `FeedPage` is `{entries, next}` (REST `{entries, page_info}`) and scope is never
+  bound into the cursor (DESIGN:1464-1468).
 - **Register aliases**: none.
 - **Acceptance signal**: a page read under a narrowed grant carries a different scope digest, and
   Rating's reader refuses to commit it in an integration test.
@@ -280,7 +289,7 @@ and they are kept only so earlier citations still resolve.
 | P-22 | Money (`PriceModel`): exact `rust_decimal::Decimal` in **major** currency units, JSON strings on REST; `Flat{amount}`, `PerUnit{unit_amount}` (REST `{rate}`), `Graduated{tiers}`, `Volume{tiers}`, `Package{package_size, package_price}` (readable, not saleable, D-504); `Tier{up_to: Option<Decimal> exclusive, rate}`, last band open (D-387); models per charge kind (D-386): usage = per_unit/graduated/volume/package, recurring and one_time = flat/per_unit; `minimum_fee` scale-checked against the currency (`MIN_FEE_INVALID`). Pricing computes no totals, proration, floor or rounding (D-415) | `pricing-sdk/src/read.rs:27-65`; `pricing/src/domain/money.rs:20-55, 75-169`; `pricing/src/domain/price.rs:94-99`; `pricing/src/domain/price_book_entry.rs:45-52` | **CONFIRMED** — kept exact in major units as fractions with the bound price's stored scale, `price.currency.scale()` (T-D-74, T-D-80; D-531) |
 | P-23 | `InvoiceInputs{template, template_digest, template_source: Entry \| SkuVersion \| SellerSettings, gl_code, tax_category, timing: BillingTiming{Advance, Arrears}, rounding: Rounding{HalfEven}}` on every binding, resolved as of `date` (D-421); prices freeze no descriptors (D-389). `InvoiceInputs` has **no** `currency_scale` since `958b5e2f1` ("feat(pricing)!: exact decimal money on the shared money contract"): under D-531 each price stores its currency spec and a line posts at the bound price's stored scale, `price.currency.scale()` (`pricing-sdk/src/terms.rs:132-156`, `read.rs:93`; `digest.rs:177, 244` hash it) The SDK requires them all: one incomplete covered cell, or a tenant rounding other than half_even, fails the whole `resolve` with `INCOMPLETE_COMMERCIAL_INPUTS` | `pricing-sdk/src/terms.rs:112-158`; `pricing/src/api/pricing_read.rs:284-399`; `docs/DECISIONS.md:183, 458-462, 645` | **CONFIRMED** — frozen in Rating's binding copy; a failed call is `incomplete_commercial_inputs` (Rating may resolve per `item_id` to isolate a cell) |
 | P-24 | Refusals: 400 `PIN_FOREIGN` (whole request), `PIN_DUPLICATE`, `PINS_TOO_MANY` (> 1 000; a consumer with more splits by `item_id`), `DATE_INVALID`, `QUERY_INVALID`, `ID_INVALID`; 409 `REVISION_NOT_PUBLISHED`, `REVISION_NOT_YET_AVAILABLE`; 404 for an unknown or foreign revision, item or price; 503 `REGISTRY_UNAVAILABLE` when Products cannot answer. An uncovered chain is not a refusal (D-420) | `docs/DESIGN.md:514-517`; `pricing/src/infra/pricing_reads.rs:42-93, 188-198, 384-419`; `pricing/src/domain/resolve.rs:25` | **CONFIRMED** — mapped to `pricing_refused(<code>)` / `pricing_unavailable` (DESIGN) |
-| P-25 | Authorization: the PDP is asked for `plan:read` (resolve, current_revision) or `price:read` (price); pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, D-523), so `CatalogRef.tenant_id` must equal the caller's `subject_tenant_id`; "a system-looking subject has no authorization bypass"; Products reads during resolve run as pricing's system actor (D-424) | `pricing/src/api/pricing_read.rs:50-80`; `docs/DECISIONS.md:492-498` | **CONFIRMED** — Rating calls as `bss-rating.system` with `plan:read` and `price:read` and a `SecurityContext` built per work item for its seller tenant (`subject_tenant_id` = `CatalogRef.tenant_id`, V59); the deployment grant is `…-upreq-pricing-read-grant` |
+| P-25 | Authorization: the PDP is asked for `plan:read` (resolve, current_revision) or `price:read` (price); pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, D-523), so `CatalogRef.tenant_id` must equal the caller's `subject_tenant_id`; "a system-looking subject has no authorization bypass"; Products reads during resolve run as pricing's system actor (D-424) | `pricing/src/api/pricing_read.rs:50-80`; `docs/DECISIONS.md:492-498` | **CONFIRMED** — Rating calls as `bss-rating.system` with `plan:read` and `price:read` in its seller tenant (`subject_tenant_id` = `CatalogRef.tenant_id`, V59): an authenticated per-seller service principal (Orders D-194, T-D-83), a `SecurityContext` built per work item until then; the deployment grant is `…-upreq-pricing-read-grant` |
 | P-26 | Events on topic `gts.cf.core.events.topic.v1~cf.bss.pricing.catalog.v1`: `prices_published`, `plan_revision_published`, `approval_unit_decided`, `price_book_entry_reference_lost`, `plan_reference_lost`; written to the toolkit outbox in the act's transaction and dispatched by `DbProducer` when a broker is registered, otherwise held (D-400, D-455) | `pricing/src/infra/events.rs:1-58, 191-293`; `pricing/src/infra/reference_events.rs:16-80` | **CONFIRMED**; Rating consumes none (pull is sufficient) |
 | P-27 | Commercial sale capability: `SellabilityV1::{check, check_fulfilment}`, `PricingAcceptanceV1::{acceptance, hold}`, `AcceptanceReceipt{acceptance_id, request_digest, terms_digest, query, accepted_at, hold_until, bindings}` (immutable, retained), `HeldBindings`; `NewSaleQuery` carries `quantity`, `market`, `term` and the Subscriptions-owned `BillingTerms`. SDK only, used by Orders and Subscriptions (D-504, D-508, D-509) | `pricing-sdk/src/acceptance.rs:42-418`; `pricing/src/module.rs:163,167`; `pricing-sdk/src/terms.rs:160-198` | **CONFIRMED**; not called by Rating — the accepted bindings reach Rating through Subscriptions' facts (§2.6) |
 | P-28 | Golden consumer contracts (fifteen files, SQLite and Postgres: `resolve_*`, `price_*`, `price_book_entry_usage`) and SDK seam fixtures (`vm-hour`, `cloudlets-hourly-graduated`, `cloudlets-hourly-volume`, `frozen-acceptance`, `unsupported-terms`) | `pricing/tests/contract/*.json`; `pricing/tests/seam_fixtures/*.json`; `docs/DECISIONS.md:1914-1932` | **CONFIRMED** — Rating's adapter tests and arithmetic vectors read them (cloudlets Q = 8 and Q = 12 hourly give 0.34, not 0.30) |
@@ -384,11 +393,12 @@ billable unit, declare it so that Rating can apply rule 5 (aggregate, round up o
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-upreq-pricing-read-grant`
 
-The deployment **MUST** grant Rating's per-tenant system subject (`bss-rating.system` with
-`subject_tenant_id` = the seller tenant) pricing `plan:read` (resolve) and `price:read` (price by id)
-in each seller tenant it rates (D-424, D-510 E3). Pricing answers only the caller's own tenant
-(D-523, `TenantMode::RootOnly`), so the grant is per seller tenant, as for Orders (Orders D-160);
-the same holds for the Products declaration read (P-D-265).
+The deployment **MUST** provision Rating's per-seller service principal (`bss-rating.system` with
+`subject_tenant_id` = the seller tenant, authenticated through the AuthN S2S path, Orders D-194,
+T-D-83) and grant it pricing `plan:read` (resolve) and `price:read` (price by id) in each seller
+tenant it rates (D-424, D-510 E3), explicitly per tenant and never by home tenant. Pricing answers
+only the caller's own tenant (D-523, `TenantMode::RootOnly`), so the grant is per seller tenant, as
+for Orders; the same holds for the Products declaration read (P-D-265).
 
 - **Rationale**: "names confer no privilege" (D-510 E3) and "a system-looking subject has no
   authorization bypass" (P-25); without the grant every resolve is denied.
@@ -1016,7 +1026,7 @@ commercial acceptance; never silently move the billing anchor. No deployed profi
 | # | Contract | Evidence | Status | Consequence for Rating |
 |---|---|---|---|---|
 | A-1 | ClientHub typed clients (`register`, `register_scoped`, `get`, `get_scoped`), in-process or OoP gRPC | `libs/toolkit/src/client_hub.rs:152-273`; `docs/toolkit_unified_system/03_clienthub_and_plugins.md`, `09_oop_grpc_sdk_pattern.md` | CONFIRMED | All inter-gear reads are SDK calls. |
-| A-2 | `toolkit_db::outbox`: `Outbox::builder(db).queue(name, Partitions::of(n)).leased(handler)`, `Outbox::enqueue(&db, Record)`, per-partition sequencing after commit, dead letters | `libs/toolkit-db/src/outbox/` (`core.rs:446`) | CONFIRMED | Work queues and the delivery sequence. |
+| A-2 | `toolkit_db::outbox`: `Outbox::builder(db).queue(name, Partitions::of(n)).leased(handler)`, `Outbox::enqueue(&db, Record)`, per-partition sequencing after commit, dead letters | `libs/toolkit-db/src/outbox/` (`core.rs:446`) | CONFIRMED; no queue-depth query (`stats.rs` counts worker executions, crate-private) | Work queues and the delivery sequence. Backpressure reads `rating.child_work`'s depth from the outbox's own tables meanwhile (`…-upreq-outbox-queue-depth`). |
 | A-3 | Cross-gear event delivery | the event-broker gear is **implemented** (`c7de7b80a`, 2026-09-23: dispatcher routing, REST handlers, standalone single-process service; `gears/system/event-broker/event-broker/src/module.rs:1-14` wires ingest, delivery, dispatcher and reaper; a `sqlite-event-broker-plugin` exists); Pricing publishes through `event_broker_sdk::ProducerOutbox` (`gears/bss/pricing/pricing/src/infra/events.rs:51-58`) and Products through `ProducerOutboxHandle` with an interim fallback (`gears/bss/products/products/src/gear.rs:136-140`); the ledger publisher is still parked (`ledger/ledger/Cargo.toml:71-73`) | **CONFIRMED** (broker); whether a deployment registers it is UNKNOWN | Rating still never depends on events alone: inbox-first (T-D-56), pull reads authoritative; producer contracts for the events Rating would consume do not exist (`…-upreq-event-contracts`). |
 | A-4 | `bss-coord` leases (`LeaseManager::acquire(key, ttl) -> LeaseGuard`, `renew`, `with_ack_in_tx`, `spawn_renewal`) | `gears/bss/libs/coord/src/lease/manager.rs:46-61` | CONFIRMED | **Not Rating's target** (DESIGN §3.5): only a MIGRATION adapter behind Rating's `LeaseProvider` port if R-27 approves it, with an owner and a removal milestone. |
 | A-5 | SecureORM / `PolicyEnforcer` / `AccessScope`; `DBRunner`, `in_transaction_mapped` | `docs/toolkit_unified_system/06_*.md`, `11_database_patterns.md` | CONFIRMED | All repositories. |
@@ -1039,6 +1049,24 @@ Rating's `LeaseProvider` port with an owner and a removal milestone.
 - **Acceptance signal**: the BSS deployment profile resolves `LeaderElectionV1` from ClientHub, or
   the adapter approval names its owner and removal milestone. **Mandatory before Rating's first
   deployment.**
+
+#### Outbox queue depth
+
+- [ ] `p3` - **ID**: `cpt-cf-bss-rating-upreq-outbox-queue-depth`
+
+`toolkit_db::outbox` **SHOULD** offer the depth of a queue — the messages enqueued and not yet
+processed, sequenced or not — read in one consistent snapshot.
+
+- **Rationale**: the usage feed readers stop fetching above `max_queue_depth` of `rating.child_work`
+  (feature 04 §3.5). With no such query, Rating reads the outbox's private tables
+  (`_incoming`, `_partitions.sequence`, `_processor.processed_seq`), so a change of their layout or
+  of how sequencing works would break backpressure at run time; Rating's tests over a real outbox
+  (unsequenced, sequenced and processed messages) are what would catch it.
+- **Source**: `gears/bss/rating` — feature [`04-usage-intake`](./features/04-usage-intake.md) §3.5;
+  `infra/queue_depth.rs`.
+- **Status**: REQUESTED (PR #5551 review).
+- **Acceptance signal**: Rating's `QueueDepth` adapter calls the toolkit's query and its entities of
+  the outbox tables are removed.
 
 #### Producer event contracts
 
@@ -1063,7 +1091,7 @@ policy. Rating states what it needs (DESIGN §3.3 event contracts) and defines n
 
 | # | Contract | Evidence | Status |
 |---|---|---|---|
-| G-7 | Tenant directory | `AccountManagementClient::get_tenant` (`account-management-sdk/src/client.rs:127`), `TenantResolverClient` (`tenant-resolver-sdk/src/api.rs:44-127`) | CONFIRMED; commercial axes come from Subscriptions (`fr-tenant-axes`); AM tenant types (`provider/reseller/customer`) differ from ledger seller defaults (`vz.ams.tenants.partner/platform`, `ledger/src/config.rs:42-43`) |
+| G-7 | Tenant directory; whether a feed entry's tenant lies in its source's configured scope (`TenantResolverClient::is_ancestor`, barriers ignored; T-D-84) | `AccountManagementClient::get_tenant` (`account-management-sdk/src/client.rs:127`), `TenantResolverClient` (`tenant-resolver-sdk/src/api.rs:44-127`, `is_ancestor` `:186`) | CONFIRMED; commercial axes come from Subscriptions (`fr-tenant-axes`); AM tenant types (`provider/reseller/customer`) differ from ledger seller defaults (`vz.ams.tenants.partner/platform`, `ledger/src/config.rs:42-43`) |
 | G-8 | OrgTier, customer-group membership | pricing taxonomies only (`m20260821_000012/13/17`) | CONFIRMED in pricing; no runtime membership read for Rating (`unresolvable_scope`) |
 
 #### Tenant-deletion signal

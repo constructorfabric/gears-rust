@@ -855,7 +855,7 @@ The constraints each contract namespace adds are defined here and specified norm
 
 | Concept | Owner | Identifier | Versioning | How Rating obtains it | Status |
 |---|---|---|---|---|---|
-| Usage entry | usage-collector | TARGET V1 (upstream `main` docs): `id` = UUIDv5 over `(tenant, gts_type_id, idempotency_key, window_start, window_end, entry_type)` (usage-collector ADR-0007); code today: UUIDv5 over `(tenant, gts_id, created_at, key)` | immutable; withdrawn only by an invalidation entry | `read_usage_feed` page → `bss_rating__usage_record` | feed DOCUMENTED on upstream `main`, not implemented (R-01) |
+| Usage entry | usage-collector | v2 contract (PR #5359): `id` = UUIDv5 over `(tenant, gts_type_id, idempotency_key, window_start, window_end, entry_type)` (usage-collector ADR-0007, `v2/id.rs`); code on `main`: UUIDv5 over `(tenant, gts_id, created_at, key)` | immutable; withdrawn only by an invalidation entry | `read_usage_feed` page → `bss_rating__usage_record` | v2 SDK contract approved, not merged; served from the collector's stage 2 (R-01); Rating reads through its own port meanwhile (T-D-84) |
 | Invalidation entry | usage-collector | an entry with `entry_type = invalidation`, server-stamped `invalidates` (ADR-0010) | append-only | same feed | DOCUMENTED on upstream `main`; code has a `status` flip (DOC/CODE DRIFT the collector acknowledges) |
 | Raw usage type | usage-collector / types-registry (collector ADR-0008) | GTS `gts_type_id` | metadata immutable | declaration read from types-registry ([12 §4.7](#contract-12-4-7)); an **input** of a derived usage type, never sold directly (products P-D-259) | DOCUMENTED; code still has an in-collector counter/gauge plugin catalog with no unit |
 | Derived usage type (the meter) | products | `products.derived/<code>@<n>` (`MeterId`), declaration `{output_unit, granularity: Hour, inputs [{name, usage_type_ref, granule_fold: Sum \| Peak \| TimeWeighted, max_hold_seconds?, unit}], formula, output_scale, output_round}` + digest | append-only versions; a new formula is a new SKU (P-D-258) | the binding's `meter: MeterRef{usage_type_id, version}`; the declaration by a typed read Products does not offer yet (R-31; REST only) | CURRENT (types and evaluator in `bss-products-sdk`); read **MISSING** |
@@ -878,7 +878,7 @@ The constraints each contract namespace adds are defined here and specified norm
 
 | Concept | Identifier | Mutability | Created by |
 |---|---|---|---|
-| Inbox entry | `(tenant_id, source, business_id, version)` | insert-only; state transitions `accepted → applied \| quarantined` | every non-usage intake path (T-D-56) |
+| Inbox entry | `entry_id` (`UUIDv5` of the key `(tenant_id, source, business_id, version)` and the payload digest) | insert-only except `state`; `accepted → applied`, a new key or a digest conflict `→ quarantined`, `quarantined → applied \| discarded` by an audited release (feature 01 §4.1) | every non-usage intake path (T-D-56) |
 | Usage capture | `(tenant_id, usage_record_id)` | raw entry insert-only; contribution state transitions (§4.2) | feed readers (T-D-61) |
 | Source checkpoint | `source_id` (canonical feed source identity, §3.7) | CAS-updated | feed readers / recovery sweeps |
 | Source loss | `(tenant_id, loss_id)` | `open → narrowed → pending_approval → resolved` | feed readers, reconciler (T-D-62) |
@@ -1623,7 +1623,11 @@ The components each contract namespace adds are defined here and specified norma
   their OpenAPI schemas), mapped to and from the `rating-sdk` types, as the platform's REST pattern
   does (`docs/toolkit_unified_system/04_rest_operation_builder.md`); the SDK types carry no HTTP or
   schema concerns, and the money fields of the DTOs follow §3.3 canonical text. The OpenAPI is
-  generated from the OperationBuilder registration. No usage ingestion endpoint. Collections use keyset cursors (`cursor`, `limit`,
+  generated from the OperationBuilder registration. A custom method `{id}:<verb>` in the table is
+  served as the sub-resource `{id}/<verb>` while axum 0.8 pins `matchit = "=0.8.4"`, which cannot
+  split `{param}:suffix` in one segment (the in-tree fallback, as account-management's
+  `/tenants/{tenant_id}/suspend`); the path the router matches is the path the OpenAPI publishes,
+  and the colon form is adopted when axum bumps matchit. No usage ingestion endpoint. Collections use keyset cursors (`cursor`, `limit`,
   default 100, maximum 500), not offsets; `$filter` (OData subset: `eq`, `in`, `and`, on the listed
   fields) where shown. Every route returns `401` unauthenticated, `403` `PermissionDenied`, `404`
   for objects outside the caller's scope (indistinguishable from absent), `400` `InvalidArgument`,
@@ -1644,7 +1648,7 @@ The components each contract namespace adds are defined here and specified norma
   | `POST /finalization-policies` | `bss_rating.finalization_policies.create` | `finalization_policy × write` (audited) | `FinalizationPolicyDraft` + required `Idempotency-Key` → new version | 201 | 400 `InvalidArgument` if the body names `owner_scope = platform`, or `evidence_mode = delay_only` without `delay_only_acceptance_ref` (V55); 400 `FailedPrecondition` if the reference names no `bss_rating__delay_only_acceptance` of this tenant and window policy, or one the requester recorded | as for re-ratings |
   | `POST /platform/finalization-policies` | `bss_rating.platform_finalization_policies.create` | `platform_finalization_policy × write` (audited) | same → new platform-default version | 201 | 400 `InvalidArgument` for `delay_only` without `delay_only_acceptance_ref`; 400 `FailedPrecondition` if the reference names no platform acceptance for this window policy, or one the requester recorded | as for re-ratings |
   | `GET /source-losses` | `bss_rating.source_losses.list` | `usage × read` | `cursor`, `limit`, `$filter` on `state`, `source_id` → `SourceLossPage` | 200 | — | safe |
-  | `POST /source-losses/{id}:reconciliation` | `bss_rating.source_losses.submit_reconciliation` | `source_loss × resolve` (audited) | `ReconciliationSubmission {collector_request_ref, rows: [{tenant_id, gts_type, day, accepted_count, quantity_summary, read_at}]}` (the figures an operator read from `GET /usage-collector/v1/reconciliation`) → `SourceLossView` | 200 (each matching day the collector still held in full at `read_at` leaves `tainted_days`) | 400 `InvalidArgument` (a row outside the loss's scope or tainted days); 400 `FailedPrecondition` (loss resolved) | the same rows twice change nothing |
+  | `POST /source-losses/{id}:reconciliation` | `bss_rating.source_losses.submit_reconciliation` | `source_loss × resolve` (audited) | `ReconciliationSubmission {collector_request_ref, rows: [{tenant_id, gts_type, day, accepted_count, quantity_summary, read_at}]}` (the figures an operator read from `GET /usage-collector/v2/reconciliation`) → `SourceLossView` | 200 (each matching day the collector still held in full at `read_at` leaves `tainted_days`) | 400 `InvalidArgument` (a row outside the loss's scope or tainted days); 400 `FailedPrecondition` (loss resolved) | the same rows twice change nothing |
   | `POST /source-losses/{id}:resolve` | `bss_rating.source_losses.resolve` | `source_loss × resolve` (audited) | `ResolveRequest {evidence_ref, resolution: repaired \| accepted_loss}` → `SourceLossView` | 200 (`repaired`: resolved; `accepted_loss`: pending approval) | 400 `FailedPrecondition` (evidence does not cover the open scope; or `repaired` for a day the collector no longer holds in full, so always for `cursor_beyond_retention` and `scope_widened_beyond_retention`) | naturally idempotent |
   | `POST /source-losses/{id}:approve` | `bss_rating.source_losses.approve` | `source_loss × approve` (audited) | `ApproveRequest {reason}` → `SourceLossView` | 200 (`accepted_loss` takes effect) | 400 `FailedPrecondition` (nothing pending, or the approver is the requester: two-person rule) | naturally idempotent |
   | `POST /source-losses/{id}:reject` | `bss_rating.source_losses.reject` | `source_loss × approve` (audited) | `RejectRequest {reason}` → `SourceLossView` | 200 (back to `open` or `narrowed`, its prior state) | 400 `FailedPrecondition` (nothing pending, or the caller is the requester) | naturally idempotent |
@@ -1758,7 +1762,7 @@ each owner are owned by [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) (last column).
 
 | Gear | Rating consumes / produces | CURRENT interface | TARGET interface | Mode | Status | Evidence and asks |
 |---|---|---|---|---|---|---|
-| usage-collector | usage entries (records, invalidations) | `UsageCollectorClientV1::list_usage_records` (keyset over `created_at, id`) — not used for charging | `read_usage_feed(FeedSubscription, FeedStart, until, limit)` — the collector's own design (upstream `main` DESIGN §3.3, ADR-0011); the Atlas `UsageFeedV1` is withdrawn by the Atlas Plus overlay | pull, SDK | **DOCUMENTED, not implemented** (R-01) | [§2.1](./UPSTREAM_REQS.md#21-usage-collector) |
+| usage-collector | usage entries (records, invalidations) | `UsageCollectorClientV1::list_usage_records` (keyset over `created_at, id`) — not used for charging | `UsageCollectorClientV2::read_usage_feed(FeedSubscription, FeedStart, until, limit)` — the collector's v2 SDK contract (PR #5359; DESIGN §3.3, ADR-0011); the Atlas `UsageFeedV1` is withdrawn by the Atlas Plus overlay | pull, SDK, through Rating's `UsageFeedPort` (T-D-84) | **v2 contract approved, not merged; not served** (R-01) | [§2.1](./UPSTREAM_REQS.md#21-usage-collector) |
 | types-registry | usage type declarations (fold, canonical unit) | `TypesRegistryClient` schema reads | a typed declaration read (Atlas Plus X7) | pull, SDK | **PARTIAL** | [§2.3](./UPSTREAM_REQS.md#23-types-registry) |
 | Usage emitter (owner unassigned, overlay T6) / IRM | coverage declarations, inventory barrier | none (IRM docs only, no code; IRM excludes metering, PRD:392) | `MeterCoverageDeclared` / `MeterCoverageReadV1`, `ResourceHistoryV1` (Atlas C05) | event + pull | **ABSENT** (R-21) | [§2.2](./UPSTREAM_REQS.md#22-usage-emitter-and-irm) |
 | pricing | bindings for the pinned chains (price, `minimum_fee`, usage rating policy, meter, SKU version, invoice inputs); prices by id for replay | `PricingReadV1::{resolve(ResolveQuery{catalog, revision_id, date, item_id?, pins}) -> ResolvedBindings, price(PriceQuery) -> ImmutablePrice, current_revision(PlanQuery) -> RevisionRef}`, registered in ClientHub; REST `GET /bss-pricing/v1/resolve`, `GET /bss-pricing/v1/prices/{id}`; golden contracts `pricing/tests/contract/*.json` (D-419…D-425). Rating calls as `bss-rating.system` with `plan:read` and `price:read` (D-424), with a `SecurityContext` built per work item for its seller tenant (`subject_tenant_id` = `CatalogRef.tenant_id`; pricing D-523). Pricing publishes `prices_published`, `plan_revision_published`, … which Rating does not need | the same (Rating's adapter T-D-73) | pull, SDK | **CONFIRMED** | [§2.4](./UPSTREAM_REQS.md#24-pricing) |
@@ -1770,7 +1774,7 @@ each owner are owned by [`UPSTREAM_REQS.md`](./UPSTREAM_REQS.md) (last column).
 | Contracts | contract overrides, pools, balances, effects | first-draft PRD only | UNKNOWN / EXTERNAL CONTRACT REQUIRED | — | **deferred, not requested now** (R-11, T-D-81) | [§2.10](./UPSTREAM_REQS.md#210-contracts-and-promotions) |
 | Promotions | promotion snapshots | owned by Pricing and deferred (pricing D-409); `resolve` returns no promotion | UNKNOWN / EXTERNAL CONTRACT REQUIRED | — | **deferred, not requested now** (R-11, T-D-81) | [§2.10](./UPSTREAM_REQS.md#210-contracts-and-promotions) |
 | FX / Finance | rate snapshots | `RateProviderV1::fetch_latest` in the ledger SDK, fed by the `rate-provider` adapter gear; the Ledger is its only consumer | pinnable rate snapshot (J-8) | — | **deferred, not requested now** (R-07, T-D-81) | [§2.9](./UPSTREAM_REQS.md#29-finance-and-fx) |
-| account-management / tenant-resolver | tenant existence (operator plane only) | `AccountManagementClient::get_tenant`, `TenantResolverClient` | unchanged; commercial axes come from Subscriptions | sync SDK | **CONFIRMED** | [§2.13](./UPSTREAM_REQS.md#213-account-management-and-tenant-resolver) |
+| account-management / tenant-resolver | tenant existence (operator plane); whether a feed entry's tenant lies in its source's configured scope (`TenantResolverClient::is_ancestor`, barriers ignored; intake) | `AccountManagementClient::get_tenant`, `TenantResolverClient` | unchanged; commercial axes come from Subscriptions | sync SDK | **CONFIRMED** | [§2.13](./UPSTREAM_REQS.md#213-account-management-and-tenant-resolver) |
 
 **Infrastructure dependencies**:
 
@@ -1818,7 +1822,7 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
   sequenceDiagram
       autonumber
       participant FR as UsageFeedReader
-      participant UC as Usage Collector (read_usage_feed, DOCUMENTED)
+      participant UC as Usage Collector (read_usage_feed v2, PR #5359)
       participant DB as Rating DB (one transaction)
       participant OB as outbox rating.child_work
 
@@ -1829,11 +1833,12 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
           FR->>UC: read_usage_feed(subscription, After(cursor), until = none, limit 1000)
       end
       UC-->>FR: FeedPage(entries, next_cursor)
-      FR->>FR: resolve the page's usage type declarations, then check the grant covers the configured tenant scope
+      FR->>FR: resolve the page's meter declarations and tenant scopes, then check the grant covers the configured tenant scope
       Note over FR: registry or PDP unavailable: back off, no transaction. Grant narrowed: commit nothing, pause the source
       FR->>DB: BEGIN, SELECT checkpoint FOR UPDATE (CAS on cursor)
       loop each entry, in feed order
-          FR->>DB: INSERT raw entry, raw_sha256, raw_digest_version ON CONFLICT DO NOTHING
+          FR->>FR: interpret the entry in memory (normalize, natural key, prior invalidation)
+          FR->>DB: INSERT raw entry, raw_sha256, raw_digest_version and its outcome ON CONFLICT (tenant_id, usage_record_id) DO NOTHING
           alt already captured, same digest under the stored version
               FR->>FR: skip, no further effect
           else already captured, different digest
@@ -1845,7 +1850,7 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
                   FR->>DB: contribution_state = withdrawn
               else normalize fails (a Peak / TimeWeighted or non-SUM input is not a failure here)
                   FR->>DB: contribution_state = rejected(reason), exception
-              else natural key held by another id (savepoint)
+              else natural key held by another id (safety net)
                   FR->>DB: contribution_state = rejected(usage_natural_key_conflict), alarm
               else no attribution segment or no usage policy projection
                   FR->>DB: contribution_state = awaiting_attribution or awaiting_spec
@@ -1896,9 +1901,10 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
   - **Received identity**: `usage_record_id` (collector id) plus the collector's dedup identity
     `(tenant, gts_type_id, idempotency_key, window_start, window_end, entry_type)` (§4.2; [contract 12](#contract-12)
     §4.3). The cursor is the only position: there is no snapshot token, sequence or watermark.
-  - **Lossless capture**: the complete entry and its digest are stored before normalization, so a
-    malformed, unsupported or not-yet-attributable entry stays retryable after the collector's
-    retention expires. A page is committed with all of its captures or with none.
+  - **Lossless capture**: the complete entry and its digest are stored by the same insert as its
+    interpretation's outcome, whatever that outcome is, so a malformed, unsupported or
+    not-yet-attributable entry stays retryable from the stored row after the collector's retention
+    expires. A page is committed with all of its captures or with none.
   - **Usage type → meter** (T-D-76): a usage SKU sells a Products derived usage type
     (`products.derived/<code>@<n>`, products P-D-259), named by the binding's `meter`; a raw
     collector type is only an **input** of such a declaration. A record counts **once**, under its
@@ -2081,7 +2087,7 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
   ```mermaid
   sequenceDiagram
       autonumber
-      participant UC as Usage Collector (DOCUMENTED)
+      participant UC as Usage Collector (v2, PR #5359)
       participant FR as UsageFeedReader
       participant DB as Rating DB
       participant R as Rater
@@ -2114,12 +2120,13 @@ Flows are written against TARGET contracts; MIGRATION steps are marked. Every "c
       end
       Note over FR,BL: Rating computes no delta. A replayed invalidation is absorbed by its unique key.
   ```
-  1. **CURRENT code**: the collector has no invalidation entry; `deactivate_usage_record` flips
-     `status` in place and cascades to `corrects_id` compensations. Rating does **not** treat these
-     as financial corrections; `list_usage_records` is not a charging input at all (R-01).
-     **DOCUMENTED target** (collector ADR-0010, upstream `main`): an invalidation is an entry with
-     `entry_type = invalidation`, a faithful copy of its target with a server-stamped `invalidates`
-     and a `reason_code`; at most one per record. A replacement is an invalidation followed by a fresh
+  1. **CURRENT code**: the collector on `main` has no invalidation entry; `deactivate_usage_record`
+     flips `status` in place and cascades to `corrects_id` compensations. Rating does **not** treat
+     these as financial corrections; `list_usage_records` is not a charging input at all (R-01).
+     **v2 contract** (collector ADR-0010, PR #5359): an invalidation is an entry carrying
+     `invalidates` and a `reason_code` (its entry type), a faithful copy of its target — same tenant,
+     meter, idempotency key and covered period — whose `invalidates` the collector derives from that
+     identity with `entry_type = record`; at most one per record. A replacement is an invalidation followed by a fresh
      record under a new key — two entries, not atomic upstream ([12 §4.4](features/04-usage-intake.md#contract-12-4-4)).
   2. In the page transaction: capture the invalidation in `bss_rating__usage_record` (`entry_type =
      invalidation`, unique `(tenant, invalidates_id)`), set it `applied`, then withdraw the target
@@ -2543,16 +2550,26 @@ V68 and V76, each marked `[PostgreSQL]` in its feature — runs on PostgreSQL on
 SQLite's single writer gives the serial outcome those vectors also accept.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-inbox`
-  `bss_rating__inbox` — PK `(tenant_id, source, business_id, version)`; `payload_digest`, `payload`
-  (jsonb), `received_via` (`pull` \| `event`), `state` (`accepted` \| `applied` \| `quarantined` \| `discarded`),
-  `quarantine_reason`, `received_at`, `applied_at`. Insert-only except `state`. `source ∈ {fact,
+  `bss_rating__inbox` — PK `entry_id` = `UUIDv5(NS_RATING_INBOX, tenant_id | source | business_id |
+  version | payload_digest)`, so one arrival names one entry; key `(tenant_id, source, business_id,
+  version)`; `payload_digest`, `payload` (jsonb), `received_via` (`pull` \| `event`), `state`
+  (`accepted` \| `applied` \| `quarantined` \| `discarded`), `quarantine_reason`
+  (`digest_conflict` \| `unsupported_schema_version`), `conflict_of?`, `received_at`, `applied_at`.
+  Unique `uq_bss_rating__inbox__key_digest (tenant_id, source, business_id, version,
+  payload_digest)`; one primary entry per key, `uq_bss_rating__inbox__primary (tenant_id, source,
+  business_id, version) WHERE conflict_of IS NULL`. A same-key arrival with another digest is
+  stored as its own `quarantined` entry with `conflict_of` = the primary entry, which stays
+  untouched, so nothing is applied and the conflicting payload is kept for the operator; the
+  release route's `{id}` is the `entry_id`. Insert-only except `state` (with `applied_at`). `source ∈ {fact,
   segment, scope, coverage, subscription_version, billing_hint}` (commitment pools are deferred with price adjustments (T-D-81); `subscription_version` drives derived coverage, T-D-82); usage records and invalidations are not inbox
   sources — their capture and deduplication are `bss_rating__usage_record` (T-D-61).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-source-checkpoint`
   `bss_rating__source_checkpoint` — PK `source_id`; `source_kind` (`usage` \| `segments` \|
   `period_facts`), `source_definition` (jsonb), `cursor` (opaque), `applied_seq` (segments),
   `state` (`active` \| `draining` \| `retired`),
-  `updated_at`. Written only in its page, restart or batch transaction, each under the row lock
+  `updated_at`, `config_generation` (usage sources: the `rating.usage_feed.config_generation` the
+  stored sources were last reconciled under; an instance configured with an older one reconciles
+  nothing and reads the stored sources, so a rollout never reverts a newer plan). Written only in its page, restart or batch transaction, each under the row lock
   with a CAS on `cursor` / `applied_seq`; a NULL `cursor` means the next read starts at `Oldest`.
   **Canonical source identity** (one per configured feed subscription):
   `source_id = "usage:" + UUIDv5(NS_RATING_SOURCE, canonical JSON {sorted gts_type_ids,
@@ -2567,14 +2584,19 @@ SQLite's single writer gives the serial outcome those vectors also accept.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-usage-record`
   `bss_rating__usage_record` — PK `(tenant_id, usage_record_id)`; `uq_…__natural_key` `(tenant_id,
   gts_type, idempotency_key, interval_start, interval_end, entry_type)` (the collector's dedup
-  identity, enforced once normalized; an entry whose natural key another id holds is
-  `rejected(usage_natural_key_conflict)` under a savepoint and never aborts the page,
+  identity, a safety net once normalized; an entry whose natural key another id holds is stored
+  `rejected(usage_natural_key_conflict)` by its capture insert and never aborts the page,
   [12 §4.3](#contract-12-4-3)); `uq_…__invalidates` `(tenant_id, invalidates_id)` where
-  `entry_type = invalidation`. **Raw capture** (written first, never changed): `source_id`,
-  `raw_entry` (jsonb, the complete entry as received), `raw_sha256` and `raw_digest_version` (the
-  versioned digest of [12 §4.1](#contract-12-4-1)), `captured_at`. **Normalized**
-  (nullable until interpreted): `gts_type`, `idempotency_key`, `resource_type`, `resource_id`, `subject_ref`,
-  `interval_start`, `interval_end`, `quantity` `NUMERIC(88,28)`, `metadata` (jsonb), `entry_type`
+  `entry_type = invalidation`. **Raw capture** (written by the capture insert, never changed): `source_id`,
+  `raw_entry` (jsonb, the complete entry as received; an entry above 64 KiB of JSON is stored as a
+  stub `{oversize: {bytes, excerpt}}` and the row `rejected(usage_malformed)`), `raw_sha256` and
+  `raw_digest_version` (the versioned digest of [12 §4.1](#contract-12-4-1), taken from the entry as
+  received), `captured_at`. **Normalized**
+  (written by the capture insert or an operator retry; NULL on a rejected row): `gts_type` (the
+  meter), `idempotency_key`, `resource_type`, `resource_id`, `subject_ref` (its validated
+  `subject_id` and `subject_type` only; anything else stays in `raw_entry`), `interval_start`, `interval_end`, `quantity` (the entry's canonical decimal text, checked against
+  the collector's pattern — at most 28 significant and 28 fractional digits — and cast to
+  `NUMERIC(88,28)` where it is summed; T-D-84), `metadata` (jsonb), `entry_type`
   (`record` \| `invalidation`), `invalidates_id`, `reason_code`, `origin` (`live` \| `backfill`),
   `accepted_at`. **Contribution** (Flow A state machine): `contribution_state` (`captured` \|
   `rejected` \| `awaiting_attribution` \| `awaiting_spec` \| `boundary_split_required` \|
@@ -2596,13 +2618,17 @@ SQLite's single writer gives the serial outcome those vectors also accept.
   `object_ref`, `archived_at`. Written by the archiver before hot rows of a final partition are
   deleted ([contract 12](#contract-12) storage tiering).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-usage-capture-reject`
-  `bss_rating__usage_capture_reject` — PK `(source_id, raw_sha256)`; `raw_entry`, `captured_at`,
-  `loss_id`. For entries whose id or tenant cannot be read; platform-scoped (`unrestricted`,
-  service identity and `source_loss × resolve` operators only).
+  `bss_rating__usage_capture_reject` — PK `(source_id, raw_sha256)`; `raw_entry` (bounded as
+  `usage_record.raw_entry` is), `captured_at`, `reason` (`unidentifiable` \| `outside_subscription`),
+  `loss_id` (the `unidentifiable_entry` loss; NULL for an entry outside the subscription). For
+  entries whose id or tenant cannot be read, and entries of a meter or tenant the source does not
+  read, which are written to no tenant's records; platform-scoped (`unrestricted`, service
+  identity and `source_loss × resolve` operators only).
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-source-loss`
   `bss_rating__source_loss` — PK `(tenant_id, loss_id)` with `tenant_id` = the root tenant of the
-  source's configured scope; `source_id`, `tenant_scope` (the source's configured tenant scope,
-  copied from its `source_definition`), `kind`
+  source's configured scope (the first of its roots in UUID order when it names several); `source_id`, `tenant_scope` (the source's configured tenant scope,
+  copied from its `source_definition`; for `scope_widened_beyond_retention`, the newly visible
+  tenants, one loss per widening), `kind`
   (`cursor_beyond_retention` \| `unidentifiable_entry` \| `scope_widened_beyond_retention`),
   `gts_type_ids`, `detected_at`, `last_good_cursor`, `last_good_at` (the checkpoint's `updated_at`
   when `last_good_cursor` was committed), `restart_cursor` (nullable: the checkpoint cursor the
@@ -2886,7 +2912,8 @@ SQLite's single writer gives the serial outcome those vectors also accept.
   `request_digest`, `response` (jsonb), `created_at`; kept 7 days.
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-dbtable-operator-audit`
   `bss_rating__operator_audit` — PK `(tenant_id, audit_id)`; `actor`, `operation_id`, `target_kind`,
-  `target_id`, `request_digest`, `reason`, `approved_by?`, `at`. Insert-only, written in the same
+  `target_id`, `request_digest`, `reason`, `approved_by?`, `request_id?` (the caller's
+  `x-request-id`), `at`. Insert-only, written in the same
   transaction as every action marked "audited" in §3.3 and §4.8 (retry, release, re-rate, cancel,
   policy writes, `delay_only` acceptances (`target_kind = delay_only_acceptance`, `target_id` =
   the `acceptance_id`), source-loss reconciliation submissions, resolve, approve and reject, hold place and release); kept with the financial
@@ -3302,6 +3329,8 @@ closed `unsupported_input_fold` (R-06); only `Sum` inputs are rated at launch. T
 | Usage feed unavailable | yes | backoff 1 s → 5 min | checkpoint CAS | that source only | — | `rating_feed_lag_seconds`, alert > 15 min | no | yes |
 | Cursor past retention (`InvalidArgument(CursorBeyondRetention)`) | no | restart the source from `Oldest` in a restart transaction under the cursor CAS | usage dedup; the CAS (a stale leader rolls back) | finality of the windows that can hold an entry of a tainted day (tenants × GTS types of the source, days from `last_good_at − F` to `detected_at − F`), **all evidence modes**; final children there are listed as suspect | `bss_rating__source_loss` (`open`) | `rating_feed_restart_total`, `rating_source_loss_open`, `rating_source_loss_suspect_final`, page | `accepted_loss` by two operators: the tainted days are past the collector's retention and backfill window, so no evidence can repair them ([12 §4.6](features/04-usage-intake.md#contract-12-4-6)) | after resolution |
 | Entry without a readable id or tenant | no | none | `(source_id, raw_sha256)` | finality of the source scope on the days the feed still holds | `bss_rating__usage_capture_reject` + source loss | page | reconciliation (Rating's or operator-submitted) narrows; resolve | after resolution |
+| Entry of a meter or tenant the source does not read | no | none | `(source_id, raw_sha256)` | no | `bss_rating__usage_capture_reject` (`outside_subscription`); no loss — nothing of the source is lost | `rating_usage_capture_rejected_total{reason="outside_subscription"}`, alarm | investigation (collector) | yes |
+| A feed, registry or tenant-hierarchy call that never answers, or a page above the limit | yes | backoff 1 s → 5 min after `call_timeout_secs` | nothing committed | that source | — | `rating_dependency_errors_total{dependency}` | no | yes |
 | Rating's grant no longer covers the source's configured tenant scope | yes, once restored | re-checked before each read | nothing committed; cursor unchanged | that source (paused) | — | `rating_feed_paused{reason = grant_narrowed}`, `usage_grant_narrowed`, page | restore the grant, or remove the tenants from the configured scope | yes: the same pages are re-read with every entry |
 | Types registry unavailable for a page's usage type | yes | backoff 1 s → 5 min | nothing committed | that source | — | `rating_dependency_errors_total{dependency="types_registry"}` | no | yes; nothing is rejected |
 | Natural key held by another id | no | none | `uq_…__natural_key` under a savepoint | no | `rejected(usage_natural_key_conflict)` | `rating_usage_natural_key_conflict_total`, alarm | investigation | yes |
@@ -3358,7 +3387,7 @@ closed `unsupported_input_fold` (R-06); only `Sum` inputs are rated at launch. T
 
 | Check | Against | Mismatch means | Repair |
 |---|---|---|---|
-| Usage completeness | collector reconciliation metadata (`GET /usage-collector/v1/reconciliation`: accepted count, quantity summary; REST-only, operator-scoped — whether Rating's service identity may call it is UNKNOWN; until it may, operators submit the figures, below) vs Σ `bss_rating__usage_record` per (tenant, GTS type, day) | missed/duplicated entries | bounded replay `read_usage_feed(After(c1), until = c2)` within the replay horizon |
+| Usage completeness | collector reconciliation metadata (`GET /usage-collector/v2/reconciliation`: accepted count, quantity summary; REST-only, operator-scoped — whether Rating's service identity may call it is UNKNOWN; until it may, operators submit the figures, below) vs Σ `bss_rating__usage_record` per (tenant, GTS type, day) | missed/duplicated entries | bounded replay `read_usage_feed(After(c1), until = c2)` within the replay horizon |
 | Source loss (T-D-62) | for each open loss, collector reconciliation per `(tenant, GTS type, day)` over the tainted days that the collector still holds in full vs Σ captured entries; the figures come from Rating's own read once `…-upreq-usage-reconciliation-access` is granted, otherwise from an operator through `POST /source-losses/{id}:reconciliation` (audited), stored in `bss_rating__reconciliation_evidence` | entries lost before capture | matching days are removed from `tainted_days` (`narrowed`); for a mismatching day still inside the backfill window, missing entries are re-delivered through the collector's backfill route, which a collector operator starts on Rating's request (Rating cannot start it; UPSTREAM_REQS J-17), and captured; the loss is `resolved(repaired)` only when every tainted day matches. A day past the collector's retention proves nothing (its figures count only what survived), so a `cursor_beyond_retention` or `scope_widened_beyond_retention` loss ends only as `resolved(accepted_loss)`: an audited `source_loss × resolve` with evidence, approved by a second operator (`source_loss × approve`), which also decides its suspect final children. A metric reset or a restart never resolves it |
 | Coverage | coverage declaration count/sum/digest vs stored records per resource window | missing/replaced records | `CoverageMismatch` pending; emitter recovery by source keys |
 | Attribution backlog | `awaiting_attribution` older than 1 h | usage not billable | segment recovery |
@@ -3379,13 +3408,14 @@ closed `unsupported_input_fold` (R-06); only `Sum` inputs are rated at launch. T
 | `rating_feed_oldest_unread_age_seconds` | gauge | `source` (now − `window_end` of the oldest entry of the last page read, while not caught up) — approaches the 125-day floor | retention near-miss |
 | `rating_usage_stall_seconds` | gauge | `gts_type` (time since the last entry per resource vs the type's `nominal_sampling_interval`) | emitter stall (consumer-side, collector PRD:749) |
 | `rating_feed_restart_total` | counter | `source` | cursor past retention |
-| `rating_feed_paused` | gauge | `source`, `reason` (`grant_narrowed`) | grant narrowed below the configured scope |
+| `rating_feed_paused` | gauge | `source`, `reason` (`grant_narrowed`, `backpressure`) | grant narrowed below the configured scope; `rating.child_work` above `max_queue_depth` |
 | `rating_reconciliation_mismatch_total` | counter | `check` | §4.6 |
 | `rating_usage_rejected_total` | counter | `reason` (`malformed`, `boundary_split_required`, `interval_missing`) | invalid usage |
 | `rating_meter_unpriced_total` | counter | `gts_type` (records no rated derived meter takes) | meter binding |
 | `rating_attribution_unresolved` | gauge | `state` | resource → subscription |
 | `rating_attribution_gap` | gauge | `resource_tenant` | segment sequence gap |
 | `rating_usage_duplicate_total`, `rating_usage_content_conflict_total`, `rating_usage_natural_key_conflict_total` | counter | — | dedup |
+| `rating_usage_capture_rejected_total` | counter | `reason` (`unidentifiable`, `outside_subscription`) | an entry set aside unread; `outside_subscription` is a collector that ignored the subscription |
 | `rating_q_materialize_seconds` | histogram | — | Q latency |
 | `rating_q_rematerialized_total` | counter | `cause` | layout change / repair |
 | `rating_rating_duration_seconds` | histogram | `child_kind` (dequeue → commit) | rating latency |
@@ -3458,7 +3488,7 @@ Resource types (GTS, registered by Rating):
 | `get_snapshot` | REST `snapshots.get`; inside `get_run` | Billing, operator | `result × read` | caller's scope | PDP scope; `(tenant_id, snapshot_id)` lookup | — |
 | `request_rerate`, `get_rerate_run`, cancel | SDK; REST `reratings.*` | operator | `rerate × execute` / `read` | caller's scope; the selector must lie inside it | PDP scope | run row: `tenant_id`, `requested_by`; target rows per tenant |
 | `OrderEvaluationV1::evaluate` | SDK | Orders service identity | `evaluation × evaluate` | the request's seller tenant, in scope | none (the request carries its exact bindings; no pricing read) | — |
-| Pricing reads (`resolve`, `price`) | background (rater, fact intake, re-rate) | Rating service identity `bss-rating.system`, with a `SecurityContext` built **per work item** for the work item's seller tenant (`subject_tenant_id` = seller; Orders D-160 pattern) | pricing `plan:read` (resolve) and `price:read` (price) — granted per seller tenant by deployment; a system-looking subject has no bypass (pricing D-424, D-510 E3) | pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523), so `CatalogRef.tenant_id` **must equal** `subject_tenant_id`; a different tenant is denied with 403 | Rating writes the copy under that tenant | the binding of record |
+| Pricing reads (`resolve`, `price`) | background (rater, fact intake, re-rate) | Rating service identity `bss-rating.system` acting in the work item's seller tenant (`subject_tenant_id` = seller): an authenticated per-seller service principal (target, Orders D-194, T-D-83); interim, a `SecurityContext` built **per work item** (the construction Orders D-160 used) | pricing `plan:read` (resolve) and `price:read` (price) — granted per seller tenant by deployment; a system-looking subject has no bypass (pricing D-424, D-510 E3) | pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523), so `CatalogRef.tenant_id` **must equal** `subject_tenant_id`; a different tenant is denied with 403 | Rating writes the copy under that tenant | the binding of record |
 | Products derived-declaration read (R-31) | background | Rating service identity | Products `sku:read` (today REST only); every products read is limited to the caller's own tenant (P-D-265) | the work item's seller tenant | Rating writes the copy under that tenant | the declaration copy |
 | exceptions list / retry, inbox release | REST | operator | `usage × read` / `retry` / `release` (audited) | caller's scope | PDP scope | exception and inbox rows keep their `tenant_id` |
 | finalization policy read / write; `delay_only` acceptance | REST | seller operator; the acceptance by a Finance/Product approver other than the policy writer | `finalization_policy × read` / `write` / `accept_delay_only` (audited) | caller's scope; `owner_scope = seller` only | PDP scope | the policy row's `tenant_id` |
@@ -3475,6 +3505,16 @@ Resource types (GTS, registered by Rating):
 subject, request id). Negative tests (§4.13) cover: an id from another tenant (snapshot, run,
 policy, exception) returns `404`; a selector outside scope returns `403`; a seller writer cannot
 create a platform default; a worker processing tenant A's item cannot read tenant B's rows.
+
+**Service identity (T-D-83).** Rating's service identity is a platform-authenticated service
+principal provisioned per tenant it works for, as Orders' D-194 (which supersedes D-160) specifies:
+the AuthN Resolver's S2S client-credentials exchange yields its subject id, type and tenant, and a
+work item's tenant selects which principal acts, never a tenant written into a hand-built
+`SecurityContext`. Until that lands (with the first feature that calls Pricing), the service grant
+builds `bss-rating.system`'s context per work item with the item's tenant as the subject tenant.
+That interim check is only as strong as the deployment's policy for `bss-rating.system`: a policy
+that grants subjects their home tenant would grant it every tenant, so a deployment grants it per
+tenant explicitly and never by home tenant.
 
 ### 4.9 NFR mapping
 
@@ -6764,9 +6804,11 @@ only pricing input. All three methods are safe reads with no idempotency key:
 | `price(ctx, PriceQuery{catalog, price_id}) -> Result<ImmutablePrice, CanonicalError>` | verify a stored binding during replay (`money_digest`) | pricing `price:read` |
 | `current_revision(ctx, PlanQuery{catalog, plan_id}) -> Result<RevisionRef, CanonicalError>` | operator diagnostics only; Rating never chooses a revision — the fact names it | pricing `plan:read` |
 
-Rating calls as the system subject `bss-rating.system`, building its `SecurityContext` per work item
-with `subject_tenant_id` = the work item's seller tenant, as Orders does (Orders D-160); resolve reads
-SKU versions as pricing's own system actor, so Rating needs no Products grant for it (pricing D-424).
+Rating calls as `bss-rating.system` acting in the work item's seller tenant (`subject_tenant_id` = the
+seller): an authenticated per-seller service principal (Orders D-194, T-D-83), which replaces the
+interim `SecurityContext` built per work item (the construction of Orders D-160, superseded there);
+resolve reads SKU versions as pricing's own system actor, so Rating needs no Products grant for it
+(pricing D-424).
 Pricing asks the PDP for the caller's tenant only (`TenantMode::RootOnly`, pricing D-523,
 `pricing/src/authz.rs`), so `CatalogRef.tenant_id` must equal `subject_tenant_id`; a catalog of
 another tenant is denied. Products applies the same rule to the derived-declaration read
@@ -7113,22 +7155,25 @@ reads no price. It counts **raw** usage: the GTS types it reads are the inputs o
 derived usage types that usage SKUs sell (products P-D-259); turning input quantities into the
 priced meter's quantity is the core's ([13 §4.5](#contract-13-4-5), T-D-76).
 
-The contract is the **usage-collector's own target V1 design** on upstream `main` (commit
-`5de85f067`, "rework the metering model"): `read_usage_feed`, interval entries, invalidation as an
-entry, a dedup identity over the covered period (usage-collector DESIGN §3.3, ADR-0007, ADR-0010,
-ADR-0011). Rating follows it; the Seam Atlas's `UsageFeedV1` / `UsageCollectorClientV2` sketch is
-withdrawn by the Atlas Plus overlay (2026-10-02) in favour of the same design.
+The contract is the **usage-collector's version 2 SDK contract** (PR #5359, approved 2026-10,
+not merged; it supersedes the target V1 design of upstream `main` commit `5de85f067`, which it
+keeps in substance): `UsageCollectorClientV2::read_usage_feed`, entries over a covered period
+`[window_start, window_end)`, invalidation as an entry, an entry id derived from the dedup identity
+(usage-collector DESIGN §3.3, ADR-0007, ADR-0010, ADR-0011). A raw usage type is a **meter**: a GTS
+type derived from `gts.cf.core.uc.usage_record.v2~` and declared in types-registry (ADR-0008).
+Rating follows it; the Seam Atlas's `UsageFeedV1` sketch is withdrawn by the Atlas Plus overlay
+(2026-10-02) in favour of the same design.
 
-**CURRENT**: the usage-collector code (SDK, gear and plugins, on this branch and on upstream
-`main`) still implements the superseded point-record model — no feed, `created_at` instants,
-`deactivate_usage_record`, `corrects_id` compensation. The collector's DESIGN names this as known
-debt and states that the document, not the code, is normative (usage-collector DESIGN:2296).
-`[DEPENDENCY GAP R-01]`. The redesigned documents are in this tree (upstream `main` at
-`a35dfc3e2`); the code has not caught up. Two code facts bear on precision: the code record's
-quantity field is `value` (a `rust_decimal::Decimal` string; the target names it `quantity`), and the
-ClickHouse plugin stores `Decimal128(9)` and refuses more than 9 fractional digits, while the
-documented target is 28 (ADR-0013). **DOC/CODE DRIFT**: until that plugin follows the document, a
-quantity with more than 9 fractional digits cannot reach Rating through it.
+**CURRENT**: nothing serves the v2 feed yet — the gateway route is stage 2 of the collector's
+five-stage rollout (SDK contract, gateway, TimescaleDB plugin, ClickHouse plugin, removal of v1;
+PR #5359 description), and the code on `main` still implements the superseded point-record model
+(no feed, `created_at` instants, `deactivate_usage_record`, `corrects_id` compensation).
+`[DEPENDENCY GAP R-01]`. Rating therefore reads through a port of its own (`UsageFeedPort`) with a
+contract fake (`FakeUsageFeed`); the adapter over `UsageCollectorClientV2` lands once PR #5359
+merges (T-D-84). One code fact bears on precision: the ClickHouse plugin on `main` stores
+`Decimal128(9)` and refuses more than 9 fractional digits, while the v2 quantity allows 28
+(ADR-0013). **DOC/CODE DRIFT**: until that plugin moves to the v2 SPI (stage 4), a quantity with
+more than 9 fractional digits cannot reach Rating through it.
 
 <!-- /contract -->
 
@@ -7166,9 +7211,13 @@ quantity with more than 9 fractional digits cannot reach Rating through it.
 
 **Contract**: `cpt-cf-bss-rating-tech-stack-ing` (`p3`), defined in [§1.3 Namespace technology layers](#register-tech).
 
-`rating` crate: `infra/upstream/usage_feed.rs` (SDK adapter), `infra/upstream/usage_types.rs`
-(types-registry declarations), `domain/ingest.rs` (normalization, pure),
-`infra/storage/usage_repo.rs`.
+`rating` crate: `domain/usage/` — the feed and declaration ports (`feed.rs`, `declarations.rs`),
+the canonical source (`source.rs`), the versioned digest and normalization (`entry.rs`,
+`normalize.rs`, pure), the page transaction (`intake.rs`), the reader (`reader.rs`) and source
+losses (`loss.rs`); `infra/storage/repo/usage_repo.rs`; `infra/feed_grant.rs` (the PDP check of
+the feed read); `infra/queue_depth.rs` (backpressure). The SDK adapter (`infra/upstream/usage_feed.rs`)
+and the types-registry declaration read (`infra/upstream/usage_types.rs`) land with R-01 and
+`…-upreq-usage-type-declaration-read`; until then the contract fakes stand in (T-D-84).
 
 <!-- /contract -->
 
@@ -7225,18 +7274,22 @@ quantity with more than 9 fractional digits cannot reach Rating through it.
 
 **Contract**: `cpt-cf-bss-rating-entity-model-ing` (`p1`), defined in [§3.1 Namespace domain models](#register-entities).
 
-- **`FeedEntry`** (collector `UsageRecord`, target V1, usage-collector REST YAML:787-889):
-  required `id, tenant_id, resource_ref {resource_id, resource_type}, gts_type_id, entry_type
-  (record | invalidation), quantity, window_start, window_end, idempotency_key, accepted_at, origin
-  (live | backfill)`; optional `subject_ref, metadata`; invalidations only `invalidates, reason_code`.
-  `quantity` is a decimal string, at most 28 significant and 28 fractional digits (ADR-0013); the
-  bound is per entry, not per sum. Rating parses it into `ExactQuantity` (DESIGN §3.3 exact numbers),
-  never into `rust_decimal::Decimal` or a float. `window_start = window_end` is a point event.
-  **DOC/CODE DRIFT**: the code's `UsageRecord.value` is a `Decimal` string, and the ClickHouse
-  plugin keeps 9 fractional digits (§1.1).
-- **`FeedPage`** — `{entries[≤ 1000], page_info {next_cursor, prev_cursor = null, limit}}`;
-  `next_cursor` is never null on a live read and is null only on the page that reaches `until`.
-  No position, sequence or watermark is on the page.
+- **`FeedEntry`** (collector v2 `UsageRecord`, `usage-collector-sdk/src/v2/models.rs`,
+  `schemas/usage_record.v2.schema.json`): `id, tenant_id, resource_ref {resource_id,
+  resource_type}, gts_type_id (a meter), quantity, window_start, window_end, idempotency_key,
+  accepted_at, origin (live | backfill)`; optional `subject_ref, metadata` (string values, closed by
+  the meter's declaration); invalidations only `invalidates, reason_code`, both or neither. The SDK
+  record carries no `entry_type`: an entry is an invalidation exactly when it carries `invalidates`
+  (the REST schema repeats `entry_type`, which must then agree). Times are RFC 3339 UTC at
+  microsecond precision. `quantity` is a decimal string, at most 28 significant and 28 fractional
+  digits (ADR-0013); the bound is per entry, not per sum. Rating keeps it as that canonical text and
+  sums it exactly (`ExactQuantity`, DESIGN §3.3), never through `rust_decimal::Decimal` or a float.
+  `window_start = window_end` is a point event. The port carries each entry as the JSON object it
+  arrived as, so an entry Rating cannot read is still captured (T-D-84). **DOC/CODE DRIFT**: the
+  ClickHouse plugin on `main` keeps 9 fractional digits (§1.1).
+- **`FeedPage`** — SDK `FeedPage<CursorV1> {entries[≤ 1000], next}`; REST `{entries, page_info
+  {next_cursor, prev_cursor = null, limit}}`. `next` is never absent on a live read and is absent
+  only on the page that reaches `until`. No position, sequence or watermark is on the page.
 - **`RawCapture`** — `{source_id, tenant_id, usage_record_id, raw_entry, raw_sha256, captured_at}`,
   written first. An entry whose `id` or `tenant_id` cannot be read is captured into
   `bss_rating__usage_capture_reject` keyed `(source_id, raw_sha256)` and opens a source loss (§4.6).
@@ -7279,30 +7332,41 @@ This slice details it; the component model is where it is defined.
 
 **Contract**: `cpt-cf-bss-rating-interface-ingest-ing` (`p1`), defined in [§3.3 Namespace interfaces](#register-interfaces).
 
-Consumed — **DOCUMENTED on upstream `main`, NOT YET IMPLEMENTED in code** (usage-collector
-DESIGN:1127-1142, REST `GET /usage-collector/v1/feed`):
+Consumed — **the version 2 SDK contract, approved and not merged** (PR #5359,
+`usage-collector-sdk/src/v2/api.rs:142-149`; REST `GET /usage-collector/v2/feed`, served from
+stage 2 of the collector's rollout):
 
 ```rust
 async fn read_usage_feed(&self, ctx: &SecurityContext, subscription: &FeedSubscription,
     start: FeedStart<&CursorV1>, until: Option<&CursorV1>, limit: Option<u64>)
-    -> Result<FeedPage, UsageCollectorError>;
+    -> Result<FeedPage<CursorV1>, UsageCollectorError>;
 ```
 
-| Element | Semantics Rating relies on (usage-collector reference) |
+| Element | Semantics Rating relies on (usage-collector v2 reference) |
 |---|---|
-| `FeedSubscription` | the set of GTS types one consumer reads; 1..100 types per subscription (YAML:342-359) |
-| `FeedStart::Oldest` | the oldest retained entry; never refused (DESIGN:923-926, 1324) |
-| `FeedStart::After(cursor)` | continue after a delivered page; the cursor binds the subscription (`INVALID_CURSOR`, `FILTER_MISMATCH` otherwise) |
+| `FeedSubscription` | the sorted, deduplicated set of meters one consumer reads; 1..100 per subscription (YAML:426-441) |
+| `FeedStart::Oldest` | the oldest retained entry; never refused (DESIGN:920-926) |
+| `FeedStart::After(cursor)` | continue after a delivered page; the cursor binds the subscription (`UsageCollectorError::CursorRejected` with `INVALID_CURSOR` or `FILTER_MISMATCH` otherwise) |
 | `until` | a later cursor bounding a replay; a bounded replay is identical entry for entry (DESIGN:919-920) |
-| `limit` | 1..1 000, default 100 |
-| ordering | one deterministic plugin-chosen order; the only promise is that an invalidation follows its target (DESIGN:600) |
-| consistency | pages carry only settled entries; nothing appears behind a returned cursor; the feed is prefix-stable, and there is no snapshot token (ADR-0011) |
-| retention | `InvalidArgument(CursorBeyondRetention)` when retention removed an entry after the cursor; a cursor within the 35-day replay horizon is served (PRD:683-699) |
+| `limit` | 1..1 000 (`MAX_PAGE_SIZE`); `Some(0)` or more is `InvalidArgument` on `limit` |
+| ordering | one deterministic plugin-chosen order; the only promise is that an invalidation follows its target (DESIGN:601) |
+| consistency | pages carry only settled entries; nothing appears behind a returned cursor; the feed is prefix-stable, and there is no snapshot token (ADR-0011); delivery is at least once, deduplicated by `id` (DESIGN:2037) |
+| retention | `UsageCollectorError::InvalidArgument { reason: CursorBeyondRetention, .. }` (wire `CURSOR_BEYOND_RETENTION`) when retention removed an entry after the cursor; decided from what the store holds, never the cursor's age (DESIGN:924-929); a cursor within the 35-day replay horizon is served (PRD:683-699) |
+| authorization | action `read_feed` on `gts.cf.core.uc.usage_record.v2~`, evaluated before any row; a narrowed grant skips entries silently, and no scope digest is on the page (DESIGN:907-914, 2082-2091) |
 | freshness | acceptance → feed visibility p95 ≤ 5 min is a plugin readiness gate for charging consumers (PRD:884-892) |
 
-The feed subscription set is gear config `rating.usage_feed.subscriptions` (lists of ≤ 100 GTS
-types); each entry is one canonical source with its own `source_id` (§4.6). Provided: nothing
-externally — there is no usage ingestion API on Rating.
+Rating does not call the SDK trait directly: the reader depends on `UsageFeedPort`, a port of its
+own that hands each entry over as the JSON object it arrived as and reports
+`CursorBeyondRetention`, `Unavailable` and a refused read apart. `FakeUsageFeed` implements it
+for the tests; the adapter over `UsageCollectorClientV2` serializes each `UsageRecord` and maps the
+SDK's errors, and lands once PR #5359 merges (T-D-84); until then the gear resolves the port
+from `ClientHub`, where only the test providers bind it, and an instance configured with
+subscriptions reports the feed missing once and reads nothing. The feed subscription set is gear
+config `rating.usage_feed.subscriptions` (at most 32, each of ≤ 100 meters), ordered by
+`rating.usage_feed.config_generation`; each entry is one canonical source with its own
+`source_id` (§4.6). Each call to the feed, the meter registry or the tenant hierarchy is bounded
+by `rating.usage_feed.call_timeout_secs`. Provided: nothing externally — there is no usage ingestion API on
+Rating.
 
 <!-- /contract -->
 
@@ -7369,40 +7433,45 @@ declarations (UPSTREAM_REQS U-9), Products derived usage types (the inputs a met
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-normalization-ing`
 
-| Rating field | Collector target V1 (upstream `main` docs) | Collector code today | Treatment |
-|---|---|---|---|
-| `usage_record_id` | `id` = UUIDv5 over `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)` (usage-collector ADR-0007) | `id` = UUIDv5 over `(tenant, gts_id, created_at, key)` | copied |
-| `tenant_id` | `tenant_id` | `tenant_id` | copied; the record's resource tenant |
-| `gts_type` | `gts_type_id` | `gts_id` | copied |
-| priced meter | — | — | **resolved, not stored on the record**: every derived usage type `products.derived/<code>@<n>` sold on the attributed line whose declaration lists this `gts_type` as an input (products P-D-259; [13 §4.5](#contract-13-4-5)), through the usage policy projection (T-D-76; R-09 closed) |
-| `resource_type`, `resource_id` | `resource_ref` | `resource_ref` | copied |
-| `subject_ref` | `subject_ref` | `subject_ref` | copied (lineage only) |
-| `interval_start`, `interval_end` | `window_start`, `window_end` (half-open; equal = point event) | **unavailable** (`created_at` only) | copied; code-today records are not rateable (`interval_missing`) |
-| `quantity` | `quantity` (decimal string, ≤ 28 fractional digits) | `value` (`Decimal` string; the ClickHouse plugin keeps 9 fractional digits — DOC/CODE DRIFT, §1.1) | parsed exactly into `ExactQuantity`, stored `NUMERIC(88,28)` |
-| unit, fold | not on the entry; on the types-registry declaration | `UsageKind` counter/gauge in the collector's plugin catalog, no unit | **resolved** from the raw type's declaration (§4.7); the per-granule fold that prices it is the derived declaration's `GranuleFold` ([13 §4.5](#contract-13-4-5)) |
-| `dimension_key` | `metadata` (closed map of declared keys) | `metadata` | **derived**: R-16 encoding of the entry's value for the binding's `dimension_key` (one tenant dimension registry, seeded with `region`; pricing chains are per dimension value and usage binds lazily per value, pricing D-385, D-397); launch: not derived from metadata — the record counts toward its item's one rated cell, the value the accepted binding names (03 §4.2) |
-| `idempotency_key` | `idempotency_key` | `idempotency_key` | copied (natural key) |
-| `entry_type` | `record` \| `invalidation` | — | copied |
-| `invalidates_id`, `reason_code` | `invalidates` (server-stamped), `reason_code` | — | copied |
-| `origin` | `live` \| `backfill` (the route, not the age) | — | copied |
-| `accepted_at` | `accepted_at` (server) | — | copied; late-arrival detection (`accepted_at` vs `window_end`) |
-| `subscription_id`, `sub_line_key`, payer, seller | — (commercial identity is the consumer's, PRD:513) | — | **resolved** through the attribution projection (§4.2); **CURRENT: no source** |
-| — | removed from the target trait | `status`, `corrects_id`, `deactivate_usage_record` | **obsolete**: never consumed |
+| Rating field | Collector v2 `UsageRecord` (PR #5359) | Treatment |
+|---|---|---|
+| `usage_record_id` | `id` = UUIDv5(`56313026-863b-4de8-b32b-1f96b67306ed`, `0x1F`-joined `(tenant_id, gts_type_id, idempotency_key, window_start, window_end, entry_type)`, bounds as `YYYY-MM-DDTHH:MM:SS.ffffffZ`) (usage-collector ADR-0007, `v2/id.rs`) | copied |
+| `tenant_id` | `tenant_id` | copied; the record's resource tenant |
+| `gts_type` | `gts_type_id`: the meter, `gts.cf.core.uc.usage_record.v2~<segment>~` | copied |
+| priced meter | — | **resolved, not stored on the record**: every derived usage type `products.derived/<code>@<n>` sold on the attributed line whose declaration lists this meter as an input (products P-D-259; [13 §4.5](#contract-13-4-5)), through the usage policy projection (T-D-76; R-09 closed) |
+| `resource_type`, `resource_id` | `resource_ref` | copied |
+| `subject_ref` | `subject_ref` (optional) | copied (lineage only) |
+| `interval_start`, `interval_end` | `window_start`, `window_end` (half-open, UTC, µs; equal = point event) | copied; an entry without them is `rejected(interval_missing)`, which a v2 entry never is |
+| `quantity` | `quantity` (decimal string, ≤ 28 significant and 28 fractional digits) | checked against that pattern and kept as its canonical text (the collector's equality is textual: `42.5` ≠ `42.500`); summed exactly as `ExactQuantity` downstream |
+| unit, fold | not on the entry; on the meter's types-registry declaration (`aggregation_fold`, `canonical_unit`) | **resolved** from the meter's declaration (§4.7); the per-granule fold that prices it is the derived declaration's `GranuleFold` ([13 §4.5](#contract-13-4-5)) |
+| `dimension_key` | `metadata` (string values; the keys the meter's declaration closes) | **derived**: R-16 encoding of the entry's value for the binding's `dimension_key` (one tenant dimension registry, seeded with `region`; pricing chains are per dimension value and usage binds lazily per value, pricing D-385, D-397); launch: not derived from metadata — the record counts toward its item's one rated cell, the value the accepted binding names (03 §4.2) |
+| `idempotency_key` | `idempotency_key` (an invalidation repeats its target's) | copied (natural key) |
+| `entry_type` | not on the SDK record: `invalidation` exactly when `invalidates` is present (the REST schema repeats it) | derived; a wire `entry_type` that disagrees is `usage_malformed` |
+| `invalidates_id`, `reason_code` | `invalidates` (derived by the collector from the invalidation's identity with `entry_type = record`), `reason_code`; both or neither | copied |
+| `origin` | `live` \| `backfill` (the route, not the age) | copied |
+| `accepted_at` | `accepted_at` (server, µs) | copied; late-arrival detection (`accepted_at` vs `window_end`) |
+| `subscription_id`, `sub_line_key`, payer, seller | — (commercial identity is the consumer's, PRD:513) | **resolved** through the attribution projection (§4.2); **CURRENT: no source** |
+| — | removed from the contract: `status`, `corrects_id`, `deactivate_usage_record`, `created_at` | **obsolete**: never consumed |
 
 - `raw_sha256` = SHA-256 over the canonical serialization (object keys sorted, values as received)
   of a **pinned, versioned field list**, never of the whole entry: the collector may add optional
   fields within a major version (usage-collector DESIGN:609), and a digest of the whole entry would
-  change on every re-read after such an addition. `raw_digest_version = 1` digests the caller-supplied
-  fields `tenant_id`, `resource_ref`, `subject_ref`, `gts_type_id`, `quantity`, `window_start`,
-  `window_end`, `idempotency_key`, `entry_type`, `reason_code`, `metadata` and the server-assigned
-  `id`, `accepted_at`, `origin`, `invalidates` (usage-collector DESIGN:549-550); an absent field is
-  serialized as `null`. Each row stores its `raw_digest_version`; a re-read entry is digested under
-  the stored row's version and compared only with it. A new collector major version that changes
-  these fields gets a new digest version; `raw_entry` keeps the complete entry, unknown fields
-  included, for audit and replay.
-- An entry with `window_end < window_start`, a GTS type the types registry answers as not declared,
-  or metadata keys outside the type's declared set is `rejected(usage_malformed)`; its raw row stays
-  and is the retry input. An unavailable registry rejects nothing (§4.7).
+  change on every re-read after such an addition. `raw_digest_version = 1` digests the v2 record's
+  caller-supplied fields `tenant_id`, `resource_ref`, `subject_ref`, `gts_type_id`, `quantity`,
+  `window_start`, `window_end`, `idempotency_key`, `reason_code`, `metadata` and its
+  server-assigned `id`, `accepted_at`, `origin`, `invalidates`. An absent field is serialized as
+  `null`, except `metadata`, which the SDK omits when empty, so an absent `metadata` and `{}` digest
+  alike; `entry_type` is not in the list, because the SDK record does not carry it and it adds
+  nothing to `invalidates`. The three instants are digested in the collector's identity form
+  `YYYY-MM-DDTHH:MM:SS.ffffffZ` when they parse as RFC 3339 (as received otherwise), so one instant
+  written two ways is no conflict. Each row stores its `raw_digest_version`; a re-read entry is
+  digested under the stored row's version and compared only with it. A new collector major version
+  that changes these fields gets a new digest version; `raw_entry` keeps the complete entry, unknown
+  fields included, for audit and replay (T-D-84).
+- An entry with `window_end < window_start`, a meter the types registry answers as not declared,
+  metadata keys outside the meter's declared set, or a field that is missing or not of its v2 shape
+  is `rejected(usage_malformed)`; its raw row stays and is the retry input. An unavailable registry
+  rejects nothing (§4.7).
 - Backfilled entries (`origin = backfill`, admitted up to 90 days back through the collector's
   backfill route) are processed identically.
 
@@ -7446,15 +7515,21 @@ declarations (UPSTREAM_REQS U-9), Products derived usage types (the inputs a met
   invalidation application). Not inserted with a different digest ⇒ `usage_content_conflict`
   alarm; the stored row stands.
 - Defence key: unique `(tenant_id, gts_type, idempotency_key, interval_start, interval_end,
-  entry_type)` — the collector's own dedup identity. An entry with a new id but an existing natural
-  key is a conflict, not a new measurement. The key is never weaker than the upstream scope, because
-  the upstream id is a function of exactly that identity. The key is checked before the normalized
-  columns are written, and the write runs under a savepoint: a stored entry holding the key, or a
-  concurrent writer's unique violation (`23505` on `uq_…__natural_key`), rolls back to the savepoint
-  and sets the entry `rejected(usage_natural_key_conflict)` with an alarm; the page continues, the
-  cursor advances and the stored entry stands. The inbox's digest quarantine is the precedent
-  (DESIGN §3.7 `bss_rating__inbox`). A conflict is never a page abort, because a re-read would fail
-  the same way and stop the feed for good.
+  entry_type)` — the collector's own dedup identity — and, for invalidations, unique
+  `(tenant_id, invalidates_id)`. An entry with a new id but an existing natural key (or a second
+  invalidation of one target) is a conflict, not a new measurement. The collector derives the id
+  from exactly that identity (v2 `id.rs`; usage-collector ADR-0007), so a conforming collector
+  never produces one: the key is a **safety net**, kept because it is never weaker than the
+  upstream scope and costs one index. The entry is interpreted in memory before its capture insert,
+  and the key is checked then: a stored entry holding it makes the insert store the raw entry
+  `rejected(usage_natural_key_conflict)` with no normalized columns, with an alarm; the page
+  continues, the cursor advances and the stored entry stands. The inbox's digest quarantine is the
+  precedent (DESIGN §3.7 `bss_rating__inbox`). A conflict is never a page abort that repeats,
+  because a re-read would fail the same way and stop the feed for good: a concurrent writer that
+  stores the key between the check and the insert (`23505` on `uq_…__natural_key`) aborts the page
+  once, and its re-read finds the stored key and takes the conflict branch. The gear's secure
+  transaction offers no savepoint, so the capture and the normalized columns are one insert
+  rather than an insert and an update under a savepoint (T-D-84).
 - Replay of any feed range — including a full replay from `Oldest` — is harmless.
 
 <!-- /contract -->
@@ -7466,25 +7541,30 @@ declarations (UPSTREAM_REQS U-9), Products derived usage types (the inputs a met
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-design-usage-types-ing`
 
-- **Target** (usage-collector ADR-0008): declarations live in types-registry, not in the collector:
-  required `aggregation_fold ∈ {SUM, COUNT, MAX, MIN, LATEST}`, `canonical_unit`, `retention`;
-  optional `nominal_sampling_interval` (`schemas/usage_record.v1.schema.json:44-65`). The collector
-  serves no type reads.
-- **CURRENT code**: the collector validates ingest against its own plugin catalog `UsageType{gts_id,
-  kind: counter | gauge, metadata_fields}`, which has no unit; types-registry is not consulted for
-  declarations. Until the target exists Rating has no raw fold or unit to check against (UNKNOWN /
-  EXTERNAL CONTRACT REQUIRED); it checks the derived declaration's input `unit` and `GranuleFold`
-  (Products) instead.
-- Rating reads a declaration through the types-registry SDK (`TypesRegistryClient` schema reads)
-  and caches it by GTS type id (declarations are immutable). A typed accessor returning fold, unit and
-  accrual method is not specified by anybody (Atlas Plus X7): UNKNOWN / EXTERNAL CONTRACT REQUIRED.
-- **When the read runs**: the reader resolves the declarations of a page's distinct GTS types
+- **Contract** (usage-collector v2, ADR-0008): a meter is a GTS type derived from
+  `gts.cf.core.uc.usage_record.v2~` with exactly one further segment, declared in types-registry,
+  not in the collector: required traits `aggregation_fold ∈ {SUM, COUNT, MAX, MIN, LATEST}`
+  (immutable), `canonical_unit` (1–64 characters), `retention` (ISO 8601 duration); optional
+  `nominal_sampling_interval`; the declaration closes `metadata` to its declared keys, each a
+  string (`schemas/usage_record.v2.schema.json:41-68, 151-155`). No collector surface serves type
+  reads; consumers read the declaration from types-registry (ADR-0008:125-131, ADR-0015).
+- **CURRENT**: the code on `main` still validates ingest against the collector's plugin catalog
+  `UsageType{gts_id, kind: counter | gauge, metadata_fields}`, which has no unit, and nothing
+  publishes a v2 meter declaration yet. Rating resolves declarations through its own port
+  (`MeterDeclarations`: a declaration, a definitive "not declared", or unavailable), cached by meter
+  (declarations are immutable); `FakeMeterDeclarations` stands in for the tests, and the reader over
+  the types-registry SDK (`TypesRegistryClient` schema reads; a typed accessor returning fold, unit
+  and accrual method is asked of types-registry, Atlas Plus X7, `…-upreq-usage-type-declaration-read`)
+  lands with R-01 (T-D-84). Until then Rating also checks the derived declaration's input `unit` and
+  `GranuleFold` (Products). An operator retry of a rejected entry resolves its meter afresh, past
+  the cache, so a declaration the cache held wrongly is corrected by the retry (V03).
+- **When the read runs**: the reader resolves the declarations of a page's distinct meters
   **before** the page transaction, as the collector's gateway resolves a type before it persists an
   entry (usage-collector DESIGN:602, 1638-1643). A transient error (registry unavailable, timeout)
   backs off without opening the transaction or advancing the cursor, so nothing is rejected and no
   transaction is held open across a retry. Only a definitive "not declared" answer makes an entry
   `rejected(usage_malformed)`.
-- Only `SUM` is chargeable (usage-collector ADR-0009, ADR-0011). Entries of a raw type with another
+- Only `SUM` is chargeable (usage-collector ADR-0009, ADR-0011). Entries of a meter with another
   fold are **not** rejected: they are captured and counted like any other, because a derived usage
   type may fold them `Peak` or `TimeWeighted` (R-06). Evaluation decides: a derived type that takes
   such a raw type as a `Sum` input fails the child `usage_type_not_chargeable`; at launch only `Sum`
