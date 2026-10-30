@@ -7060,7 +7060,7 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
 
 ### D-237 (M) Lifecycle's Stage 3 contract is mirrored: gate refusals decode but never reach this gear's calls, and the re-check adopts the frozen vectors and the occupancy count scope
 
-**Accepted (2026-10-27).** *(mirrors Lifecycle D-228, D-229, D-230, D-231 item 10, D-233 item 9, D-236, D-237 and D-238 on Lifecycle's Stage 3 branch `bss/orders-stage3`; refines D-193, D-208, D-227, D-231)*
+**Accepted (2026-10-27).** *(mirrors Lifecycle D-232, D-233, D-234, D-235 item 10, D-237 item 9, D-240, D-241 and D-242 on Lifecycle's Stage 3 branch `bss/orders-stage3`; refines D-193, D-208, D-227, D-231)*
 
 **Decision**:
 
@@ -7075,7 +7075,7 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
    arrives, it takes the *a 5xx* row through the wildcard arm of D-231. The step operations build
    against the Lifecycle SDK revision they call and take each newly registered reason in lockstep.
    An unknown reason inside `assessment` fails the whole diagnostics decode as `Integration`
-   (Lifecycle D-229 item 3), which is again the *a 5xx* row, never success. This gear neither
+   (Lifecycle D-233 item 3), which is again the *a 5xx* row, never success. This gear neither
    stores nor forwards the report.
 2. **Preview and the submit metadata are not consumed.** `OrdersV1::preview` and its types
    (`tcvWithheld`, `tcv_basis`, `resolved_total.exclusions`) and the submit result's
@@ -7095,12 +7095,12 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
    only as Lifecycle's development mirror, until Subscriptions agrees how unlimited differs from
    unknown. Under either scope the re-check adds only this order's own pending lines. Counts are
    never re-bucketed here (D-208).
-5. **Keys per line.** A line may store several overlap keys (Lifecycle D-238, item-key coverage),
+5. **Keys per line.** A line may store several overlap keys (Lifecycle D-242, item-key coverage),
    and the re-check asks for every stored key. A collision on any one key rejects that line. A line
    with no paid recurring item (one-time-only or usage-only) stores no key and needs no read
-   (Lifecycle D-236 item 6). When no line stores a key, the occupancy step is skipped, so an
+   (Lifecycle D-240 item 6). When no line stores a key, the occupancy step is skipped, so an
    unavailable occupancy port cannot defer the order.
-6. **Protected capacity is the target, not yet the set.** Lifecycle D-238 adopts Subscriptions
+6. **Protected capacity is the target, not yet the set.** Lifecycle D-242 adopts Subscriptions
    PR 5516's protected semantics: three literal counts (active, retained suspended, confirmed-order
    reservations) on the full `(payer, resource tenant, key)` tuple, with the order's own
    reservation converted at activation. Its 16 proposed vectors
@@ -7109,12 +7109,12 @@ owner part as an assumption keeps the PRD from presenting an unagreed contract a
    the way this gear names its own reservation. The duties PR 5516 assigns to this gear (carry exact
    acquisition and attempt identities, recover unknown outcomes, keep fences, deliver
    acknowledgements) are already slices 05 and 06. No operation is added.
-7. **Cardinality stays advisory at order time** (Lifecycle D-236 item 11). A re-check pass is not
+7. **Cardinality stays advisory at order time** (Lifecycle D-240 item 11). A re-check pass is not
    an admission guarantee. A later collision is the wave-2 failure that `design/06` §4.8 already
    maps to `overlap-collision`.
 
-**Rationale**: Lifecycle's Stage 3 branch lists these as the #4787 mirror (its D-231 item 10,
-D-236 item 7, D-237 item 3). Most of it changes nothing this gear calls, so the decision says
+**Rationale**: Lifecycle's Stage 3 branch lists these as the #4787 mirror (its D-235 item 10,
+D-240 item 7, D-241 item 3). Most of it changes nothing this gear calls, so the decision says
 that explicitly instead of adding rows that could never be reached. The re-check is the one place
 the gear consumes the new shapes, so it adopts Lifecycle's frozen vectors rather than restating
 the algorithm.
@@ -7223,67 +7223,67 @@ this gear's. Recording the contract now keeps Stage 4 from being read as having 
 
 ### D-241 (M) Lifecycle's PR #5536 review fixes are mirrored: stricter decodes, the committed-total scale, forward-only migrations and one item quantity per line
 
-**Accepted (2026-10-30).** *(mirrors Lifecycle D-240 and D-242 on Lifecycle's Stage 3 branch `bss/orders-stage3`, PR #5536; refines D-237)*
+**Accepted (2026-10-30).** *(mirrors Lifecycle D-244 and D-246 on Lifecycle's Stage 3 branch `bss/orders-stage3`, PR #5536; refines D-237)*
 
 **Decision**: one item per Lifecycle hand-off item. None changes a wire byte, a reason or a
 status this gear calls or answers.
 
-1. **`GateOutcome` catalog selection** (Lifecycle D-240 item 34). The Lifecycle SDK now refuses to
+1. **`GateOutcome` catalog selection** (Lifecycle D-244 item 34). The Lifecycle SDK now refuses to
    decode an outcome that states a key without a catalog selection. This gear decodes reports only
    through that SDK, keeps no mirror decoder, and reads the selection through the
    `has_catalog_selection()` and `catalog_scope_key()` accessors. A refusal whose diagnostics fail
    that decode takes the *a 5xx* row, as D-237 item 1 already says. Mirrored in `DESIGN.md` §3.4
    and `design/06` §4.9.
-2. **`GateOutcome` scope setters** (Lifecycle D-240 item 35). Not applicable: this gear builds no
+2. **`GateOutcome` scope setters** (Lifecycle D-244 item 35). Not applicable: this gear builds no
    report.
-3. **`PreviewResult` identity check** (Lifecycle D-240 item 12). The Lifecycle SDK refuses a body
+3. **`PreviewResult` identity check** (Lifecycle D-244 item 12). The Lifecycle SDK refuses a body
    whose `assessment_id` differs from its report's. This gear never calls Preview (D-237 item 2)
    and keeps no mirror decoder. Mirrored in `DESIGN.md` §3.4.
-4. **`CommittedTotal`** (Lifecycle D-240 items 12, 53). `currency_scale` is a `u8` (0..=28) and
+4. **`CommittedTotal`** (Lifecycle D-244 items 12, 53). `currency_scale` is a `u8` (0..=28) and
    the tokens stay open strings. The approval valuation carries the figure into its
    representation by that scale and never closes the tokens into enums. Mirrored in `design/03`
    §3.7 (`valuation_amount`).
-5. **Line-requests snapshot placeholder** (Lifecycle D-240 items 20, 67). Not applicable: this gear
+5. **Line-requests snapshot placeholder** (Lifecycle D-244 items 20, 67). Not applicable: this gear
    designs no commercial attempt and no `Value::Null` placeholder row. Checked `design/01` §3.7,
    `design/04` §3.7 and `design/05` §3.7.
-6. **`MaxConcurrentActive`** (Lifecycle D-240 item 38). Not applicable: this gear has no copy of
+6. **`MaxConcurrentActive`** (Lifecycle D-244 item 38). Not applicable: this gear has no copy of
    the type. Its text already reads the limit the same way (absent is unevaluable, `null` is
    unlimited only as Lifecycle's development mirror; D-237 item 4, `design/04` §3.6
    `inst-rc-compose-lifecycle`, `UPSTREAM_REQS.md` `SUB-O5`). The explicit-unlimited ask stays open.
-7. **Gate and acceptance retry** (Lifecycle D-240 item 16). Not applicable: this gear runs no gate
+7. **Gate and acceptance retry** (Lifecycle D-244 item 16). Not applicable: this gear runs no gate
    port and no Pricing acceptance. Its retries are the definition's retry policy (`design/10`
    §3.6).
-8. **Total-row tokens** (Lifecycle D-240, C8). No-op: Rust-only, strings unchanged.
-9. **Frozen attempt typing** (Lifecycle D-240, C4). No-op: Rust-only, stored bytes unchanged.
-10. **Gate config** (Lifecycle D-240, A-T1). No-op: Orders-gear-local operator config.
-11. **Limiter move** (Lifecycle D-240, A-T3). No-op: gear-local, no wire or SDK change.
-12. **In-flight reader** (Lifecycle D-240, B-T4). No-op: Orders reader signature only.
-13. **Shipped migrations are corrected forward** (Lifecycle D-242 item 1). The runner records
+8. **Total-row tokens** (Lifecycle D-244, C8). No-op: Rust-only, strings unchanged.
+9. **Frozen attempt typing** (Lifecycle D-244, C4). No-op: Rust-only, stored bytes unchanged.
+10. **Gate config** (Lifecycle D-244, A-T1). No-op: Orders-gear-local operator config.
+11. **Limiter move** (Lifecycle D-244, A-T3). No-op: gear-local, no wire or SDK change.
+12. **In-flight reader** (Lifecycle D-244, B-T4). No-op: Orders reader signature only.
+13. **Shipped migrations are corrected forward** (Lifecycle D-246 item 1). The runner records
     migrations by name only, so a migration shipped on `main` is never edited. Every schema change
     here is a new forward migration, and if this gear pins shipped migrations, a unit test pins
     each shipped name and SHA-256, as Orders' `migrations_shipped_on_main_are_unchanged` does.
     Mirrored in `DESIGN.md` §3.7 (*Migration and schema versioning*).
-14. **Mixed item quantities** (Lifecycle D-242 items 13, 14). Lifecycle refuses two different
+14. **Mixed item quantities** (Lifecycle D-246 items 13, 14). Lifecycle refuses two different
     stated item quantities at authoring (`request-invalid`, `quantity`) and fails such a line at
     assessment (`reference-unresolvable`, upstream code `mixed-item-quantities`). The items of a
     received line therefore state one quantity. This gear authors no line and runs no assessment,
     so it adds no refusal. Both rules lift together if Lifecycle Q-03 admits per-item quantities.
     Mirrored in `design/04` §2.2 (`cpt-cf-bss-orders-workflow-constraint-bundle-one-line`).
-15. **Single oversized pin** (Lifecycle D-242 item 15). Not applicable: `purchase-capacity-exceeded`
+15. **Single oversized pin** (Lifecycle D-246 item 15). Not applicable: `purchase-capacity-exceeded`
     is a submit-gate refusal, and this gear calls no gate (D-237 item 1, `design/06` §4.9).
-16. **Gate report on the in-flight refusal** (Lifecycle D-242 item 16). Not applicable: this gear
+16. **Gate report on the in-flight refusal** (Lifecycle D-246 item 16). Not applicable: this gear
     never receives `order-in-flight-for-key` from the operations it calls, and neither stores nor
     surfaces its diagnostics (D-237 item 1, `design/06` §4.9).
-17. **Commercial principal check** (Lifecycle D-242 items 19, 25). Not applicable: this gear calls
+17. **Commercial principal check** (Lifecycle D-246 items 19, 25). Not applicable: this gear calls
     Lifecycle as its own service principal and never exchanges or forwards a seller's commercial
     principal (`DESIGN.md` §3.4; `design/09`; ADR-0010). No operator note is needed here.
-18. **Rejected overlap-key answer** (Lifecycle D-242 item 7). Not applicable: the design describes
+18. **Rejected overlap-key answer** (Lifecycle D-246 item 7). Not applicable: the design describes
     no gate in-flight pre-check row and lists no Orders-authored upstream code. Checked `DESIGN.md`
     §3.4, `design/04` §3.6 and `design/06` §4.9.
-19. **Unfreezable billing terms** (Lifecycle D-242 item 11). Not applicable: the design neither
-    describes the D-236 item 2 build probe nor freezes Pricing requests from terms snapshots.
+19. **Unfreezable billing terms** (Lifecycle D-246 item 11). Not applicable: the design neither
+    describes the D-240 item 2 build probe nor freezes Pricing requests from terms snapshots.
     `billing-terms-unsupported` stays an unreachable gate reason (`design/06` §4.9).
-20. **A refused line shape is never composed or asked** (Lifecycle D-242 item 26). Not applicable:
+20. **A refused line shape is never composed or asked** (Lifecycle D-246 item 26). Not applicable:
     this gear composes no gate and asks no overlap-key answer. Its re-check reads only stored keys
     (`design/04` §3.6).
 
@@ -7295,6 +7295,46 @@ parts this gear reads or shares.
 **Propagated**: `DESIGN.md` §3.4 (Orders Lifecycle row), §3.7 (*Migration and schema versioning*);
 `design/03-approval-execution.md` §3.7 (`valuation_amount`); `design/04-fulfillment-plan.md` §2.2
 (`cpt-cf-bss-orders-workflow-constraint-bundle-one-line`); `design/06-saga-and-compensation.md` §4.9.
+
+### D-242 (L) Orders decision numbers follow Orders D-247
+
+**Accepted (2026-10-30).** *(mirrors Lifecycle D-247 on Lifecycle's Stage 3 branch `bss/orders-stage3`, PR #5536; refines D-237, D-241)*
+
+**Decision**:
+
+1. **The collision.** `main` already holds Lifecycle D-227…D-230 (PR #5259), so Lifecycle keeps
+   those and moves its Stage 3 decisions up by four:
+
+   | Old | New | Lifecycle decision |
+   |-----|-----|--------------------|
+   | D-227 | D-231 | Stage 3 port inventory, typed unavailability and the S3-F01/F02/F08 reconciliation |
+   | D-228 | D-232 | The payer relationship refusal is a gate predicate result |
+   | D-229 | D-233 | The all-failures gate report is one optional member of the refusal diagnostics |
+   | D-230 | D-234 | Definitive local refusals outrank unavailability in the gate's primary |
+   | D-231 | D-235 | Milestone 2: development delivery, engine diagnostics hook, submit protocol bindings |
+   | D-232 | D-236 | Commercial attempt recovery: scope and the open abandonment question |
+   | D-233 | D-237 | Gate observability, the gear-local breaker, alert baselines, fault injection and the activation re-check vectors |
+   | D-234 | D-238 | The submit REST route in the development delivery and the end-to-end development build |
+   | D-235 | D-239 | A declarative test-host PDP for the Orders end-to-end suite |
+   | D-236 | D-240 | Milestone 3c gate behavior, wire additions and remaining prerequisites |
+   | D-237 | D-241 | Residual follow-through, proposed mirrors and runtime evidence |
+   | D-238 | D-242 | Adopt PR5516 protected semantics and publish proposed integration contract |
+   | D-239 | D-243 | A maintenance block must schedule the retention purge |
+   | D-240 | D-244 | PR #5536 toolkit-pr-review findings: fixes, accepts, deferrals |
+   | D-241 | D-245 | Orders reads Rating's exact money with main's fraction API |
+   | D-242 | D-246 | PR #5536 maintainer review (macrocheese1, 2026-10-29): fixes |
+
+2. **Citations follow.** This gear's citations of those Lifecycle decisions are updated in the same
+   change, items moving with their decision. This gear's own decision numbers are unchanged.
+
+**Rationale**: This register uses the same numbers for its own decisions, so a stale Lifecycle
+number would point at a different decision. Citations of Lifecycle's Stage 4 branch are not in the
+table and stand as written.
+
+**Propagated**: `DESIGN.md` §3.4 (Orders Lifecycle row), §3.7 (*Migration and schema versioning*);
+`design/03-approval-execution.md` §3.7 (`valuation_amount`); `design/04-fulfillment-plan.md` §2.2
+(`cpt-cf-bss-orders-workflow-constraint-bundle-one-line`); `design/06-saga-and-compensation.md` §4.9;
+`UPSTREAM_REQS.md` §2.1 (*Overlap-presence read*); D-237, D-241.
 
 ## Open Questions
 
@@ -7656,6 +7696,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-237 | cross-cutting (Lifecycle Stage 3 mirror, 2026-10-27) | `DESIGN.md` §3.4; `design/04` §3.6; `design/05`; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
 | D-241 | cross-cutting (Lifecycle PR #5536 review mirror, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9 |
+| D-242 | cross-cutting (Lifecycle D-247 renumbering, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1 |
 | D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-232–D-236 | cross-cutting (PR #4787 comment of 2026-10-23, 2026-10-26) | `design/01` §3.7, §4.7, §4.9; `design/03` §3.3, §3.6, §3.7; `design/05` §3.2, §3.3, §3.6, §3.7, §4.1, §4.4, §4.5; `design/06` §3.2, §3.6, §4.8; `design/10` §3.6; `ADR/0008`; `PRD.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3, §4 |
@@ -7873,6 +7914,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-239 | M Lifecycle Stage 4 wave 3 mirrored: `OrderAcceptanceRecorded` emitted, consent per version; Lifecycle decides begin-fulfillment consent then payment and tolerance; `acceptance-requirement-unevaluable` is a settled 503 → `withheld`, not retried; tolerance evidence is `authorization_failure_tolerated_at`; `get_version` on `OrdersV1` | `design/04`; `design/02`; `DESIGN.md` §3.4 |
 | D-240 | M Pending-payment continuation (S4-11) is specified as requirements in `design/04` and waits on the durable engine (Q-10) and a Payments owner; no behaviour change | `design/04` §2.1 |
 | D-241 | M Lifecycle PR #5536 review fixes mirrored: stricter `GateOutcome` and `PreviewResult` decodes through the SDK only; `CommittedTotal.currency_scale` is `u8`; shipped migrations are never edited; one item quantity per line; the other items are not applicable or no-op | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9 |
+| D-242 | L Orders decision numbers follow Orders D-247: Lifecycle's Stage 3 D-227…D-242 are now D-231…D-246; citations updated, this gear's own numbers unchanged | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-237, D-241 |
 
-Highest decision number used: **D-241**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-242**; highest question number: **Q-14**. Numbering is one continuous sequence across the whole
 register; there are no parts.

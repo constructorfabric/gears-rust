@@ -122,7 +122,7 @@ answers are agreed here but are not canonical until that PR merges:
 > **Clause added 2026-10-27 (D-237)**: each answered row **MUST** carry `max_concurrent_active` and
 > `count_scope` (`per_payer` or `full_tuple`). A missing member is unevaluable here, never a default
 > limit, and the encoding that tells unlimited from unknown is still to be agreed (Lifecycle
-> D-233 item 9). The target shape is Lifecycle D-238's three counts (active, retained suspended,
+> D-237 item 9). The target shape is Lifecycle D-242's three counts (active, retained suspended,
 > confirmed-order reservations) on the full tuple, from Subscriptions PR 5516 S-U10; this gear
 > adopts it, with Lifecycle's protected re-check vectors, once Subscriptions ratifies it.
 
