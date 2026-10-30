@@ -130,6 +130,67 @@ pub struct OwnMembership {
     /// At most one right per requested line/scope.
     pub rights: Vec<OwnRight>,
 }
+/// The required `own_membership` answer of a protected row.
+///
+/// Wire form: `null` when there is no reusable context, a complete [`OwnMembership`] object
+/// for the recheck. A missing member is refused.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnMembershipAnswer {
+    /// No reusable context (`null`).
+    None,
+    /// The membership for the recheck.
+    Present(OwnMembership),
+}
+
+impl Serialize for OwnMembershipAnswer {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::None => None,
+            Self::Present(membership) => Some(membership),
+        }
+        .serialize(s)
+    }
+}
+
+/// Reads `null` as [`OwnMembershipAnswer::None`] and an object as the membership, decoded by
+/// [`OwnMembership`]'s own derive (so its `deny_unknown_fields` and error paths are unchanged).
+struct OwnMembershipVisitor;
+
+impl<'de> serde::de::Visitor<'de> for OwnMembershipVisitor {
+    type Value = OwnMembershipAnswer;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("an own-membership object, or null for no reusable context")
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(OwnMembershipAnswer::None)
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(OwnMembershipAnswer::None)
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        OwnMembership::deserialize(d).map(OwnMembershipAnswer::Present)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+        OwnMembership::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            .map(OwnMembershipAnswer::Present)
+    }
+}
+
+/// `deserialize_any`, not `deserialize_option` (as for [`MaxConcurrentActive`]): a serde derive
+/// treats a missing member of an `Option` as `None`, but a missing member reaching
+/// `deserialize_any` is an error. So the type itself refuses an absent member, with no
+/// per-field attribute; only an explicit `null` is [`OwnMembershipAnswer::None`].
+impl<'de> Deserialize<'de> for OwnMembershipAnswer {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(OwnMembershipVisitor)
+    }
+}
 /// Strict proposed protected wire object. Nullable members must be explicitly present.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,10 +214,9 @@ pub struct ProtectedOccupancy {
     pub order_reserved_count: u32,
     /// Required number or explicit null.
     pub max_concurrent_active: MaxConcurrentActive,
-    /// Required null for no reusable context; complete object for recheck. The custom
-    /// deserializer keeps the member required: a missing member is refused, `null` is accepted.
-    #[serde(deserialize_with = "Option::<OwnMembership>::deserialize")]
-    pub own_membership: Option<OwnMembership>,
+    /// Required null for no reusable context; complete object for recheck. The type keeps the
+    /// member required: a missing member is refused, `null` is accepted.
+    pub own_membership: OwnMembershipAnswer,
 }
 /// Why a protected occupancy batch was refused. Each variant is one refusal class of
 /// [`validate_batch`]; [`Self::token`] is the Orders-authored `upstream_code` it reports.
@@ -323,8 +383,8 @@ pub fn validate_batch(
         revision = Some(&o.observation_revision);
         let mut represented = BTreeSet::new();
         match (&want.own_context, &o.own_membership) {
-            (None, None) => {}
-            (Some(context), Some(membership)) => {
+            (None, OwnMembershipAnswer::None) => {}
+            (Some(context), OwnMembershipAnswer::Present(membership)) => {
                 if !membership.complete
                     || membership.context.line_ids.len() > lines.len()
                     || membership.rights.len() > lines.len()
