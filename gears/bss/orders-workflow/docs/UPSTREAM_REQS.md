@@ -874,7 +874,7 @@ its D-136), or name the existing value this gear should send for each:
 |----------------|-------------|--------------------|
 | `payment-authorization-stale` | the pre-activation re-check found the payment authorization older than its validity, so Workflow voided the wave-1 drafts before any activation | `payment-authorization-stale` (`design/04-fulfillment-plan.md` §3.6 `inst-rc-if-stale`) |
 | `grant-replacement-refused` | Lifecycle refused the D-201 replacement grant for a post-spawn rebuild (`grant-source-mismatch`, `grant-generation-exhausted`), which Lifecycle states are not acknowledgement reasons, so the order is unwound (D-243) | `grant-replacement-refused` (`design/05` §3.3) |
-| `receiver-control-abandoned` | Lifecycle abandoned a post-spawn hold's pause control and the receivers stay paused; the operator cancelled (D-243) | `receiver-control-abandoned` (`design/08` §3.6) |
+| `receiver-control-abandoned` | Lifecycle abandoned a post-spawn hold's pause control and the receivers stay paused; the operator cancelled instead of re-holding (D-243, D-244) | `receiver-control-abandoned` (`design/08` §3.6) |
 
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
 - **Why this gear cannot satisfy it alone**: Lifecycle owns the enumeration and the
@@ -987,6 +987,24 @@ and receives typed receiver evidence" through an internal port it names but has 
 - **Agreement status**: open; raised 2026-10-30.
 - **Source**: Lifecycle `DESIGN.md` *Staged hold/cancel/failure without new public states* steps 2
   and 4; `design/08` §3.3, §3.6.
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-repause-after-abandon`
+
+After Lifecycle refuses or abandons a post-spawn pause control, the receivers stay paused and
+Lifecycle issues new grants only through spawn, resume or a D-201 rebuild (Lifecycle D-198). This
+gear's recovery is an operator's fresh hold followed by a resume (decision D-244). Lifecycle
+**MUST** confirm that (i) a new pause control for a generation already paused is staged and
+finalized on receiver evidence that is still valid, and (ii) resuming that hold issues a successor
+grant as for any post-spawn hold.
+
+- **Fallback if declined**: let `replace_fulfillment_grant` reissue the unchanged roster once the
+  paused generation is closed at every receiver — the same continuation with an empty rebuilt set,
+  behind its existing closure guards.
+- **Consequence if neither lands**: the `receiver-control-abandoned` task can only be cancelled,
+  so a healthy order is unwound because a hold failed its final check.
+- **Agreement status**: open; raised 2026-10-30.
+- **Source**: Lifecycle `DESIGN.md` *Staged hold/cancel/failure without new public states*
+  ("Failed final authorization/version checks cannot discard an installed receiver fence"); `design/08` §2.2.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-current-grant-read`
 
@@ -1814,7 +1832,7 @@ then have to accept.
 | `p1` (critical), platform path | `…-upreq-serverless-runtime-readiness-gate`, `…-upreq-serverless-runtime-event-triggers-gts`, `…-upreq-serverless-runtime-consumed-event-member-storage`, `…-upreq-serverless-runtime-pdp-guarded-call`, `…-upreq-serverless-runtime-attempt-and-deadline-propagation`, `…-upreq-serverless-runtime-history-residency-retention`, `…-upreq-serverless-runtime-definition-versioning-validation-hook`, `…-upreq-serverless-runtime-trigger-version-selection`, `…-upreq-serverless-runtime-signals`, `…-upreq-serverless-runtime-event-retention-between-listens`, `…-upreq-serverless-runtime-history-growth`, `…-upreq-serverless-runtime-invocation-control-restriction`, `…-upreq-serverless-runtime-dead-letter-operator-visibility` |
 | `p2` (important) | `…-upreq-correlation-propagation`, `…-upreq-serverless-runtime-failure-handler-target`, `…-upreq-lifecycle-failure-reason-coverage` |
 | `p1` (critical), **open since 2026-10-21** — the PR #4787 proposal (D-220, D-223–D-225, D-232, D-234); each has a stated fallback the design keeps until the owner answers | `…-upreq-closed-attempt-fence` (`SUB-O17`), `…-upreq-successor-draft-preserves-acquisition` (`SUB-O18`), `…-upreq-aborted-event-on-every-unwind` (`p2`), `…-upreq-financial-readiness-through-billing`, `…-upreq-protected-purchase-before-capture`, `…-upreq-cancellation-reaches-payments`, `…-upreq-approval-named-user-criterion`, `…-upreq-prefulfillment-cancel-arbitration`, `…-upreq-assessment-expiry-vs-protected-coverage`, `…-upreq-approval-valuation-basis` |
-| `p1` (critical), **open since 2026-10-30** — the Lifecycle D-198 / D-201 receiver protocol (D-243); no fallback reaches an effective post-spawn hold without them | `…-upreq-receiver-attempt-ledger`, `…-upreq-lifecycle-fulfillment-control-port`, `…-upreq-lifecycle-current-grant-read` |
+| `p1` (critical), **open since 2026-10-30** — the Lifecycle D-198 / D-201 receiver protocol (D-243); no fallback reaches an effective post-spawn hold without them | `…-upreq-receiver-attempt-ledger`, `…-upreq-lifecycle-fulfillment-control-port`, `…-upreq-lifecycle-current-grant-read`, `…-upreq-lifecycle-repause-after-abandon` (`p2`, D-244) |
 
 `cpt-cf-bss-orders-workflow-upreq-pdp-policy-integration` is `p1` because every caller-driven
 operation fails closed until the catalogue, roles and the `assigned_principal` approver grant are

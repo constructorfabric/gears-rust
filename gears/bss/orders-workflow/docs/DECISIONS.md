@@ -7396,6 +7396,51 @@ Documentation only; none of the peer SDKs exists yet.
 §4.7, §4.8; `design/10` §3.3, §3.6 (a), (b), (e), §4.1; `ADR/0012`; `DESIGN.md` §1.2, §3.2;
 `UPSTREAM_REQS.md` §2.1, §2.4, §3.
 
+### D-244 (M) An abandoned pause request is recovered by a fresh hold and a resume; cancel stays available
+
+**Accepted (2026-10-30).** *(closes Q-15; refines D-243)*
+
+**Decision**:
+
+1. **Two resolutions.** The order-scope `receiver-control-abandoned` task is resolved by a **fresh
+   hold, then resume** at Lifecycle — a Seller Operator with hold authority holds the order again
+   and later resumes it — or by **cancel**, the unwind, whose revoke supersedes the paused
+   generation (`design/07` §3.3, §4.4).
+2. **The task triggers nothing itself.** The fresh hold reaches the definition as usual: the new
+   control's `settle-receiver-pause` is answered at once because the receivers are already paused,
+   and `OrderHeld` follows. `apply-hold` closes the task through the closure port when it records
+   that suspension and answers `abandonedControlClosed`, and the definition waits in the barrier
+   loop, where dispatch defers `held` until the resume's successor grant is recorded. While the
+   task is open nothing dispatches, because no grant is open (`design/08` §2.2, §3.6;
+   `design/10` §3.6 (e)).
+3. **Force-fail needs no action.** If the cause was the two-person forced failure (Lifecycle D-182),
+   the terminal event ends the process and `terminate-instance` closes the task with the instance.
+4. **No new Lifecycle route.** Recovery uses Lifecycle's rule that new grants come only from spawn,
+   resume or rebuild; this gear never reopens a paused generation.
+5. **One confirmation asked** (`…-upreq-lifecycle-repause-after-abandon`, `p2`): a new pause control
+   for an already-paused generation is staged and finalized on still-valid evidence, and its resume
+   issues a successor grant. **Fallback**: `replace_fulfillment_grant` reissues the unchanged roster
+   once the paused generation is closed at every receiver.
+6. **Correction to D-243.** A wave-2 call with no open grant is deferred `held`, not refused, while
+   the instance is suspended or a pause control is pending or abandoned; and the pause fan-out
+   reads the roster of the grant whose generation the control names, not the open grant, which a
+   paused generation no longer has (`design/05` §3.6 `inst-pi-wave2-guard`; `design/08` §3.6
+   `inst-rp-fanout`).
+
+**Rationale**: abandonment most often means the holding operator's authority changed; the order
+itself is healthy, and cancel-only would end a good order over an authorization problem. A fresh
+hold and a resume reuse rules both gears already have.
+
+**Alternatives considered**: cancel-only (the D-243 interim) — fails healthy orders; this gear
+reopening the generation — forbidden by Lifecycle D-198 ("cannot … silently reopen"); a new
+Lifecycle "reopen" operation — not needed while resume and the D-201 continuation cover it.
+
+**Consequences**: Q-15 closes; one `p2` upstream ask; `receiver-control-abandoned` reaches the
+failure mapping only when the operator cancels.
+
+**Propagated**: `design/05` §3.6; `design/07` §3.2, §3.3, §4.4; `design/08` §2.2, §3.3, §3.6,
+§4.7 item 11; `design/10` §3.6 (e); `UPSTREAM_REQS.md` §2.4, §3.
+
 ## Open Questions
 
 ### Q-01: Which durable-execution substrate backs the process — the OSS Workflow Engine or a BSS-local mechanism?
@@ -7717,7 +7762,7 @@ a design note mapping each port operation onto its API, or an approval SDK (`App
 provider. Lifecycle D-175 confirms that neither Orders gear verifies the verdict through a provider
 port (Seam Atlas tickets T5, T11).
 
-### Q-15: What reopens dispatch after Lifecycle abandons a post-spawn pause control?
+### Q-15: What reopens dispatch after Lifecycle abandons a post-spawn pause control? *(closed by D-244)*
 
 **Owner**: Orders Lifecycle, with this gear.
 
@@ -7728,6 +7773,9 @@ the spawn signal is written once, and D-201 needs a rebuilt member. Until this i
 `receiver-control-abandoned` task offers `cancel` only (D-243).
 
 **Review trigger**: with `…-upreq-lifecycle-fulfillment-control-port`.
+
+**Closed by D-244 (2026-10-30)**: a fresh hold followed by a resume, with cancel kept; Lifecycle's
+confirmation is the ask `…-upreq-lifecycle-repause-after-abandon`.
 
 ## What This Design Set Does Not Claim
 
@@ -7769,6 +7817,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-238 | cross-cutting (Lifecycle Stage 4 mirror, 2026-10-29) | `PRD.md` §6.2, §6.3; `DESIGN.md` §3.4; `design/03`; `UPSTREAM_REQS.md` §2.4, §4 item 2 |
 | D-241 | cross-cutting (Lifecycle PR #5536 review mirror, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9 |
 | D-242 | cross-cutting (Lifecycle D-247 renumbering, 2026-10-30) | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-237, D-241 |
+| D-244 | 07, 08, 10 (abandoned pause control recovery, 2026-10-30) | `design/05` §3.6; `design/07`; `design/08`; `design/10` §3.6 (e); `UPSTREAM_REQS.md` §2.4, §3; Q-15 |
 | D-243 | 05, 06, 08, 10 (Lifecycle D-198, D-201 receiver protocol, 2026-10-30) | `design/01`, `design/05`, `design/06`, `design/08`, `design/10`; `ADR/0012`; `DESIGN.md`; `UPSTREAM_REQS.md` §2.1, §2.4, §3; Q-15 |
 | D-240 | 04 Fulfillment plan (S4-11 pending-payment continuation, 2026-10-29) | `design/04` §2.1 |
 | D-239 | cross-cutting (Lifecycle Stage 4 wave 3 mirror, 2026-10-29) | `design/04`; `design/02`; `DESIGN.md` §3.4 |
@@ -7989,6 +8038,7 @@ register relies on is cited to a serverless-runtime file and line or registered 
 | D-241 | M Lifecycle PR #5536 review fixes mirrored: stricter `GateOutcome` and `PreviewResult` decodes through the SDK only; `CommittedTotal.currency_scale` is `u8`; shipped migrations are never edited; one item quantity per line; the other items are not applicable or no-op | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9 |
 | D-242 | L Orders decision numbers follow Orders D-247: Lifecycle's Stage 3 D-227…D-242 are now D-231…D-246; citations updated, this gear's own numbers unchanged | `DESIGN.md` §3.4, §3.7; `design/03` §3.7; `design/04` §2.2; `design/06` §4.9; `UPSTREAM_REQS.md` §2.1; D-237, D-241 |
 | D-243 | H Grants recorded and the only dispatch authority; `settle-receiver-pause` before a post-spawn hold; revoke on a spawned unwind; `replace-fulfillment-grant` before a post-spawn rebuild; 25 `protected` | `design/05`, `design/06`, `design/08`, `design/10`; `UPSTREAM_REQS.md` §2.1, §2.4; Q-15 |
+| D-244 | M Abandoned pause control: fresh hold then resume, or cancel; `apply-hold` closes the task; wave 2 defers `held` without an open grant while held; closes Q-15 | `design/05`, `design/07`, `design/08`, `design/10`; `UPSTREAM_REQS.md` §2.4 |
 
-Highest decision number used: **D-243**; highest question number: **Q-15**. Numbering is one continuous sequence across the whole
+Highest decision number used: **D-244**; highest question number: **Q-15**. Numbering is one continuous sequence across the whole
 register; there are no parts.

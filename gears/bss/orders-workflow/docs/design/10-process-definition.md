@@ -2470,7 +2470,7 @@ The pause stage, the `do` list of `process.pause`, entered from a pause arm with
     switch:
       - tick:  { when: '${ .arm == "tick" }', then: settlePause }
       - other: { then: leave }          # hold (the barrier was reported by an earlier round), lifecycle, cancel
-- pauseAbandoned:                       # an order-scope task under EITHER policy; its only resolution is cancel until Q-15 (08 §4.7 item 11)
+- pauseAbandoned:                       # an order-scope task under EITHER policy; resolved by a fresh hold then resume at Lifecycle, which apply-hold records and closes the task, or by cancel (08 §4.7 item 11, D-244)
     set: { failureScope: order, failureSubjects: '${ [ { subjectRef: $context.controlRef, reason: "receiver-control-abandoned", cause: "control-abandoned" } ] }', sourceStep: settle-receiver-pause, sourceAttempt: '${ $context.pauseRound | tostring }', forceTask: true, nextStage: failure, stageLoop: null }
     then: exit
 - leave: { set: { nextStage: '${ .arm }', returnStage: pause }, then: exit }
@@ -2501,11 +2501,13 @@ The hold stage, the `do` list of `process.hold`:
     try:
       - call: { step: apply-hold }      # body: ref + holdEventId: $context.lifecycleEventId, gateRefs: ($context.gateRefs // []); output: holdOutcome, suspensionRef
     catch: *transient
-    export: { as: '${ $context + { holdOutcome: .holdOutcome, suspensionRef: .suspensionRef, resumePollRound: (if .suspensionRef != null and .suspensionRef == $context.suspensionRef then ($context.resumePollRound // 0) else 0 end), heldTicks: 0 } }' }   # the poll family is per suspension (D-133)
+    export: { as: '${ $context + { holdOutcome: .holdOutcome, abandonedControlClosed: (.abandonedControlClosed // false), suspensionRef: .suspensionRef, resumePollRound: (if .suspensionRef != null and .suspensionRef == $context.suspensionRef then ($context.resumePollRound // 0) else 0 end), heldTicks: 0 } }' }   # the poll family is per suspension (D-133)
 - onHold:
     switch:
       - pause:  { when: '${ $context.holdOutcome == "suspended" and $context.holdPauses }', then: enterResumeWait }   # only the approval stage waits on the resume
+      - recovered: { when: '${ $context.holdOutcome == "suspended" and $context.abandonedControlClosed }', then: backToBarrier }   # D-244: the fresh hold closed the receiver-control-abandoned task; wait in the barrier loop, which defers while held, for the resume's grant
       - record: { then: back }          # suspended elsewhere, or reconciled-out-of-order | absorbed-duplicate | not-applicable: the stage continues, dispatch defers while suspended
+- backToBarrier: { set: { nextStage: fulfillment, returnStage: fulfillment, stageLoop: barrierLoop, abandonedControlClosed: false }, then: exit }
 - enterResumeWait: { set: { heldStage: '${ $context.returnStage }', heldLoop: '${ $context.stageLoop }', stageLoop: awaitResume } }   # resumePollRound as applyHold left it: the poll family is per suspension, reset only for a new suspensionRef, so a suspension already polled in another wait is not polled again from round 0 (D-130, D-133)
 - awaitResume:
     fork:
