@@ -2,7 +2,9 @@
 //! stub policy services.
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use serde_json::{Value, json};
 use toolkit_odata::ODataQuery;
@@ -14,17 +16,20 @@ use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin};
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::profile::Category;
+use crate::domain::profile_writes::ProfileWrites;
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
     Corrections, NotStored, Resolution, ReviewOutcome, ReviewQueueEvent, ReviewQueueService,
-    ReviewRequest, ReviewState,
+    ReviewRequest, ReviewStatus, ReviewText,
 };
-use crate::domain::sensitive_data::SensitiveDataChecks;
-use crate::domain::subject_settings::SubjectSettings;
+use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
+use crate::domain::subject_control::{SubjectFacts, SubjectProfiles};
+use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
+use crate::infra::processing_contexts::ServiceIdentity;
 use crate::test_support::{
     AllowInOwnTenant, AllowResolver, DenyResolver, FixedRules, FixedSubjectSettings, MemoryProfile,
-    MemoryReviews, MemoryWriter, RecordingAdmissionEvents, RecordingEvents, RecordingResolver,
-    RecordingReviewEvents, context_of, open_rules, stored_fact, subject_control_reviewed,
+    MemoryReviews, MemoryWriter, OwnerOnlyResolver, RecordingAdmissionEvents, RecordingEvents,
+    RecordingResolver, RecordingReviewEvents, SubstringCheck, context_of, open_rules, stored_fact,
 };
 
 const ON: SubjectSettings = SubjectSettings {
@@ -62,29 +67,28 @@ impl Fixture {
         }
     }
 
-    /// The service with the policy service `resolver`, and corrections whose
-    /// Admission reads the subject's settings as `settings`; none when
-    /// `settings` is none.
-    fn service_with(
+    /// The service with the policy service `resolver`, the profile read
+    /// through `profiles`, and corrections whose Admission reads the
+    /// subject's settings as `settings` and whose checks are `checks`; none
+    /// when `settings` is none.
+    fn service_over(
         &self,
         resolver: Arc<dyn AuthZResolverApi>,
+        profiles: Arc<dyn SubjectProfiles>,
         settings: Option<SubjectSettings>,
+        checks: Vec<Arc<dyn SensitiveDataCheck>>,
     ) -> ReviewQueueService {
-        let control = subject_control_reviewed(
-            Arc::clone(&resolver),
-            Arc::clone(&self.profile),
-            Arc::clone(&self.writer),
-            Arc::new(FixedSubjectSettings(Ok(ON))),
-            Arc::default(),
-            Some(Uuid::new_v4()),
-            Arc::clone(&self.reviews),
-            Arc::clone(&self.events),
+        let writes = ProfileWrites::new(
+            profiles,
+            Arc::clone(&self.writer) as _,
+            Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+            2,
         )
         .with_budget(std::time::Duration::from_secs(5));
         let corrections = settings.map(|settings| {
             let drops = Arc::new(RecordingEvents::default());
             Corrections {
-                checks: SensitiveDataChecks::new(Vec::new(), Arc::clone(&drops) as _),
+                checks: SensitiveDataChecks::new(checks, Arc::clone(&drops) as _),
                 admission: Admission::new(AdmissionPorts {
                     settings: Arc::new(FixedSubjectSettings(Ok(settings))),
                     rules: Arc::new(FixedRules(Ok(open_rules()))),
@@ -95,11 +99,24 @@ impl Fixture {
             }
         });
         ReviewQueueService::new(
-            Arc::new(control),
+            Arc::new(writes),
             Arc::clone(&self.reviews) as _,
             Arc::clone(&self.events) as _,
             corrections,
             PolicyEnforcer::new(resolver),
+        )
+    }
+
+    fn service_with(
+        &self,
+        resolver: Arc<dyn AuthZResolverApi>,
+        settings: Option<SubjectSettings>,
+    ) -> ReviewQueueService {
+        self.service_over(
+            resolver,
+            Arc::clone(&self.profile) as _,
+            settings,
+            Vec::new(),
         )
     }
 
@@ -131,7 +148,7 @@ impl Fixture {
                 &self.owner(),
                 self.subject,
                 &self.skill(),
-                Some("wrong".to_owned()),
+                Some(ReviewText::new("wrong").unwrap()),
             )
             .await
             .unwrap()
@@ -144,6 +161,26 @@ impl Fixture {
             reason: None,
         }
     }
+
+    fn reject() -> Resolution {
+        Resolution::Rejected {
+            reason: ReviewText::new("it is right").unwrap(),
+        }
+    }
+
+    /// The only request's status.
+    fn status(&self) -> ReviewStatus {
+        let [request] = self.reviews.all().try_into().unwrap();
+        request.status
+    }
+}
+
+/// The closed status's outcome, or a panic for an open one.
+fn outcome_of(request: &ReviewRequest) -> &ReviewOutcome {
+    match &request.status {
+        ReviewStatus::Closed(closed) => &closed.outcome,
+        ReviewStatus::Open { .. } => panic!("still open: {request:?}"),
+    }
 }
 
 #[tokio::test]
@@ -154,10 +191,17 @@ async fn a_flag_opens_a_request_with_the_flagged_value_and_records_it() {
     let request = fixture.flagged().await;
 
     assert_eq!(request.fact_id, skill);
-    assert_eq!(request.state, ReviewState::Open);
     assert_eq!(request.property, "skills");
-    assert_eq!(request.value, Some(json!({ "name": "Rust" })));
-    assert_eq!(request.comment.as_deref(), Some("wrong"));
+    assert_eq!(
+        request.status,
+        ReviewStatus::Open {
+            value: json!({ "name": "Rust" })
+        }
+    );
+    assert_eq!(
+        request.comment.as_ref().map(ReviewText::as_str),
+        Some("wrong")
+    );
     assert_eq!(fixture.reviews.all(), std::slice::from_ref(&request));
     assert_eq!(
         fixture.events.taken(),
@@ -223,6 +267,49 @@ async fn only_the_subject_flags_and_only_its_live_facts() {
         "{refused:?}"
     );
     assert!(fixture.reviews.all().is_empty());
+}
+
+/// Serves the fixture's facts on the first read and none after: the fact
+/// is removed while the flag is stored.
+struct Vanishing {
+    profile: Arc<MemoryProfile>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl SubjectProfiles for Vanishing {
+    async fn facts(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<SubjectFacts, DomainError> {
+        let mut facts = self.profile.facts(ctx, key).await?;
+        if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+            facts.facts.clear();
+        }
+        Ok(facts)
+    }
+}
+
+#[tokio::test]
+async fn a_flag_on_a_fact_removed_meanwhile_closes_its_request_and_is_no_such_fact() {
+    let fixture = Fixture::new(0);
+    let vanishing = Arc::new(Vanishing {
+        profile: Arc::clone(&fixture.profile),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = fixture.service_over(Arc::new(AllowResolver), vanishing, Some(ON), Vec::new());
+
+    let flagged = service
+        .flag(&fixture.owner(), fixture.subject, &fixture.skill(), None)
+        .await;
+
+    assert!(
+        matches!(flagged, Err(DomainError::NoSuchFact(_))),
+        "{flagged:?}"
+    );
+    let [request] = fixture.reviews.all().try_into().unwrap();
+    assert_eq!(outcome_of(&request), &ReviewOutcome::Deleted);
 }
 
 #[tokio::test]
@@ -293,17 +380,9 @@ async fn a_caller_without_the_permission_or_with_a_narrower_scope_is_no_reviewer
         .service_with(Arc::new(DenyResolver), Some(ON))
         .open_requests(&fixture.reviewer(), &ODataQuery::new())
         .await;
-    // AllowResolver adds the resource id when one is named; the reviewers'
-    // check names none, so a scope with another property is narrower.
     let narrower = fixture
-        .service_with(Arc::new(crate::test_support::OwnerOnlyResolver), Some(ON))
-        .resolve(
-            &fixture.reviewer(),
-            request.id,
-            Resolution::Rejected {
-                reason: "fine".to_owned(),
-            },
-        )
+        .service_with(Arc::new(OwnerOnlyResolver), Some(ON))
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
         .await;
 
     assert!(
@@ -314,7 +393,22 @@ async fn a_caller_without_the_permission_or_with_a_narrower_scope_is_no_reviewer
         matches!(narrower, Err(DomainError::Forbidden(_))),
         "{narrower:?}"
     );
-    assert_eq!(fixture.reviews.all()[0].state, ReviewState::Open);
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
+}
+
+#[tokio::test]
+async fn a_reviewer_may_not_resolve_a_request_on_its_own_fact() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+
+    let own = fixture
+        .service()
+        .resolve(&fixture.owner(), request.id, Fixture::corrected("Go"))
+        .await;
+
+    assert!(matches!(own, Err(DomainError::Forbidden(_))), "{own:?}");
+    assert!(fixture.writer.plans().is_empty(), "nothing is written");
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
 }
 
 #[tokio::test]
@@ -324,21 +418,19 @@ async fn a_rejection_closes_the_request_with_its_reason_and_keeps_the_fact() {
 
     let closed = fixture
         .service_with(Arc::new(AllowInOwnTenant), None)
-        .resolve(
-            &fixture.reviewer(),
-            request.id,
-            Resolution::Rejected {
-                reason: "it is right".to_owned(),
-            },
-        )
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
         .await
         .unwrap();
 
-    assert_eq!(closed.state, ReviewState::Closed);
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Rejected));
-    assert_eq!(closed.reason.as_deref(), Some("it is right"));
-    assert_eq!(closed.resolved_by, Some(fixture.reviewer));
-    assert_eq!(closed.value, None, "the flagged value is not kept");
+    let ReviewStatus::Closed(resolution) = &closed.status else {
+        panic!("closed: {closed:?}");
+    };
+    assert_eq!(resolution.outcome, ReviewOutcome::Rejected);
+    assert_eq!(
+        resolution.reason.as_ref().map(ReviewText::as_str),
+        Some("it is right")
+    );
+    assert_eq!(resolution.by, fixture.reviewer);
     assert!(
         fixture
             .profile
@@ -347,14 +439,18 @@ async fn a_rejection_closes_the_request_with_its_reason_and_keeps_the_fact() {
             .any(|f| f.node_key == request.fact_id)
     );
     assert!(fixture.writer.plans().is_empty(), "nothing is written");
-    assert!(matches!(
+    assert_eq!(
         fixture.events.taken().last(),
-        Some(ReviewQueueEvent::Resolved {
+        Some(&ReviewQueueEvent::Resolved {
+            tenant_id: fixture.tenant,
+            subject_id: fixture.subject,
+            request_id: request.id,
+            fact_id: request.fact_id,
             outcome: ReviewOutcome::Rejected,
-            by,
-            ..
-        }) if *by == fixture.reviewer
-    ));
+            by: fixture.reviewer,
+        })
+    );
+    assert_eq!(fixture.reviews.claims(), [None], "no claim is left");
 }
 
 #[tokio::test]
@@ -372,7 +468,7 @@ async fn a_delete_removes_the_fact_as_the_reviewer_and_closes_the_request() {
         .await
         .unwrap();
 
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Deleted));
+    assert_eq!(outcome_of(&closed), &ReviewOutcome::Deleted);
     assert!(
         fixture
             .profile
@@ -410,7 +506,7 @@ async fn a_delete_of_a_fact_already_gone_closes_the_request_as_deleted() {
         .await
         .unwrap();
 
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Deleted));
+    assert_eq!(outcome_of(&closed), &ReviewOutcome::Deleted);
     assert!(fixture.writer.plans().is_empty());
 }
 
@@ -425,8 +521,9 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
         .await
         .unwrap();
 
-    let new_key = closed.corrected_fact_id.clone().expect("the new fact's id");
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Corrected));
+    let ReviewOutcome::Corrected(new_key) = outcome_of(&closed).clone() else {
+        panic!("corrected: {closed:?}");
+    };
     assert_ne!(
         new_key, request.fact_id,
         "a replace gives the fact a new id"
@@ -454,15 +551,43 @@ async fn a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer() {
     assert!(matches!(
         fixture.events.taken().last(),
         Some(ReviewQueueEvent::Resolved {
-            outcome: ReviewOutcome::Corrected,
-            corrected_fact_id: Some(key),
+            outcome: ReviewOutcome::Corrected(key),
             ..
         }) if *key == new_key
     ));
 }
 
 #[tokio::test]
-async fn a_correction_admission_drops_stores_nothing_and_leaves_the_request_open() {
+async fn a_correction_rerun_after_a_conflict_keeps_the_key_it_stored() {
+    let fixture = Fixture::new(1);
+    let request = fixture.flagged().await;
+
+    let closed = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await
+        .unwrap();
+
+    let ReviewOutcome::Corrected(new_key) = outcome_of(&closed).clone() else {
+        panic!("corrected: {closed:?}");
+    };
+    let plans = fixture.writer.plans();
+    assert_eq!(plans.len(), 2, "written again after the conflict");
+    assert!(matches!(
+        &plans[1].steps[0].change,
+        Change::ReplaceEntity { key, .. } if *key == new_key
+    ));
+    assert!(
+        fixture
+            .profile
+            .live()
+            .iter()
+            .any(|fact| fact.node_key == new_key)
+    );
+}
+
+#[tokio::test]
+async fn a_correction_admission_drops_stores_nothing_and_gives_the_request_back() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
     let off = SubjectSettings {
@@ -485,7 +610,39 @@ async fn a_correction_admission_drops_stores_nothing_and_leaves_the_request_open
         "{refused:?}"
     );
     assert!(fixture.writer.plans().is_empty());
-    assert_eq!(fixture.reviews.all()[0].state, ReviewState::Open);
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
+    assert_eq!(fixture.reviews.claims(), [None], "the claim is given back");
+}
+
+#[tokio::test]
+async fn a_correction_whose_value_is_blocked_stores_nothing_and_stays_open() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    let blocking: Arc<dyn SensitiveDataCheck> = Arc::new(SubstringCheck {
+        kind: SensitiveDataKind::Credentials,
+        needle: "secret",
+    });
+
+    let refused = fixture
+        .service_over(
+            Arc::new(AllowResolver),
+            Arc::clone(&fixture.profile) as _,
+            Some(ON),
+            vec![blocking],
+        )
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Fixture::corrected("a secret"),
+        )
+        .await;
+
+    assert!(
+        matches!(refused, Err(DomainError::NotStored(NotStored::Blocked))),
+        "{refused:?}"
+    );
+    assert!(fixture.writer.plans().is_empty());
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
 }
 
 #[tokio::test]
@@ -500,8 +657,7 @@ async fn a_correction_of_a_fact_already_gone_closes_the_request_as_deleted() {
         .await
         .unwrap();
 
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Deleted));
-    assert_eq!(closed.corrected_fact_id, None);
+    assert_eq!(outcome_of(&closed), &ReviewOutcome::Deleted);
     assert!(fixture.writer.plans().is_empty());
 }
 
@@ -535,7 +691,7 @@ async fn a_correction_takes_only_the_facts_property_with_a_value_its_schema_take
         "{bad_value:?}"
     );
     assert!(fixture.writer.plans().is_empty());
-    assert_eq!(fixture.reviews.all()[0].state, ReviewState::Open);
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
 }
 
 #[tokio::test]
@@ -548,20 +704,63 @@ async fn without_the_opt_in_a_correction_is_not_configured_and_the_rest_works() 
         .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
         .await;
     let rejected = service
-        .resolve(
-            &fixture.reviewer(),
-            request.id,
-            Resolution::Rejected {
-                reason: "fine".to_owned(),
-            },
-        )
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
         .await;
 
     assert!(
         matches!(corrected, Err(DomainError::NotConfigured(_))),
         "{corrected:?}"
     );
-    assert_eq!(rejected.unwrap().outcome, Some(ReviewOutcome::Rejected));
+    assert_eq!(outcome_of(&rejected.unwrap()), &ReviewOutcome::Rejected);
+}
+
+#[tokio::test]
+async fn a_request_another_reviewer_is_resolving_is_a_conflict() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.requests.lock().unwrap()[0].1 = Some(Uuid::new_v4());
+
+    let second = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await;
+
+    assert!(
+        matches!(second, Err(DomainError::ReviewConflict(_))),
+        "{second:?}"
+    );
+    assert!(fixture.writer.plans().is_empty(), "nothing is written");
+}
+
+#[tokio::test]
+async fn a_request_closed_while_its_correction_was_written_is_a_conflict() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture
+        .reviews
+        .deleted_while_claimed
+        .store(true, Ordering::SeqCst);
+
+    let lost = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await;
+
+    assert!(
+        matches!(lost, Err(DomainError::ReviewConflict(_))),
+        "{lost:?}"
+    );
+    assert_eq!(
+        fixture.writer.plans().len(),
+        1,
+        "the correction was written"
+    );
+    let [closed] = fixture.reviews.all().try_into().unwrap();
+    assert_eq!(
+        outcome_of(&closed),
+        &ReviewOutcome::Deleted,
+        "as the subject closed it"
+    );
 }
 
 #[tokio::test]
@@ -569,25 +768,22 @@ async fn a_closed_or_unknown_request_cannot_be_resolved() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
     let service = fixture.service();
-    let reject = || Resolution::Rejected {
-        reason: "fine".to_owned(),
-    };
     service
-        .resolve(&fixture.reviewer(), request.id, reject())
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
         .await
         .unwrap();
 
     let again = service
-        .resolve(&fixture.reviewer(), request.id, reject())
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
         .await;
     let unknown = service
-        .resolve(&fixture.reviewer(), Uuid::new_v4(), reject())
+        .resolve(&fixture.reviewer(), Uuid::new_v4(), Fixture::reject())
         .await;
     let elsewhere = service
         .resolve(
             &context_of(fixture.reviewer, Uuid::new_v4()),
             request.id,
-            reject(),
+            Fixture::reject(),
         )
         .await;
 

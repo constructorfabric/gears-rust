@@ -16,7 +16,7 @@ use crate::domain::profile::Profile;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, ReceivedRecord,
 };
-use crate::domain::review_queue::ReviewRequests;
+use crate::domain::review_queue::FactsUnderReview;
 use crate::domain::sensitive_data::{Checked, SensitiveDataChecks};
 use crate::domain::subject_settings::SubjectKey;
 
@@ -85,7 +85,7 @@ pub struct ProcessingPorts {
     pub profiles: Arc<dyn ProfileSource>,
     pub writer: Arc<dyn PlanWriter>,
     pub events: Arc<dyn IntakeEvents>,
-    pub reviews: Arc<dyn ReviewRequests>,
+    pub reviews: Arc<dyn FactsUnderReview>,
 }
 
 /// Takes one received record through the planner, the sensitive-data checks, Admission and the writer. A write
@@ -296,9 +296,17 @@ impl Processing {
         if plan.steps.is_empty() {
             return Ok(Run::Done);
         }
-        self.skip_under_review(&mut plan)
+        self.skip_under_review(scope, &mut plan)
             .await
-            .map_err(|_| Failure::ReviewRead)?;
+            .map_err(|err| {
+                tracing::warn!(
+                    tenant_id = %record.tenant_id,
+                    %subject_id,
+                    error = %err,
+                    "processing could not read the facts under review"
+                );
+                Failure::ReviewRead
+            })?;
         if plan.steps.is_empty() {
             return Ok(Run::Done);
         }
@@ -381,7 +389,7 @@ impl Processing {
             Err(reason) => return Ok(Prepared::Nothing(NothingStored::Dropped(reason))),
         };
         if !plan.steps.is_empty() {
-            self.skip_under_review(&mut plan).await?;
+            self.skip_under_review(scope, &mut plan).await?;
         }
         if plan.steps.is_empty() {
             return Ok(Prepared::Nothing(NothingStored::NoChange));
@@ -409,16 +417,30 @@ impl Processing {
     /// open review request, or add a property to it. The planner still sees
     /// the fact, so the model does not add it again.
     ///
+    /// The open requests are read here, outside the write's compare-and-set,
+    /// and opening a request does not move the profile's version. So a flag
+    /// that lands between this read and the write does not stop the write;
+    /// the request then points at a fact that is gone, and its resolution
+    /// closes it as deleted. The window is the length of the checks,
+    /// Admission and the write.
+    ///
     /// @cpt-dod:cpt-cf-construct-dod-review-queue-frozen:p1
-    async fn skip_under_review(&self, plan: &mut Plan) -> Result<(), DomainError> {
+    async fn skip_under_review(
+        &self,
+        scope: &AccessScope,
+        plan: &mut Plan,
+    ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-skip:p1:inst-skip-drop
         let under_review = self
             .ports
             .reviews
-            .under_review(SubjectKey {
-                tenant_id: plan.tenant_id,
-                subject_id: plan.subject_id,
-            })
+            .under_review(
+                scope,
+                SubjectKey {
+                    tenant_id: plan.tenant_id,
+                    subject_id: plan.subject_id,
+                },
+            )
             .await?;
         if under_review.is_empty() {
             return Ok(());

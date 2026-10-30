@@ -19,7 +19,7 @@ use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
 use super::profile::Category;
-use super::review_queue::ReviewRequests;
+use super::review_queue::FactsUnderReview;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
 
 /// The policy property that names a profile category.
@@ -155,7 +155,7 @@ pub struct ProfileReadPorts {
     pub profiles: Arc<dyn StoredProfiles>,
     pub contexts: Arc<dyn ProcessingContexts>,
     pub events: Arc<dyn ProfileEvents>,
-    pub reviews: Arc<dyn ReviewRequests>,
+    pub reviews: Arc<dyn FactsUnderReview>,
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-read:p1
@@ -458,7 +458,7 @@ impl ProfileReadService {
         // The facts are Construct's own, so graph storage is read as
         // Construct, not as the caller. Without an identity the read is not
         // configured, whatever it would serve.
-        let (construct, _) = self.ports.contexts.for_tenant(key.tenant_id).await?;
+        let (construct, construct_scope) = self.ports.contexts.for_tenant(key.tenant_id).await?;
         let settings = self
             .ports
             .settings
@@ -484,7 +484,8 @@ impl ProfileReadService {
         let categories = if readable.is_empty() {
             Vec::new()
         } else {
-            self.facts(&construct, key, &readable).await?
+            self.facts(&construct, &construct_scope, key, &readable)
+                .await?
         };
 
         // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-event
@@ -564,6 +565,7 @@ impl ProfileReadService {
     async fn facts(
         &self,
         construct: &SecurityContext,
+        construct_scope: &AccessScope,
         key: SubjectKey,
         readable: &HashSet<Category>,
     ) -> Result<Vec<CategoryFacts>, DomainError> {
@@ -576,7 +578,11 @@ impl ProfileReadService {
             .map_err(read_failure)?;
         // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
         // @cpt-begin:cpt-cf-construct-algo-review-queue-hide:p1:inst-hide-filter
-        let under_review = self.ports.reviews.under_review(key).await?;
+        let under_review = self
+            .ports
+            .reviews
+            .under_review(construct_scope, key)
+            .await?;
         let stored = stored
             .into_iter()
             .filter(|fact| !under_review.contains(&fact.node_key));

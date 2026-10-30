@@ -253,6 +253,22 @@ pub fn bad_resolution(mistake: &crate::api::rest::dto::BodyMistake) -> Canonical
         .create()
 }
 
+/// A correction the checks or Admission refused, logged here, once. On the
+/// REST route (`rest`) it is `422`.
+fn not_stored(reason: crate::domain::review_queue::NotStored, rest: bool) -> CanonicalError {
+    tracing::info!(reason = reason.name(), "construct correction not stored");
+    let error = ReviewRequestError::failed_precondition().with_precondition_violation(
+        "properties",
+        "the correction was not stored; the review request stays open",
+        reason.name(),
+    );
+    if rest {
+        error.with_override(Http::status_code(422)).create()
+    } else {
+        error.create()
+    }
+}
+
 /// The REST answer for a domain error on the reviewers' routes. A reviewer is
 /// told a refusal as such, 403: the routes are about the whole tenant, not one
 /// subject.
@@ -271,6 +287,8 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
             tracing::error!(msg = %msg, "construct is not configured for this call");
             ReviewRequestError::unimplemented("this deployment does not provide this call").create()
         }
+        // A refused correction is 422, a status only the REST route carries.
+        DomainError::NotStored(reason) => not_stored(reason, true),
         e @ (DomainError::Refused(_)
         | DomainError::OutOfScope(_)
         | DomainError::Unavailable(_)
@@ -279,7 +297,6 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue(_)
-        | DomainError::NotStored(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
@@ -361,17 +378,7 @@ impl From<DomainError> for CanonicalError {
                 .create(),
             // The correction is refused by the checks or Admission; the
             // request stays open, and the reason says why.
-            DomainError::NotStored(reason) => {
-                tracing::info!(reason = reason.name(), "construct correction not stored");
-                ReviewRequestError::failed_precondition()
-                    .with_precondition_violation(
-                        "properties",
-                        "the correction was not stored; the review request stays open",
-                        reason.name(),
-                    )
-                    .with_override(Http::status_code(422))
-                    .create()
-            }
+            DomainError::NotStored(reason) => not_stored(reason, false),
             // The caller's query does not fit the list; the field violation
             // says which part, so a client can tell them apart.
             DomainError::InvalidQuery(err) => {

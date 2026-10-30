@@ -7,7 +7,7 @@ use crate::domain::profile::Category;
 use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::review_queue::{
-    MAX_TEXT_CHARS, Resolution, ReviewOutcome, ReviewRequest, ReviewState,
+    Resolution, ReviewOutcome, ReviewRequest, ReviewStatus, ReviewText,
 };
 use crate::domain::subject_control::{SubjectExport, SubjectFact, SubjectFactsPage};
 use crate::domain::subject_settings::SubjectSettings;
@@ -361,11 +361,11 @@ pub enum ReviewStateDto {
     Closed,
 }
 
-impl From<ReviewState> for ReviewStateDto {
-    fn from(state: ReviewState) -> Self {
-        match state {
-            ReviewState::Open => Self::Open,
-            ReviewState::Closed => Self::Closed,
+impl From<&ReviewStatus> for ReviewStateDto {
+    fn from(status: &ReviewStatus) -> Self {
+        match status {
+            ReviewStatus::Open { .. } => Self::Open,
+            ReviewStatus::Closed(_) => Self::Closed,
         }
     }
 }
@@ -379,10 +379,10 @@ pub enum ReviewOutcomeDto {
     Rejected,
 }
 
-impl From<ReviewOutcome> for ReviewOutcomeDto {
-    fn from(outcome: ReviewOutcome) -> Self {
+impl From<&ReviewOutcome> for ReviewOutcomeDto {
+    fn from(outcome: &ReviewOutcome) -> Self {
         match outcome {
-            ReviewOutcome::Corrected => Self::Corrected,
+            ReviewOutcome::Corrected(_) => Self::Corrected,
             ReviewOutcome::Deleted => Self::Deleted,
             ReviewOutcome::Rejected => Self::Rejected,
         }
@@ -407,8 +407,11 @@ impl From<ReviewRequest> for FactReviewDto {
     fn from(request: ReviewRequest) -> Self {
         Self {
             id: request.id,
-            state: request.state.into(),
-            outcome: request.outcome.map(Into::into),
+            state: (&request.status).into(),
+            outcome: match &request.status {
+                ReviewStatus::Open { .. } => None,
+                ReviewStatus::Closed(closed) => Some((&closed.outcome).into()),
+            },
             created_at: request.created_at,
         }
     }
@@ -452,20 +455,34 @@ pub struct ReviewRequestDto {
 
 impl From<ReviewRequest> for ReviewRequestDto {
     fn from(request: ReviewRequest) -> Self {
+        let state = (&request.status).into();
+        let (value, closed) = match request.status {
+            ReviewStatus::Open { value } => (Some(value), None),
+            ReviewStatus::Closed(closed) => (None, Some(closed)),
+        };
+        let outcome = closed.as_ref().map(|closed| (&closed.outcome).into());
+        let resolved_at = closed.as_ref().map(|closed| closed.at);
+        let corrected_fact_id = closed
+            .as_ref()
+            .and_then(|closed| closed.outcome.corrected_fact_id())
+            .map(|key| key.0.clone());
+        let reason = closed
+            .and_then(|closed| closed.reason)
+            .map(ReviewText::into_string);
         Self {
             id: request.id,
             subject_id: request.subject_id,
             fact_id: request.fact_id.0,
             entity_kind: request.category.into(),
             property: request.property,
-            value: request.value,
-            comment: request.comment,
-            state: request.state.into(),
-            outcome: request.outcome.map(Into::into),
-            reason: request.reason,
+            value,
+            comment: request.comment.map(ReviewText::into_string),
+            state,
+            outcome,
+            reason,
             created_at: request.created_at,
-            resolved_at: request.resolved_at,
-            corrected_fact_id: request.corrected_fact_id.map(|key| key.0),
+            resolved_at,
+            corrected_fact_id,
         }
     }
 }
@@ -529,13 +546,10 @@ impl TryFrom<ResolutionRequest> for Resolution {
 
     fn try_from(body: ResolutionRequest) -> Result<Self, BodyMistake> {
         let mistake = |field, rule| Err(BodyMistake { field, rule });
-        let reason = body.reason.filter(|reason| !reason.trim().is_empty());
-        if reason
-            .as_ref()
-            .is_some_and(|reason| reason.chars().count() > MAX_TEXT_CHARS)
-        {
-            return mistake("reason", "at most 1000 characters");
-        }
+        let reason = match ReviewText::optional(body.reason) {
+            Ok(reason) => reason,
+            Err(rule) => return mistake("reason", rule.description()),
+        };
         match (body.outcome, body.properties) {
             (ReviewOutcomeDto::Rejected, None) => match reason {
                 Some(reason) => Ok(Self::Rejected { reason }),

@@ -25,6 +25,7 @@ use crate::domain::planner::processing::{
     PlanWriter, Processing, ProcessingContexts, ProcessingPorts,
 };
 use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadService};
+use crate::domain::profile_writes::ProfileWrites;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
 };
@@ -227,7 +228,7 @@ pub fn assemble(
             profiles: Arc::clone(&reader) as _,
             contexts: Arc::clone(&contexts),
             events: Arc::new(LogProfileEvents),
-            reviews: Arc::clone(&reviews),
+            reviews: Arc::clone(&reviews) as _,
         },
         policy_enforcer.clone(),
         // Without an identity the read answers not configured before it
@@ -248,18 +249,21 @@ pub fn assemble(
         version: Arc::new(PayloadCounter),
         removal: Arc::new(SoftDelete::new(graph)),
     }));
+    let profile_writes = Arc::new(ProfileWrites::new(
+        Arc::clone(&reader) as _,
+        Arc::clone(&writer),
+        Arc::clone(&contexts),
+        cfg.config().processing.max_reruns,
+    ));
     let subject_control = Arc::new(SubjectControlService::new(
         SubjectControlPorts {
-            profiles: Arc::clone(&reader) as _,
-            writer: Arc::clone(&writer),
-            contexts: Arc::clone(&contexts),
+            writes: Arc::clone(&profile_writes),
             settings: Arc::clone(&settings),
             events: Arc::new(LogSubjectControlEvents),
             reviews: Arc::clone(&reviews),
             review_events: Arc::new(LogReviewQueueEvents),
         },
         policy_enforcer.clone(),
-        cfg.config().processing.max_reruns,
     ));
     // @cpt-end:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
 
@@ -268,18 +272,21 @@ pub fn assemble(
     // may: with an identity and the opt-in to store values unchecked. A
     // rejection and a delete need neither.
     let catalog = Arc::new(PropertyCatalog::load().context("the person types' property catalog")?);
-    let corrections = (identity.is_some() && configured.unchecked.present()).then(|| Corrections {
-        checks: SensitiveDataChecks::new(Vec::new(), Arc::new(LogIntakeEvents)),
-        admission: Admission::new(AdmissionPorts {
-            settings: Arc::clone(&settings),
-            rules: Arc::new(ConfigAdmissionRules::new(&cfg.config().admission)),
-            events: Arc::new(LogAdmissionEvents),
-            drops: Arc::new(LogIntakeEvents),
-        }),
-        catalog: Arc::clone(&catalog),
+    let stores_unchecked = identity.is_some() && configured.unchecked.present();
+    if stores_unchecked {
+        warn_unchecked(cfg);
+    }
+    let corrections = stores_unchecked.then(|| {
+        let (checks, admission) =
+            value_stages(cfg, Arc::clone(&settings), Arc::new(LogIntakeEvents));
+        Corrections {
+            checks,
+            admission,
+            catalog: Arc::clone(&catalog),
+        }
     });
     let review_queue = Arc::new(ReviewQueueService::new(
-        Arc::clone(&subject_control),
+        profile_writes,
         Arc::clone(&reviews),
         Arc::new(LogReviewQueueEvents),
         corrections,
@@ -321,20 +328,7 @@ pub fn assemble(
             max_tokens: cfg.config().processing.max_tokens,
         },
     );
-    // Every value is allowed until a real check exists; the deployment opted
-    // in, and the operator is told so at start-up.
-    let checks = SensitiveDataChecks::new(Vec::new(), Arc::clone(&events) as _);
-    tracing::warn!(
-        "construct: record processing runs with no sensitive-data check; every planned value \
-         that Admission lets through is stored"
-    );
-    warn_open_lists(&cfg.config().admission);
-    let admission = Admission::new(AdmissionPorts {
-        settings,
-        rules: Arc::new(ConfigAdmissionRules::new(&cfg.config().admission)),
-        events: Arc::new(LogAdmissionEvents),
-        drops: Arc::clone(&events) as _,
-    });
+    let (checks, admission) = value_stages(cfg, settings, Arc::clone(&events) as _);
     let processing = Arc::new(Processing::new(
         planner,
         checks,
@@ -344,7 +338,7 @@ pub fn assemble(
             profiles: reader,
             writer,
             events: Arc::clone(&events),
-            reviews,
+            reviews: reviews as _,
         },
         cfg.config().processing.max_reruns,
     ));
@@ -363,6 +357,37 @@ pub fn assemble(
         review_queue,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
+}
+
+/// The stages every value Construct stores passes before the writer: the
+/// sensitive-data checks and Admission. Record processing and a reviewer's
+/// correction both take theirs from here, so a check added here guards both.
+fn value_stages(
+    cfg: &ValidConfig,
+    settings: Arc<dyn SubjectSettingsReader>,
+    drops: Arc<dyn IntakeEvents>,
+) -> (SensitiveDataChecks, Admission) {
+    // Every value is allowed until a real check exists; the deployment opted
+    // in, and the operator is told so at start-up.
+    let checks = SensitiveDataChecks::new(Vec::new(), Arc::clone(&drops));
+    let admission = Admission::new(AdmissionPorts {
+        settings,
+        rules: Arc::new(ConfigAdmissionRules::new(&cfg.config().admission)),
+        events: Arc::new(LogAdmissionEvents),
+        drops,
+    });
+    (checks, admission)
+}
+
+/// Tell the operator at start-up that values are stored without a
+/// sensitive-data check, by record processing where it runs and by
+/// reviewers' corrections.
+fn warn_unchecked(cfg: &ValidConfig) {
+    tracing::warn!(
+        "construct: no sensitive-data check exists; every value that Admission lets through is \
+         stored, from records and from reviewers' corrections"
+    );
+    warn_open_lists(&cfg.config().admission);
 }
 
 /// The message a panic was raised with, when it is a string.

@@ -559,3 +559,77 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         .unwrap();
     assert!(after.page.items.is_empty(), "{after:?}");
 }
+
+#[tokio::test]
+async fn a_correction_needs_the_opt_in_to_store_values_unchecked() {
+    use crate::domain::error::DomainError;
+    use crate::domain::profile::Category;
+    use crate::domain::review_queue::Resolution;
+    use crate::domain::subject_settings::SubjectKey;
+
+    let db = inmem_db().await;
+    let resolve = |unchecked: bool| {
+        let db = db.clone();
+        async move {
+            let cfg = ConstructConfig {
+                processing_identity: Some(Uuid::new_v4()),
+                processing: crate::config::ProcessingConfig {
+                    run_without_sensitive_data_checks: unchecked,
+                    ..crate::config::ProcessingConfig::default()
+                },
+                profile_category_check: Some(CategoryCheckConfig::OneCall),
+                ..ConstructConfig::default()
+            }
+            .validated()
+            .unwrap();
+            let key = SubjectKey {
+                tenant_id: Uuid::new_v4(),
+                subject_id: Uuid::new_v4(),
+            };
+            let reviews = Arc::new(crate::test_support::MemoryReviews::default());
+            let request = reviews.open_on_at(
+                key,
+                &crate::test_support::stored_fact(
+                    Category::Skill,
+                    "skills",
+                    json!({ "name": "Rust" }),
+                    10,
+                ),
+                100,
+            );
+            let pipeline = assemble(
+                &cfg,
+                None,
+                fake_graph_storage(),
+                Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+                reviews,
+                PolicyEnforcer::new(Arc::new(AllowResolver)),
+            )
+            .unwrap();
+            pipeline
+                .review_queue
+                .resolve(
+                    &crate::test_support::context_of(Uuid::new_v4(), key.tenant_id),
+                    request.id,
+                    Resolution::Corrected {
+                        property: "skills".to_owned(),
+                        value: json!({ "name": "Go" }),
+                        reason: None,
+                    },
+                )
+                .await
+        }
+    };
+
+    let without = resolve(false).await;
+    let with = resolve(true).await;
+
+    assert!(
+        matches!(without, Err(DomainError::NotConfigured(_))),
+        "{without:?}"
+    );
+    assert!(
+        with.is_ok(),
+        "with the opt-in it runs; the fact is not in graph storage, so it closes as deleted: {with:?}"
+    );
+}

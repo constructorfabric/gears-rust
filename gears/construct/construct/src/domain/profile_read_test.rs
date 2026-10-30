@@ -233,6 +233,30 @@ async fn a_fact_under_an_open_review_request_is_not_served() {
 }
 
 #[tokio::test]
+async fn a_read_whose_facts_under_review_cannot_be_read_fails_instead_of_serving_them() {
+    let db = inmem_db().await;
+    let reviews = Arc::new(MemoryReviews::default());
+    reviews
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let service = profile_service_reviewed(
+        &db,
+        Arc::new(AllowResolver),
+        Arc::new(FixedFacts::new(facts())),
+        Uuid::new_v4(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+        reviews,
+    );
+
+    let read = service
+        .read(&caller_in(Uuid::new_v4()), None, Uuid::new_v4())
+        .await;
+
+    assert!(matches!(read, Err(DomainError::Unavailable(_))), "{read:?}");
+}
+
+#[tokio::test]
 async fn a_caller_the_platform_refuses_does_not_see_the_subject_and_nothing_is_read() {
     let db = inmem_db().await;
     let events = Arc::new(RecordingProfileEvents::default());

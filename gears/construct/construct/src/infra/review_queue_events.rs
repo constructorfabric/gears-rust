@@ -36,7 +36,6 @@ impl ReviewQueueEvents for LogReviewQueueEvents {
                 fact_id,
                 outcome,
                 by,
-                corrected_fact_id,
             } => tracing::info!(
                 target: "construct::audit",
                 event = "review_resolved",
@@ -46,7 +45,7 @@ impl ReviewQueueEvents for LogReviewQueueEvents {
                 %request_id,
                 fact_id = %fact_id.0,
                 outcome = outcome.name(),
-                corrected_fact_id = corrected_fact_id.as_ref().map(|key| tracing::field::display(&key.0)),
+                corrected_fact_id = outcome.corrected_fact_id().map(|key| tracing::field::display(&key.0)),
                 "review request resolved"
             ),
         }
@@ -95,9 +94,8 @@ mod tests {
             subject_id: subject,
             request_id: Uuid::new_v4(),
             fact_id: NodeKey("construct:t:old".to_owned()),
-            outcome: ReviewOutcome::Corrected,
+            outcome: ReviewOutcome::Corrected(NodeKey("construct:t:new".to_owned())),
             by: reviewer,
-            corrected_fact_id: Some(NodeKey("construct:t:new".to_owned())),
         });
 
         assert!(logs_contain("event=\"review_resolved\""));

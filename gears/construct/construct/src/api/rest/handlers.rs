@@ -18,7 +18,7 @@ use crate::api::rest::types::{
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
-use crate::domain::review_queue::{MAX_TEXT_CHARS, Resolution};
+use crate::domain::review_queue::{MAX_TEXT_CHARS, Resolution, ReviewText};
 
 use super::dto::{
     FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery,
@@ -277,13 +277,8 @@ pub async fn flag_fact(
 ) -> ApiResult<impl IntoResponse> {
     let request = async {
         let fact_id = fact_key(subject_id, body.fact_id)?;
-        let comment = body.comment.filter(|comment| !comment.trim().is_empty());
-        if comment
-            .as_ref()
-            .is_some_and(|comment| comment.chars().count() > MAX_TEXT_CHARS)
-        {
-            return Err(too_long("comment", MAX_TEXT_CHARS));
-        }
+        let comment =
+            ReviewText::optional(body.comment).map_err(|_| too_long("comment", MAX_TEXT_CHARS))?;
         svc.flag(&ctx, subject_id, &fact_id, comment)
             .await
             .map_err(|e| for_facts(e, subject_id))

@@ -17,7 +17,8 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin};
 use crate::domain::profile::Category;
-use crate::domain::review_queue::{ReviewOutcome, ReviewQueueEvent, ReviewState};
+use crate::domain::profile_writes::{ProfileWrites, WRITE_BUDGET};
+use crate::domain::review_queue::{Closed, ReviewOutcome, ReviewQueueEvent, ReviewStatus};
 use crate::domain::subject_control::{SubjectControlEvent, SubjectControlService};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 use crate::test_support::{
@@ -40,6 +41,7 @@ struct Fixture {
     events: Arc<RecordingSubjectControlEvents>,
     reviews: Arc<MemoryReviews>,
     review_events: Arc<RecordingReviewEvents>,
+    budget: Duration,
 }
 
 impl Fixture {
@@ -60,6 +62,7 @@ impl Fixture {
             events: Arc::default(),
             reviews: Arc::default(),
             review_events: Arc::default(),
+            budget: WRITE_BUDGET,
         }
     }
 
@@ -69,13 +72,20 @@ impl Fixture {
         resolver: Arc<dyn AuthZResolverApi>,
         settings: Arc<dyn SubjectSettingsReader>,
     ) -> SubjectControlService {
+        let writes = ProfileWrites::new(
+            Arc::clone(&self.profile) as _,
+            Arc::clone(&self.writer) as _,
+            Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
+                self.identity,
+            )),
+            2,
+        )
+        .with_budget(self.budget);
         subject_control_reviewed(
             resolver,
-            Arc::clone(&self.profile),
-            Arc::clone(&self.writer),
+            Arc::new(writes),
             settings,
             Arc::clone(&self.events),
-            Some(self.identity),
             Arc::clone(&self.reviews),
             Arc::clone(&self.review_events),
         )
@@ -475,10 +485,9 @@ async fn a_delete_gives_up_as_unavailable_once_the_reruns_are_spent() {
 
 #[tokio::test]
 async fn a_delete_gives_up_as_unavailable_once_its_budget_is_spent() {
-    let fixture = Fixture::new(10);
-    let service = fixture
-        .service(Arc::new(AllowResolver))
-        .with_budget(Duration::ZERO);
+    let mut fixture = Fixture::new(10);
+    fixture.budget = Duration::ZERO;
+    let service = fixture.service(Arc::new(AllowResolver));
 
     let deleted = service
         .delete(
@@ -502,11 +511,10 @@ async fn a_delete_gives_up_as_unavailable_once_its_budget_is_spent() {
 
 #[tokio::test(start_paused = true)]
 async fn a_read_past_the_budget_is_cut_off_and_nothing_is_written() {
-    let fixture = Fixture::new(0);
+    let mut fixture = Fixture::new(0);
     *fixture.profile.delay.lock().unwrap() = Duration::from_secs(30);
-    let service = fixture
-        .service(Arc::new(AllowResolver))
-        .with_budget(Duration::from_secs(20));
+    fixture.budget = Duration::from_secs(20);
+    let service = fixture.service(Arc::new(AllowResolver));
     let started = tokio::time::Instant::now();
 
     let deleted = service
@@ -533,10 +541,9 @@ async fn a_read_past_the_budget_is_cut_off_and_nothing_is_written() {
 
 #[tokio::test(start_paused = true)]
 async fn a_policy_service_that_outlasts_the_budget_is_cut_off_and_nothing_is_read_or_written() {
-    let fixture = Fixture::new(0);
-    let service = fixture
-        .service(Arc::new(SlowResolver(Duration::from_secs(30))))
-        .with_budget(Duration::from_secs(20));
+    let mut fixture = Fixture::new(0);
+    fixture.budget = Duration::from_secs(20);
+    let service = fixture.service(Arc::new(SlowResolver(Duration::from_secs(30))));
     let started = tokio::time::Instant::now();
 
     let deleted = service
@@ -564,13 +571,12 @@ async fn a_policy_service_that_outlasts_the_budget_is_cut_off_and_nothing_is_rea
 
 #[tokio::test(start_paused = true)]
 async fn a_rerun_whose_read_outlasts_the_budget_writes_nothing_more() {
-    let fixture = Fixture::new(10);
+    let mut fixture = Fixture::new(10);
     // The first read ends at 15 s, inside the budget, so the first write
     // runs; the rerun's read would end at 30 s.
     *fixture.profile.delay.lock().unwrap() = Duration::from_secs(15);
-    let service = fixture
-        .service(Arc::new(AllowResolver))
-        .with_budget(Duration::from_secs(20));
+    fixture.budget = Duration::from_secs(20);
+    let service = fixture.service(Arc::new(AllowResolver));
     let started = tokio::time::Instant::now();
 
     let deleted = service
@@ -791,11 +797,22 @@ async fn a_profile_too_large_to_read_is_the_gears_own_failure_for_the_view_the_e
 async fn each_fact_carries_its_latest_review_request_and_the_export_holds_them_all() {
     let fixture = Fixture::new(0);
     let skill = fixture.profile.live()[0].clone();
-    fixture.reviews.open_on(fixture.key(), &skill);
+    let older = fixture.reviews.open_on_at(fixture.key(), &skill, 100);
+    fixture.reviews.requests.lock().unwrap()[0].0.status = ReviewStatus::Closed(Closed {
+        outcome: ReviewOutcome::Rejected,
+        by: Uuid::new_v4(),
+        at: time::OffsetDateTime::from_unix_timestamp(150).unwrap(),
+        reason: None,
+    });
+    let newer = fixture.reviews.open_on_at(fixture.key(), &skill, 200);
     let service = fixture.service(Arc::new(AllowResolver));
 
     let view = service
         .view(&fixture.owner(), fixture.subject, &ODataQuery::new())
+        .await
+        .unwrap();
+    let one = service
+        .fact(&fixture.owner(), fixture.subject, &skill.node_key)
         .await
         .unwrap();
     let export = service
@@ -803,18 +820,20 @@ async fn each_fact_carries_its_latest_review_request_and_the_export_holds_them_a
         .await
         .unwrap();
 
-    let requests: Vec<Option<ReviewState>> = view
+    let requests: Vec<Option<Uuid>> = view
         .page
         .items
         .iter()
-        .map(|item| item.review_request.as_ref().map(|request| request.state))
+        .map(|item| item.review_request.as_ref().map(|request| request.id))
         .collect();
     assert_eq!(
         requests,
-        [None, Some(ReviewState::Open)],
-        "the role has none; the flagged skill shows its open request"
+        [None, Some(newer.id)],
+        "the role has none; the skill shows its newer, open request"
     );
-    assert_eq!(export.review_requests, fixture.reviews.all());
+    assert_eq!(one.review_request.map(|request| request.id), Some(newer.id));
+    let exported: Vec<Uuid> = export.review_requests.iter().map(|r| r.id).collect();
+    assert_eq!(exported, [newer.id, older.id]);
 }
 
 #[tokio::test]
@@ -834,10 +853,11 @@ async fn the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted() {
         .unwrap();
 
     let [closed] = fixture.reviews.all().try_into().unwrap();
-    assert_eq!(closed.state, ReviewState::Closed);
-    assert_eq!(closed.outcome, Some(ReviewOutcome::Deleted));
-    assert_eq!(closed.resolved_by, Some(fixture.subject));
-    assert_eq!(closed.value, None, "the flagged value is not kept");
+    let ReviewStatus::Closed(resolution) = closed.status else {
+        panic!("closed");
+    };
+    assert_eq!(resolution.outcome, ReviewOutcome::Deleted);
+    assert_eq!(resolution.by, fixture.subject);
     assert!(matches!(
         fixture.review_events.taken().as_slice(),
         [ReviewQueueEvent::Resolved {
@@ -848,25 +868,49 @@ async fn the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted() {
 }
 
 #[tokio::test]
-async fn a_delete_whose_request_cannot_be_closed_still_deletes_the_fact() {
+async fn a_delete_whose_request_cannot_be_closed_is_unavailable_and_its_repeat_closes_it() {
     let fixture = Fixture::new(0);
     let skill = fixture.fact_id(Category::Skill);
+    let stored = fixture.profile.live();
+    fixture.reviews.open_on(
+        fixture.key(),
+        stored.iter().find(|fact| fact.node_key == skill).unwrap(),
+    );
     fixture
         .reviews
         .down
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let service = fixture.service(Arc::new(AllowResolver));
 
-    service
+    let first = service
         .delete(&fixture.owner(), fixture.subject, &skill)
-        .await
-        .expect("the fact is gone whatever the review store says");
+        .await;
+    fixture
+        .reviews
+        .down
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let repeat = service
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await;
+    let once_more = service
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await;
 
+    assert!(
+        matches!(first, Err(DomainError::Unavailable(_))),
+        "{first:?}"
+    );
     assert!(
         fixture
             .profile
             .live()
             .iter()
             .all(|fact| fact.node_key != skill)
+    );
+    assert!(repeat.is_ok(), "the repeat closes the request: {repeat:?}");
+    assert!(!fixture.reviews.all()[0].is_open());
+    assert!(
+        matches!(once_more, Err(DomainError::NoSuchFact(_))),
+        "{once_more:?}"
     );
 }

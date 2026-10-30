@@ -55,6 +55,8 @@ CREATE TABLE IF NOT EXISTS construct__review_requests (
     open_fact_id VARCHAR(200) NULL,
     outcome TEXT NULL,
     reason TEXT NULL,
+    claimed_by UUID NULL,
+    claimed_at TIMESTAMPTZ NULL,
     resolved_by UUID NULL,
     corrected_fact_id VARCHAR(200) NULL,
     created_at TIMESTAMPTZ NOT NULL,
@@ -80,6 +82,8 @@ CREATE TABLE IF NOT EXISTS construct__review_requests (
     open_fact_id VARCHAR(200) NULL,
     outcome VARCHAR(16) NULL,
     reason TEXT NULL,
+    claimed_by BINARY(16) NULL,
+    claimed_at TIMESTAMP(6) NULL,
     resolved_by BINARY(16) NULL,
     corrected_fact_id VARCHAR(200) NULL,
     created_at TIMESTAMP(6) NOT NULL,
@@ -105,6 +109,8 @@ CREATE TABLE IF NOT EXISTS construct__review_requests (
     open_fact_id TEXT NULL,
     outcome TEXT NULL,
     reason TEXT NULL,
+    claimed_by TEXT NULL,
+    claimed_at TEXT NULL,
     resolved_by TEXT NULL,
     corrected_fact_id TEXT NULL,
     created_at TEXT NOT NULL,
@@ -140,7 +146,12 @@ mod tests {
                 sql.contains("CREATE TABLE IF NOT EXISTS construct__review_requests ("),
                 "{backend:?}"
             );
-            assert!(sql.contains("(tenant_id, open_fact_id)"), "{backend:?}");
+            let unique = if backend == DatabaseBackend::MySql {
+                "UNIQUE KEY uq_construct__review_requests__open_fact (tenant_id, open_fact_id)"
+            } else {
+                "CONSTRAINT uq_construct__review_requests__open_fact UNIQUE (tenant_id, open_fact_id)"
+            };
+            assert!(sql.contains(unique), "{backend:?}");
             assert!(
                 sql.contains("idx_construct__review_requests__subject"),
                 "{backend:?}"

@@ -22,7 +22,7 @@ use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
     AllowResolver, DenyResolver, FixedRules, FixedSubjectSettings, MemoryProfile, MemoryReviews,
     MemoryWriter, RecordingAdmissionEvents, RecordingEvents, SECURITY_HEADERS, context_of,
-    open_rules, stored_fact, subject_control_reviewed,
+    open_rules, profile_writes, stored_fact,
 };
 
 const ON: SubjectSettings = SubjectSettings {
@@ -60,15 +60,10 @@ impl Tenant {
         caller: Uuid,
         settings: SubjectSettings,
     ) -> Router {
-        let control = subject_control_reviewed(
-            Arc::clone(&resolver),
+        let writes = profile_writes(
             Arc::clone(&self.profile),
             MemoryWriter::new(Arc::clone(&self.profile), 0),
-            Arc::new(FixedSubjectSettings(Ok(ON))),
-            Arc::default(),
             Some(Uuid::new_v4()),
-            Arc::clone(&self.reviews),
-            Arc::default(),
         );
         let drops = Arc::new(RecordingEvents::default());
         let corrections = Corrections {
@@ -82,7 +77,7 @@ impl Tenant {
             catalog: Arc::new(PropertyCatalog::load().unwrap()),
         };
         let service = ReviewQueueService::new(
-            Arc::new(control),
+            Arc::new(writes),
             Arc::clone(&self.reviews) as _,
             Arc::default() as Arc<crate::test_support::RecordingReviewEvents>,
             Some(corrections),
@@ -229,12 +224,38 @@ async fn a_comment_past_its_limit_is_400_and_nothing_is_flagged() {
     .await;
 
     assert_eq!(answer.status, StatusCode::BAD_REQUEST, "{}", answer.body);
-    assert!(
-        answer.body.to_string().contains("comment"),
-        "{}",
-        answer.body
+    assert_eq!(
+        answer.body["context"]["field_violations"][0]["field"],
+        json!("comment")
     );
     assert!(tenant.reviews.all().is_empty());
+}
+
+#[tokio::test]
+async fn a_comment_and_a_reason_of_1000_characters_are_taken() {
+    let tenant = Tenant::new();
+    let at_limit = "\u{e9}".repeat(1000);
+
+    let flagged = send(
+        tenant.owner(),
+        Method::POST,
+        &tenant.requests(),
+        Some(json!({ "fact_id": tenant.skill(), "comment": at_limit })),
+    )
+    .await;
+    let id = flagged.body["id"].as_str().unwrap().to_owned();
+    let rejected = send(
+        tenant.reviewer(),
+        Method::POST,
+        &resolution(&id),
+        Some(json!({ "outcome": "rejected", "reason": at_limit })),
+    )
+    .await;
+
+    assert_eq!(flagged.status, StatusCode::CREATED, "{}", flagged.body);
+    assert_eq!(flagged.body["comment"], json!(at_limit));
+    assert_eq!(rejected.status, StatusCode::OK, "{}", rejected.body);
+    assert_eq!(rejected.body["reason"], json!(at_limit));
 }
 
 #[tokio::test]
@@ -312,10 +333,7 @@ async fn a_correction_admission_refuses_is_422_and_the_request_stays_open() {
         "{}",
         answer.body
     );
-    assert_eq!(
-        tenant.reviews.all()[0].state,
-        crate::domain::review_queue::ReviewState::Open
-    );
+    assert!(tenant.reviews.all()[0].is_open());
 }
 
 #[tokio::test]
@@ -339,6 +357,17 @@ async fn a_body_that_does_not_fit_its_outcome_is_400_naming_the_field() {
             json!({ "outcome": "rejected", "reason": "x".repeat(1001) }),
             "reason",
         ),
+        (
+            json!({ "outcome": "corrected", "properties": {} }),
+            "properties",
+        ),
+        (
+            json!({
+                "outcome": "corrected",
+                "properties": { "skills": { "name": "Go" }, "roles": { "title": "Lead" } }
+            }),
+            "properties",
+        ),
     ] {
         let answer = send(
             tenant.reviewer(),
@@ -353,16 +382,14 @@ async fn a_body_that_does_not_fit_its_outcome_is_400_naming_the_field() {
             "{body}: {}",
             answer.body
         );
-        assert!(
-            answer.body.to_string().contains(field),
+        assert_eq!(
+            answer.body["context"]["field_violations"][0]["field"],
+            json!(field),
             "{body}: {}",
             answer.body
         );
     }
-    assert_eq!(
-        tenant.reviews.all()[0].state,
-        crate::domain::review_queue::ReviewState::Open
-    );
+    assert!(tenant.reviews.all()[0].is_open());
 }
 
 #[tokio::test]

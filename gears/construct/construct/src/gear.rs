@@ -31,7 +31,7 @@ use crate::infra::pipeline::{self, Worker};
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_types::RegistryRecordTypes;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
-use crate::infra::storage::review_requests_repo::SeaOrmReviewRequests;
+use crate::infra::storage::review_requests_repo::ReviewRequestStore;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
@@ -136,7 +136,7 @@ impl Gear for ConstructGear {
             &hub,
             graph,
             Arc::clone(&settings) as _,
-            Arc::new(SeaOrmReviewRequests::new(Arc::clone(&db))),
+            Arc::new(ReviewRequestStore::new(Arc::clone(&db))),
             policy_enforcer.clone(),
         )
         .context("record processing")?;

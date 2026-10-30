@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
@@ -23,9 +24,10 @@ use super::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use super::planner::catalog::PropertyCatalog;
 use super::planner::processing::Written;
 use super::profile::Category;
+use super::profile_writes::{Attempt, ProfileWrites, Removed};
 use super::record_intake::DropReason;
 use super::sensitive_data::{Checked, SensitiveDataChecks};
-use super::subject_control::{Attempt, Removed, SubjectControlService, actions as fact_actions};
+use super::subject_access;
 use super::subject_settings::SubjectKey;
 
 /// GTS type id of a review request: the authorization resource type of the
@@ -34,13 +36,17 @@ pub(crate) const REVIEW_REQUEST_TYPE: &str =
     toolkit_gts::gts_id!("cf.construct.review.request.v1~");
 
 /// Authorization resource type for review requests, scoped by tenant: a
-/// reviewer resolves the requests of a whole tenant.
+/// reviewer resolves the requests of a whole tenant, in every category, as
+/// the tenant administrators and data protection officers it assigns read
+/// every fact anyway.
 pub(crate) const REVIEW_REQUEST_RESOURCE: ResourceType =
     ResourceType::from_static(REVIEW_REQUEST_TYPE, &[pep_properties::OWNER_TENANT_ID]);
 
 pub(crate) mod actions {
     /// The subject flags one of its own facts; on the subject facts resource.
     pub const FLAG: &str = "flag";
+    /// The subject reads its own requests; on the subject facts resource.
+    pub use super::super::subject_control::actions::READ;
     /// A reviewer lists and resolves the tenant's review requests.
     pub const RESOLVE: &str = "resolve";
 }
@@ -49,38 +55,90 @@ pub(crate) mod actions {
 /// reviewer gives with a resolution, in characters.
 pub const MAX_TEXT_CHARS: usize = 1000;
 
-/// Whether a request still waits for a reviewer.
+/// How long a reviewer holds a request it is resolving. Longer than one
+/// write may take, so a resolution under way is never taken from its
+/// reviewer; a claim left behind by a reviewer that went away frees itself.
+pub const CLAIM_HOLD: Duration = Duration::from_secs(60);
+
+/// Why a text is not a [`ReviewText`].
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReviewState {
-    Open,
-    Closed,
+pub enum TextRule {
+    Blank,
+    TooLong,
 }
 
-impl ReviewState {
-    /// The state's name on the wire and in the table.
+impl TextRule {
+    /// The rule as an answer states it.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn description(self) -> &'static str {
         match self {
-            Self::Open => "open",
-            Self::Closed => "closed",
+            Self::Blank => "must not be blank",
+            Self::TooLong => "at most 1000 characters",
+        }
+    }
+}
+
+/// A subject's comment or a reviewer's reason: trimmed, not blank, and at
+/// most [`MAX_TEXT_CHARS`] characters.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewText(String);
+
+impl ReviewText {
+    /// # Errors
+    ///
+    /// [`TextRule`] for a blank text or one past the limit.
+    pub fn new(text: impl Into<String>) -> Result<Self, TextRule> {
+        let text = text.into();
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err(TextRule::Blank);
+        }
+        if trimmed.chars().count() > MAX_TEXT_CHARS {
+            return Err(TextRule::TooLong);
+        }
+        Ok(Self(trimmed.to_owned()))
+    }
+
+    /// An optional text, where a blank one is none.
+    ///
+    /// # Errors
+    ///
+    /// [`TextRule::TooLong`] for a text past the limit.
+    pub fn optional(text: Option<String>) -> Result<Option<Self>, TextRule> {
+        match text.map(Self::new) {
+            None | Some(Err(TextRule::Blank)) => Ok(None),
+            Some(Ok(text)) => Ok(Some(text)),
+            Some(Err(rule)) => Err(rule),
         }
     }
 
     #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Open, Self::Closed]
-            .into_iter()
-            .find(|state| state.name() == name)
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// One review request of a tenant.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestKey {
+    pub tenant_id: Uuid,
+    pub id: Uuid,
 }
 
 /// How a request was closed.
 #[domain_model]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewOutcome {
-    /// A reviewer stored a new value in place of the fact.
-    Corrected,
+    /// A reviewer stored a new value in place of the fact, under this id.
+    Corrected(NodeKey),
     /// The fact was deleted: by a reviewer, by the subject, or before a
     /// correction could be stored.
     Deleted,
@@ -91,24 +149,62 @@ pub enum ReviewOutcome {
 impl ReviewOutcome {
     /// The outcome's name on the wire, in the table and in events.
     #[must_use]
-    pub const fn name(self) -> &'static str {
+    pub const fn name(&self) -> &'static str {
         match self {
-            Self::Corrected => "corrected",
+            Self::Corrected(_) => "corrected",
             Self::Deleted => "deleted",
             Self::Rejected => "rejected",
         }
     }
 
+    /// The id of the fact a correction stored.
     #[must_use]
-    pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Corrected, Self::Deleted, Self::Rejected]
-            .into_iter()
-            .find(|outcome| outcome.name() == name)
+    pub fn corrected_fact_id(&self) -> Option<&NodeKey> {
+        match self {
+            Self::Corrected(key) => Some(key),
+            Self::Deleted | Self::Rejected => None,
+        }
     }
 }
 
-/// One review request, open or closed. `value` is the flagged value, kept
-/// only while the request is open.
+/// A closed request's resolution: how, by whom, when and why.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Closed {
+    pub outcome: ReviewOutcome,
+    /// The reviewer, or the subject that deleted the fact.
+    pub by: Uuid,
+    pub at: OffsetDateTime,
+    pub reason: Option<ReviewText>,
+}
+
+/// Whether a request still waits for a reviewer.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReviewStatus {
+    /// The fact is under review; `value` is the flagged value.
+    Open { value: Value },
+    /// The flagged value is not kept.
+    Closed(Closed),
+}
+
+impl ReviewStatus {
+    /// The state's name on the wire and in the table.
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Open { .. } => "open",
+            Self::Closed(_) => "closed",
+        }
+    }
+}
+
+/// The table's name of an open request's state.
+pub const OPEN: &str = "open";
+/// The table's name of a closed request's state.
+pub const CLOSED: &str = "closed";
+
+/// One review request, open or closed.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReviewRequest {
@@ -118,17 +214,32 @@ pub struct ReviewRequest {
     pub fact_id: NodeKey,
     pub category: Category,
     pub property: String,
-    pub value: Option<Value>,
-    pub comment: Option<String>,
-    pub state: ReviewState,
-    pub outcome: Option<ReviewOutcome>,
-    pub reason: Option<String>,
-    /// Who closed it: the reviewer, or the subject that deleted the fact.
-    pub resolved_by: Option<Uuid>,
-    /// The id of the fact a correction stored.
-    pub corrected_fact_id: Option<NodeKey>,
+    pub comment: Option<ReviewText>,
     pub created_at: OffsetDateTime,
-    pub resolved_at: Option<OffsetDateTime>,
+    pub status: ReviewStatus,
+}
+
+impl ReviewRequest {
+    #[must_use]
+    pub fn key(&self) -> RequestKey {
+        RequestKey {
+            tenant_id: self.tenant_id,
+            id: self.id,
+        }
+    }
+
+    #[must_use]
+    pub fn subject(&self) -> SubjectKey {
+        SubjectKey {
+            tenant_id: self.tenant_id,
+            subject_id: self.subject_id,
+        }
+    }
+
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        matches!(self.status, ReviewStatus::Open { .. })
+    }
 }
 
 /// A request to open: the fact as the subject flagged it.
@@ -141,19 +252,8 @@ pub struct NewReviewRequest {
     pub category: Category,
     pub property: String,
     pub value: Value,
-    pub comment: Option<String>,
+    pub comment: Option<ReviewText>,
     pub created_at: OffsetDateTime,
-}
-
-/// What a close sets on an open request.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Closing {
-    pub outcome: ReviewOutcome,
-    pub by: Uuid,
-    pub reason: Option<String>,
-    pub corrected_fact_id: Option<NodeKey>,
-    pub at: OffsetDateTime,
 }
 
 /// What opening a request did.
@@ -206,55 +306,100 @@ pub struct OpenReviewQuery {
 
 pub use OpenReviewQueryFilterField as OpenReviewField;
 
-/// Construct's review requests. The calls about one subject run as Construct
-/// in the subject's tenant, after the caller was authorized; the reviewers'
-/// calls run under the reviewer's scope.
+/// The facts under review: what the profile read hides and processing
+/// leaves alone. A planner can ask it too, to leave such facts out of the
+/// model's choices.
 #[async_trait]
-pub trait ReviewRequests: Send + Sync {
-    /// Store a new open request, unless the fact has one.
-    async fn open(&self, request: NewReviewRequest) -> Result<Opened, DomainError>;
+pub trait FactsUnderReview: Send + Sync {
+    /// The subject's facts that have an open request, under `scope`.
+    async fn under_review(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+    ) -> Result<BTreeSet<NodeKey>, DomainError>;
+}
 
-    /// The request `id` of `tenant_id`, under `scope`.
+/// Construct's review requests. Every call runs under the caller's scope:
+/// the platform's for the subject's and the reviewers' calls, Construct's own
+/// for processing's.
+#[async_trait]
+pub trait ReviewRequests: FactsUnderReview {
+    /// Store a new open request, unless the fact has one.
+    async fn open(
+        &self,
+        scope: &AccessScope,
+        request: NewReviewRequest,
+    ) -> Result<Opened, DomainError>;
+
     async fn find(
         &self,
         scope: &AccessScope,
-        tenant_id: Uuid,
-        id: Uuid,
+        key: RequestKey,
     ) -> Result<Option<ReviewRequest>, DomainError>;
 
-    /// Close the request `id` while it is open; none when it is not.
+    /// Claim the open request `key` for the reviewer `by`, unless another
+    /// reviewer claimed it after `stale_before`. None when it is closed or
+    /// claimed.
+    async fn claim(
+        &self,
+        scope: &AccessScope,
+        key: RequestKey,
+        by: Uuid,
+        at: OffsetDateTime,
+        stale_before: OffsetDateTime,
+    ) -> Result<Option<ReviewRequest>, DomainError>;
+
+    /// Give back the claim of `by` on the request `key`.
+    async fn release(
+        &self,
+        scope: &AccessScope,
+        key: RequestKey,
+        by: Uuid,
+    ) -> Result<(), DomainError>;
+
+    /// Close the request `key` while it is open and claimed by `closed.by`.
+    /// None when it is not.
     async fn close(
         &self,
         scope: &AccessScope,
-        tenant_id: Uuid,
-        id: Uuid,
-        closing: &Closing,
+        key: RequestKey,
+        closed: &Closed,
     ) -> Result<Option<ReviewRequest>, DomainError>;
 
-    /// Close the open request on the subject's fact, if there is one.
+    /// Close the open request on the subject's fact, claimed or not, if
+    /// there is one.
     async fn close_open_on(
         &self,
+        scope: &AccessScope,
         key: SubjectKey,
         fact_id: &NodeKey,
-        closing: &Closing,
+        closed: &Closed,
     ) -> Result<Option<ReviewRequest>, DomainError>;
 
-    /// The subject's facts that have an open request: the facts under
-    /// review, which the profile read hides and processing leaves alone.
-    async fn under_review(&self, key: SubjectKey) -> Result<BTreeSet<NodeKey>, DomainError>;
+    /// The latest request on each of `fact_ids` that has one.
+    async fn latest_on(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        fact_ids: &[NodeKey],
+    ) -> Result<Vec<ReviewRequest>, DomainError>;
 
     /// All the subject's requests, newest first.
-    async fn of_subject(&self, key: SubjectKey) -> Result<Vec<ReviewRequest>, DomainError>;
+    async fn of_subject(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+    ) -> Result<Vec<ReviewRequest>, DomainError>;
 
     /// The page of the subject's requests that `query` asks for.
     async fn subject_page(
         &self,
+        scope: &AccessScope,
         key: SubjectKey,
         query: &ODataQuery,
     ) -> Result<Page<ReviewRequest>, DomainError>;
 
-    /// The page of the tenant's open requests that `query` asks for, under
-    /// `scope`.
+    /// The page of the tenant's open requests that `query` asks for.
     async fn open_page(
         &self,
         scope: &AccessScope,
@@ -284,23 +429,21 @@ pub enum ReviewQueueEvent {
         fact_id: NodeKey,
         outcome: ReviewOutcome,
         by: Uuid,
-        corrected_fact_id: Option<NodeKey>,
     },
 }
 
 impl ReviewQueueEvent {
-    /// The resolved event of a request just closed.
+    /// The resolved event of `request`, closed as `closed`.
     #[must_use]
-    pub fn resolved(request: &ReviewRequest) -> Option<Self> {
-        Some(Self::Resolved {
+    pub fn resolved(request: &ReviewRequest, closed: &Closed) -> Self {
+        Self::Resolved {
             tenant_id: request.tenant_id,
             subject_id: request.subject_id,
             request_id: request.id,
             fact_id: request.fact_id.clone(),
-            outcome: request.outcome?,
-            by: request.resolved_by?,
-            corrected_fact_id: request.corrected_fact_id.clone(),
-        })
+            outcome: closed.outcome.clone(),
+            by: closed.by,
+        }
     }
 }
 
@@ -310,19 +453,47 @@ pub trait ReviewQueueEvents: Send + Sync {
     fn record(&self, event: ReviewQueueEvent);
 }
 
+/// Close the open request on a fact the subject deleted, and record it.
+/// Whether there was one.
+///
+/// # Errors
+///
+/// When the request store cannot be reached.
+///
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-subject-control:p1
+pub(crate) async fn close_on_delete(
+    requests: &dyn ReviewRequests,
+    events: &dyn ReviewQueueEvents,
+    scope: &AccessScope,
+    key: SubjectKey,
+    fact_id: &NodeKey,
+) -> Result<bool, DomainError> {
+    let closed = Closed {
+        outcome: ReviewOutcome::Deleted,
+        by: key.subject_id,
+        at: OffsetDateTime::now_utc(),
+        reason: None,
+    };
+    let Some(request) = requests.close_open_on(scope, key, fact_id, &closed).await? else {
+        return Ok(false);
+    };
+    events.record(ReviewQueueEvent::resolved(&request, &closed));
+    Ok(true)
+}
+
 /// A reviewer's decision on an open request.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
 pub enum Resolution {
     /// Keep the fact as it is.
-    Rejected { reason: String },
+    Rejected { reason: ReviewText },
     /// Delete the fact.
-    Deleted { reason: Option<String> },
+    Deleted { reason: Option<ReviewText> },
     /// Store `value` for `property` in place of the fact.
     Corrected {
         property: String,
         value: Value,
-        reason: Option<String>,
+        reason: Option<ReviewText>,
     },
 }
 
@@ -369,7 +540,7 @@ pub struct Corrections {
 /// @cpt-dod:cpt-cf-construct-dod-review-queue-subject:p1
 #[domain_model]
 pub struct ReviewQueueService {
-    control: Arc<SubjectControlService>,
+    writes: Arc<ProfileWrites>,
     requests: Arc<dyn ReviewRequests>,
     events: Arc<dyn ReviewQueueEvents>,
     corrections: Option<Corrections>,
@@ -379,14 +550,14 @@ pub struct ReviewQueueService {
 impl ReviewQueueService {
     #[must_use]
     pub fn new(
-        control: Arc<SubjectControlService>,
+        writes: Arc<ProfileWrites>,
         requests: Arc<dyn ReviewRequests>,
         events: Arc<dyn ReviewQueueEvents>,
         corrections: Option<Corrections>,
         policy_enforcer: PolicyEnforcer,
     ) -> Self {
         Self {
-            control,
+            writes,
             requests,
             events,
             corrections,
@@ -400,45 +571,45 @@ impl ReviewQueueService {
     ///
     /// [`DomainError::Forbidden`] when the caller is not the subject or the
     /// platform refuses; [`DomainError::NoSuchFact`] for a fact the subject
-    /// does not have; [`DomainError::ReviewConflict`] when the fact already
-    /// has an open request; not configured without a processing identity.
+    /// does not have, also one removed while the request was opened;
+    /// [`DomainError::ReviewConflict`] when the fact already has an open
+    /// request; not configured without a processing identity.
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %subject_id))]
     pub async fn flag(
         &self,
         ctx: &SecurityContext,
         subject_id: Uuid,
         fact_id: &NodeKey,
-        comment: Option<String>,
+        comment: Option<ReviewText>,
     ) -> Result<ReviewRequest, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-read
-        let key = self
-            .control
-            .own(ctx, subject_id, fact_actions::FLAG)
-            .await?;
+        let (key, scope) =
+            subject_access::own(&self.policy_enforcer, ctx, subject_id, actions::FLAG).await?;
         let fact = self
-            .control
+            .writes
             .facts(key)
             .await?
             .facts
             .into_iter()
             .find(|fact| &fact.node_key == fact_id)
-            .ok_or_else(|| {
-                DomainError::NoSuchFact(format!("the subject has no live fact {}", fact_id.0))
-            })?;
+            .ok_or_else(|| no_such_fact(fact_id))?;
         // @cpt-end:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-read
         // @cpt-begin:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-store
         let opened = self
             .requests
-            .open(NewReviewRequest {
-                id: Uuid::new_v4(),
-                key,
-                fact_id: fact.node_key,
-                category: fact.category,
-                property: fact.property,
-                value: fact.value,
-                comment,
-                created_at: OffsetDateTime::now_utc(),
-            })
+            .open(
+                &scope,
+                NewReviewRequest {
+                    id: Uuid::new_v4(),
+                    key,
+                    fact_id: fact.node_key,
+                    category: fact.category,
+                    property: fact.property,
+                    value: fact.value,
+                    comment,
+                    created_at: OffsetDateTime::now_utc(),
+                },
+            )
             .await?;
         let Opened::Opened(request) = opened else {
             return Err(DomainError::ReviewConflict(format!(
@@ -446,6 +617,27 @@ impl ReviewQueueService {
                 fact_id.0
             )));
         };
+        // A record or a delete can remove the fact between the read and the
+        // insert. A request on a fact that is gone is closed at once, so
+        // nothing waits for a review of nothing.
+        if !self
+            .writes
+            .facts(key)
+            .await?
+            .facts
+            .iter()
+            .any(|fact| &fact.node_key == fact_id)
+        {
+            close_on_delete(
+                self.requests.as_ref(),
+                self.events.as_ref(),
+                &scope,
+                key,
+                fact_id,
+            )
+            .await?;
+            return Err(no_such_fact(fact_id));
+        }
         // @cpt-end:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-store
         // @cpt-begin:cpt-cf-construct-flow-review-queue-flag:p1:inst-flag-return
         self.events.record(ReviewQueueEvent::Requested {
@@ -473,13 +665,11 @@ impl ReviewQueueService {
         query: &ODataQuery,
     ) -> Result<Page<ReviewRequest>, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-authorize
-        let key = self
-            .control
-            .own(ctx, subject_id, fact_actions::READ)
-            .await?;
+        let (key, scope) =
+            subject_access::own(&self.policy_enforcer, ctx, subject_id, actions::READ).await?;
         // @cpt-end:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-authorize
         // @cpt-begin:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-read
-        self.requests.subject_page(key, query).await
+        self.requests.subject_page(&scope, key, query).await
         // @cpt-end:cpt-cf-construct-flow-review-queue-list-own:p1:inst-own-read
     }
 
@@ -509,22 +699,25 @@ impl ReviewQueueService {
         // @cpt-end:cpt-cf-construct-flow-review-queue-list-open:p1:inst-open-read
     }
 
-    /// Resolve an open request of the caller's tenant.
+    /// Resolve an open request of the caller's tenant. The request is
+    /// claimed before the fact is written, so two reviewers never both
+    /// resolve it; a resolution that stores nothing gives the claim back.
     ///
     /// NOT cancel-safe: a drop after a delete or a correction was written
-    /// leaves the request open; its next resolution finds the fact gone and
-    /// closes it as deleted.
+    /// leaves the request claimed until [`CLAIM_HOLD`] has passed; its next
+    /// resolution finds the fact gone and closes it as deleted.
     ///
     /// # Errors
     ///
-    /// [`DomainError::Forbidden`] without the permission;
-    /// [`DomainError::NoSuchReviewRequest`] for an unknown request;
-    /// [`DomainError::ReviewConflict`] for a closed one;
-    /// [`DomainError::InvalidValue`] for a correction of another property or
-    /// a value its schema does not take; [`DomainError::NotStored`] when the
-    /// checks or Admission refuse a correction; not configured for a
-    /// correction without the opt-in, or without a processing identity;
-    /// unavailable when the profile kept changing.
+    /// [`DomainError::Forbidden`] without the permission, or for a request
+    /// on the caller's own fact; [`DomainError::NoSuchReviewRequest`] for an
+    /// unknown request; [`DomainError::ReviewConflict`] for a closed one, or
+    /// one another reviewer is resolving; [`DomainError::InvalidValue`] for a
+    /// correction of another property or a value its schema does not take;
+    /// [`DomainError::NotStored`] when the checks or Admission refuse a
+    /// correction; not configured for a correction without the opt-in, or
+    /// without a processing identity; unavailable when the profile kept
+    /// changing.
     #[tracing::instrument(skip_all, fields(tenant_id = %ctx.subject_tenant_id(), %request_id, caller = %ctx.subject_id()))]
     pub async fn resolve(
         &self,
@@ -533,33 +726,96 @@ impl ReviewQueueService {
         resolution: Resolution,
     ) -> Result<ReviewRequest, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
-        let deadline = Instant::now() + self.control.budget();
+        let deadline = self.writes.deadline();
         let scope = self.reviewer(ctx).await?;
-        let tenant_id = ctx.subject_tenant_id();
-        let request = self
-            .requests
-            .find(&scope, tenant_id, request_id)
-            .await?
-            .ok_or_else(|| {
-                DomainError::NoSuchReviewRequest(format!(
-                    "tenant {tenant_id} has no review request {request_id}"
-                ))
-            })?;
-        if request.state == ReviewState::Closed {
+        let reviewer = ctx.subject_id();
+        let key = RequestKey {
+            tenant_id: ctx.subject_tenant_id(),
+            id: request_id,
+        };
+        let request = self.requests.find(&scope, key).await?.ok_or_else(|| {
+            DomainError::NoSuchReviewRequest(format!(
+                "tenant {} has no review request {request_id}",
+                key.tenant_id
+            ))
+        })?;
+        if !request.is_open() {
             return Err(closed(request_id));
         }
-        let reviewer = ctx.subject_id();
+        if request.subject_id == reviewer {
+            return Err(DomainError::forbidden(format!(
+                "reviewer {reviewer} may not resolve review request {request_id} on its own fact"
+            )));
+        }
+        let now = OffsetDateTime::now_utc();
+        let request = self
+            .requests
+            .claim(&scope, key, reviewer, now, now - CLAIM_HOLD)
+            .await?
+            .ok_or_else(|| {
+                DomainError::ReviewConflict(format!(
+                    "review request {request_id} is closed or being resolved"
+                ))
+            })?;
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
-        let closing = match resolution {
-            // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-reject
-            Resolution::Rejected { reason } => {
-                closing(ReviewOutcome::Rejected, reviewer, Some(reason))
+        let decided = self.decide(&request, reviewer, resolution, deadline).await;
+        let closed = match decided {
+            Ok(closed) => closed,
+            Err(err) => {
+                if let Err(release) = self.requests.release(&scope, key, reviewer).await {
+                    tracing::warn!(
+                        error = %release,
+                        "construct: a review request's claim was not given back; it frees itself"
+                    );
+                }
+                return Err(err);
             }
+        };
+        // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
+        let Some(closed_request) = self.requests.close(&scope, key, &closed).await? else {
+            // The fact was already written. Only the subject's delete or a
+            // claim held past CLAIM_HOLD closes a claimed request.
+            tracing::error!(
+                outcome = closed.outcome.name(),
+                corrected_fact_id = closed
+                    .outcome
+                    .corrected_fact_id()
+                    .map(|key| tracing::field::display(&key.0)),
+                "construct: a resolution was written, but its request was closed meanwhile"
+            );
+            return Err(DomainError::ReviewConflict(format!(
+                "review request {request_id} was closed while it was resolved"
+            )));
+        };
+        self.events
+            .record(ReviewQueueEvent::resolved(&closed_request, &closed));
+        Ok(closed_request)
+        // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
+    }
+
+    /// Carry out `resolution` on the fact of the claimed `request`, and say
+    /// how to close it.
+    async fn decide(
+        &self,
+        request: &ReviewRequest,
+        reviewer: Uuid,
+        resolution: Resolution,
+        deadline: Instant,
+    ) -> Result<Closed, DomainError> {
+        let closing = |outcome, reason| Closed {
+            outcome,
+            by: reviewer,
+            at: OffsetDateTime::now_utc(),
+            reason,
+        };
+        Ok(match resolution {
+            // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-reject
+            Resolution::Rejected { reason } => closing(ReviewOutcome::Rejected, Some(reason)),
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-reject
             // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-delete
             Resolution::Deleted { reason } => {
-                self.remove(&request, reviewer, deadline).await?;
-                closing(ReviewOutcome::Deleted, reviewer, reason)
+                self.remove(request, reviewer, deadline).await?;
+                closing(ReviewOutcome::Deleted, reason)
             }
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-delete
             // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-correct
@@ -568,28 +824,14 @@ impl ReviewQueueService {
                 value,
                 reason,
             } => match self
-                .correct(&request, reviewer, property, value, deadline)
+                .correct(request, reviewer, &property, &value, deadline)
                 .await?
             {
-                Corrected::Stored(key) => Closing {
-                    corrected_fact_id: Some(key),
-                    ..closing(ReviewOutcome::Corrected, reviewer, reason)
-                },
-                Corrected::Gone => closing(ReviewOutcome::Deleted, reviewer, reason),
+                Corrected::Stored(key) => closing(ReviewOutcome::Corrected(key), reason),
+                Corrected::Gone => closing(ReviewOutcome::Deleted, reason),
             },
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-correct
-        };
-        // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
-        let closed_request = self
-            .requests
-            .close(&scope, tenant_id, request_id, &closing)
-            .await?
-            .ok_or_else(|| closed(request_id))?;
-        if let Some(event) = ReviewQueueEvent::resolved(&closed_request) {
-            self.events.record(event);
-        }
-        Ok(closed_request)
-        // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
+        })
     }
 
     /// The platform's scope for resolving the caller's tenant's review
@@ -627,12 +869,12 @@ impl ReviewQueueService {
         deadline: Instant,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-read
-        let key = key_of(request);
-        let (construct, _) = self.control.contexts().for_tenant(key.tenant_id).await?;
+        let key = request.subject();
+        let (construct, _) = self.writes.construct(key.tenant_id).await?;
         // @cpt-end:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-read
         // @cpt-begin:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-write
         match self
-            .control
+            .writes
             .remove(
                 &construct,
                 key,
@@ -656,8 +898,8 @@ impl ReviewQueueService {
         &self,
         request: &ReviewRequest,
         reviewer: Uuid,
-        property: String,
-        value: Value,
+        property: &str,
+        value: &Value,
         deadline: Instant,
     ) -> Result<Corrected, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
@@ -674,24 +916,22 @@ impl ReviewQueueService {
                 request.property
             )));
         }
-        let spec = corrections.catalog.get(&property).ok_or_else(|| {
+        let spec = corrections.catalog.get(property).ok_or_else(|| {
             DomainError::internal(format!(
                 "stored fact {} has property `{property}`, which no person type has",
                 request.fact_id.0
             ))
         })?;
-        spec.check(&value).map_err(DomainError::InvalidValue)?;
-        let key = key_of(request);
-        let (construct, scope) = self.control.contexts().for_tenant(key.tenant_id).await?;
-        let (construct, scope, value) = (&construct, &scope, &value);
-        let profiles = &self.control.ports().profiles;
-        let writer = &self.control.ports().writer;
+        spec.check(value).map_err(DomainError::InvalidValue)?;
+        let key = request.subject();
+        let (construct, scope) = self.writes.construct(key.tenant_id).await?;
+        let (construct, scope) = (&construct, &scope);
+        let writes = self.writes.as_ref();
         // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
-        let corrected = self
-            .control
+        let corrected = writes
             .with_reruns(deadline, "correction", move || async move {
                 // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-read
-                let current = profiles.facts(construct, key).await?;
+                let current = writes.read(construct, key, deadline, "correction").await?;
                 let Some(fact) = current
                     .facts
                     .into_iter()
@@ -739,10 +979,15 @@ impl ReviewQueueService {
                 }
                 // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-admit
                 // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-write
-                Ok(match writer.write(construct, &admitted).await? {
-                    Written::Stored => Attempt::Done(Ok(Corrected::Stored(new_key))),
-                    Written::Conflict => Attempt::Conflict,
-                })
+                Ok(
+                    match writes
+                        .write(construct, &admitted, deadline, "correction")
+                        .await?
+                    {
+                        Written::Stored => Attempt::Done(Ok(Corrected::Stored(new_key))),
+                        Written::Conflict => Attempt::Conflict,
+                    },
+                )
                 // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-write
             })
             .await?;
@@ -750,38 +995,107 @@ impl ReviewQueueService {
     }
 }
 
-/// Whether some constraint of `scope` grants the whole tenant: all its
-/// filters name `tenant_id` as the owner tenant. A reviewer resolves a whole
-/// tenant's requests, so a constraint that names anything narrower, or a
-/// group or subtree that cannot be decided here, does not make one.
-fn reaches_tenant(scope: &AccessScope, tenant_id: Uuid) -> bool {
+/// Whether some constraint of `scope` grants the whole tenant: it has
+/// filters, and each names `tenant_id` as the owner tenant. A reviewer
+/// resolves a whole tenant's requests, so a constraint that names anything
+/// narrower, or a group or subtree that cannot be decided here, does not
+/// make one.
+pub(crate) fn reaches_tenant(scope: &AccessScope, tenant_id: Uuid) -> bool {
     let tenant = ScopeValue::Uuid(tenant_id);
     scope.constraints().iter().any(|constraint| {
-        constraint.filters().iter().all(|filter| {
-            matches!(filter, ScopeFilter::Eq(_) | ScopeFilter::In(_))
-                && filter.property() == pep_properties::OWNER_TENANT_ID
-                && filter.values().contains(&tenant)
-        })
+        !constraint.filters().is_empty()
+            && constraint.filters().iter().all(|filter| {
+                matches!(filter, ScopeFilter::Eq(_) | ScopeFilter::In(_))
+                    && filter.property() == pep_properties::OWNER_TENANT_ID
+                    && filter.values().contains(&tenant)
+            })
     })
-}
-
-fn key_of(request: &ReviewRequest) -> SubjectKey {
-    SubjectKey {
-        tenant_id: request.tenant_id,
-        subject_id: request.subject_id,
-    }
-}
-
-fn closing(outcome: ReviewOutcome, by: Uuid, reason: Option<String>) -> Closing {
-    Closing {
-        outcome,
-        by,
-        reason,
-        corrected_fact_id: None,
-        at: OffsetDateTime::now_utc(),
-    }
 }
 
 fn closed(request_id: Uuid) -> DomainError {
     DomainError::ReviewConflict(format!("review request {request_id} is closed"))
+}
+
+fn no_such_fact(fact_id: &NodeKey) -> DomainError {
+    DomainError::NoSuchFact(format!("the subject has no live fact {}", fact_id.0))
+}
+
+#[cfg(test)]
+mod tests {
+    use toolkit_security::ScopeConstraint;
+
+    use super::*;
+
+    #[test]
+    fn a_review_text_is_trimmed_and_bounded_in_characters_not_bytes() {
+        let at_limit = "\u{e9}".repeat(MAX_TEXT_CHARS);
+
+        assert_eq!(ReviewText::new("  why  ").unwrap().as_str(), "why");
+        assert_eq!(
+            ReviewText::new(at_limit.clone()).unwrap().as_str(),
+            at_limit
+        );
+        assert_eq!(
+            ReviewText::new(format!("{at_limit}\u{e9}")),
+            Err(TextRule::TooLong)
+        );
+        assert_eq!(ReviewText::new(" \n "), Err(TextRule::Blank));
+        assert_eq!(ReviewText::optional(Some("  ".to_owned())), Ok(None));
+        assert_eq!(ReviewText::optional(None), Ok(None));
+    }
+
+    fn scope_of(constraints: Vec<Vec<ScopeFilter>>) -> AccessScope {
+        AccessScope::from_constraints(
+            constraints
+                .into_iter()
+                .map(|filters| ScopeConstraint::try_new(filters).unwrap())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn only_a_constraint_on_the_whole_tenant_makes_a_reviewer() {
+        let tenant = Uuid::new_v4();
+        let on = |id: Uuid| ScopeFilter::eq(pep_properties::OWNER_TENANT_ID, id);
+
+        assert!(reaches_tenant(&scope_of(vec![vec![on(tenant)]]), tenant));
+        assert!(
+            reaches_tenant(
+                &scope_of(vec![vec![on(Uuid::new_v4())], vec![on(tenant)]]),
+                tenant
+            ),
+            "one constraint is enough"
+        );
+        assert!(!reaches_tenant(
+            &scope_of(vec![vec![on(Uuid::new_v4())]]),
+            tenant
+        ));
+        assert!(
+            !reaches_tenant(
+                &scope_of(vec![vec![
+                    on(tenant),
+                    ScopeFilter::eq(pep_properties::OWNER_ID, Uuid::new_v4())
+                ]]),
+                tenant
+            ),
+            "narrower than the tenant"
+        );
+        assert!(
+            !reaches_tenant(
+                &scope_of(vec![vec![ScopeFilter::in_tenant_subtree(
+                    pep_properties::OWNER_TENANT_ID,
+                    tenant,
+                    false,
+                    Vec::new()
+                )]]),
+                tenant
+            ),
+            "a subtree is not decided here"
+        );
+        assert!(!reaches_tenant(&AccessScope::deny_all(), tenant));
+        assert!(
+            !reaches_tenant(&AccessScope::allow_all(), tenant),
+            "an allow without constraints is no grant"
+        );
+    }
 }
