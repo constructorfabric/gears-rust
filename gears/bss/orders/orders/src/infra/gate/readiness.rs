@@ -1,7 +1,7 @@
 //! The gate readiness manifest (S3-14): one entry per [`GatePort`] naming how the port is bound,
 //! and the commercial authority's state. It is a diagnostic, never a readiness condition: the
 //! gear is ready with every port unavailable, because missing providers are the designed state
-//! on 2026-10-22 (D-227 item 1).
+//! on 2026-10-22 (D-231 item 1).
 use crate::domain::gate::breaker::BreakerState;
 use crate::domain::gate::ports::{Delivery, GatePort};
 use serde::{Serialize, Serializer};
@@ -17,7 +17,7 @@ pub enum PortState {
     Bound,
     /// The provider is delivered, but its client is not published in the hub.
     MissingClient,
-    /// No provider is delivered: the D-227 package and upstream ask that close the gap.
+    /// No provider is delivered: the D-231 package and upstream ask that close the gap.
     ProviderMissing {
         /// The Orders work package that implements the port once the provider lands.
         package: &'static str,
@@ -82,13 +82,13 @@ pub struct PortReadiness {
     pub owner: &'static str,
     /// How the port is bound.
     pub state: PortState,
-    /// The port's breaker state token (`closed`, `open`, `half-open`; D-233); absent when
+    /// The port's breaker state token (`closed`, `open`, `half-open`; D-237); absent when
     /// `gate.breaker` is disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub breaker: Option<&'static str>,
 }
 
-/// The gate manifest: every port in D-227 table order, and the authority.
+/// The gate manifest: every port in D-231 table order, and the authority.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GateReadiness {
     /// One entry per [`GatePort::ALL`] member, in that order.
@@ -103,7 +103,7 @@ pub struct GateReadiness {
 impl GateReadiness {
     /// The manifest for a catalog binding (`catalog_bound`: the Pricing and Products clients
     /// are both published) and an authority state. Every undelivered port is provider-missing
-    /// with its D-227 package; the delivered ports are the catalog's.
+    /// with its D-231 package; the delivered ports are the catalog's.
     #[must_use]
     pub fn new(catalog_bound: bool, authority: AuthorityState) -> Self {
         let ports = GatePort::ALL

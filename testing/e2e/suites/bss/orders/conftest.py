@@ -1,4 +1,4 @@
-"""E2E fixtures for the bss-orders gear (S2-12 draft milestone, extended by Stage 3 milestone 3b, D-234).
+"""E2E fixtures for the bss-orders gear (S2-12 draft milestone, extended by Stage 3 milestone 3b, D-238).
 
 This suite is self-managed: it owns a PostgreSQL container and the server process, because
 the gear requires PostgreSQL, a configured fail-closed AuthZ policy (the e2e policy AuthZ plugin) and
@@ -702,7 +702,7 @@ def submit(
     draft_revision: int,
     key: str | None = None,
 ) -> httpx.Response:
-    """``POST /orders/{id}/submit`` (D-234) as ``buyer`` at ``version`` and ``draft_revision``."""
+    """``POST /orders/{id}/submit`` (D-238) as ``buyer`` at ``version`` and ``draft_revision``."""
     return buyer.client.post(
         f"{API}/orders/{order_id}/submit",
         json={"expected_draft_revision": draft_revision},

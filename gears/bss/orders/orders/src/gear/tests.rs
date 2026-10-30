@@ -1028,7 +1028,7 @@ async fn boot_binds_the_gate_ports_and_names_every_missing_provider() -> anyhow:
     };
 
     // (1) No Pricing/Products client: the gear starts; the catalog ports name the missing
-    // client and every other port its D-227 package and upstream ask.
+    // client and every other port its D-231 package and upstream ask.
     let gear = boot(config(), dependencies("complete")).await?;
     assert!(!bind(&gear), "nothing to bind without the clients");
     let gate = gear.gate_readiness().expect("init binds the gate manifest");
@@ -1127,7 +1127,7 @@ async fn boot_binds_the_gate_ports_and_names_every_missing_provider() -> anyhow:
     Ok(())
 }
 
-/// M3b (D-234): the development delivery mounts `POST /bss-orders/v1/orders/{orderId}/submit`
+/// M3b (D-238): the development delivery mounts `POST /bss-orders/v1/orders/{orderId}/submit`
 /// beside Preview, outside the production census, and the route keeps the authoring routes'
 /// boundary order (edge limiter, `If-Match`, key, body, then the service): without `If-Match` it
 /// is 428 before anything else, a missing key and a refused body are `request-invalid` in that

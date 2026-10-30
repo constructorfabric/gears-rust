@@ -12,9 +12,9 @@ suite: bss-orders
 # selected. The Orders feature links Event Broker, the standalone cluster cache and the
 # SQLite event-log backend.
 #
-# `bss_orders/gate-dev-stubs` is the development delivery (D-231): the nine undelivered gate ports
+# `bss_orders/gate-dev-stubs` is the development delivery (D-235): the nine undelivered gate ports
 # answer from the per-run fixture `conftest.py` writes between the two boots; Pricing and Products
-# are real and seeded per run (D-234). The feature is enabled by this build line only, never by the
+# are real and seeded per run (D-238). The feature is enabled by this build line only, never by the
 # example server's manifest. `bss-pricing` links `bss-products`.
 features:
   - bss-orders

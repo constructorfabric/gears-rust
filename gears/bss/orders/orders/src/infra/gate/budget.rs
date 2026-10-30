@@ -3,12 +3,12 @@
 //! One deadline per port per run (D-94: "per port per run, not per line"), started at the port's
 //! first call in the run and shared by every later subrequest on that port and by the retry;
 //! at most two attempts per call, the second only for a transient failure and only while time
-//! remains, after a fully jittered pause of at most [`RETRY_PAUSE`] cut at the deadline (D-240);
+//! remains, after a fully jittered pause of at most [`RETRY_PAUSE`] cut at the deadline (D-244);
 //! cooperative cancellation. Per port per run (DESIGN L7005, F03 §3.3): at most
 //! [`PORT_RUN_CONCURRENCY`] calls in flight, a further call *waiting* for a slot until the port's
 //! run deadline, and at most [`PORT_RUN_SUBREQUEST_CAP`] subrequests. Across the gear, each port's
 //! [`PORT_BULKHEAD`] is acquired without queueing: a saturated port is backpressure at once, and
-//! each port's circuit breaker (F03 §3.3, D-233; `gate.breaker`) rejects a call before any
+//! each port's circuit breaker (F03 §3.3, D-237; `gate.breaker`) rejects a call before any
 //! subrequest while it is open. The run-level ceiling is measured by the caller through
 //! [`RunBudget::elapsed`]. Every call's outcome, its retry and every breaker transition are
 //! reported to the budget's [`GateSignals`] sink (03 §3.8).
@@ -38,7 +38,7 @@ pub const PORT_RUN_CONCURRENCY: usize = 8;
 pub const PORT_RUN_SUBREQUEST_CAP: u32 = 200;
 /// Attempts per bounded call: the first plus one retry, both under the port's run deadline.
 const MAX_ATTEMPTS: u8 = 2;
-/// The upper bound of the pause before a retry (D-240): the pause is fully jittered over
+/// The upper bound of the pause before a retry (D-244): the pause is fully jittered over
 /// `(0, RETRY_PAUSE]` and cut at the call's deadline, so callers that failed together do not
 /// retry in lockstep. 20 ms is under 10 % of the 250 ms baseline port deadline.
 pub const RETRY_PAUSE: Duration = Duration::from_millis(20);
@@ -289,11 +289,11 @@ pub enum CallError {
     Cancelled,
     /// The run already issued its 200 subrequests on the port.
     SubrequestCapExceeded,
-    /// The port's breaker is open (D-233): no subrequest was spent.
+    /// The port's breaker is open (D-237): no subrequest was spent.
     BreakerOpen,
 }
 
-/// How a bounded call's result counts for the breaker (D-233): a success or a permanent answer
+/// How a bounded call's result counts for the breaker (D-237): a success or a permanent answer
 /// is a success, a deadline or a transient failure is a failure, and an exit the callee did not
 /// answer (backpressure, cancellation, the subrequest cap) is not counted. A `Deadline` counts
 /// only when `first_deadline` (M3-2: the run's port deadline is cumulative, so the calls of one
@@ -312,7 +312,7 @@ fn breaker_outcome<T>(result: &Result<T, CallError>, first_deadline: bool) -> Op
     }
 }
 
-/// The `outcome` label of a bounded call (D-233): one variant per [`CallError`] exit plus `Ok`.
+/// The `outcome` label of a bounded call (D-237): one variant per [`CallError`] exit plus `Ok`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallOutcome {
     /// The callee answered.
@@ -346,7 +346,7 @@ impl CallOutcome {
         Self::BreakerOpen,
     ];
 
-    /// The `outcome` label value (D-233).
+    /// The `outcome` label value (D-237).
     #[must_use]
     pub const fn token(self) -> &'static str {
         match self {
@@ -641,9 +641,9 @@ pub const ACCEPTANCE_DEADLINE: Duration = Duration::from_millis(500);
 /// The budget of submit phase B's Pricing acceptance commands (Pricing's `SellabilityV1` `check` command, M2-6).
 /// Not a gate port: [`GatePort::ALL`] and the per-run tables are unchanged. Each line command has
 /// its own deadline covering both attempts, retries once only for a transient failure while time
-/// remains (after the same jittered pause as a gate port, D-240), is cancel-aware and takes a
+/// remains (after the same jittered pause as a gate port, D-244), is cancel-aware and takes a
 /// gear-wide bulkhead permit without queueing. A retry is logged at `warn` with the line and its
-/// command key; it has no instrument (D-240: D-233's instrument table has no acceptance row).
+/// command key; it has no instrument (D-244: D-237's instrument table has no acceptance row).
 #[derive(Debug, Clone)]
 pub struct AcceptanceBudget {
     deadline: Duration,

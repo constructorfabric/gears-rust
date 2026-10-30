@@ -749,7 +749,7 @@ async fn a_blocking_assessment_settles_through_the_engine_with_diagnostics_and_r
     );
     // The refusal carries the complete gate report; the run's rows are the order's.
     assert!(settled.response.body()["context"]["data"]["assessment"].is_object());
-    // D-229: the stored Problem carries exactly the report the snapshot keeps, and the SDK
+    // D-233: the stored Problem carries exactly the report the snapshot keeps, and the SDK
     // decodes it into the typed diagnostics member.
     assert_eq!(
         Some(&settled.response.body()["context"]["data"]["assessment"]),
@@ -1329,7 +1329,7 @@ async fn a_crash_before_any_receipt_leaves_the_attempt_prepared_and_the_retry_co
     assert_eq!(f.dates.prepared.load(Ordering::SeqCst), prepared);
     assert_eq!(high_water(&f, order).await, candidate);
     assert_eq!(attempt_status(&f, order).await, json!("committed"));
-    // D-231: the recovered commit settles the frozen gate report and writes the frozen outcome
+    // D-235: the recovered commit settles the frozen gate report and writes the frozen outcome
     // vector as the run's diagnostics, under the frozen run id, naming the committed version.
     let frozen =
         f.t.json(&format!(
@@ -1360,7 +1360,7 @@ async fn a_crash_before_any_receipt_leaves_the_attempt_prepared_and_the_retry_co
     );
 }
 
-/// A hung commercial exchange is bounded once, in `DeadlineAuthority` (D-240; `CatalogBinding::new`
+/// A hung commercial exchange is bounded once, in `DeadlineAuthority` (D-244; `CatalogBinding::new`
 /// wraps the production authority): phase A answers unavailable (the 503 wire) and reserves
 /// nothing. Docker + `gate-dev-stubs`.
 #[tokio::test]
@@ -1671,7 +1671,7 @@ async fn an_expired_receipt_refuses_order_binding_expired() {
     assert_eq!(committed(&f, order).await, (1, 0, 0, 0));
 }
 
-/// D-231 item 7 (R6): a receipt whose schema-2 pin alone exceeds the version byte limit
+/// D-235 item 7 (R6): a receipt whose schema-2 pin alone exceeds the version byte limit
 /// refuses `purchase-capacity-exceeded` through `gate.binding-admission`, as an oversized
 /// version does; nothing commercial is written and the same key replays the settled refusal.
 #[tokio::test]
@@ -1704,7 +1704,7 @@ async fn a_single_oversized_pin_refuses_purchase_capacity_exceeded() {
 
 /// D-179/D-188 step 17: a second order of the same payer, resource and overlap key submitted
 /// while the first holds its claim is refused `order-in-flight-for-key`, naming the visible
-/// holder and carrying the rebuilt gate report (D-236 item 4); no version is appended for it.
+/// holder and carrying the rebuilt gate report (D-240 item 4); no version is appended for it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn a_concurrent_claim_refuses_order_in_flight_for_key_with_no_version() {
@@ -1725,7 +1725,7 @@ async fn a_concurrent_claim_refuses_order_in_flight_for_key_with_no_version() {
         refused.response.body()["context"]["data"]["blocked"][0]["conflicting_order_id"],
         json!(s(holder.order.order_id))
     );
-    // D-229 as amended by D-236 item 4: the step-17 refusal carries the rebuilt predicate-9
+    // D-233 as amended by D-240 item 4: the step-17 refusal carries the rebuilt predicate-9
     // report in the Problem body, the same value the snapshot keeps.
     let report = &refused.response.body()["context"]["data"]["assessment"];
     assert!(report.is_object(), "{refused:?}");
@@ -2750,7 +2750,7 @@ async fn submitted_line_read_rejects_a_cursor_from_the_draft_version() {
     ));
 }
 
-/// D-242: a line token `main` issued is bound to the creation version, so once the draft commits
+/// D-246: a line token `main` issued is bound to the creation version, so once the draft commits
 /// it is refused like any token from the draft version.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

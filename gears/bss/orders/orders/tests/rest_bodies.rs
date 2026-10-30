@@ -545,7 +545,7 @@ fn patch_presence_rules_hold_on_the_new_path() {
     assert_eq!(cleared.named_fields(), ["contract_id"]);
 }
 
-/// The development-delivery submit body (M3b, D-234): exactly the independent draft revision.
+/// The development-delivery submit body (M3b, D-238): exactly the independent draft revision.
 /// A missing revision and any extra member are `request-invalid`, as on every Orders write.
 #[test]
 fn submit_body_requires_the_draft_revision_and_refuses_unknown_members() {

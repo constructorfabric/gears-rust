@@ -384,7 +384,7 @@ def test_service_principals_need_finite_explicit_constraints(env: OrdersEnv, buy
     for seam in ("begin-fulfillment", "spawn-signal", "approval-reflection", "workflow-cancel", "cancel", "hold"):
         r = workflow.post(f"{path}/{seam}", json={}, headers=write_headers(1))
         assert r.status_code in (404, 405), f"{seam}: {r.status_code} {r.text}"
-    # Submit is mounted in this suite's development build (D-234, `api/rest/gate.rs`
+    # Submit is mounted in this suite's development build (D-238, `api/rest/gate.rs`
     # `submit_router`), so the route answers instead of the router's 404/405: `{}` fails the body
     # boundary before the service, and a well-formed body still cannot submit for the Workflow
     # token: its finite scope names no order of this run, so the target is hidden, as on its GET.

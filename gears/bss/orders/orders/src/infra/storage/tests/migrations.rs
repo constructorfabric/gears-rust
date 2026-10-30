@@ -40,7 +40,7 @@ async fn every_forward_prefix_installs_and_preserves_old_audit_and_order_rows() 
     }
     Ok(())
 }
-/// D-242: a database `main` migrated (every Orders migration before the item-keys one, which
+/// D-246: a database `main` migrated (every Orders migration before the item-keys one, which
 /// `migrations_shipped_on_main_are_unchanged` pins byte-identical to `main`) upgrades through
 /// `m20261027_000011_orders_item_keys`. Main's pinned scalar line survives unchanged; the
 /// keyless and item-keys lines the gate commits (`infra/gate/commit.rs`, `admitted`) are then

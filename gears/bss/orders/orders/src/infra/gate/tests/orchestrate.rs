@@ -1,5 +1,5 @@
 //! The orchestrator shell over the Task 8b stubs and the example fixture, every port wrapped to
-//! count its calls (S3-11/S3-12; D-215, D-180, D-227, M2-6). Compiled only with
+//! count its calls (S3-11/S3-12; D-215, D-180, D-231, M2-6). Compiled only with
 //! `gate-dev-stubs`; the Preview service tests (`preview.rs`) reuse its harness.
 //! In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
 #![allow(

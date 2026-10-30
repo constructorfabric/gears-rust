@@ -91,7 +91,7 @@ impl AuthNResolverClient for FakeResolver {
     }
 }
 
-/// A failure [`FakePricing::fail_with`] injects into the Pricing reads (the D-233 item 6 matrix,
+/// A failure [`FakePricing::fail_with`] injects into the Pricing reads (the D-237 item 6 matrix,
 /// compiled only with `gate-dev-stubs`, as the matrix is).
 #[cfg(feature = "gate-dev-stubs")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

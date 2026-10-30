@@ -1,11 +1,11 @@
-//! The pure gate assessment (S3-09 skeleton; F03 §3.1–§3.4, §4.2; D-187, D-189, D-195, D-227):
+//! The pure gate assessment (S3-09 skeleton; F03 §3.1–§3.4, §4.2; D-187, D-189, D-195, D-231):
 //! typed port answers in, the complete ordered outcome vector, the deduplicated failure list,
 //! the engine input resolutions and the per-line pins out. No call, no storage, no clock.
 //!
 //! Orchestration only: the catalog rows and the pin come from [`map_line`], the assessment rows
 //! from [`compose`](super::compose) (submodule `assessed`), the overlap rows from submodule
 //! `overlap`, ordering and the primary from [`Vector`]. Every row is `required` except the pin,
-//! whose applicability follows the operation (D-189, D-227 item 6).
+//! whose applicability follows the operation (D-189, D-231 item 6).
 //!
 //! Determinism: every lookup is keyed (`BTreeMap`) or order-independent, and the producer
 //! subresults of one row are sorted by `(producer, profile, predicate)` before composition, so
@@ -80,13 +80,13 @@ pub struct AssessmentInput {
     /// The order contract, if any.
     pub contract_id: Option<Uuid>,
     /// Contract facts by contract id; consulted for order and line contract references.
-    /// Ignored while the payer relationship is unconfirmed (D-215, D-228): not read then.
+    /// Ignored while the payer relationship is unconfirmed (D-215, D-232): not read then.
     pub contracts: PortAnswer<BTreeMap<Uuid, ContractFacts>>,
     /// The overlap key per line (SUB-G1); a line without an entry is answered-missing.
-    /// Ignored while the payer relationship is unconfirmed (D-215, D-228): not read then.
+    /// Ignored while the payer relationship is unconfirmed (D-215, D-232): not read then.
     pub overlap_keys: PortAnswer<Vec<OverlapKey>>,
     /// Occupancy per overlap key (#5131 `getOverlapOccupancy`).
-    /// Ignored while the payer relationship is unconfirmed (D-215, D-228): not read then.
+    /// Ignored while the payer relationship is unconfirmed (D-215, D-232): not read then.
     pub occupancy: PortAnswer<Vec<(OccupancyQuery, OccupancyObservation)>>,
     /// Keys held by other orders for the same payer and resource tenant.
     pub inflight_same_tuple: std::collections::BTreeSet<String>,
@@ -112,17 +112,17 @@ pub struct Assessment {
     pub vector: Vector,
     /// Every non-passed row once per `(line, reason)`, in vector order.
     pub failures: Vec<Failure>,
-    /// The engine input resolutions (D-227 item 1 per-input rule).
+    /// The engine input resolutions (D-231 item 1 per-input rule).
     pub inputs: Inputs,
     /// The pin outcome per line.
     pub pins: BTreeMap<Uuid, PinOutcome>,
-    /// The primary Problem for the operation, if anything blocks (D-230, D-195).
+    /// The primary Problem for the operation, if anything blocks (D-234, D-195).
     pub primary: Option<Outcome>,
 }
 
 impl Assessment {
     /// The complete authorized gate report a composite-gate refusal carries as its
-    /// `context.data.assessment` member (DESIGN L5093, D-229): the vector's public fields
+    /// `context.data.assessment` member (DESIGN L5093, D-233): the vector's public fields
     /// (identity, verdict, reason, applicability) and the failure list mapped 1:1, every enum as
     /// its stored token, under [`MAPPING_VERSION`]. Never producer results or upstream evidence.
     #[must_use]
@@ -189,7 +189,7 @@ fn unevaluable_with(r: Reason, upstream_code: &str) -> Eval {
 const LINE_ID_MISMATCH: &str = "basket-line-id-mismatch";
 
 /// The upstream code of a bundle line whose items state different quantities (D-192: one exact
-/// quantity per line; D-227 item 4: an unsupported shape refuses `reference-unresolvable`).
+/// quantity per line; D-231 item 4: an unsupported shape refuses `reference-unresolvable`).
 const MIXED_ITEM_QUANTITIES: &str = "mixed-item-quantities";
 /// The predicates the D-189 assessment answers (Task 6a Amendment A).
 const ASSESSED: [P; 4] = [
@@ -217,7 +217,7 @@ fn row(predicate: P, line_id: Option<Uuid>, (verdict, reason, detail): Eval) -> 
 /// # Errors
 /// The rows break a vector rule: a duplicated line id gives a duplicate identity.
 pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
-    // D-215/D-228: until the payer relationship is confirmed no payer fact is resolved or
+    // D-215/D-232: until the payer relationship is confirmed no payer fact is resolved or
     // disclosed. The payer-dependent rows carry predicate 1's reason (`axis-invalid` when the
     // axes are also invalid), never a port's: the contract, market, overlap and in-flight rows,
     // and each composed pin row, whose billing terms the orchestrator withholds (D-215 item 2).
@@ -386,7 +386,7 @@ pub fn assess(input: &AssessmentInput) -> Result<Assessment, VectorError> {
 }
 
 /// One line's catalog mapping. A line whose request names another line, or whose items state
-/// different quantities (an unsupported purchase shape, D-192/D-227 item 4), is never repaired:
+/// different quantities (an unsupported purchase shape, D-192/D-231 item 4), is never repaired:
 /// its rows stay keyed by `line.line_id` so the vector stays complete, but `ReferenceResolution`
 /// fails with `reference-unresolvable` and the pin carries that reason.
 fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date) -> LineCatalog {
@@ -422,7 +422,7 @@ fn map_basket_line(line: &BasketLine, answer: &CatalogAnswer, resolve_date: Date
 /// and its items state one quantity. The one predicate `assess` and the orchestrator's
 /// [`line_bindings`](crate::domain::gate::orchestrate::line_bindings) share, so a refused line is
 /// never composed, asked for keys, evaluated or read, and a full key answer never holds an entry
-/// `assess` would call foreign (D-242).
+/// `assess` would call foreign (D-246).
 #[must_use]
 pub(crate) fn supported_basket_line(line: &BasketLine) -> bool {
     line.catalog.line_id == line.line_id && !mixed_quantities(&line.catalog)
@@ -445,7 +445,7 @@ fn mixed_quantities(request: &LineCatalogRequest) -> bool {
 /// another revision, is unavailable here too); a line without a catalog entry counts for both
 /// Pricing ports. `IndicativeTax` is not an input of this run. With the payer relationship
 /// unconfirmed (`withheld`) billing terms are withheld, not down: the orchestrator does not ask
-/// them (D-215 item 2) and the pin rows carry predicate 1's reason instead (D-228 item 6).
+/// them (D-215 item 2) and the pin rows carry predicate 1's reason instead (D-232 item 6).
 fn unavailable_ports(
     input: &AssessmentInput,
     withheld: bool,
@@ -501,7 +501,7 @@ fn unavailable_ports(
 }
 
 /// The payer profile answered and the payer↔seller or payer↔resource relationship is not
-/// confirmed (D-215 item 2, D-228).
+/// confirmed (D-215 item 2, D-232).
 fn relationship_unconfirmed(input: &AssessmentInput) -> bool {
     input
         .identity
@@ -510,7 +510,7 @@ fn relationship_unconfirmed(input: &AssessmentInput) -> bool {
 }
 
 /// The engine inputs the composite gate resolves by withholding while the payer relationship is
-/// unconfirmed (D-215, D-228 item 6). Predicate 1 lives inside the composite gate, which is the
+/// unconfirmed (D-215, D-232 item 6). Predicate 1 lives inside the composite gate, which is the
 /// last guard registered on its rows, so no earlier-registered guard makes these inputs moot and
 /// D-113 `Precluded` does not apply (the engine would refuse to reach the gate,
 /// `PrecludedReached`): they are `Resolved`, and the gate's own predicate carries predicate 1's
@@ -526,19 +526,19 @@ const PAYER_WITHHELD_INPUTS: [InputPort; 5] = [
     InputPort::Evaluation,
 ];
 
-/// Engine inputs from `GatePort::input_reasons` (D-227 item 1): a down port marks each input it
+/// Engine inputs from `GatePort::input_reasons` (D-231 item 1): a down port marks each input it
 /// feeds unresolvable with that input's reason; an input every feeding port answered resolves.
 ///
 /// Two overrides, both `Resolved` and both winning over `Unresolvable`:
-/// - `withheld` (D-228 item 6): the payer relationship is unconfirmed; the
+/// - `withheld` (D-232 item 6): the payer relationship is unconfirmed; the
 ///   [`PAYER_WITHHELD_INPUTS`] are resolved by the gate's withholding.
-/// - `definitive` (D-230 engine presentation): the primary is a definitive local refusal, so
+/// - `definitive` (D-234 engine presentation): the primary is a definitive local refusal, so
 ///   every composite-gate input (the eight this function produces) is `Resolved`. The engine
 ///   checks a guard's unresolvable inputs before its predicate (D-113), so an unresolvable
 ///   catalog or pricing input would otherwise settle the gate as `Unevaluable` (503) and mask
-///   the refusal D-230 ranks first; presented resolved, the bound gate predicate returns
+///   the refusal D-234 ranks first; presented resolved, the bound gate predicate returns
 ///   `Fail(primary.reason)` and the engine settles the 400. D-113 order still applies between
-///   guards; inside the gate D-230 applies. A non-definitive primary keeps the per-port marking.
+///   guards; inside the gate D-234 applies. A non-definitive primary keeps the per-port marking.
 fn inputs(down: &BTreeSet<GatePort>, withheld: bool, definitive: bool) -> Inputs {
     let mut states = BTreeMap::new();
     for port in GatePort::ALL {
@@ -574,7 +574,7 @@ fn axis(input: &AssessmentInput) -> Eval {
         return failed(Reason::AxisInvalid);
     }
     if !(p.in_relationship_with_seller && p.in_relationship_with_resource) {
-        // D-228: a gate predicate result (FailedPrecondition, 400), D-215 item 2.
+        // D-232: a gate predicate result (FailedPrecondition, 400), D-215 item 2.
         return failed(Reason::PayerRelationshipUnconfirmed);
     }
     PASS
@@ -639,7 +639,7 @@ fn quantity_floor(line: &BasketLine) -> Eval {
 ///
 /// `payer_withheld` is predicate 1's reason while the payer relationship is unconfirmed: the
 /// terms are then withheld, not missing (D-215 item 2), so a composed pin is unevaluable with
-/// that reason and `required` (D-228 item 6), whatever the terms or the policy answered. A pin
+/// that reason and `required` (D-232 item 6), whatever the terms or the policy answered. A pin
 /// that is itself unresolvable or unevaluable keeps its catalog reason.
 fn pin_row(
     input: &AssessmentInput,
@@ -668,7 +668,7 @@ fn pin_row(
         }
         (PinOutcome::Unresolvable(r), _) => (base, failed(*r)),
         (PinOutcome::Unevaluable(r), _) => (base, unevaluable(*r)),
-        // D-228 item 6: withheld terms are predicate 1's reason, never a port's (not tcv-only).
+        // D-232 item 6: withheld terms are predicate 1's reason, never a port's (not tcv-only).
         (PinOutcome::Composed { .. }, _) if let Some(w) = payer_withheld => (base, w.clone()),
         (PinOutcome::Composed { .. }, PortAnswer::Unavailable(_) | PortAnswer::Skipped(_)) => {
             (base, unevaluable(unavailable))

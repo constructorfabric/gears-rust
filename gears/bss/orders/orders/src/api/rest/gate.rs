@@ -11,7 +11,7 @@
 //! limiter, the run). The body is `snake_case` (D-206) except the `tcvWithheld` annotation,
 //! whose wire name is the registered camelCase one.
 //!
-//! Submit (M3b, D-234) is mounted under the same development-delivery condition by
+//! Submit (M3b, D-238) is mounted under the same development-delivery condition by
 //! [`submit_router`], beside Preview and outside the census. It is an existing-order write and
 //! keeps the authoring routes' boundary order exactly ([`super::capture`]): the per-(caller,
 //! order) edge limiter, then the required `If-Match` (428), `Idempotency-Key`,
@@ -196,7 +196,7 @@ pub fn router(service: Arc<PreviewService>, openapi: &dyn OpenApiRegistry) -> Ro
     router.layer(Extension(service))
 }
 
-/// Register the submit route (M3b, D-234) and attach the shared service and the edge limiter
+/// Register the submit route (M3b, D-238) and attach the shared service and the edge limiter
 /// once (`ToolKit` REST rule). Development delivery only: the gear merges it beside Preview when
 /// the submit service exists, outside [`super::DELIVERED_OPERATIONS`].
 pub fn submit_router(

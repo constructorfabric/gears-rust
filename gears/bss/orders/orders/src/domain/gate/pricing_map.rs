@@ -219,7 +219,7 @@ impl Rows {
 
 /// One line's Pricing answers after normalisation: what [`map_line`] maps and what the
 /// assessment's engine inputs read, so a port the mapping treats as unavailable is also an
-/// unresolvable input (D-227 item 1).
+/// unresolvable input (D-231 item 1).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalisedCatalog<'a> {

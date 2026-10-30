@@ -1,5 +1,5 @@
 //! Per-port circuit breaker (DESIGN 03 §3.3 "Ports are bounded by deadline, breaker and
-//! bulkhead": 0.5 failures over 30 s, open 10 s; D-233). Pure: time is a parameter. The
+//! bulkhead": 0.5 failures over 30 s, open 10 s; D-237). Pure: time is a parameter. The
 //! window is `window / BUCKETS` wide buckets of (outcomes, failures); a bucket older than the
 //! window is cleared on touch. The infra wrapper owns one `Breaker` per port behind a mutex.
 use std::time::{Duration, Instant};
@@ -11,7 +11,7 @@ const BUCKET_COUNT: u32 = 30;
 /// `BUCKET_COUNT` as the array length (the single source of truth is `BUCKET_COUNT`).
 const BUCKETS: usize = BUCKET_COUNT as usize;
 
-/// The breaker's tunables (`gate.breaker` config; D-233).
+/// The breaker's tunables (`gate.breaker` config; D-237).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BreakerPolicy {
@@ -22,7 +22,7 @@ pub struct BreakerPolicy {
     pub window: Duration,
     /// How long an open breaker rejects before admitting one probe.
     pub open_for: Duration,
-    /// Outcomes the window must hold before the rate is judged (unratified, D-233).
+    /// Outcomes the window must hold before the rate is judged (unratified, D-237).
     pub min_calls: u32,
 }
 
@@ -72,7 +72,7 @@ impl BreakerPolicy {
     }
 }
 
-/// The three breaker states (metric value 0 / 2 / 1 as the OIDC plugin's gauge; D-233).
+/// The three breaker states (metric value 0 / 2 / 1 as the OIDC plugin's gauge; D-237).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BreakerState {
@@ -114,7 +114,7 @@ pub enum Admission {
     Reject,
 }
 
-/// How an admitted call ended, as the breaker sees it (D-233 item 2).
+/// How an admitted call ended, as the breaker sees it (D-237 item 2).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {

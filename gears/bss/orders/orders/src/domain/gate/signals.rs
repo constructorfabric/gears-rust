@@ -1,4 +1,4 @@
-//! What one assessment contributes to the gate's run-level signals (DESIGN 03 §3.8; D-233
+//! What one assessment contributes to the gate's run-level signals (DESIGN 03 §3.8; D-237
 //! item 3). Pure: the infra sink turns this into counters. Dedup is per run per
 //! `(predicate, origin, reason)` so a wide basket is one signal, not one per line.
 use super::assess::Assessment;

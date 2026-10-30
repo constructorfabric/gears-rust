@@ -56,11 +56,11 @@ pub struct OrdersConfig {
     pub gate: GateConfig,
 }
 
-/// The accepted gate deadline, in milliseconds; the bound of `dependency_timeout_ms` (D-240,
-/// unratified like D-227 item 5).
+/// The accepted gate deadline, in milliseconds; the bound of `dependency_timeout_ms` (D-244,
+/// unratified like D-231 item 5).
 const GATE_DEADLINE_MS_RANGE: std::ops::RangeInclusive<u32> = 1..=60_000;
 
-/// Gate port budgets (F03 §3.3 baselines, D-227 item 5; unratified). Missing = baseline.
+/// Gate port budgets (F03 §3.3 baselines, D-231 item 5; unratified). Missing = baseline.
 #[derive(Debug, Clone, Deserialize, ExpandVars)]
 #[serde(deny_unknown_fields)]
 pub struct GateConfig {
@@ -69,7 +69,7 @@ pub struct GateConfig {
     #[serde(default)]
     pub deadline_ms: std::collections::BTreeMap<crate::domain::gate::ports::GatePort, u32>,
     /// The deadline of the one `AuthN` client-credentials exchange per catalog read, in
-    /// milliseconds (D-194). Absent = 250, the gate port baseline (F03 §3.3; unratified, D-227
+    /// milliseconds (D-194). Absent = 250, the gate port baseline (F03 §3.3; unratified, D-231
     /// item 5).
     #[serde(default)]
     pub authority_exchange_deadline_ms: Option<u32>,
@@ -97,14 +97,14 @@ pub struct GateConfig {
     /// Submit requests per minute per authenticated subject (M2-5). `1..=600`; absent = 10.
     #[serde(default = "gate_baseline::submit_per_caller_per_minute")]
     pub submit_per_caller_per_minute: u32,
-    /// The per-port circuit breaker (F03 §3.3, D-233): one per port, shared by every run in
+    /// The per-port circuit breaker (F03 §3.3, D-237): one per port, shared by every run in
     /// the gear. Absent = enabled at the baselines below.
     #[serde(default)]
     pub breaker: BreakerConfig,
 }
 
 /// The gear-local per-port circuit breaker (F03 §3.3 "0.5 failures over 30 s, open 10 s";
-/// D-233, unratified). A deadline or a transient failure counts as a failure, a success or a
+/// D-237, unratified). A deadline or a transient failure counts as a failure, a success or a
 /// permanent answer as a success; an open port answers `Unavailable::Outage` without a call.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -124,7 +124,7 @@ pub struct BreakerConfig {
     #[serde(default = "gate_baseline::breaker_open_seconds")]
     pub open_seconds: u32,
     /// Outcomes the window must hold before the rate is judged; at least 1. Absent = 10
-    /// (unratified, D-233).
+    /// (unratified, D-237).
     #[serde(default = "gate_baseline::breaker_min_calls")]
     pub min_calls: u32,
 }

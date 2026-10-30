@@ -71,7 +71,7 @@ fn u(n: u128) -> Uuid {
     Uuid::from_u128(n)
 }
 /// The line token `main` issued at the same position: this branch's validated token without the
-/// version member `r` it added (D-242). `main`'s `Token` had no `r`; key order aside, this is
+/// version member `r` it added (D-246). `main`'s `Token` had no `r`; key order aside, this is
 /// its token.
 fn main_line_cursor(token: &bss_orders_sdk::reads::Cursor) -> bss_orders_sdk::reads::Cursor {
     use base64::Engine as _;

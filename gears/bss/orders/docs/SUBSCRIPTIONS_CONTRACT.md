@@ -1,4 +1,4 @@
-# Orders / Subscriptions proposed contract (D-238)
+# Orders / Subscriptions proposed contract (D-242)
 
 Status: Orders semantic adoption of Subscriptions PR 5516 at commit
 `56f7c6ca17e21be8c27db36bc902298b0d2c7886`, reviewed 2026-10-27.

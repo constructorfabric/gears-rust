@@ -97,7 +97,7 @@ pub struct BssOrdersGear {
     /// other build it stays `None` (route unmounted, SDK `NotDelivered`).
     preview: ArcSwapOption<crate::infra::gate::preview::PreviewService>,
     /// The submit service (S3-12), under the same development-delivery condition as `preview`;
-    /// the REST route (M3b, D-234) and the local SDK delegate to it, `None` in every other build.
+    /// the REST route (M3b, D-238) and the local SDK delegate to it, `None` in every other build.
     submit: ArcSwapOption<crate::infra::gate::submit::SubmitService>,
 }
 
@@ -684,7 +684,7 @@ impl RestApiCapability for BssOrdersGear {
             .merge(crate::api::rest::read::router(reads, openapi));
         // M2-1: the Preview and submit routes exist only in the development delivery (the
         // services are set only then); the production surface stays the census. Submit (M3b,
-        // D-234) is an existing-order write and shares the authoring routes' edge limiter.
+        // D-238) is an existing-order write and shares the authoring routes' edge limiter.
         if let Some(preview) = self.preview.load_full() {
             router = router.merge(crate::api::rest::gate::router(preview, openapi));
         }

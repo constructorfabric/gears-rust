@@ -1,5 +1,5 @@
 //! The complete ordered tri-state outcome vector (03 §3.1, §3.4; DESIGN `#contract-03-3-7`
-//! ordering and identity rules; D-195 blocking/primary selection; D-230 local refusals first).
+//! ordering and identity rules; D-195 blocking/primary selection; D-234 local refusals first).
 use super::evidence::UpstreamDetail;
 use super::predicates::PredicateId;
 use bss_orders_sdk::catalog::Reason;
@@ -22,7 +22,7 @@ pub enum Verdict {
     /// An input was unavailable, so the predicate could not be evaluated.
     Unevaluable,
 }
-/// How strongly an outcome binds each operation (D-195, D-227 item 6).
+/// How strongly an outcome binds each operation (D-195, D-231 item 6).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -72,7 +72,7 @@ pub enum Operation {
 /// Evaluation identity (DESIGN L6527-6538): `(predicate, line, item, selection presence, raw
 /// dimension value)`. Selected NULL and literal `"default"` are different keys.
 ///
-/// Its serde form (frozen vectors, D-231) is [`OutcomeKeyWire`]: the selection as the two flat
+/// Its serde form (frozen vectors, D-235) is [`OutcomeKeyWire`]: the selection as the two flat
 /// members `has_catalog_selection` and `catalog_scope_key`, byte-identical to the stored rows.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,7 +269,7 @@ pub enum VectorError {
 
 /// The complete vector, sorted by `OutcomeKey`, identities unique and reasons present. Its
 /// serde form is the outcome list; deserialization re-validates it through [`Vector::build`], so
-/// a frozen vector (a D-188 attempt's, D-231) never bypasses the identity rules.
+/// a frozen vector (a D-188 attempt's, D-235) never bypasses the identity rules.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "Vec<Outcome>", into = "Vec<Outcome>")]
@@ -388,10 +388,10 @@ impl Vector {
             })
             .collect()
     }
-    /// The primary Problem (DESIGN L5093; D-230 then D-195), within the blocking set in
+    /// The primary Problem (DESIGN L5093; D-234 then D-195), within the blocking set in
     /// declared order: the first failed outcome of a definitive local predicate
     /// (`PredicateSpec::definitive_local`), or any outcome carrying predicate 1's reason (the
-    /// D-228 item 6 withheld payer-dependent rows rank with it); otherwise the first unevaluable;
+    /// D-232 item 6 withheld payer-dependent rows rank with it); otherwise the first unevaluable;
     /// otherwise the first failed. `None` when nothing blocks.
     #[must_use]
     pub fn primary(&self, op: Operation) -> Option<&Outcome> {
@@ -436,12 +436,12 @@ pub struct StoredOutcome {
     pub upstream_detail: Option<serde_json::Value>,
 }
 
-/// D-230: a definitive local business refusal: a failed outcome of a `definitive_local`
+/// D-234: a definitive local business refusal: a failed outcome of a `definitive_local`
 /// predicate, or an outcome carrying predicate 1's reason (`axis-invalid`,
-/// `payer-relationship-unconfirmed`), which the D-228 item 6 withheld rows carry as unevaluable.
+/// `payer-relationship-unconfirmed`), which the D-232 item 6 withheld rows carry as unevaluable.
 /// Unsupported authored terms or inconsistent cycles are also definitive local refusals.
 /// The assessment reads it on the primary to present every composite-gate input `Resolved`
-/// (D-230 engine presentation).
+/// (D-234 engine presentation).
 pub(crate) fn definitive_local(o: &Outcome) -> bool {
     (o.verdict == Verdict::Failed && o.key.predicate.spec().definitive_local)
         || matches!(
@@ -454,7 +454,7 @@ pub(crate) fn definitive_local(o: &Outcome) -> bool {
         )
 }
 
-/// D-195 / D-227 item 6: `tcv-only` and `preview-forecast` outcomes never block a Preview; on
+/// D-195 / D-231 item 6: `tcv-only` and `preview-forecast` outcomes never block a Preview; on
 /// submit and amendment `tcv-only` blocks (TCV is required, D-197).
 #[must_use]
 pub fn blocking(op: Operation, o: &Outcome) -> bool {

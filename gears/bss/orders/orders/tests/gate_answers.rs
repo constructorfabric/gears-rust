@@ -781,7 +781,7 @@ fn overlap_key_refuses_unknown_members() {
     }
 }
 
-/// R9 (D-144, D-236 item 6): a committed line stores its keys in `overlap_item_keys` with a
+/// R9 (D-144, D-240 item 6): a committed line stores its keys in `overlap_item_keys` with a
 /// NULL scalar (`commit.rs`). The re-check decodes the row through `StoredLine::from_stored`,
 /// so a collection-only line is keyed and occupancy is read; a scalar-only reading of the same
 /// row would `Proceed` unread.

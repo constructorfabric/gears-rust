@@ -1,5 +1,5 @@
 //! The assessment's outbound reads (S3-02) and their call discipline (S3-09, F03 §3.3):
-//! deadlines, bulkheads, run caps, and one gear-wide circuit breaker per port (D-233; see
+//! deadlines, bulkheads, run caps, and one gear-wide circuit breaker per port (D-237; see
 //! [`budget`]). Every call, retry, breaker state and run outcome is reported to the
 //! [`signals::GateSignals`] sink the [`budget::Budget`] carries. The assessed vector is persisted
 //! by [`writer`] (S3-10).

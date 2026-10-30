@@ -127,7 +127,7 @@ impl PreviewLine {
 /// `tcvWithheld`, everything else is `snake_case`.
 ///
 /// Decoding refuses a body whose `assessment_id` differs from `assessment.assessment_id`: the
-/// two are one identity, so a disagreement is a corrupt body, not a choice (D-229: consumers
+/// two are one identity, so a disagreement is a corrupt body, not a choice (D-233: consumers
 /// read the fields and never build the value).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "PreviewResultWire")]

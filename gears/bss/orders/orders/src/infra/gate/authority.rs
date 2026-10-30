@@ -21,7 +21,7 @@ use uuid::Uuid;
 pub const SERVICE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
 
 /// The baseline deadline of the one `AuthN` exchange per `PricingCatalogReads::read_lines` call:
-/// the baseline of a gate port (250 ms; D-227 item 5 is unratified), so a hung `IdP` cannot stall
+/// the baseline of a gate port (250 ms; D-231 item 5 is unratified), so a hung `IdP` cannot stall
 /// an assessment (F03 §3.3). `gate.authority_exchange_deadline_ms` overrides it.
 pub const AUTHORITY_EXCHANGE_DEADLINE: StdDuration = StdDuration::from_millis(250);
 
@@ -136,7 +136,7 @@ impl CommercialAuthority for NotProvisioned {
 /// The `AuthN` client-credentials authority over `gate.commercial_identities`, keyed by seller.
 /// Every call exchanges: `AuthenticationResult` carries no token expiry today
 /// (`authn-resolver-sdk/src/models.rs`), so no context is cached; re-add a cache when the SDK
-/// exposes one (D-240). Each submit phase resolves its own context (D-194).
+/// exposes one (D-244). Each submit phase resolves its own context (D-194).
 pub struct AuthnAuthority {
     resolver: Arc<dyn AuthNResolverClient>,
     identities: BTreeMap<Uuid, CommercialIdentityConfig>,

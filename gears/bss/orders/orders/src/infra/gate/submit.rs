@@ -48,7 +48,7 @@
 //!    reference, the frozen date basis and the seller's service principal, D-194) and
 //!    [`Engine::prepare_commercial_attempt`] claims the key and reserves the candidate; the
 //!    line requests, the overlap keys and the run's assessment, evaluation, gate report and
-//!    outcome vector (D-231) are frozen from that candidate inside the reservation transaction
+//!    outcome vector (D-235) are frozen from that candidate inside the reservation transaction
 //!    ([`FrozenLineInputs`]), after being proven buildable before it. A settled same-key replay is returned as settled;
 //! 9. phase B: for every line without a recorded result, Pricing's `SellabilityV1::check` as the
 //!    attempt's frozen commercial subject (resolved again through the seller's authority and
@@ -477,7 +477,7 @@ impl SubmitService {
     }
 
     /// Phases B and C of a reserved or recovered attempt (module doc, steps 9–10): both read
-    /// only the attempt's frozen inputs, its gate report and outcome vector included (D-231).
+    /// only the attempt's frozen inputs, its gate report and outcome vector included (D-235).
     async fn continue_attempt(
         &self,
         caller: &Caller,

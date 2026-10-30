@@ -418,7 +418,7 @@ fn line_cursor_version_comes_from_the_validated_decode() {
     assert_eq!(decode_cursor_bound(&plain, lines).unwrap().version, None);
 }
 
-/// D-242: `main` issued line tokens without the version member, and `main` never committed a
+/// D-246: `main` issued line tokens without the version member, and `main` never committed a
 /// version, so such a token is bound to the creation version; a bound token keeps its own.
 #[test]
 fn a_version_less_line_token_is_bound_to_the_creation_version() {

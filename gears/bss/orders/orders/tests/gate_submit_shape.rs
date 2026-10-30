@@ -839,7 +839,7 @@ fn the_stored_attempt_decodes_back_to_its_requests_and_order() {
     assert!(tamper(
         &|v| v[&first]["query"]["quantity"] = serde_json::json!("3")
     ));
-    // D-231: the gate report and the outcome vector are frozen with the order; a vector that
+    // D-235: the gate report and the outcome vector are frozen with the order; a vector that
     // breaks the identity rules (a reason on a passed outcome) never decodes.
     assert_eq!(decoded.order.vector, frozen_vector(&inputs.lines));
     assert_eq!(decoded.order.report, order.report);
@@ -2197,7 +2197,7 @@ fn frozen_order_decodes_a_report_written_as_value() {
     );
 }
 
-/// D-242: an attempt frozen before D-241 may hold an exact pair with a common factor, which
+/// D-246: an attempt frozen before D-245 may hold an exact pair with a common factor, which
 /// Orders then accepted and reduced when rendering totals. The stored decode reduces it, so the
 /// attempt still recovers with the same totals instead of failing as `Integration` on every
 /// retry; a part that was never canonical still refuses, and the wire stays strict.
@@ -2241,7 +2241,7 @@ fn a_stored_unreduced_exact_pair_decodes_reduced() {
         decode_line_requests(&value).map(|_| ()),
         Err(bss_orders::domain::gate::commercial::MalformedRequests::member("order"))
     );
-    // The port wire stays strict (money ADR rule 6, D-241 item 2).
+    // The port wire stays strict (money ADR rule 6, D-245 item 2).
     assert!(
         serde_json::from_value::<ExactMoney>(serde_json::json!({
             "numerator": "40", "denominator": "2", "currency": "USD", "currency_scale": 2
@@ -2250,7 +2250,7 @@ fn a_stored_unreduced_exact_pair_decodes_reduced() {
     );
 }
 
-/// D-242: the stored decode reduces only the typed `ExactMoney` positions of the evaluation.
+/// D-246: the stored decode reduces only the typed `ExactMoney` positions of the evaluation.
 /// Producer evidence (`TotalsDeclaration`'s opaque members, `Tcv.evidence`) is copied verbatim
 /// into `resolved_total` rows (D-197/D-216), so a money-shaped unreduced object there keeps its
 /// stored bytes, while unreduced typed pairs (a negative discount, the TCV carrier) are reduced.

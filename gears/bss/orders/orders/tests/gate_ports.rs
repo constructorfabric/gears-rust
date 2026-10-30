@@ -1,4 +1,4 @@
-//! D-227: the port inventory is the code. Every row of the decision's table is asserted here.
+//! D-231: the port inventory is the code. Every row of the decision's table is asserted here.
 use InputPort as I;
 use Reason as R;
 use bss_orders::domain::gate::ports::{Delivery, GatePort, PortAnswer, Unavailable};
@@ -133,7 +133,7 @@ const fn missing(package: &'static str, upreq: &'static str) -> Delivery {
     Delivery::Missing { package, upreq }
 }
 
-/// The D-227 item 1 table, row for row.
+/// The D-231 item 1 table, row for row.
 const TABLE: &[Row] = &[
     (
         GatePort::CurrentRevision,

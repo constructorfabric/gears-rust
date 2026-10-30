@@ -8,11 +8,11 @@ names (``OrdersPreviewResult`` in ``orders/src/api/rest/dto.rs``) and the store 
 ``env.psql``.
 
 Preview is nonbinding: a gate run whose failures are reported **inside** a 200 result
-(``assessment.failures``, D-229 shape) rather than as a refusal. ``PreviewService::run``
+(``assessment.failures``, D-233 shape) rather than as a refusal. ``PreviewService::run``
 (``orders/src/infra/gate/preview.rs``) refuses only before the run (``request-invalid``, the
 per-caller limiter, the axis-specific authorization) or when the run, the date basis or the
-diagnostics write cannot complete (sanitized 503). An unconfirmed payer relationship (D-228) and a
-port the fixture does not state (``Unavailable(Missing)``, D-227) are therefore asserted as 200
+diagnostics write cannot complete (sanitized 503). An unconfirmed payer relationship (D-232) and a
+port the fixture does not state (``Unavailable(Missing)``, D-231) are therefore asserted as 200
 assessments naming the registered reason, with the reason's catalog row checked to be the
 refusal submit would answer.
 
@@ -52,14 +52,14 @@ CATALOG_JSON = PROJECT_ROOT / "gears" / "bss" / "orders" / "orders-sdk" / "contr
 # successful response, not an error row, so it is not in catalog.json `errors[]`. Pinned by
 # `TCV_WITHHELD_REASON` in `orders/src/domain/gate/report.rs` and `gate_preview_shape.rs`.
 TCV_WITHHELD_REASON = "preview-term-or-cycle-missing"
-# The predicates D-228 item 6 withholds while the payer relationship is unconfirmed (per line).
+# The predicates D-232 item 6 withholds while the payer relationship is unconfirmed (per line).
 PAYER_WITHHELD = (
     "orders.market-consistency",
     "orders.overlap-uniqueness",
     "orders.in-flight-per-key",
     "orders.pin-composition",
 )
-# The nine undelivered ports of D-227 the development stubs answer (`GatePort::ALL` minus the
+# The nine undelivered ports of D-231 the development stubs answer (`GatePort::ALL` minus the
 # three catalog ports, `orders/src/domain/gate/ports.rs`); twelve ports in all.
 STUBBED_PORTS = 9
 GATE_PORTS = 12
@@ -214,7 +214,7 @@ def test_preview_withholds_tcv_when_a_line_has_no_term(env: OrdersEnv, buyer: Bu
     assert _gate_rows(env, result["assessment_id"]) == len(result["assessment"]["outcomes"])
 
 
-# ── An unconfirmed payer relationship (D-228, D-229, D-230) ────────────────
+# ── An unconfirmed payer relationship (D-232, D-233, D-234) ────────────────
 
 
 def test_preview_reports_an_unconfirmed_payer_relationship(env: OrdersEnv, buyer: Buyer, catalog: Catalog):
@@ -222,7 +222,7 @@ def test_preview_reports_an_unconfirmed_payer_relationship(env: OrdersEnv, buyer
 
     The policy names no payer (D-215), so the buyer is authorized; the gate's predicate 1 fails
     with ``payer-relationship-unconfirmed`` and withholds every payer-dependent row under the same
-    reason (D-228 item 6). Preview reports it in its 200 assessment, the same all-failures report
+    reason (D-232 item 6). Preview reports it in its 200 assessment, the same all-failures report
     submit carries in ``context.data.assessment`` of the registered 400.
     """
     reason = "payer-relationship-unconfirmed"
@@ -276,7 +276,7 @@ def test_preview_checks_the_order_contract(
         assert any(f["reason"] == reason and f.get("line_id") is None for f in failures), failures
 
 
-# ── A port the fixture does not state (D-227 `Unavailable(Missing)`) ───────
+# ── A port the fixture does not state (D-231 `Unavailable(Missing)`) ───────
 
 
 def test_preview_reports_unavailable_when_a_fixture_port_is_missing(
@@ -285,7 +285,7 @@ def test_preview_reports_unavailable_when_a_fixture_port_is_missing(
     """``write_fixture`` states payer profiles for ``PAYER_TENANT`` and ``FOREIGN_TENANT`` only.
 
     A basket paid by ``PARTNER_TENANT`` (a real tenant, authorized because the policy names no
-    payer) makes the stubbed identity-profile port answer ``Unavailable(Missing)``: D-227's
+    payer) makes the stubbed identity-profile port answer ``Unavailable(Missing)``: D-231's
     inventory maps that port to ``identity-party-unavailable``, which predicate 4-Orders reports
     unevaluable for the line (``assess``: the identity port outranks the assessment). The basket
     keeps the seeded plan revision, because a revision the fixture does not state is first refused

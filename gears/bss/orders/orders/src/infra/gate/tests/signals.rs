@@ -1,5 +1,5 @@
 //! The gate signal sink: the recording double captures every call, the `OTel` sink emits the
-//! D-233 instruments with their labels, and the flow tokens and ceilings are the 03 §3.8 values.
+//! D-237 instruments with their labels, and the flow tokens and ceilings are the 03 §3.8 values.
 //! In-crate: runs in the `orders-pg` CI lane with `gate-dev-stubs`.
 #![allow(
     clippy::unwrap_used,
@@ -95,7 +95,7 @@ pub(super) fn exported(
     points
 }
 
-/// The D-233 gate instruments [`OtelGateSignals::new`] builds. Other `bss-orders` instruments
+/// The D-237 gate instruments [`OtelGateSignals::new`] builds. Other `bss-orders` instruments
 /// (throttle, read, workers, gear) share the global meter in the same process, so an exact-set
 /// assertion first keeps only these names.
 const D233_INSTRUMENTS: [&str; 16] = [
@@ -117,7 +117,7 @@ const D233_INSTRUMENTS: [&str; 16] = [
     "orders_gate_requests_total",
 ];
 
-/// The exported points of the D-233 gate instruments only.
+/// The exported points of the D-237 gate instruments only.
 fn gate_points(points: BTreeSet<Point>) -> BTreeSet<Point> {
     points
         .into_iter()
@@ -211,7 +211,7 @@ fn the_flow_tokens_are_the_label_values() {
     assert_eq!(Flow::Submit.token(), "submit");
 }
 
-/// Every D-233 instrument the calls below touch is exported under its name with exactly its
+/// Every D-237 instrument the calls below touch is exported under its name with exactly its
 /// labels: `port`/`outcome` on calls (no seller attribute), `flow` on runs, and the catalog
 /// tenant only on the catalog denial counter. Only the Preview run past its 2500 ms ceiling is
 /// counted over the ceiling; the instant Submit run is not.

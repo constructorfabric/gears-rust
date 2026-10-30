@@ -6,8 +6,8 @@
 //! (`OrdersError::into_problem`, `ReasonMapping::http_status`) produced at 53091e0d5 for every
 //! registered reason, every settled diagnostic shape and every infrastructure error. These tests
 //! prove the wire unchanged byte for byte and every reason round-trips. A reason registered after
-//! the capture (D-228 `payer-relationship-unconfirmed`) gains its entries written from its catalog
-//! row in the shape of the captured entries of the same category and status; D-229 adds one
+//! the capture (D-232 `payer-relationship-unconfirmed`) gains its entries written from its catalog
+//! row in the shape of the captured entries of the same category and status; D-233 adds one
 //! settled entry carrying the optional `assessment` gate report member the same way.
 //!
 //! Settled bodies are stored as JSON values and replayed through `sort_all_objects`
@@ -179,7 +179,7 @@ fn the_canonical_round_trip_cannot_carry_an_orders_refusal() {
         }
     }
     // Measured: 72 of the 92 reasons are rejected; the 20 not_found, already_exists and
-    // service_unavailable reasons convert without their code and diagnostics. D-228 added
+    // service_unavailable reasons convert without their code and diagnostics. D-232 added
     // `payer-relationship-unconfirmed` (FailedPrecondition), one more rejected reason.
     assert_eq!((rejected, Reason::ALL.len()), (72, 92));
     assert_eq!(

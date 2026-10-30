@@ -1,7 +1,7 @@
 """Live HTTP/PostgreSQL E2E for submit over the development delivery (Orders Stage 3, M3b).
 
 Every test is a buyer (or a caller who is not one) driving
-``POST /bss-orders/v1/orders/{orderId}/submit`` (D-234) on boot 2 of the suite: the real Pricing
+``POST /bss-orders/v1/orders/{orderId}/submit`` (D-238) on boot 2 of the suite: the real Pricing
 and Products answer the catalog ports for the plan seeded on boot 1, the development stubs answer
 the nine undelivered ports from the per-run fixture (M3B-7), and the development
 ``SellabilityStub`` issues Pricing's acceptance receipts (``gear.rs`` ``dev_acceptance``).
@@ -856,7 +856,7 @@ def test_submit_refuses_an_unsellable_line_with_the_gate_report(
 
     The refusal settles through the engine's composite gate (step 7): the run's rows name the
     order and no version, one resolved refused audit row, and the settled Problem carries the
-    complete gate report in ``context.data.assessment`` (D-229). No attempt, version or claim.
+    complete gate report in ``context.data.assessment`` (D-233). No attempt, version or claim.
     """
     reason = "catalog-predicate-failed"
     order_id, line_id = _draft_with_line(env, buyer, catalog)

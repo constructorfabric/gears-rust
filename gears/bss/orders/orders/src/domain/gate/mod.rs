@@ -1,11 +1,11 @@
-//! The shared gate assessment's pure core (03 §3.1–§3.4; D-187, D-195, D-227): what the
+//! The shared gate assessment's pure core (03 §3.1–§3.4; D-187, D-195, D-231): what the
 //! assessment decides over typed port answers. Resolution (`infra::gate`) and the engine
 //! (`infra::engine`) are outside; this module makes no call and touches no storage.
 
-/// The per-port circuit breaker state machine (03 §3.3, D-233).
+/// The per-port circuit breaker state machine (03 §3.3, D-237).
 pub mod breaker;
 
-/// The outbound port inventory and typed unavailability (D-227 items 1 and 2).
+/// The outbound port inventory and typed unavailability (D-231 items 1 and 2).
 pub mod ports;
 
 /// Orders mapping/coverage registry version persisted with every outcome (D-195, `mapping_version`).
@@ -33,7 +33,7 @@ pub mod pricing_map;
 pub mod recheck;
 /// The pure Preview result shaping (S3-11, D-125): assessment and answers into `PreviewResult`.
 pub mod report;
-/// What one assessment contributes to the run-level signals (03 §3.8, D-233).
+/// What one assessment contributes to the run-level signals (03 §3.8, D-237).
 pub mod signals;
 /// Submit's `resolved_total` rows from the frozen evaluation (S3-12, D-197, D-216).
 pub mod totals;

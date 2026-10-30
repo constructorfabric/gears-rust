@@ -523,7 +523,7 @@ fn only_preview_asks_for_tax() {
     assert!(!plan(&basket(Operation::Amendment, two_lines())).tax);
 }
 
-// ---- identity gate (D-215, D-228) ----
+// ---- identity gate (D-215, D-232) ----
 
 #[test]
 fn the_identity_gate_follows_both_relationship_flags() {
@@ -544,7 +544,7 @@ fn the_identity_gate_follows_both_relationship_flags() {
             IdentityGate::Unavailable
         );
     }
-    // Invalid axes alone do not withhold: the assessment fails predicate 1 on them (D-228).
+    // Invalid axes alone do not withhold: the assessment fails predicate 1 on them (D-232).
     let mut p = profile(true, true);
     p.axes_valid = false;
     assert_eq!(
@@ -940,9 +940,9 @@ fn a_port_not_asked_is_missing_and_unconfirmed_payer_inputs_are_resolved_by_with
         PortAnswer::Unavailable(Unavailable::Missing)
     ));
     let out = assess(&input).unwrap();
-    // D-228 item 6: the gate resolves the withheld inputs, the unasked evaluation included
+    // D-232 item 6: the gate resolves the withheld inputs, the unasked evaluation included
     // (never `Precluded`: predicate 1 is inside the gate, not an earlier guard); with the
-    // primary a definitive local refusal every gate input is `Resolved` (D-230).
+    // primary a definitive local refusal every gate input is `Resolved` (D-234).
     for p in [
         InputPort::Identity,
         InputPort::PricingRevision,
@@ -955,7 +955,7 @@ fn a_port_not_asked_is_missing_and_unconfirmed_payer_inputs_are_resolved_by_with
     ] {
         assert_eq!(out.inputs.get(p), Some(InputState::Resolved), "{p:?}");
     }
-    // Unasked terms are withheld, not a port outage (D-228 item 6): the pin rows carry
+    // Unasked terms are withheld, not a port outage (D-232 item 6): the pin rows carry
     // predicate 1's reason and no failure carries the 503 pin reason.
     let unconfirmed = bss_orders_sdk::catalog::Reason::PayerRelationshipUnconfirmed;
     for l in [line_id(1), line_id(2)] {
@@ -977,7 +977,7 @@ fn a_port_not_asked_is_missing_and_unconfirmed_payer_inputs_are_resolved_by_with
     assert_eq!(out.primary.and_then(|o| o.reason), Some(unconfirmed));
 }
 
-/// D-242 (C6 × B3): a refused purchase shape (items stating different quantities) is never
+/// D-246 (C6 × B3): a refused purchase shape (items stating different quantities) is never
 /// composed, so the orchestrator never asks a key for it; the full key answer then holds no entry
 /// `assess` calls foreign, and the other keyed line's rows 7/9 report the in-flight read, never
 /// `overlap-key-answer-rejected`.
@@ -1108,7 +1108,7 @@ fn failures_and_the_primary_are_deterministic_across_answer_order() {
     assert_eq!(out, expected);
 }
 
-// ---- D-227 boundary ----
+// ---- D-231 boundary ----
 
 #[test]
 fn the_orchestrator_never_names_the_phase_b_sellability_check() {
@@ -1258,7 +1258,7 @@ fn pin_refuses_terms_and_recurring_cycles_that_disagree_with_evaluation() {
     }
 }
 
-/// R5 (OQ-C1 a, amends D-236 item 2): terms submit cannot freeze into a Pricing request (no
+/// R5 (OQ-C1 a, amends D-240 item 2): terms submit cannot freeze into a Pricing request (no
 /// snapshot, another schema, a non-UTC zone, a seller-policy source at version 0) refuse the
 /// pin-composition row `billing-terms-unsupported` on every operation, never a 500 at submit.
 #[test]
@@ -1710,7 +1710,7 @@ fn a_policy_version_that_is_not_a_canonical_positive_integer_is_malformed() {
     }
 }
 
-/// R5 (OQ-C2, D-231 item 12, D-227 item 4): a bundle line whose items state different quantities
+/// R5 (OQ-C2, D-235 item 12, D-231 item 4): a bundle line whose items state different quantities
 /// is an unsupported purchase shape: `reference-unresolvable` at assessment on every
 /// operation, never a 500 at submit. Each quantity alone passes the floor.
 #[test]

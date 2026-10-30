@@ -1,4 +1,4 @@
-//! In-crate gate tests. They run in the `orders-pg` CI lane with `--features gate-dev-stubs` (D-240).
+//! In-crate gate tests. They run in the `orders-pg` CI lane with `--features gate-dev-stubs` (D-244).
 mod authority;
 mod budget;
 pub mod doubles;

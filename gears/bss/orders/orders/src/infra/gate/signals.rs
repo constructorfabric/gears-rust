@@ -1,4 +1,4 @@
-//! What the gate reports (DESIGN 03 §3.8; D-233 item 3; D-223 naming): per port, every bounded
+//! What the gate reports (DESIGN 03 §3.8; D-237 item 3; D-223 naming): per port, every bounded
 //! call's outcome and duration, its retry, the breaker's state and transitions, and an unavailable
 //! answer by kind; per run, the outcome, the refused and unevaluable predicates, the pin and
 //! occupancy signals and the resolution time against the flow's ceiling; per entry point, every

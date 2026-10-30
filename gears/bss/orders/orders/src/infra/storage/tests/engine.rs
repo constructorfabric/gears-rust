@@ -2601,7 +2601,7 @@ async fn an_outbox_insert_failure_rolls_back_the_business_effect_and_audit() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// M2-2 (D-231): the engine writes the gate's diagnostic run inside the transition transaction.
+// M2-2 (D-235): the engine writes the gate's diagnostic run inside the transition transaction.
 
 /// A small run: an order-level pass and a line-level failure.
 fn gate_vector() -> crate::domain::gate::vector::Vector {

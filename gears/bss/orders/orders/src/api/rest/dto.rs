@@ -329,7 +329,7 @@ pub struct OrdersLinePatch {
 }
 
 /// Submit carries only its independent draft revision; actor/version/key are not body fields.
-/// Mounted only in the development delivery beside Preview (M3b, D-234:
+/// Mounted only in the development delivery beside Preview (M3b, D-238:
 /// [`super::gate::submit_router`]); the boundary fixtures decode it too.
 #[toolkit_macros::api_dto(request)]
 #[derive(Debug)]

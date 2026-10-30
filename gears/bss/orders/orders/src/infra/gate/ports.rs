@@ -1,4 +1,4 @@
-//! The nine gate ports whose providers are not delivered (D-227 item 1), typed by the Task 6a
+//! The nine gate ports whose providers are not delivered (D-231 item 1), typed by the Task 6a
 //! request and answer types (`domain::gate::answers`). Each method reads as the given principal
 //! (the identity, contracts, overlap, occupancy, evaluation and tax ports take the caller's `ctx`;
 //! the D-194 service-principal reads, billing terms, acceptance policy and assessment, take none
@@ -34,11 +34,11 @@ pub trait IdentityReads: Send + Sync {
 
 /// Contracts: party eligibility of the referenced contracts, by contract id (S4-02).
 ///
-/// D-215/D-228: the orchestrator must not call it before the payer relationship is confirmed
+/// D-215/D-232: the orchestrator must not call it before the payer relationship is confirmed
 /// (the identity answer has `in_relationship_with_seller` and `in_relationship_with_resource`
 /// both true). With the relationship unconfirmed the assessment ignores this port's answer, its
 /// rows carry `payer-relationship-unconfirmed` and its engine input is `Resolved` by the
-/// composite gate's withholding (D-228 item 6).
+/// composite gate's withholding (D-232 item 6).
 #[async_trait]
 pub trait ContractReads: Send + Sync {
     /// The port's answer, read as `ctx` under `run` and `cancel`.
@@ -56,11 +56,11 @@ pub trait ContractReads: Send + Sync {
 
 /// Subscriptions: the catalog subscription product key of each line (#5131 SUB-G1; S5-06a).
 ///
-/// D-215/D-228: the orchestrator must not call it before the payer relationship is confirmed
+/// D-215/D-232: the orchestrator must not call it before the payer relationship is confirmed
 /// (the identity answer has `in_relationship_with_seller` and `in_relationship_with_resource`
 /// both true). With the relationship unconfirmed the assessment ignores this port's answer, its
 /// rows carry `payer-relationship-unconfirmed` and its engine input is `Resolved` by the
-/// composite gate's withholding (D-228 item 6).
+/// composite gate's withholding (D-232 item 6).
 #[async_trait]
 pub trait OverlapKeyReads: Send + Sync {
     /// The port's answer, read as `ctx` under `run` and `cancel`.
@@ -80,11 +80,11 @@ pub trait OverlapKeyReads: Send + Sync {
 
 /// Subscriptions: overlap presence per scope (#5131 `getOverlapOccupancy`; S5-06a).
 ///
-/// D-215/D-228: the orchestrator must not call it before the payer relationship is confirmed
+/// D-215/D-232: the orchestrator must not call it before the payer relationship is confirmed
 /// (the identity answer has `in_relationship_with_seller` and `in_relationship_with_resource`
 /// both true). With the relationship unconfirmed the assessment ignores this port's answer, its
 /// rows carry `payer-relationship-unconfirmed` and its engine input is `Resolved` by the
-/// composite gate's withholding (D-228 item 6).
+/// composite gate's withholding (D-232 item 6).
 #[async_trait]
 pub trait OccupancyReads: Send + Sync {
     /// The port's answer, read as `ctx` under `run` and `cancel`.

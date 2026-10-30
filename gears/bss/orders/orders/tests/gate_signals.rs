@@ -3,7 +3,7 @@
     clippy::expect_used,
     reason = "test code: a failed setup or fixture must stop the test at once; `allow`, not `expect`, because not every item unwraps or expects"
 )]
-//! Run-level signals one assessment contributes (DESIGN 03 §3.8; D-126, D-233).
+//! Run-level signals one assessment contributes (DESIGN 03 §3.8; D-126, D-237).
 use bss_orders::domain::dates::{
     DateBasis, DatePolicySnapshot, PLATFORM_DEFAULT_POLICY_ID, PolicyRow, SuppliedDates,
 };

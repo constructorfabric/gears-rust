@@ -1429,7 +1429,7 @@ async fn acceptance_transient_retries_once_then_succeeds() {
     assert_eq!(result.unwrap(), 9);
     let starts = starts.into_inner();
     assert_eq!(starts.len(), 2, "{starts:?}");
-    // The retry waits the same bounded jittered pause as a gate port (D-240).
+    // The retry waits the same bounded jittered pause as a gate port (D-244).
     assert!(starts[1] > Duration::ZERO, "{starts:?}");
     assert!(starts[1] <= RETRY_PAUSE, "{starts:?}");
 }

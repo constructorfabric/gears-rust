@@ -1,4 +1,4 @@
-//! The fault-injection matrix (D-233 item 6; 03 §3.8): one test per injected condition, each
+//! The fault-injection matrix (D-237 item 6; 03 §3.8): one test per injected condition, each
 //! proving that the signal behind its alert moves. Rows 1–7 drive `Orchestrator::run` over the
 //! orchestrate harness (the counted stubs over the example fixture or a row fixture under
 //! `fixtures/`, and, where Pricing is the fault, the production catalog adapter over
@@ -501,7 +501,7 @@ async fn alert_4_missing_assessment_makes_predicates_unevaluable() {
 /// Row 5 (alert: unevaluable rate, D-126). No occupancy entry for the line's overlap key: the
 /// occupancy port answers missing and the run reports occupancy incomplete, with overlap
 /// uniqueness unevaluable `overlap-presence-unevaluable`. (An entry that omits
-/// `max_concurrent_active` is a decode error; only an explicit `null` is unlimited: D-233 item 9.)
+/// `max_concurrent_active` is a decode error; only an explicit `null` is unlimited: D-237 item 9.)
 #[tokio::test(start_paused = true)]
 async fn alert_5_missing_occupancy_entry_sets_the_d126_flag() {
     let (budget, sink) = budget(&GateConfig::default());
@@ -652,7 +652,7 @@ async fn alert_7_slow_resolve_crosses_the_preview_ceiling() {
     );
 }
 
-/// Row 8 (no alert; D-233 item 2). One call past the gear-wide bulkhead is backpressure at once,
+/// Row 8 (no alert; D-237 item 2). One call past the gear-wide bulkhead is backpressure at once,
 /// an outage to its run, and not a breaker failure: the breaker stays closed.
 #[tokio::test]
 async fn alert_8_backpressure_is_not_a_breaker_failure() {

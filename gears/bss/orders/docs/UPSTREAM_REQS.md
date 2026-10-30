@@ -3,7 +3,7 @@
 
 # UPSTREAM_REQS — Orders
 
-> **D-238 protected-capacity amendment (2026-10-27):** [Proposed Orders / Subscriptions contract](SUBSCRIPTIONS_CONTRACT.md) adopts PR5516's three-count full-tuple semantics, confirmation-before-capture reservation, protected own conversion/resume and lower-limit preservation. It supersedes active-only/release-on-leaving-active and activation-intent-only reservation wording below for the target contract. Historical/local active-only behavior remains legacy development behavior. Item mapping and versioned observation DTOs now have an Orders-local implementation (`a81090675`, `cd82261cf`) of the proposed contract. Real owner SDKs, atomic reservation/financial protocols, Workflow integration and bilateral conformance remain open. No provider checkbox is closed.
+> **D-242 protected-capacity amendment (2026-10-27):** [Proposed Orders / Subscriptions contract](SUBSCRIPTIONS_CONTRACT.md) adopts PR5516's three-count full-tuple semantics, confirmation-before-capture reservation, protected own conversion/resume and lower-limit preservation. It supersedes active-only/release-on-leaving-active and activation-intent-only reservation wording below for the target contract. Historical/local active-only behavior remains legacy development behavior. Item mapping and versioned observation DTOs now have an Orders-local implementation (`a81090675`, `cd82261cf`) of the proposed contract. Real owner SDKs, atomic reservation/financial protocols, Workflow integration and bilateral conformance remain open. No provider checkbox is closed.
 
 
 <!-- toc -->
@@ -57,7 +57,7 @@ Orders Workflow PRD ([`DECISIONS.md`](./DECISIONS.md) Q-04).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-pre-subscription-billing-terms`
 
-**Stage 3 status (D-227, 2026-10-22):** S3-04, port `billing-terms`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S3-04, port `billing-terms`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **D-193, proposed missing producer:** Subscriptions must expose the authorized, side-effect-free
 [pre-subscription billing-terms resolver](DESIGN.md#contract-03-billing-terms-resolution).
@@ -100,7 +100,7 @@ provenance, not an already registered callable API. Owner implementation/conform
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-overlap-presence-read`
 
-**Stage 3 status (D-227, 2026-10-22):** S5-06a, port `occupancy`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S5-06a, port `occupancy`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **Residual Task 10 proposed development mirror (2026-10-27):** occupancy requires
 `count_scope` (`per_payer` or `full_tuple`), independent of `LimitProvenance`'s limit
@@ -110,14 +110,14 @@ counts use active count plus this basket. Workflow must mirror the required fiel
 and updated activation vectors; Subscriptions scope/encoding agreement and production
 provider delivery remain outstanding. This is not D-198 admission delivery.
 
-**Stage 3 note (D-233 item 9, 2026-10-26): encode "unlimited" explicitly.** The proposed
+**Stage 3 note (D-237 item 9, 2026-10-26): encode "unlimited" explicitly.** The proposed
 `MaxConcurrentActive` wire form Orders decodes today (`domain/gate/answers.rs`; #5131 leaves the
 encoding unspecified) writes "unlimited" as `null`, so an answer that lacks the limit decodes as
 `Unlimited` and D-126's `defer(overlap-presence-unevaluable)` for a missing limit is unreachable: a
 missing limit passes as no limit, which fails open. Subscriptions must encode "unlimited" as an
 explicit value distinct from `null` and absence, and an answer without the limit must fail
 decoding. Orders keeps the proposed form until the encoding is agreed; Workflow #4787 mirrors the
-same ask (D-231 item 10).
+same ask (D-235 item 10).
 
 An **overlap-key occupancy read**: batched, and for each `(payer_tenant_id, resource_tenant_id, overlap_scope_key)`
 returning `(activeCount, maxConcurrentActive, provenance)` — the number of subscriptions `active`
@@ -369,7 +369,7 @@ SDK availability alone does not close this requirement.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-pricing-purchase-assessment`
 
-**Stage 3 status (D-227, 2026-10-22):** S3-03, port `assessment`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S3-03, port `assessment`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **Reconciled scope; stable ID (D-189).** Pricing must implement the proposed separate
 `PricingAssessmentV1::assess` SafeRead described in the [normative contract](DESIGN.md#contract-03-nonbinding-assessment).
@@ -394,7 +394,7 @@ No upstream implementation or permission provisioning is claimed here.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-pricing-acceptance-policy`
 
-**Stage 3 status (D-227, 2026-10-22):** S3-05, port `acceptance-policy`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S3-05, port `acceptance-policy`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **New requirement (D-191).** Pricing owns the issued commercial deadline and must implement
 [authorized seller-policy discovery/resolution](DESIGN.md#contract-03-commercial-deadline).
@@ -430,7 +430,7 @@ separate implementation prerequisites; never refresh accepted terms/descriptors 
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-rating-evaluation`
 
-**Stage 3 status (D-227, 2026-10-22):** S3-07, port `evaluation`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S3-07, port `evaluation`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 Rating must publish a ClientHub SDK for one logical batched pre-purchase evaluation over the exact
 selected bindings of an assessment. D-192 replaces D-167's legacy full `items[].chains[]` input: carry native selected bindings, explicit quantity/term/BillingTerms context and line/revision identity with `assessment_id` and `resolve_date`, plus seller/resource/payer context, contract and market. These are proposed nonbinding inputs before acceptance; issued receipt selection must match the evaluated inputs. The concrete DTO and unresolved purchase-model mappings remain required work, not an existing SDK. Unselected diagnostic cells cannot be billed, and this request is not the complete receiver period snapshot. Return
@@ -495,7 +495,7 @@ only the invoice lacks it.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-upreq-indicative-tax-read`
 
-**Stage 3 status (D-227, 2026-10-22):** S3-08, port `indicative-tax`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S3-08, port `indicative-tax`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 An **indicative tax read** — per line and in total for a basket — from the billing-chain tax
 owner, which PRD §9.1 requires Preview to return and this design never stores. No gear or
@@ -515,7 +515,7 @@ partner-placed path, and it has no specified form today. The platform PDP, not O
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-payer-commercial-profile`
 
-**Stage 3 status (D-227, 2026-10-22):** S4-02, port `identity-profile`, **missing** (`get_tenant` only); the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S4-02, port `identity-profile`, **missing** (`get_tenant` only); the gate answers `Unavailable::Missing` until delivered.
 
 A read of the **payer's commercial profile** yielding the `(currency, region)` binding the order
 market is derived from. Consumed at submit and re-read before the first activation intent. It is
@@ -1016,7 +1016,7 @@ until then the reference travels as the reserved, never-compiled resource proper
 `delegation_proof_ref`, and the deny codes `delegation_proof_required`/`delegation_proof_invalid`
 are Orders constants pending platform agreement.
 
-**Integration and E2E provider (2026-10-06; superseded 2026-10-26: the suite provider (#5375) is superseded by the test-host `bss-orders-test-authz-plugin` (D-235); production provisioning is unchanged).** The fail-closed `rules-authz-plugin` (its own PR,
+**Integration and E2E provider (2026-10-06; superseded 2026-10-26: the suite provider (#5375) is superseded by the test-host `bss-orders-test-authz-plugin` (D-239); production provisioning is unchanged).** The fail-closed `rules-authz-plugin` (its own PR,
 #5375) is a real resolver provider for integration and live E2E, not the production provider. It also grants
 Event Broker's property-less `event_type` `produce` check to the Orders producer principal through
 an exact unconditional grant, with no wildcard or allow-all, and its tenant-scope `produce` check
@@ -1062,7 +1062,7 @@ tests) and the test provider only (PR #5259 review, thread 13).
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-catalog-subscription-product-key`
 
-**Stage 3 status (D-227, 2026-10-22):** S5-06a, port `overlap-key`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S5-06a, port `overlap-key`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **Revised scope; legacy ID retained (D-163).** The key stays the one Subscriptions already defines
 and keys its cardinality rule on: the registry-owned `catalogSubscriptionProductKey` of `SUB-G1`,
@@ -1116,7 +1116,7 @@ and failure/compensation handling still apply; this decision adds no force-retir
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-contract-party-eligibility`
 
-**Stage 3 status (D-227, 2026-10-22):** S4-02, port `contract-resolution`, **missing**; the gate answers `Unavailable::Missing` until delivered.
+**Stage 3 status (D-231, 2026-10-22):** S4-02, port `contract-resolution`, **missing**; the gate answers `Unavailable::Missing` until delivered.
 
 **Contract status and party eligibility for a referenced contract.** Where an order references a
 `contractId`, the gate's contract-resolution port — the only port answering party eligibility —
@@ -1177,7 +1177,7 @@ limiter is per replica and Orders removes it when the composite key lands.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-upreq-shared-circuit-breaker`
 
-**A generic per-callee circuit breaker usable from gear adapters (D-233).** DESIGN 03 §3.3 retains
+**A generic per-callee circuit breaker usable from gear adapters (D-237).** DESIGN 03 §3.3 retains
 the breaker baseline 0.5 failures over 30 s, open 10 s, per port, and asks for shared platform
 adapters. No shared breaker exists: `libs/` has none, the OIDC plugin's host breaker is bound to
 `AuthNError`, and `docs/arch/toolkit-contract-binding/DESIGN.md` says a breaker "needs a separate
@@ -1190,7 +1190,7 @@ across requests.
 **Orders' interim**: `domain/gate/breaker.rs` (the state machine) consulted by
 `infra/gate/budget.rs` `bounded` before each port call; an open port answers
 `Unavailable::Outage` without a call; configured by `gate.breaker`, observable in readiness and on
-the `bss-orders` meter (D-233 items 1 and 2). Orders replaces it by changing `budget.rs` only when
+the `bss-orders` meter (D-237 items 1 and 2). Orders replaces it by changing `budget.rs` only when
 the platform breaker lands. **Release relevance**: none while the interim exists; DESIGN 03 §3.3
 no longer makes the shared breaker a release prerequisite.
 

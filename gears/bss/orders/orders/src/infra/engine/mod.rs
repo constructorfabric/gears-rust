@@ -2510,7 +2510,7 @@ async fn existing_body<'a>(
         | Decision::Unevaluable {
             reason, assessment, ..
         } => {
-            // D-229: a composite-gate refusal (the only guard whose `assessment` is set) carries
+            // D-233: a composite-gate refusal (the only guard whose `assessment` is set) carries
             // the authorized gate report in `context.data`; every other guard carries none.
             let refusal = Refusal {
                 overlap_conflict: None,
@@ -2588,20 +2588,20 @@ async fn refuse_unsettled<'a>(
     Ok(TxOutcome::Unsettled(reason))
 }
 
-/// How far a refused attempt got through the composite gate (M2-2, D-229).
+/// How far a refused attempt got through the composite gate (M2-2, D-233).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GateReach {
     /// An engine-only or non-gate guard refusal: no diagnostics, no report.
     NotReached,
     /// The gate assessment was reached: either the composite gate refused, or the step-17 claim
-    /// guard refused `order-in-flight-for-key` over a passing run (D-236 item 4). The run's
+    /// guard refused `order-in-flight-for-key` over a passing run (D-240 item 4). The run's
     /// diagnostics are written, and the report is stored both in `context.data.assessment` and
-    /// in the snapshot's `assessment` (D-229 as amended by D-236 item 4).
+    /// in the snapshot's `assessment` (D-233 as amended by D-240 item 4).
     Assessed,
 }
 
 /// A business refusal: its registered reason, permitted Problem context, and how far it got
-/// through the composite gate (D-229).
+/// through the composite gate (D-233).
 struct Refusal {
     overlap_conflict: Option<crate::domain::overlap::OverlapConflict>,
     reason: Reason,
@@ -2666,7 +2666,7 @@ async fn refuse_settled<'a>(
     } else {
         None
     };
-    // D-229 as amended by D-236 item 4: the report is part of the stored Problem for every
+    // D-233 as amended by D-240 item 4: the report is part of the stored Problem for every
     // assessed refusal (the composite gate's and the step-17 collision's), so the first answer
     // and every same-key replay carry it in `context.data.assessment`.
     if assessed
@@ -2833,7 +2833,7 @@ async fn step_diagnostics(
 
 /// The settled step-17.5 refusal: blocked tuples name a conflicting order only where the
 /// caller's read scope can see it (D-179); the rebuilt predicate-9 report rides in the Problem
-/// body and the snapshot (D-236 item 4).
+/// body and the snapshot (D-240 item 4).
 fn conflict_refusal(conflict: &crate::domain::overlap::OverlapConflict) -> Refusal {
     let blocked: Vec<Value> = conflict
         .blocked

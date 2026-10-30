@@ -185,7 +185,7 @@ impl PricingCatalogReads {
                         seller_tenant_id = %seller,
                         "the seller's commercial identity is misprovisioned: the exchanged \
                          principal is homed in another tenant or is not a service subject \
-                         (D-194, D-242); catalog reads are unavailable"
+                         (D-194, D-246); catalog reads are unavailable"
                     );
                 }
                 unanswered(Unavailable::Missing)

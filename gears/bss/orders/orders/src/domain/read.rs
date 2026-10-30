@@ -213,7 +213,7 @@ pub fn decode_cursor(
     decode_cursor_bound(cursor, binding).map(|decoded| decoded.position)
 }
 
-/// The version a line token issued by `main` is bound to (D-242). `main`'s token had no version
+/// The version a line token issued by `main` is bound to (D-246). `main`'s token had no version
 /// member, and `main` never committed a version, so every line token it issued was at the
 /// creation version.
 pub const MAIN_LINE_CURSOR_VERSION: i32 = 1;
@@ -232,7 +232,7 @@ pub struct DecodedCursor {
 
 impl DecodedCursor {
     /// The commercial version a line token is bound to: its own binding, or
-    /// [`MAIN_LINE_CURSOR_VERSION`] for a token `main` issued without one (D-242).
+    /// [`MAIN_LINE_CURSOR_VERSION`] for a token `main` issued without one (D-246).
     #[must_use]
     pub fn line_version(self) -> i32 {
         self.version.unwrap_or(MAIN_LINE_CURSOR_VERSION)

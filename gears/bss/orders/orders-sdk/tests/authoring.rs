@@ -153,7 +153,7 @@ fn authored_term_bounds_are_exact() {
     }
 }
 
-/// D-192, D-231 item 12 (OQ-C2): a line has one exact quantity; every stated item quantity
+/// D-192, D-235 item 12 (OQ-C2): a line has one exact quantity; every stated item quantity
 /// must agree, on add and on a patch that names the items.
 #[test]
 fn a_line_states_one_quantity_on_every_item() {

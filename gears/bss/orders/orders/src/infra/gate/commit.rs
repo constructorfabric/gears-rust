@@ -28,11 +28,11 @@
 //!    `capture.date-basis` and the composite gate. A single pin's size is judged when step 4
 //!    builds it, before that receipt's selection verification: an oversized receipt settles
 //!    `purchase-capacity-exceeded` even if it would also fail D-192/D-197 verification, and
-//!    nothing commits either way (D-242 item 15);
+//!    nothing commits either way (D-246 item 15);
 //!    the version contribution names the reserved candidate, the claims are the frozen keys,
 //!    the event is `OrderSubmitted`; the settlement carries the frozen gate report and the
 //!    engine writes the frozen outcome vector as the run's diagnostics, whether this call
-//!    assessed or recovered the attempt (D-231).
+//!    assessed or recovered the attempt (D-235).
 //!
 //! The engine does the rest: claims, version, documents, diagnostics, aggregate, audit, event,
 //! settlement and `finish_execution`.
@@ -116,7 +116,7 @@ enum Blocked {
     Pricing(RefusalDisposition),
     /// The evaluation cannot be stored (D-216).
     Totals,
-    /// One line's schema-2 pin alone exceeds the version byte limit (D-231 item 7).
+    /// One line's schema-2 pin alone exceeds the version byte limit (D-235 item 7).
     Capacity,
 }
 
@@ -310,7 +310,7 @@ impl Preparation for SubmitPreparation {
             acceptance: None,
         })));
         // The frozen run: a fresh and a recovered commit settle the same report and write the
-        // same diagnostics (D-231).
+        // same diagnostics (D-235).
         let order = &self.requests.order;
         let axes = &self
             .requests

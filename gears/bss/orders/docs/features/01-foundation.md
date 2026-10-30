@@ -270,7 +270,7 @@ The system **MUST** register and enqueue the existing event/error/category contr
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-dod-foundation-retention-purge`
 
-The system **MUST** ship the `retention-purge` worker with Foundation (phase 0/1): bounded daily deletion of expired Preview outcomes, refused audit rows and read-access-log rows through their indexes and restricted grants, its per-store metrics and the [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) audit-growth alerts, and the pre-engine request limiter's per-caller gateway zone binding (D-185). Refusal auditing **MUST NOT** be enabled in an environment where the worker is not running. Orders always audits refusals, so startup refuses a `maintenance` block that does not schedule `retention_purge`; with no `maintenance` block no worker runs, a warning is logged and `orders_workers_scheduled` reports 0, which a deployment alert must catch (D-239).
+The system **MUST** ship the `retention-purge` worker with Foundation (phase 0/1): bounded daily deletion of expired Preview outcomes, refused audit rows and read-access-log rows through their indexes and restricted grants, its per-store metrics and the [Foundation contract §3.8](../DESIGN.md#contract-01-3-8) audit-growth alerts, and the pre-engine request limiter's per-caller gateway zone binding (D-185). Refusal auditing **MUST NOT** be enabled in an environment where the worker is not running. Orders always audits refusals, so startup refuses a `maintenance` block that does not schedule `retention_purge`; with no `maintenance` block no worker runs, a warning is logged and `orders_workers_scheduled` reports 0, which a deployment alert must catch (D-243).
 
 **Implements**: `cpt-cf-bss-orders-algo-foundation-retention-purge`.
 

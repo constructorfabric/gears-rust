@@ -1,4 +1,4 @@
-//! The orchestrator's async shell (S3-11/S3-12; F03 §3.6 steps 2–5; D-215, D-180, D-227, M2-6):
+//! The orchestrator's async shell (S3-11/S3-12; F03 §3.6 steps 2–5; D-215, D-180, D-231, M2-6):
 //! one gate run calls each port at most once per basket, with batched queries, in F03 order,
 //! under one fresh [`RunBudget`], and assesses the collected answers through the pure half
 //! ([`crate::domain::gate::orchestrate`]).
@@ -19,7 +19,7 @@
 //! Completion order cannot change [`Resolved::unavailable_kinds`] or the once-per-run catalog
 //! denial. A port the run does not call is "not asked" (the pure half's module doc). Each
 //! unavailable called port whose answer reaches diagnostic collection is logged once at info
-//! on `orders.gate.unavailable_kind` with `port` and `kind` (D-227). In-flight storage failures
+//! on `orders.gate.unavailable_kind` with `port` and `kind` (D-231). In-flight storage failures
 //! retain completed Wave A/B port diagnostics before propagating the local error; they produce
 //! no assessment or durable outcome vector. Cancellation returns
 //! [`OrchestrateError::Cancelled`]; siblings
@@ -202,13 +202,13 @@ pub struct Resolved {
     pub keys: BTreeMap<Uuid, Vec<OverlapKey>>,
     /// The run's budget, its per-port subrequest counts included.
     pub run: RunBudget,
-    /// Every called port that did not answer, once per port, in the module's fixed diagnostic order (D-227).
+    /// Every called port that did not answer, once per port, in the module's fixed diagnostic order (D-231).
     pub unavailable_kinds: Vec<(GatePort, Unavailable)>,
 }
 
 /// [`evaluation_request`], with a binding the codec cannot encode logged as a local defect and
 /// then taken down the prerequisite-missing path (`None`, so `Skipped`): outcome, wire and
-/// D-230 precedence are unchanged.
+/// D-234 precedence are unchanged.
 fn build_evaluation_request(
     basket: &Basket,
     bindings: &BTreeMap<Uuid, Vec<AcceptedBinding>>,
@@ -250,7 +250,7 @@ impl std::fmt::Debug for Orchestrator {
     }
 }
 
-/// The unavailable answers of one run, each port logged and signalled once (D-227, 03 §3.8).
+/// The unavailable answers of one run, each port logged and signalled once (D-231, 03 §3.8).
 struct Unanswered<'a> {
     kinds: Vec<(GatePort, Unavailable)>,
     signals: &'a dyn GateSignals,
@@ -426,7 +426,7 @@ impl Orchestrator {
             .filter_map(|(line, answer)| Some((*line, Arc::clone(answer.resolved.as_ref().ok()?))))
             .collect();
 
-        // Wave B: the relationship gates every payer-dependent branch (D-215/D-228).
+        // Wave B: the relationship gates every payer-dependent branch (D-215/D-232).
         let (contracts, billing_terms, overlap) = tokio::join!(
             async {
                 if !confirmed {

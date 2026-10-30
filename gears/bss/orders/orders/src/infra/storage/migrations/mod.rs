@@ -33,7 +33,7 @@ impl MigrationTrait for SqlMigration {
 
 /// The Orders SQL migrations in apply order, after the platform migrations. A migration that is
 /// on `main` is never edited: the runner records names only, so an upgraded database would
-/// never re-apply it. A change is a forward migration (D-242).
+/// never re-apply it. A change is a forward migration (D-246).
 const ORDERS_SQL: [(&str, &str); 11] = [
     (
         "m20261006_000001_orders_foundation",
@@ -146,7 +146,7 @@ mod tests {
             .collect()
     }
 
-    /// D-242: the migration runner records names only, so a shipped migration edited in place
+    /// D-246: the migration runner records names only, so a shipped migration edited in place
     /// never re-applies on a database `main` migrated; its change must be a forward migration.
     #[test]
     fn migrations_shipped_on_main_are_unchanged() {

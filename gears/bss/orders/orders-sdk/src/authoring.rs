@@ -643,7 +643,7 @@ pub fn validate_items(items: &[SelectedItem]) -> Result<(), AuthoringInvalid> {
     if items.len() > MAX_SELECTED_ITEMS {
         return Err(AuthoringInvalid("selected_items"));
     }
-    // D-192 (D-231 item 12): a line has one exact quantity; every stated quantity agrees.
+    // D-192 (D-235 item 12): a line has one exact quantity; every stated quantity agrees.
     let mut stated = items.iter().filter_map(|i| i.quantity);
     if let Some(first) = stated.next()
         && stated.any(|q| q != first)

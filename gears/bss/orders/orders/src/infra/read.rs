@@ -433,7 +433,7 @@ impl ReadService {
         ensure_readable(&snapshot.row)?;
         // A line continuation is bound to the version it was issued at; one at another version
         // is refused (D-64: `current_version` is set from creation). A token `main` issued
-        // carries no binding and was issued at the creation version (D-242).
+        // carries no binding and was issued at the creation version (D-246).
         if let Some(decoded) = decoded
             && decoded.line_version() != snapshot.row.current_version
         {

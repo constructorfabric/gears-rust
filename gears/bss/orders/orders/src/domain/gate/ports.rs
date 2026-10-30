@@ -1,10 +1,10 @@
-//! The outbound inventory (D-227 item 1) and typed unavailability (item 2).
+//! The outbound inventory (D-231 item 1) and typed unavailability (item 2).
 use crate::domain::guards::InputPort;
 use bss_orders_sdk::catalog::Reason;
 use std::time::Duration;
 use toolkit_macros::domain_model;
 
-/// One logical outbound operation of the assessment (F03 §3.3; D-227 table order).
+/// One logical outbound operation of the assessment (F03 §3.3; D-231 table order).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum GatePort {
@@ -34,7 +34,7 @@ pub enum GatePort {
     IndicativeTax,
 }
 
-/// Whether a real provider exists on 2026-10-22 (D-227 item 1, "Status").
+/// Whether a real provider exists on 2026-10-22 (D-231 item 1, "Status").
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
@@ -42,7 +42,7 @@ pub enum Delivery {
     Available,
     /// The implementing package and the upstream ask that closes it. Only the first ask is
     /// carried; the rest (the assessment row's `…-upreq-pricing-bundle-sellability`, the grant
-    /// upreqs of the three available rows) live in the D-227 table.
+    /// upreqs of the three available rows) live in the D-231 table.
     Missing {
         /// The Orders work package that implements the port once the provider lands.
         package: &'static str,
@@ -105,7 +105,7 @@ impl<T> PortAnswer<T> {
         }
     }
 
-    /// The per-input reasons an unavailable answer carries for `port` (D-227 item 1 rule);
+    /// The per-input reasons an unavailable answer carries for `port` (D-231 item 1 rule);
     /// empty when answered.
     #[must_use]
     pub fn input_reasons_for(&self, port: GatePort) -> Vec<(InputPort, Reason)> {
@@ -127,7 +127,7 @@ impl<T> PortAnswer<T> {
 }
 
 impl GatePort {
-    /// Every port, in D-227 table order.
+    /// Every port, in D-231 table order.
     pub const ALL: [Self; 12] = [
         Self::CurrentRevision,
         Self::Resolve,
@@ -143,7 +143,7 @@ impl GatePort {
         Self::IndicativeTax,
     ];
 
-    /// The engine input ports this operation feeds (D-227 item 1, "Feeds").
+    /// The engine input ports this operation feeds (D-231 item 1, "Feeds").
     #[must_use]
     pub fn feeds(self) -> &'static [InputPort] {
         use InputPort as P;
@@ -164,7 +164,7 @@ impl GatePort {
     /// The port's primary unavailable reason, for logs and readiness (DESIGN
     /// `#contract-03-3-3`). A port feeding two engine inputs (`resolve`) reports one reason per
     /// input; [`Self::input_reasons`] is the form the assessment uses to mark engine inputs
-    /// unresolvable (D-227 item 1 rule).
+    /// unresolvable (D-231 item 1 rule).
     #[must_use]
     pub fn unavailable_reason(self) -> Reason {
         match self {
@@ -183,7 +183,7 @@ impl GatePort {
     }
 
     /// One `(input, reason)` per engine input this port feeds, the reason being that input's
-    /// registered unevaluable reason (D-227 item 1 rule); empty for `IndicativeTax`.
+    /// registered unevaluable reason (D-231 item 1 rule); empty for `IndicativeTax`.
     #[must_use]
     pub fn input_reasons(self) -> Vec<(InputPort, Reason)> {
         self.feeds()
@@ -267,7 +267,7 @@ impl GatePort {
         }
     }
 
-    /// F03 §3.3 baseline per-run deadline (unratified, D-227 item 5); config may override.
+    /// F03 §3.3 baseline per-run deadline (unratified, D-231 item 5); config may override.
     #[must_use]
     pub fn baseline_deadline(self) -> Duration {
         match self {

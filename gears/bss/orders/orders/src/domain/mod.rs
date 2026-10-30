@@ -10,7 +10,7 @@ pub mod dates;
 pub mod error;
 /// The closed fulfillment failure reasons shared by the audit rule and the event contract.
 pub mod failure;
-/// The shared gate assessment's pure core (Stage 3, D-227).
+/// The shared gate assessment's pure core (Stage 3, D-231).
 pub mod gate;
 pub mod idempotency;
 pub mod overlap;

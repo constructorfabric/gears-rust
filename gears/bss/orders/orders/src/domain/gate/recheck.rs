@@ -22,7 +22,7 @@ pub struct StoredLine {
     /// The line.
     pub line_id: Uuid,
     /// The legacy scalar overlap key (`orders_order_line.overlap_scope_key`), set only on rows
-    /// committed before item keys (D-236 item 6); `None` on every row that stores
+    /// committed before item keys (D-240 item 6); `None` on every row that stores
     /// `overlap_item_keys`, and on a keyless line.
     pub overlap_scope_key: Option<String>,
     /// Legacy scalar product identity, retained when supplied.

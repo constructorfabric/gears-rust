@@ -221,7 +221,7 @@ pub struct CommittedLine {
 ///
 /// The token fields (`scope`, `amount_status`, `amount_basis`, `discount_status`, `charge_kind`,
 /// `tcv_basis`) are open strings by design, never enums: a stored body written by a newer build
-/// may carry a token this build does not know, and replay must still decode it (D-229 item 3).
+/// may carry a token this build does not know, and replay must still decode it (D-233 item 3).
 /// Consumers match the tokens they know and treat any other as unrecognized.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommittedTotal {

@@ -212,9 +212,9 @@ fn refusal_diagnostics_pin_their_wire_members() {
     assert!(serde_json::from_value::<RefusalDiagnostics>(json!({"state": "invented"})).is_err());
 }
 
-/// D-229: the all-failures gate report is the optional `assessment` member. It round-trips under
+/// D-233: the all-failures gate report is the optional `assessment` member. It round-trips under
 /// its wire names (an absent optional field stays absent), a payload from an Orders that predates
-/// the member decodes with `None`, and a reason token outside the registry fails to decode (D-229
+/// the member decodes with `None`, and a reason token outside the registry fails to decode (D-233
 /// item 3: the closed `Reason`).
 #[test]
 fn refusal_diagnostics_carry_the_optional_gate_report() {
@@ -270,7 +270,7 @@ fn refusal_diagnostics_carry_the_optional_gate_report() {
         "the literal report encodes to the wire member"
     );
     assert_eq!(serde_json::to_value(&diagnostics).unwrap(), wire);
-    // An Orders that predates D-229 sends no `assessment`.
+    // An Orders that predates D-233 sends no `assessment`.
     let older: RefusalDiagnostics =
         serde_json::from_value(json!({"request_audit_id": "0b5d2f0e-3c8e-4f7a-a6f4-8f2f6a3c9d10"}))
             .unwrap();

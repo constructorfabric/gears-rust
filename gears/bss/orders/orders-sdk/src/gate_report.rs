@@ -1,12 +1,12 @@
 //! The complete authorized gate report of a refused submit or amendment (DESIGN *Canonical wire
 //! contract*, "For an all-failures response, retain the complete authorized report in
-//! `context.data`"; D-229). It arrives as the optional
+//! `context.data`"; D-233). It arrives as the optional
 //! [`RefusalDiagnostics::assessment`](crate::errors::RefusalDiagnostics::assessment) member; the
 //! primary blocking result is the outer refusal itself.
 //!
 //! Every field is a public token, never producer results or upstream evidence. `predicate`,
 //! `verdict` and `applicability` are open strings: a newer Orders may add a predicate or a token
-//! without breaking this decoder. `reason` is the closed [`Reason`] registry (D-229 item 3), so a
+//! without breaking this decoder. `reason` is the closed [`Reason`] registry (D-233 item 3), so a
 //! reason token this SDK does not know fails to decode the whole member.
 //!
 //! Consumers decode these types; they do not build them. The types are `#[non_exhaustive]` and
@@ -15,7 +15,7 @@ use crate::catalog::Reason;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// The complete authorized gate report of a refused submit/amendment (DESIGN L5093; D-229).
+/// The complete authorized gate report of a refused submit/amendment (DESIGN L5093; D-233).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct GateReport {

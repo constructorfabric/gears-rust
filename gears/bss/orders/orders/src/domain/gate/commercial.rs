@@ -23,7 +23,7 @@
 //! a recurring line; null for non-recurring lines; the commit claims present keys, D-179), and once per attempt the [`FrozenOrder`]: the
 //! assessment identity the pins name and the Rating evaluation the totals are written from
 //! (D-188: "freezes the request and returned evaluation before acceptance dispatch"), plus the
-//! run's gate report and outcome vector (D-231), so a recovered attempt commits from exactly
+//! run's gate report and outcome vector (D-235), so a recovered attempt commits from exactly
 //! what it reserved, with the same settled report and diagnostics, never from a fresh run.
 //!
 //! The command key of a line is `{order_id}/{candidate}/{line_id}/submit` ([`command_key`]): the
@@ -144,7 +144,7 @@ pub struct LineRequest {
 
 /// What an attempt freezes once: the assessment the pins name, the evaluation the totals are
 /// written from, and the run's gate report and outcome vector, so a recovered commit settles the
-/// same report and writes the same diagnostics as the fresh one (module doc; D-231).
+/// same report and writes the same diagnostics as the fresh one (module doc; D-235).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -639,9 +639,9 @@ pub fn decode_line_requests(value: &Value) -> Result<FrozenRequests, MalformedRe
 }
 
 /// Reduce the stored exact pairs at the typed [`ExactMoney`] positions of a frozen
-/// [`OrderEvaluation`] (D-242): `exact` of `Totals.{gross, net, discount}` on every line, line
+/// [`OrderEvaluation`] (D-246): `exact` of `Totals.{gross, net, discount}` on every line, line
 /// component, order component, the TCV carrier and the order totals, plus `tcv.exact` and an
-/// available `promotion_status`. Attempts frozen before D-241 may hold a pair with a common
+/// available `promotion_status`. Attempts frozen before D-245 may hold a pair with a common
 /// factor that Orders then accepted and reduced when rendering totals, so the reduced pair
 /// commits the same totals. A pair whose parts are not canonical integer text is left as stored,
 /// and the strict [`ExactMoney`] decode refuses it. The opaque producer evidence

@@ -450,7 +450,7 @@ async fn line_tokens_bind_principal_parent_and_collection() {
     assert_eq!(r.log_count().await, 0, "input validation appends no row");
 }
 
-/// D-242: a line token `main` issued (no version member) keeps paging the draft it was issued
+/// D-246: a line token `main` issued (no version member) keeps paging the draft it was issued
 /// for: `main` could only have issued it at the creation version.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]

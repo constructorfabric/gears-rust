@@ -1,4 +1,4 @@
--- Forward correction of the shipped foundation (D-242): a database `main` migrated never
+-- Forward correction of the shipped foundation (D-246): a database `main` migrated never
 -- re-applies an edited 01, so the committed product identity and the pinned-line rule without a
 -- scalar scope key arrive here. Complete new evidence is authoritative; historical scalar
 -- evidence stays untouched.

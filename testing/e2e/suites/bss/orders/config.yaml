@@ -7,7 +7,7 @@
 # and `__E2E_HOME__`, and (3) exports the secret references the Orders block names
 # (ORDERS_AUDIT_MINIMIZATION_KEY, ORDERS_*_DSN, ORDERS_PG_PASSWORD, ORDERS_SELLER_CLIENT_SECRET).
 #
-# Milestone 3b (D-234): the server runs three times. `migrate`, then boot 1 without the gate
+# Milestone 3b (D-238): the server runs three times. `migrate`, then boot 1 without the gate
 # block, which seeds Pricing/Products over REST; conftest.py writes the stub fixture keyed by the
 # seeded ids and boot 2 adds `development_delivery` (below) with `__E2E_FIXTURE__` substituted.
 # `development_delivery` is removed from every rendered file: it is not a server config key.
@@ -542,7 +542,7 @@ gears:
       throttling:
         per_order_per_minute: 10
 
-# The development delivery (D-231, M3B-5), deep-merged into `gears` for boot 2 only (conftest.py);
+# The development delivery (D-235, M3B-5), deep-merged into `gears` for boot 2 only (conftest.py);
 # never a server key. The gate binds the nine undelivered ports to the per-run fixture, presents
 # the seller's commercial identity (the s2s credential above), and runs Preview at 20 and submit
 # at 10 per caller per minute, so the Preview throttle test's 21st call fits the gateway zone only

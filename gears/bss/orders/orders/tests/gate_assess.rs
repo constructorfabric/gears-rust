@@ -4,7 +4,7 @@
     reason = "test code: a failed setup or fixture must stop the test at once; `allow`, not `expect`, because not every item unwraps or expects"
 )]
 //! The pure gate assessment over typed port answers (S3-09 skeleton; F03 §3.1–§3.4, §4.2;
-//! D-187, D-189, D-195, D-227): one test per rule (a)–(l).
+//! D-187, D-189, D-195, D-231): one test per rule (a)–(l).
 use bss_orders::domain::contributions::AggregateFacts;
 use bss_orders::domain::dates::{
     DateBasis, DatePolicySnapshot, PLATFORM_DEFAULT_POLICY_ID, PolicyRow, SuppliedDates,
@@ -645,7 +645,7 @@ fn b_occupancy() {
 fn b_resolve() {
     let l1 = line_id(1);
     // Resolve, for one line: the catalog inputs and the pin input are unresolvable, each with
-    // its own input's reason (D-227 item 1), never the port's primary reason for both.
+    // its own input's reason (D-231 item 1), never the port's primary reason for both.
     let mut i = base(Operation::Submit);
     let c = i.catalog.get_mut(&l1).unwrap();
     c.resolved = Err(ReadFailure::Unavailable(Unavailable::Deadline));
@@ -929,7 +929,7 @@ fn e_axis_validity_reads_the_payer_profile() {
             in_relationship_with_resource: resource,
             ..profile()
         });
-        // D-228: the registered reason, not `axis-invalid` with an upstream code.
+        // D-232: the registered reason, not `axis-invalid` with an upstream code.
         assert_eq!(vr(&o), failed(Reason::PayerRelationshipUnconfirmed));
         assert_eq!(o.upstream_detail, None);
     }
@@ -1618,7 +1618,7 @@ fn k_failures_are_deduplicated_by_line_and_reason_in_vector_order() {
             .unwrap();
         assert!(f.predicate.index() <= o.key.predicate.index());
     }
-    // The primary is the first definitive local refusal (D-230), ahead of the earlier
+    // The primary is the first definitive local refusal (D-234), ahead of the earlier
     // unevaluable catalog row that D-195 alone would pick.
     let primary = a.primary.unwrap();
     assert_eq!(primary.key.predicate, PredicateId::ReferenceResolution);
@@ -1765,7 +1765,7 @@ fn l_shuffled_inputs_yield_a_byte_identical_vector_and_failure_list() {
     assert!(o.get("upstream_detail").is_none());
 }
 
-/// D-229: the refusal's `context.data.assessment` report is the public vector and the failure
+/// D-233: the refusal's `context.data.assessment` report is the public vector and the failure
 /// list 1:1, as the same tokens, under the mapping version, and it survives the SDK diagnostics.
 #[test]
 fn report_is_the_public_vector_and_failure_list_one_to_one() {
@@ -1805,7 +1805,7 @@ fn report_is_the_public_vector_and_failure_list_one_to_one() {
     assert_eq!(back.assessment, Some(Box::new(report)));
 }
 
-// ---- inputs follow the mapping's unavailable rows (D-227 item 1) ----
+// ---- inputs follow the mapping's unavailable rows (D-231 item 1) ----
 
 /// A `resolve` answer for another revision is malformed: the mapping makes the line's resolve
 /// rows unavailable, and the engine inputs that port feeds are unresolvable, never resolved.
@@ -1863,9 +1863,9 @@ fn malformed_catalog_answer_marks_the_fed_inputs_unresolvable() {
     );
 }
 
-// ---- D-215/D-228 payer withholding ----
+// ---- D-215/D-232 payer withholding ----
 
-/// D-230: with the D-189 assessment port Missing and a catalog port down, the primary of both
+/// D-234: with the D-189 assessment port Missing and a catalog port down, the primary of both
 /// Submit and Preview is still predicate 1's definitive local refusal, never the 503 port reason.
 fn assert_local_refusal_outranks_outages(i: &AssessmentInput, expected: Reason, ctx: &str) {
     let mut down = i.clone();
@@ -1885,12 +1885,12 @@ fn assert_local_refusal_outranks_outages(i: &AssessmentInput, expected: Reason, 
             "{ctx} primary({op:?}) with providers down"
         );
     }
-    // D-230 engine presentation: the definitive local primary presents every composite-gate
+    // D-234 engine presentation: the definitive local primary presents every composite-gate
     // input `Resolved`, the down catalog ports' `CatalogPredicates` and `PricingRevision` too.
     assert_every_gate_input_resolved(&d, ctx);
 }
 
-/// The eight composite-gate inputs, all `Resolved` (D-230 engine presentation).
+/// The eight composite-gate inputs, all `Resolved` (D-234 engine presentation).
 fn assert_every_gate_input_resolved(a: &Assessment, ctx: &str) {
     for input in ALL_PORTS
         .into_iter()
@@ -1904,7 +1904,7 @@ fn assert_every_gate_input_resolved(a: &Assessment, ctx: &str) {
     }
 }
 
-/// D-228 item 6: every payer-dependent row, the composed pin rows included (their billing terms
+/// D-232 item 6: every payer-dependent row, the composed pin rows included (their billing terms
 /// are withheld), carries predicate 1's `reason` as `required`; no failure carries the 503 pin
 /// reason; the five withheld inputs, `PinComposition` and `Evaluation` included, are `Resolved`
 /// (the composite gate resolves them by withholding; D-113 `Precluded` is for inputs an
@@ -1957,7 +1957,7 @@ fn assert_payer_withheld(a: &Assessment, reason: Reason, ctx: &str) {
 /// With the payer relationship unconfirmed no payer fact is read or disclosed: the
 /// payer-dependent rows carry `payer-relationship-unconfirmed`, whatever the contract, overlap
 /// and occupancy ports answered, and their inputs are `Resolved` by the gate's withholding
-/// (D-228 item 6).
+/// (D-232 item 6).
 #[test]
 fn unconfirmed_payer_relationship_withholds_payer_dependent_rows() {
     let disclosing = |r: Reason| {
@@ -2005,7 +2005,7 @@ fn unconfirmed_payer_relationship_withholds_payer_dependent_rows() {
                     Some(Reason::PayerRelationshipUnconfirmed),
                     "{ctx}"
                 );
-                // D-230: the refusal outranks catalog and provider unavailability too.
+                // D-234: the refusal outranks catalog and provider unavailability too.
                 assert_local_refusal_outranks_outages(
                     &i,
                     Reason::PayerRelationshipUnconfirmed,
@@ -2081,7 +2081,7 @@ fn confirmed_payer_with_terms_unavailable_keeps_the_pin_port_reason() {
 }
 
 /// With the axes also invalid, predicate 1's reason is `axis-invalid`: the withheld rows and the
-/// primary carry it, and payer facts stay undisclosed (D-228 item 6).
+/// primary carry it, and payer facts stay undisclosed (D-232 item 6).
 #[test]
 fn unconfirmed_relationship_with_invalid_axes_withholds_under_axis_invalid() {
     let disclosing = |r: Reason| {
@@ -2104,7 +2104,7 @@ fn unconfirmed_relationship_with_invalid_axes_withholds_under_axis_invalid() {
             Some(Reason::AxisInvalid),
             "{ctx}"
         );
-        // D-230: `axis-invalid` outranks catalog and provider unavailability.
+        // D-234: `axis-invalid` outranks catalog and provider unavailability.
         assert_local_refusal_outranks_outages(&i, Reason::AxisInvalid, &ctx);
         assert!(
             a.vector
@@ -2125,7 +2125,7 @@ fn unconfirmed_relationship_with_invalid_axes_withholds_under_axis_invalid() {
     }
 }
 
-/// D-230: with no definitive local refusal, provider outages keep the D-195 primary: the first
+/// D-234: with no definitive local refusal, provider outages keep the D-195 primary: the first
 /// unevaluable row, as its port's 503 reason.
 #[test]
 fn provider_outages_alone_keep_the_unavailable_primary() {
@@ -2153,7 +2153,7 @@ fn provider_outages_alone_keep_the_unavailable_primary() {
     }
 }
 
-/// Regression guard for the D-230 engine presentation: with the payer confirmed and no local
+/// Regression guard for the D-234 engine presentation: with the payer confirmed and no local
 /// refusal, a down catalog port keeps `CatalogPredicates` `Unresolvable` (D-113 unavailable-first
 /// at the engine stays for provider-backed rows).
 #[test]
@@ -2275,7 +2275,7 @@ fn assert_gate_refusal(i: &AssessmentInput, reason: Reason, ctx: &str) {
     );
 }
 
-/// D-228 item 6 + D-230 at the engine: an unconfirmed payer settles the gate's 400
+/// D-232 item 6 + D-234 at the engine: an unconfirmed payer settles the gate's 400
 /// `payer-relationship-unconfirmed`, never `PrecludedReached` (500) nor `Unevaluable` (503),
 /// with every port answered and in the orchestrated shape.
 #[test]

@@ -426,8 +426,8 @@ pub struct ResolvedTerms {
     pub provenance: TermsProvenance,
     /// The snapshot's content, when the port states it. The gate checks its cycle against
     /// evaluation and recurring bindings, and refuses `billing-terms-unsupported` for answered
-    /// terms without a snapshot or with one Pricing cannot express (D-236 item 2 as amended by
-    /// D-242); submit freezes the line's Pricing request from it.
+    /// terms without a snapshot or with one Pricing cannot express (D-240 item 2 as amended by
+    /// D-246); submit freezes the line's Pricing request from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<BillingTermsSnapshot>,
 }
@@ -707,7 +707,7 @@ impl TryFrom<ExactMoneyWire> for ExactMoney {
 
 /// The canonical text of `numerator / denominator` reduced to lowest terms by the money
 /// library, when both parts are canonical integer text and the denominator is positive; `None`
-/// otherwise. Only the stored-attempt decode uses it (D-242): an attempt frozen before D-241 may
+/// otherwise. Only the stored-attempt decode uses it (D-246): an attempt frozen before D-245 may
 /// hold a pair with a common factor, while [`ExactMoney::new`] keeps refusing one on the wire.
 pub(crate) fn reduced_fraction(numerator: &str, denominator: &str) -> Option<(String, String)> {
     ExactAmount::parse_fraction("1", denominator).ok()?;
@@ -917,7 +917,7 @@ pub struct Totals {
 /// `orders_resolved_total`, D-197, D-216): its charge kind, monetary horizon and evidence, item
 /// breakdown, labelled recurring cycles and exclusions, copied verbatim into the row.
 ///
-/// Proposed addition to the #5175 mirror (D-231 note): Orders neither derives a horizon nor
+/// Proposed addition to the #5175 mirror (D-235 note): Orders neither derives a horizon nor
 /// converts cycles, so an evaluation without these declarations is unusable for submit
 /// (`evaluation-unavailable`), never defaulted. Preview copies declared exclusions when available.
 #[domain_model]
@@ -1008,7 +1008,7 @@ pub struct Tcv {
     pub display: String,
     /// The value as posting would round it, decimal text.
     pub posting_estimate: String,
-    /// The declared valuation horizon (proposed; submit needs it, D-231 note).
+    /// The declared valuation horizon (proposed; submit needs it, D-235 note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basis: Option<TcvBasis>,
     /// Per-line basis and producer policy version (`tcv_evidence`; proposed, as `basis`).
@@ -1019,7 +1019,7 @@ pub struct Tcv {
 /// The order evaluation answer (#5175).
 ///
 /// Persisted in frozen attempts: a new [`ExactMoney`] member must also be reduced by
-/// `commercial::reduce_stored_money` on the stored decode (D-242 item 2).
+/// `commercial::reduce_stored_money` on the stored decode (D-246 item 2).
 #[domain_model]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OrderEvaluation {
@@ -1042,7 +1042,7 @@ pub struct OrderEvaluation {
     /// Both its amounts and declaration are required; Orders never fabricates zero money.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_tcv_carrier: Option<CommittedComponent>,
-    /// The storage declaration of the order roll-up (proposed; submit needs it, D-231 note).
+    /// The storage declaration of the order roll-up (proposed; submit needs it, D-235 note).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_declaration: Option<TotalsDeclaration>,
     /// The storage declaration of the order roll-up's usage component: present exactly when a

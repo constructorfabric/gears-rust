@@ -4,7 +4,7 @@
 //! async shell (`infra::gate::orchestrate`) calls the ports in F03 order, one batched call per
 //! port per basket, and feeds their answers back through these functions.
 //!
-//! "Not asked" (D-215, D-228): with the payer relationship unconfirmed the shell never calls the
+//! "Not asked" (D-215, D-232): with the payer relationship unconfirmed the shell never calls the
 //! payer-dependent ports (contracts, overlap key, occupancy) nor billing terms, whose query
 //! carries the payer and the contract (D-215 item 2 withholds any payer-related commercial fact
 //! until the relationship is confirmed), and it calls the evaluation only when
@@ -16,10 +16,10 @@
 //! `Resolved`, the composite gate resolving them by withholding (its own predicate carries
 //! predicate 1's failure; D-113 `Precluded` is reserved for inputs an earlier-registered guard
 //! makes moot). Unasked terms are withheld, not a down port, so the composed pin rows carry
-//! predicate 1's reason too and `PinComposition` and `Evaluation` are `Resolved` (D-228 item 6);
+//! predicate 1's reason too and `PinComposition` and `Evaluation` are `Resolved` (D-232 item 6);
 //! with the relationship confirmed, an unasked evaluation carries its prerequisite reason.
 //! Whenever the primary is a definitive local refusal every composite-gate input is
-//! presented `Resolved`, so the engine settles the gate's 400, not an input's 503 (D-230). The
+//! presented `Resolved`, so the engine settles the gate's 400, not an input's 503 (D-234). The
 //! shell never logs a port it did not call.
 use super::answers::{
     AcceptancePolicy, AcceptancePolicyQuery, AssessmentAnswer, AssessmentLine, AssessmentQuery,
@@ -271,7 +271,7 @@ pub fn plan(basket: &Basket) -> Plan {
     }
 }
 
-/// The identity gate after the payer profile answered (D-215 item 2, D-228).
+/// The identity gate after the payer profile answered (D-215 item 2, D-232).
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityGate {
@@ -676,7 +676,7 @@ pub fn assemble(basket: &Basket, answers: Answers) -> AssessmentInput {
                         b.kind == ChargeKind::Recurring && b.recurring_period.map(cycle) != expected
                     })
             });
-            // D-193/D-236 (R5): answered terms the submit cannot freeze into a Pricing request
+            // D-193/D-240 (R5): answered terms the submit cannot freeze into a Pricing request
             // (no snapshot, or a snapshot Pricing cannot express) are unsupported terms, as
             // Pricing's own MISSING_BILLING_TERMS / UNSUPPORTED_TERMS refusals settle.
             let unusable_snapshot = answers

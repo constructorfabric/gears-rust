@@ -165,7 +165,7 @@ fn build_rejects_duplicates_missing_reasons_and_invalid_identities() {
 
 #[test]
 fn primary_is_first_unavailable_in_the_blocking_set_else_first_failed() {
-    // (d) No definitive local failure (D-230): the D-195 rule holds.
+    // (d) No definitive local failure (D-234): the D-195 rule holds.
     let v = Vector::build(vec![
         outcome(
             key(PredicateId::CatalogItemMembership, Some(1), Some(1), None),
@@ -290,7 +290,7 @@ fn d230_failed_catalog_row_keeps_the_d195_order() {
 
 #[test]
 fn d230_withheld_row_with_predicate_1_reason_outranks_catalog_unavailability() {
-    // (c) An unevaluable withheld row carrying `payer-relationship-unconfirmed` (D-228 item 6)
+    // (c) An unevaluable withheld row carrying `payer-relationship-unconfirmed` (D-232 item 6)
     // beats an earlier unevaluable catalog row.
     let v = Vector::build(vec![
         outcome(

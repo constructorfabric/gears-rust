@@ -95,9 +95,9 @@ pub struct PredicateSpec {
     /// The ports whose answers the predicate reads; any unavailable one makes it unevaluable.
     pub ports: &'static [GatePort],
     /// The reasons a `Failed` outcome of this predicate may carry; a failed producer subresult
-    /// maps only to one of these (D-195, D-242 item 6). Unevaluable reasons are not listed here.
+    /// maps only to one of these (D-195, D-246 item 6). Unevaluable reasons are not listed here.
     pub failure_reasons: &'static [Reason],
-    /// D-230: a failure of this predicate is a definitive local business refusal, final whatever
+    /// D-234: a failure of this predicate is a definitive local business refusal, final whatever
     /// any provider answers (axis validity, reference resolution, single currency, quantity
     /// floor, dates). In primary selection its first failed outcome outranks every unevaluable
     /// one; every other predicate keeps the D-195 order.
