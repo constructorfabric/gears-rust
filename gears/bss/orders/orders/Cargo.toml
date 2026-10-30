@@ -87,8 +87,6 @@ toolkit-db = { workspace = true, features = ["pg"] }
 [dev-dependencies]
 # Gate deadline, retry and breaker tests use Tokio's paused test clock directly.
 tokio = { workspace = true, features = ["test-util"] }
-# Orders-local real broker fixture event log.
-sqlite-event-broker-plugin = { workspace = true }
 # The real gateway throttling maps and middleware, so the D-185 zone bindings are proven against
 # the platform limiter in-process (the live E2E runs the whole gateway).
 api-gateway = { workspace = true }

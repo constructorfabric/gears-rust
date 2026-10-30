@@ -244,8 +244,8 @@ impl ReadSet {
             slot.last_examined = slot.last_examined.max(outcome.examined_through());
             // Counted as the filter rejected them, not derived afterwards from
             // the two frontiers: their difference is a distance in sequence
-            // space, and a partition's sequences are assigned contiguously but
-            // not populated contiguously, so that distance is not a number of
+            // space, and a partition's sequences may have gaps and are not
+            // populated contiguously, so that distance is not a number of
             // events at all.
             slot.undelivered = slot.undelivered.saturating_add(outcome.skipped());
             // Nothing is published to the reader: `read` advanced it to the

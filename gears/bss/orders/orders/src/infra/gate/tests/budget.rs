@@ -63,7 +63,7 @@ fn full_config_with_gate(gate: GateConfig) -> OrdersConfig {
     let mut config: OrdersConfig = serde_json::from_value(serde_json::json!({
         "lock_route": "direct", "idempotency_lease_seconds": 30, "dependency_timeout_ms": 1000,
         "service_principals": [{"role": "workflow", "subject_id": uuid::Uuid::from_u128(77), "tenant_id": uuid::Uuid::from_u128(1)}],
-        "events": {"producer_subject_id": uuid::Uuid::from_u128(78), "producer_tenant_id": uuid::Uuid::from_u128(1), "broker_partitions": 4},
+        "events": {"producer_subject_id": uuid::Uuid::from_u128(78), "producer_tenant_id": uuid::Uuid::from_u128(1)},
         "audit_minimization": {"key_id": "t1", "key": "0123456789abcdef0123456789abcdef"}
     }))
     .unwrap();

@@ -2137,7 +2137,6 @@ dependencies = [
  "cf-gears-bss-products-sdk",
  "cf-gears-event-broker",
  "cf-gears-event-broker-sdk",
- "cf-gears-sqlite-event-broker-plugin",
  "cf-gears-static-authz-plugin",
  "cf-gears-tenant-resolver",
  "cf-gears-tenant-resolver-sdk",
@@ -2789,11 +2788,17 @@ dependencies = [
  "cf-gears-authz-resolver-sdk",
  "cf-gears-cluster",
  "cf-gears-cluster-sdk",
+ "cf-gears-event-broker",
  "cf-gears-event-broker-sdk",
+ "cf-gears-kafka-event-broker-plugin",
+ "cf-gears-memory-event-broker-plugin",
+ "cf-gears-mysql-event-broker-plugin",
+ "cf-gears-postgres-event-broker-plugin",
  "cf-gears-sqlite-event-broker-plugin",
  "cf-gears-standalone-cluster-plugin",
  "cf-gears-static-authn-plugin",
  "cf-gears-static-authz-plugin",
+ "cf-gears-test-containers",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-db",
@@ -2814,6 +2819,9 @@ dependencies = [
  "http",
  "http-body-util",
  "jsonschema 0.40.2",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "rand 0.10.3",
  "reqwest",
  "sea-orm",
  "sea-orm-migration",
@@ -2821,6 +2829,8 @@ dependencies = [
  "serde_json",
  "serde_urlencoded",
  "tempfile",
+ "testcontainers",
+ "testcontainers-modules",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
@@ -2829,6 +2839,40 @@ dependencies = [
  "tracing",
  "tracing-test",
  "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-event-broker-backend-bench"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-toolkit-gts",
+ "chrono",
+ "clap",
+ "futures-util",
+ "humantime",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-event-broker-backend-conformance"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-toolkit-gts",
+ "chrono",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -3334,6 +3378,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-kafka-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-utils",
+ "chrono",
+ "futures-util",
+ "rdkafka",
+ "rdkafka-sys",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-keycloak-idp-plugin"
 version = "0.2.1"
 dependencies = [
@@ -3373,6 +3443,34 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "cf-gears-license-enforcement-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cf-gears-license-resolver-sdk",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-odata-macros",
+ "cf-gears-toolkit-security",
+ "gts",
+ "inventory",
+ "schemars 1.2.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "utoipa",
+ "uuid",
 ]
 
 [[package]]
@@ -3443,6 +3541,23 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "cf-gears-memory-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-toolkit-gts",
+ "chrono",
+ "futures-util",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]
@@ -3532,6 +3647,32 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-mysql-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-taskward",
+ "cf-gears-toolkit-utils",
+ "chrono",
+ "futures-util",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -3791,6 +3932,35 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-postgres-event-broker-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
+ "cf-gears-event-broker-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-taskward",
+ "cf-gears-toolkit-utils",
+ "chrono",
+ "clap",
+ "futures-util",
+ "humantime",
+ "rand 0.10.3",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "testcontainers",
+ "testcontainers-modules",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -4076,6 +4246,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
+ "fnv",
  "http",
  "inventory",
  "jsonschema 0.40.2",
@@ -4184,19 +4355,21 @@ dependencies = [
 name = "cf-gears-sqlite-event-broker-plugin"
 version = "0.1.1"
 dependencies = [
- "anyhow",
  "async-trait",
+ "cf-gears-event-broker-backend-bench",
+ "cf-gears-event-broker-backend-conformance",
  "cf-gears-event-broker-sdk",
- "cf-gears-toolkit-db",
- "cf-gears-toolkit-db-macros",
  "cf-gears-toolkit-gts",
- "cf-gears-toolkit-security",
+ "cf-gears-toolkit-utils",
  "chrono",
- "sea-orm",
- "sea-orm-migration",
+ "futures-util",
  "serde",
  "serde_json",
+ "sqlx",
+ "tempfile",
  "tokio",
+ "tokio-util",
+ "tracing",
  "uuid",
 ]
 
@@ -5061,6 +5234,7 @@ dependencies = [
  "http",
  "opentelemetry",
  "opentelemetry_sdk",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
@@ -9389,6 +9563,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "num_enum"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d0bca838442ec211fa11de3a8b0e0e8f3a4522575b5c4c06ed722e005036f26"
+dependencies = [
+ "num_enum_derive",
+ "rustversion",
+]
+
+[[package]]
+name = "num_enum_derive"
+version = "0.7.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
+dependencies = [
+ "proc-macro-crate",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "num_threads"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10782,6 +10978,36 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "rdkafka"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f1856d72dbbbea0d2a5b2eaf6af7fb3847ef2746e883b11781446a51dbc85c0"
+dependencies = [
+ "futures-channel",
+ "futures-util",
+ "libc",
+ "log",
+ "rdkafka-sys",
+ "serde",
+ "serde_derive",
+ "serde_json",
+ "slab",
+ "tokio",
+]
+
+[[package]]
+name = "rdkafka-sys"
+version = "4.9.0+2.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5230dca48bc354d718269f3e4353280e188b610f7af7e2fcf54b7a79d5802872"
+dependencies = [
+ "cmake",
+ "libc",
+ "num_enum",
+ "pkg-config",
 ]
 
 [[package]]

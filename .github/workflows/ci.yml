@@ -370,6 +370,16 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
 
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
+
       - name: Test k8s-cluster-plugin (k3s L2+L3 integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         # k3s runs in a **privileged** container (testcontainers-modules sets it);

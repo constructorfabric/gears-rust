@@ -302,6 +302,8 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("listener-failure"))
         .topics([topic(TOPIC)])
+        // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect that legally redelivers event 1.
+        .heartbeat_drop_threshold(10_000)
         .commit_mode(ConsumerCommitMode::manual())
         .register_listener(FailingRuntimeListener)
         .register_listener(recorder)
@@ -343,8 +345,8 @@ async fn listener_failure_does_not_commit_drop_or_stop_consumer_events() {
 
     let calls = handler_calls.lock().unwrap().clone();
     assert_eq!(
-        calls.len(),
-        2,
+        calls,
+        vec![(TOPIC.to_owned(), 0, 1), (TOPIC.to_owned(), 0, 2)],
         "listener failure must not drop consumer events before handler dispatch"
     );
     let commits = commits.lock().unwrap().clone();
@@ -592,6 +594,8 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
     let handle = ConsumerBuilder::new(broker.clone())
         .group(ConsumerGroupRef::auto_anonymous("affected-assignments"))
         .topics([topic(TOPIC)])
+        // 100 s of silence at the 10 ms heartbeat: a slow outbox drain must not trigger a voluntary reconnect, whose re-JOIN could see the event before both partitions are assigned again.
+        .heartbeat_drop_threshold(10_000)
         .buffering(ConsumerBuffering {
             partition_capacity: 8,
             high_watermark: 1,
@@ -638,7 +642,10 @@ async fn slow_drop_reports_other_assignments_owned_by_same_subscription_slot() {
 async fn wait_for_slow_drop_affected_assignments(
     recorded: &SharedRuntimeEvents,
 ) -> BTreeSet<(String, u32)> {
-    for _ in 0..300 {
+    // A deadline, not an iteration count: a loaded runner can take seconds to
+    // drain the outbox, and that is not a failure.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
         let events = recorded.lock().unwrap().clone();
         if let Some(affected) = events.iter().find_map(|event| {
             if let ConsumerRuntimeEvent::SubscriptionConnectionDropped {

@@ -4,8 +4,8 @@
 # authenticated subject (for example the existing tenant-a user) is `user` (D-115). A
 # lookalike subject_id in another tenant is a `user`. The `events` producer principal is the
 # Orders Event Broker publisher (D-200): distinct from every other identity, granted only the
-# Orders event family under platform-root tenancy, and `broker_partitions` must equal the
-# Event Broker deployment's configured partition count for the Orders topic (D-205). The
+# Orders event family under platform-root tenancy. Orders declares no broker partition count
+# (D-205). The
 # `audit_minimization.key` is a secret reference (D-204): the E2E launcher exports
 # ORDERS_AUDIT_MINIMIZATION_KEY (32..1024 bytes) and the gear resolves it at load time; the key
 # is never committed here. Values are test identities only.
@@ -40,7 +40,6 @@ bss-orders:
     events:
       producer_subject_id: "0e0e0000-0000-4000-8000-000000000005"
       producer_tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
-      broker_partitions: 4
     audit_minimization:
       key_id: "e2e-1"
       key: "${ORDERS_AUDIT_MINIMIZATION_KEY}"
@@ -81,11 +80,8 @@ api-gateway:
         key:
           type: identity
         max_keys: 10000
-# Paired Event Broker setting, deep-merged into the E2E host's `event-broker` block. The broker
-# resolves the Orders topic's partition count from this entry (otherwise from an instance-less
-# `gts.cf.core.events.topic.v1~` entry, otherwise its built-in 8). Orders' declared
-# `events.broker_partitions` above MUST equal it: no broker API reports the count, and a
-# mismatch silently loses events (DESIGN §3.7; UPSTREAM_REQS §2.7). A gear test pins the pair.
+# Event Broker setting, deep-merged into the E2E host's `event-broker` block. The Orders topic's
+# partition count is broker configuration alone; any count stores every event (D-205).
 event-broker:
   config:
     topics:

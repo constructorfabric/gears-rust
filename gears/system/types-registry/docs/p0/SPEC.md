@@ -910,7 +910,7 @@ no-database system `post_init`. Making AM/plugins system gears would put them be
 resource-group. The remaining gear-crate path, `keycloak-idp-plugin` → `credstore`,
 is outside this change.
 
-A host with no tenant authenticator installs no tenant plane. The registry's own gate (`require_caller`, on its routes only) then refuses every tenant route — the database reads and the legacy ones — with a canonical `401`, reason `TENANT_AUTHENTICATION_UNAVAILABLE`, before dispatch; platform routes are still served. Authentication grants no authorization (C2, C6, C8).
+A host with no tenant authenticator installs no tenant plane. Its `OoP` listener then refuses every tenant route — the database reads and the legacy ones — with a canonical `401`, reason `TENANT_AUTH_NOT_CONFIGURED`, before dispatch; platform routes are still served. The registry's own gate (`require_caller`, on its routes only) refuses any request that still arrives with no caller context, reason `TENANT_AUTHENTICATION_UNAVAILABLE`. Authentication grants no authorization (C2, C6, C8).
 
 **AM request reads (P33, T34a; 2026-10-22).** **Pending in the consumer-migration follow-up.** The target below supersedes P29's shared platform
 client for request-path reads. Type/metadata/payload schemas and UUID lookups use

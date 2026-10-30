@@ -965,7 +965,11 @@
             "type": "string"
           },
           "actor_masked": {
-            "description": "Whether `actor` carries the mask token.",
+            "description": "Whether `actor` carries the mask token, whether because the caller lacks\nthe unmasked-PII entitlement or because the boundary withheld it\n(`actor_withheld` tells the two apart).",
+            "type": "boolean"
+          },
+          "actor_withheld": {
+            "description": "Whether `actor` is withheld by the upward disclosure boundary, whatever\nthe entitlement: its tenant is not on the path from the reader tenant to\nthe record's.",
             "type": "boolean"
           },
           "change_set_id": {
@@ -4800,12 +4804,16 @@
             "type": "string"
           },
           "supplied_by": {
-            "description": "The tenant whose row supplies it; absent for `overridable`.",
+            "description": "The tenant whose row supplies it; absent for `overridable`, and absent\nwhen that tenant is above the reader tenant.",
             "format": "uuid",
             "type": [
               "string",
               "null"
             ]
+          },
+          "supplied_from_above": {
+            "description": "Set when the supplying tenant is above the reader tenant, so it is\nnot named: the access is inherited from above.",
+            "type": "boolean"
           }
         },
         "required": [
@@ -18083,6 +18091,10 @@
             "description": "The administrator of a strict ancestor who recorded it: an\nadministrator's identity, masked for a caller not authorized for\nunmasked PII.",
             "type": "string"
           },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement: its tenant is not on the path from the\nreader tenant down to the restricted tenant.",
+            "type": "boolean"
+          },
           "tenant_id": {
             "description": "The tenant restricted.",
             "format": "uuid",
@@ -18674,8 +18686,12 @@
             "type": "string"
           },
           "set_by": {
-            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII.",
+            "description": "Who set it: an administrator's identity, masked for a caller not\nauthorized for unmasked PII, and the mask token with `set_by_withheld`\nwhen its tenant is not on the path from the reader tenant to the row's\ntenant.",
             "type": "string"
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
           },
           "tenant_id": {
             "description": "The tenant whose override is flagged.",
@@ -21460,6 +21476,10 @@
       "TrailEntryDto": {
         "description": "One scope on the inheritance trail, with the setter identity and\ntimestamp the administrative read is allowed to show.",
         "properties": {
+          "above": {
+            "description": "Set on the one leading entry that stands for every scope above the\nreader tenant: it carries `provided_value`, `has_override` and\n`needs_review`, the last always `false` — a flagged ancestor row is\nnot the reader's to see.",
+            "type": "boolean"
+          },
           "has_override": {
             "description": "Whether an override row exists here.",
             "type": "boolean"
@@ -21480,25 +21500,33 @@
             "type": "boolean"
           },
           "scope": {
-            "description": "`/` or `/tenants/{id}`.",
-            "type": "string"
-          },
-          "set_by": {
-            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII.",
+            "description": "`/` or `/tenants/{id}`; absent on the collapsed entry that stands for\nevery scope above the reader tenant.",
             "type": [
               "string",
               "null"
             ]
           },
+          "set_by": {
+            "description": "Who set the row here: an administrator's identity, masked for a\ncaller not authorized for unmasked PII, and the mask token with\n`set_by_withheld` when its tenant is not on the path from the reader\ntenant down to this scope.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "set_by_withheld": {
+            "description": "Whether `set_by` is withheld by the upward disclosure boundary rather\nthan by the PII entitlement.",
+            "type": "boolean"
+          },
           "tenant_id": {
-            "description": "The tenant inspected.",
+            "description": "The tenant inspected; absent on the collapsed entry.",
             "format": "uuid",
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
-          "scope",
-          "tenant_id",
           "has_override",
           "provided_value",
           "needs_review"
@@ -63677,13 +63705,22 @@
     },
     "/settings-service/v1/settings": {
       "get": {
-        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. Values are masked by classification.",
+        "description": "Resolve a page of settings at one scope. `tenant` is resolution context, never a filter: omitted, it is the caller's own tenant, which for a platform administrator is the root and therefore platform scope; a tenant outside the caller's subtree, or a standalone descendant, answers 403. OData `$filter` supports `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`; an unmapped field or unsupported operator answers 400 rather than an unfiltered page. `$orderby` takes `key` and `category_id`; any other field answers 400. Each item carries its own outcome, so a named key that does not exist is reported in its entry, never as a failure of the request. `needs_review eq true` narrows the page to the settings whose own override at the target tenant is flagged for review, still resolved values with the flag beside them, paged and counted over the narrowed set; a named key that is visible but not flagged is absent from it. The flagged rows of the target's subtree are `GET /settings-service/v1/settings/review`. `q` narrows the page to the settings whose declaration text or shown value contains it; a value masked for the caller never matches. Under `q`, a dependency that is unavailable for a setting whose value the caller could have matched answers 503, since the narrowing cannot be decided; a page already full still answers, with a cursor. A cursor continues only the listing it was minted for: bound to the $filter, the target tenant and `q`, it answers 400 under another. Values are masked by classification.",
         "operationId": "settings_service.browse_settings",
         "parameters": [
           {
             "description": "Target tenant id; omitted, the caller's own tenant",
             "in": "query",
             "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Free text that narrows the page: at least two and at most two hundred characters after trimming; keeps the settings whose key, display name, description, category name, Schema Default, effective value or fallback value contains it, case-insensitively; combines with $filter; the cursor is bound to it beside the $filter and the target, and a page it narrows carries no total_count",
+            "in": "query",
+            "name": "q",
             "required": false,
             "schema": {
               "type": "string"
@@ -63735,7 +63772,7 @@
                 }
               }
             },
-            "description": "A page of per-key outcomes with its pagination cursors and the total of settings the listing holds under its filter"
+            "description": "A page of per-key outcomes with its pagination cursors and, unless q narrows it, the total of settings the listing holds under its filter"
           },
           "400": {
             "content": {

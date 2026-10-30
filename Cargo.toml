@@ -198,11 +198,18 @@ members = [
     "gears/bss/libs/rest",
     "gears/bss/libs/money",
     "gears/system/event-broker/event-broker-sdk",
+    "gears/system/event-broker/plugins/memory-event-broker-plugin",
+    "gears/system/event-broker/plugins/event-broker-backend-conformance",
+    "gears/system/event-broker/plugins/event-broker-backend-bench",
+    "gears/system/event-broker/plugins/postgres-event-broker-plugin",
+    "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
+    "gears/system/event-broker/plugins/mysql-event-broker-plugin",
+    "gears/system/event-broker/plugins/kafka-event-broker-plugin",
     "gears/system/event-broker/event-broker",
     "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
-    "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
+    "gears/system/license-enforcement/license-enforcement-sdk",
     "gears/system/admission-control/admission-control-sdk",
     "gears/system/admission-control/admission-control",
     "gears/system/policy-engine/policy-engine-sdk",
@@ -434,7 +441,11 @@ quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcem
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.3.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.3.1", path = "gears/system/event-broker/event-broker-sdk" }
 event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
+memory-event-broker-plugin = { package = "cf-gears-memory-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/memory-event-broker-plugin" }
+postgres-event-broker-plugin = { package = "cf-gears-postgres-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/postgres-event-broker-plugin" }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.1", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
+mysql-event-broker-plugin = { package = "cf-gears-mysql-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/mysql-event-broker-plugin" }
+kafka-event-broker-plugin = { package = "cf-gears-kafka-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/kafka-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.2.0", path = "gears/bss/ledger/ledger-sdk" }
@@ -668,6 +679,15 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # Demo-only: cf-evctl's shared group-id store (bundled = self-contained, no system libsqlite3).
 rusqlite = { version = "0.37", features = ["bundled"] }
 
+# Kafka client, used only by the event-broker Kafka backend plugin. `cmake-build`
+# compiles the vendored librdkafka, so no system library is needed; the `libz`
+# default stays off until a producer needs compression.
+rdkafka = { version = "0.38", default-features = false, features = ["cmake-build", "tokio"] }
+# Pinned below 4.10: its librdkafka 2.12.1 tests `#ifdef WITH_OAUTHBEARER_OIDC`
+# against a `#cmakedefine01` macro, so a build without curl still includes
+# <curl/curl.h> and fails. rdkafka 0.39 requires 4.10, hence rdkafka 0.38.
+rdkafka-sys = { version = "=4.9.0", default-features = false }
+
 # Redis/Valkey client, used only by the Redis cluster plugin
 # (gears/system/cluster/plugins/redis-cluster-plugin, see its docs/DESIGN.md §3.1).
 #
@@ -858,7 +878,7 @@ trybuild = "1"
 serial_test = { version = "4", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis", "kafka"] }
 httpmock = "0.8"
 flate2 = "1"
 
@@ -926,6 +946,7 @@ gts-macros = "0.16.1"
 license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.2.1", path = "gears/system/license-resolver/license-resolver-sdk" }
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.7", path = "gears/system/license-resolver/license-resolver" }
 static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.7", path = "gears/system/license-resolver/plugins/static-license-plugin" }
+license-enforcement-sdk = { package = "cf-gears-license-enforcement-sdk", version = "0.1.0", path = "gears/system/license-enforcement/license-enforcement-sdk" }
 
 # Admission control + policy engine
 admission-control-sdk = { package = "cf-gears-admission-control-sdk", version = "0.1.0", path = "gears/system/admission-control/admission-control-sdk" }

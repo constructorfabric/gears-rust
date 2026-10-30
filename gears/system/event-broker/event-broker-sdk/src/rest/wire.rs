@@ -130,16 +130,9 @@ pub(crate) struct RegisterProducerResponseWire {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) struct ProducerPartitionCursorWire {
-    pub partition: i32,
-    pub last_sequence: i64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) struct ProducerTopicCursorsWire {
     pub topic: GtsInstanceId,
-    pub partitions: Vec<ProducerPartitionCursorWire>,
+    pub last_sequence: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,14 +153,7 @@ impl From<ProducerCursorsResponseWire> for crate::api::ProducerCursors {
                 .into_iter()
                 .map(|t| crate::api::TopicCursors {
                     topic: t.topic,
-                    partitions: t
-                        .partitions
-                        .into_iter()
-                        .map(|p| crate::api::PartitionCursor {
-                            partition: u32::try_from(p.partition).unwrap_or_default(),
-                            last_sequence: p.last_sequence,
-                        })
-                        .collect(),
+                    last_sequence: t.last_sequence,
                 })
                 .collect(),
         }
@@ -179,8 +165,6 @@ impl From<ProducerCursorsResponseWire> for crate::api::ProducerCursors {
 pub(crate) struct ResetProducerWire {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topic: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub partition: Option<i32>,
 }
 
 impl ResetProducerWire {
@@ -189,11 +173,6 @@ impl ResetProducerWire {
             crate::models::ResetScope::AllTopics => Self::default(),
             crate::models::ResetScope::Topic(topic) => Self {
                 topic: Some(topic.to_owned()),
-                partition: None,
-            },
-            crate::models::ResetScope::Partition { topic, partition } => Self {
-                topic: Some(topic.to_owned()),
-                partition: Some(i32::try_from(partition).unwrap_or(i32::MAX)),
             },
         }
     }

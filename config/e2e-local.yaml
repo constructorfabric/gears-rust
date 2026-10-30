@@ -611,17 +611,6 @@ opentelemetry:
       parent_based_ratio: # parent_based_always_on | parent_based_ratio | always_on | always_off
         ratio: 1.0  # Sample 100% of traces
 
-    # Propagation configuration
-    propagation:
-      w3c_trace_context: true  # Enable W3C Trace Context propagation
-
-    # HTTP-specific options
-    http:
-      inject_request_id_header: "x-request-id"
-      # Credential-bearing headers ("authorization", "cookie", …) must never
-      # be listed here: whatever is recorded reaches the trace collector.
-      record_headers: [ "user-agent", "x-forwarded-for" ]
-
     # Add top-level trace_id / span_id to JSON log records so a backend can
     # link a log line to its span. On by default (it costs a context lookup
     # per event); set to false to opt out.

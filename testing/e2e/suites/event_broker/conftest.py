@@ -26,6 +26,7 @@ import json
 import os
 import tempfile
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -33,6 +34,7 @@ import httpx
 import pytest
 
 from lib.orchestrator import GearTestEnv
+from lib.sidecars import KafkaSidecar, MariaDbSidecar, MySqlSidecar, PostgresSidecar
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -82,6 +84,16 @@ EVENT_TYPE_LONGPOLL = "gts.cf.core.events.event.v1~cf.e2e.event_broker.longpoll.
 TOPIC_4P = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.four_part.v1"
 EVENT_TYPE_4P = "gts.cf.core.events.event.v1~cf.e2e.event_broker.four_part.v1~"
 
+# Key-order topic (feature 0007 §11 S1): four partitions, so two keys may land
+# on different ones and each key's order is checked within its own.
+TOPIC_ORDER = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.key_order.v1"
+EVENT_TYPE_ORDER = "gts.cf.core.events.event.v1~cf.e2e.event_broker.key_order.v1~"
+
+# Never-published topic (feature 0007 §11 S5): a consumer joins and seeks it
+# before any producer publishes, so its first event is sequence 1.
+TOPIC_FRESH = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.fresh.v1"
+EVENT_TYPE_FRESH = "gts.cf.core.events.event.v1~cf.e2e.event_broker.fresh.v1~"
+
 # Strict-schema topic for schema-validation tests (producer/single/1.03):
 # its event type requires data.strict_field as a string, so publishing
 # without it triggers a 400 schema-validation failure.
@@ -90,15 +102,44 @@ EVENT_TYPE_STRICT = "gts.cf.core.events.event.v1~cf.e2e.event_broker.strict.v1~"
 
 # Read-only topic for seek/cursor tests: seeded with PREFILLED_COUNT events
 # at session bootstrap via the `prefilled_topic` fixture; no test ever
-# publishes here. Because the database is fresh each session, sequences start
-# at 1 and the cursor values (earliest=0, latest=PREFILLED_COUNT) are
-# deterministic constants that tests can assert directly.
+# publishes here. The medium is fresh each session, so "earliest" is 0 and
+# "latest" is the last seeded event's sequence, which the fixture records.
 TOPIC_PREFILLED = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.prefilled.v1"
 EVENT_TYPE_PREFILLED = "gts.cf.core.events.event.v1~cf.e2e.event_broker.prefilled.v1~"
 PREFILLED_TENANT_ID = "e2e00000-0000-0000-0000-000000000000"
 PREFILLED_COUNT = 100
 # How long the prefill fixture waits for its batch to become durable.
 PREFILL_INGEST_TIMEOUT = 30.0
+
+# Retention topic (backend retention, observed through SEEK and delivery): a
+# short age bound, and the only topic whose events a backend removes during
+# the session. RETENTION_SEGMENT_EVENTS old events fill exactly one storage
+# segment on the backends that expire whole segments (the backend block below
+# sets their segment size to it), so every backend removes exactly those.
+TOPIC_RETENTION = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.retention.v1"
+EVENT_TYPE_RETENTION = "gts.cf.core.events.event.v1~cf.e2e.event_broker.retention.v1~"
+RETENTION_DURATION_S = 8
+RETENTION_SEGMENT_EVENTS = 1000
+
+# Drained topic: the same age bound as TOPIC_RETENTION, for the test that lets
+# every stored event age out and checks "latest" still names the last one.
+TOPIC_DRAIN = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.drain.v1"
+EVENT_TYPE_DRAIN = "gts.cf.core.events.event.v1~cf.e2e.event_broker.drain.v1~"
+
+# Byte-bounded topic: RETENTION_BYTES per partition and the default age, so
+# only the byte bound removes anything during the session.
+TOPIC_BYTES = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.bytes.v1"
+EVENT_TYPE_BYTES = "gts.cf.core.events.event.v1~cf.e2e.event_broker.bytes.v1~"
+RETENTION_BYTES = 100_000
+
+# Progress topic: a producer fills it with events a narrowly filtered consumer
+# rejects, so the consumer's frontier drifts and a `control:progress` frame is
+# owed. PROGRESS_DRIFT_THRESHOLD and PROGRESS_MIN_INTERVAL_S are the streaming
+# settings the generated config sets, below every other test's rejected scan.
+TOPIC_PROGRESS = "gts.cf.core.events.topic.v1~cf.e2e.event_broker.progress.v1"
+EVENT_TYPE_PROGRESS = "gts.cf.core.events.event.v1~cf.e2e.event_broker.progress.v1~"
+PROGRESS_DRIFT_THRESHOLD = 500
+PROGRESS_MIN_INTERVAL_S = 1
 
 # Shared xfail marker for tests that require real auth enforcement.
 # The standalone config sets ``auth_disabled: true``; these tests document the
@@ -122,6 +163,19 @@ _TOPIC_PARTITIONS = {
     TOPIC_4P: 4,
     TOPIC_STRICT: 1,
     TOPIC_PREFILLED: 1,
+    TOPIC_ORDER: 4,
+    TOPIC_FRESH: 1,
+    TOPIC_RETENTION: 1,
+    TOPIC_DRAIN: 1,
+    TOPIC_BYTES: 1,
+    TOPIC_PROGRESS: 1,
+}
+
+# Topics bounded tighter than the default retention: their `retention` block.
+_TOPIC_RETENTION = {
+    TOPIC_RETENTION: {"duration": f"{RETENTION_DURATION_S}s"},
+    TOPIC_DRAIN: {"duration": f"{RETENTION_DURATION_S}s"},
+    TOPIC_BYTES: {"size_bytes": RETENTION_BYTES},
 }
 
 
@@ -210,9 +264,144 @@ _EXTRA_ENTITIES = [
     _strict_event_type(EVENT_TYPE_STRICT, TOPIC_STRICT),
     _topic_instance(TOPIC_PREFILLED),
     _derived_event_type(EVENT_TYPE_PREFILLED, TOPIC_PREFILLED),
+    _topic_instance(TOPIC_ORDER),
+    _derived_event_type(EVENT_TYPE_ORDER, TOPIC_ORDER),
+    _topic_instance(TOPIC_FRESH),
+    _derived_event_type(EVENT_TYPE_FRESH, TOPIC_FRESH),
+    _topic_instance(TOPIC_RETENTION),
+    _derived_event_type(EVENT_TYPE_RETENTION, TOPIC_RETENTION),
+    _topic_instance(TOPIC_DRAIN),
+    _derived_event_type(EVENT_TYPE_DRAIN, TOPIC_DRAIN),
+    _topic_instance(TOPIC_BYTES),
+    _derived_event_type(EVENT_TYPE_BYTES, TOPIC_BYTES),
+    _topic_instance(TOPIC_PROGRESS),
+    _derived_event_type(EVENT_TYPE_PROGRESS, TOPIC_PROGRESS),
 ]
 
 _TEMP_HOME = tempfile.mkdtemp(prefix="cf-gears-e2e-event-broker-")
+
+# ── Storage backend ───────────────────────────────────────────────────────
+#
+# The suite runs against any linked storage backend, chosen by `EB_E2E_BACKEND`:
+# `memory` (the default, what the committed config names), `sqlite` (a file in
+# the server's home directory), or a server in a sidecar container -
+# `postgres`, `mysql`, `mariadb` (both served by the MySQL backend) or `kafka`.
+# The make targets are `e2e-event-broker` (the whole suite) and
+# `e2e-event-broker-<backend>` (the `backend_sensitive` tests only).
+# Tests that need events to outlive the process run on every durable backend.
+
+MEMORY_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~"
+POSTGRES_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~"
+SQLITE_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+MYSQL_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.mysql.v1~"
+KAFKA_BACKEND = "gts.cf.core.events.backend.v1~cf.core.backend.kafka.v1~"
+
+# The sidecar each server-backed choice runs, by `EB_E2E_BACKEND` value.
+_SIDECARS = {
+    "postgres": PostgresSidecar,
+    "mysql": MySqlSidecar,
+    "mariadb": MariaDbSidecar,
+    "kafka": KafkaSidecar,
+}
+BACKENDS = ("memory", "sqlite", *_SIDECARS)
+BACKEND = os.environ.get("EB_E2E_BACKEND", "").strip() or "memory"
+if BACKEND not in BACKENDS:
+    raise RuntimeError(f"EB_E2E_BACKEND must be one of {BACKENDS}, not {BACKEND!r}")
+DURABLE = BACKEND != "memory"
+
+
+def backend_sidecars() -> list:
+    """A fresh sidecar for `BACKEND`, or none for an in-process medium.
+
+    Named `eb-e2e-<backend>-<6 hex>`, so `docker ps` shows who started it.
+    """
+    sidecar = _SIDECARS.get(BACKEND)
+    if sidecar is None:
+        return []
+    named = type(f"EventBroker{sidecar.__name__}", (sidecar,), {"NAME_PREFIX": f"eb-e2e-{BACKEND}"})
+    return [named()]
+
+
+def _backend_block(sidecars, namespace: str, home_dir: str) -> tuple[str, str]:
+    """`(type, settings lines)` of the `backends.main` entry for `BACKEND`.
+
+    `namespace` keeps one server's events apart from another's on a shared
+    medium: the PostgreSQL schema, the MySQL database, the Kafka topic prefix,
+    the SQLite file name in `home_dir`.
+    """
+    sidecars = list(sidecars.values() if isinstance(sidecars, dict) else sidecars)
+    server = next((sc for sc in sidecars if sc.name == BACKEND), None)
+    indent = "          "
+    if BACKEND == "postgres":
+        # Segments of 1000 events, so the retention test's batch fills one and
+        # its expiry is observable; PostgreSQL expires whole sealed segments.
+        return POSTGRES_BACKEND, (
+            f'{indent}url: "{server.url()}"\n'
+            f'{indent}schema: "{namespace}"\n'
+            f"{indent}segment:\n"
+            f"{indent}  events: {RETENTION_SEGMENT_EVENTS}\n"
+            f"{indent}maintenance:\n"
+            f"{indent}  rescan_interval_ms: 1000\n"
+        )
+    if BACKEND == "sqlite":
+        path = Path(home_dir) / f"{namespace}.db"
+        return SQLITE_BACKEND, f'{indent}path: "{path.as_posix()}"\n'
+    if BACKEND in ("mysql", "mariadb"):
+        return MYSQL_BACKEND, (
+            f'{indent}url: "{server.url()}"\n'
+            f'{indent}database: "{namespace}"\n'
+            f"{indent}segment:\n"
+            f"{indent}  events: {RETENTION_SEGMENT_EVENTS}\n"
+            f"{indent}poll_interval_ms: 100\n"
+            f"{indent}maintenance:\n"
+            f"{indent}  rescan_interval_ms: 1000\n"
+        )
+    if BACKEND == "kafka":
+        # One broker, so one replica.
+        return KAFKA_BACKEND, (
+            f'{indent}bootstrap_servers: "{server.bootstrap()}"\n'
+            f'{indent}topic_prefix: "{namespace}"\n'
+            f"{indent}replication_factor: 1\n"
+            f"{indent}min_insync_replicas: 1\n"
+            f"{indent}poll_interval_ms: 100\n"
+        )
+    raise AssertionError(f"no backends entry for {BACKEND!r}")
+
+
+def patch_backend(config_text: str, sidecars, namespace: str, home_dir: str) -> str:
+    """Point the committed config's one registry entry, `backends.main`, at `BACKEND`.
+
+    `sidecars` is whatever the caller holds - `GearTestEnv.sidecars` (a list)
+    or `RunningTestEnv.sidecars` (a dict); `namespace` and `home_dir` are the
+    server's own (see `_backend_block`).
+    """
+    if BACKEND == "memory":
+        return config_text
+    entry = f'        main:\n          type: "{MEMORY_BACKEND}"\n'
+    assert config_text.count(entry) == 1, (
+        "the committed config no longer names the memory backend where the "
+        "backend switch expects it"
+    )
+    backend_type, settings = _backend_block(sidecars, namespace, home_dir)
+    return config_text.replace(
+        entry, f'        main:\n          type: "{backend_type}"\n' + settings
+    )
+
+
+# ── Backend-sensitive tests ───────────────────────────────────────────────
+#
+# The whole suite runs once, on the default backend: it pins the exact wire
+# formats. `backend_sensitive` marks the tests whose outcome can differ by
+# storage backend - appends, reads, position resolution, retention, watch,
+# durability - and the per-backend targets (`e2e-event-broker-<backend>`) run
+# only those.
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "backend_sensitive: outcome depends on the storage backend; "
+        "run by every e2e-event-broker-<backend> target",
+    )
 
 
 # ── Environment gate ──────────────────────────────────────────────────────
@@ -243,17 +432,10 @@ def pytest_collection_modifyitems(items):
 # ── Test environment ──────────────────────────────────────────────────────
 
 def _patch_config(config_text: str, env: GearTestEnv) -> str:
+    config_text = patch_backend(config_text, env.sidecars, "evbk_e2e", _TEMP_HOME)
     config_text = config_text.replace(
         'home_dir: "~/.cf-gears-event-broker"',
         f'home_dir: "{Path(_TEMP_HOME).as_posix()}"',
-    )
-    # The storage backend opens its own database, and the committed config
-    # points it at the real home directory. Redirect it into this session's
-    # temp home too, or every run of this suite would append to one event log
-    # shared with the last run and with the restart test's own server.
-    config_text = config_text.replace(
-        'path: "~/.cf-gears-event-broker/event-broker/event_log.db"',
-        f'path: "{Path(_TEMP_HOME).as_posix()}/event-broker/event_log.db"',
     )
     config_text = config_text.replace(
         'bind_addr: "127.0.0.1:8080"',
@@ -262,9 +444,27 @@ def _patch_config(config_text: str, env: GearTestEnv) -> str:
     # Each topic's partition count is configuration, not part of the entity.
     settings = "".join(
         f'        "{topic}":\n          partitions: {count}\n'
+        + (
+            "          retention:\n"
+            + "".join(f"            {k}: {v}\n" for k, v in _TOPIC_RETENTION[topic].items())
+            if topic in _TOPIC_RETENTION
+            else ""
+        )
         for topic, count in _TOPIC_PARTITIONS.items()
     )
     config_text = config_text.replace("      topics:\n", "      topics:\n" + settings, 1)
+    # The block is read whole, so the other settings restate their defaults.
+    streaming = (
+        "      streaming:\n"
+        "        heartbeat_interval_secs: 5\n"
+        "        read_batch_max_events: 256\n"
+        "        read_batch_max_bytes: 1048576\n"
+        f"        progress_drift_threshold: {PROGRESS_DRIFT_THRESHOLD}\n"
+        f"        progress_min_interval_secs: {PROGRESS_MIN_INTERVAL_S}\n"
+    )
+    anchor = "      backends:"
+    assert config_text.count(anchor) == 1 and "      streaming:" not in config_text
+    config_text = config_text.replace(anchor, streaming + anchor, 1)
     extra = "".join(f"        - {json.dumps(e)}\n" for e in _EXTRA_ENTITIES)
     return config_text.replace("entities:\n", "entities:\n" + extra)
 
@@ -276,11 +476,84 @@ def gear_test_env() -> GearTestEnv:
         config_path=CONFIG,
         config_patch=_patch_config,
         port=SERVER_PORT,
-        health_path="/healthz",
+        health_path="/readyz",
         health_timeout=30,
         env={"RUST_LOG": os.environ.get("RUST_LOG", "info,event_broker=debug")},
+        sidecars=backend_sidecars(),
         log_suffix="event-broker",
     )
+
+
+# How long a fresh server may take to provision its topics on the backend.
+PROVISION_TIMEOUT = 60.0
+
+
+def wait_provisioned(base_url: str, event_types: dict[str, str]) -> None:
+    """Block until every topic of `event_types` (topic -> an event type of
+    it) is provisioned on the storage backend.
+
+    The server is already ready (`/readyz`), but provisioning goes on past the
+    start phase: a backend may answer `Pending` first, and a remote one takes
+    a round trip per topic, so a test could otherwise get a 503 publishing.
+    The probe has no side effect: a publish naming an unregistered producer is
+    refused 404 only after the topic's provisioning check, which answers 503
+    before.
+    """
+    import time
+
+    deadline = time.monotonic() + PROVISION_TIMEOUT
+
+    def settle(probe, what: str) -> None:
+        while True:
+            resp = probe()
+            if resp.status_code == 404:
+                return
+            assert resp.status_code == 503, resp.text
+            assert time.monotonic() < deadline, (
+                f"{what} not ready within {PROVISION_TIMEOUT}s: {resp.text}"
+            )
+            time.sleep(0.2)
+
+    with httpx.Client(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
+        for topic, event_type in event_types.items():
+            settle(
+                lambda: client.post(
+                    "/events",
+                    json={
+                        "id": str(uuid.uuid4()),
+                        "type": event_type,
+                        "tenant_id": str(uuid.uuid4()),
+                        "source": "e2e-probe",
+                        "subject": "probe",
+                        "subject_type": SUBJECT_TYPE,
+                        "occurred_at": datetime.now(timezone.utc).isoformat(),
+                        "data": {"strict_field": "probe"},
+                        "meta": {"version": 1, "producer_id": str(uuid.uuid4()), "previous": 0, "sequence": 1},
+                    },
+                ),
+                f"topic {topic}",
+            )
+
+
+# Every suite topic, with one event type of it for the provisioning probe.
+_TOPIC_EVENT_TYPES = {
+    TOPIC_STREAM: EVENT_TYPE_STREAM,
+    TOPIC_LONGPOLL: EVENT_TYPE_LONGPOLL,
+    TOPIC_4P: EVENT_TYPE_4P,
+    TOPIC_STRICT: EVENT_TYPE_STRICT,
+    TOPIC_PREFILLED: EVENT_TYPE_PREFILLED,
+    TOPIC_ORDER: EVENT_TYPE_ORDER,
+    TOPIC_FRESH: EVENT_TYPE_FRESH,
+    TOPIC_RETENTION: EVENT_TYPE_RETENTION,
+    TOPIC_DRAIN: EVENT_TYPE_DRAIN,
+    TOPIC_BYTES: EVENT_TYPE_BYTES,
+    TOPIC_PROGRESS: EVENT_TYPE_PROGRESS,
+}
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _topics_provisioned(_require_dedicated_binary, test_env):
+    wait_provisioned(f"{test_env.base_url}{API_BASE}", _TOPIC_EVENT_TYPES)
 
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────
@@ -299,59 +572,99 @@ def api(test_env):
     return _client
 
 
+@dataclass(frozen=True)
+class Prefilled:
+    """TOPIC_PREFILLED as the session seeded it.
+
+    `events` are the delivered payloads in sequence order, one per published
+    event; `head` is the last one's sequence, which "latest" resolves to.
+    Sequences rise but may have gaps on some backends, so a test reads a
+    position from here rather than computing it from PREFILLED_COUNT.
+    """
+
+    events: list[dict]
+
+    @property
+    def head(self) -> int:
+        return self.events[-1]["sequence"]
+
+
 @pytest.fixture(scope="session")
-async def prefilled_topic(test_env):
+async def prefilled_topic(test_env) -> Prefilled:
     """Seed TOPIC_PREFILLED with PREFILLED_COUNT events at session startup.
 
-    No other test publishes to TOPIC_PREFILLED. The database is fresh each
-    session, so sequences start at 1 and seek("latest") after this fixture
-    returns exactly PREFILLED_COUNT. Tests assert that constant directly.
+    No other test publishes to TOPIC_PREFILLED, and the medium is fresh each
+    session, so the floor is 0 and the head is the last seeded event's
+    sequence.
     """
     base_url = f"{test_env.base_url}{API_BASE}"
+    now = datetime.now(timezone.utc).isoformat()
+    published = [
+        {
+            "id": str(uuid.uuid4()),
+            "type": EVENT_TYPE_PREFILLED,
+            "tenant_id": PREFILLED_TENANT_ID,
+            "source": "e2e-prefill",
+            "subject": "prefill-subject",
+            "subject_type": SUBJECT_TYPE,
+            "occurred_at": now,
+        }
+        for _ in range(PREFILLED_COUNT)
+    ]
     async with httpx.AsyncClient(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
-        now = datetime.now(timezone.utc).isoformat()
-        pub_resp = await client.post(
-            "/events:batch",
-            json={
-                "events": [
-                    {
-                        "id": str(uuid.uuid4()),
-                        "type": EVENT_TYPE_PREFILLED,
-                        "tenant_id": PREFILLED_TENANT_ID,
-                        "source": "e2e-prefill",
-                        "subject": "prefill-subject",
-                        "subject_type": SUBJECT_TYPE,
-                        "occurred_at": now,
-                    }
-                    for _ in range(PREFILLED_COUNT)
-                ]
-            },
-        )
+        pub_resp = await client.post("/events:batch", json={"events": published})
         assert pub_resp.status_code == 202
 
-        # `POST /events:batch` acks with 202 before the events are sequenced,
-        # so the partition's HWM climbs asynchronously after this call returns.
-        # Every cursor a test asserts is derived from that HWM, so the fixture
-        # has to wait for all PREFILLED_COUNT to land - otherwise seek("latest")
-        # reports a partially-ingested value and every bound shifts with it.
-        # `GET /topics/segments` reports the partition's end_sequence, which is
-        # the HWM. Temporary: a synchronous publish that acks only once durable
-        # removes the need to poll, but is not implemented yet.
-        deadline = asyncio.get_running_loop().time() + PREFILL_INGEST_TIMEOUT
-        while True:
-            seg_resp = await client.get(
-                f"/topics/segments?topic={TOPIC_PREFILLED}&partition=0"
-            )
-            assert seg_resp.status_code == 200
-            sequenced = seg_resp.json()["end_sequence"]
-            if sequenced == PREFILLED_COUNT:
-                break
-            remaining = deadline - asyncio.get_running_loop().time()
-            assert remaining > 0, (
-                f"only {sequenced} of {PREFILLED_COUNT} prefill events were "
-                f"sequenced within {PREFILL_INGEST_TIMEOUT}s"
-            )
-            await asyncio.sleep(0.1)
+        group = await client.post("/consumer-groups")
+        assert group.status_code == 201
+        sub = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": group.json()["id"],
+                "client_agent": "e2e-prefill",
+                "interests": [
+                    {
+                        "topic": TOPIC_PREFILLED,
+                        "tenant_id": PREFILLED_TENANT_ID,
+                        "types": [EVENT_TYPE_PREFILLED],
+                    }
+                ],
+            },
+        )
+        assert sub.status_code == 201
+        sub_id = sub.json()["id"]
+        seek = await client.post(
+            f"/subscriptions/{sub_id}:seek",
+            json={"topology_version": 1, "positions": {TOPIC_PREFILLED: [{"partition": 0, "value": "earliest"}]}},
+        )
+        assert seek.status_code == 200
+
+    # `POST /events:batch` acks with 202 before the events are sequenced, so
+    # the fixture reads the whole topic back: that both waits for every event
+    # to land and records the sequence each one got. Temporary: a synchronous
+    # publish that acks only once durable removes the wait, but is not
+    # implemented yet.
+    delivered: list[dict] = []
+    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+        async with stream_client.stream("GET", f"/events:sse?subscription_id={sub_id}") as resp:
+            assert resp.status_code == 200
+            reader = SseFrameReader(resp)
+            await reader.await_kind("topology", timeout=5)
+            deadline = asyncio.get_running_loop().time() + PREFILL_INGEST_TIMEOUT
+            while len(delivered) < PREFILLED_COUNT:
+                remaining = deadline - asyncio.get_running_loop().time()
+                assert remaining > 0, (
+                    f"only {len(delivered)} of {PREFILLED_COUNT} prefill events were "
+                    f"delivered within {PREFILL_INGEST_TIMEOUT}s"
+                )
+                delivered.append((await reader.await_kind("event", timeout=remaining))["payload"])
+    async with httpx.AsyncClient(base_url=base_url, timeout=REQUEST_TIMEOUT) as client:
+        assert (await client.delete(f"/subscriptions/{sub_id}")).status_code == 204
+
+    assert [e["id"] for e in delivered] == [e["id"] for e in published]
+    sequences = [e["sequence"] for e in delivered]
+    assert sequences == sorted(set(sequences)) and sequences[0] >= 1, sequences
+    return Prefilled(events=delivered)
 
 
 class FrameReader:

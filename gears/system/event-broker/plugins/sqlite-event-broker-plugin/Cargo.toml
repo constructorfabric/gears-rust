@@ -6,8 +6,7 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "SQLite storage backend plugin for the event-broker gear: the durable event log, its per-partition bookkeeping, and per-partition retention"
-readme = "README.md"
+description = "SQLite storage backend plugin for the event-broker gear: a single-process event log in one database file"
 keywords = ["constructorfabric", "cf-gears", "event-broker"]
 categories = ["database"]
 metadata.docs.rs.all-features = true
@@ -19,26 +18,33 @@ name = "sqlite_event_broker_plugin"
 workspace = true
 
 [dependencies]
-# The `EventBrokerBackend` trait this crate implements, its provider seam, and
-# the `Event` projection it persists and reads back. This crate depends on the
-# SDK only, never on the gear.
+# The `backend::Backend` contract this crate implements. This crate depends on
+# the SDK only, never on the gear.
 event-broker-sdk = { workspace = true }
 
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock", "serde"] }
-serde = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
 toolkit-gts = { workspace = true }
-toolkit-security = { workspace = true }
+toolkit-utils = { workspace = true }
+tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
-
-# All DB access goes through SecureORM (`toolkit_db::secure`); a raw connection
-# is never held. The `sqlite` feature is this backend's whole point.
-sea-orm = { workspace = true }
-sea-orm-migration = { workspace = true }
-toolkit-db = { workspace = true, features = ["sqlite"] }
-toolkit-db-macros = { workspace = true }
+# Direct sqlx, not `libs/toolkit-db`: see the crate docs in `src/lib.rs`.
+sqlx = { workspace = true, features = ["sqlite", "migrate", "macros", "chrono", "uuid"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+# Path only, no version: the suite is not published.
+event-broker-backend-conformance = { package = "cf-gears-event-broker-backend-conformance", path = "../event-broker-backend-conformance" }
+event-broker-backend-bench = { package = "cf-gears-event-broker-backend-bench", path = "../event-broker-backend-bench" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+# Needs no server: it runs over a file in a temporary directory, so it is not
+# gated behind a feature the way the server-backed plugins' benches are.
+[[bench]]
+name = "backend"
+harness = false

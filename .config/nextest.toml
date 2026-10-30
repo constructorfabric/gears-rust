@@ -14,6 +14,14 @@ slow-timeout = { period = "60s", terminate-after = 5 }
 filter = 'package(cf-gears-quota-enforcement-storage-plugin)'
 slow-timeout = { period = "60s", terminate-after = 3 }
 
+# Event broker gear-DB contention suites: no retries, ever. These tests catch a
+# race between a chained publish's head read and its write; a race that shows
+# once is the defect, so a retry that passes would hide exactly what they exist
+# to find. Explicit so a profile or command-line retry default cannot apply.
+[[profile.default.overrides]]
+filter = 'package(cf-gears-event-broker) & (binary(contention_backends_test) | binary(producer_chain_backends_test))'
+retries = 0
+
 # Flaky-test quarantine: each entry below retries a known-flaky test twice. This
 # hides the flake, it does not fix it; remove the entry once the test is fixed.
 

@@ -182,6 +182,7 @@ async def test_positions_not_set_recovery(api):
             assert stream_resp.status_code == 200
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(5, func_only=True)
 async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
     """scenario: consumer/flows/1.03-flow-path-a-consumer-with-db.md
@@ -288,9 +289,11 @@ async def test_path_a_consumer_reconnects_from_exact_offset(api, test_env):
                 )
 
             _, event2_data = await reader2.next_frame(timeout=5)
-            # Must be event2, not event1 (which was already processed).
+            # Must be event2, not event1 (which was already processed). Its
+            # sequence is above the cursor; sequences may have gaps, so not
+            # necessarily the next integer.
             assert event2_data["payload"]["id"] == event2_id
-            assert event2_data["payload"]["sequence"] == last_processed_sequence + 1
+            assert event2_data["payload"]["sequence"] > last_processed_sequence
 
 
 @pytest.mark.parametrize("disconnect", [False, True], ids=["delete", "disconnect"])

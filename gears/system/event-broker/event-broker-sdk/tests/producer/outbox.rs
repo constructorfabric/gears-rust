@@ -11,18 +11,18 @@ use event_broker::test_support::{
     EventBrokerHarness, FaultInjectingBroker, StaticTypesRegistry, TransientFault,
 };
 use event_broker_sdk::api::EventBrokerApi;
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::error::EventBrokerError;
 use event_broker_sdk::models::{Event, ProducerMeta, ResetScope};
 use event_broker_sdk::producer::IngestOutcome;
-use event_broker_sdk::producer::UnknownProducerAction;
+use event_broker_sdk::producer::TEST_QUEUE;
 use event_broker_sdk::{
-    DbDeduplication, DbProducer, GtsInstanceId, GtsTypeId, MissingProducerRegistration, ProducerId,
-    ProducerIdentity, ProducerMode, Sequence, TypedEvent, UnknownProducerRegistration,
+    DbDeduplication, DbProducer, GtsInstanceId, GtsTypeId, ProducerId, ProducerIdentity,
+    ProducerMode, Sequence, TypedEvent,
 };
 
 const QUEUE: &str = "event-broker-producer";
-/// Partition count `fixture` registers its topics with, and therefore the count
-/// its producers declare.
+/// Partition count `fixture` registers its topics with.
 const FIXTURE_BROKER_PARTITIONS: u32 = 4;
 
 const TOPIC: &str = "gts.cf.core.events.topic.v1~example.sdk.outbox.orders.v1";
@@ -35,7 +35,6 @@ const EVENT_TYPE2: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.charge
 /// payload is a *separate* catalog type - not a runtime repoint of `EVENT_TYPE`.
 const EVENT_TYPE_KEYED: &str = "gts.cf.core.events.event.v1~example.sdk.outbox.keyed.v1~";
 const SUBJECT_TYPE: &str = "gts.cf.core.events.subject.v1~example.sdk.outbox.order.v1~";
-const TENANT_PARTITION: u32 = 2;
 /// The payload member `EVENT_TYPE_KEYED` points its partition key at. Reaching
 /// inside `data` is the interesting case: a bare field name could not.
 const PAYLOAD_POINTER: &str = "/data/partition_key";
@@ -185,38 +184,13 @@ async fn lazy_validation_missing_schema_fails_without_broker_lookup() {
 }
 
 #[tokio::test]
-async fn managed_missing_registration_can_fail_without_registering() {
-    let (db, broker, _harness) = fixture().await;
-
-    let result = DbProducer::builder()
-        .broker(broker)
-        .db(db)
-        .security_context(toolkit_security::SecurityContext::anonymous())
-        .identity(ProducerIdentity::new().source("order-service"))
-        .deduplication(
-            DbDeduplication::managed(ProducerMode::Chained)
-                .key("orders")
-                .on_missing(MissingProducerRegistration::Fail),
-        )
-        .topics([TOPIC])
-        .event_type_patterns([EVENT_TYPE])
-        .prepare_all()
-        .await;
-    let err = match result {
-        Ok(_) => panic!("missing managed registration must fail"),
-        Err(err) => err,
-    };
-
-    assert!(matches!(
-        err,
-        EventBrokerError::InvalidProducerOptions { .. }
-    ));
-}
-
-#[tokio::test]
 async fn managed_client_agent_drift_fails_loudly() {
     let (db, broker, _harness) = fixture().await;
-    let _first = managed_producer(db.clone(), Arc::clone(&broker)).await;
+    let first = managed_producer(db.clone(), Arc::clone(&broker)).await;
+    first
+        .partition_producer_for_test(TEST_QUEUE, 0)
+        .await
+        .unwrap();
 
     let result = DbProducer::builder()
         .broker(broker)
@@ -227,11 +201,7 @@ async fn managed_client_agent_drift_fails_loudly() {
                 .source("order-service")
                 .client_agent("order-service/2.0"),
         )
-        .deduplication(
-            DbDeduplication::managed(ProducerMode::Chained)
-                .key("orders")
-                .on_missing(MissingProducerRegistration::RegisterNew),
-        )
+        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()
@@ -261,11 +231,7 @@ async fn managed_registration_requires_producer_migrations() {
                 .source("order-service")
                 .client_agent("order-service/1.0"),
         )
-        .deduplication(
-            DbDeduplication::managed(ProducerMode::Chained)
-                .key("orders")
-                .on_missing(MissingProducerRegistration::RegisterNew),
-        )
+        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()
@@ -281,73 +247,84 @@ async fn managed_registration_requires_producer_migrations() {
     );
 }
 
+/// A managed producer registers nothing until a partition first drains; that
+/// drain registers the partition's producer id and publishes under it.
 #[tokio::test]
-async fn unknown_producer_fail_policy_keeps_registration() {
-    let (db, broker, _harness) = fixture().await;
-    let producer =
-        managed_producer_with_unknown(db, broker, UnknownProducerRegistration::Fail).await;
-    let (_, before) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let before = envelope_json(&before);
-    let producer_id = producer_id_from_envelope(&before);
+async fn a_partition_id_is_registered_on_its_first_drain() {
+    let (db, broker, harness) = fixture().await;
+    let producer = managed_producer(db, broker).await;
+    assert_eq!(producer.registrations_for_test().await.unwrap(), vec![]);
 
-    let action = producer.handle_unknown_producer(producer_id).await.unwrap();
-    let (_, after) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let after = envelope_json(&after);
+    let result = producer
+        .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
+        .await;
 
-    assert_eq!(action, UnknownProducerAction::Fail);
-    assert_eq!(before["producer_id"], after["producer_id"]);
-    assert_eq!(before["generation"], after["generation"]);
+    assert_message_ok(result);
+    let registrations = producer.registrations_for_test().await.unwrap();
+    let id = registrations[0].2;
+    assert_eq!(registrations, vec![(TEST_QUEUE.to_owned(), 0, id, 1)]);
+    wait_for_stored(&harness, TOPIC, 1).await;
 }
 
+/// The broker forgets a partition's producer id (its registration is reaped):
+/// the drain that sees `404 ProducerNotFound` registers a replacement for that
+/// partition (generation 2) and asks for a retry, and the retry publishes under
+/// it. Nothing is rejected. Drives the real gear: `harness.forget_producer`
+/// deletes the `evbk_producer` row.
 #[tokio::test]
-async fn unknown_producer_register_new_replaces_registration() {
-    let (db, broker, _harness) = fixture().await;
-    let producer =
-        managed_producer_with_unknown(db, broker, UnknownProducerRegistration::RegisterNew).await;
-    let (_, before) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let before = envelope_json(&before);
-    let producer_id = producer_id_from_envelope(&before);
+async fn an_unknown_producer_id_is_replaced_and_the_message_retried() {
+    let (db, broker, harness) = fixture().await;
+    let producer = managed_producer(db, broker).await;
+    assert_message_ok(
+        producer
+            .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
+            .await,
+    );
+    let forgotten = producer.registrations_for_test().await.unwrap()[0].2;
+    harness.forget_producer(forgotten.0).await;
 
-    let action = producer.handle_unknown_producer(producer_id).await.unwrap();
-    let (_, after) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let after = envelope_json(&after);
+    let envelope = managed_envelope_payload(&producer).await;
+    let first = producer
+        .process_outbox_payload_for_test(envelope.clone(), 2)
+        .await;
+    let registrations = producer.registrations_for_test().await.unwrap();
+    let replacement = registrations[0].2;
+    let retried = producer.process_outbox_payload_for_test(envelope, 2).await;
 
-    assert_eq!(action, UnknownProducerAction::Rotated);
-    assert_ne!(before["producer_id"], after["producer_id"]);
-    assert_eq!(before["generation"], 1);
-    assert_eq!(after["generation"], 2);
-
-    let action = producer.handle_unknown_producer(producer_id).await.unwrap();
-    assert_eq!(action, UnknownProducerAction::AlreadyRotated);
+    assert_message_retry(first);
+    assert_ne!(replacement, forgotten);
+    assert_eq!(
+        registrations,
+        vec![(TEST_QUEUE.to_owned(), 0, replacement, 2)]
+    );
+    assert_message_ok(retried);
+    wait_for_stored(&harness, TOPIC, 2).await;
 }
 
-/// The event type decides which member is hashed, so a tenant-keyed type and a
-/// payload-keyed type yield different partitions for the same publish call - and
-/// a producer cannot change the pointer per message. Under the real broker the
-/// two pointers are two distinct catalog event types (`EVENT_TYPE` keyed on
-/// `/tenant_id`, `EVENT_TYPE_KEYED` keyed on `PAYLOAD_POINTER`), because a type's
-/// partition key is fixed at registration.
+/// The event type decides which member is the partition key, so a tenant-keyed
+/// type and a payload-keyed type place the same publish call in different
+/// producer outbox partitions - and a producer cannot change the pointer per
+/// message. Placement is `murmur3("{topic}:{key}") % 4`.
 #[tokio::test]
-async fn the_event_types_declared_pointer_drives_the_broker_partition() {
+async fn the_event_types_declared_pointer_drives_the_outbox_partition() {
     let (db, broker, _harness) = fixture().await;
     let by_tenant = stateless_producer(db.clone(), Arc::clone(&broker)).await;
 
-    let (_, tenant_envelope) = by_tenant.outbox_envelope(order(None), 4).await.unwrap();
-    assert_eq!(
-        envelope_json(&tenant_envelope)["broker_partition"],
-        serde_json::json!(TENANT_PARTITION)
+    let (tenant_partition, tenant_envelope) =
+        by_tenant.outbox_envelope(order(None), 4).await.unwrap();
+    assert_eq!(tenant_partition, 3);
+    assert!(
+        envelope_json(&tenant_envelope)
+            .get("broker_partition")
+            .is_none()
     );
 
-    let by_payload =
-        keyed_producer_with_broker_partitions(db, broker, FIXTURE_BROKER_PARTITIONS).await;
-    let (_, keyed_envelope) = by_payload
-        .outbox_envelope(keyed_order("explicit-key"), 4)
+    let by_payload = keyed_producer(db, broker).await;
+    let (keyed_partition, _) = by_payload
+        .outbox_envelope(keyed_order("payload-key"), 4)
         .await
         .unwrap();
-    assert_eq!(
-        envelope_json(&keyed_envelope)["broker_partition"],
-        serde_json::json!(3)
-    );
+    assert_eq!(keyed_partition, 0);
 }
 
 #[tokio::test]
@@ -361,23 +338,15 @@ async fn same_topic_partition_maps_to_same_outbox_partition() {
     assert_eq!(left, right);
 }
 
-/// The broker forgets a registered producer (its registration is reaped);
-/// the producer's outbox draining a later event sees the `404 ProducerNotFound`
-/// and - being `on_unknown = RegisterNew` - rotates to a fresh registration
-/// (generation 2, new `producer_id`) for future enqueues. Drives the real
-/// gear: `harness.forget_producer` deletes the `evbk_producer` row, so ingest's
-/// `find` returns `None` and raises the real not-found the SDK recovers from.
+/// The same recovery through a running outbox: after the broker forgets the
+/// partition's id, the next event drained from that partition is published
+/// under a replacement, generation 2. `order(None)` keys by the test tenant,
+/// which places it in outbox partition 3 of 4 - partition row id 4 in a fresh
+/// database, the id toolkit-db delivers messages under.
 #[tokio::test]
-async fn outbox_processor_rotates_future_registration_when_broker_forgot_producer() {
+async fn outbox_processor_replaces_an_unknown_producer_while_draining() {
     let (db, broker, harness) = fixture().await;
-    let producer =
-        managed_producer_with_unknown(db.clone(), broker, UnknownProducerRegistration::RegisterNew)
-            .await;
-    let (_, before) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let before = envelope_json(&before);
-    let producer_id = producer_id_from_envelope(&before);
-    harness.forget_producer(producer_id.0).await;
-
+    let producer = managed_producer(db.clone(), broker).await;
     let event_outbox = producer
         .outbox_queue(QUEUE, toolkit_db::outbox::Partitions::of(4))
         .unwrap();
@@ -393,38 +362,22 @@ async fn outbox_processor_rotates_future_registration_when_broker_forgot_produce
         .await
         .unwrap()
         .fire();
-    let after =
-        wait_for_rotated_registration(&producer, before["producer_id"].as_str().unwrap()).await;
-
-    assert_eq!(after["generation"], 2);
-    assert_ne!(before["producer_id"], after["producer_id"]);
-    producer_handle.stop().await;
-}
-
-/// The producer's declared broker-partition count and its outbox's partition
-/// count are independent: a payload key hashes to broker partition 15 of 16 and
-/// outbox partition 0 of 4, and both stay within their own bound.
-#[tokio::test]
-async fn producer_outbox_and_broker_topic_partition_counts_can_differ() {
-    let (db, broker, _harness) = fixture().await;
-    let producer = keyed_producer_with_broker_partitions(db, broker, 16).await;
-
-    let expected_broker_partition = 15;
-    let expected_outbox_partition = 0;
-
-    let (outbox_partition, envelope) = producer
-        .outbox_envelope(keyed_order("explicit-key"), 4)
+    wait_for_stored(&harness, TOPIC, 1).await;
+    let forgotten = producer.registrations_for_test().await.unwrap()[0].2;
+    harness.forget_producer(forgotten.0).await;
+    producer_handle
+        .outbox()
+        .enqueue(&conn, order(None))
         .await
-        .unwrap();
-    let envelope = envelope_json(&envelope);
+        .unwrap()
+        .fire();
+    wait_for_stored(&harness, TOPIC, 2).await;
 
-    assert_eq!(outbox_partition, expected_outbox_partition);
-    assert_eq!(
-        envelope["broker_partition"],
-        serde_json::json!(expected_broker_partition)
-    );
-    assert!(outbox_partition < 4);
-    assert!(expected_broker_partition < 16);
+    let registrations = producer.registrations_for_test().await.unwrap();
+    let replacement = registrations[0].2;
+    assert_ne!(replacement, forgotten);
+    assert_eq!(registrations, vec![(QUEUE.to_owned(), 4, replacement, 2)]);
+    producer_handle.stop().await;
 }
 
 #[tokio::test]
@@ -460,19 +413,22 @@ async fn one_queue_can_carry_multiple_topics() {
     assert_eq!(envelope_json(&billing)["topic"], TOPIC2);
 }
 
+/// The envelope records what was enqueued, not who publishes it: the producer
+/// id and the chain fields are stamped when the message drains, under the id
+/// of the partition it drains from.
 #[tokio::test]
-async fn managed_envelope_captures_registration_and_omits_final_chain_fields() {
+async fn managed_envelope_carries_no_producer_id_and_no_chain_fields() {
     let (db, broker, _harness) = fixture().await;
     let producer = managed_producer(db, broker).await;
 
     let (_, envelope) = producer.outbox_envelope(order(None), 4).await.unwrap();
     let json = envelope_json(&envelope);
 
-    assert_eq!(json["version"], 1);
+    assert_eq!(json["version"], 2);
     assert_eq!(json["type"], EVENT_TYPE);
     assert_eq!(json["producer_mode"], "chained");
-    assert!(json["producer_id"].as_str().is_some());
-    assert_eq!(json["generation"], 1);
+    assert!(json.get("producer_id").is_none());
+    assert!(json.get("generation").is_none());
     assert!(json.get("previous").is_none());
     assert!(json.get("sequence").is_none());
     assert_eq!(
@@ -486,33 +442,54 @@ async fn managed_envelope_captures_registration_and_omits_final_chain_fields() {
 }
 
 #[tokio::test]
-async fn rotation_affects_future_envelopes_only() {
+async fn rotation_replaces_every_partition_id() {
     let (db, broker, _harness) = fixture().await;
-    let mut producer = managed_producer(db, broker).await;
+    let producer = managed_producer(db, broker).await;
+    let zero = producer
+        .partition_producer_for_test(TEST_QUEUE, 0)
+        .await
+        .unwrap();
+    let one = producer
+        .partition_producer_for_test(TEST_QUEUE, 1)
+        .await
+        .unwrap();
 
-    let (_, before) = producer.outbox_envelope(order(None), 4).await.unwrap();
     producer.rotate_registration().await.unwrap();
-    let (_, after) = producer.outbox_envelope(order(None), 4).await.unwrap();
-    let before = envelope_json(&before);
-    let after = envelope_json(&after);
 
-    assert_ne!(before["producer_id"], after["producer_id"]);
-    assert_eq!(before["generation"], 1);
-    assert_eq!(after["generation"], 2);
+    let registrations = producer.registrations_for_test().await.unwrap();
+    let (new_zero, new_one) = (registrations[0].2, registrations[1].2);
+    assert_ne!(new_zero, zero);
+    assert_ne!(new_one, one);
+    assert_eq!(
+        registrations,
+        vec![
+            (TEST_QUEUE.to_owned(), 0, new_zero, 2),
+            (TEST_QUEUE.to_owned(), 1, new_one, 2),
+        ]
+    );
 }
 
 #[tokio::test]
-async fn reset_chain_preserves_registered_producer_id() {
+async fn reset_chain_clears_the_chain_and_keeps_the_id() {
     let (db, broker, _harness) = fixture().await;
-    let producer = managed_producer(db, broker).await;
+    let producer = managed_producer(db, Arc::clone(&broker)).await;
+    assert_message_ok(
+        producer
+            .process_outbox_payload_for_test(managed_envelope_payload(&producer).await, 1)
+            .await,
+    );
+    let id = producer.registrations_for_test().await.unwrap()[0].2;
 
-    let (_, before) = producer.outbox_envelope(order(None), 4).await.unwrap();
     producer.reset_chain(ResetScope::AllTopics).await.unwrap();
-    let (_, after) = producer.outbox_envelope(order(None), 4).await.unwrap();
 
+    let cursors = broker
+        .get_producer_cursors(&toolkit_security::SecurityContext::anonymous(), id)
+        .await
+        .unwrap();
+    assert!(cursors.is_empty(), "the chain must be cleared: {cursors:?}");
     assert_eq!(
-        envelope_json(&before)["producer_id"],
-        envelope_json(&after)["producer_id"]
+        producer.registrations_for_test().await.unwrap(),
+        vec![(TEST_QUEUE.to_owned(), 0, id, 1)]
     );
 }
 
@@ -601,8 +578,10 @@ async fn outbox_processor_treats_duplicate_as_ok() {
     let (db, broker, harness) = fixture().await;
     let producer = managed_producer(db, Arc::clone(&broker)).await;
     let envelope = managed_envelope_payload(&producer).await;
-    let json = envelope_json_from_bytes(&envelope);
-    let producer_id = producer_id_from_envelope(&json);
+    let producer_id = producer
+        .partition_producer_for_test(TEST_QUEUE, 0)
+        .await
+        .unwrap();
     seed_chained_cursor(&broker, producer_id, 1).await;
 
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
@@ -664,13 +643,16 @@ async fn outbox_processor_retries_transient_initial_cursor_read_with_empty_cache
     let result = producer.process_outbox_payload_for_test(envelope, 1).await;
     assert_message_ok(result);
     wait_for_stored(&harness, TOPIC, 1).await;
-    let ctx = harness.security_context();
     let mut stored = Vec::new();
     for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(TOPIC).unwrap(),
+            Partition::new(partition),
+        );
         stored.extend(
             harness
                 .backend()
-                .read(ctx, TOPIC, partition, Sequence::NONE, 16)
+                .read(&at, Sequence::NONE, 16, Wait::No)
                 .await
                 .unwrap(),
         );
@@ -699,8 +681,10 @@ async fn outbox_processor_recovers_chained_cursor_on_startup() {
     let (db, broker, _harness) = fixture().await;
     let producer = managed_producer(db, Arc::clone(&broker)).await;
     let envelope = managed_envelope_payload(&producer).await;
-    let json = envelope_json_from_bytes(&envelope);
-    let producer_id = producer_id_from_envelope(&json);
+    let producer_id = producer
+        .partition_producer_for_test(TEST_QUEUE, 0)
+        .await
+        .unwrap();
     seed_chained_cursor(&broker, producer_id, 2).await;
 
     let result = producer.process_outbox_payload_for_test(envelope, 4).await;
@@ -710,7 +694,7 @@ async fn outbox_processor_recovers_chained_cursor_on_startup() {
         .unwrap();
     assert_message_ok(result);
     assert_eq!(
-        cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap(), TENANT_PARTITION),
+        cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap()),
         Some(4)
     );
 }
@@ -720,8 +704,10 @@ async fn outbox_processor_recovers_chained_sequence_violation_by_refreshing_curs
     let (db, broker, _harness) = fixture().await;
     let producer = managed_producer(db, Arc::clone(&broker)).await;
     let envelope = managed_envelope_payload(&producer).await;
-    let json = envelope_json_from_bytes(&envelope);
-    let producer_id = producer_id_from_envelope(&json);
+    let producer_id = producer
+        .partition_producer_for_test(TEST_QUEUE, 0)
+        .await
+        .unwrap();
     seed_chained_cursor(&broker, producer_id, 3).await;
 
     let result = producer
@@ -733,7 +719,7 @@ async fn outbox_processor_recovers_chained_sequence_violation_by_refreshing_curs
         .unwrap();
     assert_message_ok(result);
     assert_eq!(
-        cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap(), TENANT_PARTITION),
+        cursors.last_sequence(&GtsInstanceId::try_new(TOPIC).unwrap()),
         Some(4)
     );
 }
@@ -779,12 +765,15 @@ async fn fixture() -> (toolkit_db::Db, Arc<dyn EventBrokerApi>, EventBrokerHarne
 /// Sums stored events across every partition of `topic` via the backend read
 /// side.
 async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
-    let ctx = harness.security_context();
     let mut total = 0;
     for partition in 0..FIXTURE_BROKER_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(topic).unwrap(),
+            Partition::new(partition),
+        );
         total += harness
             .backend()
-            .read(ctx, topic, partition, Sequence::NONE, 1024)
+            .read(&at, Sequence::NONE, 1024, Wait::No)
             .await
             .unwrap()
             .len();
@@ -848,17 +837,6 @@ async fn db_without_producer_migrations() -> toolkit_db::Db {
 }
 
 async fn stateless_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -> DbProducer {
-    stateless_producer_with_broker_partitions(db, broker, FIXTURE_BROKER_PARTITIONS).await
-}
-
-/// A topic reports no partition count, so a producer declares the count its
-/// broker is configured with. These fixtures register topics with a known count
-/// and hand the producer the same one.
-async fn stateless_producer_with_broker_partitions(
-    db: toolkit_db::Db,
-    broker: Arc<dyn EventBrokerApi>,
-    broker_partitions: u32,
-) -> DbProducer {
     DbProducer::builder()
         .broker(broker)
         .db(db)
@@ -867,20 +845,15 @@ async fn stateless_producer_with_broker_partitions(
         .deduplication(DbDeduplication::stateless())
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
-        .broker_partitions(broker_partitions)
         .prepare_all()
         .await
         .unwrap()
 }
 
-/// A stateless producer bound to `EVENT_TYPE_KEYED` (payload-keyed), declaring
-/// `broker_partitions`. Its own helper because `event_type_patterns` fixes which
-/// types a producer prepares, and the keyed type is a different one.
-async fn keyed_producer_with_broker_partitions(
-    db: toolkit_db::Db,
-    broker: Arc<dyn EventBrokerApi>,
-    broker_partitions: u32,
-) -> DbProducer {
+/// A stateless producer bound to `EVENT_TYPE_KEYED` (payload-keyed). Its own
+/// helper because `event_type_patterns` fixes which types a producer prepares,
+/// and the keyed type is a different one.
+async fn keyed_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -> DbProducer {
     DbProducer::builder()
         .broker(broker)
         .db(db)
@@ -889,21 +862,12 @@ async fn keyed_producer_with_broker_partitions(
         .deduplication(DbDeduplication::stateless())
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE_KEYED])
-        .broker_partitions(broker_partitions)
         .prepare_all()
         .await
         .unwrap()
 }
 
 async fn managed_producer(db: toolkit_db::Db, broker: Arc<dyn EventBrokerApi>) -> DbProducer {
-    managed_producer_with_unknown(db, broker, UnknownProducerRegistration::Fail).await
-}
-
-async fn managed_producer_with_unknown(
-    db: toolkit_db::Db,
-    broker: Arc<dyn EventBrokerApi>,
-    unknown: UnknownProducerRegistration,
-) -> DbProducer {
     DbProducer::builder()
         .broker(broker)
         .db(db)
@@ -913,12 +877,7 @@ async fn managed_producer_with_unknown(
                 .source("order-service")
                 .client_agent("order-service/1.0"),
         )
-        .deduplication(
-            DbDeduplication::managed(ProducerMode::Chained)
-                .key("orders")
-                .on_missing(MissingProducerRegistration::RegisterNew)
-                .on_unknown(unknown),
-        )
+        .deduplication(DbDeduplication::managed(ProducerMode::Chained).key("orders"))
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE])
         .prepare_all()
@@ -973,34 +932,8 @@ fn envelope_json_from_bytes(envelope: &[u8]) -> serde_json::Value {
     serde_json::from_slice(envelope).unwrap()
 }
 
-fn producer_id_from_envelope(envelope: &serde_json::Value) -> ProducerId {
-    ProducerId(Uuid::parse_str(envelope["producer_id"].as_str().unwrap()).unwrap())
-}
-
 fn test_tenant() -> Uuid {
     Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap()
-}
-
-/// Poll the producer's next envelope until its `producer_id` differs from
-/// `old_producer_id` - i.e. the outbox has drained the enqueued event, seen the
-/// broker's `404 ProducerNotFound`, and rotated to a fresh registration.
-async fn wait_for_rotated_registration(
-    producer: &DbProducer,
-    old_producer_id: &str,
-) -> serde_json::Value {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        let (_, envelope) = producer.outbox_envelope(order(None), 4).await.unwrap();
-        let json = envelope_json(&envelope);
-        if json["producer_id"].as_str() != Some(old_producer_id) {
-            return json;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for producer registration rotation"
-        );
-        sleep(Duration::from_millis(10)).await;
-    }
 }
 
 async fn managed_envelope_payload(producer: &DbProducer) -> Vec<u8> {
@@ -1050,7 +983,6 @@ fn chained_event_for_sequence(producer_id: ProducerId, sequence: i64, previous: 
             producer_id: Some(producer_id.0),
             previous: Some(previous),
             sequence: Some(sequence),
-            partition_hint: Some(TENANT_PARTITION),
         }),
     }
 }

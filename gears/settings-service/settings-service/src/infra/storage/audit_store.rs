@@ -78,6 +78,7 @@ fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainErro
         actor: model.actor,
         actor_classification: ActorClassification::parse(&model.actor_classification)
             .ok_or_else(|| corrupt("actor classification", &model.actor_classification))?,
+        actor_tenant_id: model.actor_tenant_id,
         pre_image: image_from_json(model.id, "pre-image", model.pre_value)?,
         post_image: image_from_json(model.id, "post-image", model.post_value)?,
         outcome: AuditOutcome::parse(&model.outcome)
@@ -170,6 +171,11 @@ impl AuditSink for AuditStore {
             operation: Set(record.operation.as_str().to_owned()),
             actor: Set(record.actor),
             actor_classification: Set(record.actor_classification.as_str().to_owned()),
+            // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-8
+            // Set once, here: the store is append-only, so no later write can
+            // move who a record was acted from.
+            actor_tenant_id: Set(record.actor_tenant_id),
+            // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-8
             pre_value: Set(image_to_json(record.pre_image.as_ref())),
             post_value: Set(image_to_json(record.post_image.as_ref())),
             outcome: Set(record.outcome.as_str().to_owned()),

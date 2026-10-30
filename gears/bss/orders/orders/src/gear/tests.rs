@@ -33,7 +33,7 @@ impl toolkit::config::ConfigProvider for Config {
 fn config() -> Value {
     json!({"lock_route":"direct","idempotency_lease_seconds":30,"dependency_timeout_ms":2000,
         "service_principals":[{"role":"workflow","subject_id":"00000000-0000-0000-0000-000000000901","tenant_id":"00000000-0000-0000-0000-000000000001"}],
-        "events":{"producer_subject_id":"00000000-0000-0000-0000-00000000044c","producer_tenant_id":"00000000-0000-0000-0000-00000000044d","broker_partitions":4},
+        "events":{"producer_subject_id":"00000000-0000-0000-0000-00000000044c","producer_tenant_id":"00000000-0000-0000-0000-00000000044d"},
         "audit_minimization":{"key_id":"test-1","key":TEST_KEY}})
 }
 /// A test-only 32-byte audit minimization key (D-204).
@@ -148,25 +148,17 @@ fn config_rejects_unsafe_bounds_routes_and_typographical_errors() {
         .unwrap();
 }
 
-/// D-200: the producer principal and the broker's partition count are explicit; there is no
-/// event-less mode, no SDK default partition count and no identity shared with other principals.
+/// D-200: the producer principal is explicit; there is no event-less mode and no identity
+/// shared with other principals.
 #[test]
-fn events_config_is_required_and_declares_the_broker_partition_count() {
+fn events_config_is_required_and_names_a_distinct_producer() {
     let mut missing = config();
     missing.as_object_mut().unwrap().remove("events");
     assert!(serde_json::from_value::<OrdersConfig>(missing).is_err());
-    let mut absent = config();
-    absent["events"]
-        .as_object_mut()
-        .unwrap()
-        .remove("broker_partitions");
-    assert!(serde_json::from_value::<OrdersConfig>(absent).is_err());
     let mut unknown = config();
     unknown["events"]["queue"] = json!("other");
     assert!(serde_json::from_value::<OrdersConfig>(unknown).is_err());
     for (key, bad) in [
-        ("broker_partitions", json!(0)),
-        ("broker_partitions", json!(4097)),
         (
             "producer_subject_id",
             json!("00000000-0000-0000-0000-000000000000"),
@@ -185,7 +177,13 @@ fn events_config_is_required_and_declares_the_broker_partition_count() {
         .unwrap()
         .producer_settings()
         .unwrap();
-    assert_eq!(settings.broker_partitions, 4);
+    assert_eq!(
+        (settings.subject_id, settings.tenant_id),
+        (
+            Uuid::parse_str("00000000-0000-0000-0000-00000000044c").unwrap(),
+            Uuid::parse_str("00000000-0000-0000-0000-00000000044d").unwrap(),
+        )
+    );
 }
 
 /// D-204: the audit minimization key is required configuration. A missing block, an unresolved
@@ -276,34 +274,6 @@ fn service_principal_identities_are_required_and_fail_closed() {
         value["service_principals"] = bad;
         assert!(serde_json::from_value::<OrdersConfig>(value).is_err());
     }
-}
-
-/// The E2E fragment pairs Orders' declared partition count with the broker's own setting for
-/// the Orders topic, resolved as the broker does (topic entry, then the instance-less topic-type
-/// entry, then `BUILT_IN_PARTITIONS`). A mismatch silently loses events (`UPSTREAM_REQS` §2.7),
-/// so the declaration and the broker setting must change together.
-#[test]
-fn e2e_fragment_pairs_the_declared_partition_count_with_the_broker_topic() {
-    let text = include_str!("../../../config/e2e-orders.yaml");
-    let parsed: std::collections::HashMap<String, Value> = serde_saphyr::from_str(text).unwrap();
-    let orders = serde_json::from_value::<OrdersConfig>(e2e_block())
-        .unwrap()
-        .producer_settings()
-        .unwrap();
-    let topics: event_broker::config::TopicSettingsMap =
-        serde_json::from_value(parsed["event-broker"]["config"]["topics"].clone()).unwrap();
-    let configured = topics
-        .entries
-        .get(crate::infra::events::TOPIC)
-        .and_then(|entry| entry.partitions)
-        .or_else(|| {
-            topics
-                .entries
-                .get("gts.cf.core.events.topic.v1~")
-                .and_then(|entry| entry.partitions)
-        })
-        .unwrap_or(event_broker::config::BUILT_IN_PARTITIONS);
-    assert_eq!(i64::from(orders.broker_partitions), i64::from(configured));
 }
 
 /// The E2E producer grants name exactly the configured producer principal: an exact unconditional
@@ -862,7 +832,7 @@ async fn serve_binds_the_real_producer_and_stops_its_workers() -> anyhow::Result
     .await?;
     let gear = Arc::new(BssOrdersGear::default());
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
-    let harness = crate::infra::events::test_support::broker::EventBrokerHarness::builder()
+    let harness = event_broker::test_support::EventBrokerHarness::builder()
         .with_types_registry_client(
             crate::infra::events::test_support::registry_client(),
             &[(crate::infra::events::TOPIC, 4)],
@@ -931,7 +901,7 @@ async fn store_loss_stops_readiness_without_a_restart_loop() -> anyhow::Result<(
     .await?;
     let gear = Arc::new(BssOrdersGear::default());
     toolkit_db::migration_runner::run_migrations_for_testing(&db, gear.migrations()).await?;
-    let harness = crate::infra::events::test_support::broker::EventBrokerHarness::builder()
+    let harness = event_broker::test_support::EventBrokerHarness::builder()
         .with_types_registry_client(
             crate::infra::events::test_support::registry_client(),
             &[(crate::infra::events::TOPIC, 4)],

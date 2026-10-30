@@ -43,6 +43,8 @@ uuid = { workspace = true }
 # Type Validator: structural + `format` assertions, and the regex trait check.
 jsonschema = { workspace = true }
 regex = { workspace = true }
+# The browse cursor binding: FNV-1a, a specified hash stable across releases.
+fnv = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }

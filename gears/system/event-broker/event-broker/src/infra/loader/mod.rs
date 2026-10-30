@@ -6,6 +6,7 @@
 
 pub mod attach;
 pub mod backend_source;
+pub mod heads;
 pub mod poll;
 pub mod scheduler;
 pub mod shard;
@@ -15,6 +16,8 @@ pub mod topics;
 
 #[cfg(test)]
 mod attach_tests;
+#[cfg(test)]
+mod heads_tests;
 #[cfg(test)]
 mod poll_tests;
 #[cfg(test)]

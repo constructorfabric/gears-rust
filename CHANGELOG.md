@@ -2552,6 +2552,23 @@ release-plz updates this file in the Release PR.
   `TokenError::HttpStatus { operation, status, target_url, .. }` instead of
   `TokenError::Http(String)`. Match both variants or use `TokenError::status()`;
   transport failures remain `Http`. URLs omit userinfo, query and fragment.
+- `toolkit`: an out-of-process gear serving `.authenticated()` operations without a
+  tenant authenticator refuses to start. Link `authn-resolver` into the worker, or set
+  the new development opt-out `oop_http.auth_disabled: true` (non-platform routes then
+  run with the default tenant context; platform routes still need `internal_auth`).
+- `toolkit`: `OopHttpConfig` and `toolkit::runtime::OopServeOptions` gain the public
+  field `auth_disabled`. Configuration files are unaffected (it defaults to `false`);
+  code constructing either struct with a literal must set it
+  (`OopServeOptions::with_auth_disabled` sets it on the builder).
+- `toolkit-http-middleware`: `layer_route_auth(.., None, ..)` without a bearer
+  authenticator now fails closed (`TenantPlane::Absent`): tenant and unlisted routes
+  answer 401 `TENANT_AUTH_NOT_CONFIGURED` instead of reaching the handler, and a request
+  no route matches is 404 without running the router's fallback. Pass a bearer
+  authenticator, or call `layer_route_auth_with(.., TenantPlane::Disabled, ..)` for the
+  development default tenant context.
+- `toolkit-http-middleware`: `security_context_middleware` ignores a bearer on an
+  `AnonymousRoute` instead of validating it: the handler keeps the anonymous context, and
+  an invalid bearer there is no longer 401.
 
 #### toolkit-auth 0.8.0 migration
 
@@ -2568,6 +2585,17 @@ release-plz updates this file in the Release PR.
   instead of `TokenError::Http(String)`. Existing matches on `Http(..)` still
   compile but no longer catch response failures. Match both variants or use
   `TokenError::status()` when classification depends on the HTTP status.
+
+### Changed
+
+- A bearer on an `.anonymous()` route is ignored on out-of-process listeners as on the
+  gateway: the handler gets the anonymous context, and a forged bearer is no longer 401.
+- An out-of-process listener without a tenant authenticator answers tenant and
+  undeclared routes with 401 `TENANT_AUTH_NOT_CONFIGURED` instead of reaching the
+  handler unauthenticated; a path nothing serves keeps its 404, and a method undeclared
+  on a declared path its 405.
+  Platform operations without `oop_http.internal_auth` warn at startup and answer 401,
+  as on the gateway.
 
 ### Fixed
 

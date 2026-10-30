@@ -6,8 +6,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use event_broker::test_support::StaticTypesRegistry;
 use event_broker_sdk::{
-    ConsumerBuilder, ConsumerError, ConsumerGroupRef, ConsumerProfile, Fallback, HandlerOutcome,
-    InMemoryOffsetManager, RawEvent, SingleEventHandler, gts_id,
+    ConsumerBuilder, ConsumerError, ConsumerGroupRef, ConsumerProfile, CreateConsumerGroupRequest,
+    EventBrokerError, Fallback, HandlerOutcome, InMemoryOffsetManager, RawEvent,
+    SingleEventHandler, gts_id,
 };
 use serde_json::json;
 
@@ -77,4 +78,40 @@ async fn multiple_consumer_handles_run_with_independent_lifecycle() {
 
     orders.stop().await.expect("orders handle stops");
     payments.stop().await.expect("payments handle stops");
+}
+
+/// The in-process broker checks a new group's `description` the way the REST
+/// surface does: an over-long one is refused before the group exists.
+#[tokio::test]
+async fn in_process_group_creation_rejects_an_over_long_description() {
+    let fixture = fixture_from_catalog(StaticTypesRegistry::of(
+        json!([{ "id": ORDERS_TOPIC, "partitions": 1 }]),
+    ))
+    .await;
+
+    let err = fixture
+        .broker
+        .create_consumer_group(
+            &fixture.ctx,
+            CreateConsumerGroupRequest {
+                client_agent: "lifecycle-test".to_owned(),
+                description: Some("d".repeat(1025)),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    // The answer crosses the canonical error, which carries the reason but
+    // not the field name or the rule's wording.
+    match err {
+        EventBrokerError::InvalidTextField {
+            field,
+            detail,
+            reason,
+        } => assert_eq!(
+            (field, detail.as_str(), reason),
+            ("", "Request validation failed", "field_too_long")
+        ),
+        other => panic!("expected InvalidTextField, got {other:?}"),
+    }
 }

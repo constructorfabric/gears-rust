@@ -53,7 +53,6 @@ Consumer subscription lifecycle defines the end-to-end contract a consumer SDK m
 - DESIGN.md §3.2 Subscription Lifecycle + Long-Poll Mechanism
 - DESIGN.md §3.5 Long-Poll Consumption Flow
 - DESIGN.md §3.6 (delivery shard ownership and SD double-check)
-- USE_CASES.md §1 Consumer State Machine, §4 Walked Scenarios, §5 Rebalance Algorithm
 - `openapi.yaml` — wire shapes for all endpoints referenced below
 - `ADR/0002-consumption-transport.md` — the transport (long-poll vs SSE vs multipart) is open; flows below assume the current long-poll transport.
 
@@ -101,12 +100,12 @@ created_at          = resp.json["created_at"]          # set at JOIN; list sort 
 
 # Broker-side join logic
 def join(req):
-    shard = dispatch_route(req.consumer_group)         # via cluster lookup or claim
+    # runs on the delivery instance the dispatcher picked (feature 0005 §4.3)
     with cluster.distributed_lock(f"evbk.group.{req.consumer_group}"):
         gs = GroupState.get_or_create(req.consumer_group)
         gs.active_members[sub_id] = Member(req.topics, req.filters)
         gs.topology_version += 1
-        rebalance(gs)                                  # round-robin v1, USE_CASES.md §5
+        rebalance(gs)                                  # range assignment, §3
     return Subscription(id=sub_id, assigned=gs.active_members[sub_id].assigned,
                         topology_version=gs.topology_version)
 
@@ -115,14 +114,16 @@ def join(req):
 # OffsetStore.load_position(...). For a fresh group the store returns the
 # configured Fallback sentinel; for a re-running consumer with committed
 # cursors it returns Exact(last_processed_offset).
+# The wire groups positions by topic: {topic: [{partition, value}]}.
 positions = {}
 for (topic, partition) in assigned:
     pos = offset_manager.position(group_id, topic, partition)   # ResolvedPosition
-    positions[f"{topic}:{partition}"] = pos.to_wire()           # int | "earliest" | "latest"
+    positions.setdefault(topic, []).append(
+        {"partition": partition, "value": pos.to_wire()})       # int | "earliest" | "latest"
 
 resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
     "topology_version": topology_version,   # fenced against a concurrent rebalance
-    "partition_positions": positions,
+    "positions": positions,
 })
 assert resp.status == 200    # 400 InvalidInitialPosition if an integer is out of range
 # 412 topology_version_mismatch if the group rebalanced since JOIN - re-read the
@@ -155,21 +156,27 @@ The request carries the `topology_version` the caller last observed (from JOIN o
 # Consumer side - pre-stream seed (per-partition; values are int OR "earliest"/"latest")
 resp = http.post(f"/v1/subscriptions/{sub_id}:seek", json={
     "topology_version": topology_version,   # last observed; fences a concurrent rebalance
-    "partition_positions": {
-        "orders:0": 42,         # last-processed offset; broker emits from 43
-        "orders:1": "earliest", # broker resolves to retention_floor - 1
-        "orders:2": "latest",   # broker resolves to current high-water mark
-    }
+    "positions": {
+        "orders": [
+            {"partition": 0, "value": 42},          # last-processed offset; broker emits the first event above it
+            {"partition": 1, "value": "earliest"},  # broker resolves to retention_floor - 1
+            {"partition": 2, "value": "latest"},    # broker resolves to the head, the last event's sequence
+        ],
+    },
 })
 assert resp.status == 200       # body echoes each position resolved to an integer
 
+# Bulk replay: run it in a dedicated group (e.g. replay-{job-id}) so it never takes
+# partitions from live consumers, then SEEK "earliest", an offset, or "at:<time>".
+
 # Broker side
-def seek(sub_id, topology_version, partition_positions, stream_is_open):
+def seek(sub_id, topology_version, positions, stream_is_open):
     if stream_is_open:
         return 409_StreamingInProgress                       # SEEK is pre-stream-only
     sub = state.subscriptions[sub_id]
-    for (key, _) in partition_positions.items():
-        topic, part = key.split(":")
+    entries = [(topic, e["partition"], e["value"])
+               for (topic, items) in positions.items() for e in items]
+    for (topic, _, _) in entries:
         if not topic_registered(topic):
             return 404_TopicNotFound                         # judged before the version fence
 
@@ -178,15 +185,14 @@ def seek(sub_id, topology_version, partition_positions, stream_is_open):
 
     resolved = {}
     violations = []
-    for (key, value) in partition_positions.items():
-        topic, part = key.split(":")
-        if (topic, int(part)) not in sub.assigned:
+    for (topic, part, value) in entries:
+        if (topic, part) not in sub.assigned:
             return 409_PartitionNotAssigned                  # atomic: nothing applies
-        pos = backend.resolve(topic, int(part), value)       # int verbatim or sentinel→int
+        pos = backend.resolve(topic, part, value)            # int verbatim or sentinel→int
         if pos.out_of_range:
             violations.append(pos)                           # every offender reported
         else:
-            resolved[key] = pos
+            resolved[(topic, part)] = pos
     if violations:
         return 400_SeekOutOfRange(violations)                # nothing seeded
     for (key, pos) in resolved.items():
@@ -202,6 +208,14 @@ Sentinel resolution (broker-side, at admission):
 
 ```python
 # Consumer SDK loop
+def wire_positions(group_id, slots):
+    """The SEEK body's topic-keyed `positions`: {topic: [{partition, value}]}."""
+    out = {}
+    for (t, p) in slots:
+        out.setdefault(t, []).append(
+            {"partition": p, "value": offset_manager.position(group_id, t, p).to_wire()})
+    return out
+
 while True:
     try:
         for frame in http.get(f"/v1/events:stream?subscription_id={sub_id}", stream=True):
@@ -210,26 +224,23 @@ while True:
                 # Re-SEEK newly-assigned partitions (continuing partitions keep their cursor).
                 new_slots = [s for s in frame.assigned if s not in prev_assigned]
                 if new_slots:
-                    positions = {f"{t}:{p}": offset_manager.position(group_id, t, p).to_wire()
-                                 for (t, p) in new_slots}
                     http.post(f"/v1/subscriptions/{sub_id}:seek",
-                              json={"partition_positions": positions})
+                              json={"topology_version": frame.topology_version,
+                                    "positions": wire_positions(group_id, new_slots)})
                 prev_assigned = frame.assigned
     except (HTTP_410_Gone, HTTP_404_SubscriptionNotFound):
         drop_in_flight(sub_id)                         # any unfinished work for this sub
-        sub_id, assigned = re_join(group_id, interests)
+        sub_id, assigned, topology_version = re_join(group_id, interests)
         # Fresh subscription_id → no SEEK history on broker → must re-seed
-        positions = {f"{t}:{p}": offset_manager.position(group_id, t, p).to_wire()
-                     for (t, p) in assigned}
         http.post(f"/v1/subscriptions/{sub_id}:seek",
-                  json={"partition_positions": positions})
+                  json={"topology_version": topology_version,
+                        "positions": wire_positions(group_id, assigned)})
         continue
     except TransportError:                             # ungraceful shard kill
-        sub_id, assigned = re_join(group_id, interests)
-        positions = {f"{t}:{p}": offset_manager.position(group_id, t, p).to_wire()
-                     for (t, p) in assigned}
+        sub_id, assigned, topology_version = re_join(group_id, interests)
         http.post(f"/v1/subscriptions/{sub_id}:seek",
-                  json={"partition_positions": positions})
+                  json={"topology_version": topology_version,
+                        "positions": wire_positions(group_id, assigned)})
         continue
 
 # Cursor durability on re-JOIN:
@@ -310,6 +321,9 @@ def deliver_to_member(member, raw_events):
 # When all v1 members leave, the group settles into the F2/T2 worldview.
 ```
 
+- **Scanned-past events stay behind.** Events F1 rejected but F2 would accept, and that F1 already scanned past, are never seen by F2: the cursor has moved beyond them. Gradual rollouts trade strict filter consistency for zero downtime; an operator wanting strict semantics drains v1 before starting v2.
+- **No group-level filter.** Enforcing filter parity across a group would force either rejecting v2's JOIN or evicting v1 members on a filter change. Per-member filters keep both rolling deploys and hard-stop deploys possible.
+
 ### 2.7 Session timeout (heartbeat-via-poll)
 
 ```python
@@ -356,6 +370,29 @@ async def release_ownership(G):
 The lock around `cluster.distributed_lock("evbk.group.<G>")` is the serialization point for every GroupState mutation (JOIN, LEAVE, rebalance, ownership transfer). Stream reads and pre-stream SEEK are NOT lock-protected by the GroupState mutation lock — they touch runtime cursor cache keys directly and rely on the cache's own consistency guarantees.
 
 `topology_version` is monotonically increasing per group; every mutation increments it. Consumers compare across poll responses to detect rebalance.
+
+**Rebalance (v1): range assignment per topic.** Runs under the group lock on every JOIN, LEAVE and lapsed `session_timeout`, and recomputes the whole assignment:
+
+```python
+def rebalance(gs):
+    members = sorted(gs.active_members.values(), key=lambda m: m.subscription_id)   # deterministic
+    for topic in union(m.topics for m in members):
+        eligible = [m for m in members if topic in m.topics]     # only members subscribed to it
+        n, k = topic.partitions, len(eligible)
+        if k == 0:
+            continue                                             # no eligible member: unassigned
+        if k >= n:
+            for p in range(n): assign(topic, p, eligible[p])     # surplus members get nothing here
+            continue
+        base, extra, cursor = n // k, n % k, 0
+        for i, m in enumerate(eligible):                         # member i gets a contiguous range
+            count = base + (1 if i < extra else 0)
+            for p in range(cursor, cursor + count): assign(topic, p, m)
+            cursor += count
+    gs.topology_version += 1
+```
+
+- **Thrash is accepted in v1.** A full recompute can move nearly every partition on every membership change. At-least-once delivery with idempotent consumers absorbs it: work in flight on a moved partition is delivered again by the new owner. Sticky assignment, which minimizes movement, is deferred (DESIGN §4.8); `topology_version` already carries the contract, so it is an internal change.
 
 A subscription carries a `created_at` timestamp set at JOIN. `GET /v1/subscriptions` returns subscriptions newest-first, ordered by `created_at` descending with `id` as a stable tiebreaker, so a freshly created subscription lands on the first page rather than wherever its random id would fall.
 

@@ -343,6 +343,3 @@ impl TenantResolverClient for Root {
         Err(TenantResolverError::Internal("unused".into()))
     }
 }
-
-pub mod broker;
-pub mod faults;

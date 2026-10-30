@@ -9,10 +9,14 @@
 //! Which makes retirement this module's other job. Without it a long-lived
 //! instance accumulates a cache for every partition it has ever touched.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
+use tokio::sync::Notify;
+use toolkit_gts::GtsInstanceId;
+
+use crate::domain::model::Sequence;
 use crate::domain::streaming::source::PartitionKey;
 use crate::infra::partition_cache::cache::PartitionCache;
 use crate::infra::partition_cache::reclaim::ReclaimPolicy;
@@ -92,6 +96,9 @@ impl TopicPolicyBuilder {
     }
 }
 
+/// What [`Partition::head`] holds before the head watch has reported one.
+const UNKNOWN_HEAD: i64 = i64::MIN;
+
 /// One partition's cache plus the scheduling state that belongs beside it.
 pub struct Partition {
     key: PartitionKey,
@@ -104,6 +111,9 @@ pub struct Partition {
     /// than by the readers.
     in_flight: AtomicBool,
     poll: Mutex<TailPoll>,
+    /// The highest head the backend's watch has reported, or [`UNKNOWN_HEAD`].
+    /// Only moves forward.
+    head: AtomicI64,
     /// The last round that did something for this partition. A tick count
     /// rather than a clock, so retirement is deterministic in tests.
     last_active_round: AtomicU64,
@@ -141,6 +151,28 @@ impl Partition {
         self.poll.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The highest head the head watch has reported, if it has reported one.
+    #[must_use]
+    pub fn known_head(&self) -> Option<Sequence> {
+        match self.head.load(Ordering::Acquire) {
+            UNKNOWN_HEAD => None,
+            head => Some(Sequence::assigned(head)),
+        }
+    }
+
+    /// Records `head` if it is above the known one; `true` when it moved.
+    pub fn advance_head(&self, head: Sequence) -> bool {
+        self.head.fetch_max(head.as_i64(), Ordering::AcqRel) < head.as_i64()
+    }
+
+    /// Whether a read after `after` can find anything: the known head is above
+    /// it, or no head is known yet. Without a head the loader falls back to the
+    /// tail poller's backoff, as it must before the watch first answers.
+    #[must_use]
+    pub fn may_hold_above(&self, after: Sequence) -> bool {
+        self.known_head().is_none_or(|head| head > after)
+    }
+
     pub fn touch(&self, round: u64) {
         self.last_active_round.store(round, Ordering::Relaxed);
     }
@@ -155,6 +187,9 @@ impl Partition {
 pub struct TopicManager {
     partitions: RwLock<HashMap<PartitionKey, Arc<Partition>>>,
     policy: TopicPolicy,
+    /// Signalled when a live partition's head moves, so an idle loader fetches
+    /// at once instead of at its next tick.
+    head_moved: Notify,
 }
 
 impl TopicManager {
@@ -163,6 +198,7 @@ impl TopicManager {
         Self {
             partitions: RwLock::new(HashMap::new()),
             policy,
+            head_moved: Notify::new(),
         }
     }
 
@@ -203,6 +239,7 @@ impl TopicManager {
                 cache: PartitionCache::with_reclaim_policy(self.policy.reclaim()),
                 in_flight: AtomicBool::new(false),
                 poll: Mutex::new(TailPoll::new(self.policy.poll())),
+                head: AtomicI64::new(UNKNOWN_HEAD),
                 last_active_round: AtomicU64::new(0),
             })
         }))
@@ -221,6 +258,38 @@ impl TopicManager {
     #[must_use]
     pub fn live(&self) -> Vec<Arc<Partition>> {
         self.read().values().map(Arc::clone).collect()
+    }
+
+    /// The live partitions, by topic: what the head watch follows.
+    #[must_use]
+    pub fn live_by_topic(&self) -> HashMap<GtsInstanceId, BTreeSet<i32>> {
+        let mut topics: HashMap<GtsInstanceId, BTreeSet<i32>> = HashMap::new();
+        for key in self.read().keys() {
+            topics
+                .entry(key.topic.clone())
+                .or_default()
+                .insert(key.partition);
+        }
+        topics
+    }
+
+    /// Records a head the backend reported for `key`. A partition that is not
+    /// live is skipped: nothing reads it, and attaching it later reopens the
+    /// watch, which reports its current head first.
+    pub fn publish_head(&self, key: &PartitionKey, head: Sequence) {
+        if self
+            .get(key)
+            .is_some_and(|partition| partition.advance_head(head))
+        {
+            self.head_moved.notify_one();
+        }
+    }
+
+    /// Resolves once a live partition's head has moved since the last call.
+    /// A move while nobody waits is kept, so a loader that checks after its
+    /// round does not miss one that landed during it.
+    pub async fn head_moved(&self) {
+        self.head_moved.notified().await;
     }
 
     #[must_use]

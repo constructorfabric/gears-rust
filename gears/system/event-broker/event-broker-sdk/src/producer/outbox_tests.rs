@@ -14,7 +14,6 @@ fn row(producer_mode: &str) -> Value {
         "subject": "order-1",
         "subject_type": "gts.cf.core.events.subject.v1~acme.orders.order.entity.v1~",
         "occurred_at": "2026-09-30T12:00:00Z",
-        "broker_partition": 2,
         "producer_mode": producer_mode,
         "diagnostic_metadata": { "sdk_client_agent": "test" }
     })

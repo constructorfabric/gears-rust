@@ -1097,3 +1097,49 @@ mod directory_client_bootstrap {
         );
     }
 }
+
+/// `oop_http.auth_disabled` reaches the serve options: off when omitted, as written
+/// otherwise.
+mod auth_disabled {
+    use super::*;
+    use crate::bootstrap::config::OopHttpConfig;
+    use crate::directory::LocalDirectoryClient;
+    use crate::runtime::GearManager;
+
+    async fn serve_auth_disabled(extra: serde_json::Value) -> bool {
+        let mut raw = serde_json::json!({
+            "listen_addr": "127.0.0.1:0",
+            "allow_loopback_advertise": true,
+        });
+        if let (Some(raw), Some(extra)) = (raw.as_object_mut(), extra.as_object()) {
+            raw.extend(extra.clone());
+        }
+        let cfg: OopHttpConfig = serde_json::from_value(raw).expect("valid oop_http");
+        let directory: Arc<dyn DirectoryClient> =
+            Arc::new(LocalDirectoryClient::new(Arc::new(GearManager::new())));
+        build_oop_serve_options(
+            &cfg,
+            "gear",
+            Uuid::new_v4(),
+            None,
+            Duration::from_secs(5),
+            directory,
+        )
+        .await
+        .expect("options build")
+        .auth_disabled
+    }
+
+    #[tokio::test]
+    async fn is_read_from_config() {
+        assert!(!serve_auth_disabled(serde_json::json!({})).await, "omitted");
+        assert!(
+            !serve_auth_disabled(serde_json::json!({ "auth_disabled": false })).await,
+            "false"
+        );
+        assert!(
+            serve_auth_disabled(serde_json::json!({ "auth_disabled": true })).await,
+            "true"
+        );
+    }
+}

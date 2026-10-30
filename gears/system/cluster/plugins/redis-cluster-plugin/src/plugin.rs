@@ -143,6 +143,7 @@ impl RedisClusterBuilder {
             database: config.database,
             pool_size: config.pool_size,
             command_timeout: config.command_timeout(),
+            subscriber_buffer_capacity: config.subscriber_buffer_capacity(),
         })
         .await?;
         // The registry owns the subscriber for subscription purposes; the handle

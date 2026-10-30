@@ -394,7 +394,8 @@ async fn setup_with_bindings(
     bound: bool,
     custom: Option<Arc<FixedBindings>>,
 ) -> Fixture {
-    let t = T::new().await;
+    // Boxed: the container-backed `T` future is large (`clippy::large_futures`).
+    let t = Box::pin(T::new()).await;
     let pdp = Revocable::new();
     let api: Arc<dyn AuthZResolverApi> = pdp.clone();
     let engine = Arc::new(t.engine(api.clone()));

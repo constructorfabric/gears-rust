@@ -286,7 +286,8 @@ async fn a_tenant_bearer_mutates_nothing() {
 
 /// A standalone registry without a tenant authenticator refuses every tenant route with a
 /// canonical `401` before its handler runs — never a `500` from the handler's extractor,
-/// never a served request — and still serves the platform routes.
+/// never a served request — and still serves the platform routes. The listener refuses
+/// them before the registry's own gate is reached.
 #[tokio::test]
 async fn without_a_tenant_authenticator_tenant_routes_are_refused_and_platform_routes_served() {
     let server = serve_without_tenant_authenticator().await;
@@ -300,12 +301,7 @@ async fn without_a_tenant_authenticator_tenant_routes_are_refused_and_platform_r
         ] {
             nonce += 1;
             let answer = send(&server, route, credentials, nonce).await;
-            assert_refused(
-                route,
-                credentials,
-                &answer,
-                types_registry_sdk::reason::unauthenticated::TENANT_AUTHENTICATION_UNAVAILABLE,
-            );
+            assert_refused(route, credentials, &answer, "TENANT_AUTH_NOT_CONFIGURED");
         }
     }
     for route in PLATFORM_ROUTES {

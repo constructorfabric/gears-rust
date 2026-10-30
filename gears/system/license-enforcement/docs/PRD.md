@@ -775,7 +775,7 @@ freshness TTL of each artifact and indefinitely for one without.
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-interface-management-api`
 
 - **Type**: REST API mounted into `api-gateway`, and the same operations as an in-process Rust client
-  (`LicenseEnforcementClient` in `license-enforcement-sdk`, resolved via ClientHub) for platform modules.
+  (`LicenseEnforcementApi` in `license-enforcement-sdk`, resolved via ClientHub) for platform modules.
 - **Stability**: unstable until first release, then stable.
 - **Description**: Packs, grants, sub-grants, lifecycle verbs, check-explain; one semantics and one
   authorization under both transports.

@@ -9,7 +9,9 @@ use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
 use gts::{GtsSchema, SELF_ID_REF, X_GTS_TYPE_REF};
 use serde_json::{Value, json};
 
-use super::{LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1};
+use super::{
+    LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
+};
 
 // Derived contract types, as a consuming Gear registers them.
 
@@ -278,5 +280,20 @@ fn derived_contract_does_not_add_top_level_licensing_properties() {
         keys,
         ["metadata"],
         "derived contract must refine only `metadata`:\n{schema:#}"
+    );
+}
+
+#[test]
+fn tenant_subject_derives_from_subject_base() {
+    let schema: Value =
+        serde_json::from_str(&LicenseTenantSubjectV1::gts_schema_with_refs_as_string()).unwrap();
+    assert_eq!(
+        schema.pointer("/allOf/0/$ref"),
+        Some(&json!(format!("gts://{}", LicenseSubjectV1::<()>::TYPE_ID))),
+        "{schema:#}"
+    );
+    assert_eq!(
+        LicenseTenantSubjectV1::TYPE_ID,
+        toolkit_gts::gts_id!("cf.core.lic.subj.v1~cf.core.lic.tenant.v1~")
     );
 }

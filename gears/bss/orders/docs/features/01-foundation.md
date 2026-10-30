@@ -177,7 +177,7 @@ Cross-principal create duplication and post-window re-execution remain disclosed
 
 **Output**: Durable enqueue and eventual platform acknowledgement/retry/dead letter; bounded worker pass.
 
-1. Before readiness, prepare the topic/subject and eleven event schemas, explicit root tenancy, broker partition count and managed Chained producer. Startup validation rejects incomplete registrations, unknown guard rows, duplicate transition keys or unmapped reasons.
+1. Before readiness, prepare the topic/subject and eleven event schemas, explicit root tenancy and managed Chained producer. Startup validation rejects incomplete registrations, unknown guard rows, duplicate transition keys or unmapped reasons.
 2. Enqueue through the bound platform producer using the transition runner. Preserve the [Foundation contract §4.4](../DESIGN.md#contract-01-4-4) payload/envelope contract; validate maximum basket events against the 64 KiB envelope limit.
 3. Let toolkit workers own sequencing, leases, retries, rejection and queue storage. Transient failures retry; permanent faults dead-letter and advance the cursor. Instrument every outcome. Orders owns no drain SQL or re-drive endpoint.
 4. Consumers meet the [event consumer contract](../DESIGN.md#contract-01-event-consumer-contract) (D-186); Orders does not restate it. Recovery preserves event identity through the shared platform path.

@@ -746,6 +746,7 @@ async fn build_oop_serve_options(
     // when the directory rejects the registration — the same late-failure the
     // label validation below avoids.
     validate_advertise_uri(&advertise_uri, cfg.allow_loopback_advertise)?;
+    log_auth_disabled_when_routable(cfg.auth_disabled, &advertise_uri);
 
     // Fail fast on a mis-configured label (bad charset, over-long, too many)
     // at start-up, using the same shared rules the directory enforces. Without
@@ -773,6 +774,7 @@ async fn build_oop_serve_options(
         directory,
         bearer_authenticator: None,
         internal_authenticator,
+        auth_disabled: cfg.auth_disabled,
         labels: cfg.labels.clone(),
     })
 }
@@ -990,13 +992,7 @@ fn validate_advertise_uri(uri: &str, allow_loopback: bool) -> Result<()> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("invalid oop_http.advertise_uri: must not contain userinfo: {uri}");
     }
-    let is_loopback = match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(url::Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-    if !allow_loopback && is_loopback {
+    if !allow_loopback && is_loopback_host(&parsed) {
         anyhow::bail!(
             "invalid oop_http.advertise_uri: '{uri}' is a loopback/unspecified address, which is \
              unreachable by other gears in multi-host Profile 2 / Profile 3 (a registered-but-\
@@ -1005,6 +1001,34 @@ fn validate_advertise_uri(uri: &str, allow_loopback: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether `uri`'s host is loopback / unspecified, i.e. unreachable from other hosts.
+fn is_loopback_host(uri: &url::Url) -> bool {
+    match uri.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Log an `error!` when the development-only `auth_disabled` is set on a worker advertised
+/// at a routable address: other hosts reach it through the directory, and every tenant's
+/// request then runs as the default tenant.
+fn log_auth_disabled_when_routable(auth_disabled: bool, advertise_uri: &str) {
+    if !auth_disabled {
+        return;
+    }
+    let routable = url::Url::parse(advertise_uri).is_ok_and(|uri| !is_loopback_host(&uri));
+    if routable {
+        tracing::error!(
+            advertise_uri,
+            "oop_http.auth_disabled is set on a worker advertised at a routable address: every \
+             tenant request reaching it runs as the default tenant. Development only; unset it \
+             or advertise a loopback address."
+        );
+    }
 }
 
 #[allow(unknown_lints, de1301_no_print_macros)] // direct stdout config print before exit

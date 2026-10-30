@@ -66,6 +66,10 @@ pub struct Model {
     pub updated_at: OffsetDateTime,
     /// Subject who set the value.
     pub set_by: String,
+    /// The tenant the setter acted from, written with `set_by` and copied with
+    /// it; `NULL` on a row written before it was recorded.
+    #[sea_orm(nullable)]
+    pub set_by_tenant: Option<Uuid>,
 }
 
 /// Relations of the `setting_value` entity (none).

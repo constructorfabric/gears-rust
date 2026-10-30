@@ -73,6 +73,7 @@ fn row(tenant: Uuid, value: serde_json::Value, classification: &str) -> StoredVa
         last_change_at: at(1),
         updated_at: at(1),
         set_by: "admin".to_owned(),
+        set_by_tenant: None,
     }
 }
 

@@ -1,17 +1,24 @@
-//! Partition selection: what the pointer resolves to, and where that lands.
+//! Partition keys: what the pointer resolves to, and which ingest outbox
+//! partition that places the event in. The topic partition is the backend's.
 //!
-//! Tested here rather than over HTTP because no publish response carries the
-//! partition - the endpoint answers `202` with no body - so the observable
+//! Tested here rather than over HTTP because no publish response carries
+//! either - the endpoint answers `202` with no body - so the observable
 //! behaviour lives at this boundary. What an operator sees on the wire is the
 //! ordering these values produce, which is the property each case below states.
 
+use toolkit_gts::GtsInstanceId;
 use uuid::Uuid;
 
-use super::{PublishRequest, partition_for};
+use super::PublishRequest;
 use crate::domain::backend::partition_input;
 use crate::domain::error::{DomainError, ErrorCode};
+use crate::domain::outbox::{OutboxPartitions, outbox_partition_for};
 
 const EVENT_TYPE: &str = "gts.cf.core.events.event.v1~x.eb.part.foo.v1~";
+
+fn topic() -> GtsInstanceId {
+    GtsInstanceId::try_new("gts.cf.core.events.topic.v1~x.eb.part.topic.v1").expect("valid id")
+}
 
 fn request(tenant: Uuid, subject: &str, data: serde_json::Value) -> PublishRequest {
     PublishRequest {
@@ -43,8 +50,8 @@ fn the_tenant_pointer_co_locates_a_tenants_events() {
     assert_eq!(first_input, tenant.to_string());
     assert_eq!(first_input, second_input);
     assert_eq!(
-        partition_for(&first_input, 8),
-        partition_for(&second_input, 8),
+        outbox_partition_for(&topic(), &first_input, OutboxPartitions::DEFAULT),
+        outbox_partition_for(&topic(), &second_input, OutboxPartitions::DEFAULT),
         "same input, same partition"
     );
 }
@@ -69,8 +76,8 @@ fn a_pointer_into_the_payload_groups_by_that_member() {
 
     assert_eq!(one_input, "shared");
     assert_eq!(
-        partition_for(&one_input, 8),
-        partition_for(&another_input, 8),
+        outbox_partition_for(&topic(), &one_input, OutboxPartitions::DEFAULT),
+        outbox_partition_for(&topic(), &another_input, OutboxPartitions::DEFAULT),
         "two different tenants sharing the pointed-at member land together - which is what \
          proves the key is the type's choice rather than the tenant's"
     );
@@ -158,19 +165,4 @@ fn a_pointer_resolving_to_a_container_is_refused() {
         ),
         "unexpected error: {err}"
     );
-}
-
-/// The count bounds the answer, and the mask keeps a signed remainder out of
-/// it: every partition a topic has is reachable and none outside it is.
-#[test]
-fn a_partition_is_always_inside_the_topics_count() {
-    for count in [1_u32, 2, 16, 64] {
-        for n in 0..200 {
-            let partition = partition_for(&format!("key-{n}"), count);
-            assert!(
-                partition >= 0 && partition < i32::try_from(count).expect("small count"),
-                "count {count} produced partition {partition}"
-            );
-        }
-    }
 }

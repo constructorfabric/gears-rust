@@ -1940,8 +1940,7 @@ format are static gear configuration on the same promotion path.
 instance **not ready**, so it stops receiving traffic while remaining alive, rather than being
 killed and restarted into the same unavailable store. Readiness additionally requires
 `EventBrokerApi`, eager preparation of all Orders event types, managed chained producer
-registration, a declared broker partition count (its equality with the broker is a deployment
-gate until a broker-level read exists, D-205) and a running toolkit outbox handle. Since
+registration and a running toolkit outbox handle. Since
 [docs/GEARS.md](../../../../docs/GEARS.md) currently says the Event Broker implementation crate is TODO, event-producing
 Orders deployment is blocked until that runtime and its integration tests exist.
 
@@ -2288,7 +2287,7 @@ rate-limit faults retain queue-partition FIFO; a permanent reject creates an ins
 letter without mutating order state and allows later messages to proceed; Workflow rejects stale or
 inapplicable notifications through an authoritative Orders state/version read; the largest
 200-line event envelope fits 64 KiB; and readiness fails when Event Broker, schema preparation,
-managed producer registration or partition-count configuration is unavailable.
+or managed producer registration is unavailable.
 
 ### 4.7 Accepted residual limits
 
@@ -3300,19 +3299,12 @@ operational infrastructure and are excluded from the Orders-owned inventory in [
 
 The producer queue name is `bss-orders-events`, with `Partitions::of(16)` and
 `OutboxProfile::high_throughput()`. Managed producer registration uses the stable key
-`bss-orders-events-v1`, `MissingProducerRegistration::RegisterNew` and
-`UnknownProducerRegistration::RegisterNew`; the producer source is `bss-orders`.
-Registration rotation affects future enqueues and permanently rejects a message carrying the
-unknown old producer identity, which is why consumers cannot treat the stream as a ledger. The SDK
-producer declares the Event Broker topic partition count as the required, non-defaulted gear
-setting `events.broker_partitions` (1–4096); Orders never assumes the SDK default of 8, and a
-missing or out-of-range declaration fails startup (D-205). Equality with the broker's configured
-count for the Orders topic is a **deployment gate** under
-[`upreq-event-broker-runtime`](UPSTREAM_REQS.md#27-event-broker): no Event Broker API reports the
-count, so startup cannot compare it, and a mismatch is known to lose events silently (deferred
-escalation, UPSTREAM_REQS §2.7). The deployment **MUST** set both values from one source and
-verify them before release. Once Event Broker provides the requested broker-level partition-count
-capability, startup **MUST** fail on a mismatch. Serialized producer envelopes **MUST** remain within the
+`bss-orders-events-v1`; the producer source is `bss-orders`. The SDK registers one producer id
+per outbox partition, on that partition's first delivery, so each id carries exactly one
+sequence space. A producer id the broker no longer knows is replaced by a newly registered one
+(next generation) and the in-flight message is published again under it. The broker places
+each event on a topic partition by its partition key (`/subject`), so Orders declares no broker
+partition count and a topic's count is broker configuration alone (D-205). Serialized producer envelopes **MUST** remain within the
 toolkit outbox's 64 KiB payload limit. Capacity tests cover the largest `OrderSubmitted` and
 `OrderCompleted` envelopes at the 200-line order cap.
 
@@ -4190,9 +4182,8 @@ producer-registration and toolkit outbox migrations explicitly before constructi
 **Readiness gate.** Startup obtains `EventBrokerApi` from `ClientHub`, obtains a gateway-issued Orders service
 `SecurityContext` for producer calls (distinct from and never substituted for the transition
 caller's context), calls eager
-`prepare_all()` for the topic and all eleven event types, resolves or registers the durable managed
-chained producer identity, validates the declared broker partition count (equality with the broker
-is a deployment gate, D-205), registers the
+`prepare_all()` for the topic and all eleven event types, builds the managed chained producer
+(each outbox partition registers its durable identity on its first delivery), registers the
 `bss-orders-events` queue and starts its toolkit workers. Any failure leaves the instance not ready.
 The Event Broker implementation and its ClientHub provider already exist on main (D-200);
 the platform inventory's SDK-only wording is stale. Orders still must integrate and verify actual
@@ -12061,7 +12052,7 @@ No private manipulation of toolkit tables or undocumented envelope sequencing is
 ### Implementation and release checklist
 
 - [ ] Wire the real provider, platform migrations, managed producer registration, all eleven
-  schemas, root identity/grants and declared partition count; verify readiness/shutdown/restart.
+  schemas and root identity/grants; verify readiness/shutdown/restart.
 - [ ] Implement same-transaction enqueue and post-commit Wake; prove rollback/retried transaction
   behavior and maximum envelope sizes without creating duplicate business effects.
 - [ ] Test broker acceptance with lost response, accepted/duplicate replay, restart/takeover,

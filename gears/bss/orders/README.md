@@ -27,7 +27,6 @@ gears:
       events:
         producer_subject_id: "<Orders producer subject UUID>"
         producer_tenant_id: "<its subject tenant UUID>"
-        broker_partitions: 4      # must equal the broker's Orders topic setting (D-205)
       audit_minimization:
         key_id: "2026-10"         # recorded in every value; change it on rotation
         key: "${ORDERS_AUDIT_MINIMIZATION_KEY}"  # secret reference, 32..1024 bytes
