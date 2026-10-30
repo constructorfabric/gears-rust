@@ -1,6 +1,6 @@
 // Updated: 2026-10-06 by Constructor Tech
 //! Read-only repo methods: `resolve_for_get`, `find_own`, `find_for_write`,
-//! `scope_includes_tenant`, the create-time downward type check
+//! the create-time downward type check
 //! (`list_tenants_with_other_type`), and the collection read's candidate queries
 //! (`list_candidate_references`, `list_candidates_for_references` —
 //! ADR-0005, ADR-0010).
@@ -17,26 +17,17 @@ use sea_orm::{
     QuerySelect,
 };
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, ScopeError, Scoped, SecureEntityExt, SecureSelect};
+use toolkit_db::secure::{DBRunner, Scoped, SecureEntityExt, SecureSelect};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use crate::domain::authz::scope_admits_tenant;
 use crate::domain::error::DomainError;
 use crate::domain::secret::model::{HealFlags, SecretRow};
-use crate::infra::canonical_mapping::classify_db_err_to_domain;
 use crate::infra::storage::entity;
 use crate::infra::storage::entity::enums::{DbFallback, DbSharing, DbStatus};
 use crate::infra::storage::repo_impl::helpers::{
     SecretRepoImpl, db_now_sql, entity_to_model, map_scope_err,
 };
-
-fn scope_err_to_domain(e: ScopeError) -> DomainError {
-    match e {
-        ScopeError::Db(db) => classify_db_err_to_domain(db),
-        other => map_scope_err(other),
-    }
-}
 
 /// A `credstore_secrets` row with the two heal flags computed beside it.
 #[derive(FromQueryResult)]
@@ -113,7 +104,7 @@ async fn rows_with_flags(
                 .into_model::<RowWithFlags>()
         })
         .await
-        .map_err(scope_err_to_domain)
+        .map_err(map_scope_err)
 }
 
 /// Resolution-eligible statuses (ADR-0008, Resolution): `active` (expired
@@ -135,8 +126,8 @@ fn resolution_eligible_condition() -> Condition {
 }
 
 /// Sharing-visibility predicate for `tenant`'s own rows: private rows only
-/// for `subject`, tenant/shared rows visible to the whole tenant. Shared by
-/// [`resolve_for_get`], [`resolve_candidates`] and (indirectly) `find_own`.
+/// for `subject`, tenant/shared rows visible to the whole tenant. Used by
+/// [`chain_visibility_condition`].
 fn own_tenant_visibility_condition(tenant: Uuid, subject: Uuid) -> Condition {
     Condition::any()
         .add(
@@ -219,7 +210,8 @@ pub(super) async fn resolve_for_get(
 /// resolution predicate as [`resolve_for_get`]. Private rows (the caller's
 /// own included) never take part: they are exempt from type consistency.
 /// Closest tenant in `chain` wins. Unscoped internal lookup, like
-/// [`resolve_for_get`].
+/// [`resolve_for_get`]. The row carries no heal flags: the type check only
+/// reads the type.
 pub(super) async fn resolve_non_private(
     repo: &SecretRepoImpl,
     req_tenant: TenantId,
@@ -243,13 +235,13 @@ pub(super) async fn resolve_non_private(
                         .add(entity::secrets::Column::TenantId.eq(req)),
                 ),
         );
-    let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
+    let rows = select.all(&conn).await.map_err(map_scope_err)?;
 
     let pos = |t: Uuid| chain.iter().position(|c| *c == t).unwrap_or(usize::MAX);
     Ok(rows
         .into_iter()
         .min_by_key(|r| pos(r.tenant_id))
-        .map(RowWithFlags::into_row))
+        .map(entity_to_model))
 }
 
 /// Visibility predicate shared by [`resolve_candidates`] and the collection
@@ -260,11 +252,7 @@ pub(super) async fn resolve_non_private(
 /// pass [`resolution_eligible_condition`] — an ancestor's `declared`/
 /// `inherit` row is invisible here exactly as it is to a value read.
 fn chain_visibility_condition(req: Uuid, subject: Uuid, ancestors: &[Uuid]) -> Condition {
-    let mut visibility = Condition::any().add(
-        Condition::all()
-            .add(entity::secrets::Column::TenantId.eq(req))
-            .add(own_tenant_visibility_condition(req, subject)),
-    );
+    let mut visibility = Condition::any().add(own_tenant_visibility_condition(req, subject));
     if !ancestors.is_empty() {
         visibility = visibility.add(
             Condition::all()
@@ -296,7 +284,7 @@ pub(super) async fn resolve_candidates(
         .filter(visibility)
         .all(&conn)
         .await
-        .map_err(scope_err_to_domain)?;
+        .map_err(map_scope_err)?;
 
     Ok(rows.into_iter().map(entity_to_model).collect())
 }
@@ -349,7 +337,7 @@ pub(super) async fn list_tenants_with_other_type(
                 .into_model::<TenantRow>()
         })
         .await
-        .map_err(scope_err_to_domain)?;
+        .map_err(map_scope_err)?;
     Ok(rows.into_iter().map(|r| r.tenant_id).collect())
 }
 
@@ -420,7 +408,7 @@ pub(super) async fn list_candidate_references(
             sel.limit(limit).into_model::<ReferenceRow>()
         })
         .await
-        .map_err(scope_err_to_domain)?;
+        .map_err(map_scope_err)?;
 
     Ok(rows.into_iter().map(|r| r.reference).collect())
 }
@@ -453,7 +441,7 @@ pub(super) async fn list_candidates_for_references(
         .filter(visibility)
         .all(&conn)
         .await
-        .map_err(scope_err_to_domain)?;
+        .map_err(map_scope_err)?;
 
     Ok(rows.into_iter().map(entity_to_model).collect())
 }
@@ -466,10 +454,8 @@ pub(super) async fn find_own(
     key: &SecretRef,
 ) -> Result<Option<SecretRow>, DomainError> {
     let conn = repo.db.conn()?;
-    // Active or declared — there is no delete saga to resume any more
-    // (ADR-0006: `delete_by_id` is one transaction), but a `declared` row is
-    // a legitimate "own record" `patch`/`delete` must be able to find
-    // (ADR-0004).
+    // Either resting status: a `declared` row is a legitimate "own record"
+    // `patch`/`delete` must be able to find (ADR-0004).
     let select = entity::secrets::Entity::find()
         .secure()
         .scope_with(scope)
@@ -477,7 +463,6 @@ pub(super) async fn find_own(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.is_in([DbStatus::Active, DbStatus::Declared]))
                 .add(
                     Condition::any()
                         .add(
@@ -527,16 +512,9 @@ pub(super) async fn find_for_write(
             Condition::all()
                 .add(entity::secrets::Column::Reference.eq(key.as_ref()))
                 .add(entity::secrets::Column::TenantId.eq(tenant.0))
-                .add(entity::secrets::Column::Status.is_in([DbStatus::Active, DbStatus::Declared]))
                 .add(class),
         )
         .limit(1);
     let rows = rows_with_flags(select, &conn, repo.db.db().backend()).await?;
     Ok(rows.into_iter().next().map(RowWithFlags::into_row))
-}
-
-pub(super) fn scope_includes_tenant(scope: &AccessScope, tenant: Uuid) -> bool {
-    // Fail-closed own-tenant gate shared with the domain's row clamp: row
-    // predicates (type, reference) narrow rows (applied by SQL), never the tenant.
-    scope_admits_tenant(scope, tenant)
 }
