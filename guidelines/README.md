@@ -6,3 +6,5 @@
 4. Check [SECURITY.md](./SECURITY.md) for security best practices.
 5. Review [DEPENDENCIES.md](./DEPENDENCIES.md) for preferred dependencies and libraries.
 6. Follow [CONTRIBUTING.md](../CONTRIBUTING.md) for commits and pull requests.
+7. Declare the gear's maturity level and follow its implementation flow: [MATURITY.md](./MATURITY.md).
+8. Review pull requests by [REVIEW.md](./REVIEW.md), with [DESIGN_REVIEW.md](./DESIGN_REVIEW.md) for design documents.
