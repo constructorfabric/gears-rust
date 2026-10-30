@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-event-broker"
 description = "Event Broker: Ingest/Delivery/Dispatcher composite module (deployment-topology skeleton)"
-version = "0.3.0"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -17,13 +17,18 @@ autobins = false
 # Exposes `test_support` (the in-process `EventBrokerHarness` + `test_router`)
 # to other crates' tests, mirroring oagw's `test-utils`. The event-broker SDK's
 # integration tests enable it to resolve a real in-process `EventBrokerApi`
-# (`LocalBroker`) from the harness's `ClientHub` instead of a mock. All deps the
-# harness's own deps (`sqlite-event-broker-plugin`, `types-registry-sdk`,
+# (`LocalBroker`) from the harness's `ClientHub` instead of a mock. The
+# harness's own deps (`memory-event-broker-plugin`, `types-registry-sdk`,
 # `sea-orm-migration`, `tokio-util`) are already regular dependencies; the
 # router-driving side modules (`request`/`response`) additionally need `http`
 # + `tower`, and the fixtures need `types-registry-sdk`'s `test-util`, so the
 # feature pulls those in (they are otherwise dev-only).
 test-utils = ["dep:http", "dep:tower", "types-registry-sdk/test-util"]
+# Gates the engine-matrix tests (`tests/*_backends_test.rs`), which need a
+# Docker daemon for their PostgreSQL and MySQL servers (or the servers
+# `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL` name), so a default `cargo test`
+# never does. The drivers themselves are production features already.
+integration = []
 
 [lib]
 name = "event_broker"
@@ -64,11 +69,15 @@ tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }
+rand = { workspace = true }
 chrono = { workspace = true, features = ["clock", "serde"] }
 bytes = { workspace = true }
 jsonschema = { workspace = true }
 toolkit-stable-hash = { workspace = true }
 http-body-util = { workspace = true }
+# `infra/metrics.rs`: the ingest outbox's retry and stall metrics, on the
+# global `MeterProvider` the host installs.
+opentelemetry = { workspace = true }
 
 # `bootstrap` feature: `toolkit::bootstrap::{AppConfig, run_server}`, used
 # only by `src/bin/server.rs` (eb-single-process-implementation D7) -
@@ -99,8 +108,10 @@ toolkit-gts = { workspace = true }
 toolkit-http-proxy = { workspace = true }
 
 # Database - SeaORM (driver features come from toolkit-db), for the
-# SpecificationManager cache, Storage's durable namespaces, and the SQLite
-# EventBrokerBackend (eb-single-process-implementation). All DB access goes
+# SpecificationManager cache, Storage's durable namespaces and the ingest
+# outbox (eb-single-process-implementation). The gear's database may be
+# SQLite, PostgreSQL or MySQL/MariaDB (DESIGN `cpt-cf-evbk-constraint-multi-sql`),
+# so all three drivers are linked. All DB access goes
 # through SecureORM (`toolkit_db::secure`); raw connections are never held by
 # gear code. `toolkit_db::outbox` (same crate) backs the ingest-side
 # transactional outbox (design.md D5) - the same generic library the SDK's
@@ -108,7 +119,7 @@ toolkit-http-proxy = { workspace = true }
 # (server-enqueue) side.
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
-toolkit-db = { workspace = true, features = ["sqlite"] }
+toolkit-db = { workspace = true, features = ["sqlite", "pg", "mysql"] }
 toolkit-db-macros = { workspace = true }
 
 # Optional, enabled by `test-utils`: the harness's router-driving side modules
@@ -126,7 +137,7 @@ clap = { workspace = true }
 # registrations are present in the binary. `event_broker` itself needs
 # `cluster`/`authz-resolver`/`types-registry` (already deps above) at
 # compile time for its own domain code; `api-gateway`/`authn-resolver` are
-# needed only for the binary's AuthN pipeline (decision log entry 29) and
+# needed only for the binary's AuthN pipeline and
 # have no compile-time API surface this crate's library code calls, so they
 # (and the concrete plugins) are declared here but only ever referenced from
 # `src/bin/server.rs`, never from `src/`.
@@ -135,9 +146,13 @@ authn-resolver = { workspace = true }
 static-authn-plugin = { workspace = true }
 static-authz-plugin = { workspace = true }
 standalone-cluster-plugin = { workspace = true }
-# The SQLite storage backend, injected at wiring as a provider (`module.rs`),
-# the same way the cluster gear injects its cache providers. The gear links it
-# but knows only the `EventBrokerBackend` trait behind it.
+# The storage backends, injected at wiring as providers (`module.rs`), the way
+# the cluster gear injects its cache providers. The gear links them but knows
+# only the `backend::Backend` trait behind them; the test harness runs on memory.
+kafka-event-broker-plugin = { workspace = true }
+memory-event-broker-plugin = { workspace = true }
+mysql-event-broker-plugin = { workspace = true }
+postgres-event-broker-plugin = { workspace = true }
 sqlite-event-broker-plugin = { workspace = true }
 
 [[bench]]
@@ -149,6 +164,14 @@ name = "delivery"
 harness = false
 
 [dev-dependencies]
+# The crate itself with `test-utils`, as oagw does: every `tests/` binary gets
+# `test_support` (the in-process harness) with no `required-features`.
+cf-gears-event-broker = { path = ".", features = ["test-utils"] }
+# `tests/support/containers.rs`: the PostgreSQL and MySQL servers of the
+# engine-matrix tests, on `libs/test-containers`' pinned tags.
+test-containers = { workspace = true }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
 # `benches/partition_cache.rs` - the two hot paths of the per-partition cache
 # were each once wrong in a way only a curve over a swept parameter reveals.
 criterion = { workspace = true, features = ["html_reports"] }
@@ -156,6 +179,8 @@ criterion = { workspace = true, features = ["html_reports"] }
 tokio = { workspace = true, features = ["macros", "rt", "process", "test-util"] }
 tower = { workspace = true }
 http = { workspace = true }
+# An in-memory exporter to read back `infra/metrics.rs`'s instruments.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-test = { workspace = true }
 # `tests/standalone_integration_tests.rs` (design.md D8, task group 10) -
 # spawns the real `[[bin]]` as a subprocess and drives it over real HTTP,

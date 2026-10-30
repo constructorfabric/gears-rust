@@ -18,6 +18,7 @@ fn sample_claims(op: Op, exp: i64) -> Claims {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 

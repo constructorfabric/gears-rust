@@ -10,6 +10,7 @@ use super::{
     BatchChangeRequest, render_batch_item, render_committed, render_impact, render_pending,
     render_validation,
 };
+use crate::api::rest::setting_dto::Reader;
 use crate::audit::AuditOperation;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, MASK_TOKEN};
@@ -295,6 +296,8 @@ fn validity_is_the_absence_of_violations_not_a_separate_verdict() {
             impact: None,
         },
         true,
+        Reader::Platform,
+        &[],
     );
     assert!(ok.valid);
     assert!(ok.violations.is_empty());
@@ -311,6 +314,8 @@ fn validity_is_the_absence_of_violations_not_a_separate_verdict() {
             impact: Some(ImpactReport::empty()),
         },
         true,
+        Reader::Platform,
+        &[],
     );
     assert!(!bad.valid);
     assert_eq!(bad.violations.len(), 1);
@@ -339,7 +344,7 @@ fn the_report_masks_its_impact_by_the_same_classification_as_its_value() {
         }),
     };
 
-    let dto = render_validation(&report, true);
+    let dto = render_validation(&report, true, Reader::Platform, &[]);
     assert_eq!(dto.effective.value, json!(MASK_TOKEN));
     assert_eq!(
         dto.impact.expect("impact").changed[0].current,

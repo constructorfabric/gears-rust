@@ -1,10 +1,7 @@
 //! `ClusterCapabilities` usage (`DESIGN.md:596,739-768`). Per
 //! `docs/ADR/0007-service-decomposition.md` D2/D3, this wraps the platform
 //! `cluster` gear's real `cluster-sdk` facades directly - no bespoke
-//! coordination abstraction is introduced. There is no separate pub/sub
-//! primitive; notification semantics are realized on top of
-//! `ClusterCacheV1::put` + `ClusterCacheV1::watch`
-//! (`infra::workers::ingest_outbox`'s `notify`, keyed by `domain::notify`).
+//! coordination abstraction is introduced.
 
 use cluster_sdk::{
     ClusterCacheV1, ClusterError, ClusterProfile, DistributedLockV1, LeaderElectionV1,

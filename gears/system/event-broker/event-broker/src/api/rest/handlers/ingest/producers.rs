@@ -27,11 +27,6 @@ pub async fn register_producer(
     uri: Uri,
     Json(req): Json<RegisterProducerRequest>,
 ) -> ApiResult<impl IntoResponse> {
-    // Validated before the registration is written: this `client_agent` is the
-    // one that persists, into a column documented as printable ASCII within
-    // 256 bytes.
-    event_broker_sdk::validate::client_agent(&req.client_agent).map_err(DomainError::from)?;
-
     let registration = state
         .ingest
         .register_producer(
@@ -99,7 +94,7 @@ pub async fn reset_producer(
         })?
     };
 
-    let scope = ProducerResetScope::try_from(ProducerResetSelector::from(req))?;
+    let scope = ProducerResetScope::from(ProducerResetSelector::from(req));
     state
         .ingest
         .reset_producer(&ctx, producer_id, scope)

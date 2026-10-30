@@ -155,8 +155,10 @@ TABLE event_broker_producer_registrations
   COLUMN created_at TEXT NOT NULL DEFAULT datetime('now') PK 0
   COLUMN generation INTEGER NOT NULL DEFAULT - PK 0
   COLUMN mode TEXT NOT NULL DEFAULT - PK 0
+  COLUMN outbox_partition INTEGER NOT NULL DEFAULT - PK 3
   COLUMN producer_id TEXT NOT NULL DEFAULT - PK 0
-  COLUMN registration_key TEXT NULL DEFAULT - PK 1
+  COLUMN queue TEXT NOT NULL DEFAULT - PK 2
+  COLUMN registration_key TEXT NOT NULL DEFAULT - PK 1
   COLUMN updated_at TEXT NOT NULL DEFAULT datetime('now') PK 0
 TABLE pricing_acceptance
   COLUMN accepted_at TEXT NOT NULL DEFAULT - PK 0

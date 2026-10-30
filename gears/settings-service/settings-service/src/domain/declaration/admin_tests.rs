@@ -2301,6 +2301,18 @@ impl ValueRepository for BatchRecordingValues {
             .await
     }
 
+    async fn find_many_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo
+            .find_many_in_tenants(conn, scope, declaration_ids, tenant_ids)
+            .await
+    }
+
     async fn count_in_tenants<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
@@ -2415,10 +2427,20 @@ impl ValueRepository for BatchRecordingValues {
         value: Option<Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<crate::domain::value::StoredValue, DomainError> {
         ValueRepo
-            .update(conn, scope, id, value, secret_ref, set_by, expected)
+            .update(
+                conn,
+                scope,
+                id,
+                value,
+                secret_ref,
+                set_by,
+                set_by_tenant,
+                expected,
+            )
             .await
     }
 

@@ -259,11 +259,13 @@ async fn get_topic_segments_happy_path_reflects_published_events() {
 
     // Publish is now asynchronous (the ingest outbox drains in the
     // background, design.md D5) - `end_sequence` only reaches 3 once the
-    // processor has drained all three rows, so poll briefly rather than
-    // asserting on the very next request.
+    // processor has drained all three rows, so poll rather than asserting on
+    // the very next request. A deadline, not an iteration count: a loaded
+    // runner can take seconds to drain the outbox, and that is not a failure.
     let body = {
         let mut body = json!(null);
-        for _ in 0..50 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
             let resp = harness
                 .api_v1()
                 .get_topic_segments()
@@ -273,7 +275,7 @@ async fn get_topic_segments_happy_path_reflects_published_events() {
                 .await;
             resp.assert_status(200);
             body = resp.json();
-            if body["end_sequence"] == json!(3) {
+            if body["end_sequence"] == json!(3) || tokio::time::Instant::now() >= deadline {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -281,7 +283,7 @@ async fn get_topic_segments_happy_path_reflects_published_events() {
         assert_eq!(
             body["end_sequence"],
             json!(3),
-            "all 3 published events must have drained from the ingest outbox within the poll window"
+            "all 3 published events must have drained from the ingest outbox within the deadline"
         );
         body
     };
@@ -342,5 +344,156 @@ async fn get_topic_segments_unregistered_topic_returns_404() {
                 "resource_type": "gts.cf.core.events.topic.v1~",
             },
         })
+    );
+}
+
+#[tokio::test]
+async fn get_topic_segments_partition_past_topic_count_returns_400_invalid_partition() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1", "partitions": 2 },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .get_topic_segments()
+        .with_query("topic", "gts.cf.core.events.topic.v1~x.eb.a.topic.v1")
+        .with_query("partition", "2")
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidPartition: partition must be in [0, 2) for this topic",
+            "instance": "/event-broker/v1/topics/segments",
+            "context": {
+                "format": "InvalidPartition: partition must be in [0, 2) for this topic",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+}
+
+#[tokio::test]
+async fn get_topic_segments_negative_partition_returns_400_invalid_partition() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.a.topic.v1", "partitions": 2 },
+        ])))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .get_topic_segments()
+        .with_query("topic", "gts.cf.core.events.topic.v1~x.eb.a.topic.v1")
+        .with_query("partition", "-1")
+        .send()
+        .await;
+
+    resp.assert_status(400);
+    assert_eq!(
+        resp.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "InvalidPartition: partition must be in [0, 2) for this topic",
+            "instance": "/event-broker/v1/topics/segments",
+            "context": {
+                "format": "InvalidPartition: partition must be in [0, 2) for this topic",
+                "resource_type": "gts.cf.core.events.request.v1~",
+            },
+        })
+    );
+}
+
+/// The ingest service places an event modulo the `default` outbox group's
+/// partitions, and the queue is registered with that same count: with four,
+/// keys whose sixteen-way placement lies past partition 3 still drain. Were the
+/// service to place them modulo sixteen, their enqueue would name a partition
+/// the queue does not have and the publish would fail.
+#[tokio::test]
+async fn publishes_drain_through_an_outbox_with_a_configured_partition_count() {
+    let topic = "gts.cf.core.events.topic.v1~x.eb.a.topic.v1";
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": topic, "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
+                "topic": topic,
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .with_outbox_partitions(
+            crate::domain::outbox::OutboxPartitions::new(4).expect("a power of 2 within 64"),
+        )
+        .build()
+        .await;
+    let topic_id = toolkit_gts::GtsInstanceId::try_new(topic).expect("a valid topic id");
+    // The event type partitions on `/tenant_id`.
+    let tenants: Vec<uuid::Uuid> = (1..=u128::MAX)
+        .map(uuid::Uuid::from_u128)
+        .filter(|tenant| {
+            crate::domain::outbox::outbox_partition_for(
+                &topic_id,
+                &tenant.to_string(),
+                crate::domain::outbox::OutboxPartitions::DEFAULT,
+            ) >= 4
+        })
+        .take(3)
+        .collect();
+
+    for tenant in &tenants {
+        harness
+            .api_v1()
+            .post_events()
+            .with_body(Json(&json!({
+                "id": uuid::Uuid::new_v4(),
+                "type": "gts.cf.core.events.event.v1~x.eb.a.foo.v1~",
+                "tenant_id": tenant,
+                "source": "test",
+                "subject": "s1",
+                "subject_type": "gts.x.eb.t1.subject.v1~",
+                "occurred_at": Utc::now().to_rfc3339(),
+            })))
+            .send()
+            .await
+            .assert_status(202);
+    }
+
+    assert_eq!(
+        harness.outbox_queue_partitions().await,
+        4,
+        "the queue is registered with the configured count, not the default"
+    );
+
+    let mut end_sequence = json!(null);
+    for _ in 0..250 {
+        let resp = harness
+            .api_v1()
+            .get_topic_segments()
+            .with_query("topic", topic)
+            .with_query("partition", "0")
+            .send()
+            .await;
+        resp.assert_status(200);
+        end_sequence = resp.json()["end_sequence"].clone();
+        if end_sequence == json!(3) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        end_sequence,
+        json!(3),
+        "all three drained from the four-partition outbox"
     );
 }

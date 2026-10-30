@@ -115,8 +115,9 @@ pub enum OperationKind {
 
 /// Which plane an operation belongs to.
 ///
-/// Every P0 operation is `Platform`. The plane is expressed by the contract and
-/// the data, not enforced by the transport (ceiling C8).
+/// Every P0 operation is `Platform`: only platform routes, behind a validated internal
+/// token, and the platform contract reach a mutation (D17). No listener of its own
+/// separates the planes yet (ceiling C8).
 #[domain_model]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Plane {

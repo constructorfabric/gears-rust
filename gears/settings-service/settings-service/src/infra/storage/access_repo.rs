@@ -36,6 +36,7 @@ fn to_domain(model: tenant_permission::Model) -> Result<Restriction, DomainError
         tenant_id: model.tenant_id,
         access,
         set_by: model.set_by,
+        set_by_tenant: model.set_by_tenant,
         created_at: model.created_at,
         updated_at: model.updated_at,
     })
@@ -114,6 +115,7 @@ impl AccessRepository for AccessRepo {
                 tenant_id: Set(draft.tenant_id),
                 access: Set(draft.access.as_str().to_owned()),
                 set_by: Set(draft.set_by),
+                set_by_tenant: Set(draft.set_by_tenant),
                 created_at: Set(at),
                 updated_at: Set(at),
             };
@@ -137,6 +139,10 @@ impl AccessRepository for AccessRepo {
                 Expr::value(draft.access.as_str().to_owned()),
             )
             .col_expr(tenant_permission::Column::SetBy, Expr::value(draft.set_by))
+            .col_expr(
+                tenant_permission::Column::SetByTenant,
+                Expr::value(draft.set_by_tenant),
+            )
             .col_expr(tenant_permission::Column::UpdatedAt, Expr::value(at))
             .filter(tenant_permission::Column::DeclarationId.eq(draft.declaration_id))
             .filter(tenant_permission::Column::TenantId.eq(draft.tenant_id))

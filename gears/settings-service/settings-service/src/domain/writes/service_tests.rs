@@ -310,6 +310,7 @@ impl WriteHarness {
                     tenant_id: tenant,
                     access,
                     set_by: "root-admin".to_owned(),
+                    set_by_tenant: None,
                 },
                 None,
             )
@@ -572,7 +573,16 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
     // The comparison ran against a read; a row that moved since finds no
     // match at the write and the writer gets the same `412` a stale tag gets.
     let refused = ValueRepo
-        .update(&conn, &all, row.id, Some(json!(false)), None, "b", stale)
+        .update(
+            &conn,
+            &all,
+            row.id,
+            Some(json!(false)),
+            None,
+            "b",
+            None,
+            stale,
+        )
         .await
         .expect_err("moved");
     assert!(
@@ -609,6 +619,7 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
                 needs_review: false,
                 needs_review_detail: None,
                 set_by: "b".to_owned(),
+                set_by_tenant: None,
             },
         )
         .await
@@ -627,6 +638,7 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
             Some(json!(false)),
             None,
             "b",
+            None,
             row.last_change_at,
         )
         .await

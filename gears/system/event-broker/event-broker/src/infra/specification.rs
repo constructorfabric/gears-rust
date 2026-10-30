@@ -1,6 +1,7 @@
-//! Real `SpecificationManager`, backed by a local `SQLite` cache
-//! (`event_broker_spec_cache`) that is loaded from `types-registry` and holds
-//! what the most recent read found.
+//! Real `SpecificationManager`, backed by a cache table in the gear database
+//! (`event_broker_spec_cache`; `SQLite`, `PostgreSQL` or `MySQL`/`MariaDB`)
+//! that is loaded from `types-registry` and holds what the most recent read
+//! found.
 //!
 //! Each entity is read as the GTS kind it actually is. A topic is an
 //! **instance** of the topic base type, so it comes back from
@@ -31,11 +32,14 @@ use toolkit_gts::{GtsInstanceId, GtsSchema};
 use toolkit_security::AccessScope;
 use types_registry_sdk::{InstanceQuery, TypeSchemaQuery, TypesRegistryClient};
 
-use crate::config::EventBrokerConfig;
+mod provisioning;
+
+use crate::config::{EventBrokerConfig, checks};
+use crate::domain::backend::BackendResolver;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::Topic;
 use crate::domain::resolution::{Declaration, resolve};
-use crate::domain::specification::SpecificationManager;
+use crate::domain::specification::{ProvisioningLimits, SpecificationManager, TopicState};
 use crate::domain::{event_type as event_type_traits, projection};
 use crate::infra::storage::entity::spec_cache::{
     self, ActiveModel as SpecCacheAM, Column as SpecCacheColumn, Entity as SpecCacheEntity,
@@ -157,9 +161,19 @@ impl TypesRegistrySpecificationManager {
 /// the configuration, and none of the trait's own methods, so a caller does not
 /// have to keep the concrete manager type around to reach it.
 ///
+/// Two warnings ride the topic pass (feature 0005 §2.2). A fully qualified
+/// `backend_routing` key that names no registered topic is reported on every
+/// pass, since a mistyped key would otherwise leave its topic on the
+/// instance-less route for good; a pass whose listing failed reports none, as
+/// it saw no topics to compare against. And a topic whose route differs from
+/// the one cached for it is reported once, when it changes: its log was
+/// expected on the old entry.
+///
 /// # Errors
 /// Returns `DomainError::StorageUnavailable` if the local cache database is
-/// unreachable. A per-entity failure is logged and skipped.
+/// unreachable, and `DomainError::Internal` if `config` breaks a routing
+/// rule, which the startup checks prevent. A per-entity failure is logged and
+/// skipped.
 #[allow(clippy::cognitive_complexity)]
 pub async fn bulk_load(
     client: &Arc<dyn TypesRegistryClient>,
@@ -167,18 +181,19 @@ pub async fn bulk_load(
     config: &EventBrokerConfig,
 ) -> Result<(), DomainError> {
     let conn = db.conn()?;
+    let routing = checks::routing(config).map_err(|err| DomainError::Internal(err.to_string()))?;
+    let cached_routes = cached_routes(&conn).await?;
 
     let topic_base = event_broker_sdk::gts::TopicV1::TYPE_ID;
-    let instances = match client
+    let listed = client
         .list_instances(InstanceQuery::new().with_pattern(format!("{topic_base}*")))
-        .await
-    {
-        Ok(instances) => instances,
-        Err(err) => {
-            tracing::warn!(%err, type_id = topic_base, "list_instances failed");
-            Vec::new()
-        }
-    };
+        .await;
+    let listing_failed = listed.is_err();
+    let instances = listed.unwrap_or_else(|err| {
+        tracing::warn!(%err, type_id = topic_base, "list_instances failed");
+        Vec::new()
+    });
+    let mut registered = std::collections::BTreeSet::new();
     for instance in &instances {
         let projected = match projection::topic(instance) {
             Ok(projected) => projected,
@@ -193,13 +208,24 @@ pub async fn bulk_load(
                 .as_ref()
                 .map(|retention| std::time::Duration::from(*retention)),
         };
-        let settings = match resolve(config, &projected.id, &declared) {
+        registered.insert(projected.id.as_ref().to_owned());
+        let settings = match resolve(config, &routing, &projected.id, &declared) {
             Ok(settings) => settings,
             Err(err) => {
                 tracing::warn!(%err, id = %instance.id, "topic excluded: its settings do not resolve");
                 continue;
             }
         };
+        if let Some(previous) = cached_routes.get(projected.id.as_ref())
+            && previous != settings.backend().value()
+        {
+            tracing::warn!(
+                topic = %projected.id,
+                from = %previous,
+                to = %settings.backend().value(),
+                "topic re-routed to another backend registry entry; its log was expected on the previous one"
+            );
+        }
         let topic = Topic {
             id: projected.id.clone(),
             description: projected.description,
@@ -207,6 +233,17 @@ pub async fn bulk_load(
             settings,
         };
         upsert_spec_row(&conn, SpecKind::Topic, topic.id.as_ref(), &topic).await?;
+    }
+    if !listing_failed {
+        for key in routing
+            .topic_keys()
+            .filter(|key| !registered.contains(*key))
+        {
+            tracing::warn!(
+                key,
+                "backend_routing key names no registered topic; the topic it was meant for takes the instance-less route"
+            );
+        }
     }
 
     let event_base = event_broker_sdk::gts::EventV1::TYPE_ID;
@@ -251,6 +288,27 @@ pub async fn bulk_load(
         .await?;
     }
     Ok(())
+}
+
+/// The backend registry entry every cached topic was last resolved to, keyed
+/// by topic identifier. A row that no longer deserializes as a topic is left
+/// out: the pass rewrites it anyway.
+async fn cached_routes(
+    conn: &impl DBRunner,
+) -> Result<HashMap<String, crate::domain::backend::Name>, DomainError> {
+    let rows = SpecCacheEntity::find()
+        .filter(SpecCacheColumn::Kind.eq(SpecKind::Topic.as_str()))
+        .secure()
+        .scope_with(&AccessScope::allow_all())
+        .all(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let topic: Topic = serde_json::from_str(&row.payload).ok()?;
+            Some((row.gts_id, topic.settings.backend().value().clone()))
+        })
+        .collect())
 }
 
 /// Updates the row's `payload` in place if `(kind, gts_id)` already exists
@@ -359,7 +417,17 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
                 return None;
             }
         };
-        deserialize_row(&row)
+        let topic: Topic = deserialize_row(&row)?;
+        match self.read_topic_state(id).await {
+            Ok(Some(TopicState::Provisioned { partitions, .. })) => {
+                Some(with_backend_partitions(topic, i64::from(partitions)))
+            }
+            Ok(_) => Some(topic),
+            Err(err) => {
+                tracing::warn!(%err, topic_id = %id, "topic binding lookup failed while resolving topic");
+                Some(topic)
+            }
+        }
     }
 
     async fn get_event_type(&self, id: &GtsTypeId) -> Option<EventType> {
@@ -383,13 +451,24 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
     }
 
     async fn list_topics(&self) -> Vec<Topic> {
-        match self.list_rows(SpecKind::Topic).await {
+        let topics: Vec<Topic> = match self.list_rows(SpecKind::Topic).await {
             Ok(rows) => rows.iter().filter_map(deserialize_row).collect(),
             Err(err) => {
                 tracing::warn!(%err, "spec cache list failed while listing topics");
-                Vec::new()
+                return Vec::new();
             }
-        }
+        };
+        let provisioned = self.provisioned_partitions().await.unwrap_or_else(|err| {
+            tracing::warn!(%err, "topic binding list failed while listing topics");
+            HashMap::new()
+        });
+        topics
+            .into_iter()
+            .map(|topic| match provisioned.get(topic.id.as_ref()) {
+                Some(partitions) => with_backend_partitions(topic, *partitions),
+                None => topic,
+            })
+            .collect()
     }
 
     async fn list_event_types(&self) -> Vec<EventType> {
@@ -427,6 +506,29 @@ impl SpecificationManager for TypesRegistrySpecificationManager {
                 resource: id.as_ref().to_owned(),
             })
     }
+
+    async fn topic_state(&self, id: &GtsInstanceId) -> Result<Option<TopicState>, DomainError> {
+        self.read_topic_state(id).await
+    }
+
+    async fn provision_topics(
+        &self,
+        backends: &dyn BackendResolver,
+        limits: ProvisioningLimits,
+    ) -> usize {
+        self.provision_all(backends, limits).await
+    }
+}
+
+/// `topic` with the partition count its backend holds, which is in force once
+/// the topic is provisioned, whatever configuration resolved.
+fn with_backend_partitions(mut topic: Topic, partitions: i64) -> Topic {
+    if let Ok(partitions) = i32::try_from(partitions)
+        && *topic.settings.partitions().value() != partitions
+    {
+        topic.settings = topic.settings.with_partitions_held_by_backend(partitions);
+    }
+    topic
 }
 
 #[cfg(test)]
@@ -450,6 +552,8 @@ mod tests {
     const SUBJECT_TYPE: &str = toolkit_gts::gts_id!("example.eb.t1.subject.v1~");
     const SQLITE_BACKEND: &str =
         toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.sqlite.v1~");
+    /// The instance-less routing key every `backend_routing` requires.
+    const BASE_ROUTE: &str = toolkit_gts::gts_id!("cf.core.events.topic.v1~");
 
     /// A topic instance carrying exactly what its base type declares - the
     /// partition count is not among them, and a document that named one would
@@ -465,7 +569,8 @@ mod tests {
     fn config(topics: &serde_json::Value) -> EventBrokerConfig {
         serde_json::from_value(json!({
             "mode": "standalone",
-            "default_storage_backend": SQLITE_BACKEND,
+            "backends": { "main": { "type": SQLITE_BACKEND } },
+            "backend_routing": { BASE_ROUTE: "main" },
             "topics": topics.clone(),
         }))
         .expect("test configuration deserializes")
@@ -734,5 +839,233 @@ mod tests {
             .await
             .expect_err("an unregistered topic must not resolve");
         assert!(matches!(err, DomainError::NotFound { .. }));
+    }
+
+    // ── Backend routing (feature 0005 §2.1, §2.2) ───────────────────────────
+
+    const OTHER_TOPIC_ID: &str =
+        toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.t2.topic.v1");
+    const MISTYPED_KEY: &str =
+        toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.tl.topic.v1");
+
+    /// Two registry entries, the second carrying a settings value that must
+    /// never reach the cache, routed by `backend_routing`.
+    fn routed_config(backend_routing: &serde_json::Value) -> EventBrokerConfig {
+        serde_json::from_value(json!({
+            "mode": "standalone",
+            "backends": {
+                "main": { "type": SQLITE_BACKEND },
+                "audit": { "type": SQLITE_BACKEND, "path": "/var/lib/eb/hunter2.db" },
+            },
+            "backend_routing": backend_routing.clone(),
+        }))
+        .expect("test configuration deserializes")
+    }
+
+    fn client_with(ids: &[&str]) -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+        Arc::new(
+            MockTypesRegistryClient::new().with_instances(
+                ids.iter()
+                    .map(|id| make_test_instance(id, topic_document(id))),
+            ),
+        )
+    }
+
+    async fn cached_topic_payload(
+        db: &Arc<DBProvider<toolkit_db::DbError>>,
+        id: &str,
+    ) -> serde_json::Value {
+        let row = super::TypesRegistrySpecificationManager::new(Arc::clone(db))
+            .find_row(super::SpecKind::Topic, id)
+            .await
+            .expect("the cache answers")
+            .expect("the topic is cached");
+        serde_json::from_str(&row.payload).expect("a cached payload is JSON")
+    }
+
+    /// The cached record names the registry entry and nothing of its type or
+    /// settings: nothing the broker persists carries an address or a setting.
+    #[tokio::test]
+    async fn a_cached_topic_carries_its_route_and_no_backend_settings() {
+        let cfg = routed_config(&json!({
+            BASE_ROUTE: "main",
+            TOPIC_ID: "audit",
+        }));
+        let db = test_db().await;
+        super::bulk_load(&client_with(&[TOPIC_ID]), &db, &cfg)
+            .await
+            .expect("bulk_load");
+
+        assert_eq!(
+            cached_topic_payload(&db, TOPIC_ID).await,
+            json!({
+                "id": TOPIC_ID,
+                "description": "events this test publishes",
+                "retention": "PT168H",
+                "settings": {
+                    "partitions": { "value": 8, "source": "built_in" },
+                    "retention": {
+                        "value": { "duration": { "secs": 604_800, "nanos": 0 }, "size_bytes": null },
+                        "source": "specification",
+                    },
+                    "backend": { "value": "audit", "source": "topic_entry" },
+                },
+            })
+        );
+    }
+
+    /// A fully qualified key that names no registered topic is most likely
+    /// mistyped, and would leave its topic on the instance-less route for good.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_routing_key_naming_no_registered_topic_is_warned_about() {
+        let cfg = routed_config(&json!({
+            BASE_ROUTE: "main",
+            MISTYPED_KEY: "audit",
+        }));
+        super::bulk_load(&client_with(&[TOPIC_ID]), &test_db().await, &cfg)
+            .await
+            .expect("bulk_load");
+
+        logs_assert(|lines: &[&str]| {
+            let warned: Vec<&&str> = lines
+                .iter()
+                .filter(|line| {
+                    line.contains(
+                        "backend_routing key names no registered topic; the topic it was meant for takes the instance-less route",
+                    )
+                })
+                .collect();
+            match warned.as_slice() {
+                [line] if line.contains(MISTYPED_KEY) => Ok(()),
+                _ => Err(format!(
+                    "expected one warning naming the key, got {warned:?}"
+                )),
+            }
+        });
+    }
+
+    /// A key naming a registered topic, and a key naming a type rather than
+    /// one topic, are not warned about.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_routing_key_naming_a_registered_topic_or_a_type_is_not_warned_about() {
+        const SPECIAL_TOPIC_TYPE: &str =
+            toolkit_gts::gts_id!("cf.core.events.topic.v1~example.eb.special.topic.v1~");
+        let cfg = routed_config(&json!({
+            BASE_ROUTE: "main",
+            SPECIAL_TOPIC_TYPE: "audit",
+            TOPIC_ID: "audit",
+        }));
+        super::bulk_load(&client_with(&[TOPIC_ID]), &test_db().await, &cfg)
+            .await
+            .expect("bulk_load");
+
+        assert!(!logs_contain(
+            "backend_routing key names no registered topic"
+        ));
+    }
+
+    /// A pass whose listing failed saw no topics, so every key would look
+    /// unmatched; it warns about none.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_listing_warns_about_no_routing_key() {
+        let cfg = routed_config(&json!({
+            BASE_ROUTE: "main",
+            TOPIC_ID: "audit",
+        }));
+        let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
+            MockTypesRegistryClient::new()
+                .with_list_error(types_registry_sdk::testing::internal("registry down")),
+        );
+        super::bulk_load(&client, &test_db().await, &cfg)
+            .await
+            .expect("a failed listing is not a failed load");
+
+        assert!(logs_contain("list_instances failed"));
+        assert!(!logs_contain(
+            "backend_routing key names no registered topic"
+        ));
+    }
+
+    /// Moving a provisioned topic to another entry leaves its log behind on
+    /// the old one, so the change is reported, naming both entries.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_topic_moved_to_another_entry_is_warned_about_once() {
+        let db = test_db().await;
+        let client = client_with(&[TOPIC_ID, OTHER_TOPIC_ID]);
+        let before = routed_config(&json!({ BASE_ROUTE: "main", OTHER_TOPIC_ID: "audit" }));
+        let after = routed_config(&json!({ BASE_ROUTE: "main", TOPIC_ID: "audit" }));
+
+        super::bulk_load(&client, &db, &before)
+            .await
+            .expect("first");
+        assert!(!logs_contain("topic re-routed"));
+        super::bulk_load(&client, &db, &after)
+            .await
+            .expect("second");
+
+        logs_assert(|lines: &[&str]| {
+            let moved: Vec<&&str> = lines
+                .iter()
+                .filter(|line| line.contains("topic re-routed to another backend registry entry"))
+                .collect();
+            match moved.as_slice() {
+                [first, second] => {
+                    let mentions = |line: &str, topic: &str, from: &str, to: &str| {
+                        line.contains(topic)
+                            && line.contains(&format!("from={from}"))
+                            && line.contains(&format!("to={to}"))
+                    };
+                    let both = [first, second];
+                    if both
+                        .iter()
+                        .any(|line| mentions(line, TOPIC_ID, "main", "audit"))
+                        && both
+                            .iter()
+                            .any(|line| mentions(line, OTHER_TOPIC_ID, "audit", "main"))
+                    {
+                        Ok(())
+                    } else {
+                        Err(format!("unexpected re-route lines: {moved:?}"))
+                    }
+                }
+                _ => Err(format!("expected two re-route lines, got {moved:?}")),
+            }
+        });
+        super::bulk_load(&client, &db, &after)
+            .await
+            .expect("third, with the route unchanged");
+        logs_assert(|lines: &[&str]| {
+            let moved = lines
+                .iter()
+                .filter(|line| line.contains("topic re-routed to another backend registry entry"))
+                .count();
+            if moved == 2 {
+                Ok(())
+            } else {
+                Err(format!(
+                    "an unchanged route is not reported again; got {moved} lines"
+                ))
+            }
+        });
+        assert_eq!(
+            cached_topic_payload(&db, TOPIC_ID).await,
+            json!({
+                "id": TOPIC_ID,
+                "description": "events this test publishes",
+                "retention": "PT168H",
+                "settings": {
+                    "partitions": { "value": 8, "source": "built_in" },
+                    "retention": {
+                        "value": { "duration": { "secs": 604_800, "nanos": 0 }, "size_bytes": null },
+                        "source": "specification",
+                    },
+                    "backend": { "value": "audit", "source": "topic_entry" },
+                },
+            })
+        );
     }
 }

@@ -27,7 +27,6 @@ coord = { workspace = true }
 
 async-trait = { workspace = true }
 anyhow = { workspace = true }
-bigdecimal.workspace = true
 rust_decimal.workspace = true
 tokio-retry = { workspace = true } # full-jitter delay between transaction retries
 chrono = { workspace = true, features = ["serde"] }

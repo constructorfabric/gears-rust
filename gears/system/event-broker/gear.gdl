@@ -41,7 +41,7 @@ gear(
 
     # Expose deployment and streaming settings used by prepared products.
     # Field names, types and doc comments are read from EventBrokerConfig.
-    config_schema = config(exposes = ["mode", "default_storage_backend", "topics", "streaming", "polling"]),
+    config_schema = config(exposes = ["mode", "backends", "backend_routing", "topics", "streaming", "polling"]),
 
     # The runtime resolves this profile for all three facades, including the
     # cache-backed defaults for lock and leader election in standalone mode.

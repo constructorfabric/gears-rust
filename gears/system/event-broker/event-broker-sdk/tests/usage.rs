@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{
     ConsumerBuilder, ConsumerError, ConsumerGroupRef, DirectDeduplication, Fallback, GtsIdPattern,
     GtsInstanceId, HandlerOutcome, InMemoryOffsetManager, IngestOutcome, Producer,
@@ -335,14 +336,8 @@ async fn producer_chained_mode_uses_broker_issued_id_and_sequences_events() -> T
     producer.publish(order_created()).await?;
     wait_for_stored(&harness, ORDERS_TOPIC, 1).await;
 
-    // The event lands on the one partition its tenant hashes to; the chained
-    // cursor there advances to the first assigned offset.
     let cursors = broker.get_producer_cursors(&ctx, producer_id).await?;
-    let topic = ginst(ORDERS_TOPIC);
-    let sequences: Vec<i64> = (0..ORDERS_PARTITIONS)
-        .filter_map(|partition| cursors.last_sequence(&topic, partition))
-        .collect();
-    assert_eq!(sequences, vec![0]);
+    assert_eq!(cursors.last_sequence(&ginst(ORDERS_TOPIC)), Some(0));
 
     Ok(())
 }
@@ -705,12 +700,15 @@ fn orders_and_billing_catalog() -> StaticTypesRegistry {
 /// means a test never has to know which. `read` is exclusive of the position it
 /// names, and `Sequence::NONE` reads from the start of each partition.
 async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
-    let ctx = harness.security_context().clone();
     let mut total = 0;
     for partition in 0..ORDERS_PARTITIONS {
+        let at = TopicPartition::new(
+            GtsInstanceId::try_new(topic).unwrap(),
+            Partition::new(partition),
+        );
         total += harness
             .backend()
-            .read(&ctx, topic, partition, Sequence::NONE, 1024)
+            .read(&at, Sequence::NONE, 1024, Wait::No)
             .await
             .expect("read stored events")
             .len();

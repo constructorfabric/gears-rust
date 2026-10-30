@@ -367,6 +367,8 @@ or promotion is `adjustment_unsupported`, and a billing currency other than the 
 
 Rating evaluation **MUST** expose a conceptual evaluation contract that, for a given evaluation context at timestamp `t` (UTC), prices the bindings Pricing resolved for the subscription (the binding of record) and produces a **resolved price outcome** (bound prices, model kind, tier thresholds, exact amounts) plus a `pricingSnapshotRef` and evaluation metadata. It **MUST** be replay-safe: a replay reads the stored binding of record, never a new `resolve` call.
 
+**Design**: exact amounts are written, stored and reloaded as reduced fractions with the shared money crate's exact-fraction API (`cpt-cf-bss-rating-upreq-bss-money-exact-api`, DECISIONS R-35; DESIGN §3.3), never with a Rating copy of it (money ADR rule 2).
+
 **Rationale**: Rating and Finance require a stable, reproducible outcome to reproduce charges and audits.
 
 **Actors**: `cpt-cf-bss-rating-actor-rating`

@@ -458,6 +458,39 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
 }
 
 #[tokio::test]
+async fn a_pattern_query_without_a_kind_lists_only_the_helpers_kind_with_documents() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TYPE, schema(TYPE));
+    fake.seed(INSTANCE, json!({ "n": 1 }));
+    fake.seed(
+        "gts.cf.test.pkg.thing.v1~cf.test.pkg.two.v1",
+        json!({ "n": 2 }),
+    );
+    // The pattern matches the Type Schema too; the helper narrows the kind itself.
+    let query = ListEntitiesRequest::matching(
+        gts::GtsIdPattern::try_new(&format!("{TYPE}*")).expect("pattern"),
+    )
+    .with_limit(1);
+
+    let instances = fake
+        .list_instances(&ctx(), query.clone())
+        .await
+        .expect("lists");
+    assert_eq!(instances.len(), 2, "every page, Instances only");
+    assert!(instances.iter().all(|s| s.content.is_some()));
+
+    let light = fake
+        .list_instances(&ctx(), query.with_projection(FieldSelection::light()))
+        .await
+        .expect("lists");
+    assert_eq!(light.len(), 2);
+    assert!(
+        light.iter().all(|s| s.content.is_none()),
+        "an explicit light selection is kept"
+    );
+}
+
+#[tokio::test]
 async fn a_list_helper_reads_documents_only_for_the_default_projection() {
     let fake = MockTypesRegistry::new();
     fake.seed(TYPE, schema(TYPE));

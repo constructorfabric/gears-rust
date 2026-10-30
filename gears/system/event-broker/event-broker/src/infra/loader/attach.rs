@@ -78,8 +78,9 @@ impl PartitionReader for HeldReader {
 /// The persisted cursor for one partition, or 0 when none exists.
 ///
 /// Zero means "nothing processed yet" rather than "start at sequence 0": ADR-0001
-/// fixes sequences as starting from 1 and delivery as `cursor + 1`, so a fresh
-/// subscription and a cursor of 0 are the same state.
+/// fixes sequences as starting from 1 and delivery as the first event with a
+/// sequence above the cursor, so a fresh subscription and a cursor of 0 are the
+/// same state.
 fn cursor_for(cursors: &[Cursor], key: &PartitionKey) -> Sequence {
     cursors
         .iter()

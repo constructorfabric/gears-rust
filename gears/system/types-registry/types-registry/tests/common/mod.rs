@@ -4,6 +4,7 @@
 //!
 //! Each test binary uses a subset of these helpers, hence the lint allowances.
 
+pub mod platform_server;
 mod test_stores;
 
 use std::path::{Path, PathBuf};

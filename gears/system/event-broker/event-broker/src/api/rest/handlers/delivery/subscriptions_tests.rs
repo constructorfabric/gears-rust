@@ -1799,6 +1799,86 @@ async fn seek_earliest_sentinel_resolves_to_zero_on_empty_partition() {
     );
 }
 
+/// A registered topic its backend does not hold yet reads as a partition
+/// nothing was written to (feature 0007 §4.3): a consumer may join and seek
+/// before any producer publishes, and before provisioning completes. An exact
+/// position above 0 is out of the range `[0, 0]` such a partition admits.
+#[tokio::test]
+async fn seek_before_the_topic_is_provisioned_resolves_as_an_empty_partition() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+        ])))
+        .without_provisioning()
+        .build()
+        .await;
+    let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let id = harness
+        .api_v1()
+        .post_subscriptions()
+        .with_body(Json(&json!({
+            "consumer_group": group,
+            "client_agent": "a",
+            "interests": [{
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "tenant_id": Uuid::new_v4(),
+                "types": ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"],
+            }],
+        })))
+        .send()
+        .await
+        .json()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let earliest = harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_body(Json(&json!({
+            "topology_version": 1, "positions": { ("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"): [{ "partition": 0, "value": "earliest" }] }
+        })))
+        .send()
+        .await;
+    earliest.assert_status(200);
+    assert_eq!(
+        earliest.json(),
+        json!({ "positions": { ("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"): [{ "partition": 0, "value": 0 }] } })
+    );
+
+    let above = harness
+        .api_v1()
+        .post_subscription_seek(&id)
+        .with_body(Json(&json!({
+            "topology_version": 1, "positions": { ("gts.cf.core.events.topic.v1~x.eb.t1.topic.v1"): [{ "partition": 0, "value": 1 }] }
+        })))
+        .send()
+        .await;
+    above.assert_status(400);
+    assert_eq!(
+        above.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
+            "title": "Invalid Argument",
+            "status": 400,
+            "detail": "Request validation failed",
+            "instance": format!("/event-broker/v1/subscriptions/{id}:seek"),
+            "context": {
+                "resource_type": "gts.cf.core.events.request.v1~",
+                "field_violations": [{
+                    "field": "positions",
+                    "description": "topic gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 partition 0: \
+                                    the seek position is above the valid range [0, 0]",
+                    "reason": "above_high_water_mark",
+                }],
+            },
+        })
+    );
+}
+
 #[tokio::test]
 async fn seek_invalid_sentinel_returns_400() {
     let harness = EventBrokerHarness::builder()
@@ -2443,15 +2523,15 @@ async fn seek_reports_one_violation_per_offending_partition() {
 /// A cursor names a position, not an event, and the position it names may be
 /// one retention has erased.
 ///
-/// Two events are published, a cutoff is taken, and two more follow; a
-/// retention pass bounded by that cutoff removes sequences 1 and 2. The floor
-/// is then 2 - the position below the oldest surviving event, which is exactly
-/// the event that was removed - so a cursor may sit there, and a stream opened
-/// on it delivers the events already stored above it.
+/// Four events are published and the partition is truncated through sequence
+/// 2. The floor is then 2 - the position below the oldest surviving event,
+/// which is exactly the event that was removed - so a cursor may sit there,
+/// and a stream opened on it delivers the events already stored above it.
 #[tokio::test]
 async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
     let tenant_id = Uuid::new_v4();
+    let memory = memory_event_broker_plugin::MemoryBackend::new();
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": topic, "partitions": 1 },
@@ -2461,6 +2541,7 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
                 "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
             },
         ])))
+        .with_backend(std::sync::Arc::new(memory.clone()))
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -2487,11 +2568,6 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
         .to_owned();
 
     publish_and_settle(&harness, &id, topic, tenant_id, 2).await;
-    // Retention bounds by the time the broker assigned the sequence, so the
-    // cutoff has to fall between the two bursts.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    let cutoff = chrono::Utc::now();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     for n in 2..4 {
         harness
             .api_v1()
@@ -2511,23 +2587,16 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
     }
     await_hwm(&harness, &id, topic, 4).await;
 
-    let report = harness
-        .backend()
-        .maintain(
-            harness.security_context(),
-            &event_broker_sdk::RetentionRequest::for_partition(
+    // Retention takes the two events of the first burst.
+    memory
+        .truncate(
+            &event_broker_sdk::backend::TopicPartition::new(
                 gts::GtsInstanceId::try_new(topic).unwrap(),
-                0,
-                cutoff,
-            )
-            .build(),
+                event_broker_sdk::backend::Partition::new(0),
+            ),
+            event_broker_sdk::Sequence::assigned(2),
         )
-        .await
-        .expect("a retention pass must run");
-    assert_eq!(
-        report.removed_events, 2,
-        "the pass must take the two events assigned before the cutoff"
-    );
+        .expect("truncate must succeed");
 
     // 1 is now below the floor, and 2 - the erased event's own position - is
     // the floor itself.
@@ -2629,6 +2698,7 @@ async fn a_cursor_may_sit_on_an_erased_position_and_delivery_resumes_above_it() 
 async fn an_emptied_partition_admits_only_its_ceiling() {
     let topic = "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1";
     let tenant_id = Uuid::new_v4();
+    let memory = memory_event_broker_plugin::MemoryBackend::new();
     let harness = EventBrokerHarness::builder()
         .with_type_registry(StaticTypesRegistry::of(json!([
             { "id": topic, "partitions": 1 },
@@ -2638,6 +2708,7 @@ async fn an_emptied_partition_admits_only_its_ceiling() {
                 "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
             },
         ])))
+        .with_backend(std::sync::Arc::new(memory.clone()))
         .build()
         .await;
     let group = harness.api_v1().post_consumer_groups().send().await.json()["id"]
@@ -2664,23 +2735,16 @@ async fn an_emptied_partition_admits_only_its_ceiling() {
         .to_owned();
     publish_and_settle(&harness, &id, topic, tenant_id, 3).await;
 
-    let report = harness
-        .backend()
-        .maintain(
-            harness.security_context(),
-            &event_broker_sdk::RetentionRequest::for_partition(
+    // Retention empties the partition.
+    memory
+        .truncate(
+            &event_broker_sdk::backend::TopicPartition::new(
                 gts::GtsInstanceId::try_new(topic).unwrap(),
-                0,
-                chrono::Utc::now() + chrono::Duration::hours(1),
-            )
-            .build(),
+                event_broker_sdk::backend::Partition::new(0),
+            ),
+            event_broker_sdk::Sequence::assigned(3),
         )
-        .await
-        .expect("a retention pass must run");
-    assert_eq!(
-        report.removed_events, 3,
-        "the pass must empty the partition"
-    );
+        .expect("truncate must succeed");
 
     let ceiling = harness
         .api_v1()

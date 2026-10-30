@@ -140,6 +140,22 @@ pub struct LicenseResourceV1<M: gts::GtsSchema> {
     pub metadata: M,
 }
 
+/// Well-known **tenant** Subject contract type —
+/// `gts.cf.core.lic.subj.v1~cf.core.lic.tenant.v1~`.
+///
+/// The subject of a check that licenses a whole tenant: `id` is the tenant UUID.
+/// A Resource contract admits it like any other Subject type, through
+/// `admitted_subjects`. No metadata.
+#[derive(Default)]
+#[gts_type_schema(
+    dir_path = "schemas",
+    base = LicenseSubjectV1,
+    type_id = gts_id!("cf.core.lic.subj.v1~cf.core.lic.tenant.v1~"),
+    description = "Tenant Subject licensing contract. `id` is the tenant UUID. No metadata.",
+    properties = ""
+)]
+pub struct LicenseTenantSubjectV1;
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "gts_tests.rs"]

@@ -508,7 +508,12 @@ impl RequestBuilder {
             BodyKind::Bytes(b) | BodyKind::Json(b) | BodyKind::Form(b) => b,
         };
 
-        let request = builder.body(Full::new(body_bytes))?;
+        let mut request = builder.body(Full::new(body_bytes))?;
+
+        // Forward the chain-scoped `x-request-id` of the request being served,
+        // if any. Runs here (not as a layer) because `Buffer` dispatches on a
+        // worker task that sees no task-locals — see `inject_request_id`.
+        toolkit_trace_context::inject_request_id(request.headers_mut());
 
         // Fail-fast if buffer is full
         try_acquire_buffer_slot(&mut self.service).await?;

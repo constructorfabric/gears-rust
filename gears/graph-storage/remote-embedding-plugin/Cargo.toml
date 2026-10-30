@@ -28,7 +28,6 @@ serde_json = { workspace = true }
 # The credential never appears in a `Debug` rendering of the configuration.
 secrecy = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
-tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
 # Same feature set the other outbound-HTTP gears use (chat-engine, github-mirror).
@@ -37,4 +36,5 @@ reqwest = { workspace = true, features = ["json"] }
 [dev-dependencies]
 graph-storage-sdk = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio-util = { workspace = true }
 wiremock = { workspace = true }

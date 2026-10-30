@@ -160,7 +160,7 @@ impl FileService {
     /// direction in `id asc` order and capped at `ServiceConfig::max_page_size`.
     ///
     /// # Errors
-    /// `DomainError::Cursor` for `limit == Some(0)` or a cursor of another listing.
+    /// `DomainError::Pagination` for `limit == Some(0)` or a cursor of another listing.
     pub(crate) fn list_backends(
         &self,
         limit: Option<u64>,

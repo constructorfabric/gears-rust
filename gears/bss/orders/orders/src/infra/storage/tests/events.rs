@@ -16,7 +16,7 @@ use crate::infra::events::payload::{
 use crate::infra::events::test_support::{Root, root};
 use crate::infra::events::test_support::{encoded_max_events, max_events, registry_client};
 use crate::infra::events::{
-    self as events, EventEnqueueError, EventKind, EventSink, OrderSummary, TOPIC, TxEvents,
+    self as events, EventEnqueueError, EventKind, EventSink, OrderSummary, QUEUE, TOPIC, TxEvents,
 };
 use crate::infra::storage::repo::TransactionRunner;
 use crate::infra::storage::repo::audit as writer;
@@ -24,7 +24,8 @@ use bss_orders_sdk::catalog::{OrderState, Trigger};
 use event_broker::test_support::{
     DeliveredOutcome, DeliveredPublish, EventBrokerHarness, FaultInjectingBroker, TransientFault,
 };
-use event_broker_sdk::{EventBrokerApi, Sequence};
+use event_broker_sdk::backend::{Backend, Partition, TopicPartition, Wait};
+use event_broker_sdk::{EventBrokerApi, GtsInstanceId, Sequence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
@@ -35,11 +36,10 @@ const BROKER_PARTITIONS: u32 = 4;
 const ROOT: u128 = 1_000;
 const PRODUCER: u128 = 1_100;
 
-fn settings(partitions: u32) -> ProducerSettings {
+fn settings() -> ProducerSettings {
     ProducerSettings {
         subject_id: u(PRODUCER),
         tenant_id: u(1_101),
-        broker_partitions: partitions,
     }
 }
 fn fast_retry() -> toolkit_db::outbox::WorkerTuning {
@@ -54,8 +54,10 @@ fn grants(granted: Arc<AtomicBool>) -> Arc<ScriptedPdp> {
     ScriptedPdp::new(move |request| {
         let producer = request.subject.id == u(PRODUCER);
         let produce = request.action.name == "produce";
-        let decision = match request.resource.resource_type.as_str() {
-            "gts.cf.core.events.event_type.v1~" => {
+        let resource_type = request.resource.resource_type.as_str();
+        let decision = match resource_type {
+            // The broker authorizes `produce` against the event type itself.
+            t if t.starts_with(events::EVENT_BASE) => {
                 producer
                     && produce
                     && request
@@ -89,7 +91,42 @@ pub(super) struct Env {
     faulty: Arc<FaultInjectingBroker>,
     pdp: Arc<ScriptedPdp>,
     granted: Arc<AtomicBool>,
+    /// The broker's partition count for the Orders topic.
+    partitions: u32,
 }
+
+/// One durable producer registration row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Registration {
+    queue: String,
+    outbox_partition: i64,
+    producer_id: Uuid,
+    generation: i64,
+    mode: String,
+}
+
+/// The broker-assigned ids are random: assert each row without its id, and the ids apart.
+fn without_ids(rows: &[Registration]) -> Vec<(&str, i64, i64, &str)> {
+    rows.iter()
+        .map(|r| {
+            (
+                r.queue.as_str(),
+                r.outbox_partition,
+                r.generation,
+                r.mode.as_str(),
+            )
+        })
+        .collect()
+}
+fn assert_distinct_ids(rows: &[Registration]) {
+    let ids: std::collections::BTreeSet<Uuid> = rows.iter().map(|r| r.producer_id).collect();
+    assert_eq!(
+        ids.len(),
+        rows.len(),
+        "one producer id per outbox partition: {rows:#?}"
+    );
+}
+
 impl Env {
     pub(super) async fn new() -> anyhow::Result<Self> {
         Self::with_broker_partitions(BROKER_PARTITIONS).await
@@ -114,30 +151,32 @@ impl Env {
             faulty,
             pdp,
             granted,
+            partitions,
         })
     }
-    async fn bind_declaring(&self, partitions: u32) -> Result<BoundProducer, broker::BindError> {
+    pub(super) async fn bind(&self) -> BoundProducer {
         Box::pin(broker::bind(
             Some(Arc::clone(&self.faulty) as Arc<dyn EventBrokerApi>),
             Some(root(ROOT, None)),
             self.db.clone(),
-            &settings(partitions),
+            &settings(),
             Duration::from_secs(10),
             Some(fast_retry()),
         ))
         .await
-    }
-    pub(super) async fn bind(&self) -> BoundProducer {
-        self.bind_declaring(BROKER_PARTITIONS).await.unwrap()
+        .unwrap()
     }
     pub(super) async fn stored(&self) -> Vec<event_broker_sdk::Event> {
-        let ctx = self.harness.security_context();
         let mut all = Vec::new();
-        for partition in 0..BROKER_PARTITIONS {
+        for partition in 0..self.partitions {
+            let at = TopicPartition::new(
+                GtsInstanceId::try_new(TOPIC).unwrap(),
+                Partition::new(partition),
+            );
             all.extend(
                 self.harness
                     .backend()
-                    .read(ctx, TOPIC, partition, Sequence::NONE, 4_096)
+                    .read(&at, Sequence::NONE, 4_096, Wait::No)
                     .await
                     .unwrap(),
             );
@@ -172,22 +211,27 @@ impl Env {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    async fn registration(&self) -> (Uuid, i64, String) {
-        let row = self
-            .pg
+    /// The Orders producer's registrations, one per outbox partition that has delivered.
+    async fn registrations(&self) -> Vec<Registration> {
+        self.pg
             .raw
-            .query_one_raw(Statement::from_string(
+            .query_all_raw(Statement::from_string(
                 DbBackend::Postgres,
-                "SELECT producer_id, generation, mode FROM event_broker_producer_registrations WHERE registration_key='bss-orders-events-v1'",
+                "SELECT queue, outbox_partition, producer_id, generation, mode \
+                 FROM event_broker_producer_registrations \
+                 WHERE registration_key='bss-orders-events-v1' ORDER BY outbox_partition",
             ))
             .await
             .unwrap()
-            .expect("durable producer registration");
-        (
-            row.try_get("", "producer_id").unwrap(),
-            row.try_get("", "generation").unwrap(),
-            row.try_get("", "mode").unwrap(),
-        )
+            .into_iter()
+            .map(|row| Registration {
+                queue: row.try_get("", "queue").unwrap(),
+                outbox_partition: row.try_get("", "outbox_partition").unwrap(),
+                producer_id: row.try_get("", "producer_id").unwrap(),
+                generation: row.try_get("", "generation").unwrap(),
+                mode: row.try_get("", "mode").unwrap(),
+            })
+            .collect()
     }
 }
 
@@ -280,15 +324,19 @@ const UNACKNOWLEDGED: &str = "SELECT count(*) AS n FROM toolkit_outbox_outgoing 
 
 /// D-200 / §4.4: a committed transition yields exactly one durable producer message, fired
 /// after commit and delivered with the explicit root tenant, `bss-orders` source,
-/// order-UUID subject and `/subject` routing; the registration is durable Chained.
+/// order-UUID subject and `/subject` routing. Each outbox partition registers its own durable
+/// Chained producer on its first delivery, and keeps it.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn committed_transitions_deliver_root_tenant_events_routed_by_order() -> anyhow::Result<()> {
     let env = Env::new().await?;
     let bound = env.bind().await;
     assert_eq!(bound.sink().root().id(), u(ROOT));
-    let (producer_id, generation, mode) = env.registration().await;
-    assert_eq!((generation, mode.as_str()), (1, "chained"));
+    assert_eq!(
+        env.registrations().await,
+        vec![],
+        "a partition registers on its first delivery"
+    );
     let orders: Vec<u128> = (300..308).collect();
     for id in &orders {
         create(&env.db, *id).await?;
@@ -300,6 +348,19 @@ async fn committed_transitions_deliver_root_tenant_events_routed_by_order() -> a
         orders.len(),
         "one event per committed transition"
     );
+    let registered = env.registrations().await;
+    assert_eq!(
+        without_ids(&registered),
+        vec![
+            (QUEUE, 2, 1, "chained"),
+            (QUEUE, 7, 1, "chained"),
+            (QUEUE, 10, 1, "chained"),
+            (QUEUE, 12, 1, "chained"),
+            (QUEUE, 13, 1, "chained"),
+            (QUEUE, 16, 1, "chained")
+        ]
+    );
+    assert_distinct_ids(&registered);
     let mut partitions = std::collections::BTreeSet::new();
     for event in &stored {
         assert_eq!(
@@ -333,7 +394,7 @@ async fn committed_transitions_deliver_root_tenant_events_routed_by_order() -> a
     assert_eq!(of_300.len(), 2);
     assert_eq!(of_300[0].partition, of_300[1].partition);
     assert_eq!(env.dead_letters().await, 0);
-    assert_eq!(env.registration().await.0, producer_id);
+    assert_eq!(env.registrations().await, registered);
     bound.stop().await;
     Ok(())
 }
@@ -664,7 +725,6 @@ fn assert_same_message(first: &DeliveredPublish, retry: &DeliveredPublish) {
     let (a, b) = (first.meta.as_ref().unwrap(), retry.meta.as_ref().unwrap());
     assert_eq!(b.producer_id, a.producer_id, "stable producer identity");
     assert_eq!(b.sequence, a.sequence, "stable meta.sequence");
-    assert_eq!(b.partition_hint, a.partition_hint);
 }
 
 /// DESIGN §4.4 *Required regression evidence*: the broker appends an event, the response is
@@ -683,7 +743,6 @@ async fn lost_acknowledgement_retries_after_restart_with_cursor_recovery() -> an
     }
     transition(&env, bound.sink(), 520, "submitted", submitted()).await?;
     env.wait_stored(1).await;
-    let (producer_id, generation, _) = env.registration().await;
 
     env.faulty.lose_next_ack_then_disconnect();
     let reads_before = env.faulty.cursor_reads();
@@ -706,15 +765,17 @@ async fn lost_acknowledgement_retries_after_restart_with_cursor_recovery() -> an
         1,
         "the unacknowledged message is still queued"
     );
+    let registered = env.registrations().await;
+    assert_eq!(
+        without_ids(&registered),
+        vec![(QUEUE, 1, 1, "chained"), (QUEUE, 7, 1, "chained")]
+    );
     bound.stop().await;
 
-    // Restart: new workers, empty cursor cache, same durable registration.
+    // Restart: new workers, empty cursor cache, same durable registrations.
     env.faulty.reconnect();
     let bound = env.bind().await;
-    assert_eq!(
-        env.registration().await,
-        (producer_id, generation, "chained".to_owned())
-    );
+    assert_eq!(env.registrations().await, registered);
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     while count(&env.pg, UNACKNOWLEDGED).await > 0 {
         assert!(
@@ -758,6 +819,14 @@ async fn lost_acknowledgement_retries_after_restart_with_cursor_recovery() -> an
     let stored = env.wait_stored(3).await;
     assert!(stored.iter().any(|e| e.subject == u(522).to_string()));
     assert_eq!(env.dead_letters().await, 0);
+    assert_eq!(
+        without_ids(&env.registrations().await),
+        vec![
+            (QUEUE, 1, 1, "chained"),
+            (QUEUE, 7, 1, "chained"),
+            (QUEUE, 13, 1, "chained")
+        ]
+    );
     bound.stop().await;
     Ok(())
 }
@@ -834,72 +903,100 @@ async fn initial_and_later_transient_failures_retry_in_order() -> anyhow::Result
     Ok(())
 }
 
-/// Restart keeps the durable producer identity and chain; a broker that forgot the producer
-/// permanently rejects the in-flight message (inspectable dead letter, unchanged payload and
-/// event id), rotates the registration and lets later messages proceed. The order is untouched.
+/// Restart keeps each partition's durable producer identity and chain. A broker that forgot a
+/// producer answers its next publish as unknown: the partition registers a replacement
+/// (generation 2), the same durable message is published again under it and stored, and no
+/// dead letter is written. Other partitions keep their registrations.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn unknown_producer_restart_and_permanent_rejection() -> anyhow::Result<()> {
+async fn a_forgotten_producer_re_registers_and_delivers() -> anyhow::Result<()> {
     let env = Env::new().await?;
     let bound = env.bind().await;
-    for id in 700..704 {
+    for id in 700..702 {
         create(&env.db, id).await?;
     }
     transition(&env, bound.sink(), 700, "submitted", submitted()).await?;
     env.wait_stored(1).await;
-    let (first, generation, _) = env.registration().await;
-    assert_eq!(generation, 1);
+    let registered = env.registrations().await;
+    assert_eq!(without_ids(&registered), vec![(QUEUE, 12, 1, "chained")]);
     bound.stop().await;
 
     // Restart: the stored registration is reused; the chain continues without rejection.
     let bound = env.bind().await;
     assert_eq!(
-        env.registration().await.0,
-        first,
+        env.registrations().await,
+        registered,
         "durable producer identity"
     );
     transition(&env, bound.sink(), 701, "submitted", submitted()).await?;
     env.wait_stored(2).await;
     assert_eq!(env.dead_letters().await, 0);
-
-    // The broker forgets the producer: the in-flight message is rejected, not retried forever.
-    env.harness.forget_producer(first).await;
-    transition(&env, bound.sink(), 702, "submitted", submitted()).await?;
-    env.wait_dead_letters(1).await;
-    let (rotated, generation, _) = env.registration().await;
-    assert_ne!(
-        rotated, first,
-        "replacement registration for future enqueues"
-    );
-    assert_eq!(generation, 2);
-    let letter = env
-        .pg
-        .raw
-        .query_one_raw(Statement::from_string(
-            DbBackend::Postgres,
-            "SELECT payload, last_error FROM toolkit_outbox_dead_letters",
-        ))
-        .await?
-        .unwrap();
-    let payload: Vec<u8> = letter.try_get("", "payload")?;
-    let envelope: serde_json::Value = serde_json::from_slice(&payload)?;
-    assert_eq!(envelope["subject"], serde_json::json!(u(702).to_string()));
-    assert_eq!(envelope["tenant_id"], serde_json::json!(u(ROOT)));
-    assert_eq!(envelope["data"]["orderId"], serde_json::json!(u(702)));
-    assert!(Uuid::parse_str(envelope["event_id"].as_str().unwrap()).is_ok());
-    let error: Option<String> = letter.try_get("", "last_error")?;
-    assert!(error.unwrap_or_default().contains("unknown"));
-    // The committed order is authoritative; a dead letter is never an order state.
+    let before = env.registrations().await;
     assert_eq!(
-        count(&env.pg, &format!("SELECT count(*) AS n FROM bss_orders__order WHERE order_id='{}' AND state='submitted'", u(702))).await,
-        1
+        without_ids(&before),
+        vec![(QUEUE, 2, 1, "chained"), (QUEUE, 12, 1, "chained")]
     );
-    // Later messages proceed under the rotated registration.
-    transition(&env, bound.sink(), 703, "submitted", submitted()).await?;
+    assert_distinct_ids(&before);
+
+    // The broker forgets order 700's producer; its next event is in the same partition.
+    let forgotten = registered[0].clone();
+    env.harness.forget_producer(forgotten.producer_id).await;
+    transition(&env, bound.sink(), 700, "cancelled", cancelled()).await?;
     let stored = env.wait_stored(3).await;
-    assert!(stored.iter().any(|e| e.subject == u(703).to_string()));
-    assert!(!stored.iter().any(|e| e.subject == u(702).to_string()));
-    assert_eq!(env.dead_letters().await, 1);
+    assert_eq!(
+        stored
+            .iter()
+            .filter(|e| e.subject == u(700).to_string())
+            .count(),
+        2
+    );
+    assert_eq!(env.dead_letters().await, 0);
+    let after = env.registrations().await;
+    let replacement = after
+        .iter()
+        .find(|r| r.outbox_partition == forgotten.outbox_partition)
+        .unwrap()
+        .producer_id;
+    assert_ne!(replacement, forgotten.producer_id);
+    let expected: Vec<Registration> = before
+        .iter()
+        .map(|r| {
+            if r.outbox_partition == forgotten.outbox_partition {
+                Registration {
+                    producer_id: replacement,
+                    generation: 2,
+                    ..r.clone()
+                }
+            } else {
+                r.clone()
+            }
+        })
+        .collect();
+    assert_eq!(after, expected);
+    assert_distinct_ids(&after);
+
+    // The forgotten id is answered as unknown before the cancel is published (the chained
+    // cursor read), so the cancel's only publish is under the replacement.
+    let attempts: Vec<(Uuid, Option<Uuid>, DeliveredOutcome)> = env
+        .faulty
+        .delivered_publishes()
+        .into_iter()
+        .filter(|p| p.subject == u(700).to_string())
+        .map(|p| (p.event_id, p.meta.and_then(|m| m.producer_id), p.outcome))
+        .collect();
+    let cancel = attempts[1].0;
+    assert_eq!(
+        attempts,
+        vec![
+            (
+                attempts[0].0,
+                Some(forgotten.producer_id),
+                DeliveredOutcome::Accepted
+            ),
+            (cancel, Some(replacement), DeliveredOutcome::Accepted),
+        ]
+    );
+    assert!(stored.iter().any(|e| e.id == cancel));
     bound.stop().await;
     Ok(())
 }
@@ -954,58 +1051,39 @@ async fn binding_fails_closed_without_each_prerequisite() -> anyhow::Result<()> 
     let limit = Duration::from_secs(5);
     let attempt = |broker: Option<Arc<dyn EventBrokerApi>>,
                    tenants: Option<Arc<dyn TenantResolverClient>>,
-                   db: Db,
-                   partitions: u32| async move {
-        Box::pin(broker::bind(
-            broker,
-            tenants,
-            db,
-            &settings(partitions),
-            limit,
-            None,
-        ))
-        .await
-        .err()
-        .map(|e| e.failure)
+                   db: Db| async move {
+        Box::pin(broker::bind(broker, tenants, db, &settings(), limit, None))
+            .await
+            .err()
+            .map(|e| e.failure)
     };
     let real = || Some(Arc::clone(&env.faulty) as Arc<dyn EventBrokerApi>);
     assert_eq!(
-        attempt(None, Some(root(ROOT, None)), env.db.clone(), 4).await,
+        attempt(None, Some(root(ROOT, None)), env.db.clone()).await,
         Some(BindFailure::BrokerUnavailable)
     );
     assert_eq!(
-        attempt(real(), None, env.db.clone(), 4).await,
+        attempt(real(), None, env.db.clone()).await,
         Some(BindFailure::TenantResolverUnavailable)
     );
     assert_eq!(
-        attempt(real(), Some(Arc::new(Root(None))), env.db.clone(), 4).await,
+        attempt(real(), Some(Arc::new(Root(None))), env.db.clone()).await,
         Some(BindFailure::RootTenantUnavailable)
     );
     assert_eq!(
-        attempt(real(), Some(root(ROOT, Some(1))), env.db.clone(), 4).await,
+        attempt(real(), Some(root(ROOT, Some(1))), env.db.clone()).await,
         Some(BindFailure::RootTenantInvalid)
-    );
-    assert_eq!(
-        attempt(real(), Some(root(ROOT, None)), env.db.clone(), 0).await,
-        Some(BindFailure::ProducerRegistration),
-        "no partition count is assumed"
     );
     // A broker that never loaded the Orders contract: schema preparation fails.
     let bare = EventBrokerHarness::builder().build().await;
     assert_eq!(
-        attempt(
-            Some(bare.broker()),
-            Some(root(ROOT, None)),
-            env.db.clone(),
-            4
-        )
-        .await,
+        attempt(Some(bare.broker()), Some(root(ROOT, None)), env.db.clone()).await,
         Some(BindFailure::SchemaPreparation)
     );
     // No platform producer-registration table: durable registration fails.
     let unmigrated = Pg::bare().await?;
     assert_eq!(
-        attempt(real(), Some(root(ROOT, None)), unmigrated.db.clone(), 4).await,
+        attempt(real(), Some(root(ROOT, None)), unmigrated.db.clone()).await,
         Some(BindFailure::ProducerRegistration)
     );
     assert_eq!(
@@ -1018,7 +1096,14 @@ async fn binding_fails_closed_without_each_prerequisite() -> anyhow::Result<()> 
         "no failed attempt registered a producer"
     );
     let bound = env.bind().await;
-    assert_eq!(env.registration().await.1, 1);
+    assert_eq!(env.registrations().await, vec![]);
+    create(&env.db, 900).await?;
+    transition(&env, bound.sink(), 900, "submitted", submitted()).await?;
+    env.wait_stored(1).await;
+    assert_eq!(
+        without_ids(&env.registrations().await),
+        vec![(QUEUE, 7, 1, "chained")]
+    );
     bound.stop().await;
     Ok(())
 }
@@ -1142,8 +1227,8 @@ struct Probe {
     /// of the chain at the broker-selected partition (SDK maps `Duplicate` to `Ok`).
     broker_duplicate: Vec<DeliveredPublish>,
     /// Broker `SequenceViolation`, then the SDK's `handle_sequence_violation` refreshed the
-    /// cursor of the *declared* partition and acknowledged `seq <= previous` as already
-    /// sequenced, without publishing again.
+    /// cursor and acknowledged `seq <= previous` as already sequenced, without publishing
+    /// again.
     sdk_already_sequenced: Vec<DeliveredPublish>,
     unattributed: usize,
 }
@@ -1161,11 +1246,10 @@ fn describe(p: &DeliveredPublish) -> String {
     let meta = p.meta.as_ref();
     let num = |v: Option<i64>| v.map_or_else(|| "none".to_owned(), |v| v.to_string());
     format!(
-        "{} seq={} previous={} declared_partition={} broker_answer={}",
+        "{} seq={} previous={} broker_answer={}",
         p.subject,
         num(meta.and_then(|m| m.sequence)),
         num(meta.and_then(|m| m.previous)),
-        num(meta.and_then(|m| m.partition_hint).map(i64::from)),
         answer(&p.outcome),
     )
 }
@@ -1241,8 +1325,7 @@ async fn dead_lettered(env: &Env) -> anyhow::Result<std::collections::BTreeSet<S
         let subject = envelope["subject"].as_str().unwrap_or_default().to_owned();
         let error: Option<String> = letter.try_get("", "last_error")?;
         eprintln!(
-            "  dead letter {subject} declared_partition={} error={}",
-            envelope["broker_partition"],
+            "  dead letter {subject} error={}",
             error.unwrap_or_default()
         );
         dead.insert(subject);
@@ -1286,68 +1369,51 @@ async fn sequential_probe(env: &Env, sink: &EventSink, orders: &[u128]) -> anyho
     Ok(probe)
 }
 
-/// Coordinator-requested probe (DESIGN §3.7 "startup MUST fail" on a partition-count
-/// mismatch): the producer declares 3 partitions while the broker is configured with 4.
-///
-/// Observed platform behavior, pinned here as evidence for the open deployment gate
-/// (`upreq-event-broker-runtime`) and the upstream defect in `UPSTREAM_REQS` §2.7: binding cannot
-/// detect the mismatch (no API reports the count). The SDK keys its chain cursor and
-/// `partition_hint` by `murmur3(subject) % declared`, while the broker ignores the hint and
-/// chains by `% configured`, so two producer chains feed one broker chain. Each lost event is
-/// attributed: a broker `DuplicateIgnore` for a *different* event whose sequence equals the
-/// head, or a `SequenceViolation` the SDK acknowledges as already sequenced after refreshing
-/// the wrong partition's cursor. Neither leaves a retry, dead letter or error on the queue.
-/// When a broker-level partition-count capability exists, replace this with a fail-closed
-/// startup test.
+/// The producer needs no broker partition count: each outbox partition chains under its own
+/// producer id, and the broker places events by their partition key. With the broker's Orders
+/// topic at three partitions (not the four the other cases use), sequential traffic stores
+/// every event, every publish is a first-time acceptance, and nothing is lost, retried or
+/// dead-lettered.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn a_wrong_declared_partition_count_silently_drops_events() -> anyhow::Result<()> {
-    let env = Env::new().await?;
-    let bound = env
-        .bind_declaring(3)
-        .await
-        .expect("no platform API lets binding detect the mismatch");
+async fn every_event_is_stored_whatever_the_broker_partition_count() -> anyhow::Result<()> {
+    let env = Env::with_broker_partitions(3).await?;
+    let bound = env.bind().await;
     let orders: Vec<u128> = (1_200..1_212).collect();
     let probe = sequential_probe(&env, bound.sink(), &orders).await?;
-    let silent = probe.broker_duplicate.len() + probe.sdk_already_sequenced.len();
-    eprintln!(
-        "partition mismatch probe: committed={} stored={} dead_letters={} silently_acknowledged={silent} (broker_duplicate={}, sdk_already_sequenced={}) unattributed={}",
-        probe.committed,
-        probe.stored,
-        probe.dead_letters,
-        probe.broker_duplicate.len(),
-        probe.sdk_already_sequenced.len(),
-        probe.unattributed,
+    assert_eq!(
+        (
+            probe.committed,
+            probe.stored,
+            probe.dead_letters,
+            probe.broker_duplicate.len(),
+            probe.sdk_already_sequenced.len(),
+            probe.unattributed
+        ),
+        (12, 12, 0, 0, 0, 0)
     );
-    for lost in probe
-        .broker_duplicate
-        .iter()
-        .chain(&probe.sdk_already_sequenced)
-    {
-        eprintln!("  lost {}", describe(lost));
-    }
-    assert_eq!(probe.unattributed, 0, "every loss is attributed");
-    assert_eq!(probe.stored + probe.dead_letters + silent, probe.committed);
+    assert!(
+        env.faulty
+            .delivered_publishes()
+            .iter()
+            .all(|p| p.outcome == DeliveredOutcome::Accepted && !p.ack_lost),
+        "no duplicate or sequence-violation answer"
+    );
     let errors = count(
         &env.pg,
         "SELECT count(*) AS n FROM toolkit_outbox_processor WHERE last_error IS NOT NULL OR attempts > 0",
     )
     .await;
     assert_eq!(errors, 0, "no retry or error is visible on the queue");
-    assert!(
-        silent > 0,
-        "expected silent loss under a mismatched count; the platform may have changed - revisit the gate"
-    );
     bound.stop().await;
     Ok(())
 }
 
-/// Control for the probe above: with the declared count equal to the broker's, the same
-/// sequential traffic stores every event, every publish is a first-time acceptance, and no
-/// duplicate or chain-violation answer occurs. The loss needs the mismatch.
+/// The same sequential traffic on the four-partition topic the other cases use: every event is
+/// stored and every publish is a first-time acceptance.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
-async fn a_matching_partition_count_stores_every_event() -> anyhow::Result<()> {
+async fn sequential_traffic_on_the_default_topic_stores_every_event() -> anyhow::Result<()> {
     let env = Env::new().await?;
     let bound = env.bind().await;
     let orders: Vec<u128> = (1_300..1_312).collect();
@@ -1360,7 +1426,7 @@ async fn a_matching_partition_count_stores_every_event() -> anyhow::Result<()> {
             .delivered_publishes()
             .iter()
             .all(|p| p.outcome == DeliveredOutcome::Accepted && !p.ack_lost),
-        "no duplicate or sequence-violation answer without a mismatch"
+        "no duplicate or sequence-violation answer"
     );
     bound.stop().await;
     Ok(())

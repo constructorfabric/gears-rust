@@ -1,8 +1,9 @@
 //! Binds the Event Broker managed producer and reports its readiness (D-200, §3.4 step 1).
 //!
 //! Before Orders may enqueue an event, binding resolves the real `EventBrokerApi` provider and
-//! the canonical platform-root tenant, prepares the topic and all eleven schemas, registers the
-//! managed Chained producer durably and starts the toolkit's leased outbox workers. Every
+//! the canonical platform-root tenant, prepares the topic and all eleven schemas, builds the
+//! managed Chained producer (each outbox partition registers durably on its first delivery) and
+//! starts the toolkit's leased outbox workers. Every
 //! prerequisite is required: there is no holding queue, direct publish or degraded mode, and a
 //! missing provider leaves Orders not ready rather than silently undelivered (unlike Pricing's
 //! interim `PendingProducer`).
@@ -10,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use event_broker_sdk::{
-    DbDeduplication, DbProducer, EventBrokerApi, EventBrokerError, MissingProducerRegistration,
-    ProducerIdentity, ProducerMode, ProducerOutboxHandle, UnknownProducerRegistration,
+    DbDeduplication, DbProducer, EventBrokerApi, EventBrokerError, ProducerIdentity, ProducerMode,
+    ProducerOutboxHandle,
 };
 use tenant_resolver_sdk::{TenantResolverClient, TenantStatus};
 use toolkit_db::outbox::{Outbox, OutboxProfile, Partitions, WorkerTuning};
@@ -37,9 +38,6 @@ pub struct ProducerSettings {
     pub subject_id: Uuid,
     /// The producer principal's subject tenant ID.
     pub tenant_id: Uuid,
-    /// The broker's configured topic partition count. Required: the topic does not report it,
-    /// and the SDK default is never assumed.
-    pub broker_partitions: u32,
 }
 
 /// Why the producer is not bound. Each is a readiness failure, never a degraded mode.
@@ -257,8 +255,9 @@ async fn prepare<K: super::events::EventKind>(
 // NOT cancel-safe: `bind_until_ready` drops this future at any await when the lifecycle is
 // cancelled, and the steps it already completed are not undone. What a drop leaves behind is
 // what a failed attempt leaves, and the next bind (on this or any replica) reuses it:
-// - during or after `prepare_all`: the managed producer registration (`RegisterNew`), which
-//   the next bind finds and compares under the same `PRODUCER_KEY`;
+// - during or after `prepare_all`: nothing durable from registration; the SDK registers a
+//   producer per outbox partition on its first delivery, under the same `PRODUCER_KEY` the
+//   next bind compares;
 // - between the eleven `prepare` steps: nothing durable; each `prepare` only resolves one event
 //   type from the broker into the dropped producer's in-memory schema cache;
 // - inside `queue.start` (toolkit-db `OutboxBuilder::start`): the queue's partition rows, which
@@ -284,18 +283,10 @@ pub async fn bind(
             "no TenantResolverClient provider",
         )
     })?;
-    if settings.broker_partitions == 0 {
-        return Err(BindError::new(
-            BindFailure::ProducerRegistration,
-            "broker_partitions must be declared",
-        ));
-    }
     let ctx = producer_context(settings)?;
     let root = root_tenant(tenants.as_ref(), &ctx, limit).await?;
     let deduplication = DbDeduplication::managed(ProducerMode::Chained)
         .key(PRODUCER_KEY)
-        .on_missing(MissingProducerRegistration::RegisterNew)
-        .on_unknown(UnknownProducerRegistration::RegisterNew)
         .build()
         .map_err(|e| {
             BindError::caused(
@@ -313,7 +304,6 @@ pub async fn bind(
         .deduplication(deduplication)
         .topics([TOPIC])
         .event_type_patterns([EVENT_TYPE_WILDCARD])
-        .broker_partitions(settings.broker_partitions)
         .prepare_all();
     let producer = match tokio::time::timeout(limit, built).await {
         Ok(Ok(producer)) => producer,

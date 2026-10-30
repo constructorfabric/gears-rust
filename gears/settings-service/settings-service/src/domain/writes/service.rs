@@ -21,7 +21,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{image_of, value_state_tag};
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use crate::domain::access::{AccessRepository, TenantAccess};
 use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
@@ -68,6 +68,14 @@ impl WriteActor {
     #[must_use]
     pub fn subject(&self) -> String {
         self.ctx.subject_id().to_string()
+    }
+
+    /// The tenant the caller acts from, recorded beside the subject so the
+    /// upward disclosure boundary can tell whether a reader may be shown who
+    /// it was.
+    #[must_use]
+    pub fn tenant(&self) -> Uuid {
+        self.ctx.subject_tenant_id()
     }
 
     /// Whether the caller is a human session rather than a service principal.
@@ -937,6 +945,7 @@ where
                                     inline,
                                     secret_ref,
                                     &actor.subject(),
+                                    Some(actor.tenant()),
                                     row.last_change_at,
                                 )
                                 .await?,
@@ -960,6 +969,7 @@ where
                                         needs_review: false,
                                         needs_review_detail: None,
                                         set_by: actor.subject(),
+                                        set_by_tenant: Some(actor.tenant()),
                                     },
                                 )
                                 .await?,
@@ -1009,6 +1019,7 @@ where
             declaration.key.as_str(),
             Some(gated.tenant_id),
             actor.subject(),
+            ActorTenant::of(actor.tenant()),
             operation,
             actor.request_id.clone(),
         )

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -99,6 +99,11 @@ pub struct Claims {
     /// without a DB lookup.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub etag: String,
+    /// Tells finalize to also bind the version under a `content_id IS NULL` CAS (`op = put` only).
+    /// Minted only by `POST /files` with `bind: "auto"` for a new file; replacing content goes through
+    /// the authorized `bind`. The sidecar never reads it; `#[serde(default)]` tolerates older tokens.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bind_on_finalize: bool,
 }
 
 fn is_default_constraints(c: &UploadConstraints) -> bool {
@@ -204,6 +209,20 @@ impl Verifier {
     /// Verify a token's signature and expiry, returning its claims. The caller still checks
     /// `op` against the HTTP method and enforces upload constraints.
     pub fn verify(&self, token: &str, now: OffsetDateTime) -> Result<Claims, DomainError> {
+        self.verify_with_grace(token, now, Duration::ZERO)
+    }
+
+    /// Like [`Self::verify`], but an expired token is accepted while `now < exp + grace`.
+    ///
+    /// For the s2s finalize/report-part callbacks only: the sidecar checked the token strictly at
+    /// upload start, so a slow upload can outlive the TTL. Only `exp` gets slack; signature, `op`
+    /// and the `(file_id, version_id)` binding are checked as usual.
+    pub fn verify_with_grace(
+        &self,
+        token: &str,
+        now: OffsetDateTime,
+        grace: Duration,
+    ) -> Result<Claims, DomainError> {
         let (payload_b64, sig_b64) = token
             .split_once('.')
             .ok_or_else(|| DomainError::token_invalid("malformed token"))?;
@@ -219,8 +238,9 @@ impl Verifier {
         let claims: Claims = serde_json::from_slice(&payload)
             .map_err(|_| DomainError::token_invalid("bad claims"))?;
 
-        // Expiry is exclusive: unusable from `exp` on.
-        if now.unix_timestamp() >= claims.exp {
+        // Exclusive; `grace` is clamped to whole seconds and saturates rather than overflowing `i64`.
+        let expires_at = claims.exp.saturating_add(grace.whole_seconds());
+        if now.unix_timestamp() >= expires_at {
             return Err(DomainError::token_invalid("token expired"));
         }
         Ok(claims)

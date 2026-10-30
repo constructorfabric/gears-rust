@@ -146,6 +146,7 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 | `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-integration LANE=toolkit-db-pgq`) |
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
+| `cf-gears-event-broker` | `integration` | Gear database on SQLite, PostgreSQL and MySQL (testcontainers, or `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL`; `make test-integration LANE=eb-gear-db`) |
 
 ### 4.2 Running
 

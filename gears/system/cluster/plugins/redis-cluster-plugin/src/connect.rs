@@ -85,6 +85,9 @@ pub struct ConnectSpec<'a> {
     pub pool_size: u32,
     /// The per-command client-side bound.
     pub command_timeout: Duration,
+    /// The subscriber's event-stream capacity (`fred`'s
+    /// `broadcast_channel_capacity`).
+    pub subscriber_buffer_capacity: usize,
 }
 
 /// What [`connect`] established.
@@ -180,6 +183,8 @@ pub async fn connect(spec: ConnectSpec<'_>) -> Result<Connected, ClusterError> {
             // which is exactly the state DESIGN.md §11 and §12 rest on not
             // being reachable.
             perf.default_command_timeout = spec.command_timeout;
+            // Subscriber only: the pool's streams carry nothing the plugin reads.
+            perf.broadcast_channel_capacity = spec.subscriber_buffer_capacity;
         })
         .build_subscriber_client()
     {

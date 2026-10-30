@@ -31,7 +31,8 @@ pub mod submit;
 use submit::{Failure, Stop, await_registration, bounded, deadline_after, jittered};
 
 mod telemetry;
-use telemetry::{Run, StopReason, error_fields, operation_id_of};
+pub use telemetry::error_fields;
+use telemetry::{Run, StopReason, operation_id_of};
 
 /// Retryable transport failure limit per batch, excluding hinted throttling.
 const TRANSPORT_ATTEMPTS: u32 = 3;
@@ -53,6 +54,11 @@ pub struct ReconcileOptions {
     pub retry_backoff_max: Duration,
     /// Budget of the whole call, every pass and poll included.
     pub deadline: Duration,
+    /// End the call once a pass admits nothing new and every identifier still wanted
+    /// waits on a dependency: only another writer could store that dependency. For a
+    /// caller whose desired set is complete, so a missing dependency fails at once;
+    /// conflicts and unavailability still retry under the remaining passes.
+    pub stop_when_stalled: bool,
 }
 
 impl Default for ReconcileOptions {
@@ -63,9 +69,16 @@ impl Default for ReconcileOptions {
             retry_backoff: Duration::from_millis(200),
             retry_backoff_max: Duration::from_secs(5),
             deadline: Duration::from_secs(60),
+            stop_when_stalled: false,
         }
     }
 }
+
+/// The [`ReconcileOptions::deadline`] for a gear that publishes its own entities at
+/// startup — a plugin's instance, a root type — and waits for their admission before it
+/// binds anything. With several registry instances on one database an admission can wait
+/// up to a minute for another instance's outbox, so this is twice the default deadline.
+pub const STARTUP_PUBLICATION_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Successful reconciliation: all desired identifiers are admitted.
 #[derive(Debug, Clone)]
@@ -93,6 +106,9 @@ pub enum ReconcileStop {
     ReadFailed,
     /// A permanent submission refusal; no further batches or passes run.
     InvalidInput,
+    /// A pass admitted nothing and only dependencies remain; see
+    /// [`ReconcileOptions::stop_when_stalled`].
+    Stalled,
 }
 
 impl ReconcileStop {
@@ -105,6 +121,7 @@ impl ReconcileStop {
             "deadline" => Some(Self::Deadline),
             "read_failed" => Some(Self::ReadFailed),
             "invalid_input" => Some(Self::InvalidInput),
+            "stalled" => Some(Self::Stalled),
             _ => None,
         }
     }
@@ -118,6 +135,7 @@ impl ReconcileStop {
             Self::Deadline => "deadline",
             Self::ReadFailed => "read_failed",
             Self::InvalidInput => "invalid_input",
+            Self::Stalled => "stalled",
         }
     }
 }
@@ -247,7 +265,8 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
     let mut stop = ReconcileStop::PassesExhausted;
     for pass in 1..=options.passes.get() {
         run.passes = pass;
-        let end = if pass > 1
+        let admitted = admitted_count(&run.outcomes);
+        let mut end = if pass > 1
             && let Err(stopped) = pause(jittered(backoff), deadline, cancel).await
         {
             stopped_between_passes(stopped, &wanted, &mut run)
@@ -255,6 +274,13 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
             call.pass(pass, options.batch_size.get(), &mut wanted, &mut run)
                 .await
         };
+        if options.stop_when_stalled
+            && matches!(end, PassEnd::Next)
+            && admitted_count(&run.outcomes) == admitted
+            && only_dependencies(&wanted, &run.outcomes)
+        {
+            end = PassEnd::Stop(ReconcileStop::Stalled);
+        }
         // Each later pause doubles, up to the maximum.
         if pass > 1 {
             backoff = backoff.saturating_mul(2).min(options.retry_backoff_max);
@@ -277,6 +303,26 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
         stop = ReconcileStop::Deadline;
     }
     conclude(run, &wanted, call.batches > 0, stop)
+}
+
+fn admitted_count(outcomes: &Outcomes) -> usize {
+    outcomes
+        .values()
+        .filter(|(_, outcome)| matches!(outcome, ReconcileOutcome::Admitted))
+        .count()
+}
+
+/// Whether every identifier still wanted waits on a dependency, and on nothing else.
+fn only_dependencies(wanted: &Wanted<'_>, outcomes: &Outcomes) -> bool {
+    wanted.keys().all(|key| {
+        matches!(
+            outcomes.get(key),
+            Some((
+                _,
+                ReconcileOutcome::Pending(ReconcilePendingCause::Dependency(_))
+            ))
+        )
+    })
 }
 
 /// The pause before a later pass, ended by the caller or the deadline.
@@ -367,7 +413,9 @@ fn compare(
 ) -> Vec<RegisterItem> {
     let mut candidates = Vec::new();
     wanted.retain(|key, (id, content)| match current.get(key) {
-        Some(found) if found.lifecycle == LifecycleStatus::Active && found.content == **content => {
+        Some(found)
+            if found.lifecycle == LifecycleStatus::Active && same(&found.content, content) =>
+        {
             outcomes.insert(key.clone(), (id.clone(), ReconcileOutcome::Admitted));
             false
         }
@@ -382,6 +430,25 @@ fn compare(
         }
     });
     candidates
+}
+
+/// Whether two documents have the same canonical text, as the registry stores and compares
+/// it: object key order aside, every number keeps its spelling. `Value` equality would call
+/// `0.0` and `-0.0` equal and so leave a stored document differing from the desired one.
+fn same(left: &JsonDocument, right: &JsonDocument) -> bool {
+    use serde_json::Value;
+    match (left, right) {
+        (Value::Number(l), Value::Number(r)) => l.to_string() == r.to_string(),
+        (Value::Array(l), Value::Array(r)) => {
+            l.len() == r.len() && l.iter().zip(r).all(|(l, r)| same(l, r))
+        }
+        (Value::Object(l), Value::Object(r)) => {
+            l.len() == r.len()
+                && l.iter()
+                    .all(|(key, l)| r.get(key).is_some_and(|r| same(l, r)))
+        }
+        _ => left == right,
+    }
 }
 
 /// Record decisions and remove the identifiers this call will not submit again.
@@ -429,7 +496,7 @@ fn validate<'d>(
     for (id, content) in desired {
         inputs += 1;
         match wanted.get(id.id()) {
-            Some((_, existing)) if *existing != content => conflicting.push(id.clone()),
+            Some((_, existing)) if !same(existing, content) => conflicting.push(id.clone()),
             Some(_) => {}
             None => {
                 wanted.insert(id.id().to_owned(), (id.clone(), content));

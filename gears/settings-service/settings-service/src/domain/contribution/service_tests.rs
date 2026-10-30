@@ -234,6 +234,7 @@ impl Harness {
                     needs_review: false,
                     needs_review_detail: None,
                     set_by: "an-admin".to_owned(),
+                    set_by_tenant: None,
                 },
             )
             .await
@@ -1278,6 +1279,25 @@ impl DeclarationRepository for JournalingDeclarations {
     ) -> Result<Vec<String>, crate::domain::error::DomainError> {
         DeclarationRepo
             .visible_keys(conn, scope, visibility, hidden_for, keys)
+            .await
+    }
+    async fn list_candidates<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &toolkit_odata::ODataQuery,
+        narrowing: &crate::domain::declaration::BrowseNarrowing<'_>,
+    ) -> Result<
+        toolkit_odata::Page<crate::domain::declaration::BrowseCandidate>,
+        crate::domain::error::DomainError,
+    > {
+        DeclarationRepo
+            .list_candidates(
+                conn, scope, visibility, hidden_for, flagged_at, query, narrowing,
+            )
             .await
     }
     async fn find_by_key<C: toolkit_db::secure::DBRunner>(

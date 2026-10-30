@@ -151,7 +151,8 @@ _endpoint_call_counts: dict[str, int] = {}
 # Credentials /oauth2/token accepts; they match the secrets conftest provisions.
 _OAUTH2_CLIENT = ("test-client-id", "test-client-secret")
 
-# Gap between /sse/events events: wide enough that buffering is visible.
+# Gap between SSE events (/sse/events, /v1/chat/completions/stream): wide enough
+# that buffering is visible over a busy CI runner's scheduling jitter.
 SSE_EVENT_GAP_SECS = 0.2
 
 
@@ -368,7 +369,7 @@ async def _handle(method: str, target: str, headers: dict, body: bytes, writer: 
             }
             writer.write(_sse_chunk(json.dumps(chunk)))
             await writer.drain()
-            await asyncio.sleep(0.01)
+            await asyncio.sleep(SSE_EVENT_GAP_SECS)
         final = {
             "id": "chatcmpl-mock-stream",
             "object": "chat.completion.chunk",

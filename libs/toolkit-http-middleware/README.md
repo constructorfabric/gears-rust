@@ -9,8 +9,9 @@ maintaining their own.
 ## What it does
 
 - **Two-plane authentication** as axum layers:
-  - `security_context_middleware` (tenant plane) — always re-validates the bearer token via
-    an injected `BearerAuthenticator` and inserts a `SecurityContext`
+  - `security_context_middleware` (tenant plane) — re-validates the bearer token via
+    an injected `BearerAuthenticator` on every non-anonymous route and inserts a
+    `SecurityContext`; a bearer on an anonymous route is ignored
   - `internal_auth_middleware` (platform plane) — validates the
     `X-ToolKit-Internal-Token` via an injected `InternalAuthenticator` and inserts
     a `PlatformSecurityContext` plus `PeerAuthenticated`

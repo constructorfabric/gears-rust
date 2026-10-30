@@ -84,8 +84,6 @@ pub struct TracingConfig {
     /// [`OpenTelemetryConfig::exporter`] is used instead.
     pub exporter: Option<Exporter>,
     pub sampler: Option<Sampler>,
-    pub propagation: Option<Propagation>,
-    pub http: Option<HttpOpts>,
     pub logs_correlation: Option<LogsCorrelation>,
 }
 
@@ -135,17 +133,6 @@ pub enum Sampler {
     },
     AlwaysOn {},
     AlwaysOff {},
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Propagation {
-    pub w3c_trace_context: Option<bool>,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct HttpOpts {
-    pub inject_request_id_header: Option<String>,
-    pub record_headers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

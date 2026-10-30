@@ -1046,7 +1046,9 @@ produce all three natively:
   the variant at all.
 - **`Reset`** — emitted from three places, all meaning "re-read": the subscriber
   reconnected; the fan-out's own broadcast stream lagged, so messages were lost
-  before the task could read them and there is no way to know which; or an
+  before the task could read them and there is no way to know which (the streams
+  are `subscriber_buffer_capacity` deep, §8, and the `Reset` is broadcast from its
+  own task so a full watcher cannot stall the fan-out); or an
   unrecognized payload arrived on a published channel (§2.5), which resets that
   key's watchers rather than the registry. Redis pub/sub is fire-and-forget with no
   resumption point, so every gap is a total gap. Each `Reset` logs
@@ -1603,6 +1605,12 @@ pub struct RedisClusterConfig {
     /// Default: false — mutating a shared server's global config is opt-in.
     #[serde(default)]
     pub manage_keyspace_notifications: bool,
+
+    /// Capacity, in messages, of the subscriber client's event streams. A burst
+    /// larger than this resets every watcher (§4.3). Default: 4096; 1..=1 048 576.
+    /// Also on `RedisLockConfig`.
+    #[serde(default = "default_subscriber_buffer_capacity")]
+    pub subscriber_buffer_capacity: u32,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq)]
@@ -1658,7 +1666,8 @@ the backend to discover: `fred` reads a zero command timeout as "no timeout at a
 which silently deletes the property §11 and §12 rest on; and `wait_timeout_ms: 0`
 makes `WAIT` block with no deadline. `pool_size: 0` is refused
 here rather than by `fred` so the operator reads the name of the field they have to
-change.
+change. It also bounds `subscriber_buffer_capacity` to 1..=1 048 576: `tokio` panics
+on a zero-capacity broadcast channel, and the buffer is preallocated.
 
 Operator YAML — the recommended production shape from `docs/DESIGN.md` §4.2, with
 Redis serving cache and lock and K8s Lease serving the other two (the K8s plugin

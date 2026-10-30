@@ -4,8 +4,8 @@
 <!-- toc -->
 
 - [Two planes](#two-planes)
-- [Changes for 0.2.x clients](#changes-for-02x-clients)
 - [P1 — Control plane (`/api/file-storage/v1`)](#p1--control-plane-apifile-storagev1)
+- [Cursor pagination](#cursor-pagination)
 - [P1 — Sidecar (signed-URL authorized)](#p1--sidecar-signed-url-authorized)
 - [Data-plane callbacks (sidecar → control plane, s2s token-authenticated)](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)
 - [P2 — Multipart upload](#p2--multipart-upload)
@@ -22,10 +22,15 @@
 
 <!-- /toc -->
 
+This document covers only what the generated OpenAPI does not express. Control-plane REST — paths, parameters, and
+request/response schemas — is described by the generated OpenAPI spec `docs/api/api.json` (the server serves it at
+`/openapi.json`). What remains here is the sidecar protocol and signed URLs, headers, `Range`, processes, the
+behavioral rules of the control plane, and response codes.
+
 FileStorage is split into a **control plane** (metadata + signed-URL issuance; never carries content) and a **sidecar**
 data plane (the only thing that moves bytes, addressed only by control-issued signed URLs). See
-[ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md) and [DESIGN.md](./DESIGN.md). Every content
-operation is at least two requests: a control request to obtain a signed URL, then a data request against the sidecar.
+[ADR-0003](./ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md) and [DESIGN.md](./DESIGN.md). A content
+operation always starts on the control plane, which issues a signed URL, and continues on the sidecar with that URL.
 
 ## Two planes
 
@@ -57,149 +62,95 @@ Encoding conventions:
 - All error responses follow RFC 7807 (`application/problem+json`).
 - `file_id` and `version_id` are UUIDs. A backend object lives at `/{file_id}/{version_id}` and is immutable.
 
-## Changes for 0.2.x clients
-
-Breaking changes to the four list endpoints — `GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`,
-`GET /storages` (details in [Cursor pagination](#cursor-pagination) and [P2 — Retention rules](#p2--retention-rules)):
-
-- Each now returns `{"items": [...], "page_info": {"next_cursor", "prev_cursor", "limit"}}` instead of a bare JSON
-  array.
-- The `cursor` query parameter (taken from `page_info.next_cursor` or `page_info.prev_cursor`) replaces `offset`.
-  `offset`, and any other unrecognized query parameter, is rejected with `400`.
-- `limit=0` is rejected with `400`. The default page size is 25; a `limit` above the configured
-  `max_page_size` (200 by default, never more than 200) is clamped down to it.
-- `GET /retention-rules` is now paginated.
-- `GET /storages` now returns `{"items": [{id, capabilities}], "page_info": ...}` instead of a bare JSON array and
-  is paginated by cursor.
-- `$top` and `$skiptoken` are accepted as synonyms of `limit` and `cursor`; passing both spellings of one parameter in
-  the same request is a `400`.
-- `$skip`, `$filter`, `$orderby`, `$select` and every other `$` parameter except `$top` and `$skiptoken` are
-  rejected with `400`.
-
 ## P1 — Control plane (`/api/file-storage/v1`)
 
-```text
-1.  POST   /files                          create file + return a signed upload URL (JSON body — see below; gts_file_type required)
-2.  POST   /files/{id}/versions            presign a new-version upload (no request body, no If-Match) → signed upload URL
-3.  POST   /files/{id}/bind                bind/rebind content_id := version_id                          — If-Match (omittable only on a file's first bind; required to rebind)
-4.  GET    /files/{id}/download-url         issue a signed download URL (pins current content_id, or ?version_id=)
-5.  PATCH  /files/{id}                      update custom metadata (JSON Merge Patch)        — If-Match-Metadata?
-6.  GET    /files/{id}                      file metadata (JSON)                                          — If-None-Match
-7.  DELETE /files/{id}                      delete file + all versions                                    — If-Match
-8.  GET    /files                           list files (owner_kind + owner_id required; cursor-paginated; `{items, page_info}` incl. custom_metadata)
-9.  GET    /files/{id}/versions             list versions (version_id, size, hash, hash_mode, part_count?, manifest?, created_at, is_current; cursor-paginated)
-10. DELETE /files/{id}/versions/{version_id} delete a single, non-current version                          — 409 if current
-11. GET    /storages                        list storages + capabilities inline; cursor-paginated
-12. GET    /storages/{storage_id}           one storage + capabilities
-13. GET    /policy                          get the stored policy for a scope (?scope=tenant|user)
-14. PUT    /policy                          upsert the policy for a scope
-15. GET    /policy/effective                compute the effective (most-restrictive) policy
-16. GET    /retention-rules                 list retention rules for the caller's tenant
-17. POST   /retention-rules                 create a retention rule
-18. DELETE /retention-rules/{rule_id}       delete a retention rule
-19. POST   /files/{id}/migrate              migrate a non-versioned file's content to a different backend
-20. POST   /files/{id}/transfer             transfer ownership of a file to a new owner
-```
+Paths, query parameters and request/response schemas of the control-plane routes are in the generated OpenAPI; this
+section keeps only the behavior the schema does not express.
 
-Notes:
 - There is **no** `HEAD /files/{id}` route on the control plane.
 - `GET /storages` and `GET /storages/{storage_id}` require the caller's `READ` authorization scope (`403`
-  otherwise). `GET /storages` returns `{items: [{id, capabilities}], page_info}` in `id asc` order, paginated like the
-  other listings — see [Cursor pagination](#cursor-pagination).
-- `POST /files` request body (`application/json`, `CreateFileReq`): `{ "owner_kind": "user"|"app", "owner_id":
-  "<uuid>", "name": "<string>", "gts_file_type": "<gts uri>", "mime_type": "<string>", "custom_metadata":
-  [{"key": "...", "value": "..."}] (optional, default []), "idempotency_key": "<string>" (optional),
-  "multipart": { "declared_size": <u64>, "preferred_part_size": <u64>? } (optional),
-  "bind": "auto"|"manual" (optional, default "auto") }`. `idempotency_key`
-  is the field documented under "Idempotent-create semantics" (`operations.md`) — see the `409` cause in "Status code
-  summary" for what happens on a reused key with a different body; it is rejected (`400`) together with `multipart`.
-  Creating a file with `(owner_kind, owner_id)` equal to the caller's own kind and subject id proceeds under the
-  ordinary `WRITE` grant; any other `(owner_kind, owner_id)` pair additionally requires the caller's `ADMIN_POLICY`
-  authorization scope (`403` otherwise) — plain `WRITE` must not let any tenant member create files on another
-  subject's behalf. The comparison is on the *pair*, not `owner_id` alone: `user` and `app` are disjoint owner
-  spaces that can legitimately share the same UUID, so a caller could otherwise pass their own id under
-  `owner_kind: "app"` and have the self-service check pass while actually authoring the file into the other
+  otherwise). `GET /storages` is ordered `id asc` and paginated like the other listings — see
+  [Cursor pagination](#cursor-pagination).
+- **Owner on create.** Creating a file with `(owner_kind, owner_id)` equal to the caller's own kind and subject id
+  proceeds under the ordinary `WRITE` grant; any other `(owner_kind, owner_id)` pair additionally requires the
+  caller's `ADMIN_POLICY` authorization scope (`403` otherwise) — plain `WRITE` must not let any tenant member create
+  files on another subject's behalf. The comparison is on the *pair*, not `owner_id` alone: `user` and `app` are
+  disjoint owner spaces that can legitimately share the same UUID, so a caller could otherwise pass their own id
+  under `owner_kind: "app"` and have the self-service check pass while actually authoring the file into the other
   owner space (a different effective policy and a different owner's quota/listing than their own).
-- **Multipart plan inline in `POST /files`.** With the `multipart` block and a server plan of **≥2 parts**, the `201` response carries
-  the full parts plan instead of a single-part URL: `{ file_id, version_id, multipart: { upload_id, version_id,
-  part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at } }` — no separate
+- `idempotency_key` on `POST /files` is the field documented under "Idempotent-create semantics" (`operations.md`) —
+  see the `409` cause in "Status code summary" for what happens on a reused key with a different body; it is
+  rejected (`400`) together with `multipart`.
+- **Multipart plan inline in `POST /files`.** With the `multipart` block and a server plan of **≥2 parts**, the
+  `201` response carries the full parts plan (the shape of the multipart initiate response, see
+  [P2 — Multipart upload](#p2--multipart-upload)) instead of a single-part URL — no separate
   `POST /files/{id}/multipart` call, and no orphan single-part pending version. Resume is unchanged:
   `GET /files/{id}/multipart/{upload_id}` (the `upload_id` now arrives from `POST /files`). A plan that collapses to
   one part falls back to the single-part `upload_url` path below. `bind: "auto"` (default) makes the upload itself
-  bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below — for a total of
-  **2 requests** single-part and **N+2** multipart; `bind: "manual"` keeps the staged flow (explicit `bind`, see
-  "Upload, bind, and the conflict retry" below).
+  bind the first content — see the `X-FS-Bound` contract and the `complete` `bind_state` field below; `bind:
+  "manual"` keeps the staged flow (explicit `bind`, see "Upload, bind, and the conflict retry" below).
 - `POST /files/{id}/versions` takes **no** request body and does **not** read `If-Match`.
-- `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is missing/invalid). A
-  caller listing with `(owner_kind, owner_id)` equal to the caller's own kind and subject id proceeds under the
-  ordinary `READ` grant; **any other pair** additionally requires the caller's `ADMIN_POLICY` authorization scope
-  (`403` otherwise) — this closes an enumeration vector where any tenant member could otherwise list an arbitrary
-  other subject's files via `?owner_kind=user&owner_id=<victim>`. The comparison is on the *pair*, not `owner_id`
-  alone, for the same reason `POST /files` checks it that way (see above): `user` and `app` are disjoint owner
-  spaces, so a caller could otherwise pass their own id under the *other* `owner_kind` and have the self-service
-  check pass while actually listing the other owner space's files. Each returned item's `custom_metadata` is real,
-  batch-fetched per page (one `IN (...)` query), not an always-empty placeholder. Results are ordered
-  `created_at DESC` with `file_id DESC` as a deterministic tie-breaker — `created_at` has only millisecond
-  resolution, so rows can share an instant, and without the tie-breaker a page boundary could skip or repeat a row
-  at that boundary. See [Cursor pagination](#cursor-pagination) below for the full model.
-- All four listing endpoints (`GET /files`, `GET /files/{id}/versions`, `GET /retention-rules`, `GET /storages`) page
-  via `?limit`/`?cursor` (synonyms `?$top`/`?$skiptoken`) — see [Cursor pagination](#cursor-pagination). The
-  effective limit on every request is `min(requested-or-default, configured max_page_size)`: `default_page_size`
-  (25 by default) is used when `?limit` is omitted, and `max_page_size` (200 by default) is a **hard ceiling** —
-  `MAX_PAGE_SIZE_CEILING` = 200 — that a configured `max_page_size` can never exceed regardless of what an operator
-  sets, enforced at config-validation time (gear init fails if `max_page_size` is configured above it), independent
-  of and in addition to the ordinary `default_page_size ≤ max_page_size` sanity check. A caller can therefore never
-  receive more than the configured `max_page_size` items in one page, and that configured value itself can never
-  exceed 200.
-- `POST /files` and `POST /files/{id}/versions` return `{ file_id, version_id, upload_url }` (the control plane
-  creates a `pending` `file_versions` row for `version_id` before returning the URL). The client `PUT`s the bytes to
-  `upload_url` on the sidecar; the sidecar streams them to the backend, measuring size + SHA-256, then calls the
-  control plane's `POST .../versions/{version_id}/finalize` callback (see
+- **Listing files.** `GET /files` **requires** both `owner_kind` and `owner_id` query params (`400` if either is
+  missing/invalid). A caller listing with `(owner_kind, owner_id)` equal to the caller's own kind and subject id
+  proceeds under the ordinary `READ` grant; **any other pair** additionally requires the caller's `ADMIN_POLICY`
+  authorization scope (`403` otherwise) — this closes an enumeration vector where any tenant member could otherwise
+  list an arbitrary other subject's files via `?owner_kind=user&owner_id=<victim>`. The comparison is on the *pair*,
+  not `owner_id` alone, for the same reason as on create (see above). Each returned item's `custom_metadata` is
+  real, batch-fetched per page, not an always-empty placeholder. Results are ordered `created_at DESC` with
+  `file_id DESC` as a deterministic tie-breaker. All four listing endpoints (`GET /files`,
+  `GET /files/{id}/versions`, `GET /retention-rules`, `GET /storages`) share the model in
+  [Cursor pagination](#cursor-pagination).
+- `POST /files` and `POST /files/{id}/versions` create a `pending` `file_versions` row for the returned `version_id`
+  before returning the signed `upload_url`. The client `PUT`s the bytes to `upload_url` on the sidecar; the sidecar
+  streams them to the backend, measuring size + SHA-256, then calls the control plane's
+  `POST .../versions/{version_id}/finalize` callback (see
   [Data-plane callbacks](#data-plane-callbacks-sidecar--control-plane-s2s-token-authenticated)), which marks the
   version `available`.
 - **Single-part bind outcome headers.** For a file created with `bind: "auto"` (the default),
   the finalize also binds the first content under a strict `content_id IS NULL` CAS, and the sidecar's `200` `PUT`
   response forwards the outcome transparently as fixed headers — the single-part half of the ONE bind-state model it
-  shares with `complete`'s `bind_state`: `X-FS-Bound: true` + `ETag: <new content etag>` (bound), or
+  shares with `complete`'s `bind_state`, spelled identically (`bound`, `conflict`, `manual`):
+  `X-FS-Bound: bound` + `ETag: <new content etag>`, or
   `X-FS-Bound: conflict` + `X-FS-Current-ETag: <current etag>` (CAS lost — e.g. two create-tokens on one new file;
-  the version is `available`, resolve with a manual `bind` using that ETag as `If-Match`, no re-upload). No headers
-  for `bind: "manual"` uploads. **Client rule:** the *absence* of `X-FS-Bound` on the `PUT` response means "not
-  bound" — a `bind: "manual"` upload, or an instance that does not auto-bind (e.g. an older instance during a
-  rolling update) — and the client must then call `POST /files/{id}/bind` itself; a `200` alone never implies the
-  version was bound. An honest `PUT` retry (lost response) is idempotent: `publish_exclusive` is
+  the version is `available`, resolve with a manual `bind` using that ETag as `If-Match`, no re-upload). A
+  `bind: "manual"` upload answers `X-FS-Bound: manual` with no `ETag`. **Client rule:** only `X-FS-Bound: bound`
+  means the version was bound; on `manual` (and on `conflict`) the client must call `POST /files/{id}/bind` itself,
+  and a `200` alone never implies the version was bound. An honest `PUT` retry (lost response) is idempotent: `publish_exclusive` is
   replay-safe and finalize converges an already-`available` version with matching size/hash to the same headers —
   never a 409 — **regardless of the upload's bind mode**: the sidecar publishes every single-part upload through the
   same replay-safe path whether or not the token carries the auto-bind claim, so a `bind: "manual"` retry converges
-  exactly like an auto-bind one, simply with no `X-FS-Bound`/`ETag` headers to report (as on the first call). An
-  auto-bind retry that WON the CAS on its original call replays that exact `X-FS-Bound: true` + `ETag` outcome, even
+  exactly like an auto-bind one, simply answering `X-FS-Bound: manual` with no `ETag` (as on the first call). An
+  auto-bind retry that WON the CAS on its original call replays that exact `X-FS-Bound: bound` + `ETag` outcome, even
   if the file's content has legitimately moved on to a different version since — never the current pointer's
-  `conflict`, which would contradict what the original call already returned. With
+  `conflict`, which would contradict what the original call already returned. An auto-bind retry that LOST the CAS
+  follows the current pointer instead: `bound` while the file points at this version (e.g. after a manual bind of it),
+  `conflict` with the current ETag otherwise. With
   `bind: "manual"` (or `POST /files/{id}/versions`, which never auto-binds), the client follows up
   with an explicit `POST /files/{id}/bind` (see "Upload, bind, and the conflict retry" below).
-- `GET /files/{id}/versions` returns a cursor-paginated page (`{items, page_info}`, see "Cursor pagination" below) of
-  version objects, ordered `created_at DESC` with `version_id
-  DESC` as a deterministic tie-breaker — same reasoning as `GET /files` above. Each carries
-  `{ version_id, mime_type, size, hash_algorithm, hash, hash_mode, part_count?, manifest?, status, is_current, created_at }`
-  (ADR-0006). `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is `"whole-sha256"` (then
-  `hash` = `sha256(object bytes)` and `part_count`/`manifest` are omitted) or `"multipart-composite-sha256"` (then
-  `hash` = `sha256(manifest)`, the offset-manifest composite root, `part_count` is the number of parts, and
-  `manifest` is the canonical offset-manifest wire text — the same string the multipart `complete` response carries,
-  re-served from the stored `version_hash_manifest` row so a client can re-verify `hash` for an already-existing
-  version, per [content-hash-modes.md](./features/content-hash-modes.md) §"Client-Side Manifest Re-Verification").
-  Note that a multipart upload whose plan had exactly **one part** finalizes as `whole-sha256` (ADR-0006 single-part
-  amendment), so it too carries no `part_count`/`manifest` here. `?limit` itself is **not** additionally capped for
-  this — a page of ordinary `whole-sha256` versions is sized exactly like any other listing (`?limit` clamped only
-  to `max_page_size`). Instead, the manifests actually attached to a page are bounded by a 4 MiB aggregate budget:
-  if attaching the next `multipart-composite-sha256` version's manifest, in page order, would push the running
-  total over budget, the page is cut short right before that version (the version already-included even if its own
-  single manifest exceeds the budget alone, so the listing always makes forward progress). Such a page can
-  therefore come back shorter than `?limit` with more versions still to list — but `page_info.next_cursor` is
-  **always** set on a budget-truncated page (rebuilt from the last version actually returned, even when the
-  underlying keyset query itself had reached the true end), so a client that simply follows `next_cursor` resumes
-  correctly with no special case of its own.
-- `GET /files/{id}/download-url` returns `{ download_url, etag, version_id }`. By default it pins the current
-  `content_id`; `?version_id=<v>` pins a specific version.
-- Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload).
+- **Version listing and hashes.** `GET /files/{id}/versions` is ordered `created_at DESC` with `version_id DESC` as
+  a deterministic tie-breaker. `hash` is lowercase-hex; `hash_algorithm` is always `"SHA-256"`. `hash_mode` is
+  `"whole-sha256"` (then `hash` = `sha256(object bytes)` and `part_count`/`manifest` are omitted) or
+  `"multipart-composite-sha256"` (then `hash` = `sha256(manifest)`, the offset-manifest composite root, `part_count`
+  is the number of parts, and `manifest` is the canonical offset-manifest wire text — the same string the multipart
+  `complete` response carries, re-served from the stored `version_hash_manifest` row so a client can re-verify
+  `hash` for an already-existing version, per [content-hash-modes.md](./features/content-hash-modes.md)
+  §"Client-Side Manifest Re-Verification"). A multipart upload whose plan had exactly **one part** finalizes as
+  `whole-sha256` (ADR-0006 single-part amendment), so it too carries no `part_count`/`manifest` here. `?limit`
+  itself is **not** additionally capped for this. Instead, the manifests actually attached to a page are bounded by
+  a 4 MiB aggregate budget, counted from the request's cursor outward (page order for a first or forward page, the
+  reverse for a backward page): if attaching the next `multipart-composite-sha256` version's manifest would push the
+  running total over budget, the page is cut short right before that version. The version nearest the cursor is
+  always included, even if its own manifest alone exceeds the budget, so the listing always makes progress, and the
+  cut is always at the page's edge farthest from the cursor. Such a page can come back shorter than `?limit` with
+  more versions still to list — but the cursor for the direction of travel (`page_info.next_cursor` paging forward,
+  `page_info.prev_cursor` paging backward) is **always** set on a budget-truncated page, rebuilt from the version at
+  the cut, even when the underlying keyset query itself had reached the end in that direction. The cursor for the
+  opposite direction is built from the row next to the request's cursor, which the cut never removes. A client that
+  follows the cursor of its own direction resumes with no gap and no duplicate, and needs no special case.
+- `GET /files/{id}/download-url` pins the current `content_id` by default; `?version_id=<v>` pins a specific
+  version. `GET /files/{id}` supports `If-None-Match` → `304` (see "Conditional headers").
+- Restoring a prior version is `POST /files/{id}/bind` with that `version_id` (a pointer swap, no re-upload). Bind
+  semantics (`If-Match` / ETag) are in "Conditional headers" and "Upload, bind, and the conflict retry".
 - `DELETE /files/{id}/versions/{version_id}` cannot delete the file's current version (`409`, "bind another version
   first"); deleting the file's only version instead deletes the whole file.
 
@@ -212,8 +163,9 @@ PLID-52.06):
 - **Request**: `limit` (integer, default 25, min 1, max 200; also accepted as `$top`) and `cursor` (an opaque
   string — the previous page's `page_info.next_cursor` to page forward, or its `page_info.prev_cursor` to page
   backward; also accepted as `$skiptoken`). The two spellings of a parameter are the same parameter.
-  - Both spellings of one parameter in the same request (`limit` with `$top`, or `cursor` with `$skiptoken`) are a
-    `400` with reason `INVALID_QUERY_PARAMS`.
+  - A page parameter given more than once — repeated, or under both spellings (`limit` with `$top`, `cursor` with
+    `$skiptoken`) — is a `400` with reason `INVALID_QUERY_PARAMS`, reported on its `$` field (`$top` or
+    `$skiptoken`) whichever spellings were sent.
   - `limit=0` (or `$top=0`) is a `400` with reason `INVALID_LIMIT`, reported on the field `$top` for either
     spelling. A value above the configured maximum (`max_page_size`, 200 by default, never more than 200) is
     not an error — it is silently clamped down to that maximum.
@@ -228,7 +180,8 @@ PLID-52.06):
     `$expand`, `$search`, `$format`, ...) is a `400 UNSUPPORTED_QUERY_PARAM` too; for `$count` the error adds that a
     page never carries a total. An unknown `$` key (a typo such as `$filtre`) is a `400`.
   - Names are case-sensitive: `$Top` is a `400` whose error says the parameter is accepted only as `$top`.
-  - All unsupported `$` parameters in one request are reported together in a single response.
+  - Every unsupported key and every repeated parameter (under either spelling) in one request is reported together
+    in a single response.
   - Platform rules: `guidelines/DNA/REST/QUERYING.md`; toolkit reference:
     [`07_odata_pagination_select_filter.md`](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md).
 - **Response**: `{"items": [...], "page_info": {"next_cursor": <string|null>, "prev_cursor": <string|null>, "limit":
@@ -339,26 +292,28 @@ refuses to start without `FS_SIDECAR_INTERNAL_TOKEN`; see `docs/ADR/0003-…-sid
 section for the mechanism (interim gear-local shared secret). A client-visible `fs-token` alone can not drive these
 two routes.
 
-```text
-D1. POST /files/{file_id}/versions/{version_id}/finalize
-    D2. POST /files/{file_id}/versions/{version_id}/multipart/{upload_id}/parts/{part_number}/report
-```
+**Token expiry.** Both routes accept the `fs-token` for up to `finalize_token_grace_secs` past its `exp` (default
+1 h, `0` enforces `exp` strictly, capped at 7 days), so an upload that outlives the token's TTL can still finalize
+or report its parts. The grace applies only to these callbacks: the sidecar checks `exp` strictly when a `PUT`
+starts.
+
 
 **`D1` finalize** — called once after a successful single-part `PUT` (or, from the sidecar's own perspective, after
 each part write in the multipart case — see `D2`).
 - **Header**: `x-fs-token: <signed upload token>` (the same token minted for the `PUT`; `op` must be `Put` and the
   token's `file_id`/`version_id` must match the path).
-- **Request body** (`application/json`): `{ "size": <i64>, "hash_hex": "<64-char lowercase hex>" }` — the size and
-  SHA-256 hash the sidecar itself measured while streaming.
+- **Request body**: the size and SHA-256 hash (`size`, `hash_hex`, 64-char lowercase hex) the sidecar itself measured
+  while streaming.
 - **Server behavior**: re-enforces the policy size ceiling, then reads the stored object's length from the backend
   (metadata only, no download) at the version's `backend_path` and rejects (`400`) if it does not match the
   request body's `size`, or if no blob is present at that path at all (upload never completed). The reported
   SHA-256 is persisted as is. The version's `mime_type` is re-validated/resolved from a ranged read of the object's
   leading bytes (magic-byte sniffing) and persisted, and the version is marked `available`.
-- **Response**: `204 No Content`. Errors: `400` (validation/size mismatch or no object), `403` (bad/expired/mismatched
-  token, **or** missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `409` (already
-  finalized), `500` (a permanent backend fault reading the object's length or prefix), `503` (a transient one —
-  network, timeout, backend overload — carries `Retry-After`).
+- **Response**: `204 No Content`. Errors: `400` (validation/size mismatch, no object, or a replay against an
+  already-`available` version with a different size or hash), `403` (bad/mismatched token, a token expired beyond
+  the grace, **or** missing/mismatched `x-fs-internal-token` — see above), `404` (version not found), `500` (a
+  permanent backend fault reading the object's length or prefix), `503` (a transient one — network, timeout, backend
+  overload — carries `Retry-After`).
 - For a `bind: "manual"` upload (and `POST /files/{id}/versions`, which never auto-binds) this endpoint does **not**
   bind the version as current — `POST /files/{id}/bind` remains a separate, explicit client call. For the default
   `bind: "auto"` it binds inline under the same CAS and reports the outcome instead — see "Single-part bind outcome
@@ -368,28 +323,26 @@ each part write in the multipart case — see `D2`).
 populates `multipart_upload_parts`, the table `complete` assembles from.
 - **Header**: `x-fs-token: <signed multipart-part token>` (`op` must be `MultipartPart`; `file_id`/`version_id`/
   `upload_id`/`part_number` must match the path).
-- **Request body** (`application/json`): `{ "backend_etag": "<string>", "hash_hex": "<64-char lowercase hex>", "size": <i64> }`
-  — the backend-assigned ETag for this part plus the part's measured SHA-256 and byte length. `hash_hex` that does
-  not decode to exactly 32 bytes is rejected with `400` (mirrors `D1` finalize's identical check) — persisting a
-  wrong-length hash here would otherwise only surface later as an opaque `400` at `complete`, charged against
-  whichever caller happens to call `complete`, not the one that reported the bad hash.
+- **Request body**: the backend-assigned ETag for this part (`backend_etag`) plus the part's measured SHA-256
+  (`hash_hex`) and byte length (`size`). A `hash_hex` that does not decode to exactly 32 bytes is rejected with
+  `400` (mirrors `D1` finalize's identical check) — persisting a wrong-length hash here would otherwise only surface
+  later as an opaque `400` at `complete`, charged against whichever caller happens to call `complete`, not the one
+  that reported the bad hash.
 - **Response**: `204 No Content`. Errors: `400` (malformed/wrong-length `hash_hex`, or a reported `size` that does not
-  match the per-part size minted into the token at initiate time), `403` (bad/expired/mismatched token, **or**
-  missing/mismatched `x-fs-internal-token` — see above), `404`, `409` (the session is no longer
-  `in_progress` — already completed/aborted/expired), `500`.
+  match the per-part size minted into the token at initiate time), `403` (bad/mismatched token, a token expired
+  beyond the grace, **or** missing/mismatched `x-fs-internal-token` — see above), `404`, `409` (the session is no
+  longer `in_progress` — already completed/aborted/expired), `500`.
 
 ## P2 — Multipart upload
 
 Multipart is **server-authoritative**: the client sends desired parameters and the control plane returns the exact
-parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar.
+parts plan (sizes/offsets) with **one signed URL per part** pointing at the sidecar. The control-plane routes
+(initiate `P2-1`, complete `P2-3`, abort `P2-4`, introspect/resume `P2-5`) are in the generated OpenAPI; the part
+upload `P2-2` is a `PUT` to the per-part signed URL on the sidecar and is not in OpenAPI.
 
-```text
-P2-1. POST /files/{id}/multipart            initiate (JSON: declared_mime, declared_size, preferred part size); returns the parts plan + per-part signed URLs
-P2-2. PUT  <signed part url>                upload one part to the sidecar (raw body)
-P2-3. POST /files/{id}/multipart/{upload_id}/complete   assemble all reported parts into the final object, mark the version `available`, and return version/size/composite-hash
-P2-4. DELETE /files/{id}/multipart/{upload_id}          abort; parts discarded
-P2-5. GET /files/{id}/multipart/{upload_id}             introspect/resume; returns state + received/missing parts, with fresh resume URLs for missing parts of a live session
-```
+`DELETE /files/{id}/multipart/{upload_id}` (`P2-4`, abort) discards the session and its pending version; if the file then
+has no versions and no bound content, the file is deleted too (like `DELETE` of its only version), including for a
+session opened by a separate `POST /files/{id}/multipart`.
 
 Notes:
 - `P2-1` (`initiate`) always targets the backend registry's **default** backend (`FileStorageConfig::default_backend_id`,
@@ -403,24 +356,24 @@ Notes:
   explicit client call. For the default `bind: "auto"` it binds inline and reports `bind_state` — see "Bind inside
   complete" below. It takes an **optional** `If-Match` header: a concrete value is checked
   against the file's current content ETag (`400` on mismatch — `FailedPrecondition` collapses to `400` on this
-  platform); `*` or an absent header is unconditional. The route declares `401`/`403`/`404`/`409`/`400`/`500`/`503`
-  (the winning completer's assembly calls `StorageBackend::complete_multipart`; a transient backend fault surfaces
-  as `503` + `Retry-After`, distinct from the `202`/`Retry-After` lease-poll signal above).
-- `P2-3` (`complete`) returns **`200`** with a JSON body — see the response shape below.
-- `P2-5` (`GET .../multipart/{upload_id}`, introspect/resume) is authorized on `write` (like initiate/complete/abort,
-  not `read`) since it hands out live resume upload URLs. A foreign or missing `upload_id` is masked as `404`,
-  identical to `complete`'s guard. The route declares `401`/`403`/`404`/`500`. See the response shape below.
+  platform); `*` or an absent header is unconditional. The winning completer's assembly calls
+  `StorageBackend::complete_multipart`; a transient backend fault surfaces as `503` + `Retry-After`, distinct from
+  the `202`/`Retry-After` lease-poll signal below. `complete` returns **`200`** with a JSON body.
+- `P2-5` (introspect/resume) is authorized on `write` (like initiate/complete/abort, not `read`) since it hands out
+  live resume upload URLs. A foreign or missing `upload_id` is masked as `404`, identical to `complete`'s guard.
 - There is no control-plane route for uploading individual parts (e.g. a `PUT /files/{id}/multipart/{upload_id}/parts/{n}`
   against the control plane); bytes flow exclusively to the sidecar via the per-part signed URLs in the initiate
   response (ADR-0003, "no bytes through the control plane").
 
-**`P2-1` initiate request body** (`application/json`):
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `declared_mime` | `string` | yes | MIME type of the file being uploaded (e.g. `video/mp4`). Validated against the effective allowed-types policy. |
-| `declared_size` | `uint64` | yes | Total file size in bytes. The control plane validates this against the effective policy size limit and storage quota at initiate time — exactly like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any bytes are transferred. `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. The `429` quota path only fires when a `QuotaClient` is configured; none is wired in any deployment (`gear.rs`'s `quota_client: None`), so callers do not currently observe quota rejections — see [operations.md](./operations.md#storage-quota-not-enforced). |
-| `preferred_part_size` | `uint64` | no | Client hint for the part size in bytes; the server may widen it (see the `MAX_PART_COUNT` note below) or otherwise adjust it to satisfy backend minimums. Rejected with `400` if outside `[DEFAULT_MIN_PART_SIZE (5 MiB), MAX_PART_SIZE (5 GiB)]`. |
+**`P2-1` initiate validation.** `declared_mime` is validated against the effective allowed-types policy.
+`declared_size` is validated against the effective policy size limit and storage quota at initiate time — exactly
+like single-part upload does at presign time — so that oversized or quota-exceeding uploads are rejected before any
+bytes are transferred: `400` if it exceeds the policy size limit; `429` if it would exceed the storage quota. The
+`429` quota path only fires when a `QuotaClient` is configured; none is wired in any deployment (`gear.rs`'s
+`quota_client: None`), so callers do not currently observe quota rejections — see
+[operations.md](./operations.md#storage-quota-not-enforced). `preferred_part_size` is a client hint; the server may
+widen it (see below) or otherwise adjust it to satisfy backend minimums, and rejects it with `400` if outside
+`[DEFAULT_MIN_PART_SIZE (5 MiB), MAX_PART_SIZE (5 GiB)]`.
 
 The server-computed parts plan is capped at `MAX_PART_COUNT = 10_000` parts. If
 the chosen part size would produce more parts than that, `part_size` is **widened** (never past `MAX_PART_SIZE`, 5
@@ -433,7 +386,8 @@ multi-GB upload) while each part URL is signed for the much shorter `default_url
 still-`in_progress`, unexpired session can re-mint fresh part URLs via `P2-5` introspect as earlier ones expire,
 without re-initiating.
 
-**`P2-1` initiate response** (`application/json`) — the server-computed plan:
+The initiate response (and the inline plan in `POST /files`) carries the server-computed plan; each part's
+`upload_url` points at the sidecar:
 
 ```json
 {
@@ -474,21 +428,10 @@ hashes are reported to the control plane via the `D2` report-part callback (see
 for a successful part `PUT` is `{ "part_number": <u32>, "etag": "<backend-assigned or hash-derived string>",
 "hash_algorithm": "SHA-256", "hash": "<64-char lowercase hex>" }`.
 
-**`P2-3` complete response** (`application/json`, `200`):
 
-```json
-{
-  "version_id": "uuid",
-  "size": 10485763,
-  "hash_algorithm": "SHA-256",
-  "content_hash": "<64-char lowercase hex — sha256(manifest), ADR-0006 composite root>",
-  "hash_mode": "multipart-composite-sha256",
-  "part_count": 2,
-  "manifest": "v1,0:<64-hex>,8388608:<64-hex>",
-  "bind_state": "bound",
-  "etag": "\"<content etag — bind_state == bound only>\""
-}
-```
+**`P2-3` complete.** The response carries the version's `size`, the composite `content_hash` (`sha256(manifest)`,
+ADR-0006), `hash_mode`, `part_count`, the `manifest`, and `bind_state` (plus `etag` when bound, or `current_etag` on
+conflict).
 
 **Bind inside complete.** `bind_state` is the multipart half of the shared bind-state model
 (single-part: the `X-FS-Bound` header): `"bound"` — an `auto_bind` session (opened by `POST /files` with
@@ -507,14 +450,13 @@ are meant to be backstopped by a cleanup job (not running yet). The complete per
 catalog for both upload paths is [concurrency-and-failure-model.md](./concurrency-and-failure-model.md).
 
 **Wire-spelling stability (`bind_state` / `state`).** `bind_state` (`"bound"`/`"conflict"`/`"manual"`) and the
-multipart session's `state` field (`"in_progress"`/`"completing"`/`"completed"`/`"aborted"`) are stable string
-values, not integers to be renumbered — the spellings above are exhaustive today, but a future release **may add** a
-new value to either set as a backward-compatible, additive change (removing or repurposing an existing value would
-instead be breaking and would require a new API version). A client **MUST** treat any `bind_state`/`state` value it
-does not recognize as "not yet resolved, re-check" — re-`GET`/re-`complete` and read the fresh response — rather
-than as an error, the same posture already required for a recognized `"completing"`. The single-part `X-FS-Bound`
-header carries the same three-value bind-state model (spelled `true`/`conflict`, with no header at all standing in
-for `manual`) and is covered by the same stability contract.
+multipart session's `state` field (`"in_progress"`/`"completing"`/`"completed"`/`"aborted"`) are closed sets of
+string values, published as `enum`s in `api.json`: the spellings above are exhaustive, and adding, removing or
+repurposing a value within `/v1` is a breaking change that requires a new API version. The single-part
+`X-FS-Bound` header uses the very same three values as `bind_state` (`bound`/`conflict`/`manual`) — there is no
+second vocabulary and no header-less outcome. The create request's `bind` field is a closed enum too (`"auto"` or
+`"manual"`); any other value is rejected while the body is deserialized, with the toolkit's usual `422` for a body
+that does not match the schema.
 
 **One-part plans degenerate to `whole-sha256`** (ADR-0006 single-part amendment): when the plan had exactly one
 part, `hash_mode` is `"whole-sha256"`, `content_hash` is plain `sha256(object bytes)` (identical to the single
@@ -531,33 +473,13 @@ independently re-verify the composite hash (see [content-hash-modes.md](./featur
 later by `GET /files/{id}/versions` (the `manifest` field on `multipart-composite-sha256` versions — see
 "P1 — Control plane" above), so a client that discarded the `complete` response can still re-verify.
 
-**`P2-5` introspect response** (`application/json`, `200`):
-
-```json
-{
-  "upload_id": "uuid",
-  "version_id": "uuid",
-  "state": "in_progress",
-  "declared_mime": "video/mp4",
-  "declared_size": 10485763,
-  "part_size": 8388608,
-  "created_at": "RFC3339",
-  "expires_at": "RFC3339",
-  "received": [
-    { "part_number": 1, "size": 8388608, "uploaded_at": "RFC3339" }
-  ],
-  "missing": [
-    { "part_number": 2, "offset": 8388608, "size": 2097155, "upload_url": "https://sidecar/…?fs-token=…" }
-  ]
-}
-```
-
-`received` lists parts already reported (via the sidecar's report-part callback); `missing` lists the rest, with
-their `(offset, size)` recomputed from the session's persisted `declared_size`/`part_size` columns. `upload_url` on a
-`missing` entry is present only while the session is still `in_progress` and unexpired — its token `exp` is capped at
-the session's own `expires_at`, never a fresh full TTL, so a resumed upload cannot outlive the session it resumes. A
-terminal (`completed`/`aborted`) or expired session still returns `state` and the `received`/`missing` accounting,
-but every `missing` entry omits `upload_url`.
+**`P2-5` introspect.** The response reports the session `state`, the declared parameters, `received` parts (already
+reported via the sidecar's report-part callback) and `missing` parts, with their `(offset, size)` recomputed from the
+session's persisted `declared_size`/`part_size` columns. `upload_url` on a `missing` entry is present only while the
+session is still `in_progress` and unexpired — its token `exp` is capped at the session's own `expires_at`, never a
+fresh full TTL, so a resumed upload cannot outlive the session it resumes. A terminal (`completed`/`aborted`) or
+expired session still returns `state` and the `received`/`missing` accounting, but every `missing` entry omits
+`upload_url`.
 
 Full request/response envelopes, error taxonomy, token claims, persistence, and resumability are specified in the
 FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coordinator.md)**.
@@ -567,24 +489,16 @@ FEATURE artifact **[features/multipart-coordinator.md](./features/multipart-coor
 Per-tenant and per-user policies (allowed MIME types, size limits, metadata limits, enabled event types). The
 **effective** policy for a write is the most-restrictive combination across the applicable levels (tenant ⊕ user).
 
-```text
-GET  /policy?scope=<tenant|user>&scope_owner_id=<uuid>   fetch the stored policy for one scope
-PUT  /policy                                             upsert (create or replace) the policy for one scope
-GET  /policy/effective?user_owner_id=<uuid>              compute the effective (most-restrictive) policy
-```
-
 - `GET /policy`: `scope` is required (`"tenant"` or `"user"`); `scope_owner_id` is required when `scope="user"` —
   omitting it is rejected with `400`, not silently treated as tenant scope.
   Returns `204 No Content` (no body) when no policy is configured for that scope — this is a normal, non-error
   outcome, not a `404`.
-- `PUT /policy` request body: `{ "scope": "tenant"|"user", "scope_owner_id": "<uuid, omit for tenant>", "body": { "allowed_mime_types": [...], "size_limits": {...}, "metadata_limits": {...}, "enabled_event_types": [...] } }`.
-  Response: the stored `PolicyDto` (`200`).
+- `PUT /policy` upserts (creates or replaces) the policy for one scope and returns the stored policy (`200`).
 - `GET /policy/effective`: no scope is required to read the caller's own effective policy; `user_owner_id` includes
   a specific user level in the resolution, but it is not a free-form hint — passing any id other than the caller's
   own subject id additionally requires the caller's `ADMIN_POLICY` authorization scope (`403` otherwise), since it
-  would otherwise let any tenant member read another subject's user-level policy. Response fields are all
-  "effective" (most restrictive already resolved): `allowed_mime_types` (`null` = unrestricted), `max_bytes`,
-  `per_mime_max_bytes`, `metadata_limits`.
+  would otherwise let any tenant member read another subject's user-level policy. All response fields are
+  "effective" (most restrictive already resolved); `allowed_mime_types: null` means unrestricted.
 - `enabled_event_types` (inside the policy body) is stored and returned but does not currently gate anything: file
   events are enqueued into `events_outbox` unconditionally, independent of this field's configured value.
 - **There is no `DELETE /policy` route.** To relax a policy, `PUT` a replacement body (e.g. an empty/permissive one);
@@ -598,19 +512,14 @@ Tenant/user/file-scoped rules (age-based, inactivity-based, or custom-metadata-v
 cleanup job that deletes files matching an active rule's criteria. **Not enforced yet**: the gear runs no background
 worker, so rules can be stored but nothing deletes files (see `docs/operations.md`).
 
-```text
-GET    /retention-rules             list retention rules for the caller's tenant (cursor-paginated)
-POST   /retention-rules             create a retention rule
-DELETE /retention-rules/{rule_id}   delete a retention rule
-```
-
-- `POST /retention-rules` request body: `{ "scope": "tenant"|"user"|"file", "scope_target_id": "<uuid, omit for tenant>", "body": { "age": {"max_age_days": N}, "inactivity": {"inactivity_days": N}, "metadata": {"key": "...", "value": "..."} } }`
-  (`age`/`inactivity`/`metadata` are each optional; a rule may combine more than one criterion). Response: the
-  created `RetentionRuleDto` (`201`). Semantic validation rejects with
-  `400`: a body with **all three** of `age`/`inactivity`/`metadata` absent (a rule that could never match any file);
-  `age.max_age_days` or `inactivity.inactivity_days` **less than 1** (either would match every file in the tenant on
-  the first cleanup run, once one exists); and `scope` ∈ `{user, file}` with `scope_target_id` omitted.
-- `GET /retention-rules` (no scope filter query param; `?limit`/`?cursor` — see
+- `POST /retention-rules` (`201`): `age`/`inactivity`/`metadata` criteria are each optional; a rule may combine more
+  than one. Semantic validation rejects with `400`: a body with **all three** absent (a rule that could never match
+  any file); `age.max_age_days` or `inactivity.inactivity_days` **less than 1** (either would match every file in the
+  tenant on the first cleanup run, once one exists); and `scope` ∈ `{user, file}` with `scope_target_id` omitted.
+- `POST /retention-rules` with `scope="tenant"` requires the caller's `ADMIN_POLICY` authorization scope, with no
+  fallback to `WRITE` — a tenant-scope rule is a standing instruction for the (future) cleanup job to permanently
+  delete every matching file for every subject in the tenant, so ordinary file-`WRITE` is not enough.
+- `GET /retention-rules` (no scope filter; paginated — see
   [Cursor pagination](#cursor-pagination)) returns every rule in the caller's tenant, across every scope, only when
   the caller holds `ADMIN_POLICY`. A non-admin caller instead gets a filtered view: all `tenant`-scope rules,
   `user`-scope rules that target themselves, and `file`-scope rules whose target file they own (compared as the
@@ -622,38 +531,25 @@ DELETE /retention-rules/{rule_id}   delete a retention rule
   longer outlive the file and go invisible that way. One remaining caveat on the `file`-scope case: a rule created
   via delegated `WRITE` on a file the creator does not own stays invisible to that creator, since visibility is
   gated on file *ownership*, not on having created the rule.
-- `POST /retention-rules` with `scope="tenant"` requires the caller's `ADMIN_POLICY` authorization scope, with no
-  fallback to `WRITE` — a tenant-scope rule is a standing instruction for the (future) cleanup job to permanently
-  delete every matching file for every subject in the tenant, so ordinary file-`WRITE` is not enough.
 - `DELETE /retention-rules/{rule_id}` → `204`, or `404` if the rule does not exist.
 
 ## P2 — Backend migration
 
-```text
-POST /files/{id}/migrate   { "target_backend_id": "<string>" }   → 204
-```
-
-Migrates a file's content to a different configured storage backend, preserving the file's identity (`file_id`
-unchanged). **Non-versioned files only** — a file with more than one `file_versions` row is rejected
-(`VersionedFileMigrationNotSupported`, `409`). The version must already be `available` (`409` otherwise). A per-version
-migration lease is acquired first — a second migration attempt of the same version while one is already in progress
-gets `409 Conflict` immediately, before any backend is touched. The content then streams straight from the source
-backend into the destination, with its hash re-verified incrementally on the same pass; the verdict is only known
-once the destination has received the whole stream, and the version's backend pointer is only ever repointed (CAS,
-also gated on the lease) once that verification has passed. The whole attempt runs under a `migrate_timeout_secs`
-time budget; exceeding it fails with a retryable `503` + `Retry-After` — see
-[backend-migration.md](./features/backend-migration.md) for the full failure/cleanup contract. Migrating
+`POST /files/{id}/migrate` (`204`) migrates a file's content to a different configured storage backend, preserving
+the file's identity (`file_id` unchanged). **Non-versioned files only** — a file with more than one `file_versions` row is rejected
+(`VersionedFileMigrationNotSupported`, `409`). The version must already be `available` (`409` otherwise). The content
+is read from the source backend in full and its hash re-verified before anything is written to the destination (a
+mismatch is `400`, with no destination write); the version's backend pointer is then repointed (CAS) only after the
+destination write succeeded. A concurrent migration of the same version loses the CAS and gets `409`. A
+transient backend failure (`BackendUnavailable`) surfaces as `503` + `Retry-After`; see
+[backend-migration.md](./features/backend-migration.md) for the failure/cleanup contract. Migrating
 onto a non-durable backend (e.g. a dev/test `memory` backend) additionally requires the caller's `ADMIN_POLICY`
 authorization scope, not just `WRITE`, since it risks silent data loss on the next restart.
 
 ## P2 — Ownership transfer
 
-```text
-POST /files/{id}/transfer   { "new_owner_kind": "user"|"app", "new_owner_id": "<uuid>" }   → 200, FileDto
-```
-
-Atomically replaces the file's `owner_kind` + `owner_id`, records an audit row (`TransferOwnership`), and enqueues a
-`file.owner_transferred` event in the same transaction. Authorized on the file's ordinary `WRITE` grant, not
+`POST /files/{id}/transfer` (`200`) atomically replaces the file's `owner_kind` + `owner_id`, records an audit row (`TransferOwnership`), and
+enqueues a `file.owner_transferred` event in the same transaction. Authorized on the file's ordinary `WRITE` grant, not
 `ADMIN_POLICY` — this gear has no principal directory, so it cannot verify `new_owner_id` names a real, same-tenant
 principal, only that it is not the nil UUID (`400` otherwise); a cross-tenant transfer is structurally impossible,
 since the updated row's `tenant_id` always comes from the existing file, never the request. If the file is deleted
@@ -664,8 +560,8 @@ is `404` — identical to transferring a `file_id` that never existed.
 
 Content is an immutable blob per version; a file's live content is the `content_id` pointer, swapped under optimistic
 CAS. This section spells out the **`bind: "manual"`** flow (and `POST /files/{id}/versions`, which never auto-binds):
-presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control) — three control-plane touches and
-one data-plane touch, the last control touch an explicit, separate client call. **`bind: "auto"` (the default for
+presign (control) → `PUT` (data) → finalize (data-plane callback) → bind (control), the last step an explicit,
+separate client call. **`bind: "auto"` (the default for
 `POST /files`) skips step 4**: finalize itself swaps `content_id` inline, under the same CAS, and reports the
 outcome via the `X-FS-Bound` header (single-part) / `complete`'s `bind_state` field (multipart) instead of requiring
 a separate `bind` call — see "Single-part bind outcome headers" and "Bind inside complete" above (§P1 control plane
@@ -959,8 +855,7 @@ access or carry substantially more per-request state in the token than it does t
   - `bind`: the target `version_id`'s upload has not been finalized yet.
   - `delete_version` (`DELETE /files/{id}/versions/{version_id}`): attempting to delete the file's current version
     (bind another version first).
-  - `migrate` (`POST /files/{id}/migrate`): the version is not yet finalized, another migration attempt of the same
-    version already holds its migration lease, a destination path already claimed by a concurrently-committed
+  - `migrate` (`POST /files/{id}/migrate`): the version is not yet finalized, a destination path already claimed by a concurrently-committed
     migration, or a concurrent migration to a different target already won the CAS race.
   - multipart `complete`/`abort`: the session is not `in_progress` (e.g. completing an already-aborted upload), one
     or more planned parts have not been reported yet (`MultipartPartsMissing`; the error detail lists the missing
@@ -981,11 +876,15 @@ access or carry substantially more per-request state in the token than it does t
     version's upload has not been finalized. This route's OpenAPI registration in `routes.rs` declares only
     `401`/`403`/`404`/`500`, so this `409` is not represented in the generated OpenAPI schema even though the domain
     code returns it.
-  - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob (a
-    genuine token replay after the version was already finalized, as opposed to a benign retry of the same in-flight
-    upload) gets `409 Conflict` from the sidecar itself — `publish_exclusive`'s create-exclusive write refuses to
-    overwrite the existing object, and the live bytes are never touched. A benign retry (the earlier publish landed
-    but finalize had not yet run) instead converges to `200` once finalize succeeds on this attempt.
+  - **sidecar `PUT` (replay)**: a `PUT` to an `upload_url` whose `backend_path` already holds a published blob —
+    `publish_exclusive`'s create-exclusive write refuses to overwrite it, so the live bytes are never touched. The
+    sidecar then reads the stored object back and hashes it: if the stored bytes differ from this attempt's bytes it
+    answers `409 Conflict` without calling finalize — this `PUT` took no effect, and a still-`pending` version is never
+    finalized with a digest of bytes that were not stored. Otherwise it calls finalize with this attempt's size/hash.
+    If finalize succeeds (a benign retry of an upload whose finalize never landed, or whose response was lost) the
+    `PUT` converges to `200` with the original bind headers; a control-plane `4xx` is also `409`. With no control
+    plane configured a replay is `409` (nothing can confirm it matches the stored object). A failed read-back is
+    `500`; a transport failure or a control-plane `5xx` is `502`, as for a first upload.
 
   Note: `update_metadata` (`PATCH /files/{id}`) declares a `409` response in its OpenAPI registration
   (`routes.rs`), but no domain code path returns `DomainError::Conflict` for this handler — its only failure mode
@@ -1004,8 +903,7 @@ access or carry substantially more per-request state in the token than it does t
     with the length already resolved by the caller's earlier `stat`/`HeadObject` — a transient read race, not a
     fault (see "P1 — Sidecar" above). Carries `Retry-After: 1`; the recovery is a plain retry.
   - any storage-backend call (control plane or sidecar) failing with a **transient** backend fault — network,
-    timeout, backend overload/5xx, the losing side of a concurrent object change, or `POST /files/{id}/migrate`
-    exceeding its own `migrate_timeout_secs` budget (`DomainError::BackendUnavailable`,
+    timeout, backend overload/5xx, or the losing side of a concurrent object change (`DomainError::BackendUnavailable`,
     per `docs/arch/errors/categories/14-service-unavailable.md`). Carries `retry_after_seconds` in the response body
     and a matching `Retry-After: 5` header; the recovery is a plain retry once that window has elapsed. Distinct
     from `502` (control-plane callback failure) and `500` (a **permanent** backend fault — bad config, a protocol
@@ -1018,12 +916,14 @@ access or carry substantially more per-request state in the token than it does t
   `check_quota_bytes` are a permissive no-op and this `429` cause cannot currently occur. See
   [operations.md](./operations.md#storage-quota-not-enforced).
 - `502 Bad Gateway` — the sidecar's own response to the client when its finalize or report-part callback to the
-  control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx). This
+  control plane fails (transport error after retries, or the control plane rejects the callback with a 4xx/5xx; on a
+  replayed `PUT` a control-plane `4xx` is reported as `409` instead). This
   is a **retry signal**: the callback failure does not mean the bytes failed to land — see "Data-plane callbacks"
   above (`FS_SIDECAR_FINALIZE_TIMEOUT_SECS`/`FS_SIDECAR_FINALIZE_CONNECT_TIMEOUT_SECS`) for the retry/timeout
   configuration and the decision between `200`, `409`, and `502` on a replayed `PUT`.
 
-`422 Unprocessable Entity`, `415 Unsupported Media Type`, and `507 Insufficient Storage` are not used anywhere in this
-gear: an `expected_hash` mismatch and an invalid GTS file type both map to `400`; a magic-bytes MIME mismatch
+`415 Unsupported Media Type` and `507 Insufficient Storage` are not used anywhere in this gear, and `422` only
+comes from the toolkit's body extractor (a body that does not match the schema: unknown field, unknown enum value such
+as `bind: "bogus"`) — the gear's own errors never use it: an `expected_hash` mismatch and an invalid GTS file type both map to `400`; a magic-bytes MIME mismatch
 (`DomainError::MimeMismatch`) also maps to `400` (`invalid_argument`); and the storage-quota-exceeded case maps to
 `429`, not `507`.

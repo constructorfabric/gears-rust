@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::marker::PhantomData;
 use std::sync::Arc;
 
@@ -5,12 +6,9 @@ use tokio::sync::Mutex;
 use toolkit_security::SecurityContext;
 
 use crate::api::EventBrokerApi;
-#[cfg(feature = "outbox")]
-use crate::api::ProducerMode;
 use crate::error::EventBrokerError;
-use crate::ids::ProducerId;
 #[cfg(feature = "outbox")]
-use crate::models::ProducerMeta;
+use crate::ids::ProducerId;
 use crate::models::ResetScope;
 use crate::sdk::EventBrokerSdk;
 use crate::typed_event::TypedEvent;
@@ -20,12 +18,11 @@ use super::direct::{Has, Missing};
 use super::event_factory::prepare_event;
 #[cfg(feature = "outbox")]
 use super::outbox::{ProducerOutboxEnvelope, ProducerOutboxQueue};
-use super::registration::{ProducerRegistration, ProducerRegistrationStore};
+#[cfg(feature = "outbox")]
+use super::registration::NewRegistration;
+use super::registration::{ProducerRegistration, ProducerRegistrationStore, RegistrationSlot};
 use super::schema_cache::ProducerSchemaCache;
-use super::types::{
-    DbDeduplication, MissingProducerRegistration, ProducerIdentity, UnknownProducerRegistration,
-    ValidationTiming,
-};
+use super::types::{DbDeduplication, ProducerIdentity, ValidationTiming};
 
 type DbProducerBuilderState<Broker, Db, Ctx, Identity, Dedup, Topics, Patterns> =
     PhantomData<(Broker, Db, Ctx, Identity, Dedup, Topics, Patterns)>;
@@ -47,7 +44,6 @@ pub struct DbProducerBuilder<
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
     validation_timing: ValidationTiming,
-    broker_partitions: u32,
     _state: DbProducerBuilderState<Broker, Db, Ctx, Identity, Dedup, Topics, Patterns>,
 }
 
@@ -63,7 +59,6 @@ impl DbProducerBuilder {
             topics: Vec::new(),
             event_type_patterns: Vec::new(),
             validation_timing: ValidationTiming::Eager,
-            broker_partitions: super::schema_cache::DEFAULT_BROKER_PARTITIONS,
             _state: PhantomData,
         }
     }
@@ -84,7 +79,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -100,7 +94,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -119,7 +112,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -135,7 +127,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -154,7 +145,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -174,7 +164,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: topics.into_iter().map(Into::into).collect(),
             event_type_patterns: self.event_type_patterns,
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -197,7 +186,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
             topics: self.topics,
             event_type_patterns: patterns.into_iter().map(Into::into).collect(),
             validation_timing: self.validation_timing,
-            broker_partitions: self.broker_partitions,
             _state: PhantomData,
         }
     }
@@ -205,17 +193,6 @@ impl<B, Db, C, I, D, T, P> DbProducerBuilder<B, Db, C, I, D, T, P> {
     #[must_use]
     pub fn lazy_validation(mut self) -> Self {
         self.validation_timing = ValidationTiming::Lazy;
-        self
-    }
-
-    /// Partition count the producer assumes the broker gives every topic it
-    /// publishes to. It feeds the partition a producer-state chain is keyed by and
-    /// the partition hint an outbox envelope carries. A topic does not report a
-    /// count, so a producer whose broker is configured away from the default must
-    /// declare it here.
-    #[must_use]
-    pub fn broker_partitions(mut self, partitions: u32) -> Self {
-        self.broker_partitions = partitions;
         self
     }
 }
@@ -245,42 +222,34 @@ impl DbProducerBuilder<Has, Has, Has, Has, Has, Has, Has> {
             });
         }
 
-        let cache = Arc::new(ProducerSchemaCache::new(self.broker_partitions));
+        let cache = Arc::new(ProducerSchemaCache::new());
         if prepare_all {
             cache
                 .prepare_all(&broker, &ctx, &self.topics, &self.event_type_patterns)
                 .await?;
         }
 
+        let client_agent = identity.client_agent_ref().map_or_else(
+            || EventBrokerSdk::default_client_agent().to_owned(),
+            str::to_owned,
+        );
         let registration_store = ProducerRegistrationStore::new(db.clone());
-        let registration = match &deduplication {
-            DbDeduplication::Stateless => None,
-            DbDeduplication::Managed(managed) => {
-                let client_agent = identity.client_agent_ref().map_or_else(
-                    || EventBrokerSdk::default_client_agent().to_owned(),
-                    str::to_owned,
-                );
-                Some(
-                    resolve_managed_registration(
-                        &broker,
-                        &ctx,
-                        &registration_store,
-                        managed,
-                        &client_agent,
-                    )
-                    .await?,
-                )
+        // Partition ids are registered as their partitions first drain; what
+        // is already stored has to agree with this configuration, since a
+        // producer id's mode never changes (ADR-0004).
+        if let DbDeduplication::Managed(managed) = &deduplication {
+            for registration in registration_store.load_all(&managed.key).await? {
+                registration.validate_matches(managed, &client_agent)?;
             }
-        };
+        }
 
         Ok(DbProducer {
             broker,
             ctx,
             identity,
             deduplication,
-            registration_state: Arc::new(Mutex::new(RegistrationState::from_registration(
-                registration,
-            ))),
+            client_agent,
+            registrations: Arc::new(Mutex::new(HashMap::new())),
             registration_store,
             topics: self.topics,
             event_type_patterns: self.event_type_patterns,
@@ -303,8 +272,13 @@ pub struct DbProducer {
     pub(crate) identity: ProducerIdentity,
     /// Deduplication setting the producer registers with.
     pub(crate) deduplication: DbDeduplication,
-    /// Cached producer registration, shared across clones.
-    pub(crate) registration_state: Arc<Mutex<RegistrationState>>,
+    // Sent when a partition's id is registered on its first drain, which only
+    // the outbox does.
+    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
+    client_agent: String,
+    /// The producer id of each outbox partition drained so far, by slot.
+    #[cfg_attr(not(feature = "outbox"), allow(dead_code))]
+    registrations: Arc<Mutex<HashMap<RegistrationSlot, ProducerRegistration>>>,
     registration_store: ProducerRegistrationStore,
     topics: Vec<String>,
     event_type_patterns: Vec<String>,
@@ -353,74 +327,149 @@ impl DbProducer {
         ProducerOutboxQueue::new(self.clone(), queue.into(), partitions)
     }
 
+    /// Resets the broker chain of every stored partition id, each keeping its
+    /// id.
     pub async fn reset_chain(&self, scope: ResetScope<'_>) -> Result<(), EventBrokerError> {
-        let producer_id = self
-            .registration_state
-            .lock()
-            .await
-            .producer_id
-            .ok_or_else(|| {
-                EventBrokerError::Internal("reset_chain called on a stateless producer".to_owned())
-            })?;
-        self.broker
-            .reset_producer_chain(&self.ctx, producer_id, scope)
-            .await
+        for registration in self.stored_registrations("reset_chain").await? {
+            self.broker
+                .reset_producer_chain(&self.ctx, registration.producer_id, scope)
+                .await?;
+        }
+        Ok(())
     }
 
-    pub async fn rotate_registration(&mut self) -> Result<ProducerId, EventBrokerError> {
-        let current = {
-            let state = self.registration_state.lock().await;
-            let Some(current) = state.registration.as_ref() else {
-                return Err(EventBrokerError::Internal(
-                    "rotate_registration called on a stateless producer".to_owned(),
-                ));
-            };
-            current.clone()
+    /// Replaces every stored partition id with a newly registered one, under
+    /// the next generation. Messages drained afterwards, including ones
+    /// enqueued before, publish under the new ids.
+    pub async fn rotate_registration(&self) -> Result<(), EventBrokerError> {
+        for registration in self.stored_registrations("rotate_registration").await? {
+            self.replace(&registration).await?;
+        }
+        Ok(())
+    }
+
+    /// Every stored partition registration of this producer's key, as
+    /// `(queue, partition, producer id, generation)`, ordered by queue and
+    /// partition.
+    #[cfg(feature = "outbox")]
+    pub(crate) async fn stored_partition_registrations(
+        &self,
+    ) -> Result<Vec<(String, i64, ProducerId, i64)>, EventBrokerError> {
+        let mut rows: Vec<_> = self
+            .stored_registrations("registrations")
+            .await?
+            .into_iter()
+            .map(|r| (r.slot.queue, r.slot.partition, r.producer_id, r.generation))
+            .collect();
+        rows.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        Ok(rows)
+    }
+
+    async fn stored_registrations(
+        &self,
+        operation: &str,
+    ) -> Result<Vec<ProducerRegistration>, EventBrokerError> {
+        let DbDeduplication::Managed(managed) = &self.deduplication else {
+            return Err(EventBrokerError::Internal(format!(
+                "{operation} called on a stateless producer"
+            )));
         };
-        let client_agent = current.client_agent.clone();
-        let producer_id = self
-            .broker
-            .register_producer(&self.ctx, current.mode, &client_agent)
-            .await?;
-        let next = self
-            .registration_store
-            .replace_with_new_generation(&current, producer_id)
-            .await?;
-        self.registration_state.lock().await.set(next);
+        self.registration_store.load_all(&managed.key).await
+    }
+
+    /// The producer id messages of `partition` of `queue` publish under:
+    /// cached, else stored, else registered with the broker and stored.
+    ///
+    /// # Errors
+    /// [`EventBrokerError::Internal`] on a stateless producer; whatever the
+    /// broker or the registration store fail with.
+    #[cfg(feature = "outbox")]
+    pub(crate) async fn partition_producer(
+        &self,
+        queue: &str,
+        partition: i64,
+    ) -> Result<ProducerId, EventBrokerError> {
+        let DbDeduplication::Managed(managed) = &self.deduplication else {
+            return Err(EventBrokerError::Internal(
+                "a stateless producer has no producer id".to_owned(),
+            ));
+        };
+        let slot = RegistrationSlot {
+            key: managed.key.clone(),
+            queue: queue.to_owned(),
+            partition,
+        };
+        let mut registrations = self.registrations.lock().await;
+        if let Some(registration) = registrations.get(&slot) {
+            return Ok(registration.producer_id);
+        }
+        let registration = match self.registration_store.load(&slot).await? {
+            Some(registration) => registration,
+            None => {
+                let producer_id = self
+                    .broker
+                    .register_producer(&self.ctx, managed.mode, &self.client_agent)
+                    .await?;
+                self.registration_store
+                    .insert_new(NewRegistration {
+                        slot: &slot,
+                        producer_id,
+                        mode: managed.mode,
+                        client_agent: &self.client_agent,
+                    })
+                    .await?
+            }
+        };
+        let producer_id = registration.producer_id;
+        registrations.insert(slot, registration);
         Ok(producer_id)
     }
 
-    #[doc(hidden)]
-    pub async fn handle_unknown_producer(
+    /// Replaces `rejected`, the id of `partition` of `queue` the broker
+    /// answered as unknown, with a newly registered one. A no-op when the
+    /// partition already moved on to another id.
+    ///
+    /// # Errors
+    /// Whatever the broker or the registration store fail with.
+    #[cfg(feature = "outbox")]
+    pub(crate) async fn replace_unknown_producer(
         &self,
-        rejected_producer_id: ProducerId,
-    ) -> Result<UnknownProducerAction, EventBrokerError> {
+        queue: &str,
+        partition: i64,
+        rejected: ProducerId,
+    ) -> Result<(), EventBrokerError> {
         let DbDeduplication::Managed(managed) = &self.deduplication else {
-            return Ok(UnknownProducerAction::Fail);
+            return Ok(());
         };
-        if managed.on_unknown == UnknownProducerRegistration::Fail {
-            return Ok(UnknownProducerAction::Fail);
+        let slot = RegistrationSlot {
+            key: managed.key.clone(),
+            queue: queue.to_owned(),
+            partition,
+        };
+        let Some(current) = self.registration_store.load(&slot).await? else {
+            return Ok(());
+        };
+        if current.producer_id != rejected {
+            self.registrations.lock().await.insert(slot, current);
+            return Ok(());
         }
-        let current = {
-            let state = self.registration_state.lock().await;
-            let Some(current) = state.registration.as_ref() else {
-                return Ok(UnknownProducerAction::Fail);
-            };
-            if current.producer_id != rejected_producer_id {
-                return Ok(UnknownProducerAction::AlreadyRotated);
-            }
-            current.clone()
-        };
+        self.replace(&current).await
+    }
+
+    async fn replace(&self, current: &ProducerRegistration) -> Result<(), EventBrokerError> {
         let producer_id = self
             .broker
             .register_producer(&self.ctx, current.mode, &current.client_agent)
             .await?;
         let next = self
             .registration_store
-            .replace_with_new_generation(&current, producer_id)
+            .replace_with_new_generation(current, producer_id)
             .await?;
-        self.registration_state.lock().await.set(next);
-        Ok(UnknownProducerAction::Rotated)
+        self.registrations
+            .lock()
+            .await
+            .insert(next.slot.clone(), next);
+        Ok(())
     }
 
     #[doc(hidden)]
@@ -442,110 +491,24 @@ impl DbProducer {
                     .to_owned(),
             });
         }
-        let mode = self.deduplication.mode();
-        let state = self.registration_state.lock().await.clone();
-        let producer_id = state.producer_id;
-        let generation = state.generation;
-        let prepared = prepare_event(
-            &self.cache,
-            &self.identity,
-            &self.ctx,
-            event,
-            |_, partition| match (mode, producer_id) {
-                (ProducerMode::Stateless, _) => None,
-                (ProducerMode::Monotonic, Some(pid)) | (ProducerMode::Chained, Some(pid)) => {
-                    Some(ProducerMeta {
-                        version: 1,
-                        producer_id: Some(pid.0),
-                        previous: None,
-                        sequence: None,
-                        partition_hint: Some(partition),
-                    })
-                }
-                (_, None) => None,
-            },
-        )
-        .await?;
+        // Producer metadata is stamped when the message drains, under the id of
+        // the partition it drains from; nothing of it is known here.
+        let prepared =
+            prepare_event(&self.cache, &self.identity, &self.ctx, event, |_| None).await?;
         let outbox_partition = super::partitioning::producer_outbox_partition(
             &prepared.topic,
-            prepared.broker_partition,
+            &prepared.key,
             outbox_partitions,
         );
         let envelope = ProducerOutboxEnvelope::from_event(
             prepared.event,
             prepared.topic,
-            prepared.broker_partition,
-            mode,
-            producer_id,
-            generation,
+            self.deduplication.mode(),
             self.identity.client_agent_ref().map_or_else(
                 || EventBrokerSdk::default_client_agent().to_owned(),
                 str::to_owned,
             ),
         );
         Ok((outbox_partition, envelope))
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct RegistrationState {
-    pub(crate) producer_id: Option<ProducerId>,
-    pub(crate) generation: Option<i64>,
-    pub(crate) registration: Option<ProducerRegistration>,
-}
-
-impl RegistrationState {
-    fn from_registration(registration: Option<ProducerRegistration>) -> Self {
-        let producer_id = registration
-            .as_ref()
-            .map(|registration| registration.producer_id);
-        let generation = registration
-            .as_ref()
-            .map(|registration| registration.generation);
-        Self {
-            producer_id,
-            generation,
-            registration,
-        }
-    }
-
-    fn set(&mut self, registration: ProducerRegistration) {
-        self.producer_id = Some(registration.producer_id);
-        self.generation = Some(registration.generation);
-        self.registration = Some(registration);
-    }
-}
-
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnknownProducerAction {
-    Fail,
-    Rotated,
-    AlreadyRotated,
-}
-
-async fn resolve_managed_registration(
-    broker: &Arc<dyn EventBrokerApi>,
-    ctx: &SecurityContext,
-    store: &ProducerRegistrationStore,
-    managed: &super::types::ManagedDeduplication,
-    client_agent: &str,
-) -> Result<ProducerRegistration, EventBrokerError> {
-    match store.load(&managed.key).await? {
-        Some(registration) => {
-            registration.validate_matches(managed, client_agent)?;
-            Ok(registration)
-        }
-        None if managed.on_missing == MissingProducerRegistration::Fail => {
-            Err(EventBrokerError::InvalidProducerOptions {
-                detail: format!("managed producer registration '{}' is missing", managed.key),
-            })
-        }
-        None => {
-            let producer_id = broker
-                .register_producer(ctx, managed.mode, client_agent)
-                .await?;
-            store.insert_new(managed, producer_id, client_agent).await
-        }
     }
 }

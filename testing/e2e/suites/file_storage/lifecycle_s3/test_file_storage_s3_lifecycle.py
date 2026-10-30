@@ -65,6 +65,8 @@ def _create_file(client: httpx.Client, gts_file_type: str) -> dict:
         "name": f"s3-lifecycle-test-{uuid.uuid4()}.bin",
         "gts_file_type": gts_file_type,
         "mime_type": "application/octet-stream",
+        # Keep the explicit `POST /bind` flow; the default (`auto`) binds on upload.
+        "bind": "manual",
     }
     r = client.post(f"{API_BASE}/files", json=create_body)
     assert r.status_code == 201, f"POST /files failed: {r.status_code}\n{r.text}"

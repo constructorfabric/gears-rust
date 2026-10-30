@@ -822,7 +822,7 @@ credit-note poster: Billing decides and posts notes (T-D-50).
 
 #### Exact-fraction API of the shared money crate
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-upreq-bss-money-exact-api`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-upreq-bss-money-exact-api`
 
 The owner of `cf-gears-bss-money` (`gears/bss/libs/money`) **MUST** add to
 `bss_money::exact::ExactAmount`:
@@ -841,10 +841,12 @@ The owner of `cf-gears-bss-money` (`gears/bss/libs/money`) **MUST** add to
   `i128` for a correction or replay, compute a package block or take a 40-digit `Q`. Money ADR
   rule 2 means one crate, so Rating asks for the API instead of keeping a copy.
 - **Source**: `gears/bss/rating` — DESIGN §3.3 (shared money crate API); DECISIONS T-D-80.
-- **Status**: PARTIAL on `main` — `ceil` exists; `numer` / `denom`, `from_parts`, `floor`, the
-  60 + 28-digit constructor and canonical fraction text do not (constructors are still only
-  `from_decimal` and `from_coefficient`, `exact.rs:60, 67`; `Display` prints a fraction "for messages
-  only").
+- **Status**: CONFIRMED (closed by PR #5527) — `ExactAmount` has `numer()` / `denom()`,
+  `from_parts`, `floor` beside `ceil`, `parse_decimal` (at most 60 integer and 28 fractional
+  digits, the syntax of `bss_money::parse_decimal`) and `canonical_fraction` / `parse_fraction`
+  (strict: the parser accepts only the reduced form with a positive denominator, so one value has
+  one text and one digest); `BigInt` is re-exported as `bss_money::exact::BigInt`. `Display`
+  stays for messages only.
 - **Register aliases**: DECISIONS R-35, T-D-80.
 - **Acceptance signal**: the remaining additions are on `main`; Rating's generation vendors that
   release (ADR-0006).

@@ -197,11 +197,18 @@ members = [
     "gears/bss/libs/rest",
     "gears/bss/libs/money",
     "gears/system/event-broker/event-broker-sdk",
+    "gears/system/event-broker/plugins/memory-event-broker-plugin",
+    "gears/system/event-broker/plugins/event-broker-backend-conformance",
+    "gears/system/event-broker/plugins/event-broker-backend-bench",
+    "gears/system/event-broker/plugins/postgres-event-broker-plugin",
+    "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
+    "gears/system/event-broker/plugins/mysql-event-broker-plugin",
+    "gears/system/event-broker/plugins/kafka-event-broker-plugin",
     "gears/system/event-broker/event-broker",
     "gears/system/license-resolver/license-resolver-sdk",
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
-    "gears/system/event-broker/plugins/sqlite-event-broker-plugin",
+    "gears/system/license-enforcement/license-enforcement-sdk",
     "gears/system/admission-control/admission-control-sdk",
     "gears/system/admission-control/admission-control",
     "gears/system/policy-engine/policy-engine-sdk",
@@ -339,24 +346,24 @@ verbose_file_reads = "deny"
 
 [workspace.dependencies]
 cel-core = "=0.5.1"
-quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
+quota-enforcement-engine-cel = { package = "cf-gears-quota-enforcement-engine-cel", version = "0.1.1", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-cel" }
 apalis = { version = "=1.0.0-rc.10", default-features = false, features = ["tracing", "limit"] }
 apalis-core = "=1.0.0-rc.10"
 # Keep SQLx runtime/TLS settings in the workspace. The adapter's default
 # tokio-comp feature enables rustls/ring alongside our aws-lc-rs provider.
 apalis-postgres = { version = "=1.0.0-rc.9", default-features = false, features = ["migrate"] }
 # libs
-toolkit = { package = "cf-gears-toolkit", version = "0.11.0", path = "libs/toolkit" }
-toolkit-http = { package = "cf-gears-toolkit-http", version = "0.7.0", path = "libs/toolkit-http" }
-toolkit-http-proxy = { package = "cf-gears-toolkit-http-proxy", version = "0.1.0", path = "libs/toolkit-http-proxy" }
+toolkit = { package = "cf-gears-toolkit", version = "0.11.1", path = "libs/toolkit" }
+toolkit-http = { package = "cf-gears-toolkit-http", version = "0.7.1", path = "libs/toolkit-http" }
+toolkit-http-proxy = { package = "cf-gears-toolkit-http-proxy", version = "0.1.1", path = "libs/toolkit-http-proxy" }
 toolkit-trace-context = { package = "cf-gears-toolkit-trace-context", version = "0.2.0", path = "libs/toolkit-trace-context" }
 toolkit-http-middleware = { package = "cf-gears-toolkit-http-middleware", version = "0.3.3", path = "libs/toolkit-http-middleware" }
-toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.9", path = "libs/toolkit-gateway" }
+toolkit-gateway = { package = "cf-gears-toolkit-gateway", version = "0.2.10", path = "libs/toolkit-gateway" }
 toolkit-k8s-auth = { package = "cf-gears-toolkit-k8s-auth", version = "0.3.1", path = "libs/toolkit-k8s-auth" }
-toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.8.1", path = "libs/toolkit-auth" }
+toolkit-auth = { package = "cf-gears-toolkit-auth", version = "0.8.2", path = "libs/toolkit-auth" }
 toolkit-canonical-errors = { package = "cf-gears-toolkit-canonical-errors", version = "0.10.0", path = "libs/toolkit-canonical-errors" }
 toolkit-canonical-errors-macro = { package = "cf-gears-toolkit-canonical-errors-macro", version = "0.6.5", path = "libs/toolkit-canonical-errors-macro" }
-toolkit-db = { package = "cf-gears-toolkit-db", version = "0.17.0", path = "libs/toolkit-db" }
+toolkit-db = { package = "cf-gears-toolkit-db", version = "0.17.1", path = "libs/toolkit-db" }
 toolkit-db-macros = { package = "cf-gears-toolkit-db-macros", version = "0.7.0", path = "libs/toolkit-db-macros" }
 toolkit-gts = { package = "cf-gears-toolkit-gts", version = "0.1.7", path = "libs/toolkit-gts" }
 # SQL/PGQ AST + renderer (docs/arch/secure-orm/ADR/0002). Security-agnostic:
@@ -373,7 +380,6 @@ toolkit-security = { package = "cf-gears-toolkit-security", version = "0.12.0", 
 toolkit-stable-hash = { package = "cf-gears-toolkit-stable-hash", version = "0.2.0", path = "libs/toolkit-stable-hash" }
 toolkit-transport-grpc = { package = "cf-gears-toolkit-transport-grpc", version = "0.9.1", path = "libs/toolkit-transport-grpc" }
 toolkit-taskward = { package = "cf-gears-toolkit-taskward", version = "0.1.1", path = "libs/toolkit-taskward" }
-toolkit-durable-execution = { package = "cf-gears-toolkit-durable-execution", version = "0.1.0", path = "libs/toolkit-durable-execution" }
 toolkit-utils = { package = "cf-gears-toolkit-utils", version = "0.7.3", path = "libs/toolkit-utils" }
 toolkit-onnx-runtime = { package = "cf-gears-toolkit-onnx-runtime", version = "0.2.0", path = "libs/ai/toolkit-onnx-runtime" }
 rustls-corecrypto-provider = { package = "cf-gears-rustls-corecrypto-provider", version = "0.1.4", path = "libs/rustls-corecrypto-provider" }
@@ -392,50 +398,53 @@ rustls-cng-crypto = { version = "0.1", default-features = false, features = ["fi
 pkcs8 = "0.11"
 sec1 = { version = "0.8", default-features = false, features = ["alloc", "der"] }
 
-toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.4.1", path = "libs/toolkit-contract" }
+toolkit-contract = { package = "cf-gears-toolkit-contract", version = "0.4.2", path = "libs/toolkit-contract" }
 toolkit-contract-macros = { package = "cf-gears-toolkit-contract-macros", version = "0.2.0", path = "libs/toolkit-contract-macros" }
-toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", version = "0.1.10", path = "libs/toolkit-contract-protogen" }
+toolkit-contract-protogen = { package = "cf-gears-toolkit-contract-protogen", version = "0.1.11", path = "libs/toolkit-contract-protogen" }
 
 cf-gears-system-sdks = { version = "0.1.50", path = "libs/system-sdks" }
 cf-gears-system-sdk-directory = { version = "0.3.0", path = "libs/system-sdks/sdks/directory" }
 
 # System gears
-types-registry = { package = "cf-gears-types-registry", version = "0.5.0", path = "gears/system/types-registry/types-registry" }
-authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.38", path = "gears/system/authn-resolver/authn-resolver" }
-authz-resolver = { package = "cf-gears-authz-resolver", version = "0.3.0", path = "gears/system/authz-resolver/authz-resolver" }
-tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.42", path = "gears/system/tenant-resolver/tenant-resolver" }
-resource-group = { package = "cf-gears-resource-group", version = "0.4.6", path = "gears/system/resource-group/resource-group" }
-credstore = { package = "cf-gears-credstore", version = "0.6.0", path = "gears/credstore/credstore" }
-oagw = { package = "cf-gears-oagw", version = "0.6.0", path = "gears/system/oagw/oagw" }
-account-management = { package = "cf-gears-account-management", version = "0.11.0", path = "gears/system/account-management/account-management" }
-usage-collector = { package = "cf-gears-usage-collector", version = "0.5.0", path = "gears/system/usage-collector/usage-collector" }
-quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.1.0", path = "gears/system/quota-enforcement/quota-enforcement" }
-quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
-cluster = { package = "cf-gears-cluster", version = "0.3.0", path = "gears/system/cluster/cluster" }
-api-gateway = { package = "cf-gears-api-gateway", version = "0.6.0", path = "gears/system/api-gateway" }
+types-registry = { package = "cf-gears-types-registry", version = "0.5.1", path = "gears/system/types-registry/types-registry" }
+authn-resolver = { package = "cf-gears-authn-resolver", version = "0.2.39", path = "gears/system/authn-resolver/authn-resolver" }
+authz-resolver = { package = "cf-gears-authz-resolver", version = "0.3.1", path = "gears/system/authz-resolver/authz-resolver" }
+tenant-resolver = { package = "cf-gears-tenant-resolver", version = "0.1.43", path = "gears/system/tenant-resolver/tenant-resolver" }
+resource-group = { package = "cf-gears-resource-group", version = "0.4.7", path = "gears/system/resource-group/resource-group" }
+credstore = { package = "cf-gears-credstore", version = "0.6.1", path = "gears/credstore/credstore" }
+oagw = { package = "cf-gears-oagw", version = "0.6.1", path = "gears/system/oagw/oagw" }
+account-management = { package = "cf-gears-account-management", version = "0.11.1", path = "gears/system/account-management/account-management" }
+usage-collector = { package = "cf-gears-usage-collector", version = "0.5.1", path = "gears/system/usage-collector/usage-collector" }
+quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.2.0", path = "gears/system/quota-enforcement/quota-enforcement" }
+quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.2.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
+cluster = { package = "cf-gears-cluster", version = "0.3.1", path = "gears/system/cluster/cluster" }
+api-gateway = { package = "cf-gears-api-gateway", version = "0.6.1", path = "gears/system/api-gateway" }
 # Concrete plugins needed to link a standalone-mode binary.
-static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.19", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
-firebase-authn-plugin = { package = "cf-gears-firebase-authn-plugin", version = "0.1.0", path = "gears/system/authn-resolver/plugins/firebase-authn-plugin" }
-static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.39", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
-standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.9", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
+static-authn-plugin = { package = "cf-gears-static-authn-plugin", version = "0.3.20", path = "gears/system/authn-resolver/plugins/static-authn-plugin" }
+static-authz-plugin = { package = "cf-gears-static-authz-plugin", version = "0.1.40", path = "gears/system/authz-resolver/plugins/static-authz-plugin" }
+standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", version = "0.2.10", path = "gears/system/cluster/plugins/standalone-cluster-plugin" }
 
-cf-gears-cluster-sdk = { version = "0.3.0", path = "gears/system/cluster/cluster-sdk" }
-cf-gears-cluster-conformance = { version = "0.3.9", path = "gears/system/cluster/cluster-conformance" }
+cf-gears-cluster-sdk = { version = "0.3.1", path = "gears/system/cluster/cluster-sdk" }
+cf-gears-cluster-conformance = { version = "0.3.10", path = "gears/system/cluster/cluster-conformance" }
 
 # System gears SDKs
-account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.8.0", path = "gears/system/account-management/account-management-sdk" }
-cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.3.0", path = "gears/system/cluster/cluster-sdk" }
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "gears/system/types-registry/types-registry-sdk" }
-tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.6", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
-authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.0", path = "gears/system/authz-resolver/authz-resolver-sdk" }
+account-management-sdk = { package = "cf-gears-account-management-sdk", version = "0.8.1", path = "gears/system/account-management/account-management-sdk" }
+cluster-sdk = { package = "cf-gears-cluster-sdk", version = "0.3.1", path = "gears/system/cluster/cluster-sdk" }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.1", path = "gears/system/types-registry/types-registry-sdk" }
+tenant-resolver-sdk = { package = "cf-gears-tenant-resolver-sdk", version = "0.4.7", path = "gears/system/tenant-resolver/tenant-resolver-sdk" }
+authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.1", path = "gears/system/authz-resolver/authz-resolver-sdk" }
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.6", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.16", path = "gears/system/oagw/oagw-sdk" }
-usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.15", path = "gears/system/usage-collector/usage-collector-sdk" }
-quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
-quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.2.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
-event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.3.0", path = "gears/system/event-broker/event-broker-sdk" }
+usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.16", path = "gears/system/usage-collector/usage-collector-sdk" }
+quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.1", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
+quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.3.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
+event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.3.1", path = "gears/system/event-broker/event-broker-sdk" }
 event-broker = { package = "cf-gears-event-broker", path = "gears/system/event-broker/event-broker" }
-sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
+memory-event-broker-plugin = { package = "cf-gears-memory-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/memory-event-broker-plugin" }
+postgres-event-broker-plugin = { package = "cf-gears-postgres-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/postgres-event-broker-plugin" }
+sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", version = "0.1.1", path = "gears/system/event-broker/plugins/sqlite-event-broker-plugin" }
+mysql-event-broker-plugin = { package = "cf-gears-mysql-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/mysql-event-broker-plugin" }
+kafka-event-broker-plugin = { package = "cf-gears-kafka-event-broker-plugin", version = "0.1.0", path = "gears/system/event-broker/plugins/kafka-event-broker-plugin" }
 
 # BSS gears (ported from vhp-core)
 bss-ledger-sdk = { package = "cf-gears-bss-ledger-sdk", version = "0.2.0", path = "gears/bss/ledger/ledger-sdk" }
@@ -463,12 +472,7 @@ bss-orders-sdk = { package = "cf-gears-bss-orders-sdk", path = "gears/bss/orders
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }
 bss-approvals = { package = "cf-gears-bss-approvals", path = "gears/bss/approvals/approvals" }
-# NFKC for the products registry's `normalized(name)`, the operand of its
-# uniqueness index. Already in the tree transitively; taken as a direct
-# dependency because the normalization must be identical on both engines and
-# std offers neither NFKC nor full casefold.
-unicode-normalization = "0.1"
-bss-rate-provider-sdk = { package = "cf-gears-bss-rate-provider-sdk", version = "0.2.0", path = "gears/bss/rate-provider/rate-provider-sdk" }
+bss-rate-provider-sdk = { package = "cf-gears-bss-rate-provider-sdk", version = "0.2.1", path = "gears/bss/rate-provider/rate-provider-sdk" }
 coord = { package = "cf-gears-bss-coord", path = "gears/bss/libs/coord" }
 bss-approval = { package = "cf-gears-bss-approval", path = "gears/bss/libs/approval" }
 # Weak ETag and If-None-Match for the BSS list and reference reads.
@@ -480,25 +484,25 @@ aws-lc-rs = "1.17"
 
 # settings-service
 settings-service-sdk = { package = "cf-gears-settings-service-sdk", version = "0.2.0", path = "gears/settings-service/settings-service-sdk" }
-settings-service = { package = "cf-gears-settings-service", version = "0.1.7", path = "gears/settings-service/settings-service" }
+settings-service = { package = "cf-gears-settings-service", version = "0.1.8", path = "gears/settings-service/settings-service" }
 
 # credstore
-credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.18", path = "gears/credstore/credstore-sdk" }
+credstore-sdk = { package = "cf-gears-credstore-sdk", version = "0.2.19", path = "gears/credstore/credstore-sdk" }
 
 # graph-storage
-graph-storage = { package = "cf-gears-graph-storage", version = "0.2.0", path = "gears/graph-storage/graph-storage" }
+graph-storage = { package = "cf-gears-graph-storage", version = "0.2.1", path = "gears/graph-storage/graph-storage" }
 graph-storage-sdk = { package = "cf-gears-graph-storage-sdk", version = "0.2.0", path = "gears/graph-storage/graph-storage-sdk" }
 onnx-embedding-plugin = { package = "cf-gears-graph-storage-onnx-embedding-plugin", version = "0.1.1", path = "gears/graph-storage/onnx-embedding-plugin" }
 remote-embedding-plugin = { package = "cf-gears-graph-storage-remote-embedding-plugin", version = "0.1.1", path = "gears/graph-storage/remote-embedding-plugin" }
 
 # mini-chat
-mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.27", path = "gears/mini-chat/mini-chat-sdk" }
+mini-chat-sdk = { package = "cf-gears-mini-chat-sdk", version = "0.10.28", path = "gears/mini-chat/mini-chat-sdk" }
 
 # api-contracts (example: toolkit-contract macros showcased on a Payment API)
 api-contracts-sdk = { package = "cf-api-contracts-sdk", version = "0.1.0", path = "examples/toolkit/api-contracts/api-contracts-sdk" }
 
 # System gears
-grpc_hub = { package = "cf-gears-grpc-hub", version = "0.4.0", path = "gears/system/grpc-hub" }
+grpc_hub = { package = "cf-gears-grpc-hub", version = "0.4.1", path = "gears/system/grpc-hub" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -672,6 +676,15 @@ sea-orm-migration = { version = "2.0", default-features = false, features = [
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-aws-lc-rs"] }
 # Demo-only: cf-evctl's shared group-id store (bundled = self-contained, no system libsqlite3).
 rusqlite = { version = "0.37", features = ["bundled"] }
+
+# Kafka client, used only by the event-broker Kafka backend plugin. `cmake-build`
+# compiles the vendored librdkafka, so no system library is needed; the `libz`
+# default stays off until a producer needs compression.
+rdkafka = { version = "0.38", default-features = false, features = ["cmake-build", "tokio"] }
+# Pinned below 4.10: its librdkafka 2.12.1 tests `#ifdef WITH_OAUTHBEARER_OIDC`
+# against a `#cmakedefine01` macro, so a build without curl still includes
+# <curl/curl.h> and fails. rdkafka 0.39 requires 4.10, hence rdkafka 0.38.
+rdkafka-sys = { version = "=4.9.0", default-features = false }
 
 # Redis/Valkey client, used only by the Redis cluster plugin
 # (gears/system/cluster/plugins/redis-cluster-plugin, see its docs/DESIGN.md §3.1).
@@ -863,7 +876,7 @@ trybuild = "1"
 serial_test = { version = "4", features = ["file_locks"] }
 criterion = { version = "0.8", default-features = false }
 testcontainers = { version = "0.27", default-features = false, features = ["aws-lc-rs"] }
-testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis"] }
+testcontainers-modules = { version = "0.15", default-features = false, features = ["aws-lc-rs", "postgres", "mysql", "redis", "kafka"] }
 httpmock = "0.8"
 flate2 = "1"
 
@@ -928,9 +941,10 @@ gts-id = "0.16.1"
 gts = "0.16.1"
 gts-macros = "0.16.1"
 
-license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.2.0", path = "gears/system/license-resolver/license-resolver-sdk" }
-license-resolver = { package = "cf-gears-license-resolver", version = "0.1.6", path = "gears/system/license-resolver/license-resolver" }
-static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.6", path = "gears/system/license-resolver/plugins/static-license-plugin" }
+license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0.2.1", path = "gears/system/license-resolver/license-resolver-sdk" }
+license-resolver = { package = "cf-gears-license-resolver", version = "0.1.7", path = "gears/system/license-resolver/license-resolver" }
+static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.7", path = "gears/system/license-resolver/plugins/static-license-plugin" }
+license-enforcement-sdk = { package = "cf-gears-license-enforcement-sdk", version = "0.1.0", path = "gears/system/license-enforcement/license-enforcement-sdk" }
 
 # Admission control + policy engine
 admission-control-sdk = { package = "cf-gears-admission-control-sdk", version = "0.1.0", path = "gears/system/admission-control/admission-control-sdk" }
@@ -957,4 +971,5 @@ ignored = [
     "resource-group",
     "tenant-resolver",
     "types-registry",
+    "usage-collector",
 ]

@@ -9,14 +9,6 @@
 //! SubscriptionTerminated`) need a consumer-group rebalance coordinator that
 //! doesn't exist yet and are deferred to a follow-up `OpenSpec` change (see
 //! `eb-rest-handlers`'s design.md "Streaming/rebalance scope").
-//!
-//! The event-delivery loop wakes on `domain::notify::DeliveryNotifier`
-//! (design.md D6: a `ClusterCacheV1`-backed, payload-free notification the
-//! ingest outbox publishes after a successful persist - see that module's
-//! own doc comment for the exact mechanism and a correction against D6's
-//! literal per-`(topic, partition)`-key wording) rather than a busy-poll.
-//! Still bounded by `heartbeat_interval` each iteration, so idle-heartbeat
-//! cadence is unaffected by whether a notification ever arrives.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -39,7 +31,6 @@ pub use event_broker_sdk::api::Position;
 
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::model::{Interest, Sequence, Subscription};
-use crate::domain::notify::DeliveryNotifier;
 use crate::domain::streaming::filter::{AuthorizedInterestFilter, EventFilter};
 use crate::domain::streaming::lease::StreamLeases;
 use crate::domain::streaming::progress::ProgressConfig;
@@ -397,7 +388,6 @@ where
     R: crate::domain::repo::RoutingMarkers
         + crate::domain::repo::CursorRepo
         + crate::domain::repo::ConsumerGroupRepo
-        + DeliveryNotifier
         + Send
         + Sync
         + 'static,
@@ -768,21 +758,26 @@ where
             // The backend owns this: it is the only thing that knows where
             // retention has reached, what it has assigned, and when each event
             // occurred. An inadmissible `Exact` fails to resolve.
-            match backend
-                .resolve(
-                    ctx,
-                    topic.id.as_ref(),
-                    target.partition.cast_unsigned(),
-                    target.value,
-                )
-                .await
-            {
+            let at = event_broker_sdk::backend::TopicPartition::new(
+                topic.id.clone(),
+                event_broker_sdk::backend::Partition::new(target.partition.cast_unsigned()),
+            );
+            let position = target.value.clone();
+            let outcome = match backend.resolve(&at, target.value).await {
+                // A registered topic its backend does not hold yet reads as a
+                // partition nothing was written to (feature 0007 §4.3).
+                Err(event_broker_sdk::backend::BackendError::NotProvisioned { .. }) => {
+                    resolve_unprovisioned(&position)
+                }
+                outcome => outcome,
+            };
+            match outcome {
                 Ok(offset) => resolved.push(SeekPosition {
                     topic: target.topic,
                     partition: target.partition,
                     offset,
                 }),
-                Err(event_broker_sdk::StorageBackendError::OffsetOutOfRange {
+                Err(event_broker_sdk::backend::BackendError::OffsetOutOfRange {
                     floor,
                     ceiling,
                     breached,
@@ -831,6 +826,16 @@ where
         ctx: &SecurityContext,
         input: crate::domain::model::ConsumerGroupCreateInput,
     ) -> Result<crate::domain::model::ConsumerGroup, DomainError> {
+        // The persisted text fields, checked on every path in (REST and the
+        // in-process broker) and ahead of authorization, so a malformed
+        // request is a `400` whoever sends it.
+        if let Some(client_agent) = input.client_agent.as_deref() {
+            event_broker_sdk::validate::client_agent(client_agent)?;
+        }
+        if let Some(description) = input.description.as_deref() {
+            event_broker_sdk::validate::description(description)?;
+        }
+
         // `docs/DESIGN.md`'s Consumer Group Lifecycle: "Errors: 403
         // Forbidden — caller lacks consumer_group:define permission via
         // PEP". No `consumer_group_id` property - the group doesn't exist
@@ -918,5 +923,22 @@ where
             });
         }
         self.repo.delete_consumer_group(id).await
+    }
+}
+
+/// Where `position` resolves on a partition nothing was written to: head 0,
+/// and 0 the only position a cursor can hold.
+fn resolve_unprovisioned(
+    position: &Position,
+) -> Result<Sequence, event_broker_sdk::backend::BackendError> {
+    match position {
+        Position::Exact(requested) if !requested.is_none() => {
+            Err(event_broker_sdk::backend::BackendError::out_of_range(
+                *requested,
+                Sequence::NONE,
+                Sequence::NONE,
+            ))
+        }
+        _ => Ok(Sequence::NONE),
     }
 }

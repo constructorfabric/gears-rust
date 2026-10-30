@@ -11,6 +11,16 @@ config_gears:
   - oagw
   - credstore
   - static-credstore-plugin
+env:
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Keep previous seed revisions and OAGW rows out of independent suite runs.
+clean_home: true
+config_overrides:
+  gears:
+    types-registry:
+      # OAGW still uses the legacy in-memory registry. Its fixtures and catalog
+      # will move to database-backed admission with the system gears migration.
+      database: null
 profiles:
   # OAGW on SQLite instead of in memory, with one upstream and two routes
   # provisioned from the types registry. The section 19 tests run only here,
@@ -53,4 +63,4 @@ profiles:
     env:
       OAGW_E2E_PROFILE: "sqlite"
       # Where 19.1 reads the stored rows; set it when `home_dir` moves.
-      OAGW_E2E_DB: "~/.cf-gears/oagw/oagw.db"
+      OAGW_E2E_DB: "{root}/target/e2e-home-{suite_key}/oagw/oagw.db"

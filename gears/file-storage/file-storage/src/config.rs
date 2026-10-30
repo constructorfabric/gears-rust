@@ -7,6 +7,18 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 use toolkit_utils::SecretString;
 
+/// Upper bound (seconds) for `finalize_token_grace_secs`: 7 days.
+///
+/// `gear.rs` converts to `i64` saturating; an oversized value would make the `exp` check a no-op.
+pub const MAX_FINALIZE_TOKEN_GRACE_SECS: u64 = 7 * 24 * 3600;
+
+/// Upper bound (seconds) for `multipart_session_ttl_secs`: 30 days (added to `now`; must not overflow).
+pub const MAX_MULTIPART_SESSION_TTL_SECS: u64 = 30 * 24 * 3600;
+
+/// Upper bound (seconds) for `multipart_complete_lease_secs`: 1 day (a huge lease lets a crashed
+/// completer block others).
+pub const MAX_MULTIPART_COMPLETE_LEASE_SECS: u64 = 24 * 3600;
+
 /// Absolute ceiling accepted for `max_page_size` (the platform-wide cursor-pagination cap);
 /// `validate()` rejects anything above it.
 pub(crate) const MAX_PAGE_SIZE_CEILING: u64 = 200;
@@ -27,6 +39,22 @@ pub struct FileStorageConfig {
     /// Hard ceiling on signed-URL TTL in seconds (default 7 days).
     #[serde(default = "default_max_url_ttl_secs")]
     pub max_url_ttl_secs: u64,
+
+    /// Grace (seconds) on the signed PUT token's `exp` when re-checked on finalize/report-part: the
+    /// sidecar checks `exp` only at PUT start, so a slow upload can arrive expired. `0` disables.
+    /// Default 3600, capped by `validate()`.
+    #[serde(default = "default_finalize_token_grace_secs")]
+    pub finalize_token_grace_secs: u64,
+
+    /// Lifetime (seconds) of a multipart session, independent of `default_url_ttl_secs` so large
+    /// uploads are not capped by the URL TTL. Default 86400.
+    #[serde(default = "default_multipart_session_ttl_secs")]
+    pub multipart_session_ttl_secs: u64,
+
+    /// Lease (seconds) a multipart `complete` holds on `completing` before takeover after a crash.
+    /// Default 120.
+    #[serde(default = "default_multipart_complete_lease_secs")]
+    pub multipart_complete_lease_secs: u64,
 
     /// Public base URL of the data-plane sidecar that signed URLs point at.
     #[serde(default = "default_sidecar_base_url")]
@@ -172,6 +200,15 @@ impl FileStorageConfig {
                  same value as the sidecar's FS_SIDECAR_INTERNAL_TOKEN)"
             );
         }
+        // Bounded: `gear.rs` saturates the `i64` conversion (would make `exp` a no-op).
+        if self.finalize_token_grace_secs > MAX_FINALIZE_TOKEN_GRACE_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: finalize_token_grace_secs ({}) must not exceed \
+                 MAX_FINALIZE_TOKEN_GRACE_SECS ({})",
+                self.finalize_token_grace_secs,
+                MAX_FINALIZE_TOKEN_GRACE_SECS
+            );
+        }
         // A zero page size would make every listing return an empty page with no cursor.
         if self.default_page_size == 0 || self.max_page_size == 0 {
             anyhow::bail!(
@@ -199,6 +236,48 @@ impl FileStorageConfig {
                 MAX_PAGE_SIZE_CEILING
             );
         }
+        // Zero would mint a 1-second session (`.max(1)` downstream).
+        if self.multipart_session_ttl_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs must be > 0 (a \
+                 zero-second session lifetime would expire before any upload could complete)"
+            );
+        }
+        // The session must outlive the per-part URLs.
+        if self.multipart_session_ttl_secs < self.default_url_ttl_secs {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs ({}) must be >= \
+                 default_url_ttl_secs ({}) -- otherwise a signed upload URL minted at initiate \
+                 time could remain valid past the multipart session's own expiry",
+                self.multipart_session_ttl_secs,
+                self.default_url_ttl_secs
+            );
+        }
+        // Bounded: added to `now` for `expires_at`.
+        if self.multipart_session_ttl_secs > MAX_MULTIPART_SESSION_TTL_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_session_ttl_secs ({}) must not exceed \
+                 MAX_MULTIPART_SESSION_TTL_SECS ({})",
+                self.multipart_session_ttl_secs,
+                MAX_MULTIPART_SESSION_TTL_SECS
+            );
+        }
+        // Zero would defeat crash recovery.
+        if self.multipart_complete_lease_secs == 0 {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_complete_lease_secs must be > 0 (a \
+                 zero-second lease would let another caller take it over almost immediately)"
+            );
+        }
+        // Bounded: an oversized lease lets a crashed completer block others.
+        if self.multipart_complete_lease_secs > MAX_MULTIPART_COMPLETE_LEASE_SECS {
+            anyhow::bail!(
+                "invalid file-storage config: multipart_complete_lease_secs ({}) must not exceed \
+                 MAX_MULTIPART_COMPLETE_LEASE_SECS ({})",
+                self.multipart_complete_lease_secs,
+                MAX_MULTIPART_COMPLETE_LEASE_SECS
+            );
+        }
         Ok(())
     }
 }
@@ -208,6 +287,15 @@ impl fmt::Debug for FileStorageConfig {
         f.debug_struct("FileStorageConfig")
             .field("default_url_ttl_secs", &self.default_url_ttl_secs)
             .field("max_url_ttl_secs", &self.max_url_ttl_secs)
+            .field("finalize_token_grace_secs", &self.finalize_token_grace_secs)
+            .field(
+                "multipart_session_ttl_secs",
+                &self.multipart_session_ttl_secs,
+            )
+            .field(
+                "multipart_complete_lease_secs",
+                &self.multipart_complete_lease_secs,
+            )
             .field("sidecar_base_url", &self.sidecar_base_url)
             .field("default_page_size", &self.default_page_size)
             .field("max_page_size", &self.max_page_size)
@@ -237,6 +325,9 @@ impl Default for FileStorageConfig {
         Self {
             default_url_ttl_secs: default_default_url_ttl_secs(),
             max_url_ttl_secs: default_max_url_ttl_secs(),
+            finalize_token_grace_secs: default_finalize_token_grace_secs(),
+            multipart_session_ttl_secs: default_multipart_session_ttl_secs(),
+            multipart_complete_lease_secs: default_multipart_complete_lease_secs(),
             sidecar_base_url: default_sidecar_base_url(),
             default_page_size: default_page_size(),
             max_page_size: default_max_page_size(),
@@ -260,6 +351,18 @@ fn default_default_url_ttl_secs() -> u64 {
 fn default_max_url_ttl_secs() -> u64 {
     // 7 days.
     7 * 24 * 60 * 60
+}
+
+fn default_finalize_token_grace_secs() -> u64 {
+    3600 // 1 hour: see FileStorageConfig::finalize_token_grace_secs
+}
+
+fn default_multipart_session_ttl_secs() -> u64 {
+    86400 // 24 hours
+}
+
+fn default_multipart_complete_lease_secs() -> u64 {
+    120 // backend-assembly budget; see FileStorageConfig::multipart_complete_lease_secs
 }
 
 fn default_sidecar_base_url() -> String {

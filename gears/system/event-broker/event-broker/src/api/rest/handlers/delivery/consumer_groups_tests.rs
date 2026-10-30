@@ -377,7 +377,6 @@ async fn seed_consumer_group(
 }
 
 #[tokio::test]
-#[ignore = "named consumer groups not implemented yet (returns 501); re-enable when named-group support lands"]
 async fn get_consumer_group_rejects_a_caller_from_a_different_tenant_for_anonymous() {
     let foreign_tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
@@ -389,7 +388,7 @@ async fn get_consumer_group_rejects_a_caller_from_a_different_tenant_for_anonymo
         })))
         .build()
         .await;
-    let id = "gts.cf.core.events.consumer_group.v1~x.eb.t1.foreignanon.v1";
+    let id = "gts.cf.core.events.consumer_group.v1~0190f1c2-7a3b-7c4d-8e5f-6a7b8c9d0e1f";
     seed_consumer_group(
         &harness,
         id,
@@ -404,7 +403,6 @@ async fn get_consumer_group_rejects_a_caller_from_a_different_tenant_for_anonymo
 }
 
 #[tokio::test]
-#[ignore = "named consumer groups not implemented yet (returns 501); re-enable when named-group support lands"]
 async fn delete_consumer_group_rejects_a_caller_from_a_different_tenant_for_anonymous() {
     let foreign_tenant_id = Uuid::new_v4();
     let harness = EventBrokerHarness::builder()
@@ -416,7 +414,7 @@ async fn delete_consumer_group_rejects_a_caller_from_a_different_tenant_for_anon
         })))
         .build()
         .await;
-    let id = "gts.cf.core.events.consumer_group.v1~x.eb.t1.foreignanon.v1";
+    let id = "gts.cf.core.events.consumer_group.v1~0190f1c2-7a3b-7c4d-8e5f-6a7b8c9d0e1f";
     seed_consumer_group(
         &harness,
         id,

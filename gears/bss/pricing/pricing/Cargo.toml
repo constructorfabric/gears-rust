@@ -7,11 +7,10 @@ description = "PriceBook pricing gear"
 [lib]
 name = "bss_pricing"
 
-# `infra/storage/entity.rs` declares every entity module through its
-# `entities!` macro (`pub mod $module;`), which cargo-shear cannot follow, so it
-# reports the files as unlinked. They are compiled.
+# Shared test helpers reached only through `#[path = "../<dir>/mod.rs"]`, which
+# cargo-shear cannot follow, so it reports the files as unlinked. They are compiled.
 [package.metadata.cargo-shear]
-ignored-paths = ["src/infra/storage/entity/*.rs"]
+ignored-paths = ["tests/common/mod.rs", "tests/policy_support/mod.rs"]
 
 [lints]
 workspace = true

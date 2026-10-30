@@ -82,8 +82,7 @@ fn config(max_keys: u64) -> OrdersConfig {
         }],
         "events": {
             "producer_subject_id": "00000000-0000-0000-0000-00000000044c",
-            "producer_tenant_id": "00000000-0000-0000-0000-00000000044d",
-            "broker_partitions": 4
+            "producer_tenant_id": "00000000-0000-0000-0000-00000000044d"
         },
         "audit_minimization": {"key_id": "test-1", "key": "unit-test-key-0123456789abcdefgh"},
         "throttling": {"per_order_max_keys": max_keys}

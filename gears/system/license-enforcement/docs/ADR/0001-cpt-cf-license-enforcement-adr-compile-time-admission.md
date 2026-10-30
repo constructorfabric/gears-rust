@@ -100,7 +100,7 @@ links it.
 
 * A test binary with zero plugins and a test binary with two plugins both fail at gear init.
 * The dependency tree of a binary with a plugin that does not verify evidence contains no signature crate.
-* The route table of a binary registers create routes only for the intakes that its plugin declares.
+* A binary rejects as `unimplemented` an operation that needs an intake that its plugin does not declare.
 * No configuration key or registry entry exists that can select or disable the plugin.
 * The shared conformance suite passes with each plugin crate.
 

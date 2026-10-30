@@ -1541,14 +1541,15 @@ impl HostRuntime {
         }
         .await;
 
-        let serve_result = match composed {
-            Ok((gear_router, openapi_json, route_auth)) => {
-                // Publish gear routes (they go live) + start directory presence.
-                // Dependency resolution already ran in the proxy-wiring phase.
-                server.attach(gear_router, openapi_json, route_auth);
-                // Serve until cancelled, drain, then deregister.
-                server.join().await
-            }
+        // Check the route policy, then publish gear routes (they go live) and start
+        // directory presence. Dependency resolution already ran in the proxy-wiring
+        // phase. A policy whose plane has no validator stops here, before serving.
+        let attached = composed.and_then(|(gear_router, openapi_json, route_auth)| {
+            server.attach(gear_router, openapi_json, route_auth)
+        });
+        let serve_result = match attached {
+            // Serve until cancelled, drain, then deregister.
+            Ok(()) => server.join().await,
             Err(e) => {
                 tracing::error!(error = %e, "OoP startup failed before serving gear routes");
                 // Tear down the probe server that is already bound.

@@ -35,7 +35,7 @@ use crate::infra::partition_cache::segment::Segment;
 
 use super::attach::{AttachRequest, attach_readers};
 use super::scheduler::{DemandScheduler, SchedulerPolicy};
-use super::shard::ShardLoader;
+use super::shard::{ShardLoader, pays_tick};
 use super::source::{EventSource, SourceError};
 use super::topics::{TopicManager, TopicPolicy};
 
@@ -315,4 +315,113 @@ async fn the_loader_reclaims_spans_a_reader_has_passed() {
     );
 
     drop(slots);
+}
+
+/// Counts reads, answering each the way the variant says.
+struct CountingSource {
+    reads: AtomicI64,
+    answer: Result<(), SourceError>,
+}
+
+impl CountingSource {
+    fn new(answer: Result<(), SourceError>) -> Self {
+        Self {
+            reads: AtomicI64::new(0),
+            answer,
+        }
+    }
+
+    fn reads(&self) -> i64 {
+        self.reads.load(Ordering::Relaxed)
+    }
+}
+
+impl EventSource for CountingSource {
+    async fn read(
+        &self,
+        _key: &PartitionKey,
+        _after: Sequence,
+        _max_events: usize,
+    ) -> Result<Vec<Event>, SourceError> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.answer.clone().map(|()| Vec::new())
+    }
+}
+
+async fn settle() {
+    for _ in 0..30 {
+        tokio::task::yield_now().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn backend_failures_wait_for_the_tick_instead_of_spinning() {
+    let topics = Arc::new(TopicManager::new(TopicPolicy::default()));
+    let partition = topics.attach(&PartitionKey::new(gts(TOPIC), 0));
+    let _reader = partition.cache().track_reader(Sequence::assigned(0));
+    let source = Arc::new(CountingSource::new(Err(SourceError::Unavailable)));
+    let scheduler = Arc::new(DemandScheduler::new(
+        Arc::clone(&source),
+        Arc::clone(&topics),
+        SchedulerPolicy::with_pool(1).build(),
+    ));
+    let stop = CancellationToken::new();
+    let task = ShardLoader::new(scheduler, topics, Duration::from_millis(50)).spawn(stop.clone());
+
+    settle().await;
+    assert_eq!(source.reads(), 1, "no retry before the tick");
+    tokio::time::advance(Duration::from_millis(50)).await;
+    settle().await;
+    assert_eq!(source.reads(), 2, "one retry after the tick");
+
+    stop.cancel();
+    task.await.expect("the loader cancels while waiting");
+}
+
+#[test]
+fn one_failing_partition_does_not_throttle_the_healthy_ones() {
+    // fetches issued, events fetched, failures
+    assert!(pays_tick(0, 0, 0), "an idle round waits");
+    assert!(pays_tick(1, 0, 1), "a round that only failed waits");
+    assert!(
+        !pays_tick(3, 40, 1),
+        "a round that delivered does not wait for its failing partition"
+    );
+    assert!(
+        !pays_tick(2, 0, 0),
+        "empty fetches rely on the empty-tail backoff"
+    );
+    assert!(
+        !pays_tick(2, 10, 0),
+        "a productive round goes again at once"
+    );
+}
+
+/// A reader at the known head costs no read while the clock stands still, and
+/// a head moving above it is read at once, without waiting out the tick.
+#[tokio::test(start_paused = true)]
+async fn a_tail_at_the_known_head_is_read_only_when_the_head_moves() {
+    let topics = Arc::new(TopicManager::new(TopicPolicy::default()));
+    let key = PartitionKey::new(gts(TOPIC), 0);
+    let partition = topics.attach(&key);
+    let _reader = partition.cache().track_reader(Sequence::assigned(7));
+    topics.publish_head(&key, Sequence::assigned(7));
+    let source = Arc::new(CountingSource::new(Ok(())));
+    let scheduler = Arc::new(DemandScheduler::new(
+        Arc::clone(&source),
+        Arc::clone(&topics),
+        SchedulerPolicy::with_pool(1).build(),
+    ));
+    let stop = CancellationToken::new();
+    let task = ShardLoader::new(scheduler, Arc::clone(&topics), Duration::from_secs(3600))
+        .spawn(stop.clone());
+
+    settle().await;
+    assert_eq!(source.reads(), 0, "nothing above the head to read");
+    topics.publish_head(&key, Sequence::assigned(8));
+    settle().await;
+    assert_eq!(source.reads(), 1, "the moved head is read before the tick");
+
+    stop.cancel();
+    task.await.expect("the loader cancels while waiting");
 }

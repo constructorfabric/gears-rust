@@ -11,7 +11,8 @@ pub use admin::{
 };
 pub use kinds::{DataClassification, DeclarationStatus, UnknownKind};
 pub use repo::{
-    CategoryTally, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    BrowseCandidate, BrowseNarrowing, CategoryTally, Declaration, DeclarationDraft,
+    DeclarationMetadata, DeclarationRepository,
 };
 pub use service::DeclarationService;
 

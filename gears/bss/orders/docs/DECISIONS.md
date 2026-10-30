@@ -3509,22 +3509,16 @@ verbatim `external_reference`.
 [Minimization contract](DESIGN.md#43-data-protection-residency-and-retention),
 [audit column](DESIGN.md#contract-01-3-7), implementation evidence.
 
-## D-205 — The broker partition count is a required declaration; broker equality is a deployment gate (amends DESIGN §3.7; S2-08)
+## D-205 - Orders declares no broker partition count (amends DESIGN §3.7; S2-08)
 
 **Status:** decided 2026-10-06 by the user ("do the recommended way"), confirming the S2-08
-coordinator decision; Event Broker is not changed.
+coordinator decision.
 
-DESIGN §3.7 required startup to fail when the producer's declared partition count differs from
-the broker's. No Event Broker API reports a topic's resolved partition count, so that cannot be
-enforced today. The count is therefore the required, non-defaulted gear setting
-`events.broker_partitions` (1–4096), following the Event Broker SDK's own declaration precedent;
-Orders never assumes the SDK default of 8. Equality with the broker's configured count for the
-Orders topic is a deployment gate under `cpt-cf-bss-orders-upreq-event-broker-runtime`
-(S6-05): the deployment sets both from one source and verifies them before release. UPSTREAM_REQS
-§2.7 asks Event Broker for a broker-level partition-count capability (or `partition_hint`
-validation); once it exists, startup **MUST** fail on a mismatch. The silent event loss observed
-under a mismatch is a **deferred escalation** recorded in UPSTREAM_REQS §2.7 and not yet raised
-with the owner.
+The Event Broker SDK registers one producer id per producer outbox partition, so each id
+carries exactly one sequence space, and the broker places each event on a topic partition by
+its partition key. The producer therefore needs no knowledge of the topic's partition count:
+Orders has no partition-count setting, and the count of the Orders topic is broker
+configuration alone. Any broker partition count stores every event.
 
 [Producer persistence contract](DESIGN.md#contract-01-platform-managed-producer-persistence),
 [upstream requirement](UPSTREAM_REQS.md#27-event-broker), implementation evidence.
@@ -3947,9 +3941,9 @@ Milestone evidence, implementation report (`S2-12-implementation.md`, kept out o
    - In `gear/tests.rs`: `serve_binds_the_real_producer_and_stops_its_workers` and `store_loss_stops_readiness_without_a_restart_loop`.
    - Test-only helpers whose only callers are gated: `events::test_support::{Root, root}` and `TxEvents::enqueue_unchecked`. The test-time `dead_code` expectations on `BssOrdersGear::engine` and `EventDetail` also hold while the feature is off.
 4. **What is now unproven until #5381 merges.** No test in this PR exercises:
-   - the real-registry contract load: the in-process broker's Orders topic and event types loaded from the `types-registry` commit of the Orders contract, and the declared partition count pairing with it (a wrong count silently drops events; a matching one stores every event);
+   - the real-registry contract load: the in-process broker's Orders topic and event types loaded from the `types-registry` commit of the Orders contract, with every event stored whatever the topic's partition count;
    - event delivery through the managed producer: committed transitions deliver platform-root-tenant events routed by order; the enqueue is atomic with the transition and once per attempt; a failed enqueue never commits even if the error is dropped; maximal envelopes fit and oversize events roll back; the root-tenant grant is required and a rejection advances; binding fails closed without each prerequisite;
-   - event fault injection: transport and rate-limit outages on cursor reads and publishes retry in order and roll nothing back; a lost acknowledgement retries after a restart with cursor recovery and without a duplicate; a publish delivered without a reply (accepted, persisted or duplicate) is acknowledged once; an unknown producer re-registers and a permanent rejection dead-letters;
+   - event fault injection: transport and rate-limit outages on cursor reads and publishes retry in order and roll nothing back; a lost acknowledgement retries after a restart with cursor recovery and without a duplicate; a publish delivered without a reply (accepted, persisted or duplicate) is acknowledged once; an unknown producer re-registers and its message is delivered;
    - the S2-04 engine on PostgreSQL (row effects, audit and event cardinality per key, refusals, version precedence, replays, concurrent creates, lease and changed-facts handling, rollback at every persistence boundary, commit rejection, claims, post-spawn hold, administrative and draft edits, the outbox-insert rollback);
    - S2-09 draft authoring through the capture service, REST and the local SDK, and the date admission through the engine (S2-10 row 4);
    - the early S6-01/S6-04 reads (point and list reads, cursors, the access-log decision table, hidden/missing, service finite IDs, the mounted read routes and the undelivered compositions);

@@ -34,7 +34,7 @@ fn maintenance_identity_and_tasks_are_explicit() {
     let config: crate::config::OrdersConfig = serde_json::from_value(serde_json::json!({
         "lock_route": "direct", "idempotency_lease_seconds": 30, "dependency_timeout_ms": 1000,
         "service_principals": [{"role": "workflow", "subject_id": u(77), "tenant_id": u(1)}],
-        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1), "broker_partitions": 4},
+        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1)},
         "audit_minimization": {"key_id": "t1", "key": "0123456789abcdef0123456789abcdef"}
     }))
     .unwrap();
@@ -42,7 +42,7 @@ fn maintenance_identity_and_tasks_are_explicit() {
     let nil: crate::config::OrdersConfig = serde_json::from_value(serde_json::json!({
         "lock_route": "direct", "idempotency_lease_seconds": 30, "dependency_timeout_ms": 1000,
         "service_principals": [{"role": "workflow", "subject_id": u(77), "tenant_id": u(1)}],
-        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1), "broker_partitions": 4},
+        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1)},
         "audit_minimization": {"key_id": "t1", "key": "0123456789abcdef0123456789abcdef"},
         "maintenance": {"actor_subject_id": Uuid::nil(), "actor_tenant_id": u(1), "tasks": ["retention_purge"]}
     }))
@@ -51,7 +51,7 @@ fn maintenance_identity_and_tasks_are_explicit() {
     let unknown = serde_json::from_value::<crate::config::OrdersConfig>(serde_json::json!({
         "lock_route": "direct", "idempotency_lease_seconds": 30, "dependency_timeout_ms": 1000,
         "service_principals": [{"role": "workflow", "subject_id": u(77), "tenant_id": u(1)}],
-        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1), "broker_partitions": 4},
+        "events": {"producer_subject_id": u(78), "producer_tenant_id": u(1)},
         "audit_minimization": {"key_id": "t1", "key": "0123456789abcdef0123456789abcdef"},
         "maintenance": {"actor_subject_id": u(1), "actor_tenant_id": u(1), "tasks": ["purge_everything"]}
     }));

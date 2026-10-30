@@ -1,10 +1,12 @@
 //! Policy and retention-rule intent methods.
 
 use time::OffsetDateTime;
+use toolkit_db::secure::TxConfig;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
 use crate::domain::policy::{
     PolicyBody, PolicyScope, RetentionRuleBody, RetentionScope, StoredPolicy, StoredRetentionRule,
 };
@@ -50,7 +52,11 @@ impl Store {
         let body = body.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let policies = policies.clone();
+                let scope = scope.clone();
+                let policy_scope = policy_scope.clone();
+                let body = body.clone();
                 Box::pin(async move {
                     policies
                         .upsert(

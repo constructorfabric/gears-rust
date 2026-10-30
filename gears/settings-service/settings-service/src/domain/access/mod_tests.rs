@@ -20,6 +20,7 @@ fn row(tenant: Uuid, access: TenantAccess) -> Restriction {
         tenant_id: tenant,
         access,
         set_by: "root-admin".to_owned(),
+        set_by_tenant: None,
         created_at: OffsetDateTime::UNIX_EPOCH,
         updated_at: OffsetDateTime::from_unix_timestamp(42).expect("in range"),
     }

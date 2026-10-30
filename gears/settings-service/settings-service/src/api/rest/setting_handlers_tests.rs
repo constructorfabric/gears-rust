@@ -4,7 +4,8 @@ use toolkit_odata::ast::Expr;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use super::{gate_target, interpret};
+use super::{gate_target, interpret, qualify};
+use crate::api::rest::setting_dto::Reader;
 use crate::domain::error::DomainError;
 use crate::domain::resolution::ScopeTarget;
 use crate::test_support::ResolutionHarness;
@@ -149,5 +150,119 @@ async fn the_target_is_the_caller_or_a_reachable_descendant_and_nothing_else() {
             Err(DomainError::Unauthorized { .. }) => {}
             other => panic!("{who} -> {target}: expected a denial, got {other:?}"),
         }
+    }
+}
+
+async fn declaration_of(
+    h: &ResolutionHarness,
+    name: &str,
+    classification: &str,
+) -> crate::domain::declaration::Declaration {
+    use crate::domain::declaration::DeclarationRepository as _;
+    let id = h
+        .declare_typed(
+            name,
+            "cascading",
+            serde_json::json!("x"),
+            crate::test_support::TEXT,
+            classification,
+        )
+        .await;
+    let conn = h.db.conn().expect("connection");
+    crate::infra::storage::declaration_repo::DeclarationRepo
+        .find_by_ids(&conn, &toolkit_security::AccessScope::allow_all(), &[id])
+        .await
+        .expect("declaration")
+        .remove(0)
+}
+
+fn failure(kind: &str) -> DomainError {
+    match kind {
+        "unavailable" => DomainError::Unavailable {
+            detail: "down".to_owned(),
+        },
+        "internal" => DomainError::Internal {
+            diagnostic: "defect".to_owned(),
+        },
+        _ => DomainError::Retired {
+            key: "k".to_owned(),
+        },
+    }
+}
+
+#[tokio::test]
+async fn a_failed_candidate_is_decided_by_what_the_caller_could_have_seen() {
+    let h = ResolutionHarness::new().await;
+    let needle = crate::domain::search::Needle::parse("zzz").expect("needle");
+    let public = declaration_of(&h, "open_one", "public").await;
+    let secret = declaration_of(&h, "vault_one", "secret").await;
+    let pii = declaration_of(&h, "contact_one", "pii").await;
+
+    // An outage over a value the caller could have matched is the request's.
+    for (declaration, entitled) in [(&public, false), (&pii, true)] {
+        let outcome = qualify(
+            declaration,
+            false,
+            Err(failure("unavailable")),
+            &needle,
+            entitled,
+            Reader::Platform,
+            &[],
+        );
+        assert!(matches!(outcome, Err(DomainError::Unavailable { .. })));
+    }
+    // A defect keeps its entry, as it does without `q`.
+    let kept = qualify(
+        &public,
+        false,
+        Err(failure("internal")),
+        &needle,
+        false,
+        Reader::Platform,
+        &[],
+    )
+    .expect("decided")
+    .expect("kept");
+    assert_eq!(kept.0.outcome, "error");
+    assert!(kept.0.effective.is_none());
+    // What the caller could never match is left to the text.
+    for (declaration, entitled) in [(&secret, true), (&pii, false)] {
+        for kind in ["unavailable", "internal"] {
+            let outcome = qualify(
+                declaration,
+                false,
+                Err(failure(kind)),
+                &needle,
+                entitled,
+                Reader::Platform,
+                &[],
+            );
+            assert!(matches!(outcome, Ok(None)), "{kind}");
+        }
+    }
+    // A retired one qualifies by its text alone; a text match keeps any failure.
+    assert!(matches!(
+        qualify(
+            &public,
+            false,
+            Err(failure("retired")),
+            &needle,
+            true,
+            Reader::Platform,
+            &[],
+        ),
+        Ok(None)
+    ));
+    for kind in ["retired", "unavailable", "internal"] {
+        let outcome = qualify(
+            &secret,
+            true,
+            Err(failure(kind)),
+            &needle,
+            false,
+            Reader::Platform,
+            &[],
+        );
+        assert!(matches!(outcome, Ok(Some(_))), "{kind}");
     }
 }

@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::body::Body;
@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 use uuid::Uuid;
 
+use file_storage::domain::error::DomainError;
 use file_storage::infra::backend::{
     BackendRegistry, InMemoryBackend, LocalFsBackend, StorageBackend,
 };
@@ -18,9 +19,9 @@ use file_storage::infra::metrics::NoopMetrics;
 use file_storage::infra::signed_url::{Claims, Issuer, MultipartClaims, Op, UploadConstraints};
 
 use super::{
-    DEFAULT_MAX_BODY_BYTES, SidecarState, build_router, finalize_with_control_plane,
-    report_part_with_control_plane, write_multipart_part_native,
-    write_multipart_part_offset_object,
+    DEFAULT_MAX_BODY_BYTES, Rejection, SidecarState, backend_failure, build_router,
+    finalize_rejection_response, finalize_with_control_plane, report_part_with_control_plane,
+    truncate_utf8, write_multipart_part_native, write_multipart_part_offset_object,
 };
 
 fn test_state() -> SidecarState {
@@ -322,6 +323,7 @@ fn download_token_with_meta(
         request_id: "test-request-id".to_owned(),
         content_type: content_type.to_owned(),
         etag: etag.to_owned(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -711,6 +713,7 @@ fn upload_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -748,6 +751,7 @@ fn multipart_part_token(
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
     issuer
         .issue(claims, OffsetDateTime::now_utc())
@@ -933,6 +937,7 @@ async fn write_multipart_part_native_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err = write_multipart_part_native(&backend, &claims, 1, Body::from(b"short".to_vec()))
@@ -967,6 +972,7 @@ async fn write_multipart_part_offset_object_undersized_returns_400() {
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     };
 
     let err =
@@ -1109,6 +1115,7 @@ fn part_claims(backend_id: &str, backend_path: &str, size: u64, backend_handle: 
         request_id: "test-request-id".to_owned(),
         content_type: String::new(),
         etag: String::new(),
+        bind_on_finalize: false,
     }
 }
 
@@ -1238,6 +1245,93 @@ async fn upload_returns_502_when_finalize_fails() {
     assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
 }
 
+/// Mock control plane answering every request `204 No Content`; returns its base URL and the
+/// number of requests it received.
+async fn counting_control_plane() -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nconnection: close\r\n\r\n")
+                    .await
+                    .ok();
+            }
+        }
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// A replayed `PUT` whose bytes differ from the already-published object is refused before
+/// finalize, so a `pending` version cannot be finalized with a digest of bytes never stored.
+#[tokio::test]
+async fn upload_replay_with_different_bytes_returns_409_without_finalize() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (control_base_url, finalize_calls) = counting_control_plane().await;
+    state.control_base_url = control_base_url;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    backend
+        .put("/replay-differs", bytes::Bytes::from_static(b"original"))
+        .await
+        .expect("seed the published object");
+    let token = upload_token(&issuer, file_id, version_id, "test", "/replay-differs");
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"replaced".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert_eq!(finalize_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        backend.get("/replay-differs").await.expect("object kept"),
+        bytes::Bytes::from_static(b"original")
+    );
+}
+
+/// A replayed `PUT` with the published object's exact bytes still finalizes (F3 recovery).
+#[tokio::test]
+async fn upload_replay_with_same_bytes_finalizes() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (control_base_url, finalize_calls) = counting_control_plane().await;
+    state.control_base_url = control_base_url;
+    let file_id = Uuid::now_v7();
+    let version_id = Uuid::now_v7();
+    backend
+        .put("/replay-same", bytes::Bytes::from_static(b"original"))
+        .await
+        .expect("seed the published object");
+    let token = upload_token(&issuer, file_id, version_id, "test", "/replay-same");
+
+    let response = build_router(state, DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(b"original".to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(finalize_calls.load(Ordering::SeqCst), 1);
+}
+
 /// A part the sidecar refuses to write reaches the client with the write's
 /// status, and no report-part callback is made.
 #[tokio::test]
@@ -1319,4 +1413,259 @@ async fn multipart_part_returns_502_when_report_fails() {
         .await
         .expect("read response body");
     assert_eq!(&body[..], b"report failed");
+}
+
+/// Mock control plane answering every request with the status currently stored in the returned
+/// cell (a bodyless response; a `400` carries a short text body).
+async fn scripted_control_plane(initial: u16) -> (String, Arc<AtomicU16>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    let status = Arc::new(AtomicU16::new(initial));
+    let current = Arc::clone(&status);
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                let code = current.load(Ordering::SeqCst);
+                let body = if code == 400 { "size not allowed" } else { "" };
+                let resp = format!(
+                    "HTTP/1.1 {code} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(resp.as_bytes()).await.ok();
+            }
+        }
+    });
+    (format!("http://{addr}"), status)
+}
+
+async fn put_upload(
+    state: &SidecarState,
+    issuer: &Issuer,
+    file_id: Uuid,
+    version_id: Uuid,
+    path: &str,
+    bytes: &'static [u8],
+) -> (StatusCode, String) {
+    let token = upload_token(issuer, file_id, version_id, "test", path);
+    let response = build_router(state.clone(), DEFAULT_MAX_BODY_BYTES)
+        .oneshot(
+            Request::put(format!(
+                "/api/file-storage-data/v1/upload/{file_id}/{version_id}?fs-token={token}"
+            ))
+            .body(Body::from(bytes.to_vec()))
+            .expect("valid request"),
+        )
+        .await
+        .expect("router call succeeds");
+    let status = response.status();
+    let body = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("read body");
+    (status, String::from_utf8_lossy(&body).into_owned())
+}
+
+/// Control plane `400` on the first write: the client gets `400` with its message, the object
+/// is removed, and a corrected retry succeeds.
+#[tokio::test]
+async fn upload_finalize_400_is_relayed_and_object_deleted_then_retry_succeeds() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (url, cp_status) = scripted_control_plane(400).await;
+    state.control_base_url = url;
+    let (file_id, version_id) = (Uuid::now_v7(), Uuid::now_v7());
+
+    let (status, body) =
+        put_upload(&state, &issuer, file_id, version_id, "/cp-400", b"too-big").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "size not allowed");
+    assert!(!backend.exists("/cp-400").await.expect("exists"));
+
+    cp_status.store(200, Ordering::SeqCst);
+    let (status, _) = put_upload(&state, &issuer, file_id, version_id, "/cp-400", b"ok").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(backend.exists("/cp-400").await.expect("exists"));
+}
+
+/// Control plane `404` (version deleted concurrently) on the first write: `404`, object removed.
+#[tokio::test]
+async fn upload_finalize_404_deletes_created_object() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (url, _cp_status) = scripted_control_plane(404).await;
+    state.control_base_url = url;
+    let (status, _) = put_upload(
+        &state,
+        &issuer,
+        Uuid::now_v7(),
+        Uuid::now_v7(),
+        "/cp-404",
+        b"data",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!backend.exists("/cp-404").await.expect("exists"));
+}
+
+/// Control plane `403` on the first write: `502`, the object is kept; the same bytes retried once
+/// the control plane accepts finalize give `200`.
+#[tokio::test]
+async fn upload_finalize_403_keeps_object_and_retry_succeeds() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (url, cp_status) = scripted_control_plane(403).await;
+    state.control_base_url = url;
+    let (file_id, version_id) = (Uuid::now_v7(), Uuid::now_v7());
+
+    let (status, _) = put_upload(&state, &issuer, file_id, version_id, "/cp-403", b"same").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(backend.exists("/cp-403").await.expect("exists"));
+
+    cp_status.store(200, Ordering::SeqCst);
+    let (status, _) = put_upload(&state, &issuer, file_id, version_id, "/cp-403", b"same").await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// A replay (object already stored) whose finalize gets `429` is `502`, not `409`; a `400`
+/// on the replay is the `409`.
+#[tokio::test]
+async fn upload_replay_finalize_429_is_502_and_400_is_409() {
+    let (mut state, issuer, backend) = test_download_state();
+    let (url, cp_status) = scripted_control_plane(429).await;
+    state.control_base_url = url;
+    let (file_id, version_id) = (Uuid::now_v7(), Uuid::now_v7());
+    backend
+        .put("/cp-replay", bytes::Bytes::from_static(b"same"))
+        .await
+        .expect("seed");
+
+    let (status, _) = put_upload(&state, &issuer, file_id, version_id, "/cp-replay", b"same").await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+    cp_status.store(400, Ordering::SeqCst);
+    let (status, _) = put_upload(&state, &issuer, file_id, version_id, "/cp-replay", b"same").await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(backend.exists("/cp-replay").await.expect("kept"));
+}
+
+/// A transient backend error is `503` + `Retry-After: 5`; a permanent one stays `500`.
+#[test]
+fn backend_failure_maps_transient_to_503_with_retry_after() {
+    let transient = backend_failure(&DomainError::backend_unavailable("s3", "timeout"), "test");
+    assert_eq!(transient.status, StatusCode::SERVICE_UNAVAILABLE);
+    let resp = transient.into_response();
+    assert_eq!(
+        resp.headers().get(header::RETRY_AFTER).expect("header"),
+        "5"
+    );
+
+    let permanent = backend_failure(&DomainError::backend("s3", "bad config"), "test");
+    assert_eq!(permanent.status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(permanent.body, "backend error");
+    assert!(
+        permanent
+            .into_response()
+            .headers()
+            .get(header::RETRY_AFTER)
+            .is_none()
+    );
+}
+
+/// Mock control plane answering every request with `status` and `body`.
+async fn control_plane_answering(status: u16, body: &'static str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock control plane");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            if stream.read(&mut buf).await.is_ok() {
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.ok();
+            }
+        }
+    });
+    format!("http://{addr}")
+}
+
+async fn finalize_rejection_body(status: u16, body: &'static str) -> (StatusCode, String) {
+    let mut state = test_state();
+    state.control_base_url = control_plane_answering(status, body).await;
+    let Err(rejection) = finalize_with_control_plane(
+        &state,
+        "dummy-token",
+        "rid",
+        Uuid::nil(),
+        Uuid::nil(),
+        0,
+        "deadbeef",
+    )
+    .await
+    else {
+        panic!("finalize must fail");
+    };
+    let backend = InMemoryBackend::new("test");
+    let claims = part_claims("test", "/x", 1, String::new());
+    let response = finalize_rejection_response(&backend, &claims, true, rejection).await;
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    (status, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn finalize_400_relays_problem_detail_only() {
+    let (status, body) = finalize_rejection_body(
+        400,
+        r#"{"type":"x","title":"Bad","status":400,"detail":"size exceeds policy","trace_id":"t"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "size exceeds policy");
+
+    let (status, body) = finalize_rejection_body(400, "plain text reason").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(body, "plain text reason");
+}
+
+#[tokio::test]
+async fn finalize_other_statuses_do_not_leak_control_plane_body() {
+    for status in [401u16, 403, 500, 503] {
+        let (code, body) = finalize_rejection_body(status, "control-plane-secret").await;
+        assert_eq!(code, StatusCode::BAD_GATEWAY, "status {status}");
+        assert_eq!(body, "finalize failed", "status {status}");
+    }
+}
+
+/// A lost-but-not-created upload whose version vanished (`404`) is not turned into a `404`
+/// for the client: the object belongs to another request, so it stays a generic `502`.
+#[tokio::test]
+async fn finalize_404_without_created_is_502_with_generic_body() {
+    let backend = InMemoryBackend::new("test");
+    let claims = part_claims("test", "/x", 1, String::new());
+    let rejection = Rejection {
+        status: StatusCode::BAD_GATEWAY,
+        body: "finalize failed".into(),
+        control_plane_status: Some(StatusCode::NOT_FOUND),
+        retry_after_secs: None,
+    };
+    let response = finalize_rejection_response(&backend, &claims, false, rejection).await;
+    assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read body");
+    assert_eq!(&bytes[..], b"finalize failed");
+}
+
+#[test]
+fn truncate_utf8_cuts_on_a_char_boundary() {
+    // Each U+044F is 2 bytes: a cut at 3 bytes must back off to 2.
+    let s = "\u{44f}".repeat(3);
+    assert_eq!(truncate_utf8(s.clone(), 3), "\u{44f}");
+    assert_eq!(truncate_utf8(s, 4), "\u{44f}\u{44f}");
+    assert_eq!(truncate_utf8("abc".to_owned(), 10), "abc");
 }

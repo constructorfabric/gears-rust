@@ -82,14 +82,17 @@ impl RestBroker {
         self
     }
 
+    /// Whether wire logging is on for this client.
     pub(crate) fn debug(&self) -> bool {
         self.debug
     }
 
+    /// The underlying HTTP client every request goes through.
     pub(crate) fn http(&self) -> &HttpClient {
         &self.http
     }
 
+    /// The framing this client opens delivery streams with.
     pub(crate) fn framing(&self) -> StreamTransport {
         self.framing
     }

@@ -4,13 +4,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use event_broker_sdk::backend::{
+    AppendRequest, Appended, Backend, BackendError, Dedup, LogClaim, Provisioning, TopicPartition,
+    TopicSpec, Wait, Watch,
+};
+use event_broker_sdk::{Event, PartitionRange, Position, Sequence, TopicSegment};
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use toolkit_gts::GtsInstanceId;
 use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
 
 use super::SpecificationRefreshWorker;
-use crate::domain::specification::SpecificationManager;
+use crate::domain::specification::{ProvisioningLimits, SpecificationManager};
 use crate::infra::specification::TypesRegistrySpecificationManager;
+use crate::test_support::SingleBackendResolver;
 use crate::test_support::StaticTypesRegistry;
 
 const TOPIC_ID: &str = "gts.cf.core.events.topic.v1~example.eb.refresh.topic.v1";
@@ -158,4 +166,117 @@ async fn a_failing_pass_leaves_the_previous_load_in_place() {
         manager.get_topic(&topic_id).await.is_some(),
         "a pass that found nothing must not remove what the last one admitted"
     );
+}
+
+/// Answers every `provision` with `Pending`, standing in for a backend still
+/// starting; provisioning calls nothing else.
+struct PendingBackend;
+
+fn unused() -> BackendError {
+    BackendError::Internal("provisioning calls only provision".to_owned())
+}
+
+#[async_trait]
+impl Backend for PendingBackend {
+    async fn provision(&self, _: &TopicSpec, _: &LogClaim) -> Result<Provisioning, BackendError> {
+        Ok(Provisioning::Pending)
+    }
+    async fn append(&self, _: &AppendRequest<'_>) -> Result<Appended, BackendError> {
+        Err(unused())
+    }
+    fn dedup(&self) -> Dedup {
+        Dedup::Fenced
+    }
+    fn max_events_per_append(&self) -> usize {
+        1
+    }
+    async fn read(
+        &self,
+        _: &TopicPartition,
+        _: Sequence,
+        _: usize,
+        _: Wait,
+    ) -> Result<Vec<Event>, BackendError> {
+        Err(unused())
+    }
+    async fn resolve(&self, _: &TopicPartition, _: Position) -> Result<Sequence, BackendError> {
+        Err(unused())
+    }
+    fn watch(&self) -> Watch<'_> {
+        Watch::Poll(Duration::from_secs(1))
+    }
+    async fn query(
+        &self,
+        _: &TopicPartition,
+        _: PartitionRange,
+    ) -> Result<Vec<TopicSegment>, BackendError> {
+        Err(unused())
+    }
+}
+
+/// A worker over one registered topic whose backend never provisions it.
+async fn pending_worker() -> SpecificationRefreshWorker {
+    let db = test_db().await;
+    let client: Arc<dyn types_registry_sdk::TypesRegistryClient> = Arc::new(
+        MockTypesRegistryClient::new()
+            .with_instances(vec![make_test_instance(TOPIC_ID, topic_document())]),
+    );
+    let backend: Arc<dyn Backend> = Arc::new(PendingBackend);
+    SpecificationRefreshWorker::new(
+        client,
+        Arc::clone(&db),
+        StaticTypesRegistry::empty_config(),
+        Duration::from_mins(1),
+    )
+    .provisioning(
+        Arc::new(TypesRegistrySpecificationManager::new(db)),
+        Arc::new(SingleBackendResolver::new(backend)),
+        ProvisioningLimits {
+            call_timeout: Duration::from_millis(100),
+            attempt_timeout: Duration::from_mins(5),
+        },
+    )
+}
+
+/// A stop during the startup wait ends the wait at once instead of after it:
+/// the process exits promptly on a stop right after launch.
+#[tokio::test]
+async fn a_stop_ends_the_startup_provisioning_wait_promptly() {
+    let worker = pending_worker().await;
+    assert_eq!(
+        worker.run_once().await,
+        1,
+        "the backend leaves the topic pending"
+    );
+
+    let stop = CancellationToken::new();
+    let stopper = stop.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stopper.cancel();
+    });
+    let started = std::time::Instant::now();
+    let settled = worker
+        .settle_provisioning(Duration::from_secs(10), &stop)
+        .await;
+    let waited = started.elapsed();
+
+    assert_eq!(settled, None, "a stop ends the wait before it settles");
+    assert!(
+        waited < Duration::from_secs(2),
+        "the wait ended {waited:?} after starting, the stop came after 200ms"
+    );
+}
+
+/// Without a stop the wait runs to its bound and reports what is still pending.
+#[tokio::test]
+async fn the_startup_provisioning_wait_reports_what_is_left_at_its_bound() {
+    let worker = pending_worker().await;
+    worker.run_once().await;
+
+    let settled = worker
+        .settle_provisioning(Duration::from_millis(300), &CancellationToken::new())
+        .await;
+
+    assert_eq!(settled, Some(1));
 }

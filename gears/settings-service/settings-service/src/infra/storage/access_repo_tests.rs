@@ -16,6 +16,7 @@ fn draft(declaration: Uuid, tenant: Uuid, access: TenantAccess) -> RestrictionDr
         tenant_id: tenant,
         access,
         set_by: "root-admin".to_owned(),
+        set_by_tenant: None,
     }
 }
 

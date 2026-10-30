@@ -1431,24 +1431,22 @@ The components each contract namespace adds are defined here and specified norma
     | Pricing money (`PriceModel` amounts, `Tier.rate`, `minimum_fee`) | `rust_decimal::Decimal` in **major** units, as Pricing sends it | decimal string (REST), `Decimal` (SDK) | inside the stored binding, canonical decimal text | Pricing's own validation; no narrower rate or amount limit is published (R-33), except that `minimum_fee` is capped at the currency scale (`MIN_FEE_INVALID`, the money ADR's Adoption) | enters exact arithmetic as the reduced fraction of its digits over `10^scale`, in major units, tagged with the bound price's `currency` and its stored scale `price.currency.scale()` (D-531); never rounded, rescaled or multiplied by `10^currency_scale` (T-D-74, T-D-80) |
     | Usage entry quantity | `ExactQuantity` (big integer × 10^-28 scale) | canonical decimal string | `NUMERIC(88,28)` | as accepted by the collector (≤ 28 fractional digits, magnitude < 10^28, ADR-0013) | `usage_malformed` (raw row kept) |
     | Aggregate `Q` (per slice, per window, group total) | `ExactQuantity` | canonical decimal string | `NUMERIC(88,28)` | ≤ 60 integer digits, ≤ 28 fractional digits; never rounded or saturated | `quantity_out_of_range`: checked in `count` before the counter UPSERT, so the SQL bound is never hit and the feed never stalls; the record becomes `rejected(quantity_out_of_range)`, its child `failed`, nothing is delivered |
-    | `ExactMoney` (reduced fraction in **major** units, with `currency` and `currency_scale`; Rating's wire DTO) | `bss_money::exact::ExactAmount` (the shared BSS money crate, `gears/bss/libs/money`: reduced fraction, exact arithmetic; canonical fraction text once `…-upreq-bss-money-exact-api` lands) + `bss_money::CurrencySpec{code, scale}` | `{numerator, denominator, currency, currency_scale}`: numerator and denominator canonical integer strings, `currency_scale` a JSON integer (as in the money ADR) | `*_num NUMERIC(84,0)`, `*_den NUMERIC(64,0)` on a row that carries `currency` and `currency_scale` (§3.7) | `abs(numerator) < 10^84`, `1 ≤ denominator < 10^64` after reduction | `precision_overflow`: deterministic `EvaluationError` before persistence or delivery |
+    | `ExactMoney` (reduced fraction in **major** units, with `currency` and `currency_scale`; Rating's wire DTO) | `bss_money::exact::ExactAmount` (the shared BSS money crate, `gears/bss/libs/money`: reduced fraction, exact arithmetic, canonical fraction text) + `bss_money::CurrencySpec{code, scale}` | `{numerator, denominator, currency, currency_scale}`: numerator and denominator canonical integer strings, `currency_scale` a JSON integer (as in the money ADR) | `*_num NUMERIC(84,0)`, `*_den NUMERIC(64,0)` on a row that carries `currency` and `currency_scale` (§3.7) | `abs(numerator) < 10^84`, `1 ≤ denominator < 10^64` after reduction | `precision_overflow`: deterministic `EvaluationError` before persistence or delivery |
     | Intermediate arithmetic | `bss_money::exact::ExactAmount` | — | — | the crate's limits — a reduced integer ≤ 256 decimal digits, scratch products ≤ 512 — recorded as the generation's `ArithmeticBudget` and checked **before** each multiply/divide | `ExactError::ArithmeticLimit` → `precision_overflow` |
 
     **Shared money crate API** (money ADR rule 2: one crate, no Rating copy). From
     `bss_money::exact::ExactAmount` on `main` the core uses `from_decimal`, `from_coefficient`,
     `checked_add`, `checked_sub`, `checked_mul`, `checked_div`, `ceil` (the package block
     `ceil(q / size)`; `exact.rs:126`, added in `958b5e2f1`) and `Ord`, plus `round_half_even`
-    and `canonical_at_scale` only for `evaluate_order`'s display decimals. It
-    also needs additions the crate does not have (`gears/bss/libs/money/src/exact.rs`, whose
-    fields are private): `numer()` / `denom()` accessors; `from_parts(BigInt, BigInt)`, which
-    reduces and refuses a zero denominator; `floor` to an integer;
-    a constructor from an `ExactQuantity` of up to 60 + 28 digits; and canonical fraction text
-    with a parser (the `numerator` / `denominator` strings of the wire, storage and digests).
-    They are asked of the crate owner
-    ([`…-upreq-bss-money-exact-api`](./UPSTREAM_REQS.md#28-bss-ledger-and-the-shared-money-crate));
-    a generation vendors the crate release that has them (§4.1). Without them the core cannot write
-    `47/400` (V35), reload a numerator above `i128` or take a 40-digit `Q`, so feature 02 waits
-    for the ask.
+    and `canonical_at_scale` only for `evaluate_order`'s display decimals. It also uses the
+    additions Rating asked of the crate owner
+    ([`…-upreq-bss-money-exact-api`](./UPSTREAM_REQS.md#28-bss-ledger-and-the-shared-money-crate),
+    closed by PR #5527): the `numer()` / `denom()` accessors; `from_parts(BigInt, BigInt)`, which
+    reduces and refuses a zero denominator; `floor` to an integer; `parse_decimal`, which reads an
+    `ExactQuantity` of up to 60 + 28 digits; and `canonical_fraction` with its strict parser
+    `parse_fraction` (the `numerator` / `denominator` strings of the wire, storage and digests).
+    With them the core writes `47/400` (V35), reloads a numerator above `i128` and takes a
+    40-digit `Q`; a generation vendors the crate release that has them (§4.1).
 
     **Why the bounds suffice** (money ADR rule 3; Rating's proposal until Billing accepts the delivery
     bounds, R-32). The producers publish today: pricing money is a `rust_decimal::Decimal` (scale

@@ -90,23 +90,16 @@ impl RequestFingerprint {
     }
 }
 
-/// The principal recorded on every P0 operation.
+/// Placeholder principal for every P0 operation (ponytail: ceiling C2).
 ///
-/// ponytail: ceiling C2. P0 has no platform identity to name — no inbound
-/// platform-identity validator exists (C8) — so this constant stands in. `nil` is
-/// the value, decided at the Checkpoint 1 gate (SPEC §17, O2 closed): it is the
-/// honest spelling of "no subject", where a deterministic `UUIDv5` would read as a
-/// principal that could be resolved. Greppability comes from this constant's name,
-/// not from its value.
-/// Because `idempotency_scope_hash` then digests three constants, the
-/// `Idempotency-Key` namespace is effectively **global**: two unrelated callers
-/// reusing one key collide with `409` rather than being separated by scope. The
-/// upgrade path needs no schema change, only a real subject: the column and the
-/// digest already carry it.
+/// Platform routes validate internal tokens (D17), but P0 records no identity;
+/// in-process outbound markers identify no workload. `nil` means no subject
+/// (SPEC §17 O2). The scope hash therefore digests constants, making
+/// `Idempotency-Key` effectively global: unrelated callers reusing a key get 409.
 ///
-/// TODO(P1): replace with the `SecurityContext` subject once platform identity
-/// exists, at which point the namespace narrows to (plane, tenant, principal) as
-/// `database.sql` describes.
+/// TODO(P1): use validated `PlatformIdentity` (unavailable for outbound markers)
+/// to scope keys by (plane, tenant, principal), as `database.sql` describes.
+/// The column and digest already support this; no schema change is needed.
 pub const P0_PRINCIPAL_ID: Uuid = Uuid::nil();
 
 /// Canonical UTF-8 bytes of a JSON document: object keys sorted, arrays in order,
