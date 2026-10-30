@@ -38,6 +38,12 @@ use graph_storage_sdk::models::{
 use crate::config::GraphStorageConfig;
 use crate::domain::error::DomainError;
 
+/// How many values `edge_discriminators` may carry. Every one is a bind
+/// parameter of the edge scan on every hop, and `PostgreSQL` accepts at most
+/// 65 535 per statement: past that the scan fails and the walk would answer
+/// `Internal` instead of a refusal the caller can act on.
+pub const EDGE_DISCRIMINATORS_MAX: usize = 1_000;
+
 fn exceeded(what: impl Into<String>) -> DomainError {
     DomainError::LimitExceeded { what: what.into() }
 }
@@ -432,6 +438,12 @@ pub fn admit_traverse(
     }
     for (index, pattern) in node_type_patterns.iter().enumerate() {
         admit_identifier(cfg, &format!("node_type_patterns[{index}]"), pattern)?;
+    }
+    if edge_discriminators.len() > EDGE_DISCRIMINATORS_MAX {
+        return Err(exceeded(format!(
+            "edge_discriminators carries {} values; the bound is {EDGE_DISCRIMINATORS_MAX}",
+            edge_discriminators.len()
+        )));
     }
     // Held to the bound ingest holds a discriminator to: a longer value can
     // match no stored edge, and every one is bound into the edge scan.
@@ -965,6 +977,30 @@ mod tests {
 
         // Zero is not a depth, whatever the ceiling.
         admit_neighborhood(&loosened, &neighborhood(0)).expect_err("depth 0 is not a walk");
+    }
+
+    /// The discriminator list is bounded by count as well as by length: each
+    /// value is a bind parameter of every hop's edge scan.
+    #[test]
+    fn edge_discriminators_are_bounded_by_count() {
+        use graph_storage_sdk::models::TraverseRequest;
+
+        use super::{DomainError, EDGE_DISCRIMINATORS_MAX};
+
+        let cfg = GraphStorageConfig::default();
+        let walk = |count: usize| TraverseRequest {
+            seeds: vec!["root".to_owned()],
+            depth: 1,
+            edge_discriminators: (0..count).map(|i| format!("d{i}")).collect(),
+            ..TraverseRequest::default()
+        };
+        admit_traverse(&cfg, &walk(EDGE_DISCRIMINATORS_MAX)).expect("the bound itself is admitted");
+        let refusal = admit_traverse(&cfg, &walk(EDGE_DISCRIMINATORS_MAX + 1))
+            .expect_err("one value over the bound is refused");
+        assert!(
+            matches!(refusal, DomainError::LimitExceeded { ref what } if what.contains("edge_discriminators")),
+            "refused as a limit naming the field: {refusal}"
+        );
     }
 
     /// The two endpoints answer the same question the same way.

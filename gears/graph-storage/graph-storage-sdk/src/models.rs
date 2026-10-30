@@ -1158,7 +1158,8 @@ pub struct TraverseRequest {
     /// ingested without a discriminator never matches a non-empty list.
     ///
     /// Applied in the edge scan, so the edges it excludes spend neither the
-    /// hop's edge budget nor the walk's node budget.
+    /// hop's edge budget nor the walk's node budget. At most 1 000 values;
+    /// a longer list is refused as `limit_exceeded`.
     pub edge_discriminators: Vec<String>,
 }
 
