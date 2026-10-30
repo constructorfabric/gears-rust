@@ -180,6 +180,8 @@ pub enum NothingStored {
     NoChange,
     /// The deadline passed before the write started.
     Timeout,
+    /// Every step touched a fact under an open review request.
+    UnderReview,
     Dropped(DropReason),
 }
 
@@ -190,6 +192,7 @@ impl NothingStored {
         match self {
             Self::NoChange => "no_change",
             Self::Timeout => "timeout",
+            Self::UnderReview => "under_review",
             Self::Dropped(reason) => reason.name(),
         }
     }
@@ -388,11 +391,16 @@ impl Processing {
             Ok(plan) => plan,
             Err(reason) => return Ok(Prepared::Nothing(NothingStored::Dropped(reason))),
         };
-        if !plan.steps.is_empty() {
-            self.skip_under_review(scope, &mut plan).await?;
-        }
         if plan.steps.is_empty() {
             return Ok(Prepared::Nothing(NothingStored::NoChange));
+        }
+        // The open requests are Construct's own, read as Construct: under
+        // the agent's scope a request the scope does not reach would not
+        // freeze its fact.
+        let (_, construct) = self.ports.contexts.for_tenant(message.tenant_id).await?;
+        self.skip_under_review(&construct, &mut plan).await?;
+        if plan.steps.is_empty() {
+            return Ok(Prepared::Nothing(NothingStored::UnderReview));
         }
         let Checked::Verdicts(verdicts) = self.checks.run(&plan).await else {
             return Ok(Prepared::Nothing(NothingStored::Dropped(
@@ -415,7 +423,8 @@ impl Processing {
 impl Processing {
     /// Drops every step of `plan` that would change or remove a fact under an
     /// open review request, or add a property to it. The planner still sees
-    /// the fact, so the model does not add it again.
+    /// the fact, so the model does not add it again. `construct` is
+    /// Construct's own scope in the plan's tenant.
     ///
     /// The open requests are read here, outside the write's compare-and-set,
     /// and opening a request does not move the profile's version. So a flag
@@ -427,7 +436,7 @@ impl Processing {
     /// @cpt-dod:cpt-cf-construct-dod-review-queue-frozen:p1
     async fn skip_under_review(
         &self,
-        scope: &AccessScope,
+        construct: &AccessScope,
         plan: &mut Plan,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-skip:p1:inst-skip-drop
@@ -435,7 +444,7 @@ impl Processing {
             .ports
             .reviews
             .under_review(
-                scope,
+                construct,
                 SubjectKey {
                     tenant_id: plan.tenant_id,
                     subject_id: plan.subject_id,
@@ -456,6 +465,7 @@ impl Processing {
             tracing::info!(
                 event = "planner_steps_under_review_dropped",
                 tenant_id = %plan.tenant_id,
+                subject_id = %plan.subject_id,
                 dropped,
                 "planned steps on facts under review were dropped"
             );

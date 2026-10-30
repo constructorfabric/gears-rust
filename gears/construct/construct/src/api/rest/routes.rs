@@ -248,9 +248,12 @@ pub fn register_subject_control_routes(
         .operation_id("construct.delete_subject_fact")
         .summary("Delete one of the subject's own facts")
         .description(
-            "Soft-deletes one live fact of the caller; it is not served from the next read. \
-             Owner only. Another subject, or a fact the subject does not have, answers 404. \
-             503 when the profile kept changing while the delete was written.",
+            "Soft-deletes one live fact of the caller; it is not served from the next read, \
+             and an open review request on it closes as deleted. Owner only. Another subject, \
+             or a fact the subject does not have, answers 404. 503 when the profile kept \
+             changing while the delete was written, or when the fact was deleted but its \
+             review request could not be closed; sending the delete again then closes the \
+             request and answers 204.",
         )
         .tag(SUBJECT_FACTS_TAG)
         .authenticated()
@@ -274,8 +277,8 @@ pub fn register_subject_control_routes(
         .operation_id("construct.export_subject")
         .summary("Export a subject's data")
         .description(
-            "All of a subject's data in the caller's tenant, as a JSON file: the settings \
-             and every live fact with its origin. For the data protection officer, under \
+            "All of a subject's data in the caller's tenant, as a JSON file: the settings, \
+             every live fact with its origin, and every review request, open and closed. For the data protection officer, under \
              the permission to export a subject's data; without it, 403. A subject \
              without data in the tenant exports empty, like one with no profile.",
         )

@@ -17,8 +17,9 @@ use crate::domain::profile::Category;
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
     AllowResolver, DenyResolver, FixedSubjectSettings, MemoryProfile, MemoryWriter, context_of,
-    stored_fact, subject_control,
+    stored_fact,
 };
+use crate::test_support::{MemoryReviews, profile_writes, subject_control_reviewed};
 
 const FACTS_RESOURCE_TYPE: &str = "gts.cf.construct.subject.fact.v1~";
 
@@ -26,6 +27,7 @@ struct Subject {
     tenant: Uuid,
     id: Uuid,
     profile: Arc<MemoryProfile>,
+    reviews: Arc<MemoryReviews>,
 }
 
 impl Subject {
@@ -38,6 +40,7 @@ impl Subject {
                 stored_fact(Category::Skill, "skills", json!({ "name": "Rust" }), 10),
                 stored_fact(Category::Role, "roles", json!({ "title": "Engineer" }), 20),
             ]),
+            reviews: Arc::default(),
         }
     }
 
@@ -60,13 +63,17 @@ impl Subject {
         caller: Uuid,
         settings: Arc<dyn crate::domain::subject_settings::SubjectSettingsReader>,
     ) -> Router {
-        let service = subject_control(
+        let service = subject_control_reviewed(
             resolver,
-            Arc::clone(&self.profile),
-            MemoryWriter::new(Arc::clone(&self.profile), 0),
+            Arc::new(profile_writes(
+                Arc::clone(&self.profile),
+                MemoryWriter::new(Arc::clone(&self.profile), 0),
+                Some(Uuid::new_v4()),
+            )),
             settings,
             Arc::default(),
-            Some(Uuid::new_v4()),
+            Arc::clone(&self.reviews),
+            Arc::default(),
         );
         register_subject_control_routes(
             Router::new(),
@@ -244,6 +251,20 @@ async fn the_export_is_a_json_attachment_and_403_without_its_permission() {
     let subject = Subject::new();
     let officer = Uuid::new_v4();
     let uri = format!("/construct/v1/subjects/{}/export", subject.id);
+    let skill = subject
+        .profile
+        .live()
+        .into_iter()
+        .find(|fact| fact.category == Category::Skill)
+        .unwrap();
+    let request = subject.reviews.open_on_at(
+        crate::domain::subject_settings::SubjectKey {
+            tenant_id: subject.tenant,
+            subject_id: subject.id,
+        },
+        &skill,
+        1_000,
+    );
 
     let exported = send(
         subject.routes(Arc::new(AllowResolver), officer),
@@ -267,6 +288,20 @@ async fn the_export_is_a_json_attachment_and_403_without_its_permission() {
     assert_eq!(exported.body["tenant_id"], subject.tenant.to_string());
     assert_eq!(exported.body["settings"]["personalization_enabled"], false);
     assert_eq!(exported.body["facts"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        exported.body["review_requests"],
+        json!([{
+            "id": request.id,
+            "subject_id": subject.id,
+            "fact_id": skill.node_key.0,
+            "entity_kind": "skill",
+            "property": "skills",
+            "value": { "name": "Rust" },
+            "state": "open",
+            "created_at": "1970-01-01T00:16:40Z",
+        }]),
+        "every request, with the flagged value while open"
+    );
     assert!(exported.body["exported_at"].is_string());
     assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.body);
     assert_eq!(
@@ -421,4 +456,54 @@ async fn a_refused_settings_read_on_the_export_is_403() {
 
     assert_eq!(answer.status, StatusCode::FORBIDDEN, "{}", answer.body);
     assert_eq!(answer.body["context"]["resource_type"], FACTS_RESOURCE_TYPE);
+}
+
+#[tokio::test]
+async fn each_fact_shows_its_latest_review_request_or_null() {
+    use crate::domain::review_queue::{Closed, ReviewOutcome, ReviewStatus};
+    use crate::domain::subject_settings::SubjectKey;
+
+    let subject = Subject::new();
+    let key = SubjectKey {
+        tenant_id: subject.tenant,
+        subject_id: subject.id,
+    };
+    let live = subject.profile.live();
+    let (skill, role) = (&live[0], &live[1]);
+    let open = subject.reviews.open_on_at(key, skill, 100);
+    let closed = subject.reviews.open_on_at(key, role, 200);
+    subject.reviews.requests.lock().unwrap()[0].0.status = ReviewStatus::Closed(Closed {
+        outcome: ReviewOutcome::Rejected,
+        by: Uuid::new_v4(),
+        at: time::OffsetDateTime::from_unix_timestamp(300).unwrap(),
+        reason: None,
+    });
+
+    let listed = send(subject.own(), Method::GET, &subject.facts()).await;
+    let one = send(subject.own(), Method::GET, &subject.fact(&skill.node_key.0)).await;
+    let nothing = {
+        let other = Subject::new();
+        send(other.own(), Method::GET, &other.facts()).await
+    };
+
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.body);
+    let by_id = |id: &str| {
+        listed.body["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["fact_id"] == json!(id))
+            .unwrap()["review_request"]
+            .clone()
+    };
+    let on_skill = by_id(&skill.node_key.0);
+    assert_eq!(on_skill["id"], json!(open.id));
+    assert_eq!(on_skill["state"], json!("open"));
+    assert!(on_skill.get("outcome").is_none(), "{on_skill}");
+    let on_role = by_id(&role.node_key.0);
+    assert_eq!(on_role["id"], json!(closed.id));
+    assert_eq!(on_role["state"], json!("closed"));
+    assert_eq!(on_role["outcome"], json!("rejected"));
+    assert_eq!(one.body["review_request"]["id"], json!(open.id));
+    assert_eq!(nothing.body["items"][0]["review_request"], Value::Null);
 }

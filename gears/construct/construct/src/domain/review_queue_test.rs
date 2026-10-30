@@ -13,23 +13,26 @@ use uuid::Uuid;
 
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
+use crate::domain::plan::Plan;
 use crate::domain::plan::{Change, NodeKey, Origin};
 use crate::domain::planner::catalog::PropertyCatalog;
+use crate::domain::planner::processing::{PlanWriter, Written};
 use crate::domain::profile::Category;
 use crate::domain::profile_writes::ProfileWrites;
+use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::record_intake::DropReason;
 use crate::domain::review_queue::{
-    Corrections, NotStored, Resolution, ReviewOutcome, ReviewQueueEvent, ReviewQueueService,
-    ReviewRequest, ReviewStatus, ReviewText,
+    CLAIM_HOLD, Corrections, NotStored, Resolution, ReviewConflict, ReviewOutcome,
+    ReviewQueueEvent, ReviewQueueService, ReviewRequest, ReviewStatus, ReviewText,
 };
 use crate::domain::sensitive_data::{SensitiveDataCheck, SensitiveDataChecks, SensitiveDataKind};
-use crate::domain::subject_control::{SubjectFacts, SubjectProfiles};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
 use crate::infra::processing_contexts::ServiceIdentity;
 use crate::test_support::{
-    AllowInOwnTenant, AllowResolver, DenyResolver, FixedRules, FixedSubjectSettings, MemoryProfile,
-    MemoryReviews, MemoryWriter, OwnerOnlyResolver, RecordingAdmissionEvents, RecordingEvents,
-    RecordingResolver, RecordingReviewEvents, SubstringCheck, context_of, open_rules, stored_fact,
+    AllowInOwnTenant, AllowResolver, DenyResolver, FailingCheck, FixedRules, FixedSubjectSettings,
+    MemoryProfile, MemoryReviews, MemoryWriter, OwnerOnlyResolver, RecordingAdmissionEvents,
+    RecordingEvents, RecordingResolver, RecordingReviewEvents, SubstringCheck, context_of,
+    open_rules, stored_fact,
 };
 
 const ON: SubjectSettings = SubjectSettings {
@@ -226,7 +229,10 @@ async fn a_second_flag_on_a_fact_under_review_is_a_conflict() {
         .await;
 
     assert!(
-        matches!(again, Err(DomainError::ReviewConflict(_))),
+        matches!(
+            again,
+            Err(DomainError::ReviewConflict(ReviewConflict::AlreadyOpen(_)))
+        ),
         "{again:?}"
     );
     assert_eq!(fixture.reviews.all().len(), 1);
@@ -310,6 +316,56 @@ async fn a_flag_on_a_fact_removed_meanwhile_closes_its_request_and_is_no_such_fa
     );
     let [request] = fixture.reviews.all().try_into().unwrap();
     assert_eq!(outcome_of(&request), &ReviewOutcome::Deleted);
+    let events = fixture.events.taken();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                ReviewQueueEvent::Requested { request_id: opened, .. },
+                ReviewQueueEvent::Resolved { request_id: closed, outcome: ReviewOutcome::Deleted, by, .. },
+            ] if *opened == request.id && *closed == request.id && *by == fixture.subject
+        ),
+        "the request is announced, then closed: {events:?}"
+    );
+}
+
+/// Serves the fixture's facts on the first read and fails after.
+struct ReadOnce {
+    profile: Arc<MemoryProfile>,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl SubjectProfiles for ReadOnce {
+    async fn facts(
+        &self,
+        ctx: &SecurityContext,
+        key: SubjectKey,
+    ) -> Result<SubjectFacts, DomainError> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+            return Err(DomainError::Unavailable("graph storage is down".to_owned()));
+        }
+        self.profile.facts(ctx, key).await
+    }
+}
+
+#[tokio::test]
+async fn a_flag_whose_fact_cannot_be_read_again_is_answered_with_its_stored_request() {
+    let fixture = Fixture::new(0);
+    let once = Arc::new(ReadOnce {
+        profile: Arc::clone(&fixture.profile),
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = fixture.service_over(Arc::new(AllowResolver), once, Some(ON), Vec::new());
+
+    let flagged = service
+        .flag(&fixture.owner(), fixture.subject, &fixture.skill(), None)
+        .await
+        .unwrap();
+
+    let [stored] = fixture.reviews.all().try_into().unwrap();
+    assert_eq!(flagged, stored);
+    assert!(stored.is_open());
 }
 
 #[tokio::test]
@@ -368,7 +424,16 @@ async fn the_subject_lists_its_requests_and_a_reviewer_the_open_ones() {
         .unwrap();
 
     assert_eq!(own.items, std::slice::from_ref(&request));
-    assert_eq!(open.items, [request]);
+    assert_eq!(open.items, std::slice::from_ref(&request));
+    assert_eq!(
+        fixture.events.taken().last(),
+        Some(&ReviewQueueEvent::Listed {
+            tenant_id: fixture.tenant,
+            by: fixture.reviewer,
+            request_ids: vec![request.id],
+        }),
+        "the reviewer's read of flagged values is recorded"
+    );
 }
 
 #[tokio::test]
@@ -450,7 +515,7 @@ async fn a_rejection_closes_the_request_with_its_reason_and_keeps_the_fact() {
             by: fixture.reviewer,
         })
     );
-    assert_eq!(fixture.reviews.claims(), [None], "no claim is left");
+    assert_eq!(fixture.reviews.held(), [false], "no claim is left");
 }
 
 #[tokio::test]
@@ -611,7 +676,7 @@ async fn a_correction_admission_drops_stores_nothing_and_gives_the_request_back(
     );
     assert!(fixture.writer.plans().is_empty());
     assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
-    assert_eq!(fixture.reviews.claims(), [None], "the claim is given back");
+    assert_eq!(fixture.reviews.held(), [false], "the claim is given back");
 }
 
 #[tokio::test]
@@ -715,30 +780,53 @@ async fn without_the_opt_in_a_correction_is_not_configured_and_the_rest_works() 
 }
 
 #[tokio::test]
-async fn a_request_another_reviewer_is_resolving_is_a_conflict() {
+async fn a_request_another_resolution_holds_is_a_conflict_until_its_hold_ends() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
-    fixture.reviews.requests.lock().unwrap()[0].1 = Some(Uuid::new_v4());
+    let now = time::OffsetDateTime::now_utc();
+    fixture
+        .reviews
+        .hold_first(now - CLAIM_HOLD + std::time::Duration::from_secs(5));
 
-    let second = fixture
+    let held = fixture
         .service()
         .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
         .await;
+    fixture
+        .reviews
+        .hold_first(now - CLAIM_HOLD - std::time::Duration::from_secs(5));
+    let after_the_hold = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await;
 
     assert!(
-        matches!(second, Err(DomainError::ReviewConflict(_))),
-        "{second:?}"
+        matches!(
+            held,
+            Err(DomainError::ReviewConflict(ReviewConflict::Held(id))) if id == request.id
+        ),
+        "{held:?}"
     );
-    assert!(fixture.writer.plans().is_empty(), "nothing is written");
+    assert_eq!(
+        fixture.writer.plans().len(),
+        0,
+        "nothing is written while it is held"
+    );
+    assert_eq!(
+        outcome_of(&after_the_hold.unwrap()),
+        &ReviewOutcome::Rejected,
+        "a hold older than CLAIM_HOLD is taken over"
+    );
 }
 
+#[tracing_test::traced_test]
 #[tokio::test]
-async fn a_request_closed_while_its_correction_was_written_is_a_conflict() {
+async fn a_request_closed_while_its_correction_was_written_is_a_conflict_that_says_so() {
     let fixture = Fixture::new(0);
     let request = fixture.flagged().await;
     fixture
         .reviews
-        .deleted_while_claimed
+        .deleted_while_written
         .store(true, Ordering::SeqCst);
 
     let lost = fixture
@@ -747,7 +835,15 @@ async fn a_request_closed_while_its_correction_was_written_is_a_conflict() {
         .await;
 
     assert!(
-        matches!(lost, Err(DomainError::ReviewConflict(_))),
+        matches!(
+            &lost,
+            Err(DomainError::ReviewConflict(
+                ReviewConflict::ClosedAfterWrite {
+                    outcome: ReviewOutcome::Corrected(_),
+                    ..
+                }
+            ))
+        ),
         "{lost:?}"
     );
     assert_eq!(
@@ -761,6 +857,254 @@ async fn a_request_closed_while_its_correction_was_written_is_a_conflict() {
         &ReviewOutcome::Deleted,
         "as the subject closed it"
     );
+    assert!(logs_contain("was written, but its request was not closed"));
+    assert!(
+        matches!(
+            fixture.events.taken().as_slice(),
+            [ReviewQueueEvent::Requested { .. }]
+        ),
+        "no resolved event from the reviewer"
+    );
+}
+
+/// A writer that fails every write, after it may have landed.
+struct FailingWriter;
+
+#[async_trait]
+impl PlanWriter for FailingWriter {
+    async fn write(&self, _: &SecurityContext, _: &Plan) -> Result<Written, DomainError> {
+        Err(DomainError::Unavailable("graph storage is down".to_owned()))
+    }
+}
+
+/// A writer that stores each plan through `inner`, then fails.
+struct LandsThenFails {
+    inner: Arc<MemoryWriter>,
+}
+
+#[async_trait]
+impl PlanWriter for LandsThenFails {
+    async fn write(&self, ctx: &SecurityContext, plan: &Plan) -> Result<Written, DomainError> {
+        self.inner.write(ctx, plan).await?;
+        Err(DomainError::Unavailable("the answer was lost".to_owned()))
+    }
+}
+
+#[tokio::test]
+async fn a_failed_write_found_in_the_profile_closes_the_request() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    let writes = ProfileWrites::new(
+        Arc::clone(&fixture.profile) as _,
+        Arc::new(LandsThenFails {
+            inner: Arc::clone(&fixture.writer),
+        }),
+        Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+        2,
+    );
+    let service = ReviewQueueService::new(
+        Arc::new(writes),
+        Arc::clone(&fixture.reviews) as _,
+        Arc::clone(&fixture.events) as _,
+        None,
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    );
+
+    let deleted = service
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Deleted { reason: None },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome_of(&deleted), &ReviewOutcome::Deleted);
+    assert!(
+        !fixture
+            .profile
+            .live()
+            .iter()
+            .any(|fact| fact.node_key == request.fact_id)
+    );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_correction_whose_close_failed_is_closed_as_it_by_the_next_resolution() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.reviews.close_fails.store(true, Ordering::SeqCst);
+
+    let unclosed = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await;
+    let Err(DomainError::ReviewConflict(ReviewConflict::NotClosed {
+        request_id,
+        outcome: ReviewOutcome::Corrected(new_key),
+    })) = unclosed
+    else {
+        panic!("{unclosed:?}");
+    };
+    let held_while_open = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await;
+    fixture.reviews.close_fails.store(false, Ordering::SeqCst);
+    fixture
+        .reviews
+        .claimed_first_at(time::OffsetDateTime::now_utc() - CLAIM_HOLD);
+    let next = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await
+        .unwrap();
+
+    assert_eq!(request_id, request.id);
+    assert!(
+        matches!(
+            held_while_open,
+            Err(DomainError::ReviewConflict(ReviewConflict::Held(_)))
+        ),
+        "{held_while_open:?}"
+    );
+    assert_eq!(
+        outcome_of(&next),
+        &ReviewOutcome::Corrected(new_key.clone()),
+        "closed as the correction that is in the profile, not as the rejection"
+    );
+    assert_eq!(fixture.writer.plans().len(), 1, "written once");
+    assert!(
+        fixture
+            .profile
+            .live()
+            .iter()
+            .any(|fact| fact.node_key == new_key)
+    );
+    assert!(logs_contain("was written, but its request was not closed"));
+    assert!(matches!(
+        fixture.events.taken().last(),
+        Some(ReviewQueueEvent::Resolved {
+            outcome: ReviewOutcome::Corrected(_),
+            ..
+        })
+    ));
+}
+
+#[tokio::test]
+async fn a_write_that_may_have_landed_keeps_the_claim() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    let writes = ProfileWrites::new(
+        Arc::clone(&fixture.profile) as _,
+        Arc::new(FailingWriter),
+        Arc::new(ServiceIdentity::new(Uuid::new_v4())),
+        2,
+    );
+    let service = ReviewQueueService::new(
+        Arc::new(writes),
+        Arc::clone(&fixture.reviews) as _,
+        Arc::clone(&fixture.events) as _,
+        None,
+        PolicyEnforcer::new(Arc::new(AllowResolver)),
+    );
+
+    let failed = service
+        .resolve(
+            &fixture.reviewer(),
+            request.id,
+            Resolution::Deleted { reason: None },
+        )
+        .await;
+
+    assert!(
+        matches!(failed, Err(DomainError::Unavailable(_))),
+        "{failed:?}"
+    );
+    assert_eq!(
+        fixture.reviews.held(),
+        [true],
+        "held until CLAIM_HOLD, so nobody resolves it on a guess"
+    );
+    fixture
+        .reviews
+        .claimed_first_at(time::OffsetDateTime::now_utc() - CLAIM_HOLD);
+    let next = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome_of(&next),
+        &ReviewOutcome::Rejected,
+        "the delete is not in the profile, so the next resolution goes on as asked"
+    );
+}
+
+#[test]
+fn a_claim_outlasts_the_budget_and_the_writer() {
+    use crate::domain::profile_writes::{WRITE_BUDGET, WRITER_LIMIT};
+
+    assert!(CLAIM_HOLD > WRITE_BUDGET + WRITER_LIMIT);
+}
+
+#[tokio::test]
+async fn a_correction_whose_check_fails_stores_nothing_and_gives_the_request_back() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+
+    let refused = fixture
+        .service_over(
+            Arc::new(AllowResolver),
+            Arc::clone(&fixture.profile) as _,
+            Some(ON),
+            vec![Arc::new(FailingCheck(SensitiveDataKind::Health))],
+        )
+        .resolve(&fixture.reviewer(), request.id, Fixture::corrected("Go"))
+        .await;
+
+    assert!(
+        matches!(
+            refused,
+            Err(DomainError::NotStored(NotStored::Dropped(
+                DropReason::CheckFailed
+            )))
+        ),
+        "{refused:?}"
+    );
+    assert!(fixture.writer.plans().is_empty());
+    assert!(matches!(fixture.status(), ReviewStatus::Open { .. }));
+    assert_eq!(fixture.reviews.held(), [false]);
+    assert_eq!(fixture.reviews.pending_of(request.id), None);
+    assert_eq!(
+        fixture.events.taken().last(),
+        Some(&ReviewQueueEvent::CorrectionRefused {
+            tenant_id: fixture.tenant,
+            subject_id: fixture.subject,
+            request_id: request.id,
+            fact_id: request.fact_id.clone(),
+            reason: NotStored::Dropped(DropReason::CheckFailed),
+            by: fixture.reviewer,
+        })
+    );
+}
+
+#[tracing_test::traced_test]
+#[tokio::test]
+async fn a_rejection_of_a_fact_gone_closes_the_request_as_deleted() {
+    let fixture = Fixture::new(0);
+    let request = fixture.flagged().await;
+    fixture.profile.facts.lock().unwrap().clear();
+
+    let closed = fixture
+        .service()
+        .resolve(&fixture.reviewer(), request.id, Fixture::reject())
+        .await
+        .unwrap();
+
+    assert_eq!(outcome_of(&closed), &ReviewOutcome::Deleted);
+    assert!(logs_contain("a resolution found its fact gone"));
 }
 
 #[tokio::test]
@@ -788,7 +1132,10 @@ async fn a_closed_or_unknown_request_cannot_be_resolved() {
         .await;
 
     assert!(
-        matches!(again, Err(DomainError::ReviewConflict(_))),
+        matches!(
+            again,
+            Err(DomainError::ReviewConflict(ReviewConflict::Closed(_)))
+        ),
         "{again:?}"
     );
     assert!(

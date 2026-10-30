@@ -16,7 +16,7 @@ use crate::api::rest::routes::register_review_queue_routes;
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::profile::Category;
-use crate::domain::review_queue::{Corrections, ReviewQueueService};
+use crate::domain::review_queue::{CLAIM_HOLD, Corrections, ReviewQueueService};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_settings::SubjectSettings;
 use crate::test_support::{
@@ -207,6 +207,7 @@ async fn a_second_flag_is_409_and_another_subject_or_an_unknown_fact_404() {
     .await;
 
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
+    assert_eq!(again.body["context"]["reason"], json!("ALREADY_OPEN"));
     assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{}", unknown.body);
     assert_eq!(another.status, StatusCode::NOT_FOUND, "{}", another.body);
 }
@@ -328,11 +329,14 @@ async fn a_correction_admission_refuses_is_422_and_the_request_stays_open() {
         "{}",
         answer.body
     );
-    assert!(
-        answer.body.to_string().contains("personalization_off"),
+    let violation = &answer.body["context"]["violations"][0];
+    assert_eq!(
+        violation["type"],
+        json!("personalization_off"),
         "{}",
         answer.body
     );
+    assert_eq!(violation["subject"], json!("properties"));
     assert!(tenant.reviews.all()[0].is_open());
 }
 
@@ -411,7 +415,36 @@ async fn a_closed_request_is_409_and_an_unknown_one_404() {
     assert_eq!(first.status, StatusCode::OK, "{}", first.body);
     assert_eq!(first.body["reason"], json!("it is right"));
     assert_eq!(again.status, StatusCode::CONFLICT, "{}", again.body);
+    assert_eq!(again.body["context"]["reason"], json!("CLOSED"));
     assert_eq!(unknown.status, StatusCode::NOT_FOUND, "{}", unknown.body);
+}
+
+#[tokio::test]
+async fn a_held_or_unclosed_request_is_409_with_a_reason_a_client_tells_apart() {
+    let tenant = Tenant::new();
+    let id = tenant.flagged().await;
+    let reject = || Some(json!({ "outcome": "rejected", "reason": "it is right" }));
+    let correct =
+        Some(json!({ "outcome": "corrected", "properties": { "skills": { "name": "Go" } } }));
+
+    tenant.reviews.hold_first(time::OffsetDateTime::now_utc());
+    let held = send(tenant.reviewer(), Method::POST, &resolution(&id), reject()).await;
+    tenant
+        .reviews
+        .hold_first(time::OffsetDateTime::now_utc() - CLAIM_HOLD);
+    tenant
+        .reviews
+        .close_fails
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let unclosed = send(tenant.reviewer(), Method::POST, &resolution(&id), correct).await;
+
+    assert_eq!(held.status, StatusCode::CONFLICT, "{}", held.body);
+    assert_eq!(held.body["context"]["reason"], json!("BEING_RESOLVED"));
+    assert_eq!(unclosed.status, StatusCode::CONFLICT, "{}", unclosed.body);
+    assert_eq!(
+        unclosed.body["context"]["reason"],
+        json!("WRITTEN_NOT_CLOSED")
+    );
 }
 
 #[tokio::test]

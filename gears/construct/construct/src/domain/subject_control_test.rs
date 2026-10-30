@@ -914,3 +914,128 @@ async fn a_delete_whose_request_cannot_be_closed_is_unavailable_and_its_repeat_c
         "{once_more:?}"
     );
 }
+
+/// A writer that takes `delay`, then writes; or writes, then fails, when
+/// `fails`.
+struct OddWriter {
+    inner: Arc<MemoryWriter>,
+    delay: Duration,
+    fails: bool,
+}
+
+#[async_trait]
+impl crate::domain::planner::processing::PlanWriter for OddWriter {
+    async fn write(
+        &self,
+        ctx: &SecurityContext,
+        plan: &crate::domain::plan::Plan,
+    ) -> Result<crate::domain::planner::processing::Written, DomainError> {
+        tokio::time::sleep(self.delay).await;
+        let written = self.inner.write(ctx, plan).await?;
+        if self.fails {
+            return Err(DomainError::Unavailable("the answer was lost".to_owned()));
+        }
+        Ok(written)
+    }
+}
+
+impl Fixture {
+    /// The service over a writer that takes `delay` and fails after it
+    /// wrote when `fails`, with a budget of 20 ms.
+    fn service_over_odd_writer(&self, delay: Duration, fails: bool) -> SubjectControlService {
+        let writes = ProfileWrites::new(
+            Arc::clone(&self.profile) as _,
+            Arc::new(OddWriter {
+                inner: Arc::clone(&self.writer),
+                delay,
+                fails,
+            }),
+            Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
+                self.identity,
+            )),
+            2,
+        )
+        .with_budget(Duration::from_millis(20));
+        subject_control_reviewed(
+            Arc::new(AllowResolver),
+            Arc::new(writes),
+            Arc::new(FixedSubjectSettings(Ok(OFF_AND_ERASING))),
+            Arc::clone(&self.events),
+            Arc::clone(&self.reviews),
+            Arc::clone(&self.review_events),
+        )
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_write_that_started_runs_past_the_budget_to_its_end() {
+    let fixture = Fixture::new(0);
+    let skill = fixture.fact_id(Category::Skill);
+
+    fixture
+        .service_over_odd_writer(Duration::from_millis(100), false)
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await
+        .expect("a started write is not cut off by the budget");
+
+    assert!(
+        fixture
+            .profile
+            .live()
+            .iter()
+            .all(|fact| fact.node_key != skill)
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_writer_past_its_limit_is_a_delete_to_send_again_with_the_request_open() {
+    use crate::domain::profile_writes::WRITER_LIMIT;
+
+    let fixture = Fixture::new(0);
+    let skill = fixture.fact_id(Category::Skill);
+    let fact = fixture
+        .profile
+        .live()
+        .into_iter()
+        .find(|f| f.node_key == skill);
+    fixture.reviews.open_on(fixture.key(), &fact.unwrap());
+
+    let deleted = fixture
+        .service_over_odd_writer(WRITER_LIMIT + Duration::from_secs(1), false)
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await;
+
+    assert!(
+        matches!(&deleted, Err(DomainError::Unavailable(msg)) if msg.contains("send it again")),
+        "{deleted:?}"
+    );
+    assert!(
+        fixture.reviews.all()[0].is_open(),
+        "the fact is still there"
+    );
+    assert!(fixture.events.taken().is_empty());
+}
+
+#[tokio::test]
+async fn a_delete_whose_writer_failed_after_it_landed_is_done() {
+    let fixture = Fixture::new(0);
+    let skill = fixture.fact_id(Category::Skill);
+    let fact = fixture
+        .profile
+        .live()
+        .into_iter()
+        .find(|f| f.node_key == skill);
+    fixture.reviews.open_on(fixture.key(), &fact.unwrap());
+
+    fixture
+        .service_over_odd_writer(Duration::ZERO, true)
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await
+        .expect("the delete is in the profile");
+
+    assert!(!fixture.reviews.all()[0].is_open(), "its request is closed");
+    assert!(matches!(
+        fixture.events.taken().as_slice(),
+        [SubjectControlEvent::Deleted { .. }]
+    ));
+}

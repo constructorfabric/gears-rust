@@ -5,7 +5,7 @@ use toolkit_macros::domain_model;
 use super::pagination::{PageError, QueryError};
 use super::profile::FullProfile;
 use super::refusal::Refusal;
-use super::review_queue::NotStored;
+use super::review_queue::{NotStored, ReviewConflict};
 use super::settings_scope::SettingsOutOfScope;
 
 #[domain_model]
@@ -48,7 +48,7 @@ pub enum DomainError {
     /// The fact already has an open review request, or the request asked to
     /// resolve is closed.
     #[error("Review conflict: {0}")]
-    ReviewConflict(String),
+    ReviewConflict(ReviewConflict),
 
     /// A reviewer's corrected value is for another property than the fact's,
     /// or its property's schema does not take it. The message names the rule,

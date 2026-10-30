@@ -144,7 +144,7 @@ pub enum ManageOutcomeDto {
 #[toolkit_macros::api_dto(response)]
 pub struct ManageFactsResponse {
     pub outcome: ManageOutcomeDto,
-    /// Why nothing was stored: `no_change`, `timeout`, or a drop reason such as `personalization_off`. It never names
+    /// Why nothing was stored: `no_change`, `timeout`, `under_review`, or a drop reason such as `personalization_off`. It never names
     /// a blocked value.
     pub reason: Option<String>,
     pub added: usize,
@@ -432,7 +432,7 @@ pub struct ReviewRequestDto {
     pub entity_kind: EntityKindDto,
     pub property: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schema(value_type = Option<Object>)]
+    #[schema(value_type = Option<Value>)]
     pub value: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comment: Option<String>,

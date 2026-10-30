@@ -305,7 +305,16 @@ impl Chain {
     }
 
     pub(super) async fn manage(&self, deadline: Instant) -> Result<Managed, DomainError> {
-        let (ctx, scope) = processing_context(TENANT);
+        self.manage_as(processing_context(TENANT).1, deadline).await
+    }
+
+    /// A manage-facts call by an agent whose scope is `scope`.
+    pub(super) async fn manage_as(
+        &self,
+        scope: AccessScope,
+        deadline: Instant,
+    ) -> Result<Managed, DomainError> {
+        let (ctx, _) = processing_context(TENANT);
         self.processing()
             .manage(&ctx, &scope, &agent_message(), deadline)
             .await

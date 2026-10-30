@@ -5,10 +5,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use authz_resolver_sdk::PolicyEnforcer;
 use time::OffsetDateTime;
-use tokio::time::timeout_at;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page, SortDir};
 use toolkit_security::{AccessScope, SecurityContext};
@@ -19,7 +17,7 @@ use super::pagination::{Key, Listed, Listing, page};
 use super::plan::{NodeKey, Origin};
 use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
-use super::profile_writes::{ProfileWrites, Removed, out_of_budget};
+use super::profile_writes::{ProfileWrites, Removed, WriteError};
 use super::review_queue::{ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_delete};
 use super::subject_access::{authorize, own};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
@@ -83,15 +81,6 @@ pub struct SubjectFact {
     pub review_request: Option<ReviewRequest>,
 }
 
-/// A subject's live facts, and the version of its profile they belong to;
-/// none for a subject without a profile.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq)]
-pub struct SubjectFacts {
-    pub version: Option<u64>,
-    pub facts: Vec<StoredFact>,
-}
-
 /// One page of the subject's facts, and the version of the profile it was
 /// cut from.
 #[domain_model]
@@ -99,21 +88,6 @@ pub struct SubjectFacts {
 pub struct SubjectFactsPage {
     pub version: Option<u64>,
     pub page: Page<SubjectFact>,
-}
-
-/// Reads a subject's live facts with its profile's version, as Construct.
-#[async_trait]
-pub trait SubjectProfiles: Send + Sync {
-    /// # Errors
-    ///
-    /// The errors of the profile store, and an internal error for a stored
-    /// fact that cannot be read: the subject must see, export and delete
-    /// every fact, so none is left out.
-    async fn facts(
-        &self,
-        ctx: &SecurityContext,
-        key: SubjectKey,
-    ) -> Result<SubjectFacts, DomainError>;
 }
 
 /// A subject's data as the export gives it: the settings, every live fact
@@ -280,18 +254,19 @@ impl SubjectControlService {
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
     /// fact deleted without its delete event, and its review request open
-    /// until the delete is sent again. The budget keeps the delete well
-    /// inside the gateway's timeout, so a drop comes only from the caller
-    /// going away. It cuts off the permission check, the context and a read,
-    /// and starts no write past its end, but never cuts off a write.
+    /// until the delete is sent again. The budget bounds only the steps
+    /// before a write: the permission check, the context, the reads and the
+    /// pauses. So it never drops a started write; a drop comes only from the
+    /// caller going away.
     ///
     /// # Errors
     ///
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact,
     /// also when a concurrent write removed it before a rerun; unavailable
-    /// when the profile kept changing past the reruns or the budget, or when
-    /// the fact's review request could not be closed, which a repeat of the
-    /// delete finishes; otherwise as [`Self::view`].
+    /// when the profile kept changing past the reruns or the budget, when the
+    /// writer failed and the fact is not seen gone after it, or when the
+    /// fact's review request could not be closed, the last two of which a
+    /// repeat of the delete finishes; otherwise as [`Self::view`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
     /// @cpt-dod:cpt-cf-construct-dod-review-queue-subject-control:p1
@@ -306,13 +281,12 @@ impl SubjectControlService {
         let deadline = self.ports.writes.deadline();
         // The permission check and the context write nothing, so the budget
         // may cut them off, like a read.
-        let (key, scope, construct) = timeout_at(deadline, async {
+        let (key, scope, construct) = ProfileWrites::before_write(deadline, "delete", async {
             let (key, scope) = own(&self.policy_enforcer, ctx, subject_id, actions::DELETE).await?;
             let (construct, _) = self.ports.writes.construct(key.tenant_id).await?;
-            Ok::<_, DomainError>((key, scope, construct))
+            Ok((key, scope, construct))
         })
-        .await
-        .map_err(|_| out_of_budget("delete"))??;
+        .await?;
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
         let origin = Origin::Subject {
             subject: subject_id,
@@ -321,7 +295,17 @@ impl SubjectControlService {
             .ports
             .writes
             .remove(&construct, key, fact_id, &origin, deadline)
-            .await?;
+            .await
+            .map_err(|err| match err {
+                WriteError::NotWritten(err) => err,
+                // The read after the failure did not find the fact gone, so
+                // its request stays open: a repeat deletes the fact or finds
+                // it gone, and closes the request.
+                WriteError::MaybeWritten(err) => DomainError::Unavailable(format!(
+                    "the delete of fact {} may have landed; send it again: {err}",
+                    fact_id.0
+                )),
+            })?;
         if let Removed::Removed(fact) = &removed {
             self.ports.events.record(SubjectControlEvent::Deleted {
                 tenant_id: key.tenant_id,
@@ -341,12 +325,17 @@ impl SubjectControlService {
             fact_id,
         )
         .await
-        .map_err(|err| {
-            DomainError::Unavailable(format!(
-                "fact {} is deleted, but its review request was not closed; send the delete \
-                 again: {err}",
-                fact_id.0
-            ))
+        .map_err(|err| match err {
+            // A store that did not answer: a repeat finds the fact gone and
+            // closes the request.
+            DomainError::Unavailable(_) | DomainError::Database(_) => {
+                DomainError::Unavailable(format!(
+                    "fact {} is deleted, but its review request was not closed; send the \
+                     delete again: {err}",
+                    fact_id.0
+                ))
+            }
+            other => other,
         })?;
         match removed {
             Removed::Removed(_) => Ok(()),

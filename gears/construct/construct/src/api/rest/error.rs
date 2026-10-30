@@ -149,6 +149,15 @@ pub fn too_long(field: &str, limit: usize) -> CanonicalError {
         .create()
 }
 
+/// A subject's text that breaks its rule, as an invalid-argument problem
+/// that names the field.
+#[must_use]
+pub fn bad_text(field: &str, rule: crate::domain::review_queue::TextRule) -> CanonicalError {
+    SubjectFactsError::invalid_argument()
+        .with_field_violation(field, rule.description(), "invalid_text")
+        .create()
+}
+
 /// The REST answer for a domain error on the export. The data protection
 /// officer is told a refusal as such, 403, since the export is not the
 /// subject's own data; a subject without data in the tenant exports empty
@@ -289,6 +298,13 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         }
         // A refused correction is 422, a status only the REST route carries.
         DomainError::NotStored(reason) => not_stored(reason, true),
+        // A query of the reviewers' list names the review request resource.
+        DomainError::InvalidQuery(err) => {
+            let (field, detail, reason) = query_violation(err);
+            ReviewRequestError::invalid_argument()
+                .with_field_violation(field, detail, reason)
+                .create()
+        }
         e @ (DomainError::Refused(_)
         | DomainError::OutOfScope(_)
         | DomainError::Unavailable(_)
@@ -297,10 +313,20 @@ pub fn for_reviews(e: DomainError) -> CanonicalError {
         | DomainError::NoSuchReviewRequest(_)
         | DomainError::ReviewConflict(_)
         | DomainError::InvalidValue(_)
-        | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// The field, detail and reason of a query a list does not take, so a
+/// client can tell a bad filter, order, cursor and select apart.
+fn query_violation(err: QueryError) -> (&'static str, String, &'static str) {
+    match err {
+        QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
+        QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
+        QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
+        QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
     }
 }
 
@@ -367,27 +393,25 @@ impl From<DomainError> for CanonicalError {
             }
             // A second open request on a fact, or a request already closed:
             // the message names only ids the caller sent.
-            DomainError::ReviewConflict(msg) => {
-                tracing::info!(msg = %msg, "construct review request conflict");
-                ReviewRequestError::aborted(msg)
-                    .with_reason("REVIEW_CONFLICT")
+            DomainError::ReviewConflict(conflict) => {
+                tracing::info!(%conflict, "construct review request conflict");
+                ReviewRequestError::aborted(conflict.to_string())
+                    .with_reason(conflict.reason())
                     .create()
             }
-            DomainError::InvalidValue(rule) => ReviewRequestError::invalid_argument()
-                .with_field_violation("properties", rule, "invalid_value")
-                .create(),
+            DomainError::InvalidValue(rule) => {
+                tracing::info!(rule = %rule, "construct correction value refused");
+                ReviewRequestError::invalid_argument()
+                    .with_field_violation("properties", rule, "invalid_value")
+                    .create()
+            }
             // The correction is refused by the checks or Admission; the
             // request stays open, and the reason says why.
             DomainError::NotStored(reason) => not_stored(reason, false),
             // The caller's query does not fit the list; the field violation
             // says which part, so a client can tell them apart.
             DomainError::InvalidQuery(err) => {
-                let (field, detail, reason) = match err {
-                    QueryError::Filter(detail) => ("$filter", detail, "invalid_filter"),
-                    QueryError::Order(detail) => ("$orderby", detail, "invalid_order"),
-                    QueryError::Cursor(detail) => ("cursor", detail, "invalid_cursor"),
-                    QueryError::Select(detail) => ("$select", detail, "unsupported_select"),
-                };
+                let (field, detail, reason) = query_violation(err);
                 SubjectFactsError::invalid_argument()
                     .with_field_violation(field, detail, reason)
                     .create()

@@ -7,8 +7,10 @@ use uuid::Uuid;
 /// while the request is open and nothing once it closes, so the unique key on
 /// the tenant and it allows one open request per fact and any number of
 /// closed ones. `value` is the flagged value as JSON text, kept only while the
-/// request is open. `claimed_by` and `claimed_at` name the reviewer resolving
-/// an open request. The subject is the resource and its owner, as for the
+/// request is open. `claim_id` and `claimed_at` name the resolution that holds
+/// an open request, and `pending` is what that resolution is about to write,
+/// as JSON text, so a resolution that ends without closing the request is
+/// closed as it later. The subject is the resource and its owner, as for the
 /// subject's facts, so the platform's scope on those reaches its requests.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-review-queue-storage:p1
@@ -34,8 +36,9 @@ pub struct Model {
     pub open_fact_id: Option<String>,
     pub outcome: Option<String>,
     pub reason: Option<String>,
-    pub claimed_by: Option<Uuid>,
+    pub claim_id: Option<Uuid>,
     pub claimed_at: Option<OffsetDateTime>,
+    pub pending: Option<String>,
     pub resolved_by: Option<Uuid>,
     pub corrected_fact_id: Option<String>,
     pub created_at: OffsetDateTime,

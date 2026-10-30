@@ -18,7 +18,7 @@ use crate::domain::plan::NodeKey;
 use crate::domain::planner::processing::ProfileSource;
 use crate::domain::profile::{FactCount, FullProfile, Profile};
 use crate::domain::profile_read::{StoredFact, StoredProfiles};
-use crate::domain::subject_control::{SubjectFacts, SubjectProfiles};
+use crate::domain::profile_writes::{SubjectFacts, SubjectProfiles};
 use crate::domain::subject_settings::SubjectKey;
 
 /// The most nodes one profile read takes: the root and its facts. Graph

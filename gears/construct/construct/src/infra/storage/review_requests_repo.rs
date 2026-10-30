@@ -1,10 +1,12 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use sea_orm::sea_query::Expr;
-use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, SqlErr};
+use sea_orm::{ActiveValue, ColumnTrait, Condition, EntityTrait, QuerySelect, SqlErr};
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use toolkit_db::DBProvider;
 use toolkit_db::odata::LimitCfg;
@@ -22,13 +24,19 @@ use crate::domain::pagination::{DEFAULT_LIMIT, MAX_LIMIT, PageError, QueryError}
 use crate::domain::plan::NodeKey;
 use crate::domain::profile::Category;
 use crate::domain::review_queue::{
-    CLOSED, Closed, FactsUnderReview, NewReviewRequest, OPEN, OpenReviewField, Opened, RequestKey,
-    ReviewOutcome, ReviewRequest, ReviewRequests, ReviewStatus, ReviewText, SubjectReviewField,
+    ClaimId, Claimed, Closed, FactsUnderReview, NewReviewRequest, OpenReviewField, Opened,
+    RequestKey, ReviewOutcome, ReviewRequest, ReviewRequests, ReviewStatus, ReviewText,
+    SubjectReviewField,
 };
 use crate::domain::subject_settings::SubjectKey;
 
 use super::review_requests_entity::{self as entity, Column, Entity as ReviewRequestEntity};
 use super::scope_error::map_scope_error;
+
+/// The table's name of an open request's state.
+pub(crate) const OPEN: &str = "open";
+/// The table's name of a closed request's state.
+pub(crate) const CLOSED: &str = "closed";
 
 const PAGE_LIMITS: LimitCfg = LimitCfg {
     default: DEFAULT_LIMIT,
@@ -40,6 +48,52 @@ fn is_unique_violation(err: &ScopeError) -> bool {
         err,
         ScopeError::Db(db) if matches!(db.sql_err(), Some(SqlErr::UniqueConstraintViolation(_)))
     )
+}
+
+/// What a claim is about to write, as the `pending` column holds it.
+#[derive(Debug, Serialize, Deserialize)]
+struct PendingRow {
+    outcome: String,
+    corrected_fact_id: Option<String>,
+    by: Uuid,
+    #[serde(with = "time::serde::rfc3339")]
+    at: OffsetDateTime,
+    reason: Option<String>,
+}
+
+fn pending_text(pending: &Closed) -> Result<String, DomainError> {
+    serde_json::to_string(&PendingRow {
+        outcome: pending.outcome.name().to_owned(),
+        corrected_fact_id: pending.outcome.corrected_fact_id().map(|key| key.0.clone()),
+        by: pending.by,
+        at: pending.at,
+        reason: pending.reason.clone().map(ReviewText::into_string),
+    })
+    .map_err(|err| DomainError::internal(format!("a pending resolution is not JSON: {err}")))
+}
+
+/// The resolution a row's claim recorded, if any. A record Construct cannot
+/// read is a defect.
+fn pending_of(row: &entity::Model) -> Result<Option<Closed>, DomainError> {
+    let Some(text) = &row.pending else {
+        return Ok(None);
+    };
+    let defect = |what: String| {
+        DomainError::internal(format!("review request {} has a pending {what}", row.id))
+    };
+    let pending: PendingRow = serde_json::from_str(text)
+        .map_err(|err| defect(format!("resolution that is not readable: {err}")))?;
+    let outcome =
+        ReviewOutcome::from_parts(&pending.outcome, pending.corrected_fact_id.map(NodeKey))
+            .ok_or_else(|| defect(format!("outcome `{}`", pending.outcome)))?;
+    let reason = ReviewText::optional(pending.reason)
+        .map_err(|rule| defect(format!("reason that {}", rule.description())))?;
+    Ok(Some(Closed {
+        outcome,
+        by: pending.by,
+        at: pending.at,
+        reason,
+    }))
 }
 
 /// A stored row as a request. A row Construct cannot read is a defect.
@@ -63,21 +117,20 @@ fn request_of(row: entity::Model) -> Result<ReviewRequest, DomainError> {
             ReviewStatus::Open { value }
         }
         CLOSED => {
-            let outcome = match (row.outcome.as_deref(), row.corrected_fact_id) {
-                (Some("corrected"), Some(key)) => ReviewOutcome::Corrected(NodeKey(key)),
-                (Some("deleted"), None) => ReviewOutcome::Deleted,
-                (Some("rejected"), None) => ReviewOutcome::Rejected,
-                (outcome, corrected) => {
-                    return Err(defect(format!(
-                        "outcome {outcome:?} with a corrected fact id {}",
-                        if corrected.is_some() {
-                            "set"
-                        } else {
-                            "missing"
-                        }
-                    )));
-                }
-            };
+            let corrected = row.corrected_fact_id.is_some();
+            let outcome = row
+                .outcome
+                .as_deref()
+                .and_then(|name| {
+                    ReviewOutcome::from_parts(name, row.corrected_fact_id.clone().map(NodeKey))
+                })
+                .ok_or_else(|| {
+                    defect(format!(
+                        "outcome {:?} with a corrected fact id {}",
+                        row.outcome,
+                        if corrected { "set" } else { "missing" }
+                    ))
+                })?;
             let (Some(by), Some(at)) = (row.resolved_by, row.resolved_at) else {
                 return Err(defect("no resolver or time while closed".to_owned()));
             };
@@ -157,10 +210,25 @@ fn open() -> Condition {
     Condition::all().add(Column::State.eq(OPEN))
 }
 
+/// The one column [`SeaOrmReviewRequestRepository::open_fact_ids`] reads.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct OpenFact {
+    fact_id: String,
+}
+
+/// Which open request a close may take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseGuard {
+    /// Only one held by this claim: a reviewer's resolution.
+    HeldBy(ClaimId),
+    /// Held or not: the subject's delete.
+    Any,
+}
+
 /// The review requests table. Every call runs on the runner and under the
 /// scope its caller gives, so it can join a caller's transaction and never
 /// reaches past the caller's authorization.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct SeaOrmReviewRequestRepository;
 
 impl SeaOrmReviewRequestRepository {
@@ -190,8 +258,9 @@ impl SeaOrmReviewRequestRepository {
             open_fact_id: ActiveValue::Set(Some(request.fact_id.0.clone())),
             outcome: ActiveValue::Set(None),
             reason: ActiveValue::Set(None),
-            claimed_by: ActiveValue::Set(None),
+            claim_id: ActiveValue::Set(None),
             claimed_at: ActiveValue::Set(None),
+            pending: ActiveValue::Set(None),
             resolved_by: ActiveValue::Set(None),
             corrected_fact_id: ActiveValue::Set(None),
             created_at: ActiveValue::Set(request.created_at),
@@ -232,19 +301,64 @@ impl SeaOrmReviewRequestRepository {
         scope: &AccessScope,
         key: RequestKey,
     ) -> Result<Option<ReviewRequest>, DomainError> {
+        self.find_row(conn, scope, key)
+            .await?
+            .map(request_of)
+            .transpose()
+    }
+
+    async fn find_row<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: RequestKey,
+    ) -> Result<Option<entity::Model>, DomainError> {
         ReviewRequestEntity::find()
             .secure()
             .scope_with(scope)
             .filter(of_request(key))
             .one(conn)
             .await
-            .map_err(map_scope_error)?
-            .map(request_of)
-            .transpose()
+            .map_err(map_scope_error)
     }
 
-    /// Set the claim of `by` on the open request `key`, unless another
-    /// reviewer holds it since `stale_before`. Whether it was set.
+    /// Claim the open request `key` as [`Self::claim`] does, and read what
+    /// the claim holds, on the same connection: run it in a transaction to
+    /// make the two one step.
+    ///
+    /// # Errors
+    ///
+    /// When the database fails or the row cannot be read.
+    pub async fn claim_and_read<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: RequestKey,
+        claim: ClaimId,
+        at: OffsetDateTime,
+        hold: Duration,
+    ) -> Result<Claimed, DomainError> {
+        let claimed = self.claim(conn, scope, key, claim, at, hold).await?;
+        let Some(row) = self.find_row(conn, scope, key).await? else {
+            return Ok(Claimed::Closed);
+        };
+        let ours = claimed && row.claim_id == Some(claim.0);
+        let pending = pending_of(&row)?;
+        let request = request_of(row)?;
+        Ok(if !request.is_open() {
+            Claimed::Closed
+        } else if ours {
+            Claimed::Taken {
+                request: Box::new(request),
+                pending,
+            }
+        } else {
+            Claimed::Held
+        })
+    }
+
+    /// Set `claim` on the open request `key`, unless another claim holds it
+    /// since less than `hold` before `at`. Whether it was set.
     ///
     /// # Errors
     ///
@@ -254,19 +368,18 @@ impl SeaOrmReviewRequestRepository {
         conn: &C,
         scope: &AccessScope,
         key: RequestKey,
-        by: Uuid,
+        claim: ClaimId,
         at: OffsetDateTime,
-        stale_before: OffsetDateTime,
+        hold: Duration,
     ) -> Result<bool, DomainError> {
         let free = Condition::any()
             .add(Column::ClaimedAt.is_null())
-            .add(Column::ClaimedAt.lt(stale_before))
-            .add(Column::ClaimedBy.eq(by));
+            .add(Column::ClaimedAt.lt(at - hold));
         let updated = ReviewRequestEntity::update_many()
             .secure()
             .scope_with(scope)
             .filter(open().add(of_request(key)).add(free))
-            .col_expr(Column::ClaimedBy, Expr::value(by))
+            .col_expr(Column::ClaimId, Expr::value(claim.0))
             .col_expr(Column::ClaimedAt, Expr::value(at))
             .exec(conn)
             .await
@@ -274,7 +387,32 @@ impl SeaOrmReviewRequestRepository {
         Ok(updated.rows_affected > 0)
     }
 
-    /// Clear the claim of `by` on the request `key`.
+    /// Record `pending` on the open request `key` while `claim` holds it.
+    /// Whether it was recorded.
+    ///
+    /// # Errors
+    ///
+    /// When the database fails.
+    pub async fn pend<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: RequestKey,
+        claim: ClaimId,
+        pending: &Closed,
+    ) -> Result<bool, DomainError> {
+        let updated = ReviewRequestEntity::update_many()
+            .secure()
+            .scope_with(scope)
+            .filter(open().add(of_request(key)).add(Column::ClaimId.eq(claim.0)))
+            .col_expr(Column::Pending, Expr::value(pending_text(pending)?))
+            .exec(conn)
+            .await
+            .map_err(map_scope_error)?;
+        Ok(updated.rows_affected > 0)
+    }
+
+    /// Clear `claim` on the request `key`, and what it recorded.
     ///
     /// # Errors
     ///
@@ -284,26 +422,26 @@ impl SeaOrmReviewRequestRepository {
         conn: &C,
         scope: &AccessScope,
         key: RequestKey,
-        by: Uuid,
+        claim: ClaimId,
     ) -> Result<(), DomainError> {
         ReviewRequestEntity::update_many()
             .secure()
             .scope_with(scope)
-            .filter(open().add(of_request(key)).add(Column::ClaimedBy.eq(by)))
-            .col_expr(Column::ClaimedBy, Expr::value(Option::<Uuid>::None))
+            .filter(open().add(of_request(key)).add(Column::ClaimId.eq(claim.0)))
+            .col_expr(Column::ClaimId, Expr::value(Option::<Uuid>::None))
             .col_expr(
                 Column::ClaimedAt,
                 Expr::value(Option::<OffsetDateTime>::None),
             )
+            .col_expr(Column::Pending, Expr::value(Option::<String>::None))
             .exec(conn)
             .await
             .map_err(map_scope_error)?;
         Ok(())
     }
 
-    /// Close the open request `key` as `closed`, clearing its flagged value
-    /// and claim; with `claimed`, only while `closed.by` holds the claim.
-    /// Whether it was closed.
+    /// Close the open request `key` as `closed`, clearing its flagged value,
+    /// its claim and what the claim recorded, as `guard` allows. Whether it was closed.
     ///
     /// # Errors
     ///
@@ -314,13 +452,13 @@ impl SeaOrmReviewRequestRepository {
         scope: &AccessScope,
         key: RequestKey,
         closed: &Closed,
-        claimed: bool,
+        guard: CloseGuard,
     ) -> Result<bool, DomainError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-close:p1:inst-close-update
         // @cpt-begin:cpt-cf-construct-state-review-queue-request:p1:inst-state-close
         let mut only = open().add(of_request(key));
-        if claimed {
-            only = only.add(Column::ClaimedBy.eq(closed.by));
+        if let CloseGuard::HeldBy(claim) = guard {
+            only = only.add(Column::ClaimId.eq(claim.0));
         }
         let updated = ReviewRequestEntity::update_many()
             .secure()
@@ -329,11 +467,12 @@ impl SeaOrmReviewRequestRepository {
             .col_expr(Column::State, Expr::value(CLOSED))
             .col_expr(Column::OpenFactId, Expr::value(Option::<String>::None))
             .col_expr(Column::Value, Expr::value(Option::<String>::None))
-            .col_expr(Column::ClaimedBy, Expr::value(Option::<Uuid>::None))
+            .col_expr(Column::ClaimId, Expr::value(Option::<Uuid>::None))
             .col_expr(
                 Column::ClaimedAt,
                 Expr::value(Option::<OffsetDateTime>::None),
             )
+            .col_expr(Column::Pending, Expr::value(Option::<String>::None))
             .col_expr(Column::Outcome, Expr::value(closed.outcome.name()))
             .col_expr(
                 Column::Reason,
@@ -373,6 +512,33 @@ impl SeaOrmReviewRequestRepository {
             .await
             .map_err(map_scope_error)?
             .map(|row| row.id))
+    }
+
+    /// The facts of the subject's open requests, without reading the rest of
+    /// each row.
+    ///
+    /// # Errors
+    ///
+    /// When the database fails.
+    pub async fn open_fact_ids<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        key: SubjectKey,
+    ) -> Result<BTreeSet<NodeKey>, DomainError> {
+        let ids: Vec<OpenFact> = ReviewRequestEntity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(of_subject(key).add(open()))
+            .project_all(conn, |select| {
+                select
+                    .select_only()
+                    .column(Column::FactId)
+                    .into_model::<OpenFact>()
+            })
+            .await
+            .map_err(map_scope_error)?;
+        Ok(ids.into_iter().map(|row| NodeKey(row.fact_id)).collect())
     }
 
     /// The subject's requests matching `also`, newest first.
@@ -461,12 +627,12 @@ impl SeaOrmReviewRequestRepository {
 }
 
 /// [`ReviewRequests`] over the database: each call on a connection of its
-/// own, a close and its read-back in one transaction.
+/// own, a claim or a close and its read-back in one transaction.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-review-queue-storage:p1
 pub struct ReviewRequestStore {
     db: Arc<DbProvider>,
-    repo: Arc<SeaOrmReviewRequestRepository>,
+    repo: SeaOrmReviewRequestRepository,
 }
 
 impl ReviewRequestStore {
@@ -474,7 +640,7 @@ impl ReviewRequestStore {
     pub fn new(db: Arc<DbProvider>) -> Self {
         Self {
             db,
-            repo: Arc::new(SeaOrmReviewRequestRepository),
+            repo: SeaOrmReviewRequestRepository,
         }
     }
 
@@ -484,13 +650,13 @@ impl ReviewRequestStore {
         scope: &AccessScope,
         key: RequestKey,
         closed: &Closed,
-        claimed: bool,
+        guard: CloseGuard,
     ) -> Result<Option<ReviewRequest>, DomainError> {
-        let (repo, scope, closed) = (Arc::clone(&self.repo), scope.clone(), closed.clone());
+        let (repo, scope, closed) = (self.repo, scope.clone(), closed.clone());
         DBProvider::<DomainError>::new(self.db.db())
             .transaction(move |tx| {
                 Box::pin(async move {
-                    if !repo.close(tx, &scope, key, &closed, claimed).await? {
+                    if !repo.close(tx, &scope, key, &closed, guard).await? {
                         return Ok(None);
                     }
                     repo.find(tx, &scope, key).await
@@ -508,13 +674,7 @@ impl FactsUnderReview for ReviewRequestStore {
         key: SubjectKey,
     ) -> Result<BTreeSet<NodeKey>, DomainError> {
         let conn = self.db.conn().map_err(DomainError::from)?;
-        Ok(self
-            .repo
-            .of_subject(&conn, scope, key, open())
-            .await?
-            .into_iter()
-            .map(|request| request.fact_id)
-            .collect())
+        self.repo.open_fact_ids(&conn, scope, key).await
     }
 }
 
@@ -542,38 +702,48 @@ impl ReviewRequests for ReviewRequestStore {
         &self,
         scope: &AccessScope,
         key: RequestKey,
-        by: Uuid,
+        claim: ClaimId,
         at: OffsetDateTime,
-        stale_before: OffsetDateTime,
-    ) -> Result<Option<ReviewRequest>, DomainError> {
+        hold: Duration,
+    ) -> Result<Claimed, DomainError> {
+        let (repo, scope) = (self.repo, scope.clone());
+        DBProvider::<DomainError>::new(self.db.db())
+            .transaction(move |tx| {
+                Box::pin(async move { repo.claim_and_read(tx, &scope, key, claim, at, hold).await })
+            })
+            .await
+    }
+
+    async fn pend(
+        &self,
+        scope: &AccessScope,
+        key: RequestKey,
+        claim: ClaimId,
+        pending: &Closed,
+    ) -> Result<bool, DomainError> {
         let conn = self.db.conn().map_err(DomainError::from)?;
-        if !self
-            .repo
-            .claim(&conn, scope, key, by, at, stale_before)
-            .await?
-        {
-            return Ok(None);
-        }
-        self.repo.find(&conn, scope, key).await
+        self.repo.pend(&conn, scope, key, claim, pending).await
     }
 
     async fn release(
         &self,
         scope: &AccessScope,
         key: RequestKey,
-        by: Uuid,
+        claim: ClaimId,
     ) -> Result<(), DomainError> {
         let conn = self.db.conn().map_err(DomainError::from)?;
-        self.repo.release(&conn, scope, key, by).await
+        self.repo.release(&conn, scope, key, claim).await
     }
 
     async fn close(
         &self,
         scope: &AccessScope,
         key: RequestKey,
+        claim: ClaimId,
         closed: &Closed,
     ) -> Result<Option<ReviewRequest>, DomainError> {
-        self.close_and_read(scope, key, closed, true).await
+        self.close_and_read(scope, key, closed, CloseGuard::HeldBy(claim))
+            .await
     }
 
     async fn close_open_on(
@@ -591,7 +761,8 @@ impl ReviewRequests for ReviewRequestStore {
             tenant_id: key.tenant_id,
             id,
         };
-        self.close_and_read(scope, request, closed, false).await
+        self.close_and_read(scope, request, closed, CloseGuard::Any)
+            .await
     }
 
     async fn latest_on(

@@ -69,19 +69,19 @@ The PRD requires that the subject can mark any fact as incorrect, with an option
 
 **The lists.** Both are cursor pages, `{items, page_info: {next_cursor, prev_cursor, limit}}`, read from the table under the caller's scope: `limit` 50 by default and at most 200; `$filter` and `$orderby`; an opaque cursor that remembers the order and the filter. The subject's list holds all its requests, open and closed, newest first, filtered and ordered over `id`, `fact_id`, `state`, `outcome` and `created_at`. The reviewer's list holds the open requests of the caller's tenant, oldest first, so the queue is worked in order, filtered and ordered over `id`, `subject_id`, `fact_id`, `entity_kind` and `created_at`. `id` breaks every tie.
 
-**The resolution.** The body is `{outcome, reason, properties}`. `reason` is required for `rejected` and optional otherwise, at most 1000 characters. `properties` is required for `corrected`, and only there: one entry, the fact's own property, with the new value. An unknown request, or one of another tenant, answers `404`; a closed one `409`. The reviewer claims the request before the fact is written, so a second reviewer gets `409` while the first resolves it; a resolution that stores nothing gives the claim back, and a claim left behind frees itself after 60 seconds. When the subject's delete closes a request while a reviewer resolves it, the reviewer gets `409` and the error log names what was written.
+**The resolution.** The body is `{outcome, reason, properties}`. `reason` is required for `rejected` and optional otherwise, at most 1000 characters. `properties` is required for `corrected`, and only there: one entry, the fact's own property, with the new value. An unknown request, or one of another tenant, answers `404`. Each resolution claims the request before the fact is written, with a claim of its own, so two resolutions never run at once, also not two from the same reviewer. A `409` names its reason: `CLOSED` for a closed request; `BEING_RESOLVED` while another resolution holds it, which a retry after it may pass; `ALREADY_OPEN` for a second flag; `WRITTEN_BUT_CLOSED` when the resolution was stored but the subject's delete closed the request meanwhile; `WRITTEN_NOT_CLOSED` when the resolution was stored, or may have been, but the request could not be closed. The last two carry the outcome and the new fact's id in the message. Before a delete or a correction is written, the claim records it: the outcome, the new fact's id, the reviewer and the reason. A resolution that stored nothing gives the claim back and forgets that record; one whose write failed and may have landed, or whose close failed, keeps it. A claim frees itself after 140 seconds: the 20-second budget, the 90 seconds the writer is awaited at most, and 30 seconds for a statement graph storage still runs. The next resolution then closes the request as the recorded one when its write is in the profile (its new fact is there, or its deleted fact is gone), and otherwise goes on as asked. When the writer fails, the profile is read once more, and a write found there counts as stored. A resolution that finds its fact gone, a rejection included, closes the request as deleted and logs a warning.
 
 - **Rejected**: the request closes with the reason. The fact is served again.
 - **Deleted**: the fact is soft-deleted as the subject's delete does it, and the request closes. A fact already gone closes it all the same.
 - **Corrected**: the new value goes through the one-step plan path: a plan with one replace step, the reviewer as origin, the sensitive-data checks and Admission like any plan, and the profile writer. The replace gives the fact a new id, `corrected_fact_id`. When the checks fail, a value is blocked, or Admission drops the plan (personalization off, a rule broken), nothing is stored, the request stays open, and the answer is `422` naming the reason. When the fact is gone before the correction is stored, nothing is stored and the request closes as deleted, which the answer shows. No sensitive-data check exists yet, so a correction, like record processing, runs only where the deployment opted in (`processing.run_without_sensitive_data_checks`); elsewhere it answers `501`. A rejection and a delete need no opt-in. Without a processing identity a delete and a correction answer `501`.
 
-A delete and a correction are written against the profile's version, and read and written again after a short pause on a conflict, as the subject's delete does (`processing.max_reruns`, within 20 seconds: the budget cuts off a read and starts no write past its end, but never cuts off a write); past either they answer `503` and the request stays open. A correction takes its sensitive-data checks and Admission from the same place record processing does, so a check added there guards both, and the start-up warning that values are stored unchecked covers both.
+A delete and a correction are written against the profile's version, and read and written again after a short pause on a conflict, as the subject's delete does (`processing.max_reruns`, within 20 seconds); past either they answer `503` and the request stays open. The 20 seconds bound the reads, checks and pauses before each write; a write that started runs to its end, so a stored change is never answered as not written. A correction takes its sensitive-data checks and Admission from the same place record processing does, so a check added there guards both, and the start-up warning that values are stored unchecked covers both.
 
-**Frozen while open.** The profile read leaves out a fact under an open request, as it does for a category the caller may not read. Processing drops every planned step that would replace or remove such a fact, or add a property to it, before the checks; the drop is logged without content, and a plan left empty stores nothing. The planner itself still sees the fact, so the model does not add it again; `FactsUnderReview::under_review` tells it which facts are under review if it wants to leave them out of the model's choices. The subject's own view still shows the fact. A plan whose step was checked before the request opened can still land a few milliseconds after it; the request then points at a fact that is gone, and its resolution closes it as deleted.
+**Frozen while open.** The profile read leaves out a fact under an open request, as it does for a category the caller may not read. Processing drops every planned step that would replace or remove such a fact, or add a property to it, before the checks; the drop is logged without content, with the subject, and a plan left empty stores nothing. A manage-facts call left with nothing answers `under_review`. The planner itself still sees the fact, so the model does not add it again; `FactsUnderReview::under_review` tells it which facts are under review if it wants to leave them out of the model's choices. The subject's own view still shows the fact. A plan whose step was checked before the request opened can still land a few milliseconds after it; the request then points at a fact that is gone, and its resolution closes it as deleted.
 
 **In Subject Control.** Each fact in the subject's view carries its latest review request, `{id, state, outcome, created_at}`, or `null`. The export holds all the subject's requests. The subject's delete closes an open request on the fact as deleted; when that close fails, the delete answers `503`, and its repeat, which finds the fact gone, closes the request and answers `204`.
 
-**Events.** Each flag writes a requested event with the request and the fact, and each resolution a resolved event with the outcome, the reviewer and, for a correction, the new fact id. None holds a value, a comment or a reason. They go to the structured log until the Audit gear ships.
+**Events.** Each flag writes a requested event with the request and the fact, and each resolution a resolved event with the outcome, the reviewer and, for a correction, the new fact id. A correction the checks or Admission refuse writes a refused event with the reason's name, and each page of the reviewers' list a listed event with the reviewer and the ids of the requests it served, as that page holds flagged values. None holds a value, a comment or a reviewer's reason. They go to the structured log until the Audit gear ships.
 
 **Out of scope**:
 
@@ -132,7 +132,7 @@ A delete and a correction are written against the profile's version, and read an
 1. [x] - `p1` - Caller sends `POST /construct/v1/subjects/{subject_id}/review-requests` with `{fact_id, comment}`, authenticated - `inst-flag-send`
 2. [x] - `p1` - API: the extractors take the security context, the service, the subject id and the body; a fact id not shaped like a node key answers 404, a comment over 1000 characters 400 - `inst-flag-parse`
 3. [x] - `p1` - Run `cpt-cf-construct-algo-subject-control-owner-only` for `flag`, and read the subject's facts as in `cpt-cf-construct-algo-subject-control-read-facts`. **IF** no live fact has the id, no such fact - `inst-flag-read`
-4. [x] - `p1` - Store an open request with a new id, the fact's id, category, property and value, the comment and the time. **IF** the fact already has an open request, refuse as a conflict - `inst-flag-store`
+4. [x] - `p1` - Store an open request with a new id, the fact's id, category, property and value, the comment and the time. **IF** the fact already has an open request, refuse as a conflict. Read the facts again: **IF** the fact is gone, close the request as deleted and answer no such fact; **IF** the read fails, keep the request open - `inst-flag-store`
 5. [x] - `p1` - Record a requested event. **RETURN** 201 with the request - `inst-flag-return`
 
 ### List One's Own Review Requests
@@ -170,7 +170,7 @@ A delete and a correction are written against the profile's version, and read an
 **Steps**:
 1. [x] - `p1` - Caller sends `GET /construct/v1/admin/review-requests`, authenticated, with optional `limit`, `cursor`, `$filter` and `$orderby` - `inst-open-send`
 2. [x] - `p1` - Run `cpt-cf-construct-algo-review-queue-reviewer-only` - `inst-open-authorize`
-3. [x] - `p1` - Read the page of the tenant's open requests from the table, under the scope - `inst-open-read`
+3. [x] - `p1` - Read the page of the tenant's open requests from the table, under the scope, and record a listed event with the ids it holds - `inst-open-read`
 4. [x] - `p1` - **RETURN** 200 with the page - `inst-open-return`
 
 ### Resolve a Review Request
@@ -186,7 +186,8 @@ A delete and a correction are written against the profile's version, and read an
 **Error Scenarios**:
 - The platform refuses: 403.
 - An unknown request, or one of another tenant: 404.
-- A closed request: 409.
+- A closed request: 409 `CLOSED`; one another resolution holds: 409 `BEING_RESOLVED`.
+- A resolution written but not closed: 409 `WRITTEN_BUT_CLOSED` or `WRITTEN_NOT_CLOSED`.
 - A body that does not fit the outcome: 400.
 - A correction the checks or Admission do not let through: 422, and the request stays open.
 - A correction without the opt-in, or a delete or correction without a processing identity: 501.
@@ -195,11 +196,12 @@ A delete and a correction are written against the profile's version, and read an
 **Steps**:
 1. [x] - `p1` - Caller sends `POST /construct/v1/admin/review-requests/{request_id}/resolution` with `{outcome, reason, properties}`, authenticated - `inst-resolve-send`
 2. [x] - `p1` - API: the extractors take the security context, the service, the request id and the body; a body that does not fit its outcome answers 400 - `inst-resolve-parse`
-3. [x] - `p1` - Run `cpt-cf-construct-algo-review-queue-reviewer-only`, and read the request in the caller's tenant. **IF** there is none, not found. **IF** it is closed, conflict - `inst-resolve-read`
-4. [x] - `p1` - **IF** rejected, run `cpt-cf-construct-algo-review-queue-close` with the reason - `inst-resolve-reject`
-5. [x] - `p1` - **IF** deleted, run `cpt-cf-construct-algo-review-queue-remove`, then `cpt-cf-construct-algo-review-queue-close` - `inst-resolve-delete`
-6. [x] - `p1` - **IF** corrected, run `cpt-cf-construct-algo-review-queue-correct`; on a stored correction, run `cpt-cf-construct-algo-review-queue-close` with the new fact's id; on a fact that is gone, close as deleted - `inst-resolve-correct`
-7. [x] - `p1` - Record a resolved event. **RETURN** 200 with the closed request - `inst-resolve-return`
+3. [x] - `p1` - Run `cpt-cf-construct-algo-review-queue-reviewer-only`, and read the request in the caller's tenant. **IF** there is none, not found. **IF** it is closed, conflict. Claim it, and read in the same step what an earlier claim recorded; **IF** another claim holds it, conflict - `inst-resolve-read`
+4. [x] - `p1` - **IF** an earlier claim recorded a write that is in the profile, run `cpt-cf-construct-algo-review-queue-close` as that one - `inst-resolve-settle`
+5. [x] - `p1` - **IF** rejected, run `cpt-cf-construct-algo-review-queue-close` with the reason - `inst-resolve-reject`
+6. [x] - `p1` - **IF** deleted, record the delete on the claim, run `cpt-cf-construct-algo-review-queue-remove`, then `cpt-cf-construct-algo-review-queue-close` - `inst-resolve-delete`
+7. [x] - `p1` - **IF** corrected, run `cpt-cf-construct-algo-review-queue-correct`; on a stored correction, run `cpt-cf-construct-algo-review-queue-close` with the new fact's id; on a fact that is gone, close as deleted; on a refusal, record a refused event and give the claim back - `inst-resolve-correct`
+8. [x] - `p1` - Record a resolved event. **RETURN** 200 with the closed request. **IF** the close failed, or found the request no longer held, read it again: closed as this resolution, **RETURN** it; closed otherwise, conflict `WRITTEN_BUT_CLOSED`; else conflict `WRITTEN_NOT_CLOSED`, with the claim kept - `inst-resolve-return`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -227,7 +229,7 @@ A delete and a correction are written against the profile's version, and read an
 2. [x] - `p1` - Read the subject's facts, cut off when the budget runs out (unavailable). **IF** no live fact has the request's fact id, **RETURN** gone - `inst-correct-read`
 3. [x] - `p1` - Build a plan with one step that replaces the fact with a new entity under a new node key, holding the new value, with the reviewer as origin and the version just read - `inst-correct-plan`
 4. [x] - `p1` - Run the sensitive-data checks and Admission on it. **IF** a check fails, Admission drops the plan, or the value is blocked, **RETURN** nothing stored, with the reason - `inst-correct-admit`
-5. [x] - `p1` - **IF** the budget ran out, unavailable, and nothing is written. Write it through the profile writer, which is not cut off. **IF** stored, **RETURN** the new key. On a conflict, pause briefly and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; then unavailable - `inst-correct-write`
+5. [x] - `p1` - Record the correction with the new key on the claim; **IF** the claim no longer holds the request, conflict. Write it through the profile writer, for at most 90 seconds; when the writer fails, read the facts once more and count the new key found there as stored. **IF** stored, **RETURN** the new key. On a conflict, pause briefly and go back to step 2, at most `processing.max_reruns` times and while the budget lasts; then unavailable - `inst-correct-write`
 
 ### Remove a Fact Under Review
 
@@ -272,16 +274,16 @@ A delete and a correction are written against the profile's version, and read an
 **Output**: The plan without the steps that touch a fact under review.
 
 **Steps**:
-1. [x] - `p1` - Read the fact ids of the subject's open requests. Drop each step that replaces or removes one of them or adds a property to it, and log how many were dropped, without content - `inst-skip-drop`
+1. [x] - `p1` - Read the fact ids of the subject's open requests as Construct, also for a manage-facts call, whose agent's scope may not reach them. Drop each step that replaces or removes one of them or adds a property to it, and log how many were dropped, without content - `inst-skip-drop`
 
 ### Log the Review Queue's Events
 
 - [x] `p1` - **ID**: `cpt-cf-construct-algo-review-queue-log`
 
-**Input**: A requested or resolved event.
+**Input**: A requested, resolved, refused or listed event.
 
 **Steps**:
-1. [x] - `p1` - Write it to the structured log under the target `construct::audit`, with the event's name, the tenant, the subject, the request, the fact, the caller and, for a resolution, the outcome; never a value, comment or reason - `inst-log-event`
+1. [x] - `p1` - Write it to the structured log under the target `construct::audit`, with the event's name, the tenant, the subject, the request, the fact, the caller and, for a resolution, the outcome, for a refusal its reason's name, and for a listed page its request ids; never a value, comment or reviewer's reason - `inst-log-event`
 
 ### Wire the Review Queue
 
@@ -320,7 +322,7 @@ The system **MUST** keep each review request, open or closed, in `construct__rev
 - DB Table: `construct__review_requests` (`cpt-cf-construct-dbtable-review-requests`)
 - Entities: Review Request (`cpt-cf-construct-entity-review-request`)
 
-**Verified by**: `an_open_request_reads_back_as_stored`, `a_scope_naming_the_subject_reaches_its_requests_and_another_subjects_does_not`, `a_second_open_request_on_a_fact_is_refused_and_a_closed_one_is_not`, `one_reviewer_holds_a_claim_until_it_gives_it_back_or_it_goes_stale`, `a_close_needs_the_claim_sets_the_outcome_clears_the_value_and_happens_once`, `a_correction_keeps_the_new_facts_id`, `the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not`, `the_subjects_requests_are_newest_first_and_the_latest_per_fact_is_the_newest`, `a_scope_of_another_tenant_finds_claims_and_closes_nothing`, `an_unknown_request_is_none` (the store on `SQLite`), `every_backend_keys_one_open_request_per_fact_and_indexes_the_lists`, `mysql_ddl_pins_utf8mb4`, `identifiers_are_within_63_bytes` (migration), `a_review_text_is_trimmed_and_bounded_in_characters_not_bytes` (domain).
+**Verified by**: `an_open_request_reads_back_as_stored`, `a_scope_naming_the_subject_reaches_its_requests_and_another_subjects_does_not`, `a_second_open_request_on_a_fact_is_refused_and_a_closed_one_is_not`, `one_claim_holds_a_request_until_it_is_given_back_or_goes_stale`, `a_close_needs_the_claim_sets_the_outcome_clears_the_value_and_happens_once`, `a_correction_keeps_the_new_facts_id`, `the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not`, `the_subjects_requests_are_newest_first_and_the_latest_per_fact_is_the_newest`, `a_scope_of_another_tenant_finds_claims_and_closes_nothing`, `an_unknown_request_is_none` (the store on `SQLite`), `every_backend_keys_one_open_request_per_fact_and_indexes_the_lists`, `mysql_ddl_pins_utf8mb4`, `identifiers_are_within_63_bytes` (migration), `a_review_text_is_trimmed_and_bounded_in_characters_not_bytes` (domain), `a_closed_or_unknown_request_cannot_be_claimed`, `a_row_construct_cannot_read_is_an_internal_error`.
 
 ### The Subject's Flag and List
 
@@ -336,13 +338,13 @@ The system **MUST** let the subject, and only the subject, open a review request
 - API: `POST`, `GET /construct/v1/subjects/{subject_id}/review-requests`
 - DB Table: `construct__review_requests`
 
-**Verified by**: `a_flag_opens_a_request_with_the_flagged_value_and_records_it`, `a_second_flag_on_a_fact_under_review_is_a_conflict`, `only_the_subject_flags_and_only_its_live_facts`, `a_flag_on_a_fact_removed_meanwhile_closes_its_request_and_is_no_such_fact`, `each_operation_asks_for_its_own_permission`, `the_subject_lists_its_requests_and_a_reviewer_the_open_ones` (service), `the_subjects_list_is_newest_first_filters_and_pages`, `a_bad_filter_or_cursor_is_the_callers_mistake` (store), `the_subject_flags_a_fact_and_sees_its_request`, `a_second_flag_is_409_and_another_subject_or_an_unknown_fact_404`, `a_comment_past_its_limit_is_400_and_nothing_is_flagged`, `a_comment_and_a_reason_of_1000_characters_are_taken` (routes), `every_enforced_permission_is_declared_once_on_its_resource_and_action` (permissions).
+**Verified by**: `a_flag_opens_a_request_with_the_flagged_value_and_records_it`, `a_second_flag_on_a_fact_under_review_is_a_conflict`, `only_the_subject_flags_and_only_its_live_facts`, `a_flag_on_a_fact_removed_meanwhile_closes_its_request_and_is_no_such_fact`, `a_flag_whose_fact_cannot_be_read_again_is_answered_with_its_stored_request`, `each_operation_asks_for_its_own_permission`, `the_subject_lists_its_requests_and_a_reviewer_the_open_ones` (service), `the_subjects_list_is_newest_first_filters_and_pages`, `a_bad_filter_or_cursor_is_the_callers_mistake` (store), `the_subject_flags_a_fact_and_sees_its_request`, `a_second_flag_is_409_and_another_subject_or_an_unknown_fact_404`, `a_comment_past_its_limit_is_400_and_nothing_is_flagged`, `a_comment_and_a_reason_of_1000_characters_are_taken` (routes), `every_enforced_permission_is_declared_once_on_its_resource_and_action` (permissions).
 
 ### The Reviewer's List and Resolution
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-review-queue-reviewer`
 
-The system **MUST** list the open requests of the caller's tenant, oldest first, to a caller with the permission to resolve review requests, and **MUST** let that caller resolve an open request as rejected with a reason, deleted, or corrected, never one on its own fact. The request **MUST** be claimed before its fact is written, so two reviewers never both resolve it. A closed request, or one another reviewer is resolving, **MUST** answer 409. A rejection serves the fact again; a delete removes it as the subject's delete does.
+The system **MUST** list the open requests of the caller's tenant, oldest first, to a caller with the permission to resolve review requests, and **MUST** let that caller resolve an open request as rejected with a reason, deleted, or corrected, never one on its own fact. The request **MUST** be claimed before its fact is written, so two reviewers never both resolve it. What a resolution is about to write **MUST** be recorded on its claim first, so a resolution that ends without closing the request is closed as it once its write is in the profile. A closed request, one another reviewer is resolving, or one written but not closed **MUST** answer 409 with a reason that tells them apart. A rejection serves the fact again; a delete removes it as the subject's delete does.
 
 **Implements**:
 - `cpt-cf-construct-flow-review-queue-list-open`
@@ -353,7 +355,7 @@ The system **MUST** list the open requests of the caller's tenant, oldest first,
 **Touches**:
 - API: `GET /construct/v1/admin/review-requests`, `POST /construct/v1/admin/review-requests/{request_id}/resolution`
 
-**Verified by**: `a_caller_without_the_permission_or_with_a_narrower_scope_is_no_reviewer`, `a_reviewer_may_not_resolve_a_request_on_its_own_fact`, `a_rejection_closes_the_request_with_its_reason_and_keeps_the_fact`, `a_delete_removes_the_fact_as_the_reviewer_and_closes_the_request`, `a_delete_of_a_fact_already_gone_closes_the_request_as_deleted`, `a_request_another_reviewer_is_resolving_is_a_conflict`, `a_request_closed_while_its_correction_was_written_is_a_conflict`, `a_closed_or_unknown_request_cannot_be_resolved`, `only_a_constraint_on_the_whole_tenant_makes_a_reviewer` (service), `the_reviewers_list_holds_the_tenants_open_requests_oldest_first` (store), `a_reviewer_lists_the_open_requests_and_a_caller_without_the_permission_gets_403`, `a_closed_request_is_409_and_an_unknown_one_404`, `a_body_that_does_not_fit_its_outcome_is_400_naming_the_field` (routes).
+**Verified by**: `a_caller_without_the_permission_or_with_a_narrower_scope_is_no_reviewer`, `a_reviewer_may_not_resolve_a_request_on_its_own_fact`, `a_rejection_closes_the_request_with_its_reason_and_keeps_the_fact`, `a_delete_removes_the_fact_as_the_reviewer_and_closes_the_request`, `a_delete_of_a_fact_already_gone_closes_the_request_as_deleted`, ``a_closed_or_unknown_request_cannot_be_resolved`, `only_a_constraint_on_the_whole_tenant_makes_a_reviewer` (service), `the_reviewers_list_holds_the_tenants_open_requests_oldest_first` (store), `a_reviewer_lists_the_open_requests_and_a_caller_without_the_permission_gets_403`, `a_closed_request_is_409_and_an_unknown_one_404`, `a_body_that_does_not_fit_its_outcome_is_400_naming_the_field` (routes), `a_request_another_resolution_holds_is_a_conflict_until_its_hold_ends`, `a_request_closed_while_its_correction_was_written_is_a_conflict_that_says_so`, `a_write_that_may_have_landed_keeps_the_claim`, `a_failed_write_found_in_the_profile_closes_the_request`, `a_correction_whose_close_failed_is_closed_as_it_by_the_next_resolution`, `a_claim_outlasts_the_budget_and_the_writer`, `a_rejection_of_a_fact_gone_closes_the_request_as_deleted` (service), `a_stale_claim_gives_back_nothing_once_another_took_the_request`, `what_a_claim_recorded_reaches_the_next_claim_until_given_back_or_closed`, `the_reviewers_list_pages_oldest_first` (store), `a_held_or_unclosed_request_is_409_with_a_reason_a_client_tells_apart` (routes), `a_bad_query_of_the_reviewers_list_names_review_requests_and_the_part` (errors).
 
 ### The One-Step Plan Path
 
@@ -369,7 +371,7 @@ The system **MUST** turn a corrected value into a plan with one replace step and
 - Graph storage: the fact's node (replaced), the root's version
 - Config: `processing.run_without_sensitive_data_checks`, `processing.max_reruns`
 
-**Verified by**: `a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer`, `a_correction_rerun_after_a_conflict_keeps_the_key_it_stored`, `a_correction_admission_drops_stores_nothing_and_gives_the_request_back`, `a_correction_whose_value_is_blocked_stores_nothing_and_stays_open`, `a_correction_of_a_fact_already_gone_closes_the_request_as_deleted`, `a_correction_takes_only_the_facts_property_with_a_value_its_schema_takes`, `without_the_opt_in_a_correction_is_not_configured_and_the_rest_works` (service), `a_correction_needs_the_opt_in_to_store_values_unchecked` (pipeline), `a_correction_answers_the_closed_request_with_the_new_facts_id`, `a_correction_admission_refuses_is_422_and_the_request_stays_open` (routes).
+**Verified by**: `a_correction_replaces_the_fact_under_a_new_key_as_the_reviewer`, `a_correction_rerun_after_a_conflict_keeps_the_key_it_stored`, `a_correction_admission_drops_stores_nothing_and_gives_the_request_back`, `a_correction_whose_value_is_blocked_stores_nothing_and_stays_open`, `a_correction_of_a_fact_already_gone_closes_the_request_as_deleted`, `a_correction_takes_only_the_facts_property_with_a_value_its_schema_takes`, `without_the_opt_in_a_correction_is_not_configured_and_the_rest_works` (service), `a_correction_needs_the_opt_in_to_store_values_unchecked` (pipeline), `a_correction_answers_the_closed_request_with_the_new_facts_id`, `a_correction_admission_refuses_is_422_and_the_request_stays_open` (routes), `a_correction_whose_check_fails_stores_nothing_and_gives_the_request_back`, `a_write_that_started_runs_past_the_budget_to_its_end`.
 
 ### A Fact Under Review Is Frozen
 
@@ -384,7 +386,7 @@ While a request is open, the profile read **MUST NOT** serve its fact, and proce
 **Touches**:
 - Profile Reader, processing (`cpt-cf-construct-component-profile-reader`, `cpt-cf-construct-component-planner`)
 
-**Verified by**: `a_fact_under_an_open_review_request_is_not_served`, `a_read_whose_facts_under_review_cannot_be_read_fails_instead_of_serving_them` (profile read), `a_step_on_a_fact_under_review_is_dropped_and_the_rest_written`, `a_call_whose_only_step_is_on_a_fact_under_review_stores_nothing`, `an_unreadable_review_store_drops_the_record_at_the_planner` (processing), `a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none` (plan), `each_fact_carries_its_latest_review_request_and_the_export_holds_them_all` (the subject still sees it).
+**Verified by**: `a_fact_under_an_open_review_request_is_not_served`, `a_read_whose_facts_under_review_cannot_be_read_fails_instead_of_serving_them` (profile read), `a_step_on_a_fact_under_review_is_dropped_and_the_rest_written`, `a_call_whose_only_step_is_on_a_fact_under_review_stores_nothing`, `an_unreadable_review_store_drops_the_record_at_the_planner`, `a_manage_call_reads_the_facts_under_review_as_construct_not_as_the_agent`, `a_manage_call_drops_only_the_steps_on_a_fact_under_review`, `a_manage_call_with_the_review_store_down_writes_nothing` (processing), `a_change_touches_the_stored_entity_it_changes_and_a_new_entity_touches_none` (plan), `each_fact_carries_its_latest_review_request_and_the_export_holds_them_all` (the subject still sees it).
 
 ### Review Requests in Subject Control
 
@@ -398,13 +400,13 @@ Each fact in the subject's view **MUST** carry its latest review request or none
 **Touches**:
 - API: `GET /construct/v1/subjects/{subject_id}/facts`, `GET /construct/v1/subjects/{subject_id}/export`, `DELETE /construct/v1/subjects/{subject_id}/facts/{fact_id}`
 
-**Verified by**: `each_fact_carries_its_latest_review_request_and_the_export_holds_them_all`, `the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted`, `a_delete_whose_request_cannot_be_closed_is_unavailable_and_its_repeat_closes_it` (Subject Control).
+**Verified by**: `each_fact_carries_its_latest_review_request_and_the_export_holds_them_all`, `the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted`, `a_delete_whose_request_cannot_be_closed_is_unavailable_and_its_repeat_closes_it`, `a_delete_whose_writer_failed_after_it_landed_is_done` (Subject Control), `each_fact_shows_its_latest_review_request_or_null`, `the_export_is_a_json_attachment_and_403_without_its_permission` (routes).
 
 ### The Review Queue's Events
 
 - [x] `p1` - **ID**: `cpt-cf-construct-dod-review-queue-events`
 
-The system **MUST** log each flag and each resolution as an event with the tenant, the subject, the request, the fact and the caller, and for a resolution the outcome, and never a value, comment or reason.
+The system **MUST** log each flag, each resolution, each refused correction and each page of the reviewers' list as an event with the tenant and the caller, and the subject, the request and the fact where there is one; for a resolution the outcome, for a refusal its reason's name, for a page the ids of its requests; and never a value, comment or reviewer's reason.
 
 **Implements**:
 - `cpt-cf-construct-algo-review-queue-log`
@@ -412,7 +414,7 @@ The system **MUST** log each flag and each resolution as an event with the tenan
 **Touches**:
 - Log target: `construct::audit`
 
-**Verified by**: `a_flag_names_the_request_the_fact_and_the_subject_as_caller`, `a_correction_names_the_reviewer_the_outcome_and_the_new_fact`, and the recorded events in the service tests.
+**Verified by**: `a_flag_names_the_request_the_fact_and_the_subject_as_caller`, `a_correction_names_the_reviewer_the_outcome_and_the_new_fact`, `a_refused_correction_names_the_reviewer_and_the_reason`, `a_reviewers_read_names_the_requests_it_served`, and the recorded events in the service tests.
 
 ## 6. Acceptance Criteria
 
@@ -428,9 +430,9 @@ The system **MUST** log each flag and each resolution as an event with the tenan
 ## 7. Non-Functional Considerations
 
 - **Security**: The caller and the tenant come only from the platform. Flagging and the subject's list are owner only, checked before the policy service is asked; refusals and unknown facts answer 404. The admin routes need the permission to resolve review requests in the caller's tenant and cover that tenant only; another tenant's request answers 404. Graph storage is read and written as Construct's processing identity. The table is read and written under the tenant's scope. Every answer is `no-store` with the security headers of the subject routes.
-- **Privacy**: The flagged value is copied into the request only while it is open and is cleared on close. The comment and the reason are kept with the request until erasure or retention removes it. No event holds a value, a comment or a reason.
+- **Privacy**: The flagged value is copied into the request only while it is open and is cleared on close. The comment and the reason are kept with the request until erasure or retention removes it. No event holds a value, a comment or a reviewer's reason.
 - **Data integrity**: At most one open request per fact, enforced by a unique key on the tenant and the open fact. A close updates only an open request, so two resolutions cannot both close it. A correction and a delete are written against the profile's version; a replace keeps the old value until the new one is stored.
-- **Reliability**: The rerun limit and the 20-second budget bound a delete and a correction; past either the answer is 503, and the request stays open. A write that started before the budget ran out finishes under the writer's own timeouts.
+- **Reliability**: The rerun limit and the 20-second budget bound a delete and a correction; past either the answer is 503, and the request stays open. A write that started before the budget ran out is not cut off by it; it is awaited for at most 90 seconds.
 - **Performance**: The lists are cut by the database with the secure ORM's `OData` pager. The profile read and processing read a subject's open requests in one query by tenant and subject.
 - **Observability**: Each operation has a tracing span with the tenant, and the subject or the request. Events go to `construct::audit`.
 - **Not done in this part**: see the out-of-scope list in 1.2.

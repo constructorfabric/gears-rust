@@ -862,7 +862,7 @@ async fn the_application_read_leaves_out_a_fact_it_cannot_read_and_serves_the_re
 
 #[tokio::test]
 async fn the_subjects_read_fails_on_a_fact_it_cannot_read_instead_of_leaving_it_out() {
-    use crate::domain::subject_control::SubjectProfiles as _;
+    use crate::domain::profile_writes::SubjectProfiles as _;
 
     let profiles = Profiles::new();
     let other = profiles.neighbour();
@@ -894,7 +894,7 @@ async fn the_subjects_read_fails_on_a_fact_it_cannot_read_instead_of_leaving_it_
 
 #[tokio::test]
 async fn the_subjects_read_serves_the_live_facts_with_the_version() {
-    use crate::domain::subject_control::SubjectProfiles as _;
+    use crate::domain::profile_writes::SubjectProfiles as _;
 
     let profiles = Profiles::new();
     profiles.given(None, vec![add_skill("Go")]).await;

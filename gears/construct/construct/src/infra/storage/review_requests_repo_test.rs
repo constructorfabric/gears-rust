@@ -6,18 +6,19 @@ use std::sync::Arc;
 
 use serde_json::json;
 use time::{Duration, OffsetDateTime};
-use toolkit_odata::{CursorV1, ODataQuery, SortDir};
+use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, OrderKey, SortDir};
 use toolkit_security::{AccessScope, ScopeConstraint, ScopeFilter, pep_properties};
 use uuid::Uuid;
 
+use super::review_requests_entity as entity;
 use super::review_requests_repo::ReviewRequestStore;
 use crate::domain::error::DomainError;
 use crate::domain::pagination::QueryError;
 use crate::domain::plan::NodeKey;
 use crate::domain::profile::Category;
 use crate::domain::review_queue::{
-    Closed, FactsUnderReview, NewReviewRequest, Opened, RequestKey, ReviewOutcome, ReviewRequest,
-    ReviewRequests, ReviewStatus, ReviewText,
+    ClaimId, Claimed, Closed, FactsUnderReview, NewReviewRequest, Opened, RequestKey,
+    ReviewOutcome, ReviewRequest, ReviewRequests, ReviewStatus, ReviewText,
 };
 use crate::domain::subject_settings::SubjectKey;
 use crate::test_support::inmem_db;
@@ -86,19 +87,42 @@ fn rejection(by: Uuid) -> Closed {
     }
 }
 
-/// Claim `request` for `closed.by` and close it as `closed`.
+const HOLD: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Claim `request` as `claim` at `seconds`.
+async fn claim_at(
+    store: &ReviewRequestStore,
+    request: &ReviewRequest,
+    claim: ClaimId,
+    seconds: i64,
+) -> Claimed {
+    store
+        .claim(
+            &tenant(request.subject()),
+            request.key(),
+            claim,
+            at(seconds),
+            HOLD,
+        )
+        .await
+        .unwrap()
+}
+
+/// Claim `request` and close it as `closed`.
 async fn claimed_and_closed(
     store: &ReviewRequestStore,
     request: &ReviewRequest,
     closed: &Closed,
 ) -> Option<ReviewRequest> {
-    let scope = tenant(request.subject());
+    let claim = ClaimId(Uuid::new_v4());
+    assert!(matches!(
+        claim_at(store, request, claim, 4_000).await,
+        Claimed::Taken { .. }
+    ));
     store
-        .claim(&scope, request.key(), closed.by, at(4_000), at(3_000))
+        .close(&tenant(request.subject()), request.key(), claim, closed)
         .await
         .unwrap()
-        .expect("claimed");
-    store.close(&scope, request.key(), closed).await.unwrap()
 }
 
 #[tokio::test]
@@ -181,29 +205,121 @@ async fn a_second_open_request_on_a_fact_is_refused_and_a_closed_one_is_not() {
 }
 
 #[tokio::test]
-async fn one_reviewer_holds_a_claim_until_it_gives_it_back_or_it_goes_stale() {
+async fn one_claim_holds_a_request_until_it_is_given_back_or_goes_stale() {
     let store = store().await;
     let key = key();
     let scope = tenant(key);
     let request = opened(&store, new(key, "construct:t:a", 0)).await;
-    let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
-    let claim = |by, now: i64| store.claim(&scope, request.key(), by, at(now), at(now - 60));
+    let (first, second) = (ClaimId(Uuid::new_v4()), ClaimId(Uuid::new_v4()));
 
-    let taken = claim(first, 100).await.unwrap();
-    let refused = claim(second, 110).await.unwrap();
-    let again_by_first = claim(first, 120).await.unwrap();
+    let taken = claim_at(&store, &request, first, 100).await;
+    let refused = claim_at(&store, &request, second, 110).await;
+    let not_again = claim_at(&store, &request, first, 120).await;
     store.release(&scope, request.key(), first).await.unwrap();
-    let after_release = claim(second, 130).await.unwrap();
-    let stale_taken = claim(first, 200).await.unwrap();
+    let after_release = claim_at(&store, &request, second, 130).await;
+    let stale_taken = claim_at(&store, &request, first, 200).await;
 
-    assert!(taken.is_some());
-    assert_eq!(refused, None, "another reviewer holds it");
-    assert!(again_by_first.is_some(), "its own claim is renewed");
-    assert!(after_release.is_some());
+    assert!(matches!(taken, Claimed::Taken { .. }));
+    assert_eq!(refused, Claimed::Held, "another claim holds it");
+    assert_eq!(
+        not_again,
+        Claimed::Held,
+        "a held request is not claimed twice, by the same reviewer either"
+    );
+    assert!(matches!(after_release, Claimed::Taken { .. }));
     assert!(
-        stale_taken.is_some(),
+        matches!(stale_taken, Claimed::Taken { .. }),
         "a claim older than the hold frees itself"
     );
+}
+
+#[tokio::test]
+async fn a_stale_claim_gives_back_nothing_once_another_took_the_request() {
+    let store = store().await;
+    let key = key();
+    let scope = tenant(key);
+    let request = opened(&store, new(key, "construct:t:a", 0)).await;
+    let (stale, newer) = (ClaimId(Uuid::new_v4()), ClaimId(Uuid::new_v4()));
+    claim_at(&store, &request, stale, 100).await;
+    let took = claim_at(&store, &request, newer, 200).await;
+
+    store.release(&scope, request.key(), stale).await.unwrap();
+    let late_pend = store
+        .pend(&scope, request.key(), stale, &rejection(Uuid::new_v4()))
+        .await
+        .unwrap();
+    let third = claim_at(&store, &request, ClaimId(Uuid::new_v4()), 210).await;
+
+    assert!(matches!(took, Claimed::Taken { .. }));
+    assert!(!late_pend, "a stale claim records nothing");
+    assert_eq!(third, Claimed::Held, "the newer claim still holds it");
+}
+
+#[tokio::test]
+async fn what_a_claim_recorded_reaches_the_next_claim_until_given_back_or_closed() {
+    let store = store().await;
+    let key = key();
+    let scope = tenant(key);
+    let request = opened(&store, new(key, "construct:t:a", 0)).await;
+    let pending = Closed {
+        outcome: ReviewOutcome::Corrected(NodeKey("construct:t:new".to_owned())),
+        by: Uuid::new_v4(),
+        at: at(100),
+        reason: Some(ReviewText::new("typo").unwrap()),
+    };
+    let first = ClaimId(Uuid::new_v4());
+    claim_at(&store, &request, first, 100).await;
+    let recorded = store
+        .pend(&scope, request.key(), first, &pending)
+        .await
+        .unwrap();
+
+    let after_lapse = claim_at(&store, &request, ClaimId(Uuid::new_v4()), 200).await;
+    let again = ClaimId(Uuid::new_v4());
+    claim_at(&store, &request, again, 300).await;
+    store.release(&scope, request.key(), again).await.unwrap();
+    let after_release = claim_at(&store, &request, ClaimId(Uuid::new_v4()), 310).await;
+
+    assert!(recorded);
+    let Claimed::Taken {
+        request: taken,
+        pending: carried,
+    } = after_lapse
+    else {
+        panic!("taken after the hold: {after_lapse:?}");
+    };
+    assert_eq!(*taken, request);
+    assert_eq!(carried, Some(pending), "read back as recorded");
+    assert!(
+        matches!(after_release, Claimed::Taken { pending: None, .. }),
+        "a release forgets it: {after_release:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_closed_or_unknown_request_cannot_be_claimed() {
+    let store = store().await;
+    let key = key();
+    let request = opened(&store, new(key, "construct:t:a", 0)).await;
+    claimed_and_closed(&store, &request, &rejection(Uuid::new_v4()))
+        .await
+        .expect("closed");
+    let unknown = ReviewRequest {
+        id: Uuid::new_v4(),
+        ..request.clone()
+    };
+
+    let closed = claim_at(&store, &request, ClaimId(Uuid::new_v4()), 9_000).await;
+    let missing = claim_at(&store, &unknown, ClaimId(Uuid::new_v4()), 9_000).await;
+
+    assert_eq!(closed, Claimed::Closed);
+    assert_eq!(missing, Claimed::Closed);
+    let still = store
+        .find(&tenant(key), request.key())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!still.is_open(), "still closed");
 }
 
 #[tokio::test]
@@ -213,20 +329,34 @@ async fn a_close_needs_the_claim_sets_the_outcome_clears_the_value_and_happens_o
     let scope = tenant(key);
     let request = opened(&store, new(key, "construct:t:a", 0)).await;
     let reviewer = Uuid::new_v4();
+    let claim = ClaimId(Uuid::new_v4());
 
     let unclaimed = store
-        .close(&scope, request.key(), &rejection(reviewer))
+        .close(&scope, request.key(), claim, &rejection(reviewer))
         .await
         .unwrap();
-    let closed = claimed_and_closed(&store, &request, &rejection(reviewer))
+    claim_at(&store, &request, claim, 4_000).await;
+    let by_another_claim = store
+        .close(
+            &scope,
+            request.key(),
+            ClaimId(Uuid::new_v4()),
+            &rejection(reviewer),
+        )
         .await
+        .unwrap();
+    let closed = store
+        .close(&scope, request.key(), claim, &rejection(reviewer))
+        .await
+        .unwrap()
         .expect("closed");
     let again = store
-        .close(&scope, request.key(), &rejection(reviewer))
+        .close(&scope, request.key(), claim, &rejection(reviewer))
         .await
         .unwrap();
 
-    assert_eq!(unclaimed, None, "a reviewer closes only what it claimed");
+    assert_eq!(unclaimed, None, "a resolution closes only what it claimed");
+    assert_eq!(by_another_claim, None);
     assert_eq!(closed.status, ReviewStatus::Closed(rejection(reviewer)));
     assert_eq!(
         closed.comment.as_ref().map(ReviewText::as_str),
@@ -262,10 +392,7 @@ async fn the_open_request_on_a_fact_closes_by_the_fact_claimed_or_not() {
     opened(&store, new(key, "construct:t:b", 1)).await;
     let other = self::key();
     opened(&store, new(other, "construct:t:c", 2)).await;
-    store
-        .claim(&scope, claimed.key(), Uuid::new_v4(), at(10), at(0))
-        .await
-        .unwrap();
+    claim_at(&store, &claimed, ClaimId(Uuid::new_v4()), 10).await;
     let deleted = Closed {
         outcome: ReviewOutcome::Deleted,
         by: key.subject_id,
@@ -429,6 +556,47 @@ async fn the_reviewers_list_holds_the_tenants_open_requests_oldest_first() {
 }
 
 #[tokio::test]
+async fn the_reviewers_list_pages_oldest_first() {
+    let store = store().await;
+    let key = key();
+    let scope = tenant(key);
+    let mut ids = Vec::new();
+    for (fact, seconds) in [
+        ("construct:t:a", 0),
+        ("construct:t:b", 1),
+        ("construct:t:c", 2),
+    ] {
+        ids.push(opened(&store, new(key, fact, seconds)).await.id);
+    }
+
+    let first = store
+        .open_page(&scope, key.tenant_id, &ODataQuery::new().with_limit(2))
+        .await
+        .unwrap();
+    let rest = store
+        .open_page(
+            &scope,
+            key.tenant_id,
+            &ODataQuery::new().with_limit(2).with_cursor(
+                CursorV1::decode(&first.page_info.next_cursor.clone().expect("a next page"))
+                    .unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+
+    let ids_of = |page: &toolkit_odata::Page<ReviewRequest>| {
+        page.items
+            .iter()
+            .map(|request| request.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids_of(&first), [ids[0], ids[1]]);
+    assert_eq!(ids_of(&rest), [ids[2]]);
+    assert_eq!(rest.page_info.next_cursor, None);
+}
+
+#[tokio::test]
 async fn a_scope_of_another_tenant_finds_claims_and_closes_nothing() {
     let store = store().await;
     let key = key();
@@ -437,12 +605,13 @@ async fn a_scope_of_another_tenant_finds_claims_and_closes_nothing() {
     let reviewer = Uuid::new_v4();
 
     let found = store.find(&elsewhere, request.key()).await.unwrap();
+    let claim = ClaimId(Uuid::new_v4());
     let claimed = store
-        .claim(&elsewhere, request.key(), reviewer, at(10), at(0))
+        .claim(&elsewhere, request.key(), claim, at(10), HOLD)
         .await
         .unwrap();
     let closed = store
-        .close(&elsewhere, request.key(), &rejection(reviewer))
+        .close(&elsewhere, request.key(), claim, &rejection(reviewer))
         .await
         .unwrap();
     let listed = store
@@ -451,7 +620,7 @@ async fn a_scope_of_another_tenant_finds_claims_and_closes_nothing() {
         .unwrap();
 
     assert_eq!(found, None);
-    assert_eq!(claimed, None);
+    assert_eq!(claimed, Claimed::Closed);
     assert_eq!(closed, None);
     assert!(listed.items.is_empty());
     let still = store.find(&tenant(key), request.key()).await.unwrap();
@@ -496,6 +665,19 @@ async fn a_bad_filter_or_cursor_is_the_callers_mistake() {
     let bad_cursor = store
         .subject_page(&scope, key, &ODataQuery::new().with_cursor(foreign_cursor))
         .await;
+    let bad_order = store
+        .subject_page(
+            &scope,
+            key,
+            &ODataQuery::new().with_order(ODataOrderBy(vec![OrderKey {
+                field: "value".to_owned(),
+                dir: SortDir::Asc,
+            }])),
+        )
+        .await;
+    let bad_open_filter = store
+        .open_page(&scope, key.tenant_id, &filtered("state eq 'open'"))
+        .await;
 
     assert!(
         matches!(
@@ -511,4 +693,136 @@ async fn a_bad_filter_or_cursor_is_the_callers_mistake() {
         ),
         "{bad_cursor:?}"
     );
+    assert!(
+        matches!(
+            bad_order,
+            Err(DomainError::InvalidQuery(QueryError::Order(_)))
+        ),
+        "{bad_order:?}"
+    );
+    assert!(
+        matches!(
+            bad_open_filter,
+            Err(DomainError::InvalidQuery(QueryError::Filter(_)))
+        ),
+        "the reviewers' list has no state field: {bad_open_filter:?}"
+    );
+}
+
+/// A row as an operator's hand or an old version could leave it, inserted
+/// past the store.
+async fn stored_row(db: &toolkit_db::Db, row: entity::ActiveModel) {
+    use sea_orm::EntityTrait as _;
+    use toolkit_db::secure::SecureInsertExt as _;
+
+    let conn = db.conn().expect("connection");
+    entity::Entity::insert(row.clone())
+        .secure()
+        .scope_with_model(&AccessScope::allow_all(), &row)
+        .unwrap()
+        .exec(&conn)
+        .await
+        .unwrap();
+}
+
+/// A change that breaks one rule of a stored row.
+type Tweak = fn(&mut entity::ActiveModel);
+
+#[tokio::test]
+async fn a_row_construct_cannot_read_is_an_internal_error() {
+    use sea_orm::ActiveValue::Set;
+
+    let db = inmem_db().await;
+    let store = ReviewRequestStore::new(Arc::new(toolkit_db::DBProvider::new(db.clone())));
+    let key = key();
+    let row = |tweak: fn(&mut entity::ActiveModel)| {
+        let mut row = entity::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            tenant_id: Set(key.tenant_id),
+            subject_id: Set(key.subject_id),
+            fact_id: Set(format!("construct:t:{}", Uuid::new_v4())),
+            entity_kind: Set("skill".to_owned()),
+            property: Set("skills".to_owned()),
+            value: Set(Some("{}".to_owned())),
+            comment: Set(None),
+            state: Set("open".to_owned()),
+            open_fact_id: Set(None),
+            outcome: Set(None),
+            reason: Set(None),
+            claim_id: Set(None),
+            claimed_at: Set(None),
+            pending: Set(None),
+            resolved_by: Set(None),
+            corrected_fact_id: Set(None),
+            created_at: Set(at(0)),
+            resolved_at: Set(None),
+        };
+        tweak(&mut row);
+        row
+    };
+    let closed = |row: &mut entity::ActiveModel| {
+        row.state = Set("closed".to_owned());
+        row.value = Set(None);
+        row.resolved_by = Set(Some(Uuid::new_v4()));
+        row.resolved_at = Set(Some(at(10)));
+        row.outcome = Set(Some("rejected".to_owned()));
+    };
+    let defects: [(&str, Tweak); 6] = [
+        ("an unknown state", |row| {
+            row.state = Set("waiting".to_owned());
+        }),
+        ("an open row without a value", |row| row.value = Set(None)),
+        ("a value that is not JSON", |row| {
+            row.value = Set(Some("{".to_owned()));
+        }),
+        ("an unknown entity kind", |row| {
+            row.entity_kind = Set("hobby".to_owned());
+        }),
+        ("a correction without its new fact", |row| {
+            row.state = Set("closed".to_owned());
+            row.value = Set(None);
+            row.resolved_by = Set(Some(Uuid::new_v4()));
+            row.resolved_at = Set(Some(at(10)));
+            row.outcome = Set(Some("corrected".to_owned()));
+        }),
+        ("a closed row without a resolver", |row| {
+            row.state = Set("closed".to_owned());
+            row.value = Set(None);
+            row.outcome = Set(Some("deleted".to_owned()));
+        }),
+    ];
+    let sound = row(closed);
+    let sound_id = sound.id.clone().unwrap();
+    stored_row(&db, sound).await;
+
+    for (defect, tweak) in defects {
+        let bad = row(tweak);
+        let id = bad.id.clone().unwrap();
+        stored_row(&db, bad).await;
+
+        let found = store
+            .find(
+                &tenant(key),
+                RequestKey {
+                    tenant_id: key.tenant_id,
+                    id,
+                },
+            )
+            .await;
+
+        assert!(
+            matches!(found, Err(DomainError::Internal(_))),
+            "{defect}: {found:?}"
+        );
+    }
+    let fine = store
+        .find(
+            &tenant(key),
+            RequestKey {
+                tenant_id: key.tenant_id,
+                id: sound_id,
+            },
+        )
+        .await;
+    assert!(matches!(fine, Ok(Some(_))), "{fine:?}");
 }

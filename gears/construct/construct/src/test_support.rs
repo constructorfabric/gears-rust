@@ -1137,12 +1137,12 @@ impl MemoryProfile {
 }
 
 #[async_trait]
-impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
+impl crate::domain::profile_writes::SubjectProfiles for MemoryProfile {
     async fn facts(
         &self,
         ctx: &SecurityContext,
         key: SubjectKey,
-    ) -> Result<crate::domain::subject_control::SubjectFacts, DomainError> {
+    ) -> Result<crate::domain::profile_writes::SubjectFacts, DomainError> {
         self.reads.lock().unwrap().push((ctx.subject_id(), key));
         let delay = *self.delay.lock().unwrap();
         if !delay.is_zero() {
@@ -1157,7 +1157,7 @@ impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
                 },
             ));
         }
-        Ok(crate::domain::subject_control::SubjectFacts {
+        Ok(crate::domain::profile_writes::SubjectFacts {
             version: *self.version.lock().unwrap(),
             facts: self.live(),
         })
@@ -1375,17 +1375,32 @@ impl crate::domain::planner::processing::ProcessingContexts for NoProcessingIden
 
 // --- Review requests ---
 
+/// One stored request with the claim that holds it, if any: the claim's id
+/// and when it was taken.
+pub type HeldRequest = (
+    crate::domain::review_queue::ReviewRequest,
+    Option<(Uuid, time::OffsetDateTime)>,
+);
+
 /// [`ReviewRequests`](crate::domain::review_queue::ReviewRequests) in memory,
 /// newest first, with each request's claim. Pages hold every match; paging is
 /// the store's own test. The scope is not applied; the store's tests show it.
 #[derive(Default)]
 pub struct MemoryReviews {
-    pub requests: std::sync::Mutex<Vec<(crate::domain::review_queue::ReviewRequest, Option<Uuid>)>>,
+    pub requests: std::sync::Mutex<Vec<HeldRequest>>,
     /// Fail every call as unavailable.
     pub down: std::sync::atomic::AtomicBool,
-    /// Close each claimed request as deleted by its subject, as the
-    /// subject's delete would while a reviewer resolves it.
-    pub deleted_while_claimed: std::sync::atomic::AtomicBool,
+    /// Close each request as deleted by its subject right after its claim
+    /// recorded a write, as the subject's delete would while a reviewer's
+    /// write runs.
+    pub deleted_while_written: std::sync::atomic::AtomicBool,
+    /// Fail a reviewer's close as unavailable, and nothing else.
+    pub close_fails: std::sync::atomic::AtomicBool,
+    /// The scope of each read of the facts under review.
+    pub under_review_scopes: std::sync::Mutex<Vec<AccessScope>>,
+    /// What each request's claim recorded, by request id.
+    pub pending:
+        std::sync::Mutex<std::collections::HashMap<Uuid, crate::domain::review_queue::Closed>>,
 }
 
 impl MemoryReviews {
@@ -1398,14 +1413,32 @@ impl MemoryReviews {
             .collect()
     }
 
-    /// The claim on each request, in the order of [`Self::all`].
-    pub fn claims(&self) -> Vec<Option<Uuid>> {
+    /// Whether each request is held by a claim, in the order of [`Self::all`].
+    pub fn held(&self) -> Vec<bool> {
         self.requests
             .lock()
             .unwrap()
             .iter()
-            .map(|(_, claim)| *claim)
+            .map(|(_, claim)| claim.is_some())
             .collect()
+    }
+
+    /// Hold the first request by another resolution, claimed at `at`.
+    pub fn hold_first(&self, at: time::OffsetDateTime) {
+        self.requests.lock().unwrap()[0].1 = Some((Uuid::new_v4(), at));
+    }
+
+    /// Move the claim on the first request back to `at`, as if it had been
+    /// taken then.
+    pub fn claimed_first_at(&self, at: time::OffsetDateTime) {
+        if let Some((_, since)) = &mut self.requests.lock().unwrap()[0].1 {
+            *since = at;
+        }
+    }
+
+    /// What the claim on `request_id` recorded.
+    pub fn pending_of(&self, request_id: Uuid) -> Option<crate::domain::review_queue::Closed> {
+        self.pending.lock().unwrap().get(&request_id).cloned()
     }
 
     /// An open request on `fact`, created `seconds` after the epoch, as if
@@ -1452,7 +1485,10 @@ impl MemoryReviews {
 
     fn close_where(
         &self,
-        matches: impl Fn(&crate::domain::review_queue::ReviewRequest, Option<Uuid>) -> bool,
+        matches: impl Fn(
+            &crate::domain::review_queue::ReviewRequest,
+            Option<(Uuid, time::OffsetDateTime)>,
+        ) -> bool,
         closed: &crate::domain::review_queue::Closed,
     ) -> Option<crate::domain::review_queue::ReviewRequest> {
         use crate::domain::review_queue::ReviewStatus;
@@ -1462,6 +1498,7 @@ impl MemoryReviews {
             .find(|(r, claim)| r.is_open() && matches(r, *claim))?;
         request.status = ReviewStatus::Closed(closed.clone());
         *claim = None;
+        self.pending.lock().unwrap().remove(&request.id);
         Some(request.clone())
     }
 
@@ -1484,9 +1521,10 @@ impl MemoryReviews {
 impl crate::domain::review_queue::FactsUnderReview for MemoryReviews {
     async fn under_review(
         &self,
-        _scope: &AccessScope,
+        scope: &AccessScope,
         key: SubjectKey,
     ) -> Result<std::collections::BTreeSet<crate::domain::plan::NodeKey>, DomainError> {
+        self.under_review_scopes.lock().unwrap().push(scope.clone());
         self.check()?;
         Ok(self
             .all()
@@ -1540,46 +1578,76 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         &self,
         _scope: &AccessScope,
         key: crate::domain::review_queue::RequestKey,
-        by: Uuid,
-        _at: time::OffsetDateTime,
-        _stale_before: time::OffsetDateTime,
-    ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
-        use crate::domain::review_queue::{Closed, ReviewOutcome, ReviewStatus};
+        claim: crate::domain::review_queue::ClaimId,
+        at: time::OffsetDateTime,
+        hold: std::time::Duration,
+    ) -> Result<crate::domain::review_queue::Claimed, DomainError> {
+        use crate::domain::review_queue::Claimed;
         self.check()?;
         let mut requests = self.requests.lock().unwrap();
-        let Some((request, claim)) = requests
-            .iter_mut()
-            .find(|(r, claim)| r.key() == key && r.is_open() && claim.is_none_or(|c| c == by))
-        else {
-            return Ok(None);
+        let Some((request, holder)) = requests.iter_mut().find(|(r, _)| r.key() == key) else {
+            return Ok(Claimed::Closed);
         };
-        *claim = Some(by);
-        let claimed = request.clone();
-        if self
-            .deleted_while_claimed
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            request.status = ReviewStatus::Closed(Closed {
-                outcome: ReviewOutcome::Deleted,
-                by: request.subject_id,
-                at: time::OffsetDateTime::now_utc(),
-                reason: None,
-            });
-            *claim = None;
+        if !request.is_open() {
+            return Ok(Claimed::Closed);
         }
-        Ok(Some(claimed))
+        if holder.is_some_and(|(_, since)| since >= at - hold) {
+            return Ok(Claimed::Held);
+        }
+        *holder = Some((claim.0, at));
+        let claimed = request.clone();
+        let pending = self.pending_of(request.id);
+        Ok(Claimed::Taken {
+            request: Box::new(claimed),
+            pending,
+        })
+    }
+
+    async fn pend(
+        &self,
+        _scope: &AccessScope,
+        key: crate::domain::review_queue::RequestKey,
+        claim: crate::domain::review_queue::ClaimId,
+        pending: &crate::domain::review_queue::Closed,
+    ) -> Result<bool, DomainError> {
+        self.check()?;
+        let held = self.requests.lock().unwrap().iter().any(|(request, held)| {
+            request.key() == key && request.is_open() && held.is_some_and(|(id, _)| id == claim.0)
+        });
+        if held {
+            self.pending.lock().unwrap().insert(key.id, pending.clone());
+        }
+        if held
+            && self
+                .deleted_while_written
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            let subject = |r: &crate::domain::review_queue::ReviewRequest| r.subject_id;
+            let by = self.all().iter().find(|r| r.key() == key).map(subject);
+            self.close_where(
+                |r, _| r.key() == key,
+                &crate::domain::review_queue::Closed {
+                    outcome: crate::domain::review_queue::ReviewOutcome::Deleted,
+                    by: by.unwrap_or_default(),
+                    at: time::OffsetDateTime::now_utc(),
+                    reason: None,
+                },
+            );
+        }
+        Ok(held)
     }
 
     async fn release(
         &self,
         _scope: &AccessScope,
         key: crate::domain::review_queue::RequestKey,
-        by: Uuid,
+        claim: crate::domain::review_queue::ClaimId,
     ) -> Result<(), DomainError> {
         self.check()?;
-        for (request, claim) in self.requests.lock().unwrap().iter_mut() {
-            if request.key() == key && *claim == Some(by) {
-                *claim = None;
+        for (request, held) in self.requests.lock().unwrap().iter_mut() {
+            if request.key() == key && held.is_some_and(|(id, _)| id == claim.0) {
+                *held = None;
+                self.pending.lock().unwrap().remove(&key.id);
             }
         }
         Ok(())
@@ -1589,11 +1657,15 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         &self,
         _scope: &AccessScope,
         key: crate::domain::review_queue::RequestKey,
+        claim: crate::domain::review_queue::ClaimId,
         closed: &crate::domain::review_queue::Closed,
     ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
         self.check()?;
+        if self.close_fails.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DomainError::Unavailable("the close failed".to_owned()));
+        }
         Ok(self.close_where(
-            |r, claim| r.key() == key && claim == Some(closed.by),
+            |r, held| r.key() == key && held.is_some_and(|(id, _)| id == claim.0),
             closed,
         ))
     }
