@@ -38,7 +38,11 @@ pub enum Outcome {
     /// Inserted as new.
     Registered,
     /// Metadata updated in place.
-    Updated,
+    Updated {
+        /// The classification or the domain affinity changed at the same
+        /// major: what a cached resolution carries, so peers must evict.
+        reclassified: bool,
+    },
     /// Already as contributed; nothing written.
     Unchanged,
     /// Revived from retired.
@@ -641,6 +645,8 @@ where
         let metadata = derived.metadata(contributed);
         let changed = metadata_differs(&existing, &metadata);
         let classification_changed = existing.data_classification != metadata.data_classification;
+        let reclassified =
+            classification_changed || existing.domain_affinity != metadata.domain_affinity;
 
         if existing.status.is_retired() {
             // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-6
@@ -712,7 +718,7 @@ where
             Some(snapshot(&updated)),
         )
         .await?;
-        Ok(Outcome::Updated)
+        Ok(Outcome::Updated { reclassified })
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-5
     }
 

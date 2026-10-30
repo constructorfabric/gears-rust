@@ -15,7 +15,8 @@
 //! startup rather than serving traffic on a guess.
 //!
 //! Fields that carry a value fixed by the design, rather than by the deployment,
-//! may default — [`SettingsServiceConfig::cache_ttl_seconds`] is the only one.
+//! may default — [`SettingsServiceConfig::cache_ttl_seconds`] and
+//! [`SettingsServiceConfig::publish_timeout_seconds`] are those.
 //!
 //! # Step-up configuration
 //!
@@ -39,6 +40,11 @@ use serde::Deserialize;
 /// missed. Fixed by DESIGN.md §4.2 *Cache & Invalidation*, not by the operator.
 const DEFAULT_CACHE_TTL_SECONDS: u64 = 30;
 const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 365;
+/// How long a request waits for the broker to accept its `cache_invalidate`
+/// broadcast.
+const DEFAULT_PUBLISH_TIMEOUT_SECONDS: u64 = 2;
+/// The longest a deployment may make a request wait on the broker.
+pub const PUBLISH_TIMEOUT_CEILING_SECONDS: u64 = 10;
 
 /// Bootstrap configuration, read once at gear init.
 ///
@@ -64,6 +70,16 @@ pub struct SettingsServiceConfig {
     /// evicted first. Defaults to 500,000; a zero is refused at init.
     #[serde(default = "default_cache_max_entries")]
     pub cache_max_entries: usize,
+
+    /// The longest a request waits for the broker to accept its
+    /// `cache_invalidate` broadcast, in seconds.
+    ///
+    /// Defaults to 2; init refuses a zero, which would time every publish out,
+    /// and anything above 10, which would let a slow broker stall the request.
+    /// A request pays this at most once: after the first refusal or timeout its
+    /// remaining broadcasts are skipped.
+    #[serde(default = "default_publish_timeout_seconds")]
+    pub publish_timeout_seconds: u64,
 
     /// How long an audit record without an explicit `retain_until` stays in the
     /// online window. Twelve months by default, and never configurable below
@@ -108,6 +124,21 @@ pub const IN_PROCESS_CONTRACTS: [&str; 2] =
     ["settings_reader_client", "settings_contribution_client"];
 
 impl SettingsServiceConfig {
+    /// Refuse a `publish_timeout_seconds` outside `1..=10`.
+    ///
+    /// # Errors
+    /// Names the field, the value and the bounds.
+    pub fn check_publish_timeout(&self) -> Result<(), String> {
+        if (1..=PUBLISH_TIMEOUT_CEILING_SECONDS).contains(&self.publish_timeout_seconds) {
+            return Ok(());
+        }
+        Err(format!(
+            "publish_timeout_seconds is {} but must be between 1 and {PUBLISH_TIMEOUT_CEILING_SECONDS}, \
+             the bound on how long a request waits for the broker to accept its cache broadcast",
+            self.publish_timeout_seconds
+        ))
+    }
+
     /// Refuse a remote binding for either of this gear's SDK traits.
     ///
     /// # Errors
@@ -183,6 +214,10 @@ impl Default for StepUpConfig {
 
 const fn default_cache_ttl_seconds() -> u64 {
     DEFAULT_CACHE_TTL_SECONDS
+}
+
+const fn default_publish_timeout_seconds() -> u64 {
+    DEFAULT_PUBLISH_TIMEOUT_SECONDS
 }
 
 const fn default_cache_max_entries() -> usize {

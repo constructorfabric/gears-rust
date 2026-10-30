@@ -1,7 +1,7 @@
 # Created: 2026-08-12 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -29,6 +29,9 @@ integration = ["toolkit-db/pg"]
 # Trait boundaries of consumed SDKs are `CanonicalError` (ADR 0005).
 toolkit-canonical-errors = { workspace = true }
 settings-service-sdk = { workspace = true }
+# The broker-native `Event` the cache_invalidate broadcast is built as.
+event-broker-sdk = { workspace = true }
+chrono = { workspace = true }
 # `rest-client`: `#[toolkit::consumes]` needs the directory-resolving client to
 # exist, even though R1 binds the co-located provider (DESIGN.md §4.9).
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
@@ -66,6 +69,8 @@ toolkit-db = { workspace = true }
 # The pending-secret sweep runs on the gear's managed lifecycle tick.
 tokio = { workspace = true, features = ["time", "macros", "rt"] }
 tokio-util = { workspace = true }
+# The consumer takes the broker's delivery stream frame by frame.
+futures-util = { workspace = true }
 # Step-up: the presented token is validated by the platform's AuthN resolver,
 # fetched from the hub at first use; the freshness claims are read from it.
 authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.38", path = "../../system/authn-resolver/authn-resolver-sdk" }
@@ -76,9 +81,17 @@ base64 = { workspace = true }
 secrecy = { workspace = true }
 toolkit-security = { workspace = true }
 toolkit-macros = { workspace = true }
+# The envelope's `trace_parent` is the request's span context; the consumer
+# continues it. The `otel` feature comes through `toolkit`.
+toolkit-trace-context = { workspace = true }
 toolkit-gts = { workspace = true }
 
 [dev-dependencies]
+# Captures the consumer's `warn` lines in the coherence tests.
+tracing-subscriber = { workspace = true }
+# A live OTel span for the trace-propagation tests.
+tracing-opentelemetry = { workspace = true }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }
 # The SQL query recorder: the impact walk pins its round trips as a count of

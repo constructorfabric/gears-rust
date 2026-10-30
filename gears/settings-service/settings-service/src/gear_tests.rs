@@ -132,7 +132,49 @@ fn gear_with_writes(
         ))
         .map_err(|_| "already set")
         .expect("a fresh gear");
+    // `serve` also runs the cache invalidation consumer; with no broker in the
+    // hub it only waits.
+    gear.cache
+        .set(std::sync::Arc::new(
+            crate::domain::resolution::EffectiveCache::new(std::time::Duration::from_secs(30)),
+        ))
+        .map_err(|_| "already set")
+        .expect("a fresh gear");
+    gear.event_broker
+        .set(std::sync::Arc::new(
+            crate::infra::event_broker::EventBrokerClient::new(
+                std::sync::Arc::new(toolkit::ClientHub::new()),
+                std::sync::Arc::new(NoRegistry),
+                std::sync::Arc::new(crate::test_support::FixedScope(uuid::Uuid::from_u128(1))),
+                std::time::Duration::from_secs(2),
+                uuid::Uuid::from_u128(2),
+            ),
+        ))
+        .map_err(|_| "already set")
+        .expect("a fresh gear");
     std::sync::Arc::new(gear)
+}
+
+/// A registry the lifecycle tests never reach: no broker is in their hub.
+struct NoRegistry;
+
+#[async_trait::async_trait]
+impl crate::infra::event_broker::CacheSchemaRegistry for NoRegistry {
+    async fn register_topic(
+        &self,
+        _: serde_json::Value,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+    {
+        Ok(Vec::new())
+    }
+
+    async fn register_event_type(
+        &self,
+        _: serde_json::Value,
+    ) -> Result<Vec<types_registry_sdk::RegisterResult>, toolkit_canonical_errors::CanonicalError>
+    {
+        Ok(Vec::new())
+    }
 }
 
 /// Stage an expired secret directly, the way an abandoned stage leaves one.
@@ -409,8 +451,24 @@ async fn init_takes_the_design_fixed_defaults_when_nothing_is_configured() {
     let config = gear.config().expect("config");
     assert_eq!(config.cache_ttl_seconds, 30);
     assert_eq!(config.cache_max_entries, 500_000);
+    assert_eq!(config.publish_timeout_seconds, 2);
     assert_eq!(config.audit_retention_days, 365);
     assert_eq!(config.step_up.max_age_seconds, 300);
+}
+
+#[tokio::test]
+async fn init_binds_the_event_broker_client_without_resolving_the_broker() {
+    // The hub of the default context holds no broker: init still succeeds, and
+    // the client it bound has resolved nothing.
+    let ctx = default_context().await;
+    let gear = SettingsService::default();
+    gear.init(&ctx)
+        .await
+        .expect("init with no broker in the hub");
+    let client = gear.event_broker().expect("the client is bound");
+    assert!(client.broker().is_none());
+    let state = client.state();
+    assert!(!state.types_registered && !state.root_tenant_known);
 }
 
 #[tokio::test]
@@ -624,6 +682,32 @@ async fn init_refuses_a_cache_ttl_wider_than_the_design_backstop_or_zero() {
         .init(&ctx)
         .await
         .expect("a shorter backstop is the deployment's to choose");
+}
+
+#[tokio::test]
+async fn init_refuses_a_publish_timeout_of_zero_or_above_ten_without_a_broker_in_the_hub() {
+    // The broadcast is bounded so a request never waits on the broker for
+    // long; a zero would time every publish out and a long one would stall the
+    // request. The hub holds no broker here, and init neither resolves nor
+    // waits for one.
+    for seconds in [0, 11] {
+        let ctx = context_with(json!({ "publish_timeout_seconds": seconds }), wired_hub()).await;
+        let err = SettingsService::default()
+            .init(&ctx)
+            .await
+            .expect_err("outside 1..=10");
+        let message = err.to_string();
+        assert!(
+            message.contains("publish_timeout_seconds") && message.contains("between 1 and 10"),
+            "the message names the field and the bounds: `{message}`"
+        );
+    }
+
+    let ctx = context_with(json!({ "publish_timeout_seconds": 10 }), wired_hub()).await;
+    SettingsService::default()
+        .init(&ctx)
+        .await
+        .expect("ten seconds is the ceiling, and init completes with no broker");
 }
 
 #[tokio::test]
@@ -928,4 +1012,71 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
     let year = std::time::Duration::from_hours(400 * 24);
     SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await;
     assert_eq!(recorded().await, Some(400));
+}
+
+#[tokio::test]
+async fn a_consumer_that_outlives_the_shutdown_bound_is_aborted() {
+    // A task parked on a broker call that never answers: the stop returns once
+    // the bound has passed, and the task is gone, not left running.
+    struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Dropped(std::sync::Arc::clone(&dropped));
+    let stuck = tokio::spawn(async move {
+        let _held = guard;
+        std::future::pending::<()>().await;
+    });
+    let started = std::time::Instant::now();
+    SettingsService::await_consumer(
+        super::ConsumerTask(Some(stuck)),
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    // `abort` takes effect at the task's next poll; give the runtime one.
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the task was aborted"
+    );
+}
+
+#[tokio::test]
+async fn a_consumer_that_ends_in_time_is_awaited_without_abort() {
+    let quick = tokio::spawn(async {});
+    SettingsService::await_consumer(
+        super::ConsumerTask(Some(quick)),
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_consumer_task_dropped_without_awaiting_is_aborted() {
+    struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let guard = Dropped(std::sync::Arc::clone(&dropped));
+    let stuck = tokio::spawn(async move {
+        let _held = guard;
+        std::future::pending::<()>().await;
+    });
+    // Let the task start so the abort has a poll point to land on.
+    tokio::task::yield_now().await;
+    drop(super::ConsumerTask(Some(stuck)));
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(
+        dropped.load(std::sync::atomic::Ordering::SeqCst),
+        "the task was aborted by the guard's drop"
+    );
 }

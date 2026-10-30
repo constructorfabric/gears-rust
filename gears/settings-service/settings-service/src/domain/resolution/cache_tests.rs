@@ -116,6 +116,30 @@ fn a_declaration_change_evicts_the_whole_key() {
 }
 
 #[test]
+fn many_keys_are_evicted_in_one_pass_and_each_generation_moves() {
+    let cache = EffectiveCache::new(Duration::from_secs(30));
+    let tenants = [Uuid::new_v4(), Uuid::new_v4()];
+    let named: Vec<String> = (0..500).map(|i| format!("named-{i}")).collect();
+    for tenant in tenants {
+        for key in &named {
+            cache.seed(entry(key, tenant));
+        }
+        cache.seed(entry("kept", tenant));
+    }
+    let before = cache.generation("named-7", tenants[0]);
+    cache.invalidate_keys(&named);
+    assert_eq!(cache.len(), tenants.len(), "only the unnamed key stays");
+    for tenant in tenants {
+        assert!(cache.get("kept", tenant).is_some());
+        assert!(cache.get("named-499", tenant).is_none());
+    }
+    assert_ne!(cache.generation("named-7", tenants[0]), before);
+    // Nothing named, nothing touched.
+    cache.invalidate_keys(&[]);
+    assert_eq!(cache.len(), tenants.len());
+}
+
+#[test]
 fn a_hierarchy_change_evicts_the_affected_subtree_across_every_setting() {
     let cache = EffectiveCache::new(Duration::from_secs(30));
     let moved = Uuid::new_v4();

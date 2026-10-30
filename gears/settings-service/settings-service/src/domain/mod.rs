@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod category;
+pub mod coherence;
 pub mod contribution;
 pub mod declaration;
 pub mod error;

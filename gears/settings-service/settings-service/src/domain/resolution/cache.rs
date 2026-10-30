@@ -335,6 +335,25 @@ impl EffectiveCache {
         self.invalidate(key, scope_class::CASCADING, None);
     }
 
+    /// Evict every scope of each of `keys` in one pass: one lock, one walk of
+    /// the entries against a membership set of the keys, and each key's
+    /// generation moved as [`Self::invalidate_key`] moves it. What a broadcast
+    /// naming many keys costs, instead of a walk of the cache per key.
+    pub fn invalidate_keys(&self, keys: &[String]) {
+        if keys.is_empty() {
+            return;
+        }
+        let named: HashSet<&str> = keys.iter().map(String::as_str).collect();
+        let mut store = self.lock();
+        // Counted before anything is removed, as `invalidate` does.
+        for key in &named {
+            store.bump_key(key);
+        }
+        store
+            .entries
+            .retain(|(k, _), _| !named.contains(k.as_str()));
+    }
+
     // @cpt-begin:cpt-cf-settings-service-algo-value-resolution-cache-invalidate:p1:inst-vr-inv-4
     // A cached effective value of a cascading setting is a function of the
     // ancestor chain, so a tenant re-parent or a mid-chain insertion changes

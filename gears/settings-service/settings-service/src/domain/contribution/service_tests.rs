@@ -129,6 +129,19 @@ impl Harness {
         }
     }
 
+    /// A harness whose passes end through the cache broadcast hook.
+    async fn hooked(
+        gateway: &Arc<crate::domain::coherence::testing::RecordingGateway>,
+    ) -> (
+        Self,
+        Arc<crate::domain::coherence::testing::CountingMetrics>,
+    ) {
+        let (hook, metrics) = crate::domain::coherence::testing::publisher(gateway);
+        let mut h = Self::new().await;
+        h.client = h.client.with_coherence(hook);
+        (h, metrics)
+    }
+
     /// The keys announced as newly registered.
     fn registered_events(&self) -> Vec<String> {
         self.published
@@ -1829,4 +1842,154 @@ async fn the_in_place_update_record_carries_the_old_and_new_display_name() {
         json!("Egress proxy"),
         "the new label"
     );
+}
+
+// --- the end-of-pass cache broadcast ------------------------------------------
+
+mod coherence {
+    use super::*;
+    use crate::domain::coherence::testing::RecordingGateway;
+
+    fn keys(event: &event_broker_sdk::Event) -> Vec<String> {
+        event.data.as_ref().expect("body")["changed_keys"]
+            .as_array()
+            .expect("keys")
+            .iter()
+            .map(|k| k.as_str().expect("key").to_owned())
+            .collect()
+    }
+
+    fn change_set(event: &event_broker_sdk::Event) -> String {
+        event.data.as_ref().expect("body")["change_set_id"]
+            .as_str()
+            .expect("an id")
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn a_pass_of_new_and_unchanged_declarations_publishes_nothing() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        h.register(vec![flag("network", "proxy_enabled")]).await;
+        h.register(vec![flag("network", "proxy_enabled")]).await;
+        let mut described = flag("network", "proxy_enabled");
+        described.description = Some("words only".to_owned());
+        h.register(vec![described]).await;
+        assert!(gateway.events().is_empty());
+        assert!(metrics.all().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_pass_publishes_once_under_one_id_naming_every_key_it_changed() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let root = gateway.root.expect("root");
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        h.register(vec![
+            flag("network", "a"),
+            flag("network", "b"),
+            port("listen_port", json!(8080)),
+        ])
+        .await;
+        h.retire_as(MODULE, vec![key("network", "b", 1)]).await;
+        assert_eq!(
+            gateway.events().len(),
+            1,
+            "the retire pass announced itself"
+        );
+        let before = gateway.events().len();
+
+        // One pass: a reclassification (a), a revival (b), an upgrade (port).
+        let mut reclassified = flag("network", "a");
+        reclassified.data_classification = Some(ContributedClassification::Pii);
+        let v2 = ContributedDeclaration::new(
+            key("network", "listen_port", 2),
+            NARROW_PORT.to_owned(),
+            json!(8080),
+            ScopeClass::Global,
+        );
+        let result = h
+            .register(vec![reclassified, flag("network", "b"), v2])
+            .await;
+        assert_eq!(result.errors, Vec::new());
+
+        let events = gateway.events();
+        assert_eq!(events.len() - before, 1, "one broadcast for the pass");
+        let event = events.last().expect("the pass's broadcast");
+        assert_eq!(event.tenant_id, root, "under the root tenant");
+        assert_eq!(
+            event.data.as_ref().expect("body")["tenant"],
+            json!(root.to_string())
+        );
+        assert_eq!(
+            keys(event),
+            [
+                key("network", "a", 1).to_string(),
+                key("network", "b", 1).to_string(),
+                key("network", "listen_port", 2).to_string(),
+                key("network", "listen_port", 1).to_string(),
+            ],
+            "the upgrade names the successor and the predecessor"
+        );
+        assert!(Uuid::parse_str(&change_set(event)).is_ok());
+        assert_eq!(metrics.all(), ["sent", "sent"]);
+    }
+
+    #[tokio::test]
+    async fn two_passes_mint_two_ids_and_a_retire_pass_names_what_it_retired() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let (h, _) = Harness::hooked(&gateway).await;
+        h.register(vec![flag("network", "a"), flag("network", "b")])
+            .await;
+        h.retire_as(MODULE, vec![key("network", "a", 1), key("network", "b", 1)])
+            .await;
+        let mut reclassified = flag("network", "a");
+        reclassified.data_classification = Some(ContributedClassification::Pii);
+        h.register(vec![flag("network", "b"), reclassified.clone()])
+            .await;
+        let events = gateway.events();
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            keys(&events[0]),
+            [
+                key("network", "a", 1).to_string(),
+                key("network", "b", 1).to_string()
+            ]
+        );
+        assert_ne!(change_set(&events[0]), change_set(&events[1]));
+    }
+
+    #[tokio::test]
+    async fn an_in_place_domain_affinity_change_is_a_reclassification() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let (h, _) = Harness::hooked(&gateway).await;
+        h.register(vec![flag("network", "a")]).await;
+        let mut moved = flag("network", "a");
+        moved.domain_affinity = Some("network".to_owned());
+        h.register(vec![moved]).await;
+        assert_eq!(gateway.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_pass_before_the_root_tenant_is_known_is_skipped_and_still_succeeds() {
+        let mut gateway = RecordingGateway::ready(Uuid::new_v4());
+        gateway.root = None;
+        gateway.state.root_tenant_known = false;
+        let gateway = Arc::new(gateway);
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        h.register(vec![flag("network", "a")]).await;
+        let result = h.retire_as(MODULE, vec![key("network", "a", 1)]).await;
+        assert_eq!(result.retired, 1, "the retire stands");
+        assert_eq!(metrics.all(), ["skipped"]);
+        assert!(gateway.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_broker_a_pass_counts_skipped_and_its_result_is_unchanged() {
+        let gateway = Arc::new(RecordingGateway::without_broker());
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        h.register(vec![flag("network", "a")]).await;
+        let result = h.retire_as(MODULE, vec![key("network", "a", 1)]).await;
+        assert_eq!(result.retired, 1);
+        assert_eq!(metrics.all(), ["skipped"]);
+    }
 }

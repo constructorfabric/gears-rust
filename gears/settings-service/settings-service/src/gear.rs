@@ -86,6 +86,8 @@ pub struct SettingsService {
     >,
     declaration_admin:
         OnceLock<Arc<crate::api::rest::declaration_handlers::ConcreteDeclarationAdmin>>,
+    event_broker: OnceLock<Arc<crate::infra::event_broker::EventBrokerClient>>,
+    cache: OnceLock<Arc<crate::domain::resolution::EffectiveCache>>,
 }
 
 impl Default for SettingsService {
@@ -103,6 +105,8 @@ impl Default for SettingsService {
             hierarchy: OnceLock::new(),
             declarations: OnceLock::new(),
             declaration_admin: OnceLock::new(),
+            event_broker: OnceLock::new(),
+            cache: OnceLock::new(),
         }
     }
 }
@@ -142,6 +146,24 @@ const PRUNE_BATCHES: PruneBatches = PruneBatches {
 /// indexed counts, cheap enough for a minute's resolution on a dashboard.
 const REVIEW_TICK: Duration = Duration::from_mins(1);
 
+/// How long the stop waits for the cache invalidation consumer: its own
+/// cleanup deadline (10 s) with room to spare, inside the lifecycle's 30 s
+/// `stop_timeout`.
+const CONSUMER_STOP_BOUND: Duration = Duration::from_secs(15);
+
+/// The running cache invalidation consumer: dropping it without joining it
+/// (the lifecycle future dropped, an early return) aborts the task, so it never
+/// outlives the gear.
+struct ConsumerTask(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for ConsumerTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
+}
+
 impl SettingsService {
     /// The managed lifecycle: the pending-secret sweep and the needs-review
     /// gauge once a minute, and the audit retention pass once a day, until
@@ -159,6 +181,8 @@ impl SettingsService {
         let writes = self.writes()?;
         let db = self.db()?;
         let retention = Duration::from_hours(u64::from(self.config()?.audit_retention_days) * 24);
+        // Spawned before readiness so an uninitialized gear refuses to start.
+        let consuming = self.spawn_consumer(&cancel)?;
         ready.notify();
         info!(
             tick_secs = SWEEP_TICK.as_secs(),
@@ -166,8 +190,50 @@ impl SettingsService {
         );
         let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
         Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
+        Self::await_consumer(consuming, CONSUMER_STOP_BOUND).await;
         info!("pending-secret sweep and audit retention stopped");
         Ok(())
+    }
+
+    /// Start the replica's cache invalidation consumer beside the retention loop,
+    /// under the same token. The broker is looked up inside the task, so a missing
+    /// broker never delays or fails the start.
+    fn spawn_consumer(&self, cancel: &CancellationToken) -> anyhow::Result<ConsumerTask> {
+        // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-2
+        let consumer = crate::infra::cache_invalidation::CacheInvalidationConsumer::new(
+            self.event_broker()?,
+            self.cache()?,
+        );
+        let cancel = cancel.clone();
+        Ok(ConsumerTask(Some(tokio::spawn(async move {
+            consumer.run(cancel).await;
+        }))))
+        // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-2
+    }
+
+    /// The stop waits for the consumer to leave and delete its group, which is
+    /// bounded by its own deadline inside the lifecycle's stop timeout. A
+    /// consumer still running when `bound` has passed is aborted, so a broker
+    /// call that never answers cannot hold the lifecycle past its stop.
+    async fn await_consumer(mut consuming: ConsumerTask, bound: Duration) {
+        let Some(handle) = consuming.0.as_mut() else {
+            return;
+        };
+        match tokio::time::timeout(bound, &mut *handle).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::warn!(%error, "cache invalidation consumer ended abnormally");
+            }
+            Err(_elapsed) => {
+                handle.abort();
+                tracing::warn!(
+                    bound_secs = bound.as_secs(),
+                    "cache invalidation consumer outlived the shutdown bound; aborted"
+                );
+            }
+        }
+        // Joined or aborted: nothing is left for the guard to abort.
+        consuming.0 = None;
     }
 
     /// The periodic passes, until the lifecycle is cancelled.
@@ -425,6 +491,50 @@ impl SettingsService {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
     }
+    /// Build the Event Broker client. The broker is neither depended on nor
+    /// resolved here: the client looks it up at first use and init never waits
+    /// on it.
+    fn bind_event_broker(
+        &self,
+        ctx: &GearCtx,
+        platform_scope: &Arc<dyn PlatformScope>,
+    ) -> anyhow::Result<()> {
+        let publish_timeout = Duration::from_secs(self.config()?.publish_timeout_seconds);
+        self.event_broker
+            .set(Arc::new(
+                crate::infra::event_broker::EventBrokerClient::new(
+                    ctx.client_hub(),
+                    Arc::new(self.types()?),
+                    Arc::clone(platform_scope),
+                    publish_timeout,
+                    ctx.instance_id(),
+                ),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))
+    }
+
+    /// The Event Broker client, once initialization has run. Nothing is
+    /// resolved at init: the broker is looked up when first needed.
+    ///
+    /// # Errors
+    /// When the gear has not been initialized.
+    pub fn event_broker(
+        &self,
+    ) -> anyhow::Result<Arc<crate::infra::event_broker::EventBrokerClient>> {
+        self.event_broker
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
+    /// The replica's effective-value cache, once initialization has run.
+    fn cache(&self) -> anyhow::Result<Arc<crate::domain::resolution::EffectiveCache>> {
+        self.cache
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
     /// The Type Validator, once initialization has run.
     ///
     /// Generic over any GTS type id; for a setting the id passed is the
@@ -547,6 +657,7 @@ impl Gear for SettingsService {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         let platform_scope: Arc<dyn PlatformScope> =
             Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
+        self.bind_event_broker(ctx, &platform_scope)?;
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
 
         // The audit sink: the gear's own table, written in each mutation's
@@ -559,6 +670,13 @@ impl Gear for SettingsService {
         if let Err(reason) = config.check_in_process_bindings() {
             anyhow::bail!("{}: {reason}", Self::MODULE_NAME);
         }
+        // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-1
+        // The broker is not resolved here and never waited for; only the bound
+        // on how long a request waits for it is checked.
+        if let Err(reason) = config.check_publish_timeout() {
+            anyhow::bail!("{}: {reason}", Self::MODULE_NAME);
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-1
         if config.audit_retention_days < crate::audit::MIN_RETENTION_DAYS {
             anyhow::bail!(
                 "{}: audit_retention_days is {} but must not be below {}",
@@ -607,6 +725,7 @@ impl Gear for SettingsService {
             std::time::Duration::from_secs(config.cache_ttl_seconds),
             config.cache_max_entries,
         ));
+        self.cache.get_or_init(|| Arc::clone(&cache));
         let hierarchy: Arc<dyn crate::domain::resolution::TenantHierarchy> = Arc::new(
             crate::infra::tenant_hierarchy::HubTenantHierarchy::new(ctx.client_hub()),
         );
@@ -659,6 +778,13 @@ impl Gear for SettingsService {
             crate::infra::secret_manager::CredStoreSecretManager::new(credstore),
         );
         let step_up_for_admin = Arc::clone(&step_up);
+        // The end-of-request publish hook every writing path calls once its
+        // request ends. It reads the broker client's cached state; nothing
+        // here resolves the broker.
+        let coherence = Arc::new(crate::domain::coherence::CoherencePublisher::new(
+            self.event_broker()?,
+            Arc::new(crate::infra::coherence_metrics::OtelBroadcastMetrics::new()),
+        ));
         let writer = Arc::new(crate::domain::writes::ValueWriter::new(
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),
@@ -671,10 +797,10 @@ impl Gear for SettingsService {
             Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
         ));
         self.writes
-            .set(Arc::new(crate::infra::value_writes::WriteCoordinator::new(
-                self.db()?,
-                writer,
-            )))
+            .set(Arc::new(
+                crate::infra::value_writes::WriteCoordinator::new(self.db()?, writer)
+                    .with_coherence(Arc::clone(&coherence)),
+            ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-7
@@ -707,13 +833,15 @@ impl Gear for SettingsService {
             ),
             audit,
         ));
-        let contribution_client: Arc<dyn SettingsContributionClient> =
-            Arc::new(crate::infra::contribution_client::ContributionClient::new(
+        let contribution_client: Arc<dyn SettingsContributionClient> = Arc::new(
+            crate::infra::contribution_client::ContributionClient::new(
                 self.db()?,
                 contributions,
                 Arc::clone(&cache),
                 Arc::new(crate::infra::write_metrics::LoggingPublisher),
-            ));
+            )
+            .with_coherence(Arc::clone(&coherence)),
+        );
         ctx.client_hub()
             .register::<dyn SettingsContributionClient>(contribution_client);
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-7
@@ -731,20 +859,23 @@ impl Gear for SettingsService {
         // shares the step-up verifier and the audit store with the value write
         // path, so one gate and one trail cover both.
         self.declaration_admin
-            .set(Arc::new(crate::domain::declaration::DeclarationAdmin::new(
-                crate::infra::storage::declaration_repo::DeclarationRepo,
-                crate::infra::storage::category_repo::CategoryRepo,
-                crate::infra::storage::value_repo::ValueRepo,
-                self.validator()?,
-                Arc::new(
-                    crate::infra::setting_type_registrar::TypesRegistryRegistrar::new(
-                        self.types()?,
+            .set(Arc::new(
+                crate::domain::declaration::DeclarationAdmin::new(
+                    crate::infra::storage::declaration_repo::DeclarationRepo,
+                    crate::infra::storage::category_repo::CategoryRepo,
+                    crate::infra::storage::value_repo::ValueRepo,
+                    self.validator()?,
+                    Arc::new(
+                        crate::infra::setting_type_registrar::TypesRegistryRegistrar::new(
+                            self.types()?,
+                        ),
                     ),
-                ),
-                Arc::clone(&step_up_for_admin),
-                crate::infra::storage::audit_store::AuditStore,
-                Arc::clone(&cache),
-            )))
+                    Arc::clone(&step_up_for_admin),
+                    crate::infra::storage::audit_store::AuditStore,
+                    Arc::clone(&cache),
+                )
+                .with_coherence(Arc::clone(&coherence)),
+            ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-12

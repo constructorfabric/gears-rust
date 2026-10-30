@@ -230,7 +230,7 @@ The standalone seam lives here too, because it is the same boundary drawn from t
 **Steps**:
 1. [x] - `p1` - Obtain the tenant's descendants from the tenant resolver, under the shared subtree budget - `inst-ta-evict-1`
 2. [x] - `p1` - Evict the cached entries of the setting for the tenant and every descendant on this instance, regardless of scope class, because their effective access may have changed even where their effective value has not; **IF** the budget cut the subtree → evict every scope of the setting instead, so nothing stale survives - `inst-ta-evict-2`
-3. [x] - `p1` - **RETURN** having evicted locally only; peer replicas converge through the R2 `cache_invalidate` broadcast - `inst-ta-evict-3`
+3. [x] - `p1` - **RETURN** having evicted locally only; no broadcast follows — the cache holds values, never access decisions, and every replica decides access afresh on each read (DESIGN §4.2 *Cache & Invalidation*) - `inst-ta-evict-3`
 
 ## 4. States (CDSL)
 

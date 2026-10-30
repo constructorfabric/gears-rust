@@ -688,3 +688,57 @@ async fn clearing_removes_one_row_and_leaves_an_ancestor_s_in_force() {
     assert_eq!(free.effective.access, TenantAccess::Overridable);
     assert!(free.effective.supplied_by.is_none());
 }
+
+#[tokio::test]
+async fn a_restriction_change_evicts_locally_and_publishes_no_broadcast() {
+    // The cache holds values, never access decisions, which every replica
+    // decides afresh on each read: the access service takes no end-of-request
+    // publish hook, so nothing a set or a clear does can reach the broker.
+    use crate::domain::coherence::testing::{RecordingGateway, publisher};
+    let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+    let (_hook, metrics) = publisher(&gateway);
+    let h = Harness::new().await;
+    let d = h
+        .base
+        .declare("strict", scope_class::CASCADING, json!(false))
+        .await;
+    let t = &h.base.tree;
+    let conn = h.base.db.conn().expect("connection");
+    h.base.set(d, t.root, json!(true)).await;
+    h.base
+        .resolve("strict", ScopeTarget::Tenant(t.b))
+        .await
+        .expect("cached");
+    let key = h.key("strict");
+
+    h.service
+        .set(
+            &conn,
+            &actor(t.root),
+            &key,
+            t.a,
+            TenantAccess::ReadOnly,
+            Some(ABSENT_RESTRICTION_TAG),
+        )
+        .await
+        .expect("sets");
+    h.service.evict(&key, t.a).await.expect("evicts");
+    assert!(
+        h.base.cache.get(key.as_str(), t.b).is_none(),
+        "evicted locally"
+    );
+    let tag = h
+        .service
+        .read(&conn, &actor(t.root), &key, t.a)
+        .await
+        .expect("reads")
+        .etag;
+    h.service
+        .clear(&conn, &actor(t.root), &key, t.a, Some(tag.as_str()))
+        .await
+        .expect("clears");
+    h.service.evict(&key, t.a).await.expect("evicts");
+
+    assert!(gateway.events().is_empty(), "nothing published");
+    assert!(metrics.all().is_empty(), "nothing counted");
+}

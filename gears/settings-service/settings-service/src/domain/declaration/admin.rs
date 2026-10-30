@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::repo::CategoryRepository;
 use crate::domain::category::visibility;
+use crate::domain::coherence::{CoherencePublisher, correlation_id};
 use crate::domain::contribution::SettingTypeRegistrar;
 use crate::domain::declaration::{
     DataClassification, Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
@@ -84,6 +85,21 @@ pub struct Created {
     pub evolved: bool,
     /// The key an evolution retired, for the caller to evict with the new one.
     pub retired: Option<String>,
+}
+
+impl Created {
+    /// The keys whose cached resolution this create changed: a revive's key,
+    /// an evolve's successor and its retired predecessor; a brand-new setting
+    /// has nothing cached to change.
+    #[must_use]
+    pub fn changed_keys(&self) -> Vec<String> {
+        let mut keys = Vec::new();
+        if self.reactivated || self.evolved {
+            keys.push(self.declaration.key.clone());
+        }
+        keys.extend(self.retired.clone());
+        keys
+    }
 }
 
 /// What the create's first phase found: the composed key, the normalised
@@ -564,6 +580,7 @@ pub struct DeclarationAdmin<R, Cat, Val, S> {
     step_up: Arc<dyn StepUpVerifier>,
     sink: S,
     cache: Arc<EffectiveCache>,
+    coherence: Option<Arc<CoherencePublisher>>,
 }
 
 impl<R, Cat, Val, S> DeclarationAdmin<R, Cat, Val, S>
@@ -594,6 +611,67 @@ where
             step_up,
             sink,
             cache,
+            coherence: None,
+        }
+    }
+
+    /// Publish `cache_invalidate` at the end of each declaration request
+    /// through `hook`. Without one a request ends silently.
+    #[must_use]
+    pub fn with_coherence(mut self, hook: Arc<CoherencePublisher>) -> Self {
+        self.coherence = Some(hook);
+        self
+    }
+
+    /// What follows a durable create: a revived or evolved setting's keys are
+    /// evicted here, then announced to the peers; a brand-new setting has
+    /// nothing cached and announces nothing.
+    pub async fn after_create(&self, created: &Created, request_id: &str) {
+        // Retained values re-enter resolution on a revive; on an evolution the
+        // old key leaves it and the new one enters. Nothing cached may keep
+        // answering for either.
+        if created.reactivated || created.evolved {
+            self.evict(&created.declaration.key);
+        }
+        if let Some(retired) = &created.retired {
+            self.evict(retired);
+        }
+        self.publish_changes(created.changed_keys(), request_id)
+            .await;
+    }
+
+    /// What follows a durable `PATCH`: the key is evicted again — a reader
+    /// between the in-transaction eviction and the commit could have
+    /// re-populated the entry — and announced only when the patch changed the
+    /// classification or the domain affinity; any other metadata change
+    /// publishes nothing.
+    pub async fn after_update(&self, key: &str, reclassified: bool, request_id: &str) {
+        self.evict(key);
+        if reclassified {
+            self.publish_changes(vec![key.to_owned()], request_id).await;
+        }
+    }
+
+    /// What follows a durable retire: evicted again, and announced when this
+    /// call retired it (a declaration already retired changed nothing).
+    pub async fn after_retire(&self, key: &str, changed: bool, request_id: &str) {
+        self.evict(key);
+        if changed {
+            self.publish_changes(vec![key.to_owned()], request_id).await;
+        }
+    }
+
+    /// The end of a declaration request — a retire, a revive, an evolve or a
+    /// reclassifying `PATCH`, committed and evicted locally: one broadcast
+    /// under the root tenant naming `keys`, under the request's correlation
+    /// id. Nothing for no keys; never fails the request.
+    pub async fn publish_changes(&self, keys: Vec<String>, request_id: &str) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(hook) = &self.coherence {
+            hook.publish_declaration_changes(keys, correlation_id(request_id))
+                .await;
         }
     }
 
@@ -1467,6 +1545,26 @@ where
         patch: &Map<String, Value>,
         actor: &WriteActor,
     ) -> Result<Declaration, DomainError> {
+        self.update_change(conn, scope, id, if_match, patch, actor)
+            .await
+            .map(|(updated, _)| updated)
+    }
+
+    /// [`Self::update`], also saying whether the patch reclassified the
+    /// declaration — changed its classification or its domain affinity — which
+    /// is what the end-of-request broadcast is for.
+    ///
+    /// # Errors
+    /// As [`Self::update`].
+    pub async fn update_change<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        if_match: Option<&str>,
+        patch: &Map<String, Value>,
+        actor: &WriteActor,
+    ) -> Result<(Declaration, bool), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-5
         let current = self.find(conn, scope, id).await?;
@@ -1557,6 +1655,8 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-12
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-13
         let classification_changed = metadata.data_classification != current.data_classification;
+        let reclassified =
+            classification_changed || metadata.domain_affinity != current.domain_affinity;
         let new_classification = metadata.data_classification.clone();
         // At the version the tag was compared against: a row that moved in
         // between is changed by nobody twice. The definition recency moves
@@ -1600,7 +1700,7 @@ where
         .await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-14
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-15
-        Ok(updated)
+        Ok((updated, reclassified))
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-15
     }
 
@@ -1618,6 +1718,24 @@ where
         if_match: Option<&str>,
         actor: &WriteActor,
     ) -> Result<Declaration, DomainError> {
+        self.retire_change(conn, scope, id, if_match, actor)
+            .await
+            .map(|(retired, _)| retired)
+    }
+
+    /// [`Self::retire`], also saying whether this call retired it: a
+    /// declaration already retired changes nothing and is broadcast by no one.
+    ///
+    /// # Errors
+    /// As [`Self::retire`].
+    pub async fn retire_change<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+    ) -> Result<(Declaration, bool), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // Retire drops a live setting out of resolution at once: gated like a
@@ -1637,7 +1755,7 @@ where
         precondition::evaluate(if_match, &etag_of(&current))?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-9
         if current.status.is_retired() {
-            return Ok(current);
+            return Ok((current, false));
         }
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-10
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-11
@@ -1678,7 +1796,7 @@ where
         .await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-13
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-14
-        Ok(retired)
+        Ok((retired, true))
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-14
     }
 

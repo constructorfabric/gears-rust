@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::DomainVisibility;
+use crate::domain::coherence::{ChangeOutcome, CoherencePublisher};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget};
@@ -142,6 +143,7 @@ pub struct WriteCoordinator {
     writer: Arc<ConcreteWriter>,
     pending: PendingSecretRepo,
     declarations: DeclarationRepo,
+    coherence: Option<Arc<CoherencePublisher>>,
 }
 
 fn conn_error(err: &DbError) -> DomainError {
@@ -159,6 +161,39 @@ impl WriteCoordinator {
             writer,
             pending: PendingSecretRepo,
             declarations: DeclarationRepo,
+            coherence: None,
+        }
+    }
+
+    /// Publish `cache_invalidate` at the end of every request through `hook`.
+    /// Without one a request ends silently, as when no broker resolves.
+    #[must_use]
+    pub fn with_coherence(mut self, hook: Arc<CoherencePublisher>) -> Self {
+        self.coherence = Some(hook);
+        self
+    }
+
+    /// The end of a batch: what its entries committed, published once.
+    async fn publish_batch_end(
+        &self,
+        results: &[Result<Committed, DomainError>],
+        change_set_id: Uuid,
+    ) {
+        let committed: Vec<&Committed> = results.iter().filter_map(|r| r.as_ref().ok()).collect();
+        self.publish_request_end(&committed, change_set_id).await;
+    }
+
+    /// The end of a request: one hook call over every change it committed.
+    /// The response of the request never depends on it.
+    async fn publish_request_end(&self, committed: &[&Committed], change_set_id: Uuid) {
+        if let Some(hook) = &self.coherence {
+            hook.publish_value_writes(
+                committed
+                    .iter()
+                    .map(|c| ChangeOutcome::value_write(&c.key, c.tenant_id, &c.scope_class, true)),
+                change_set_id,
+            )
+            .await;
         }
     }
 
@@ -218,11 +253,31 @@ impl WriteCoordinator {
             .await
     }
 
-    /// Commit a gated change in its own transaction and run what follows.
+    /// Commit a gated change in its own transaction and run what follows. A
+    /// single-change request ends here, so the cache broadcast follows the
+    /// local eviction.
     ///
     /// # Errors
     /// The commit's rejection, after it was published.
     pub async fn commit(
+        &self,
+        actor: &WriteActor,
+        gated: Gated,
+        change: Change,
+        if_match: Option<&str>,
+        change_set_id: Uuid,
+    ) -> Result<Committed, DomainError> {
+        let committed = self
+            .commit_change(actor, gated, change, if_match, change_set_id)
+            .await?;
+        self.publish_request_end(&[&committed], committed.change_set_id)
+            .await;
+        Ok(committed)
+    }
+
+    /// One change of a request: commit, evict, record. The request's own end
+    /// publishes the broadcast, once for all of its changes.
+    async fn commit_change(
         &self,
         actor: &WriteActor,
         gated: Gated,
@@ -380,19 +435,7 @@ impl WriteCoordinator {
                 // at the scope asked for or the caller's own, so the events
                 // alone still tell the whole outcome of the batch.
                 Err(refused) => {
-                    let tenant_id = refused
-                        .tenant
-                        .unwrap_or_else(|| actor.ctx.subject_tenant_id());
-                    self.writer
-                        .after_rejection(
-                            &refused.key,
-                            tenant_id,
-                            actor,
-                            &refused.error,
-                            change_set_id,
-                        )
-                        .await;
-                    results.push(Err(refused.error));
+                    results.push(self.refuse_entry(actor, refused, change_set_id).await);
                     continue;
                 }
             };
@@ -418,22 +461,14 @@ impl WriteCoordinator {
             // a requirement that pass could not see is verified here, once: a
             // success covers the rest of the request, a refusal is this
             // entry's and a later gated entry asks again.
-            let gated = match gated {
-                Ok(gated) if gated.declaration.requires_step_up && !verified => {
-                    self.writer.verify_step_up(actor, "batch").await.map(|()| {
-                        verified = true;
-                        gated
-                    })
-                }
-                other => other,
-            };
+            let gated = self.verify_late(actor, gated, &mut verified).await;
             let outcome = match gated {
                 Ok(gated) => match self
                     .batch_change_for(&conn, &gated, actor, op.as_deref(), value)
                     .await
                 {
                     Ok(change) => {
-                        self.commit(actor, gated, change, if_match.as_deref(), change_set_id)
+                        self.commit_change(actor, gated, change, if_match.as_deref(), change_set_id)
                             .await
                     }
                     Err(err) => {
@@ -470,12 +505,57 @@ impl WriteCoordinator {
         // @cpt-begin:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-8
         // Eviction and publication ran per committed change, after each
         // commit and before the next; nothing here is observable before it is
-        // stored.
+        // stored. The cache broadcast is the request's, published once after
+        // the last commit: one per tenant the batch touched.
+        self.publish_batch_end(&results, change_set_id).await;
         // @cpt-end:cpt-cf-settings-service-flow-value-writes-batch:p1:inst-vw-batch-8
         Ok(BatchOutcome {
             change_set_id,
             results,
         })
+    }
+
+    /// A gate result whose requirement the up-front pass could not see: step-up
+    /// is verified here, once. A success covers the rest of the request, a
+    /// refusal is this entry's and a later gated entry asks again.
+    async fn verify_late(
+        &self,
+        actor: &WriteActor,
+        gated: Result<Gated, DomainError>,
+        verified: &mut bool,
+    ) -> Result<Gated, DomainError> {
+        match gated {
+            Ok(gated) if gated.declaration.requires_step_up && !*verified => {
+                self.writer.verify_step_up(actor, "batch").await.map(|()| {
+                    *verified = true;
+                    gated
+                })
+            }
+            other => other,
+        }
+    }
+
+    /// An entry refused on the surface, published as a refusal and handed back
+    /// as its outcome.
+    async fn refuse_entry(
+        &self,
+        actor: &WriteActor,
+        refused: RefusedEntry,
+        change_set_id: Uuid,
+    ) -> Result<Committed, DomainError> {
+        let tenant_id = refused
+            .tenant
+            .unwrap_or_else(|| actor.ctx.subject_tenant_id());
+        self.writer
+            .after_rejection(
+                &refused.key,
+                tenant_id,
+                actor,
+                &refused.error,
+                change_set_id,
+            )
+            .await;
+        Err(refused.error)
     }
 
     /// The change a batch entry carries: the operation it names, and for a set

@@ -52,6 +52,22 @@ toolkit_gts::inventory::submit! {
 }
 // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-9
 
+/// The activation signal subject: the `subject_type` of `cache_invalidate` and
+/// of the filtered `change_notification`. A signal describes a tenant's
+/// settings, not one key, so the subject is a control-plane type of this gear.
+/// The gear registers its schema through the link-time inventory.
+pub const ACTIVATION_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.settings.activation.v1~");
+
+/// The topic the replicas' `cache_invalidate` broadcasts travel on: an instance
+/// of the broker's topic base. Only this service's own replicas read it.
+pub const CACHE_TOPIC_ID: &str =
+    toolkit_gts::gts_id!("cf.core.events.topic.v1~cf.core.settings.cache.v1");
+
+/// The event type of the `cache_invalidate` broadcast: a derived schema of the
+/// broker's event base. The body and its schemas live in the gear.
+pub const CACHE_INVALIDATE_EVENT_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.events.event.v1~cf.core.settings.cache_invalidate.v1~");
+
 pub const DECLARATION_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.declaration.v1~");
 
 /// A stored setting value at some scope — what a setting currently *holds*.

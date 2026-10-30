@@ -23,47 +23,7 @@ use uuid::Uuid;
 use crate::api::authz::{self, resource};
 use crate::domain::error::DomainError;
 use crate::domain::ports::{SecretManager, SecretResolveGate};
-
-/// The name the gear's store namespace and principal derive from.
-const NAMESPACE_NAME: &[u8] = b"urn:constructorfabric:gears:settings-service";
-
-/// First-party wildcard token scope (`"*"`) presented on the Credential Store
-/// path.
-///
-/// This is an in-process call made on the gear's own behalf, so no bearer
-/// token exists to carry scopes — and the authorization resolver's OAuth
-/// token-scope enforcer fail-closes on an empty `token_scopes` with
-/// `scope_mismatch`, *before* RBAC is consulted at all. Without this the store
-/// call is refused before any policy runs, and the refusal arrives as
-/// `access denied` from a store that is neither down nor mis-provisioned.
-///
-/// It widens nothing. The scope check only decides whether evaluation
-/// continues; what this gear may actually do in the store remains RBAC's to
-/// say, through the narrow Credstore Secret Operator grant held by the derived
-/// principal above — which is also why presenting the wildcard cannot grant
-/// anything the grant does not already allow. `keycloak-idp-plugin` presents
-/// the same scope on the same path, for the same reason.
-const FIRST_PARTY_TOKEN_SCOPE: &str = "*";
-
-/// The subject type presented on the Credential Store path, classifying this
-/// gear's principal as a machine.
-///
-/// The tag is what decides which principal type RBAC is asked about, and the
-/// grant this gear holds is held by a service principal. An **absent** tag does
-/// not read as "not a person": the authorization plugin maps `None` to `User`
-/// outright, mirroring RBAC's own resolver, so leaving it off asks for a grant
-/// held by a user with this id — which no one holds — and the store call is
-/// denied after passing every other check. The gear's own grant is lost to the
-/// omission.
-///
-/// Like the scope above this widens nothing: naming the type only selects which
-/// grant is looked up, and the narrow Credstore Secret Operator role remains
-/// the authoritative limit. It is the same spelling `keycloak-idp-plugin`
-/// presents on the same path, and the pair — service tag, service-principal
-/// grant — is what makes the lookup meet. The interactive vocabulary this gear
-/// reads on the way *in* is a separate matter; see
-/// [`crate::domain::stepup::INTERACTIVE_SUBJECT_TYPES`].
-const STORE_SUBJECT_TYPE: &str = toolkit_gts::gts_id!("cf.core.security.subject_service.v1~");
+use crate::infra::service_identity::{service_context, service_namespace, service_principal};
 
 /// The Secret Manager bound to `credstore`.
 // @cpt-dod:cpt-cf-settings-service-dod-secret-values-manager:p1
@@ -77,8 +37,8 @@ impl CredStoreSecretManager {
     /// Bind to the store's client.
     #[must_use]
     pub fn new(client: Arc<dyn CredStoreClientV1>) -> Self {
-        let namespace = Uuid::new_v5(&Uuid::NAMESPACE_URL, NAMESPACE_NAME);
-        let principal = Uuid::new_v5(&namespace, b"principal");
+        let namespace = service_namespace();
+        let principal = service_principal();
         Self {
             client,
             namespace,
@@ -118,25 +78,13 @@ impl CredStoreSecretManager {
         // @cpt-end:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-2
     }
 
-    fn context(&self, tenant: Uuid) -> Result<SecurityContext, DomainError> {
+    fn context(tenant: Uuid) -> Result<SecurityContext, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-3
         // @cpt-begin:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-4
         // The target tenant is the subject tenant, so the entry lives where the
-        // value belongs; the subject is this gear's principal, so only this
-        // gear reads it back; the subject type says that principal is a
-        // machine, because an omitted one is read as a person and asks for a
-        // grant nobody holds — see [`STORE_SUBJECT_TYPE`]; and the first-party
-        // wildcard scope, without which the enforcer refuses the call before
-        // RBAC is asked at all — see [`FIRST_PARTY_TOKEN_SCOPE`].
-        SecurityContext::builder()
-            .subject_id(self.principal)
-            .subject_type(STORE_SUBJECT_TYPE)
-            .subject_tenant_id(tenant)
-            .token_scopes(vec![FIRST_PARTY_TOKEN_SCOPE.to_owned()])
-            .build()
-            .map_err(|err| DomainError::Internal {
-                diagnostic: format!("store context: {err}"),
-            })
+        // value belongs; the principal, subject type and scope are the gear's
+        // shared service identity, see [`service_context`].
+        service_context(tenant)
         // @cpt-end:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-4
         // @cpt-end:cpt-cf-settings-service-algo-secret-values-reference:p1:inst-sv-ref-3
     }
@@ -180,7 +128,7 @@ impl SecretManager for CredStoreSecretManager {
         plaintext: &Value,
     ) -> Result<(), DomainError> {
         let secret_ref = Self::parse_ref(secret_ref)?;
-        let ctx = self.context(tenant)?;
+        let ctx = Self::context(tenant)?;
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-4
         // @cpt-begin:cpt-cf-settings-service-flow-secret-values-set:p1:inst-sv-set-5
         // Create-only under the caller's fresh reference: nothing this write
@@ -206,7 +154,7 @@ impl SecretManager for CredStoreSecretManager {
         secret_ref: &str,
     ) -> Result<SecretString, DomainError> {
         let reference = Self::parse_ref(secret_ref)?;
-        let ctx = self.context(tenant)?;
+        let ctx = Self::context(tenant)?;
         let found = match self.client.get(&ctx, &reference).await {
             Ok(found) => found,
             Err(CredStoreError::NotFound) => None,
@@ -234,7 +182,7 @@ impl SecretManager for CredStoreSecretManager {
         secret_ref: &str,
     ) -> Result<(), DomainError> {
         let reference = Self::parse_ref(secret_ref)?;
-        let ctx = self.context(tenant)?;
+        let ctx = Self::context(tenant)?;
         match self
             .client
             .delete(&ctx, &reference, WritePrecondition::Exists)

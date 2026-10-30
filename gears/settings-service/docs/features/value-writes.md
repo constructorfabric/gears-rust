@@ -82,7 +82,7 @@ Step-up is verified through the platform. The token the caller presents is authe
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.8
 - **Dependencies**: entry 2.5 for the current effective value the validate report and the impact preview compare against, and for the cache the commit evicts; entry 2.6, since every change commits its audit record in the same transaction and refuses without it; entry 2.7 for the caller's effective access; entry 2.4 for the Type Validator and the `setting_values` table; entry 2.3 for the declaration, its scope class and its `requires_step_up`.
 - **Sequences**: `cpt-cf-settings-service-seq-validate-and-set`
-- **Not applicable**: The service-principal SDK write `set_value` is R2; this feature enforces the gate table's machine column — refusal before validation on a declaration that requires step-up — for any caller the platform identifies as a service principal. Dependency Groups, and their all-or-nothing set, are R3. Consumer `change_notification` delivery and the cross-replica `cache_invalidate` broadcast are owned by the Settings Activation and are not bound in R1: the Change Publisher port is called, the local eviction is the write's only cache effect, and a second host would be stale for at most `cache_ttl_seconds`. Secret plaintext storage is the Secret Manager's (entry 2.9); this feature routes to its port and refuses a secret write as unavailable while nothing is bound to it. The platform-wide elevated session that replaces the token check is R2 and lands behind the same port.
+- **Not applicable**: The service-principal SDK write `set_value` is R2; this feature enforces the gate table's machine column — refusal before validation on a declaration that requires step-up — for any caller the platform identifies as a service principal. Dependency Groups, and their all-or-nothing set, are R3. Consumer `change_notification` delivery is owned by the Settings Activation, and the cross-replica `cache_invalidate` broadcast by entry 2.12 (`cpt-cf-settings-service-feature-replica-coherence`); neither is bound in R1: the Change Publisher port is called, the local eviction is the write's only cache effect, and a second host would be stale for at most `cache_ttl_seconds`. Secret plaintext storage is the Secret Manager's (entry 2.9); this feature routes to its port and refuses a secret write as unavailable while nothing is bound to it. The platform-wide elevated session that replaces the token check is R2 and lands behind the same port.
 
 ## 2. Actor Flows (CDSL)
 
@@ -137,7 +137,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 3. [x] - `p1` - Invoke commit one change with the value and the `If-Match` tag - `inst-vw-set-3`
 4. [x] - `p1` - **IF** the change was rejected → **RETURN** its outcome — `400` with field-level detail for an invalid value, `412` for a moved value, `503` for an unavailable dependency — with nothing stored - `inst-vw-set-4`
 5. [x] - `p1` - Mint a change set id for the request and carry it on the audit record, so the change is retrievable with any activation tracking that later refers to it - `inst-vw-set-5`
-6. [x] - `p1` - **RETURN** `200` with `old_value`, `new_value`, `scope` and the new `etag`; the value is effective on the next read - `inst-vw-set-6`
+6. [x] - `p1` - After the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`), **RETURN** `200` with `old_value`, `new_value`, `scope` and the new `etag`; the value is effective on the next read - `inst-vw-set-6`
 
 ### Set or Revert Several Values in One Call
 
@@ -162,7 +162,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
    1. [x] - `p1` - Read the operation the entry names: `set` carries a value and `revert` carries none — an explicit `null` is a value, only an absent `value` field is none; **IF** the key is not a setting key, **OR** the value contradicts the operation, **OR** the word is not one of the two → reject this change alone as `invalid`, published under the change set like any refusal, and continue; a revert takes the same gates, tag check and commit a set does and parts from it only in the change handed on, which the commit records as `revert` — and a revert of a scope holding no override is rejected `not_found` alone - `inst-vw-batch-10`
    2. [x] - `p1` - Invoke the remaining write gates for its key and target, then commit one change; for a `secret`-trait target whose value is `{ "pending_id": … }`, the change adopts the entry staged earlier instead of carrying a value (the stage flow of entry 2.9) - `inst-vw-batch-6`
    3. [x] - `p1` - Record its outcome: the old and new value, scope and operation on success, or the error that rejected it; a failing change stores nothing and does not stop the others, and every rejected entry — at the gate, at validation or at commit — publishes `event_value_change_failed` under the batch's change set - `inst-vw-batch-7`
-6. [x] - `p1` - Evict the local cache for every committed change, then publish the committed keys under the change set id - `inst-vw-batch-8`
+6. [x] - `p1` - Evict the local cache for every committed change, then hand the request to the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) - `inst-vw-batch-8`
 7. [x] - `p1` - **RETURN** `200` with one entry per change; the status reflects that every item was answered, and the caller reads the outcomes - `inst-vw-batch-9`
 
 ### Revert a Value
@@ -183,7 +183,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 2. [x] - `p1` - Invoke the write gate order; **IF** any gate refuses → **RETURN** its refusal - `inst-vw-rev-2`
 3. [x] - `p1` - Compute the fallback the scope will resolve to once its override is gone, through the Value Resolver — the same fallback `validate` reports beforehand - `inst-vw-rev-3`
 4. [x] - `p1` - Invoke commit one change as a removal of the scope's own row, guarded on `If-Match`; **IF** rejected → **RETURN** its outcome - `inst-vw-rev-4`
-5. [x] - `p1` - **RETURN** `200` with the resolved fallback and its source; the Schema Default is untouched by the revert - `inst-vw-rev-5`
+5. [x] - `p1` - After the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`), **RETURN** `200` with the resolved fallback and its source; the Schema Default is untouched by the revert - `inst-vw-rev-5`
 
 ### Clone a Value From Another Scope
 
@@ -206,7 +206,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 4. [x] - `p1` - **IF** the declaration is `secret`-classified → **RETURN** `400` with reason `SecretNotCloneable`; copying a secret reference would couple the target to the source credential's lifecycle - `inst-vw-clone-4`
 5. [x] - `p1` - Resolve the effective value at the source through the Value Resolver - `inst-vw-clone-5`
 6. [x] - `p1` - Invoke commit one change at the target with that value, guarded on `If-Match`; **IF** rejected → **RETURN** its outcome - `inst-vw-clone-6`
-7. [x] - `p1` - **RETURN** `200` with `old_value`, `new_value`, `scope` and the new `etag` - `inst-vw-clone-7`
+7. [x] - `p1` - After the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`), **RETURN** `200` with `old_value`, `new_value`, `scope` and the new `etag` - `inst-vw-clone-7`
 
 ### Remove a Value
 
@@ -224,7 +224,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 1. [x] - `p1` - Actor sends DELETE /settings-service/v1/settings/{key}/value?tenant={tenant_id} with `If-Match` and the step-up token where required - `inst-vw-rm-1`
 2. [x] - `p1` - Invoke the write gate order; **IF** any gate refuses → **RETURN** its refusal - `inst-vw-rm-2`
 3. [x] - `p1` - Invoke commit one change as a removal of the scope's own row, guarded on `If-Match`; **IF** rejected → **RETURN** its outcome - `inst-vw-rm-3`
-4. [x] - `p1` - **RETURN** `200` with the resulting effective value and source; declaration removal is a separate, immediate soft-delete and is not reachable here - `inst-vw-rm-4`
+4. [x] - `p1` - After the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`), **RETURN** `200` with the resulting effective value and source; declaration removal is a separate, immediate soft-delete and is not reachable here - `inst-vw-rm-4`
 
 ### Report Cascading Impact
 
@@ -298,7 +298,7 @@ Throughout, `tenant` omitted means the caller's own tenant, which for a platform
 5. [x] - `p1` - DB: INSERT or UPDATE setting_values for `(declaration_id, tenant_id)` with `value` or `secret_ref`, the denormalized `data_classification`, `set_by`, `last_change_at` now, and `needs_review` cleared — a valid re-set or a removal clears the flag — or DELETE the row for a removal — either filtered on the `last_change_at` the tag was compared against; **IF** no row matched → **RETURN** rejected `412`; the unique index guards the insert of a first row so two first writers cannot both land, the second refused `412` - `inst-vw-commit-5`
 6. [x] - `p1` - Invoke the audit sink's append in the same transaction with the pre-image and post-image masked by classification, the operation — `create`, `change`, `revert` or `remove` — the actor, the request id and the change set id; **IF** the append fails → roll back and **RETURN** rejected `503` - `inst-vw-commit-6`
 7. [x] - `p1` - Commit; **IF** the commit fails → **RETURN** rejected `503` with nothing stored - `inst-vw-commit-7`
-8. [x] - `p1` - Evict the local cache for the key at the target, key-wide when the scope class is `cascading`, so descendants re-resolve lazily - `inst-vw-commit-8`
+8. [x] - `p1` - Evict the local cache for the key at the target, key-wide when the scope class is `cascading` or `global`, so descendants re-resolve lazily - `inst-vw-commit-8`
 9. [x] - `p1` - Publish `event_value_changed` through the Change Publisher port, and on a rejection `event_value_change_failed` with the reason and the change set id — minted before the gate, so a refusal at the gate carries it too — so a failed change is a durable notification an operator can join to its request; a validation failure's reason is its field and code only, never the message, which may name part of the submitted value; count the outcome on `settings_value_writes_total` - `inst-vw-commit-9`
 10. [x] - `p1` - **RETURN** the old value, the new value, the scope and the new tag - `inst-vw-commit-10`
 
@@ -426,7 +426,7 @@ Every write **MUST** be guarded on the tag the caller presents: the target scope
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-value-writes-ordering`
 
-A change **MUST** count as set only once it is durably committed, and the order after the commit **MUST** be: evict the local cache — key-wide for a `cascading` setting — then publish through the Change Publisher port. No consumer **MUST** be able to observe an invalidation or a change event for a value that is not yet stored. A valid re-set or a removal **MUST** clear the row's `needs_review` flag.
+A change **MUST** count as set only once it is durably committed, and the order after the commit **MUST** be: evict the local cache — key-wide for a `cascading` or `global` setting — then the end-of-request publish of replica coherence. No consumer **MUST** be able to observe an invalidation or a change event for a value that is not yet stored. A valid re-set or a removal **MUST** clear the row's `needs_review` flag.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-value-writes-commit`

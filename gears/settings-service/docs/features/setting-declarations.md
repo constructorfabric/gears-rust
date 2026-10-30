@@ -156,7 +156,7 @@ The hardest constraint here is not any single field but the rule connecting them
 10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
 11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
 12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity; when the classification or domain affinity changed, after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-update-13`
 14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
@@ -186,7 +186,7 @@ The hardest constraint here is not any single field but the rule connecting them
 9. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-retire-9`
 10. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'retired' WHERE id = {id} AND `updated_at` = {the version the tag was compared against}, in one transaction with the invalidation below; **IF** no row matched → **RETURN** `412` - `inst-decl-retire-10`
 11. [x] - `p1` - Retain every row in `setting_values` for this declaration; retire never deletes values - `inst-decl-retire-11`
-12. [x] - `p1` - Invalidate the local cache for the affected scopes and publish the cache-invalidation and declaration-retired signals - `inst-decl-retire-12`
+12. [x] - `p1` - Invalidate the local cache for the affected scopes and emit the declaration-retired signal; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-retire-12`
 13. [x] - `p1` - Emit a declaration-retired audit record carrying pre-images - `inst-decl-retire-13`
 14. [x] - `p1` - **RETURN** `200` with the retired declaration; this is a soft delete, not a `204` removal - `inst-decl-retire-14`
 
@@ -219,7 +219,7 @@ The hardest constraint here is not any single field but the rule connecting them
 11. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
 12. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
 13. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs - `inst-decl-react-10`
 15. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
 16. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
 
@@ -278,7 +278,7 @@ The hardest constraint here is not any single field but the rule connecting them
 5. [x] - `p1` - **IF** the new value type flips the secret trait → **RETURN** `409`, since stored values would be re-interpreted rather than moved - `inst-decl-evolve-4`
 6. [x] - `p1` - Mint the next free major: one above the highest major the path has ever used, retired ones included, composed as `<vendor>.settings.<category>.<name>.vN~` - `inst-decl-evolve-5`
 7. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
-8. [x] - `p1` - Invalidate the local cache for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
+8. [x] - `p1` - Invalidate the local cache for both keys; after the request's commits, the audit record included, the end-of-request publish of replica coherence (`cpt-cf-settings-service-flow-replica-coherence-publish`) runs for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
 
 ### Declare Dependency Group
 

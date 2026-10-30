@@ -52,6 +52,27 @@ impl Harness {
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
+        Self::with_hook(step_up, None).await
+    }
+
+    /// A verified harness whose requests end through the cache broadcast hook.
+    async fn hooked(
+        gateway: &Arc<crate::domain::coherence::testing::RecordingGateway>,
+    ) -> (
+        Self,
+        Arc<crate::domain::coherence::testing::CountingMetrics>,
+    ) {
+        let (hook, metrics) = crate::domain::coherence::testing::publisher(gateway);
+        (
+            Self::with_hook(Arc::new(FixedStepUp::verified()), Some(hook)).await,
+            metrics,
+        )
+    }
+
+    async fn with_hook(
+        step_up: Arc<dyn StepUpVerifier>,
+        hook: Option<Arc<crate::domain::coherence::CoherencePublisher>>,
+    ) -> Self {
         let base = ResolutionHarness::new().await;
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(RecordingRegistrar::default());
@@ -65,6 +86,10 @@ impl Harness {
             Arc::clone(&audit),
             Arc::clone(&base.cache),
         );
+        let admin = match hook {
+            Some(hook) => admin.with_coherence(hook),
+            None => admin,
+        };
         Self {
             base,
             admin,
@@ -2559,4 +2584,249 @@ async fn the_listing_stops_after_the_first_tenant_batch_that_fills_the_limit() {
     assert!(report.rows.is_empty());
     assert_eq!(report.total, 6);
     assert!(batches.is_empty());
+}
+
+// --- the end-of-request cache broadcast ---------------------------------------
+
+mod coherence {
+    use super::*;
+    use crate::domain::coherence::testing::RecordingGateway;
+
+    /// An administrator's request with its own correlation id.
+    fn request() -> (WriteActor, Uuid) {
+        let id = Uuid::new_v4();
+        (
+            WriteActor {
+                request_id: id.to_string(),
+                ..admin_actor()
+            },
+            id,
+        )
+    }
+
+    fn keys(event: &event_broker_sdk::Event) -> Vec<String> {
+        event.data.as_ref().expect("body")["changed_keys"]
+            .as_array()
+            .expect("keys")
+            .iter()
+            .map(|k| k.as_str().expect("key").to_owned())
+            .collect()
+    }
+
+    fn assert_root_broadcast(event: &event_broker_sdk::Event, root: Uuid, id: Uuid) {
+        assert_eq!(event.tenant_id, root, "under the root tenant");
+        let data = event.data.as_ref().expect("body");
+        assert_eq!(data["tenant"], json!(root.to_string()));
+        assert_eq!(data["change_set_id"], json!(id.to_string()));
+    }
+
+    /// `PATCH` as the handler runs it: the transaction body, then what follows.
+    async fn patch(h: &Harness, id: Uuid, patch: Value, actor: &WriteActor) {
+        let tag = etag_of(&h.load(id).await);
+        let conn = h.base.db.conn().expect("connection");
+        let map: Map<String, Value> = patch.as_object().expect("an object").clone();
+        let (updated, reclassified) = h
+            .admin
+            .update_change(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                Some(tag.as_str()),
+                &map,
+                actor,
+            )
+            .await
+            .expect("patched");
+        h.admin
+            .after_update(&updated.key, reclassified, &actor.request_id)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_retire_publishes_once_under_the_root_tenant_naming_the_key() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let root = gateway.root.expect("root");
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        let created = h
+            .create(h.request("retry_policy"), &admin_actor())
+            .await
+            .expect("created");
+        h.admin.after_create(&created, "req").await;
+        assert!(
+            gateway.events().is_empty(),
+            "a brand-new setting announces nothing"
+        );
+
+        let (actor, id) = request();
+        let tag = etag_of(&created.declaration);
+        let conn = h.base.db.conn().expect("connection");
+        let (retired, changed) = h
+            .admin
+            .retire_change(
+                &conn,
+                &AccessScope::allow_all(),
+                created.declaration.id,
+                Some(tag.as_str()),
+                &actor,
+            )
+            .await
+            .expect("retired");
+        assert!(changed);
+        h.admin
+            .after_retire(&retired.key, changed, &actor.request_id)
+            .await;
+        let events = gateway.events();
+        assert_eq!(events.len(), 1);
+        assert_root_broadcast(&events[0], root, id);
+        assert_eq!(keys(&events[0]), std::slice::from_ref(&retired.key));
+        assert_eq!(metrics.all(), ["sent"]);
+
+        // Retiring what is already retired changes nothing and says nothing.
+        let (again, changed) = h
+            .admin
+            .retire_change(
+                &conn,
+                &AccessScope::allow_all(),
+                created.declaration.id,
+                Some(etag_of(&retired).as_str()),
+                &actor,
+            )
+            .await
+            .expect("idempotent");
+        assert!(!changed);
+        h.admin
+            .after_retire(&again.key, changed, &actor.request_id)
+            .await;
+        assert_eq!(gateway.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reactivation_publishes_once_naming_the_revived_key() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let root = gateway.root.expect("root");
+        let (h, _) = Harness::hooked(&gateway).await;
+        let created = h
+            .create(h.request("retry_policy"), &admin_actor())
+            .await
+            .expect("created");
+        let tag = etag_of(&created.declaration);
+        h.retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+            .await
+            .expect("retired");
+
+        let (actor, id) = request();
+        let revived = h
+            .create(h.request("retry_policy"), &actor)
+            .await
+            .expect("revived");
+        assert!(revived.reactivated);
+        h.admin.after_create(&revived, &actor.request_id).await;
+        let events = gateway.events();
+        assert_eq!(events.len(), 1);
+        assert_root_broadcast(&events[0], root, id);
+        assert_eq!(
+            keys(&events[0]),
+            std::slice::from_ref(&revived.declaration.key)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_evolve_publishes_once_naming_the_successor_and_the_predecessor() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let root = gateway.root.expect("root");
+        let (h, _) = Harness::hooked(&gateway).await;
+        let v1 = h
+            .create(h.request("retry_policy"), &admin_actor())
+            .await
+            .expect("created")
+            .declaration;
+
+        let (actor, id) = request();
+        let mut retyped = h.request("retry_policy");
+        retyped.value_type_id = TEXT.to_owned();
+        retyped.default_value = json!("gentle");
+        let evolved = h.create(retyped, &actor).await.expect("evolved");
+        assert!(evolved.evolved);
+        h.admin.after_create(&evolved, &actor.request_id).await;
+        let events = gateway.events();
+        assert_eq!(events.len(), 1, "one broadcast for both keys");
+        assert_root_broadcast(&events[0], root, id);
+        assert_eq!(
+            keys(&events[0]),
+            [evolved.declaration.key.clone(), v1.key.clone()]
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_patch_that_changes_classification_or_domain_affinity_publishes() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let root = gateway.root.expect("root");
+        let (h, _) = Harness::hooked(&gateway).await;
+        let created = h
+            .create(h.request("retry_policy"), &admin_actor())
+            .await
+            .expect("created");
+        let key = created.declaration.key.clone();
+        let sid = created.declaration.id;
+
+        let (actor, _) = request();
+        patch(&h, sid, json!({"description": "only words"}), &actor).await;
+        assert!(
+            gateway.events().is_empty(),
+            "a description-only PATCH publishes nothing"
+        );
+        patch(&h, sid, json!({"data_classification": "pii"}), &actor).await;
+        let (actor2, id2) = request();
+        patch(&h, sid, json!({"domain_affinity": "network"}), &actor2).await;
+        let events = gateway.events();
+        assert_eq!(events.len(), 2, "classification, then domain affinity");
+        assert_eq!(keys(&events[0]), std::slice::from_ref(&key));
+        assert_root_broadcast(&events[1], root, id2);
+        // Setting the same classification again changes nothing.
+        patch(&h, sid, json!({"data_classification": "pii"}), &actor).await;
+        assert_eq!(gateway.events().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_broker_a_declaration_change_still_succeeds_and_counts_skipped() {
+        let gateway = Arc::new(RecordingGateway::without_broker());
+        let (h, metrics) = Harness::hooked(&gateway).await;
+        let created = h
+            .create(h.request("retry_policy"), &admin_actor())
+            .await
+            .expect("created");
+        let (actor, _) = request();
+        let conn = h.base.db.conn().expect("connection");
+        let (retired, changed) = h
+            .admin
+            .retire_change(
+                &conn,
+                &AccessScope::allow_all(),
+                created.declaration.id,
+                Some(etag_of(&created.declaration).as_str()),
+                &actor,
+            )
+            .await
+            .expect("retired");
+        h.admin
+            .after_retire(&retired.key, changed, &actor.request_id)
+            .await;
+        assert_eq!(metrics.all(), ["skipped"]);
+        assert!(gateway.events().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_id_that_is_not_a_uuid_is_replaced_by_a_minted_correlation_id() {
+        let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+        let (h, _) = Harness::hooked(&gateway).await;
+        h.admin
+            .publish_changes(vec!["k".to_owned()], "not-a-uuid")
+            .await;
+        let events = gateway.events();
+        let sent = events[0].data.as_ref().expect("body")["change_set_id"]
+            .as_str()
+            .expect("an id")
+            .to_owned();
+        assert!(Uuid::parse_str(&sent).is_ok());
+    }
 }

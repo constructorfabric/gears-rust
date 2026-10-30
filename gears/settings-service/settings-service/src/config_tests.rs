@@ -143,3 +143,42 @@ fn a_local_binding_another_contract_and_no_section_at_all_are_all_accepted() {
         );
     }
 }
+
+#[test]
+fn the_publish_timeout_defaults_to_two_seconds_and_takes_an_override() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.publish_timeout_seconds, 2);
+    let cfg = parse(serde_json::json!({ "publish_timeout_seconds": 7 })).expect("parses");
+    assert_eq!(cfg.publish_timeout_seconds, 7);
+}
+
+#[test]
+fn the_publish_timeout_accepts_one_through_ten() {
+    for seconds in [1, 2, 10] {
+        let cfg = parse(serde_json::json!({ "publish_timeout_seconds": seconds })).expect("parses");
+        cfg.check_publish_timeout()
+            .unwrap_or_else(|reason| panic!("{seconds} s is within bounds: {reason}"));
+    }
+}
+
+#[test]
+fn the_publish_timeout_refuses_zero_and_anything_above_ten_naming_the_field_and_the_bounds() {
+    for seconds in [0, 11, 999_999] {
+        let cfg = parse(serde_json::json!({ "publish_timeout_seconds": seconds })).expect("parses");
+        let reason = cfg
+            .check_publish_timeout()
+            .expect_err("outside 1..=10 is refused");
+        assert!(
+            reason.contains("publish_timeout_seconds")
+                && reason.contains(&seconds.to_string())
+                && reason.contains("between 1 and 10"),
+            "the reason names the field, the value and the bounds: `{reason}`"
+        );
+    }
+}
+
+#[test]
+fn a_wrong_typed_publish_timeout_is_refused_rather_than_coerced() {
+    assert!(parse(serde_json::json!({ "publish_timeout_seconds": "two" })).is_err());
+    assert!(parse(serde_json::json!({ "publish_timeout_seconds": -1 })).is_err());
+}

@@ -22,6 +22,7 @@ use super::{BATCH_LIMIT, BatchChange, WriteCoordinator};
 use crate::api::rest::value_dto::rejection_code;
 use crate::audit::{AuditOperation, AuditValue, StoredAuditRecord};
 use crate::domain::category::DomainVisibility;
+use crate::domain::coherence::testing::{RecordingGateway, publisher as coherence_hook};
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::ports::NoMetrics;
@@ -59,6 +60,29 @@ impl Harness {
     }
 
     async fn with_step_up(step_up: Arc<dyn StepUpVerifier>) -> Self {
+        Self::with_hook(step_up, None).await
+    }
+
+    /// A harness whose requests end through the cache broadcast hook.
+    async fn with_gateway(
+        gateway: &Arc<RecordingGateway>,
+    ) -> (
+        Self,
+        Arc<crate::domain::coherence::testing::CountingMetrics>,
+    ) {
+        let (hook, metrics) = coherence_hook(gateway);
+        let h = Self::with_hook(
+            Arc::new(FixedStepUp::refusing(StepUpRefusal::NotConfigured)),
+            Some(hook),
+        )
+        .await;
+        (h, metrics)
+    }
+
+    async fn with_hook(
+        step_up: Arc<dyn StepUpVerifier>,
+        hook: Option<Arc<crate::domain::coherence::CoherencePublisher>>,
+    ) -> Self {
         let base = ResolutionHarness::new().await;
         let published = Arc::new(RecordingPublisher::default());
         let secrets = Arc::new(RecordingSecrets::default());
@@ -73,7 +97,10 @@ impl Harness {
             Arc::clone(&published) as Arc<dyn crate::domain::ports::ChangePublisher>,
             Arc::new(NoMetrics),
         ));
-        let coordinator = WriteCoordinator::new(Arc::clone(&base.db), writer);
+        let mut coordinator = WriteCoordinator::new(Arc::clone(&base.db), writer);
+        if let Some(hook) = hook {
+            coordinator = coordinator.with_coherence(hook);
+        }
         Self {
             base,
             coordinator,
@@ -1890,4 +1917,275 @@ async fn a_secret_write_with_a_stale_or_missing_tag_never_reaches_the_store() {
     .await
     .expect("current tag");
     assert_eq!(h.stores(), stores_after_first + 1);
+}
+
+// --- the end-of-request cache broadcast ---------------------------------------
+
+fn data_of(event: &event_broker_sdk::Event) -> serde_json::Value {
+    event.data.clone().expect("a body")
+}
+
+fn keys_in(event: &event_broker_sdk::Event) -> Vec<String> {
+    data_of(event)["changed_keys"]
+        .as_array()
+        .expect("keys")
+        .iter()
+        .map(|k| k.as_str().expect("a key").to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_batch_of_three_changes_at_two_tenants_publishes_two_broadcasts_after_the_evictions() {
+    let probe_cache: Arc<std::sync::OnceLock<Arc<crate::domain::resolution::EffectiveCache>>> =
+        Arc::default();
+    let seeded_for = Arc::new(std::sync::OnceLock::<(String, Uuid)>::new());
+    let mut gateway = RecordingGateway::ready(Uuid::new_v4());
+    {
+        let (cache, seeded) = (Arc::clone(&probe_cache), Arc::clone(&seeded_for));
+        gateway.probe = Some(Arc::new(move || {
+            let (key, tenant) = seeded.get().expect("seeded");
+            cache.get().expect("cache").get(key, *tenant).is_none()
+        }));
+    }
+    let gateway = Arc::new(gateway);
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    let root = gateway.root.expect("root");
+    h.declare("one", scope_class::CASCADING).await;
+    h.declare("two", scope_class::CASCADING).await;
+    h.declare("three", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    probe_cache.set(Arc::clone(&h.base.cache)).ok();
+    // A cached value of the first key at the first tenant: gone when the
+    // broadcast is handed to the broker.
+    let first = h.base.key("one");
+    h.base
+        .cache
+        .seed(Arc::new(crate::domain::resolution::cache::tests_entry(
+            first.as_str(),
+            t.a,
+        )));
+    seeded_for.set((first.as_str().to_owned(), t.a)).ok();
+
+    let mut changes = vec![
+        entry(h.base.key("one"), None, Some(json!(true)), "absent"),
+        entry(h.base.key("two"), None, Some(json!(true)), "absent"),
+        entry(h.base.key("three"), None, Some(json!(true)), "absent"),
+    ];
+    changes[0].tenant = Some(t.a);
+    changes[1].tenant = Some(t.b);
+    changes[2].tenant = Some(t.a);
+    let outcome = h
+        .coordinator
+        .batch(&actor(t.root), changes)
+        .await
+        .expect("the batch runs");
+    assert!(outcome.results.iter().all(Result::is_ok));
+
+    let events = gateway.events();
+    assert_eq!(events.len(), 2, "one broadcast per tenant touched");
+    for event in &events {
+        assert_eq!(event.tenant_id, root, "under the root tenant");
+        assert_eq!(
+            data_of(event)["change_set_id"],
+            json!(outcome.change_set_id.to_string()),
+            "under the request's change set"
+        );
+    }
+    assert_eq!(events[0].subject, t.a.to_string());
+    assert_eq!(
+        keys_in(&events[0]),
+        [
+            h.base.key("one").to_string(),
+            h.base.key("three").to_string()
+        ]
+    );
+    assert_eq!(events[1].subject, t.b.to_string());
+    assert_eq!(keys_in(&events[1]), [h.base.key("two").to_string()]);
+    assert_eq!(metrics.all(), ["sent", "sent"]);
+    assert_eq!(
+        *gateway.probed.lock().unwrap(),
+        [true, true],
+        "the local cache was evicted before each publish"
+    );
+}
+
+#[tokio::test]
+async fn a_single_set_revert_remove_and_clone_each_publish_one_broadcast() {
+    let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    h.declare("flag", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    let key = h.base.key("flag");
+    let actor = actor(t.root);
+
+    let set = h
+        .set(&actor, "flag", Some(t.a), json!(true), Some("absent"))
+        .await
+        .expect("set");
+    let reverted = h
+        .coordinator
+        .change(
+            &actor,
+            &key,
+            Some(t.a),
+            Change::Revert,
+            Some(&set.etag),
+            "revert",
+        )
+        .await
+        .expect("revert");
+    let set_again = h
+        .set(&actor, "flag", Some(t.a), json!(true), Some("absent"))
+        .await
+        .expect("set again");
+    let removed = h
+        .coordinator
+        .change(
+            &actor,
+            &key,
+            Some(t.a),
+            Change::Remove,
+            Some(&set_again.etag),
+            "remove",
+        )
+        .await
+        .expect("remove");
+    h.set(&actor, "flag", Some(t.a), json!(true), Some("absent"))
+        .await
+        .expect("a source row");
+    let cloned = h
+        .coordinator
+        .clone_value(&actor, &key, Some(t.a), Some(t.c), Some("absent"))
+        .await
+        .expect("clone");
+
+    let events = gateway.events();
+    assert_eq!(events.len(), 6, "one per single-change request");
+    let subjects: Vec<_> = events.iter().map(|e| e.subject.clone()).collect();
+    assert_eq!(subjects[1], reverted.tenant_id.to_string());
+    assert_eq!(subjects[3], removed.tenant_id.to_string());
+    assert_eq!(
+        subjects[5],
+        cloned.tenant_id.to_string(),
+        "a clone publishes for its target"
+    );
+    assert_eq!(cloned.tenant_id, t.c);
+    assert_eq!(metrics.all(), ["sent"; 6]);
+}
+
+#[tokio::test]
+async fn a_request_that_committed_nothing_publishes_nothing() {
+    let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    h.declare("flag", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    // A stale tag: the change is refused.
+    let refused = h
+        .set(
+            &actor(t.root),
+            "flag",
+            Some(t.a),
+            json!(true),
+            Some("stale"),
+        )
+        .await;
+    assert!(refused.is_err());
+    let batch = h
+        .coordinator
+        .batch(
+            &actor(t.root),
+            vec![entry(h.base.key("flag"), None, Some(json!(true)), "stale")],
+        )
+        .await
+        .expect("the batch runs");
+    assert!(batch.results[0].is_err());
+    assert!(gateway.events().is_empty());
+    assert!(metrics.all().is_empty(), "nothing counted either");
+}
+
+#[tokio::test]
+async fn a_global_write_publishes_under_the_root_tenant_as_data_tenant() {
+    let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
+    let (h, _) = Harness::with_gateway(&gateway).await;
+    let root = gateway.root.expect("root");
+    h.declare("wide", scope_class::GLOBAL).await;
+    let t = &h.base.tree;
+    h.set(&actor(t.root), "wide", None, json!(true), Some("absent"))
+        .await
+        .expect("global set");
+    let events = gateway.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(data_of(&events[0])["tenant"], json!(root.to_string()));
+    assert_eq!(events[0].subject, root.to_string());
+}
+
+#[tokio::test]
+async fn without_a_broker_the_write_commits_and_one_skipped_is_counted_per_tenant_touched() {
+    let gateway = Arc::new(RecordingGateway::without_broker());
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    let declared = h.declare("one", scope_class::CASCADING).await;
+    h.declare("two", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    let mut first = entry(h.base.key("one"), None, Some(json!(true)), "absent");
+    first.tenant = Some(t.a);
+    let mut second = entry(h.base.key("two"), None, Some(json!(true)), "absent");
+    second.tenant = Some(t.b);
+    let mut third = entry(h.base.key("two"), None, Some(json!(false)), "absent");
+    third.tenant = Some(t.a);
+    let outcome = h
+        .coordinator
+        .batch(&actor(t.root), vec![first, second, third])
+        .await
+        .expect("the batch runs");
+    assert!(
+        outcome.results.iter().all(Result::is_ok),
+        "no error to the caller"
+    );
+    assert_eq!(h.rows(declared).await.len(), 1, "the value committed");
+    assert_eq!(metrics.all(), ["skipped", "skipped"]);
+    assert!(gateway.events().is_empty());
+}
+
+#[tokio::test]
+async fn an_unknown_root_tenant_skips_the_broadcast_and_builds_nothing() {
+    let mut gateway = RecordingGateway::ready(Uuid::new_v4());
+    gateway.root = None;
+    gateway.state.root_tenant_known = false;
+    let gateway = Arc::new(gateway);
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    h.declare("flag", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    h.set(
+        &actor(t.root),
+        "flag",
+        Some(t.a),
+        json!(true),
+        Some("absent"),
+    )
+    .await
+    .expect("the write stands");
+    assert_eq!(metrics.all(), ["skipped"]);
+    assert!(gateway.events().is_empty());
+}
+
+#[tokio::test]
+async fn a_refused_publish_never_fails_the_request_and_the_rest_are_skipped() {
+    let mut gateway = RecordingGateway::ready(Uuid::new_v4());
+    gateway.refuse = true;
+    let gateway = Arc::new(gateway);
+    let (h, metrics) = Harness::with_gateway(&gateway).await;
+    h.declare("one", scope_class::CASCADING).await;
+    let t = &h.base.tree;
+    let mut a = entry(h.base.key("one"), None, Some(json!(true)), "absent");
+    a.tenant = Some(t.a);
+    let mut b = entry(h.base.key("one"), None, Some(json!(true)), "absent");
+    b.tenant = Some(t.b);
+    let outcome = h
+        .coordinator
+        .batch(&actor(t.root), vec![a, b])
+        .await
+        .expect("the batch runs");
+    assert!(outcome.results.iter().all(Result::is_ok));
+    assert_eq!(metrics.all(), ["failed", "skipped"]);
+    assert_eq!(gateway.events().len(), 1, "the second was never attempted");
 }
