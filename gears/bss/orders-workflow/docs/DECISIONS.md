@@ -1794,7 +1794,7 @@ engine data as much as task inputs are: the start trigger's input is the raw `$w
 (Serverless Workflow DSL 1.0.0, dsl.md *Runtime expression arguments*) and a `listen` output is
 the array of consumed events (dsl-reference.md *Listen*), while Lifecycle's events as published
 carry tenant axes, per-line net components, the deciding authority and actor and reason fields
-([Lifecycle `01 §4.4`](../../orders/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders/docs/DESIGN.md#contract-01-4-4),
 lines 2396–2406). The start trigger and every Lifecycle, Generic Approval and Subscriptions
 `listen` **MUST** keep only references. Two routes are registered and either closes the gap: the
 platform persists only the members the definition selects

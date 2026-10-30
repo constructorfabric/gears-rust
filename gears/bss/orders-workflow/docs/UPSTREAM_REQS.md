@@ -831,7 +831,7 @@ projection loses it nothing.
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage`
 
 Orders Lifecycle **MUST** add one value to the closed `failure_reason` enumeration of
-`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders/docs/features/06-workflow-seam.md#44-acknowledgement-normative),
+`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders/docs/features/06-workflow-seam.md#contract-06-4-4),
 its D-136), or name the existing value this gear should send for each:
 
 | Proposed value | Raised when | This gear's reason |
@@ -860,7 +860,7 @@ its D-136), or name the existing value this gear should send for each:
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-workflow-key-retention`
 
 Orders Lifecycle **MUST** either **retain the idempotency records of the workflow-trigger class**
-(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders/docs/features/01-foundation.md#41-the-transition-contract-normative)),
+(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders/docs/DESIGN.md#contract-01-4-1)),
 scoped to the Workflow service principal, for **at least 30 days** from the record's creation —
 this gear's key lifetime (`design/01-foundation.md` §3.7 *Key lifetime*, D-185), after which it
 never re-issues the same key — **or expose a read of a seam operation's stored outcome by its
@@ -869,7 +869,7 @@ record".
 
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
 - **Why this gear cannot satisfy it alone**: Lifecycle owns the registry and, before its D-173, its 24-hour window
-  ([Lifecycle `01 §2.2`](../../orders/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
+  ([Lifecycle `01 §2.2`](../../orders/docs/DESIGN.md#contract-01-the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
   This gear re-issues an unchanged Lifecycle key after a lease death or an interruption that can
   last days — a hold, a ceiling park, an `invocation-dead` task awaiting its re-drive — and the
   keys of `begin-fulfillment`, `report-spawn-signal` and `report-outcome` carry no attempt, so
@@ -1361,7 +1361,7 @@ Lifecycle's `OrderSubmitted` carries the tenant axes, per-line references and pi
 total's per-line net components; `OrderApproved` and `OrderRejected` the deciding authority;
 `OrderHeld` the hold reason; `OrderCancelled` the cancelling actor and the cancel reason;
 `OrderCompleted` the line-to-subscription mapping
-([Lifecycle `01 §4.4`](../../orders/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders/docs/DESIGN.md#contract-01-4-4),
 lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`; the approval policy adapter
 decision event has no specification (§2.3, Q-05). The platform has no data-classification model
 for execution history ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md)

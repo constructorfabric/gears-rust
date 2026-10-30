@@ -149,7 +149,7 @@ invocation through a platform event trigger —
 `admit-trigger` input schema declares `triggerKind` as this closed enum, so an unlisted kind is a
 schema refusal at the envelope (`01 §3.3` step 3). On the start path the definition derives
 `triggerKind` from the event's **exact** GTS type — `…cf.bss.orders.submitted.v1~` or
-`…cf.bss.orders.amended.v1~` ([Lifecycle `01 §4.4`](../../../orders/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative))
+`…cf.bss.orders.amended.v1~` ([Lifecycle `01 §4.4`](../../../orders/docs/DESIGN.md#contract-01-4-4))
 — and any other type yields no value, which the schema refuses; it never defaults an unknown type
 to `OrderSubmitted` (`10 §3.6` (a), decision D-107). The validation hook refuses a definition
 whose `listen` names any other Lifecycle type (ADR-0012 rule 3). A closed list is what makes "does
@@ -278,7 +278,7 @@ global sequencing guarantee from the broker, and it is why the definition compar
 The comparison has **three** branches — the event's version can be equal to, older than, or
 newer than what the read returns. The third is **not replica lag**: Lifecycle forbids replica
 reads and serves the aggregate row itself
-([Lifecycle `08 §3.8`](../../../orders/docs/features/08-read-and-authz.md#38-deployment-topology),
+([Lifecycle `08 §3.8`](../../../orders/docs/DESIGN.md#contract-08-3-8),
 Lifecycle [D-51](../../../orders/docs/DECISIONS.md)), and it publishes only after the state write commits, so an event ahead of the read is a
 divergence between the stream and the system of record. The full rule is §4.2.
 
@@ -300,7 +300,7 @@ running invocation's `listen` tasks, which the plugin matches with its backend's
 mechanism (`DESIGN.md:808`). Two start bindings are needed, because Lifecycle publishes no
 `OrderSubmitted` for an amended version — an amendment returns the order to `submitted` and
 publishes `OrderAmended` only
-([Lifecycle `04 §4.3`](../../../orders/docs/features/04-versioning.md#43-re-approval-is-a-two-step-seam-interaction-normative)):
+([Lifecycle `04 §4.3`](../../../orders/docs/features/04-versioning.md#contract-04-4-3)):
 one trigger on `OrderSubmitted` and one on `OrderAmended` (decision D-73:
 the start-trigger set is `{OrderSubmitted, OrderAmended}`, which amends `10 §2.2` rule 7 and the
 event-trigger row of `10 §3.3`). Whether one broker event can both start an invocation through a
@@ -876,7 +876,7 @@ read returns. Every admission takes exactly one branch:
 |------------|--------|------|
 | event version **==** read version | agree | Proceed to the trigger-to-outcome table (§3.3) |
 | event version **<** read version | superseded | The event speaks for a version the order has moved past. On the listen role, when the running instance is itself pinned below the read version, the outcome is `supersede`; otherwise `ignored-superseded` |
-| event version **>** read version | ahead | **Divergence**, not lag: Lifecycle serves no replica ([Lifecycle `08 §3.8`](../../../orders/docs/features/08-read-and-authz.md#38-deployment-topology)) and publishes after commit. The attempt **MUST** settle `retryable-failure` with `trigger-applicability-unverified` and **MUST NOT** be treated as superseded or as agreement |
+| event version **>** read version | ahead | **Divergence**, not lag: Lifecycle serves no replica ([Lifecycle `08 §3.8`](../../../orders/docs/DESIGN.md#contract-08-3-8)) and publishes after commit. The attempt **MUST** settle `retryable-failure` with `trigger-applicability-unverified` and **MUST NOT** be treated as superseded or as agreement |
 
 The ahead branch is kept defensively. It performs no effect, and it is bounded by the definition's
 retry policy on the call: on the start path, exhaustion fails the invocation, which is the
@@ -915,7 +915,7 @@ ADR-0011 the new version's invocation is created durably by the platform trigger
 side runs, and its admission key is `open` — never settled — until the start can be admitted, so a
 crash on either side resumes into the same ordering. The cost is a bounded wait: amendment is
 admissible only before `in_fulfillment` (Lifecycle
-[`04 §2.2`](../../../orders/docs/features/04-versioning.md#22-constraints)), so the prior
+[`04 §2.2`](../../../orders/docs/DESIGN.md#contract-04-2-2)), so the prior
 instance holds no provisioning intent and its unwind is gate cancellation plus the fence's checks.
 
 **Why unwinding first, not overlapping.** Letting the new version start while the prior one

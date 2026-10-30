@@ -46,7 +46,7 @@ applied by `SecureConn`, and a denied, unreachable or constraint-less PDP fails 
 envelope ([`event-broker-sdk/src/typed_event.rs`](../../../../system/event-broker/event-broker-sdk/src/typed_event.rs)
 `EnvelopedEvent`) carries no producer principal and no signature. The sibling Orders Lifecycle
 design already replaced its own local evaluator with the shared PolicyEnforcer adapter
-([`08-read-and-authz.md` §3.5](../../../orders/docs/features/08-read-and-authz.md#35-external-dependencies),
+([`08-read-and-authz.md` §3.5](../../../orders/docs/DESIGN.md#contract-08-3-5),
 D-111, D-114, D-141), following Pricing's integration
 (Pricing [`DESIGN.md` §1.2 *Architecture Drivers*](../../../pricing/docs/DESIGN.md#12-architecture-drivers), `cpt-cf-bss-pricing-nfr-authz`; the catalogue section of Pricing's former `05-governance.md` was retired by the PriceBook rewrite, and the catalogue shape this gear follows is Lifecycle's).
 
