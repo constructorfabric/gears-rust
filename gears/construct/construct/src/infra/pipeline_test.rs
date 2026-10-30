@@ -97,6 +97,7 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
         Some(adds_a_skill()),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .expect("the pipeline assembles");
@@ -149,7 +150,7 @@ async fn a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_i
     };
     pipeline
         .subject_control
-        .delete(&owner, subject, &stored.node_key)
+        .delete(&owner, subject, &stored.fact.node_key)
         .await
         .expect("the subject deletes its fact");
     let after = pipeline.profile.read(&reader, None, subject).await.unwrap();
@@ -225,6 +226,7 @@ async fn a_record_whose_processing_panics_is_dropped_and_the_worker_goes_on() {
         Some(Arc::clone(&model) as _),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .expect("the pipeline assembles");
@@ -296,6 +298,7 @@ async fn without_a_model_records_are_dropped_with_an_event_and_no_worker_runs() 
         None,
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -333,6 +336,7 @@ async fn without_a_processing_identity_the_profile_read_is_not_configured() {
         Some(adds_a_skill()),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -402,6 +406,7 @@ async fn the_configured_category_check_reaches_the_profile_read() {
             None,
             fake_graph_storage(),
             Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+            Arc::new(crate::test_support::MemoryReviews::default()),
             PolicyEnforcer::new(Arc::clone(&asked) as Arc<dyn AuthZResolverApi>),
         )
         .unwrap();
@@ -430,6 +435,7 @@ async fn without_a_processing_identity_even_an_empty_profile_is_not_configured()
         fake_graph_storage(),
         // Personalization off by default: the read would serve nothing.
         Arc::new(settings_service(&db, Arc::new(AllowResolver), false)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -465,6 +471,7 @@ async fn without_the_opt_in_to_run_unchecked_no_worker_runs_and_it_warns() {
         Some(adds_a_skill()),
         fake_graph_storage(),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -499,6 +506,7 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
         None,
         Arc::clone(&graph),
         Arc::new(settings_service(&db, Arc::new(AllowResolver), true)),
+        Arc::new(crate::test_support::MemoryReviews::default()),
         PolicyEnforcer::new(Arc::new(AllowResolver)),
     )
     .unwrap();
@@ -540,7 +548,7 @@ async fn without_a_model_the_subject_still_deletes_its_facts() {
 
     pipeline
         .subject_control
-        .delete(&owner, subject, &fact.node_key)
+        .delete(&owner, subject, &fact.fact.node_key)
         .await
         .expect("a delete needs no model");
 

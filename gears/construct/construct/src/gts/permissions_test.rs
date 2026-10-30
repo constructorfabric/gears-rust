@@ -40,6 +40,11 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
             "delete",
         ),
         (
+            "cf.construct._.facts_flag.v1",
+            "gts.cf.construct.subject.fact.v1~",
+            "flag",
+        ),
+        (
             "cf.construct._.facts_manage.v1",
             "gts.cf.construct.subject.fact.v1~",
             "manage",
@@ -58,6 +63,11 @@ fn every_enforced_permission_is_declared_once_on_its_resource_and_action() {
             "cf.construct._.record_send.v1",
             "gts.cf.connectors.core.record.v1~",
             "send",
+        ),
+        (
+            "cf.construct._.review_resolve.v1",
+            "gts.cf.construct.review.request.v1~",
+            "resolve",
         ),
         (
             "cf.construct._.subject_export.v1",

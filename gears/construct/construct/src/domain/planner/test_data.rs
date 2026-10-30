@@ -278,6 +278,7 @@ pub(super) struct Chain {
     pub(super) rules: Result<AdmissionRules, fn() -> DomainError>,
     pub(super) writer: Arc<Writer>,
     pub(super) events: Arc<RecordingEvents>,
+    pub(super) reviews: Arc<crate::test_support::MemoryReviews>,
 }
 
 impl Chain {
@@ -295,6 +296,7 @@ impl Chain {
             rules: Ok(open_rules()),
             writer: Writer::answering(written),
             events,
+            reviews: Arc::default(),
         }
     }
 
@@ -330,6 +332,7 @@ impl Chain {
                 profiles: Arc::clone(&self.profiles) as Arc<dyn ProfileSource>,
                 writer: Arc::clone(&self.writer) as Arc<dyn PlanWriter>,
                 events,
+                reviews: Arc::clone(&self.reviews) as _,
             },
             2,
         )

@@ -20,7 +20,7 @@ use graph_storage_sdk::GraphStorageClientV1;
 
 use crate::api::rest::routes;
 use crate::api::rest::types::{
-    ConcreteIntake, ConcreteProfile, ConcreteSettings, ConcreteSubjectControl,
+    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
 };
 use crate::config::ConstructConfig;
 use crate::domain::local_client::LocalClient;
@@ -31,6 +31,7 @@ use crate::infra::pipeline::{self, Worker};
 use crate::infra::processing_metrics::WorkerLoad;
 use crate::infra::record_types::RegistryRecordTypes;
 use crate::infra::storage::record_ids_repo::SeaOrmRecordIdRepository;
+use crate::infra::storage::review_requests_repo::SeaOrmReviewRequests;
 use crate::infra::storage::subject_settings_repo::SeaOrmSubjectSettingsRepository;
 use crate::infra::tenant_defaults::SettingsServiceDefaults;
 
@@ -49,6 +50,7 @@ pub struct ConstructGear {
     settings: OnceLock<Arc<ConcreteSettings>>,
     profile: OnceLock<Arc<ConcreteProfile>>,
     subject_control: OnceLock<Arc<ConcreteSubjectControl>>,
+    review_queue: OnceLock<Arc<ConcreteReviewQueue>>,
     /// The processing worker, until `start` takes it.
     worker: Mutex<Option<Worker>>,
     running: Mutex<Option<Running>>,
@@ -68,6 +70,7 @@ impl Default for ConstructGear {
             settings: OnceLock::new(),
             profile: OnceLock::new(),
             subject_control: OnceLock::new(),
+            review_queue: OnceLock::new(),
             worker: Mutex::new(None),
             running: Mutex::new(None),
         }
@@ -133,6 +136,7 @@ impl Gear for ConstructGear {
             &hub,
             graph,
             Arc::clone(&settings) as _,
+            Arc::new(SeaOrmReviewRequests::new(Arc::clone(&db))),
             policy_enforcer.clone(),
         )
         .context("record processing")?;
@@ -147,6 +151,9 @@ impl Gear for ConstructGear {
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         self.subject_control
             .set(pipeline.subject_control)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.review_queue
+            .set(pipeline.review_queue)
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         *self.worker.lock() = pipeline.worker;
         let ports = IntakePorts {
@@ -212,8 +219,15 @@ impl toolkit::contracts::RestApiCapability for ConstructGear {
             .map(Arc::clone)
             .ok_or_else(|| anyhow::anyhow!("Subject control not initialized"))?;
 
+        let review_queue = self
+            .review_queue
+            .get()
+            .map(Arc::clone)
+            .ok_or_else(|| anyhow::anyhow!("Review queue not initialized"))?;
+
         let router = routes::register_routes(router, openapi, intake, settings, profile);
         let router = routes::register_subject_control_routes(router, openapi, subject_control);
+        let router = routes::register_review_queue_routes(router, openapi, review_queue);
         info!("Construct gear: REST routes registered");
         Ok(router)
         // @cpt-end:cpt-cf-construct-algo-gear-foundation-start-gear:p1:inst-start-rest

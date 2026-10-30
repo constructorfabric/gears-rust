@@ -28,6 +28,7 @@ use crate::domain::profile_read::{CategoryCheck, ProfileReadPorts, ProfileReadSe
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
 };
+use crate::domain::review_queue::{Corrections, ReviewQueueService, ReviewRequests};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
 use crate::domain::subject_settings::SubjectSettingsReader;
@@ -40,6 +41,7 @@ use crate::infra::processing_contexts::ServiceIdentity;
 use crate::infra::processing_metrics::{CountedDrops, ProcessingMetrics, WorkerLoad};
 use crate::infra::profile_events::LogProfileEvents;
 use crate::infra::record_queue::{RecordQueue, record_queue, serve};
+use crate::infra::review_queue_events::LogReviewQueueEvents;
 use crate::infra::storage::graph::reader::GraphProfileSource;
 use crate::infra::storage::graph::root::PayloadCounter;
 use crate::infra::storage::graph::types::GraphTypes;
@@ -145,6 +147,7 @@ pub struct Pipeline {
     pub worker: Option<Worker>,
     pub profile: Arc<ProfileReadService>,
     pub subject_control: Arc<SubjectControlService>,
+    pub review_queue: Arc<ReviewQueueService>,
 }
 
 /// Build the pipeline from the config.
@@ -164,6 +167,7 @@ pub fn build(
     hub: &Arc<ClientHub>,
     graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
+    reviews: Arc<dyn ReviewRequests>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let model: Option<Arc<dyn ModelClient>> = match &cfg.config().model {
@@ -177,7 +181,7 @@ pub fn build(
         )?)),
         None => None,
     };
-    assemble(cfg, model, graph, settings, policy_enforcer)
+    assemble(cfg, model, graph, settings, reviews, policy_enforcer)
 }
 
 /// [`build`] with the model given, the seam a test uses for a scripted model.
@@ -190,6 +194,7 @@ pub fn assemble(
     model: Option<Arc<dyn ModelClient>>,
     graph: Arc<dyn GraphStorageClientV1>,
     settings: Arc<dyn SubjectSettingsReader>,
+    reviews: Arc<dyn ReviewRequests>,
     policy_enforcer: PolicyEnforcer,
 ) -> anyhow::Result<Pipeline> {
     let configured = Configured {
@@ -222,6 +227,7 @@ pub fn assemble(
             profiles: Arc::clone(&reader) as _,
             contexts: Arc::clone(&contexts),
             events: Arc::new(LogProfileEvents),
+            reviews: Arc::clone(&reviews),
         },
         policy_enforcer.clone(),
         // Without an identity the read answers not configured before it
@@ -249,11 +255,37 @@ pub fn assemble(
             contexts: Arc::clone(&contexts),
             settings: Arc::clone(&settings),
             events: Arc::new(LogSubjectControlEvents),
+            reviews: Arc::clone(&reviews),
+            review_events: Arc::new(LogReviewQueueEvents),
         },
-        policy_enforcer,
+        policy_enforcer.clone(),
         cfg.config().processing.max_reruns,
     ));
     // @cpt-end:cpt-cf-construct-algo-subject-control-wire:p1:inst-wire-subject-control
+
+    // @cpt-begin:cpt-cf-construct-algo-review-queue-wire:p1:inst-wire-review-queue
+    // A correction stores a value, so it runs only where record processing
+    // may: with an identity and the opt-in to store values unchecked. A
+    // rejection and a delete need neither.
+    let catalog = Arc::new(PropertyCatalog::load().context("the person types' property catalog")?);
+    let corrections = (identity.is_some() && configured.unchecked.present()).then(|| Corrections {
+        checks: SensitiveDataChecks::new(Vec::new(), Arc::new(LogIntakeEvents)),
+        admission: Admission::new(AdmissionPorts {
+            settings: Arc::clone(&settings),
+            rules: Arc::new(ConfigAdmissionRules::new(&cfg.config().admission)),
+            events: Arc::new(LogAdmissionEvents),
+            drops: Arc::new(LogIntakeEvents),
+        }),
+        catalog: Arc::clone(&catalog),
+    });
+    let review_queue = Arc::new(ReviewQueueService::new(
+        Arc::clone(&subject_control),
+        Arc::clone(&reviews),
+        Arc::new(LogReviewQueueEvents),
+        corrections,
+        policy_enforcer,
+    ));
+    // @cpt-end:cpt-cf-construct-algo-review-queue-wire:p1:inst-wire-review-queue
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
     // No real sensitive-data check exists yet, so processing runs only where
@@ -266,6 +298,7 @@ pub fn assemble(
             worker: None,
             profile,
             subject_control,
+            review_queue,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -281,7 +314,7 @@ pub fn assemble(
     ));
     let planner = Planner::new(
         model,
-        Arc::new(PropertyCatalog::load().context("the planner's property catalog")?),
+        catalog,
         Arc::clone(&events) as _,
         PlannerCaps {
             max_rounds: cfg.config().processing.max_rounds,
@@ -311,6 +344,7 @@ pub fn assemble(
             profiles: reader,
             writer,
             events: Arc::clone(&events),
+            reviews,
         },
         cfg.config().processing.max_reruns,
     ));
@@ -326,6 +360,7 @@ pub fn assemble(
         }),
         profile,
         subject_control,
+        review_queue,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }

@@ -4,6 +4,7 @@ pub mod initial_001;
 pub mod m002_subject_settings;
 pub mod m003_record_ids;
 pub mod m004_record_ids_key_only;
+pub mod m005_review_requests;
 
 pub struct Migrator;
 
@@ -18,6 +19,7 @@ impl MigratorTrait for Migrator {
             Box::new(m002_subject_settings::Migration),
             Box::new(m003_record_ids::Migration),
             Box::new(m004_record_ids_key_only::Migration),
+            Box::new(m005_review_requests::Migration),
         ]
     }
 }

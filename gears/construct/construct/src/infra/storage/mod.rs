@@ -5,6 +5,10 @@ pub mod record_ids_entity;
 pub mod record_ids_repo;
 #[cfg(test)]
 mod record_ids_repo_test;
+pub mod review_requests_entity;
+pub mod review_requests_repo;
+#[cfg(test)]
+mod review_requests_repo_test;
 pub mod scope_error;
 #[cfg(test)]
 mod scope_error_test;

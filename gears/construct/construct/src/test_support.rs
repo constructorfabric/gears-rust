@@ -943,6 +943,27 @@ pub fn profile_service_over(
     events: Arc<RecordingProfileEvents>,
     check: crate::domain::profile_read::CategoryCheck,
 ) -> crate::domain::profile_read::ProfileReadService {
+    profile_service_reviewed(
+        db,
+        resolver,
+        profiles,
+        identity,
+        events,
+        check,
+        Arc::default(),
+    )
+}
+
+/// [`profile_service_over`] with the review requests `reviews`.
+pub fn profile_service_reviewed(
+    db: &Db,
+    resolver: Arc<dyn AuthZResolverApi>,
+    profiles: Arc<dyn crate::domain::profile_read::StoredProfiles>,
+    identity: Uuid,
+    events: Arc<RecordingProfileEvents>,
+    check: crate::domain::profile_read::CategoryCheck,
+    reviews: Arc<MemoryReviews>,
+) -> crate::domain::profile_read::ProfileReadService {
     use crate::domain::profile_read::{ProfileEvents, ProfileReadPorts, ProfileReadService};
     ProfileReadService::new(
         ProfileReadPorts {
@@ -952,6 +973,7 @@ pub fn profile_service_over(
                 identity,
             )),
             events: events as Arc<dyn ProfileEvents>,
+            reviews,
         },
         PolicyEnforcer::new(resolver),
         check,
@@ -1176,20 +1198,46 @@ impl MemoryWriter {
         })
     }
 
+    /// Apply the plan's removals, and its entity replaces as a reviewer's
+    /// correction makes them.
     fn remove(&self, plan: &Plan) {
         let removed: Vec<&NodeKey> = plan
             .steps
             .iter()
             .filter_map(|step| match &step.change {
-                Change::RemoveEntity { entity } => Some(entity),
+                Change::RemoveEntity { entity } | Change::ReplaceEntity { old: entity, .. } => {
+                    Some(entity)
+                }
                 _ => None,
             })
             .collect();
-        self.profile
-            .facts
-            .lock()
-            .unwrap()
-            .retain(|fact| !removed.contains(&&fact.node_key));
+        let mut facts = self.profile.facts.lock().unwrap();
+        let replaced: Vec<crate::domain::profile_read::StoredFact> = plan
+            .steps
+            .iter()
+            .filter_map(|step| match &step.change {
+                Change::ReplaceEntity {
+                    old,
+                    key,
+                    properties,
+                } => {
+                    let category = facts.iter().find(|fact| &fact.node_key == old)?.category;
+                    let property = properties.first()?;
+                    Some(crate::domain::profile_read::StoredFact {
+                        node_key: key.clone(),
+                        category,
+                        property: property.name.clone(),
+                        value: property.value.clone(),
+                        origin: crate::domain::profile_read::OriginKind::Reviewer,
+                        stored_at: time::OffsetDateTime::now_utc(),
+                        produced_at: None,
+                    })
+                }
+                _ => None,
+            })
+            .collect();
+        facts.retain(|fact| !removed.contains(&&fact.node_key));
+        facts.extend(replaced);
     }
 
     pub fn plans(&self) -> Vec<Plan> {
@@ -1261,6 +1309,30 @@ pub fn subject_control(
     events: Arc<RecordingSubjectControlEvents>,
     identity: Option<Uuid>,
 ) -> crate::domain::subject_control::SubjectControlService {
+    subject_control_reviewed(
+        resolver,
+        profile,
+        writer,
+        settings,
+        events,
+        identity,
+        Arc::default(),
+        Arc::default(),
+    )
+}
+
+/// [`subject_control`] with the review requests `reviews` and their events.
+#[expect(clippy::too_many_arguments, reason = "a test fixture of every port")]
+pub fn subject_control_reviewed(
+    resolver: Arc<dyn AuthZResolverApi>,
+    profile: Arc<MemoryProfile>,
+    writer: Arc<MemoryWriter>,
+    settings: Arc<dyn SubjectSettingsReader>,
+    events: Arc<RecordingSubjectControlEvents>,
+    identity: Option<Uuid>,
+    reviews: Arc<MemoryReviews>,
+    review_events: Arc<RecordingReviewEvents>,
+) -> crate::domain::subject_control::SubjectControlService {
     use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
     let contexts: Arc<dyn crate::domain::planner::processing::ProcessingContexts> = match identity {
         Some(identity) => Arc::new(crate::infra::processing_contexts::ServiceIdentity::new(
@@ -1275,6 +1347,8 @@ pub fn subject_control(
             contexts,
             settings,
             events,
+            reviews,
+            review_events,
         },
         PolicyEnforcer::new(resolver),
         2,
@@ -1293,5 +1367,245 @@ impl crate::domain::planner::processing::ProcessingContexts for NoProcessingIden
         Err(DomainError::NotConfigured(
             "no processing identity is configured".to_owned(),
         ))
+    }
+}
+
+// --- Review requests ---
+
+/// [`ReviewRequests`](crate::domain::review_queue::ReviewRequests) in memory,
+/// newest first. Pages hold every match; paging is the store's own test.
+#[derive(Default)]
+pub struct MemoryReviews {
+    pub requests: std::sync::Mutex<Vec<crate::domain::review_queue::ReviewRequest>>,
+    /// Fail every call as unavailable.
+    pub down: std::sync::atomic::AtomicBool,
+}
+
+impl MemoryReviews {
+    pub fn all(&self) -> Vec<crate::domain::review_queue::ReviewRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+
+    /// An open request on `fact`, as if the subject had flagged it.
+    pub fn open_on(&self, key: SubjectKey, fact: &crate::domain::profile_read::StoredFact) {
+        use crate::domain::review_queue::{ReviewRequest, ReviewState};
+        self.requests.lock().unwrap().insert(
+            0,
+            ReviewRequest {
+                id: Uuid::new_v4(),
+                tenant_id: key.tenant_id,
+                subject_id: key.subject_id,
+                fact_id: fact.node_key.clone(),
+                category: fact.category,
+                property: fact.property.clone(),
+                value: Some(fact.value.clone()),
+                comment: None,
+                state: ReviewState::Open,
+                outcome: None,
+                reason: None,
+                resolved_by: None,
+                corrected_fact_id: None,
+                created_at: time::OffsetDateTime::now_utc(),
+                resolved_at: None,
+            },
+        );
+    }
+
+    fn check(&self) -> Result<(), DomainError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(DomainError::Unavailable("the database is down".to_owned()))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn close_where(
+        &self,
+        matches: impl Fn(&crate::domain::review_queue::ReviewRequest) -> bool,
+        closing: &crate::domain::review_queue::Closing,
+    ) -> Option<crate::domain::review_queue::ReviewRequest> {
+        use crate::domain::review_queue::ReviewState;
+        let mut requests = self.requests.lock().unwrap();
+        let request = requests
+            .iter_mut()
+            .find(|r| r.state == ReviewState::Open && matches(r))?;
+        request.state = ReviewState::Closed;
+        request.value = None;
+        request.outcome = Some(closing.outcome);
+        request.reason.clone_from(&closing.reason);
+        request.resolved_by = Some(closing.by);
+        request
+            .corrected_fact_id
+            .clone_from(&closing.corrected_fact_id);
+        request.resolved_at = Some(closing.at);
+        Some(request.clone())
+    }
+
+    fn page(
+        items: Vec<crate::domain::review_queue::ReviewRequest>,
+    ) -> toolkit_odata::Page<crate::domain::review_queue::ReviewRequest> {
+        let limit = items.len() as u64;
+        toolkit_odata::Page {
+            items,
+            page_info: toolkit_odata::PageInfo {
+                next_cursor: None,
+                prev_cursor: None,
+                limit,
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
+    async fn open(
+        &self,
+        new: crate::domain::review_queue::NewReviewRequest,
+    ) -> Result<crate::domain::review_queue::Opened, DomainError> {
+        use crate::domain::review_queue::{Opened, ReviewRequest, ReviewState};
+        self.check()?;
+        let mut requests = self.requests.lock().unwrap();
+        if requests.iter().any(|r| {
+            r.tenant_id == new.key.tenant_id
+                && r.fact_id == new.fact_id
+                && r.state == ReviewState::Open
+        }) {
+            return Ok(Opened::AlreadyOpen);
+        }
+        let request = ReviewRequest {
+            id: new.id,
+            tenant_id: new.key.tenant_id,
+            subject_id: new.key.subject_id,
+            fact_id: new.fact_id,
+            category: new.category,
+            property: new.property,
+            value: Some(new.value),
+            comment: new.comment,
+            state: ReviewState::Open,
+            outcome: None,
+            reason: None,
+            resolved_by: None,
+            corrected_fact_id: None,
+            created_at: new.created_at,
+            resolved_at: None,
+        };
+        requests.insert(0, request.clone());
+        Ok(Opened::Opened(Box::new(request)))
+    }
+
+    async fn find(
+        &self,
+        _scope: &AccessScope,
+        tenant_id: Uuid,
+        id: Uuid,
+    ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        self.check()?;
+        Ok(self
+            .all()
+            .into_iter()
+            .find(|r| r.tenant_id == tenant_id && r.id == id))
+    }
+
+    async fn close(
+        &self,
+        _scope: &AccessScope,
+        tenant_id: Uuid,
+        id: Uuid,
+        closing: &crate::domain::review_queue::Closing,
+    ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        self.check()?;
+        Ok(self.close_where(|r| r.tenant_id == tenant_id && r.id == id, closing))
+    }
+
+    async fn close_open_on(
+        &self,
+        key: SubjectKey,
+        fact_id: &crate::domain::plan::NodeKey,
+        closing: &crate::domain::review_queue::Closing,
+    ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        self.check()?;
+        Ok(self.close_where(
+            |r| {
+                r.tenant_id == key.tenant_id
+                    && r.subject_id == key.subject_id
+                    && &r.fact_id == fact_id
+            },
+            closing,
+        ))
+    }
+
+    async fn under_review(
+        &self,
+        key: SubjectKey,
+    ) -> Result<std::collections::BTreeSet<crate::domain::plan::NodeKey>, DomainError> {
+        use crate::domain::review_queue::ReviewState;
+        self.check()?;
+        Ok(self
+            .all()
+            .into_iter()
+            .filter(|r| {
+                r.tenant_id == key.tenant_id
+                    && r.subject_id == key.subject_id
+                    && r.state == ReviewState::Open
+            })
+            .map(|r| r.fact_id)
+            .collect())
+    }
+
+    async fn of_subject(
+        &self,
+        key: SubjectKey,
+    ) -> Result<Vec<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        self.check()?;
+        Ok(self
+            .all()
+            .into_iter()
+            .filter(|r| r.tenant_id == key.tenant_id && r.subject_id == key.subject_id)
+            .collect())
+    }
+
+    async fn subject_page(
+        &self,
+        key: SubjectKey,
+        _query: &toolkit_odata::ODataQuery,
+    ) -> Result<toolkit_odata::Page<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        Ok(Self::page(
+            crate::domain::review_queue::ReviewRequests::of_subject(self, key).await?,
+        ))
+    }
+
+    async fn open_page(
+        &self,
+        _scope: &AccessScope,
+        tenant_id: Uuid,
+        _query: &toolkit_odata::ODataQuery,
+    ) -> Result<toolkit_odata::Page<crate::domain::review_queue::ReviewRequest>, DomainError> {
+        use crate::domain::review_queue::ReviewState;
+        self.check()?;
+        let mut open: Vec<_> = self
+            .all()
+            .into_iter()
+            .filter(|r| r.tenant_id == tenant_id && r.state == ReviewState::Open)
+            .collect();
+        open.reverse();
+        Ok(Self::page(open))
+    }
+}
+
+/// Keeps every Review Queue event.
+#[derive(Default)]
+pub struct RecordingReviewEvents {
+    pub events: std::sync::Mutex<Vec<crate::domain::review_queue::ReviewQueueEvent>>,
+}
+
+impl RecordingReviewEvents {
+    pub fn taken(&self) -> Vec<crate::domain::review_queue::ReviewQueueEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl crate::domain::review_queue::ReviewQueueEvents for RecordingReviewEvents {
+    fn record(&self, event: crate::domain::review_queue::ReviewQueueEvent) {
+        self.events.lock().unwrap().push(event);
     }
 }

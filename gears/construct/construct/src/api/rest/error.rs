@@ -120,6 +120,10 @@ pub fn for_settings(e: DomainError) -> CanonicalError {
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue(_)
+        | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -174,6 +178,10 @@ pub fn for_export(e: DomainError) -> CanonicalError {
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
         | DomainError::NotVisible(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue(_)
+        | DomainError::NotStored(_)
         | DomainError::Database(_)) => e.into(),
     }
 }
@@ -221,6 +229,57 @@ pub fn for_facts(e: DomainError, subject_id: Uuid) -> CanonicalError {
         }
         e @ (DomainError::Refused(_)
         | DomainError::Unavailable(_)
+        | DomainError::InvalidQuery(_)
+        | DomainError::Internal(_)
+        | DomainError::ProfileFull(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue(_)
+        | DomainError::NotStored(_)
+        | DomainError::Database(_)) => e.into(),
+    }
+}
+
+/// Errors about review requests.
+#[resource_error(gts_id!("cf.construct.review.request.v1~"))]
+pub struct ReviewRequestError;
+
+/// A resolution whose body does not fit its outcome, as an invalid-argument
+/// problem that names the field.
+#[must_use]
+pub fn bad_resolution(mistake: &crate::api::rest::dto::BodyMistake) -> CanonicalError {
+    ReviewRequestError::invalid_argument()
+        .with_field_violation(mistake.field, mistake.rule, "invalid_resolution")
+        .create()
+}
+
+/// The REST answer for a domain error on the reviewers' routes. A reviewer is
+/// told a refusal as such, 403: the routes are about the whole tenant, not one
+/// subject.
+///
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-reviewer:p1
+#[must_use]
+pub fn for_reviews(e: DomainError) -> CanonicalError {
+    match e {
+        DomainError::Forbidden(msg) => {
+            tracing::warn!(msg = %msg, "construct review requests access refused");
+            ReviewRequestError::permission_denied()
+                .with_reason("ACCESS_DENIED")
+                .create()
+        }
+        DomainError::NotConfigured(msg) => {
+            tracing::error!(msg = %msg, "construct is not configured for this call");
+            ReviewRequestError::unimplemented("this deployment does not provide this call").create()
+        }
+        e @ (DomainError::Refused(_)
+        | DomainError::OutOfScope(_)
+        | DomainError::Unavailable(_)
+        | DomainError::NotVisible(_)
+        | DomainError::NoSuchFact(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue(_)
+        | DomainError::NotStored(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::ProfileFull(_)
@@ -281,6 +340,36 @@ impl From<DomainError> for CanonicalError {
                 tracing::warn!(msg = %msg, "construct subject fact not found");
                 SubjectFactsError::not_found("no such fact")
                     .with_resource("fact")
+                    .create()
+            }
+            DomainError::NoSuchReviewRequest(msg) => {
+                tracing::warn!(msg = %msg, "construct review request not found");
+                ReviewRequestError::not_found("no such review request")
+                    .with_resource("review_request")
+                    .create()
+            }
+            // A second open request on a fact, or a request already closed:
+            // the message names only ids the caller sent.
+            DomainError::ReviewConflict(msg) => {
+                tracing::info!(msg = %msg, "construct review request conflict");
+                ReviewRequestError::aborted(msg)
+                    .with_reason("REVIEW_CONFLICT")
+                    .create()
+            }
+            DomainError::InvalidValue(rule) => ReviewRequestError::invalid_argument()
+                .with_field_violation("properties", rule, "invalid_value")
+                .create(),
+            // The correction is refused by the checks or Admission; the
+            // request stays open, and the reason says why.
+            DomainError::NotStored(reason) => {
+                tracing::info!(reason = reason.name(), "construct correction not stored");
+                ReviewRequestError::failed_precondition()
+                    .with_precondition_violation(
+                        "properties",
+                        "the correction was not stored; the review request stays open",
+                        reason.name(),
+                    )
+                    .with_override(Http::status_code(422))
                     .create()
             }
             // The caller's query does not fit the list; the field violation

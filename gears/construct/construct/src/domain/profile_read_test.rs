@@ -25,9 +25,9 @@ use crate::domain::profile_read::{
 };
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings};
 use crate::test_support::{
-    AllowResolver, DenyResolver, ErroringResolver, FixedFacts, OwnTenantOnlyResolver,
-    RecordingProfileEvents, RecordingResolver, inmem_db, profile_service, profile_service_over,
-    seed_subject_settings,
+    AllowResolver, DenyResolver, ErroringResolver, FixedFacts, MemoryReviews,
+    OwnTenantOnlyResolver, RecordingProfileEvents, RecordingResolver, inmem_db, profile_service,
+    profile_service_over, profile_service_reviewed, seed_subject_settings,
 };
 
 fn fact(category: Category, property: &str, value: serde_json::Value) -> StoredFact {
@@ -191,6 +191,45 @@ async fn a_caller_the_platform_lets_act_for_the_subject_reads_its_facts_by_categ
         "the grant, also the categories without facts"
     );
     assert!(event.served);
+}
+
+#[tokio::test]
+async fn a_fact_under_an_open_review_request_is_not_served() {
+    let db = inmem_db().await;
+    let stored = facts();
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let reviews = Arc::new(MemoryReviews::default());
+    let flagged = stored
+        .iter()
+        .find(|fact| fact.category == Category::Identity)
+        .unwrap();
+    reviews.open_on(
+        SubjectKey {
+            tenant_id: tenant,
+            subject_id: subject,
+        },
+        flagged,
+    );
+    let service = profile_service_reviewed(
+        &db,
+        Arc::new(AllowResolver),
+        Arc::new(FixedFacts::new(stored)),
+        Uuid::new_v4(),
+        Arc::default(),
+        CategoryCheck::OneCall,
+        reviews,
+    );
+
+    let view = service
+        .read(&caller_in(tenant), None, subject)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        kinds(&view),
+        [(Category::Skill, 2)],
+        "the identity under review is left out, its category with it"
+    );
 }
 
 #[tokio::test]

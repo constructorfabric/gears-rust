@@ -7,7 +7,7 @@ use tokio::time::Instant;
 
 use super::processing::{Changes, Managed, NothingStored, Written};
 use super::test_data::{
-    AGENT, Chain, Profiles, SUBJECT, TENANT, Writer, adding_rust, done, tool_calls,
+    AGENT, Chain, Profiles, SUBJECT, TENANT, Writer, adding_rust, done, node_key, tool_calls,
 };
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelError;
@@ -219,6 +219,93 @@ async fn a_fact_candidate_never_removes_or_replaces_a_value() {
             [step] if matches!(step.change, Change::AddEntity { .. } | Change::AddProperty { .. })
         ),
         "only the add is written: {plan:?}"
+    );
+}
+
+/// The skill, fact 2, under an open review request.
+fn skill_under_review(chain: &Chain) {
+    let mut skill = crate::test_support::stored_fact(
+        crate::domain::profile::Category::Skill,
+        "skills",
+        json!({ "name": "Python" }),
+        1,
+    );
+    skill.node_key = node_key(2);
+    chain.reviews.open_on(
+        crate::domain::subject_settings::SubjectKey {
+            tenant_id: TENANT,
+            subject_id: SUBJECT,
+        },
+        &skill,
+    );
+}
+
+#[tokio::test]
+async fn a_step_on_a_fact_under_review_is_dropped_and_the_rest_written() {
+    let remove_skill = ("remove", json!({ "number": 2, "confidence": 0.9 }));
+    let replace_role = (
+        "replace",
+        json!({ "number": 1, "value": "professor", "confidence": 0.9 }),
+    );
+    let chain = Chain::new(
+        vec![
+            Ok(tool_calls(&[remove_skill, replace_role], 900)),
+            Ok(done(950)),
+        ],
+        &[Ok(Written::Stored)],
+    );
+    skill_under_review(&chain);
+
+    chain.process(&record()).await;
+
+    let plans = chain.writer.plans();
+    let [plan] = plans.as_slice() else {
+        panic!("one write: {plans:?}");
+    };
+    assert!(
+        matches!(
+            plan.steps.as_slice(),
+            [step] if matches!(&step.change, Change::ReplaceEntity { old, .. } if *old == node_key(1))
+        ),
+        "only the role's replace is written: {plan:?}"
+    );
+    assert!(chain.events.taken().is_empty(), "the record is not dropped");
+}
+
+#[tokio::test]
+async fn a_call_whose_only_step_is_on_a_fact_under_review_stores_nothing() {
+    let chain = Chain::new(
+        vec![
+            Ok(tool_calls(
+                &[("remove", json!({ "number": 2, "confidence": 0.9 }))],
+                900,
+            )),
+            Ok(done(950)),
+        ],
+        &[Ok(Written::Stored)],
+    );
+    skill_under_review(&chain);
+
+    let managed = chain.manage(in_a_while()).await.expect("an answer");
+
+    assert_eq!(managed, Managed::NothingStored(NothingStored::NoChange));
+    assert!(chain.writer.plans().is_empty());
+}
+
+#[tokio::test]
+async fn an_unreadable_review_store_drops_the_record_at_the_planner() {
+    let chain = Chain::new(adding_rust(1), &[Ok(Written::Stored)]);
+    chain
+        .reviews
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    chain.process(&record()).await;
+
+    assert!(chain.writer.plans().is_empty());
+    assert_eq!(
+        chain.events.taken(),
+        dropped(DropStage::Planner, DropReason::ProcessingFailed)
     );
 }
 

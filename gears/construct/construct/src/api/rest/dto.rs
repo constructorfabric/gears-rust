@@ -6,7 +6,10 @@ use crate::domain::planner::processing::{Changes, Managed};
 use crate::domain::profile::Category;
 use crate::domain::profile_read::{OriginKind, ProfileView, StoredFact};
 use crate::domain::record_intake::IntakeOutcome;
-use crate::domain::subject_control::{SubjectExport, SubjectFactsPage};
+use crate::domain::review_queue::{
+    MAX_TEXT_CHARS, Resolution, ReviewOutcome, ReviewRequest, ReviewState,
+};
+use crate::domain::subject_control::{SubjectExport, SubjectFact, SubjectFactsPage};
 use crate::domain::subject_settings::SubjectSettings;
 
 /// One connector record, as JSON. Intake checks it against its GTS type, so
@@ -307,22 +310,255 @@ impl From<ProfileView> for ProfileDto {
     }
 }
 
-/// One of the subject's facts: the profile read's fact with its category.
+/// One of the subject's facts: the profile read's fact with its category,
+/// and its latest review request, or none.
 ///
 /// @cpt-dod:cpt-cf-construct-dod-subject-control-view:p1
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-subject-control:p1
 #[derive(Debug)]
 #[toolkit_macros::api_dto(response)]
 pub struct SubjectFactDto {
     pub entity_kind: EntityKindDto,
     #[serde(flatten)]
     pub fact: ProfileFactDto,
+    pub review_request: Option<FactReviewDto>,
 }
 
-impl From<StoredFact> for SubjectFactDto {
+impl From<SubjectFact> for SubjectFactDto {
+    fn from(item: SubjectFact) -> Self {
+        Self {
+            entity_kind: item.fact.category.into(),
+            fact: item.fact.into(),
+            review_request: item.review_request.map(Into::into),
+        }
+    }
+}
+
+/// One fact of the export, which carries no review request: the export lists
+/// the requests apart.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ExportedFactDto {
+    pub entity_kind: EntityKindDto,
+    #[serde(flatten)]
+    pub fact: ProfileFactDto,
+}
+
+impl From<StoredFact> for ExportedFactDto {
     fn from(fact: StoredFact) -> Self {
         Self {
             entity_kind: fact.category.into(),
             fact: fact.into(),
+        }
+    }
+}
+
+/// Whether a review request still waits for a reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub enum ReviewStateDto {
+    Open,
+    Closed,
+}
+
+impl From<ReviewState> for ReviewStateDto {
+    fn from(state: ReviewState) -> Self {
+        match state {
+            ReviewState::Open => Self::Open,
+            ReviewState::Closed => Self::Closed,
+        }
+    }
+}
+
+/// How a review request was, or is to be, closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[toolkit_macros::api_dto(request, response)]
+pub enum ReviewOutcomeDto {
+    Corrected,
+    Deleted,
+    Rejected,
+}
+
+impl From<ReviewOutcome> for ReviewOutcomeDto {
+    fn from(outcome: ReviewOutcome) -> Self {
+        match outcome {
+            ReviewOutcome::Corrected => Self::Corrected,
+            ReviewOutcome::Deleted => Self::Deleted,
+            ReviewOutcome::Rejected => Self::Rejected,
+        }
+    }
+}
+
+/// A fact's latest review request, as the subject's view shows it.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct FactReviewDto {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    pub state: ReviewStateDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ReviewOutcomeDto>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
+    pub created_at: OffsetDateTime,
+}
+
+impl From<ReviewRequest> for FactReviewDto {
+    fn from(request: ReviewRequest) -> Self {
+        Self {
+            id: request.id,
+            state: request.state.into(),
+            outcome: request.outcome.map(Into::into),
+            created_at: request.created_at,
+        }
+    }
+}
+
+/// One review request. `value` is the flagged value, given only while the
+/// request is open.
+///
+/// @cpt-dod:cpt-cf-construct-dod-review-queue-subject:p1
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewRequestDto {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub subject_id: Uuid,
+    pub fact_id: String,
+    pub entity_kind: EntityKindDto,
+    pub property: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<Object>)]
+    pub value: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    pub state: ReviewStateDto,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ReviewOutcomeDto>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    #[schema(value_type = String, format = DateTime)]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<String>, format = DateTime)]
+    pub resolved_at: Option<OffsetDateTime>,
+    /// The id of the fact a correction stored.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub corrected_fact_id: Option<String>,
+}
+
+impl From<ReviewRequest> for ReviewRequestDto {
+    fn from(request: ReviewRequest) -> Self {
+        Self {
+            id: request.id,
+            subject_id: request.subject_id,
+            fact_id: request.fact_id.0,
+            entity_kind: request.category.into(),
+            property: request.property,
+            value: request.value,
+            comment: request.comment,
+            state: request.state.into(),
+            outcome: request.outcome.map(Into::into),
+            reason: request.reason,
+            created_at: request.created_at,
+            resolved_at: request.resolved_at,
+            corrected_fact_id: request.corrected_fact_id.map(|key| key.0),
+        }
+    }
+}
+
+/// A page of review requests.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct ReviewRequestsPageDto {
+    pub items: Vec<ReviewRequestDto>,
+    pub page_info: toolkit_odata::PageInfo,
+}
+
+impl From<toolkit_odata::Page<ReviewRequest>> for ReviewRequestsPageDto {
+    fn from(page: toolkit_odata::Page<ReviewRequest>) -> Self {
+        Self {
+            items: page.items.into_iter().map(Into::into).collect(),
+            page_info: page.page_info,
+        }
+    }
+}
+
+/// What the subject sends to flag one of its facts as incorrect.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct FlagFactRequest {
+    /// The fact's id, as the facts list gives it.
+    pub fact_id: String,
+    /// What is wrong with it, at most 1 000 characters.
+    #[serde(default)]
+    #[schema(max_length = 1000)]
+    pub comment: Option<String>,
+}
+
+/// A reviewer's decision on an open review request. `reason` is required to
+/// reject; `properties` is required to correct, and only there: the fact's
+/// own property with its new value.
+#[derive(Debug)]
+#[toolkit_macros::api_dto(request)]
+#[serde(deny_unknown_fields)]
+pub struct ResolutionRequest {
+    pub outcome: ReviewOutcomeDto,
+    /// Why, at most 1 000 characters.
+    #[serde(default)]
+    #[schema(max_length = 1000)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub properties: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Why a resolution's body does not fit its outcome: the field and the rule.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BodyMistake {
+    pub field: &'static str,
+    pub rule: &'static str,
+}
+
+impl TryFrom<ResolutionRequest> for Resolution {
+    type Error = BodyMistake;
+
+    fn try_from(body: ResolutionRequest) -> Result<Self, BodyMistake> {
+        let mistake = |field, rule| Err(BodyMistake { field, rule });
+        let reason = body.reason.filter(|reason| !reason.trim().is_empty());
+        if reason
+            .as_ref()
+            .is_some_and(|reason| reason.chars().count() > MAX_TEXT_CHARS)
+        {
+            return mistake("reason", "at most 1000 characters");
+        }
+        match (body.outcome, body.properties) {
+            (ReviewOutcomeDto::Rejected, None) => match reason {
+                Some(reason) => Ok(Self::Rejected { reason }),
+                None => mistake("reason", "a rejection needs a reason"),
+            },
+            (ReviewOutcomeDto::Deleted, None) => Ok(Self::Deleted { reason }),
+            (ReviewOutcomeDto::Corrected, Some(properties)) => {
+                let mut properties = properties.into_iter();
+                match (properties.next(), properties.next()) {
+                    (Some((property, value)), None) => Ok(Self::Corrected {
+                        property,
+                        value,
+                        reason,
+                    }),
+                    _ => mistake("properties", "a correction sets exactly one property"),
+                }
+            }
+            (ReviewOutcomeDto::Corrected, None) => {
+                mistake("properties", "a correction needs the new value")
+            }
+            (ReviewOutcomeDto::Rejected | ReviewOutcomeDto::Deleted, Some(_)) => {
+                mistake("properties", "only a correction takes properties")
+            }
         }
     }
 }
@@ -362,7 +598,8 @@ pub struct SubjectExportDto {
     #[schema(value_type = String, format = DateTime)]
     pub exported_at: OffsetDateTime,
     pub settings: SubjectSettingsDto,
-    pub facts: Vec<SubjectFactDto>,
+    pub facts: Vec<ExportedFactDto>,
+    pub review_requests: Vec<ReviewRequestDto>,
 }
 
 impl SubjectExportDto {
@@ -374,6 +611,7 @@ impl SubjectExportDto {
             exported_at,
             settings: SubjectSettingsDto::new(export.subject_id, export.settings),
             facts: export.facts.into_iter().map(Into::into).collect(),
+            review_requests: export.review_requests.into_iter().map(Into::into).collect(),
         }
     }
 }

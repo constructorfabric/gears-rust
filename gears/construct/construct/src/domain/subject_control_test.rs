@@ -17,12 +17,13 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::plan::{Change, NodeKey, Origin};
 use crate::domain::profile::Category;
+use crate::domain::review_queue::{ReviewOutcome, ReviewQueueEvent, ReviewState};
 use crate::domain::subject_control::{SubjectControlEvent, SubjectControlService};
 use crate::domain::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 use crate::test_support::{
-    AllowResolver, DenyResolver, FixedSubjectSettings, MemoryProfile, MemoryWriter,
-    RecordingResolver, RecordingSubjectControlEvents, SlowResolver, context_of, stored_fact,
-    subject_control,
+    AllowResolver, DenyResolver, FixedSubjectSettings, MemoryProfile, MemoryReviews, MemoryWriter,
+    RecordingResolver, RecordingReviewEvents, RecordingSubjectControlEvents, SlowResolver,
+    context_of, stored_fact, subject_control, subject_control_reviewed,
 };
 
 const OFF_AND_ERASING: SubjectSettings = SubjectSettings {
@@ -37,6 +38,8 @@ struct Fixture {
     profile: Arc<MemoryProfile>,
     writer: Arc<MemoryWriter>,
     events: Arc<RecordingSubjectControlEvents>,
+    reviews: Arc<MemoryReviews>,
+    review_events: Arc<RecordingReviewEvents>,
 }
 
 impl Fixture {
@@ -55,6 +58,8 @@ impl Fixture {
             profile,
             writer,
             events: Arc::default(),
+            reviews: Arc::default(),
+            review_events: Arc::default(),
         }
     }
 
@@ -64,13 +69,15 @@ impl Fixture {
         resolver: Arc<dyn AuthZResolverApi>,
         settings: Arc<dyn SubjectSettingsReader>,
     ) -> SubjectControlService {
-        subject_control(
+        subject_control_reviewed(
             resolver,
             Arc::clone(&self.profile),
             Arc::clone(&self.writer),
             settings,
             Arc::clone(&self.events),
             Some(self.identity),
+            Arc::clone(&self.reviews),
+            Arc::clone(&self.review_events),
         )
     }
 
@@ -155,7 +162,12 @@ async fn the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_
         .await
         .unwrap();
 
-    let categories: Vec<Category> = view.page.items.iter().map(|fact| fact.category).collect();
+    let categories: Vec<Category> = view
+        .page
+        .items
+        .iter()
+        .map(|item| item.fact.category)
+        .collect();
     assert_eq!(categories, [Category::Role, Category::Skill]);
     assert_eq!(view.version, Some(1));
     assert_eq!(
@@ -323,7 +335,8 @@ async fn one_fact_is_served_and_a_fact_the_subject_does_not_have_is_no_such_fact
         )
         .await;
 
-    assert_eq!(found, skill);
+    assert_eq!(found.fact, skill);
+    assert_eq!(found.review_request, None);
     assert!(
         matches!(missing, Err(DomainError::NoSuchFact(_))),
         "{missing:?}"
@@ -380,7 +393,10 @@ async fn a_delete_writes_one_removal_as_the_subject_against_the_version_and_the_
         .await
         .unwrap();
     assert!(
-        view.page.items.iter().all(|fact| fact.node_key != skill),
+        view.page
+            .items
+            .iter()
+            .all(|item| item.fact.node_key != skill),
         "not served from the next read"
     );
     assert_eq!(
@@ -769,4 +785,88 @@ async fn a_profile_too_large_to_read_is_the_gears_own_failure_for_the_view_the_e
         "{delete:?}"
     );
     assert!(fixture.writer.plans().is_empty(), "nothing written");
+}
+
+#[tokio::test]
+async fn each_fact_carries_its_latest_review_request_and_the_export_holds_them_all() {
+    let fixture = Fixture::new(0);
+    let skill = fixture.profile.live()[0].clone();
+    fixture.reviews.open_on(fixture.key(), &skill);
+    let service = fixture.service(Arc::new(AllowResolver));
+
+    let view = service
+        .view(&fixture.owner(), fixture.subject, &ODataQuery::new())
+        .await
+        .unwrap();
+    let export = service
+        .export(&fixture.owner(), fixture.subject)
+        .await
+        .unwrap();
+
+    let requests: Vec<Option<ReviewState>> = view
+        .page
+        .items
+        .iter()
+        .map(|item| item.review_request.as_ref().map(|request| request.state))
+        .collect();
+    assert_eq!(
+        requests,
+        [None, Some(ReviewState::Open)],
+        "the role has none; the flagged skill shows its open request"
+    );
+    assert_eq!(export.review_requests, fixture.reviews.all());
+}
+
+#[tokio::test]
+async fn the_subjects_delete_closes_an_open_request_on_the_fact_as_deleted() {
+    let fixture = Fixture::new(0);
+    let skill = fixture.fact_id(Category::Skill);
+    let stored = fixture.profile.live();
+    fixture.reviews.open_on(
+        fixture.key(),
+        stored.iter().find(|fact| fact.node_key == skill).unwrap(),
+    );
+    let service = fixture.service(Arc::new(AllowResolver));
+
+    service
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await
+        .unwrap();
+
+    let [closed] = fixture.reviews.all().try_into().unwrap();
+    assert_eq!(closed.state, ReviewState::Closed);
+    assert_eq!(closed.outcome, Some(ReviewOutcome::Deleted));
+    assert_eq!(closed.resolved_by, Some(fixture.subject));
+    assert_eq!(closed.value, None, "the flagged value is not kept");
+    assert!(matches!(
+        fixture.review_events.taken().as_slice(),
+        [ReviewQueueEvent::Resolved {
+            outcome: ReviewOutcome::Deleted,
+            ..
+        }]
+    ));
+}
+
+#[tokio::test]
+async fn a_delete_whose_request_cannot_be_closed_still_deletes_the_fact() {
+    let fixture = Fixture::new(0);
+    let skill = fixture.fact_id(Category::Skill);
+    fixture
+        .reviews
+        .down
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let service = fixture.service(Arc::new(AllowResolver));
+
+    service
+        .delete(&fixture.owner(), fixture.subject, &skill)
+        .await
+        .expect("the fact is gone whatever the review store says");
+
+    assert!(
+        fixture
+            .profile
+            .live()
+            .iter()
+            .all(|fact| fact.node_key != skill)
+    );
 }

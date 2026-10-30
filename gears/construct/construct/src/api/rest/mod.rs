@@ -17,6 +17,9 @@ mod profile_routes_test;
 mod routes_test;
 
 #[cfg(test)]
+mod review_queue_routes_test;
+
+#[cfg(test)]
 mod settings_routes_test;
 
 #[cfg(test)]

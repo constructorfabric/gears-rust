@@ -19,6 +19,7 @@ use super::error::DomainError;
 use super::plan::NodeKey;
 use super::planner::processing::ProcessingContexts;
 use super::profile::Category;
+use super::review_queue::ReviewRequests;
 use super::subject_settings::{SubjectKey, SubjectSettingsReader};
 
 /// The policy property that names a profile category.
@@ -154,6 +155,7 @@ pub struct ProfileReadPorts {
     pub profiles: Arc<dyn StoredProfiles>,
     pub contexts: Arc<dyn ProcessingContexts>,
     pub events: Arc<dyn ProfileEvents>,
+    pub reviews: Arc<dyn ReviewRequests>,
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-profile-reader-read:p1
@@ -378,6 +380,10 @@ pub(crate) fn read_failure(err: DomainError) -> DomainError {
         | DomainError::Unavailable(_)
         | DomainError::NotConfigured(_)
         | DomainError::NoSuchFact(_)
+        | DomainError::NoSuchReviewRequest(_)
+        | DomainError::ReviewConflict(_)
+        | DomainError::InvalidValue(_)
+        | DomainError::NotStored(_)
         | DomainError::InvalidQuery(_)
         | DomainError::Internal(_)
         | DomainError::Database(_)) => err,
@@ -551,7 +557,10 @@ impl ProfileReadService {
     }
 
     /// The facts of the readable categories, read as `construct`, grouped in
-    /// category order, without categories that hold none.
+    /// category order, without categories that hold none. A fact under an
+    /// open review request is not served.
+    ///
+    /// @cpt-dod:cpt-cf-construct-dod-review-queue-frozen:p1
     async fn facts(
         &self,
         construct: &SecurityContext,
@@ -565,6 +574,14 @@ impl ProfileReadService {
             .stored(construct, key)
             .await
             .map_err(read_failure)?;
+        // @cpt-end:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
+        // @cpt-begin:cpt-cf-construct-algo-review-queue-hide:p1:inst-hide-filter
+        let under_review = self.ports.reviews.under_review(key).await?;
+        let stored = stored
+            .into_iter()
+            .filter(|fact| !under_review.contains(&fact.node_key));
+        // @cpt-end:cpt-cf-construct-algo-review-queue-hide:p1:inst-hide-filter
+        // @cpt-begin:cpt-cf-construct-algo-profile-reader-read:p1:inst-read-facts
         let mut groups: Vec<CategoryFacts> = Category::ALL
             .into_iter()
             .filter(|category| readable.contains(category))
