@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-types-registry"
-version = "0.5.0"
+version = "0.5.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,8 +19,11 @@ name = "types_registry"
 doctest = false
 
 [dependencies]
-# SDK - public API, models, and errors
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.0", path = "../types-registry-sdk" }
+# SDK - public API, models, and errors. `#[toolkit::provides(transports = [local, rest])]`
+# compiles its REST arm and validates the REST binding descriptors whatever the wiring, so
+# both transport features are needed here, with `toolkit-contract` for its generated code.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.1", path = "../types-registry-sdk", features = ["rest-client", "rest-server"] }
+toolkit-contract = { workspace = true }
 
 # GTS types (from git dependency)
 gts = { workspace = true }
@@ -93,8 +96,8 @@ tokio = { workspace = true, features = [
     "net",
     "test-util",
 ] }
-# The SDK's contract conformance checks, run against the local client.
-types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../types-registry-sdk", features = ["test-util"] }
+# The SDK's contract conformance checks, run against the local and the REST client.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../types-registry-sdk", features = ["test-util", "rest-client", "rest-server"] }
 # SQLite and transaction observation for dispatch tests.
 toolkit-db = { workspace = true, features = ["sqlite", "test-support"] }
 # PostgreSQL / MySQL bring-up for the `integration` suite. Not optional --
@@ -108,6 +111,13 @@ testcontainers = { workspace = true }
 test-containers = { workspace = true }
 # `Router::oneshot` for the REST contract tests (T9).
 tower = { workspace = true }
+# The `OoP` route-auth stack and its shared-secret token for the TCP tests (T34).
+toolkit-http-middleware = { workspace = true }
+secrecy = { workspace = true }
+# A plain HTTP client for the TCP auth matrix (T34).
+toolkit-http = { workspace = true }
+# The REST client's configuration for the TCP contract test (T34).
+toolkit-contract = { workspace = true, features = ["rest-client"] }
 # In-memory exporter for metric contract tests.
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Captures span and event fields in unit tests.
@@ -117,3 +127,5 @@ tracing-subscriber = { workspace = true }
 time = { workspace = true, features = ["macros"] }
 # Builds test `OutboxMessage` timestamps.
 chrono = { workspace = true }
+# Database configuration for the host-runtime boot tests (T31).
+figment = { workspace = true }

@@ -1,10 +1,9 @@
-//! Backoff for a tail that has not materialised yet.
+//! Backoff for a tail that comes back empty.
 //!
-//! A cluster notification can arrive before the backend has assigned the event
-//! a sequence and stored it, so a fetch aimed at the tail can legitimately come
-//! back empty. Treating that as "the partition is idle" strands every reader
-//! parked there: the notification for that event has already fired, so nothing
-//! will wake them. This is what keeps asking.
+//! Before the head watch has reported a partition's head, a tail is fetched
+//! blind, and even after it a head can stand above events retention removed, so
+//! a fetch aimed at the tail can legitimately come back empty. This spaces the
+//! asking instead of repeating it every round.
 //!
 //! Pure - `now` is passed in rather than read, so a test can drive it exactly.
 

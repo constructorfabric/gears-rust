@@ -52,7 +52,6 @@ gts = { workspace = true }
 # REST API (DESIGN §3.3 "Policy Administration REST API")
 axum = { workspace = true }
 utoipa = { workspace = true, features = ["time"] }
-http = { workspace = true }
 
 # Async runtime
 async-trait = { workspace = true }

@@ -762,9 +762,9 @@ async fn commit_or_replay(
                             id: operation_id,
                             kind: validated.kind,
                             dry_run: validated.dry_run,
-                            // Every P0 operation is platform-plane. ponytail: ceiling
-                            // C8 — the plane is expressed by this column and the
-                            // contract, not enforced by the transport.
+                            // Every P0 operation is platform-plane: only platform
+                            // routes and the platform contract reach acceptance (D17).
+                            // ponytail: ceiling C8 — no platform listener of its own.
                             plane: Plane::Platform,
                             tenant_id: None,
                             principal_id: P0_PRINCIPAL_ID,

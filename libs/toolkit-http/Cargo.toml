@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-http"
-version = "0.7.0"
+version = "0.7.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -45,7 +45,7 @@ fips = [
     "dep:rustls-cng-crypto",
 ]
 # OpenTelemetry integration for distributed tracing
-otel = ["dep:opentelemetry", "dep:tracing-opentelemetry", "toolkit-trace-context/otel"]
+otel = ["dep:opentelemetry", "toolkit-trace-context/otel"]
 
 [dependencies]
 # Core dependencies
@@ -93,7 +93,6 @@ rand = { workspace = true }
 
 # OpenTelemetry (optional, for distributed tracing)
 opentelemetry = { workspace = true, optional = true }
-tracing-opentelemetry = { workspace = true, optional = true }
 
 # Apple corecrypto-backed rustls CryptoProvider. The crate's `lib.rs` is gated
 # on `cfg(target_os = "macos")` so on Linux/Windows it is an empty lib with no

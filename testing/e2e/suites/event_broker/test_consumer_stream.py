@@ -5,8 +5,9 @@ Skips:
 - 1.09 (SSE happy path) is already covered by ``test_publish_consume.py``
 - 1.06 (terminated subscription via shard shutdown) is xfail: triggering an
   internal shard teardown is not possible from outside in E2E.
-- 1.14 (control-progress-frame) is xfail: requires a heavily-publishing producer
-  and a narrow topic filter to make the frontier drift observable.
+- 1.14 (control-progress-frame) runs on TOPIC_PROGRESS: a producer fills it with
+  events another tenant's subscription rejects, past the drift threshold the
+  generated config sets.
 
 Patterns:
 - Multipart (``/events:stream``) tests use ``MultipartReader`` from conftest.
@@ -30,6 +31,9 @@ from .conftest import (
     TOPIC_STREAM,
     TOPIC_4P,
     EVENT_TYPE_4P,
+    EVENT_TYPE_PROGRESS,
+    PROGRESS_DRIFT_THRESHOLD,
+    TOPIC_PROGRESS,
     MultipartReader,
     SseFrameReader,
     TRACE_ID,
@@ -71,6 +75,7 @@ async def _setup_seeded_sub(client, topic: str = TOPIC_STREAM, event_type: str =
     return tenant_id, sub_id
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(45, func_only=True)
 async def test_multipart_stream_delivers_event_frame(api, test_env):
     """scenario: consumer/stream/1.01-positive-stream-multipart-frames.md
@@ -140,6 +145,7 @@ async def test_multipart_stream_delivers_event_frame(api, test_env):
     }
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(20, func_only=True)
 async def test_heartbeat_frame_arrives_on_idle_stream(api, test_env):
     """scenario: consumer/stream/1.02-positive-stream-heartbeat-cadence.md
@@ -553,36 +559,78 @@ async def test_stream_terminates_with_control_on_rebalance_gain(api, test_env):
             assert ctrl["code"] == "terminal"
 
 
-@pytest.mark.xfail(
-    reason=(
-        "control-progress-frame requires a narrow topic filter that rejects most events "
-        "while a producer publishes heavily — not achievable with the standard E2E topics"
-    ),
-    strict=False,
-)
-@pytest.mark.timeout(30, func_only=True)
+@pytest.mark.backend_sensitive
+@pytest.mark.timeout(45, func_only=True)
 async def test_control_progress_frame_emitted_on_filtered_stream(api, test_env):
     """scenario: consumer/stream/1.14-positive-control-progress-frame.md
 
-    When a consumer's filter rejects most events, the broker emits a
-    ``control`` frame with ``code: "progress"`` carrying the frontier drift.
-    Not triggerable in E2E with standard topic configuration.
+    A producer appends more than PROGRESS_DRIFT_THRESHOLD events for one tenant;
+    a consumer filtering on another tenant scans them all and is delivered
+    none. The stream reports where its scan has got to with a ``control``
+    frame, ``code: "progress"``: the partition's delivered offset is still the
+    seeked 0 and ``last_examined`` reaches the last event's sequence.
     """
+    producer_tenant = str(uuid.uuid4())
+    count = PROGRESS_DRIFT_THRESHOLD + 100
     async with api() as client:
-        _, sub_id = await _setup_seeded_sub(client)
+        # A reader on the producer's tenant, to learn the last event's sequence.
+        reader_group = (await client.post("/consumer-groups")).json()["id"]
+        reader = await client.post(
+            "/subscriptions",
+            json={
+                "consumer_group": reader_group,
+                "client_agent": "e2e-test",
+                "interests": [{"topic": TOPIC_PROGRESS, "tenant_id": producer_tenant, "types": [EVENT_TYPE_PROGRESS]}],
+            },
+        )
+        assert reader.status_code == 201
+        reader_sub = reader.json()["id"]
+        seek = await client.post(
+            f"/subscriptions/{reader_sub}:seek",
+            json={"topology_version": 1, "positions": {TOPIC_PROGRESS: [{"partition": 0, "value": "earliest"}]}},
+        )
+        assert seek.status_code == 200
+        for start in range(0, count, 100):
+            batch = [
+                {
+                    "id": str(uuid.uuid4()),
+                    "type": EVENT_TYPE_PROGRESS,
+                    "tenant_id": producer_tenant,
+                    "source": "e2e-test",
+                    "subject": f"s{n}",
+                    "subject_type": SUBJECT_TYPE,
+                    "occurred_at": _now(),
+                }
+                for n in range(start, min(start + 100, count))
+            ]
+            resp = await client.post("/events:batch", json={"events": batch})
+            assert resp.status_code == 202, resp.text
+        _, filtered_sub = await _setup_seeded_sub(client, TOPIC_PROGRESS, EVENT_TYPE_PROGRESS)
 
-    async with httpx.AsyncClient(
-        base_url=f"{test_env.base_url}/event-broker/v1", timeout=None
-    ) as stream_client:
-        async with stream_client.stream(
-            "GET", f"/events:sse?subscription_id={sub_id}"
-        ) as stream_resp:
-            assert stream_resp.status_code == 200
-            reader = SseFrameReader(stream_resp)
-            _, _ = await reader.next_frame(timeout=5)  # topology
+    base_url = f"{test_env.base_url}/event-broker/v1"
+    async with httpx.AsyncClient(base_url=base_url, timeout=None) as stream_client:
+        # Every event stored, and the last one's sequence: read them back.
+        async with stream_client.stream("GET", f"/events:sse?subscription_id={reader_sub}") as resp:
+            assert resp.status_code == 200
+            frames = SseFrameReader(resp)
+            await frames.await_kind("topology", timeout=5)
+            for _ in range(count):
+                head = (await frames.await_kind("event", timeout=15))["payload"]["sequence"]
 
-            # Expect a control/progress frame — requires heavy publish + narrow filter.
-            kind, data = await reader.next_frame(timeout=25)
-            assert kind == "control"
-            assert data["code"] == "progress"
-            assert "positions" in data
+        async with stream_client.stream("GET", f"/events:sse?subscription_id={filtered_sub}") as resp:
+            assert resp.status_code == 200
+            frames = SseFrameReader(resp)
+            await frames.await_kind("topology", timeout=5)
+            # A report may go out before the scan reaches the head; the next one
+            # follows within the minimum interval.
+            while True:
+                control = await frames.await_kind("control", timeout=15)
+                if control["positions"][0]["last_examined"] == head:
+                    break
+                assert control["positions"][0]["last_examined"] < head, control
+
+    assert control == {
+        "kind": "control",
+        "code": "progress",
+        "positions": [{"topic": TOPIC_PROGRESS, "partition": 0, "offset": 0, "last_examined": head}],
+    }

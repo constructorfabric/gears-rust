@@ -1,4 +1,4 @@
-//! `Storage`: the real (`SQLite` + `ClusterCacheV1`) implementation of every
+//! `Storage`: the real (gear database + `ClusterCacheV1`) implementation of every
 //! `domain::repo` trait. Topics and events have none - topics go through
 //! `SpecificationManager` only, events straight to the backend
 //! (eb-single-process-implementation D1/D3). One struct implements every
@@ -10,7 +10,8 @@
 //! DESIGN.md's own "why subscription/group state is ephemeral" invariant):
 //! routing markers -> `ClusterCacheV1` (subscriptions themselves are not
 //! stored here - they live in `ConsumerGroupCoordinator`); `cursor`/
-//! `consumer_group`/`producer_state` -> `SQLite` (durable). `cursor` and
+//! `consumer_group`/`producer_state` -> the gear database (durable;
+//! `SQLite`, `PostgreSQL` or `MySQL`/`MariaDB`). `cursor` and
 //! `producer_sequence` denormalize `tenant_id` from their owning
 //! `consumer_group`/`producer` row at write time, since neither has an
 //! independent tenant of its own.
@@ -34,15 +35,15 @@ use uuid::Uuid;
 use crate::domain::error::{DomainError, ErrorCode};
 use crate::domain::idempotency::{IdempotencyGuard, ProducerIdempotencyOutcome, PublishEnqueue};
 use crate::domain::ingest::{
-    ProducerCursors, ProducerMode, ProducerPartitionCursor, ProducerRecord, ProducerRegistration,
-    ProducerRegistry, ProducerResetScope, ProducerTopicCursors,
+    ProducerCursors, ProducerMode, ProducerRecord, ProducerRegistration, ProducerRegistry,
+    ProducerResetScope, ProducerTopicCursors,
 };
 use crate::domain::model::{ConsumerGroup, ConsumerGroupKind, Cursor};
-use crate::domain::notify::{DeliveryNotifier, NOTIFICATION_PREFIX};
 use crate::domain::repo::{ConsumerGroupRepo, CursorRepo, RoutingMarkers};
 use crate::domain::specification::SpecificationManager;
-use crate::infra::storage::entity::{consumer_group, cursor, producer, producer_sequence};
-use crate::infra::storage::error::db_err_from_scope;
+use crate::infra::storage::entity::{
+    consumer_group, cursor, outbox_identity, producer, producer_sequence,
+};
 
 /// Subscription id -> its consumer group.
 fn subscription_marker_key(id: Uuid) -> String {
@@ -53,8 +54,7 @@ fn subscription_marker_key(id: Uuid) -> String {
 /// `evbk.group.endpoint:{consumer_group}` routing cache).
 ///
 /// Keyed by the group's deterministic UUID, not its id: a GTS id's `.` and `~`
-/// are outside the cache's key alphabet. The same encoding
-/// `domain::notify::notification_key` uses for a topic.
+/// are outside the cache's key alphabet.
 fn group_marker_key(group: &GtsInstanceId) -> Result<String, DomainError> {
     let uuid = gts::GtsId::try_new(group.as_ref())
         .map_err(|e| DomainError::Internal(format!("consumer group id is not a GTS id: {e}")))?
@@ -145,6 +145,11 @@ pub struct Storage {
     /// This process's instance id - what a group marker names as the group's
     /// owner.
     instance_id: Uuid,
+    /// Where a test holds a chained publish at the last point another writer
+    /// can still commit before it writes - after the producer-head read, or
+    /// before the write lock on `SQLite` - to put a committed writer there.
+    #[cfg(any(test, feature = "test-utils"))]
+    head_read_pause: crate::test_support::PausePoint,
 }
 
 impl Storage {
@@ -160,7 +165,17 @@ impl Storage {
             cache: OnceLock::new(),
             outbox: OnceLock::new(),
             instance_id,
+            #[cfg(any(test, feature = "test-utils"))]
+            head_read_pause: crate::test_support::PausePoint::default(),
         }
+    }
+
+    /// The point a chained publish passes right after it read the producer's
+    /// head (on `SQLite`: before it takes the write lock and reads).
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn head_read_pause(&self) -> &crate::test_support::PausePoint {
+        &self.head_read_pause
     }
 
     /// Wires the routing markers' `ClusterCacheV1` in once
@@ -264,7 +279,7 @@ impl ConsumerGroupRepo for Storage {
     /// logic - not a plain tenant-scoped `AccessScope` - decides which rows
     /// a caller may see; that's a larger, separate piece of work than this
     /// change's storage-layer scope. What *did* change: this now queries a
-    /// real `SQLite` table instead of an in-memory `HashMap`, resolving the
+    /// real gear-database table instead of an in-memory `HashMap`, resolving the
     /// "no persistence" half of the original gap.
     async fn list_consumer_groups(&self) -> Result<Vec<ConsumerGroup>, DomainError> {
         let conn = self.db.conn()?;
@@ -349,8 +364,7 @@ impl CursorRepo for Storage {
         }
 
         // First write for this (consumer_group, topic, partition) - resolve
-        // the owning consumer_group's tenant to denormalize onto the row
-        // (decision log entry 28).
+        // the owning consumer_group's tenant to denormalize onto the row.
         let group = consumer_group::Entity::find_by_id(cursor.consumer_group.as_ref().to_owned())
             .secure()
             .scope_with(&AccessScope::allow_all())
@@ -406,132 +420,14 @@ impl IdempotencyGuard for Storage {
                 source: None,
             });
         };
-        let outbox = Arc::clone(outbox);
-        let PublishEnqueue {
-            chain,
-            topic_partition,
-            payload,
-            payload_type,
-        } = request;
-        // Every event of one topic partition has to reach the same outbox
-        // partition to keep its relative order, and the topic's partition
-        // count is unrelated to the outbox's - see `outbox_partition_for`.
-        let partition_for_outbox = crate::domain::outbox::outbox_partition_for(topic_partition);
-
-        let (outcome, wake) = self
-            .db
-            .transaction(move |tx| {
-                Box::pin(async move {
-                    let outcome = match &chain {
-                        None => ProducerIdempotencyOutcome::Accept,
-                        Some(c) => {
-                            let existing = producer_sequence::Entity::find()
-                                .filter(producer_sequence::Column::ProducerId.eq(c.producer_id))
-                                .filter(producer_sequence::Column::Topic.eq(c.topic.as_ref()))
-                                .filter(producer_sequence::Column::Partition.eq(c.partition))
-                                .secure()
-                                .scope_with(&AccessScope::allow_all())
-                                .one(tx)
-                                .await
-                                .map_err(|e| db_err_from_scope(&e))?;
-
-                            // The domain owns the sequencing decision; infra only
-                            // read the head above and performs the write it
-                            // dictates (seed on first publish, advance the head on
-                            // accept, nothing on duplicate/violation).
-                            let outcome = c.decide(existing.as_ref().map(|row| row.last_sequence));
-
-                            if matches!(outcome, ProducerIdempotencyOutcome::Accept) {
-                                match existing {
-                                    None => {
-                                        let producer_row =
-                                            producer::Entity::find_by_id(c.producer_id)
-                                                .secure()
-                                                .scope_with(&AccessScope::allow_all())
-                                                .one(tx)
-                                                .await
-                                                .map_err(|e| db_err_from_scope(&e))?
-                                                .ok_or_else(|| {
-                                                    toolkit_db::DbError::Other(anyhow::anyhow!(
-                                                        "producer '{}' is not registered",
-                                                        c.producer_id
-                                                    ))
-                                                })?;
-                                        let am = producer_sequence::ActiveModel {
-                                            producer_id: Set(c.producer_id),
-                                            topic: Set(c.topic.as_ref().to_owned()),
-                                            partition: Set(c.partition),
-                                            tenant_id: Set(producer_row.tenant_id),
-                                            last_sequence: Set(c.sequence),
-                                            updated_at: Set(Utc::now()),
-                                        };
-                                        secure_insert::<producer_sequence::Entity>(
-                                            am,
-                                            &AccessScope::for_tenant(producer_row.tenant_id),
-                                            tx,
-                                        )
-                                        .await
-                                        .map_err(|e| db_err_from_scope(&e))?;
-                                    }
-                                    Some(_) => {
-                                        producer_sequence::Entity::update_many()
-                                            .secure()
-                                            .scope_with(&AccessScope::allow_all())
-                                            .filter(
-                                                Condition::all()
-                                                    .add(
-                                                        producer_sequence::Column::ProducerId
-                                                            .eq(c.producer_id),
-                                                    )
-                                                    .add(
-                                                        producer_sequence::Column::Topic
-                                                            .eq(c.topic.as_ref()),
-                                                    )
-                                                    .add(
-                                                        producer_sequence::Column::Partition
-                                                            .eq(c.partition),
-                                                    ),
-                                            )
-                                            .col_expr(
-                                                producer_sequence::Column::LastSequence,
-                                                Expr::value(c.sequence),
-                                            )
-                                            .col_expr(
-                                                producer_sequence::Column::UpdatedAt,
-                                                Expr::value(Utc::now()),
-                                            )
-                                            .exec(tx)
-                                            .await
-                                            .map_err(|e| db_err_from_scope(&e))?;
-                                    }
-                                }
-                            }
-
-                            outcome
-                        }
-                    };
-
-                    let wake = if matches!(outcome, ProducerIdempotencyOutcome::Accept) {
-                        let record = toolkit_db::outbox::Record::to(
-                            crate::domain::outbox::INGEST_QUEUE_NAME,
-                            partition_for_outbox,
-                        )
-                        .payload(payload, &payload_type)
-                        .build()
-                        .map_err(|e| {
-                            toolkit_db::DbError::Other(anyhow::anyhow!("outbox enqueue: {e}"))
-                        })?;
-                        outbox.enqueue(tx, record).await.map_err(|e| {
-                            toolkit_db::DbError::Other(anyhow::anyhow!("outbox enqueue: {e}"))
-                        })?
-                    } else {
-                        toolkit_db::outbox::Wake::empty()
-                    };
-
-                    Ok((outcome, wake))
-                })
-            })
-            .await?;
+        let (outcome, wake) = super::producer_chain::check_and_enqueue(
+            &self.db.db(),
+            Arc::clone(outbox),
+            request,
+            #[cfg(any(test, feature = "test-utils"))]
+            self.head_read_pause.clone(),
+        )
+        .await?;
         // Fired here, never inside the transaction: marking a partition dirty
         // before its row is durable lets a sequencer claim the partition, find
         // nothing, and clear the flag before the commit lands, leaving the row
@@ -541,46 +437,6 @@ impl IdempotencyGuard for Storage {
         // no-op.
         wake.fire();
         Ok(outcome)
-    }
-}
-
-#[async_trait]
-impl DeliveryNotifier for Storage {
-    async fn wait_for_notification(&self, timeout: std::time::Duration) {
-        // One shared deadline for both steps (subscribing, then waiting for
-        // the first event) - `wait_for_notification`'s contract is "wait up
-        // to `timeout` total", not up to `timeout` per step.
-        let deadline = tokio::time::Instant::now() + timeout;
-        let Ok(cache) = self.cache() else {
-            // Same degradation the trait documents for a backend failure: the
-            // delivery loop's own re-query decides what is new, so a missed
-            // wake costs one iteration. Returning early instead would spin it.
-            tokio::time::sleep_until(deadline).await;
-            return;
-        };
-        let mut watch = match tokio::time::timeout_at(
-            deadline,
-            cache.watch_prefix(NOTIFICATION_PREFIX),
-        )
-        .await
-        {
-            Ok(Ok(watch)) => watch,
-            Ok(Err(err)) => {
-                tracing::warn!(
-                    ?err,
-                    "notification watch_prefix failed; falling back to timeout"
-                );
-                return;
-            }
-            Err(_elapsed) => return,
-        };
-        // A `Lagged`/`Reset` event still just means "something changed, go
-        // re-check", same as a real `Event`, and an elapsed deadline just
-        // means "nothing changed in time" - either way there's nothing
-        // further to do with the result.
-        match tokio::time::timeout_at(deadline, watch.recv()).await {
-            Ok(_) | Err(_) => {}
-        }
     }
 }
 
@@ -645,27 +501,15 @@ impl ProducerRegistry for Storage {
             .all(&conn)
             .await?;
 
-        let mut by_topic: std::collections::HashMap<String, Vec<ProducerPartitionCursor>> =
-            std::collections::HashMap::new();
-        for row in sequence_rows {
-            by_topic
-                .entry(row.topic)
-                .or_default()
-                .push(ProducerPartitionCursor {
-                    partition: row.partition,
-                    last_sequence: row.last_sequence,
-                });
-        }
-
         Ok(Some(ProducerCursors {
             producer_id,
             client_agent: producer_row.client_agent,
-            topics: by_topic
+            topics: sequence_rows
                 .into_iter()
-                .map(|(topic, partitions)| {
+                .map(|row| {
                     Ok(ProducerTopicCursors {
-                        topic: parse_gts_id(&topic)?,
-                        partitions,
+                        topic: parse_gts_id(&row.topic)?,
+                        last_sequence: row.last_sequence,
                     })
                 })
                 .collect::<Result<Vec<_>, DomainError>>()?,
@@ -680,10 +524,8 @@ impl ProducerRegistry for Storage {
         let conn = self.db.conn()?;
         let mut filter =
             Condition::all().add(producer_sequence::Column::ProducerId.eq(producer_id));
-        if let ProducerResetScope::TopicPartition { topic, partition } = scope {
-            filter = filter
-                .add(producer_sequence::Column::Topic.eq(topic.as_str()))
-                .add(producer_sequence::Column::Partition.eq(*partition));
+        if let ProducerResetScope::Topic { topic } = scope {
+            filter = filter.add(producer_sequence::Column::Topic.eq(topic.as_str()));
         }
         producer_sequence::Entity::delete_many()
             .filter(filter)
@@ -692,6 +534,63 @@ impl ProducerRegistry for Storage {
             .exec(&conn)
             .await?;
         Ok(())
+    }
+}
+
+impl Storage {
+    /// The identity of the ingest outbox group `name` (feature 0005 §2.5):
+    /// created once, as random 64 bits, by whichever instance reads it first,
+    /// and the same on every instance and restart after that. The high half of
+    /// every fence key the group's messages append under.
+    ///
+    /// # Errors
+    /// Returns a `DomainError` if the connection, the read or the insert fails,
+    /// or if the stored identity is not 16 lowercase hex digits.
+    pub async fn outbox_identity(
+        &self,
+        name: &str,
+    ) -> Result<crate::domain::outbox::OutboxId, DomainError> {
+        let conn = self.db.conn()?;
+        let read = || async {
+            outbox_identity::Entity::find_by_id(name.to_owned())
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+                .one(&conn)
+                .await
+        };
+        let stored = |row: outbox_identity::Model| {
+            crate::domain::outbox::OutboxId::parse(&row.outbox_id).ok_or_else(|| {
+                DomainError::Internal(format!(
+                    "ingest outbox identity for '{name}' is not 16 lowercase hex digits"
+                ))
+            })
+        };
+        if let Some(row) = read().await? {
+            return stored(row);
+        }
+        let candidate = crate::domain::outbox::OutboxId::new(rand::random::<u64>());
+        let inserted = secure_insert::<outbox_identity::Entity>(
+            outbox_identity::ActiveModel {
+                name: Set(name.to_owned()),
+                outbox_id: Set(candidate.to_string()),
+                created_at: Set(
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+                ),
+            },
+            &AccessScope::allow_all(),
+            &conn,
+        )
+        .await;
+        // Another instance may have inserted first; its identity is the one.
+        match (inserted, read().await?) {
+            (_, Some(row)) => stored(row),
+            (Err(err), None) => Err(DomainError::Internal(format!(
+                "ingest outbox identity for '{name}' could not be stored: {err}"
+            ))),
+            (Ok(_), None) => Err(DomainError::Internal(format!(
+                "ingest outbox identity for '{name}' vanished after it was stored"
+            ))),
+        }
     }
 }
 
@@ -873,6 +772,8 @@ mod tests {
         // which keeps its handle alive for its whole lifetime because its
         // tests do rely on real draining.
         let handle = Outbox::builder(db.db())
+            .table_prefix(crate::domain::outbox::OUTBOX_TABLE_PREFIX)
+            .expect("the default group's prefix is valid")
             .queue(crate::domain::outbox::INGEST_QUEUE_NAME, Partitions::of(4))
             .leased(NoopLeasedHandler)
             .start()
@@ -887,24 +788,42 @@ mod tests {
     /// by partition. A partition at `0` never received anything.
     ///
     /// Read from the staging table rather than from
-    /// `toolkit_outbox_partitions.sequence`, because these tests deliberately
+    /// the partitions table's `sequence`, because these tests deliberately
     /// drop the pipeline handle (see [`test_storage_with_db`]) and so the
     /// sequencer that fills that column never runs. Enqueue's own routing
     /// decision is already final here: the row names its partition the moment
     /// it is staged.
     async fn outbox_partition_row_counts(dsn: &str) -> Vec<(i32, i64)> {
-        use sea_orm::{ConnectionTrait, Statement};
+        use sea_orm::ConnectionTrait;
+        use sea_orm::sea_query::{Alias, Expr, ExprTrait, JoinType, Order, Query};
 
+        let prefix = crate::domain::outbox::OUTBOX_TABLE_PREFIX;
+        let (p, i) = (Alias::new("p"), Alias::new("i"));
+        let partition = Expr::col((p.clone(), Alias::new("partition")));
         let conn = sea_orm::Database::connect(dsn).await.expect("connect");
         let rows = conn
-            .query_all_raw(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Sqlite,
-                "SELECT p.partition AS partition, COUNT(i.id) AS rows_staged \
-                 FROM toolkit_outbox_partitions AS p \
-                 LEFT JOIN toolkit_outbox_incoming AS i ON i.partition_id = p.id \
-                 WHERE p.queue = ? GROUP BY p.partition ORDER BY p.partition",
-                [crate::domain::outbox::INGEST_QUEUE_NAME.into()],
-            ))
+            .query_all(
+                Query::select()
+                    .expr_as(partition.clone(), "partition")
+                    .expr_as(
+                        Expr::col((i.clone(), Alias::new("id"))).count(),
+                        "rows_staged",
+                    )
+                    .from_as(Alias::new(format!("{prefix}_partitions")), p.clone())
+                    .join_as(
+                        JoinType::LeftJoin,
+                        Alias::new(format!("{prefix}_incoming")),
+                        i.clone(),
+                        Expr::col((i, Alias::new("partition_id")))
+                            .equals((p.clone(), Alias::new("id"))),
+                    )
+                    .and_where(
+                        Expr::col((p, Alias::new("queue")))
+                            .eq(crate::domain::outbox::INGEST_QUEUE_NAME),
+                    )
+                    .add_group_by([partition.clone()])
+                    .order_by_expr(partition, Order::Asc),
+            )
             .await
             .expect("read outbox partitions");
         rows.into_iter()
@@ -917,21 +836,18 @@ mod tests {
             .collect()
     }
 
-    /// Stateless publishes - the common case, no producer `meta` at all - used
-    /// to be enqueued onto outbox partition `0` unconditionally, leaving every
-    /// other sequencer/processor slot permanently idle.
+    /// Stateless publishes - the common case, no producer `meta` at all - land
+    /// in the ingest outbox partition they are given, so every
+    /// sequencer/processor slot carries work.
     #[tokio::test]
     async fn stateless_publishes_reach_every_outbox_partition() {
         let (storage, dsn) = test_storage_with_db().await;
 
-        // One publish per topic partition of an eight-partition topic. Eight
-        // is deliberately more than the outbox has, so this also covers the
-        // partitions that used to address slots that do not exist.
-        for topic_partition in 0..8 {
+        for ingest_partition in [0, 1, 2, 3, 0, 1, 2, 3] {
             let outcome = storage
                 .check_and_enqueue(
                     PublishEnqueue::builder(
-                        topic_partition,
+                        ingest_partition,
                         b"payload".to_vec(),
                         "application/json",
                     )
@@ -944,52 +860,7 @@ mod tests {
 
         assert_eq!(
             outbox_partition_row_counts(&dsn).await,
-            vec![(0, 2), (1, 2), (2, 2), (3, 2)],
-            "eight topic partitions over a four-partition outbox must land two \
-             apiece, not eight on partition 0"
-        );
-    }
-
-    /// A topic with more partitions than the outbox has used to hand
-    /// `toolkit-db` a partition index it had never registered, which failed
-    /// the whole enqueue transaction and rejected the publish.
-    #[tokio::test]
-    async fn chained_publish_beyond_the_outbox_partition_count_is_accepted() {
-        let (storage, dsn) = test_storage_with_db().await;
-        let owner = Uuid::new_v4();
-        let registration = storage
-            .register(
-                owner,
-                Uuid::new_v4(),
-                ProducerMode::Chained,
-                "agent".to_owned(),
-            )
-            .await
-            .expect("register must succeed");
-        let topic = GtsInstanceId::try_new(TOPIC_ID).unwrap();
-
-        // Partition 7 of an eight-partition topic: past the outbox's four.
-        let outcome = storage
-            .check_and_enqueue(
-                PublishEnqueue::builder(7, b"payload".to_vec(), "application/json")
-                    .chain(ProducerChainCheck {
-                        producer_id: registration.id,
-                        topic,
-                        partition: 7,
-                        previous: 0,
-                        sequence: 1,
-                        mode: ProducerMode::Chained,
-                    })
-                    .build(),
-            )
-            .await
-            .expect("a chained publish past the outbox partition count must be accepted");
-        assert_eq!(outcome, ProducerIdempotencyOutcome::Accept);
-
-        assert_eq!(
-            outbox_partition_row_counts(&dsn).await,
-            vec![(0, 0), (1, 0), (2, 0), (3, 1)],
-            "topic partition 7 must land on outbox partition 3"
+            vec![(0, 2), (1, 2), (2, 2), (3, 2)]
         );
     }
 
@@ -1269,7 +1140,6 @@ mod tests {
                 .chain(ProducerChainCheck {
                     producer_id: registration.id,
                     topic: topic.clone(),
-                    partition: 0,
                     previous,
                     sequence,
                     mode: ProducerMode::Chained,
@@ -1324,7 +1194,7 @@ mod tests {
             .expect("cursors lookup must succeed")
             .expect("producer must exist");
         assert_eq!(cursors.topics.len(), 1);
-        assert_eq!(cursors.topics[0].partitions[0].last_sequence, 10);
+        assert_eq!(cursors.topics[0].last_sequence, 10);
 
         storage
             .reset(registration.id, &ProducerResetScope::All)
@@ -1338,6 +1208,123 @@ mod tests {
         assert!(
             cursors.topics.is_empty(),
             "reset must clear all sequence state"
+        );
+    }
+
+    /// The identity row of the ingest outbox group `name`, read raw, so a test
+    /// sees exactly what was stored.
+    async fn identity_row(dsn: &str, name: &str) -> Option<(String, String, String)> {
+        use sea_orm::ConnectionTrait;
+        use sea_orm::sea_query::{Alias, Expr, ExprTrait, Query};
+
+        let conn = sea_orm::Database::connect(dsn).await.expect("connect");
+        conn.query_one(
+            Query::select()
+                .columns([
+                    Alias::new("name"),
+                    Alias::new("outbox_id"),
+                    Alias::new("created_at"),
+                ])
+                .from(Alias::new("event_broker__outbox_identity"))
+                .and_where(Expr::col(Alias::new("name")).eq(name)),
+        )
+        .await
+        .expect("read the identity table")
+        .map(|row| {
+            (
+                row.try_get::<String>("", "name").expect("name"),
+                row.try_get::<String>("", "outbox_id").expect("outbox_id"),
+                row.try_get::<String>("", "created_at").expect("created_at"),
+            )
+        })
+    }
+
+    /// An outbox group's identity is minted once - 16 lowercase hex digits and
+    /// the RFC 3339 moment it was minted - and every later read, a restart
+    /// included, gets the same one (feature 0005 §2.5).
+    #[tokio::test]
+    async fn an_outbox_identity_is_minted_once_and_reused() {
+        let (db, dsn) = test_db().await;
+        let storage = Storage::new(
+            Arc::clone(&db),
+            Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db))),
+            TEST_INSTANCE_ID,
+        );
+
+        let minted = storage.outbox_identity("default").await.expect("minted");
+        let (name, outbox_id, created_at) = identity_row(&dsn, "default")
+            .await
+            .expect("the row is stored");
+        assert_eq!(
+            (name.as_str(), outbox_id.as_str()),
+            ("default", minted.to_string().as_str())
+        );
+        assert_eq!(
+            crate::domain::outbox::OutboxId::parse(&outbox_id),
+            Some(minted)
+        );
+        let minted_at = chrono::DateTime::parse_from_rfc3339(&created_at).expect("RFC 3339");
+        assert_eq!(minted_at.offset().local_minus_utc(), 0, "UTC: {created_at}");
+        assert!(created_at.len() <= 32, "fits VARCHAR(32): {created_at}");
+
+        let restarted = Storage::new(
+            Arc::clone(&db),
+            Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db))),
+            TEST_INSTANCE_ID,
+        );
+        assert_eq!(
+            restarted.outbox_identity("default").await.expect("read"),
+            minted
+        );
+        assert_eq!(
+            identity_row(&dsn, "default").await,
+            Some((name, outbox_id, created_at)),
+            "a second read writes nothing"
+        );
+    }
+
+    /// A stored identity becomes the high half of every fence key, so one of
+    /// a shape this gear never writes is refused rather than reinterpreted.
+    #[tokio::test]
+    async fn a_malformed_stored_outbox_identity_is_refused() {
+        use sea_orm::ConnectionTrait;
+        use sea_orm::sea_query::{Alias, Query};
+
+        let (db, dsn) = test_db().await;
+        let conn = sea_orm::Database::connect(&dsn).await.expect("connect");
+        conn.execute(
+            Query::insert()
+                .into_table(Alias::new("event_broker__outbox_identity"))
+                .columns([
+                    Alias::new("name"),
+                    Alias::new("outbox_id"),
+                    Alias::new("created_at"),
+                ])
+                .values_panic([
+                    "default".into(),
+                    "0123456789ABCDEF".into(),
+                    "2026-10-28T00:00:00.000Z".into(),
+                ]),
+        )
+        .await
+        .expect("seed a malformed row");
+        drop(conn);
+        let storage = Storage::new(
+            Arc::clone(&db),
+            Arc::new(TypesRegistrySpecificationManager::new(Arc::clone(&db))),
+            TEST_INSTANCE_ID,
+        );
+
+        let err = storage
+            .outbox_identity("default")
+            .await
+            .expect_err("not an identity this gear wrote");
+        assert_eq!(
+            err.to_string(),
+            DomainError::Internal(
+                "ingest outbox identity for 'default' is not 16 lowercase hex digits".to_owned()
+            )
+            .to_string()
         );
     }
 }

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
-use toolkit_odata::ODataQuery;
+use toolkit_odata::{CursorV1, ODataQuery, Page};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -17,6 +17,7 @@ use crate::domain::category::DomainVisibility;
 use crate::domain::declaration::kinds::{DataClassification, DeclarationStatus};
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
+use crate::domain::search::needle::{Corpus, Needle};
 
 /// A declaration as the domain sees it.
 ///
@@ -218,6 +219,40 @@ pub struct CategoryTally {
     pub retired: u64,
 }
 
+/// What the browse narrowing by text asks the candidate read: the needle, the
+/// classifications it may match a declaration's Schema Default against, and
+/// the spelling of the substring predicate.
+#[domain_model]
+#[derive(Debug, Clone, Copy)]
+pub struct BrowseNarrowing<'a> {
+    /// The validated, trimmed text.
+    pub needle: &'a Needle,
+    /// The corpus the caller's entitlement admits, decided before the read.
+    pub corpus: Corpus,
+    /// Whether the database in use is `PostgreSQL` (`ILIKE`), as against the
+    /// portable `LIKE` spelling. A flag rather than a binding of the
+    /// repository: `DeclarationRepo` is built at about fifty sites and cannot
+    /// read the backend from its connection. A wrong value is SQL in the wrong
+    /// dialect.
+    pub postgres: bool,
+}
+
+/// One candidate of a narrowed browse batch: a declaration, whether its own
+/// text matched, and its place in the listing, from which a cursor continues
+/// after it or before it, so a page can end on any candidate of the batch.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct BrowseCandidate {
+    /// The declaration.
+    pub declaration: Declaration,
+    /// Whether the declaration text (`key`, `display_name`, `description`,
+    /// category name, Schema Default) contains the needle.
+    pub text_matched: bool,
+    /// The forward cursor positioned after this row, not yet encoded; the
+    /// same position with `d = "bwd"` is the cursor before it.
+    pub position: CursorV1,
+}
+
 /// Operations on declarations.
 #[async_trait]
 pub trait DeclarationRepository: Send + Sync {
@@ -401,6 +436,28 @@ pub trait DeclarationRepository: Send + Sync {
         flagged_at: Option<Uuid>,
         query: &ODataQuery,
     ) -> Result<Listing<Declaration>, DomainError>;
+
+    /// One batch of the narrowed browse: the same page as [`Self::list`], each
+    /// candidate marked with whether its declaration text matched — one read
+    /// over the batch's ids with the search's predicate expressions, never a
+    /// conjunct of the page query — and carrying its position in the
+    /// listing. The `query`'s `filter_hash` is what a cursor minted from a
+    /// position is bound to.
+    ///
+    /// # Errors
+    /// [`DomainError::Validation`] as for [`Self::list`]; [`DomainError`] when
+    /// a read fails.
+    #[allow(clippy::too_many_arguments)]
+    async fn list_candidates<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &ODataQuery,
+        narrowing: &BrowseNarrowing<'_>,
+    ) -> Result<Page<BrowseCandidate>, DomainError>;
 
     /// Which of `keys` name a declaration the caller may see: within the
     /// caller's grant and administrative domains and not `hidden` on the

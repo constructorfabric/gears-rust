@@ -31,7 +31,8 @@
 //! one `select!` would mean a `Reset` broadcast — bounded by `TERMINAL_GRACE`
 //! per non-draining watcher — stalls message delivery for everyone, which is
 //! exactly the "one slow consumer must not stall delivery" rule the registry
-//! exists to keep.
+//! exists to keep. The `Reset` after a lagged stream gets its own task for the
+//! same reason ([`spawn_lag_resetter`]).
 
 use std::sync::Arc;
 
@@ -242,22 +243,28 @@ pub fn spawn_fan_out(
     // emits no `Expired` — see the `watch.rs` module docs.
     let mut messages = subscriber.message_rx();
     let mut keyspace = subscriber.keyspace_event_rx();
+    // Owned by the fan-out task so it cannot outlive it.
+    let resetter = routes
+        .cache
+        .as_ref()
+        .map(|cache| spawn_lag_resetter(Arc::clone(&cache.registry), shutdown.clone()));
     tokio::spawn(async move {
+        let reset = resetter.as_ref().map(|(request, _task)| request.as_ref());
         loop {
             let dispatched = tokio::select! {
-                () = shutdown.cancelled() => return,
+                () = shutdown.cancelled() => break,
                 received = messages.recv() => match received {
                     Ok(message) => published(&routes, &message),
-                    Err(err) => match on_lag(&routes, err, "pub/sub").await {
+                    Err(err) => match on_lag(&routes, reset, &err, "pub/sub") {
                         Continue::Yes => continue,
-                        Continue::No => return,
+                        Continue::No => break,
                     },
                 },
                 received = keyspace.recv() => match received {
                     Ok(event) => keyspace_notification(&routes, &event),
-                    Err(err) => match on_lag(&routes, err, "keyspace").await {
+                    Err(err) => match on_lag(&routes, reset, &err, "keyspace") {
                         Continue::Yes => continue,
-                        Continue::No => return,
+                        Continue::No => break,
                     },
                 },
             };
@@ -272,7 +279,37 @@ pub fn spawn_fan_out(
             let orphaned = cache.registry.dispatch(&notification, kind);
             release_all(&cache.registry, &cache.names, orphaned).await;
         }
+        if let Some((_request, task)) = resetter {
+            // `stop()`'s `close_all` delivers the terminal event on its own.
+            task.abort();
+        }
     })
+}
+
+/// Spawns the task that broadcasts the `Reset` a lagged stream calls for, and
+/// returns the `Notify` the fan-out requests one through.
+///
+/// The broadcast waits up to `TERMINAL_GRACE` on a watcher with a full buffer,
+/// so running it on the fan-out loop would stall delivery for everyone else
+/// (`RD-WATCH-012`) — the same reason the reconnect observer has its own task.
+/// Requests coalesce: lags during a broadcast queue exactly one more, which is
+/// all `Reset` ("re-read") needs.
+fn spawn_lag_resetter(
+    registry: Arc<WatchRegistry>,
+    shutdown: CancellationToken,
+) -> (Arc<tokio::sync::Notify>, JoinHandle<()>) {
+    let request = Arc::new(tokio::sync::Notify::new());
+    let requested = Arc::clone(&request);
+    let task = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = requested.notified() => {}
+            }
+            let _broadcast = registry.broadcast_reset().await;
+        }
+    });
+    (request, task)
 }
 
 /// Whether the fan-out loop should keep going after a stream error.
@@ -291,10 +328,18 @@ enum Continue {
 /// Lock releases lost in the same gap need no equivalent, and get none: their
 /// waiters re-attempt the `SET NX` on the jittered heartbeat regardless, so the
 /// cost is latency rather than a stale view somebody has to be told about.
-async fn on_lag(routes: &FanOutRoutes, err: RecvError, stream: &str) -> Continue {
-    match err {
+///
+/// The `Reset` is only requested here; [`spawn_lag_resetter`]'s task delivers
+/// it. The WARN and the counter stay here so they count every lag.
+fn on_lag(
+    routes: &FanOutRoutes,
+    reset: Option<&tokio::sync::Notify>,
+    err: &RecvError,
+    stream: &str,
+) -> Continue {
+    match *err {
         RecvError::Lagged(missed) => {
-            let Some(cache) = routes.cache.as_ref() else {
+            let Some(reset) = reset else {
                 // The standalone lock plugin: nothing to reset, and nothing that
                 // would make `cluster_watch_resets_total` true if incremented.
                 tracing::debug!(
@@ -319,7 +364,7 @@ async fn on_lag(routes: &FanOutRoutes, err: RecvError, stream: &str) -> Continue
                  every watcher is being reset (DESIGN.md sec 4.3)"
             );
             routes.signals.watch_reset();
-            let _broadcast = cache.registry.broadcast_reset().await;
+            reset.notify_one();
             Continue::Yes
         }
         RecvError::Closed => Continue::No,

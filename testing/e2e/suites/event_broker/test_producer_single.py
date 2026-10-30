@@ -65,18 +65,13 @@ async def test_publish_prefer_wait_returns_501(api):
     assert resp.status_code == 501
 
 
-@pytest.mark.xfail(
-    reason=(
-        "schema validation against data_schema may not be implemented; "
-        "EVENT_TYPE_STRICT requires data.strict_field"
-    ),
-    strict=False,
-)
-async def test_schema_validation_failure_returns_400(api):
+async def test_schema_validation_failure_returns_422(api):
     """scenario: producer/single/1.03-negative-schema-validation-failure.md
 
     EVENT_TYPE_STRICT is registered with a data schema that requires
-    ``strict_field`` (string).  Publishing without it should fail validation.
+    ``strict_field`` (string).  Publishing without it fails validation: the
+    body parsed, its ``data`` does not satisfy the type's schema, so the
+    answer is 422 ``PayloadValidationFailed`` (``docs/openapi.yaml``).
     """
     tenant_id = str(uuid.uuid4())
     async with api() as client:
@@ -87,16 +82,25 @@ async def test_schema_validation_failure_returns_400(api):
                 "data": {"missing_the_required_field": True},
             },
         )
-    assert resp.status_code == 400
-    body = resp.json()
-    assert body == {
+    assert resp.status_code == 422
+    assert resp.json() == {
         "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.invalid_argument.v1~",
         "title": "Invalid Argument",
-        "status": 400,
-        "detail": body["detail"],
-        "instance": body["instance"],
+        "status": 422,
+        "detail": "Request validation failed",
+        "instance": "/event-broker/v1/events",
         "trace_id": TRACE_ID,
-        "context": body["context"],
+        "context": {
+            "field_violations": [
+                {
+                    "description": "event data does not satisfy the event type's data schema",
+                    "field": "(payload)",
+                    "reason": "schema_validation",
+                },
+            ],
+            "resource_name": TOPIC_STRICT,
+            "resource_type": "gts.cf.core.events.topic.v1~",
+        },
     }
 
 

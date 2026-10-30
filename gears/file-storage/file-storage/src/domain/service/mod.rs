@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use time::OffsetDateTime;
 use toolkit_gts::gts_id;
+use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -51,6 +52,20 @@ pub struct UploadTicket {
     pub file_id: Uuid,
     pub version_id: Uuid,
     pub upload_url: String,
+}
+
+/// Outcome of the token-authenticated finalize callback; the sidecar surfaces it as `PUT`-response headers.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct FinalizeByTokenOutcome {
+    /// `None`: no bind requested (manual mode), first call. `Some(Bound)`/`Some(Conflict)`: auto-bind
+    /// token that won/lost the `content_id IS NULL` CAS. `Some(Manual)`: retry of a manual finalize
+    /// on an `Available`, unbound version; handled like `None`.
+    pub bind_state: Option<crate::domain::multipart::BindState>,
+    /// Content ETag after a successful bind (`Bound` only).
+    pub etag: Option<String>,
+    /// Current content ETag on a lost CAS (`Conflict` only), for a manual rebind.
+    pub current_etag: Option<String>,
 }
 
 /// Result of `download-url`: the signed URL plus the content ETag.
@@ -145,6 +160,18 @@ impl FileService {
         constraints: UploadConstraints,
         download_meta: Option<(String, String)>,
     ) -> Result<String, DomainError> {
+        self.sign_url_with_bind(op, v, constraints, download_meta, false)
+    }
+
+    /// `sign_url` with an explicit `bind_on_finalize` claim (only `create_file` with auto-bind).
+    pub(super) fn sign_url_with_bind(
+        &self,
+        op: Op,
+        v: &VersionRef,
+        constraints: UploadConstraints,
+        download_meta: Option<(String, String)>,
+        bind_on_finalize: bool,
+    ) -> Result<String, DomainError> {
         let verb = content_verb(op)?;
         let now = OffsetDateTime::now_utc();
         let (content_type, etag) = match op {
@@ -164,6 +191,7 @@ impl FileService {
             request_id: Uuid::now_v7().to_string(),
             content_type,
             etag,
+            bind_on_finalize,
         };
         let token = self.issuer.issue(claims, now)?;
         Ok(format!(
@@ -227,6 +255,23 @@ impl FileService {
     }
 }
 
+/// Delete a backend blob, logging (not failing) on error; a failure leaves an orphan for the
+/// cleanup engine. Shared by `FileService` and `MultipartService`.
+pub(crate) async fn best_effort_blob_delete(
+    backends: &BackendRegistry,
+    metrics: &dyn FileStorageMetricsPort,
+    backend_id: &str,
+    path: &str,
+) {
+    let Ok(backend) = backends.get(backend_id) else {
+        return;
+    };
+    if let Err(err) = backend.delete(path).await {
+        metrics.record_backend_error(backend_id, "delete");
+        tracing::warn!(?err, path, "best-effort backend delete failed");
+    }
+}
+
 /// Map an `Op` to its sidecar path segment.
 ///
 /// `Op::MultipartPart` is rejected: part uploads use a distinct route with part-specific
@@ -255,6 +300,11 @@ pub(super) struct IdempotencyTicket {
     pub(super) file_id: Uuid,
     pub(super) version_id: Uuid,
     pub(super) upload_url: String,
+    /// The `bind` mode minted into the token at the original `create_file`; a replay re-mints with it.
+    /// `None`: the ticket was written by a binary from before `bind` existed, so the original create
+    /// was manual; a replay skips the mode comparison and re-signs with `bind_on_finalize = false`.
+    #[serde(default)]
+    pub(super) auto_bind: Option<bool>,
 }
 
 impl From<IdempotencyTicket> for UploadTicket {

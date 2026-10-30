@@ -67,9 +67,12 @@ async def test_sse_proxy_streams_chat_completion(
         "Hello", " from", " mock", " server",
     ]
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
-    # The mock sleeps 10 ms between the first four events.
+    # The mock sleeps SSE_EVENT_GAP_SECS after each of the first four events.
+    # The whole spread is checked, not each gap, so jitter on one tick is ok.
     spread = arrivals[-1][0] - arrivals[0][0]
-    assert spread >= 0.025, f"events arrived together (buffered?): spread={spread * 1000:.1f}ms"
+    assert spread >= 2 * SSE_EVENT_GAP_SECS * 0.75, (
+        f"events arrived together (buffered?): spread={spread * 1000:.1f}ms"
+    )
 
 
 @pytest.mark.scenario("positive-13.1-sse-stream-forwarded-buffering")

@@ -139,7 +139,7 @@ pub struct AuditMinimizationConfig {
     pub key: SecretString,
 }
 
-/// The Orders producer principal and the broker deployment's declared partition count.
+/// The Orders producer principal.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EventsConfig {
@@ -147,9 +147,6 @@ pub struct EventsConfig {
     /// event family under platform-root tenancy (08 §4.3) and nothing confers them implicitly.
     pub producer_subject_id: uuid::Uuid,
     pub producer_tenant_id: uuid::Uuid,
-    /// The broker's configured topic partition count. Required and never defaulted: a topic
-    /// does not report it, and a count differing from the broker's misroutes the chain.
-    pub broker_partitions: u32,
 }
 
 /// One authenticated service principal, matched on `(subject_id, tenant_id)`.
@@ -431,11 +428,10 @@ impl OrdersConfig {
             .map_err(|e| anyhow::anyhow!("bss-orders: audit_minimization: {e}"))
     }
 
-    /// The validated producer principal and partition declaration.
+    /// The validated producer principal.
     ///
     /// # Errors
-    /// A nil producer identity, one shared with another configured principal, or an absent
-    /// (zero) or implausible partition count.
+    /// A nil producer identity, or one shared with another configured principal.
     pub(crate) fn producer_settings(
         &self,
     ) -> anyhow::Result<crate::infra::broker::ProducerSettings> {
@@ -443,10 +439,6 @@ impl OrdersConfig {
         anyhow::ensure!(
             !events.producer_subject_id.is_nil() && !events.producer_tenant_id.is_nil(),
             "bss-orders: events producer must be a configured service identity"
-        );
-        anyhow::ensure!(
-            (1..=4096).contains(&events.broker_partitions),
-            "bss-orders: events.broker_partitions must declare the broker's partition count (1..4096); there is no default"
         );
         let shared = self
             .service_principals
@@ -463,7 +455,6 @@ impl OrdersConfig {
         Ok(crate::infra::broker::ProducerSettings {
             subject_id: events.producer_subject_id,
             tenant_id: events.producer_tenant_id,
-            broker_partitions: events.broker_partitions,
         })
     }
 

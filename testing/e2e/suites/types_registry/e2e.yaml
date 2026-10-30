@@ -5,6 +5,10 @@ features:
   - static-authz
 launcher: e2e-launcher
 config_gears: []
+env:
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Keep old seed revisions and migrations from other branches out of this suite.
+clean_home: true
 profiles:
   force-disabled:
     config_overrides:

@@ -33,7 +33,7 @@ impl toolkit::config::ConfigProvider for Config {
 fn config() -> Value {
     json!({"lock_route":"direct","idempotency_lease_seconds":30,"dependency_timeout_ms":2000,
         "service_principals":[{"role":"workflow","subject_id":"00000000-0000-0000-0000-000000000901","tenant_id":"00000000-0000-0000-0000-000000000001"}],
-        "events":{"producer_subject_id":"00000000-0000-0000-0000-00000000044c","producer_tenant_id":"00000000-0000-0000-0000-00000000044d","broker_partitions":4},
+        "events":{"producer_subject_id":"00000000-0000-0000-0000-00000000044c","producer_tenant_id":"00000000-0000-0000-0000-00000000044d"},
         "audit_minimization":{"key_id":"test-1","key":TEST_KEY}})
 }
 /// A test-only 32-byte audit minimization key (D-204).
@@ -122,25 +122,17 @@ fn config_rejects_unsafe_bounds_routes_and_typographical_errors() {
         .unwrap();
 }
 
-/// D-200: the producer principal and the broker's partition count are explicit; there is no
-/// event-less mode, no SDK default partition count and no identity shared with other principals.
+/// D-200: the producer principal is explicit; there is no event-less mode and no identity
+/// shared with other principals.
 #[test]
-fn events_config_is_required_and_declares_the_broker_partition_count() {
+fn events_config_is_required_and_names_a_distinct_producer() {
     let mut missing = config();
     missing.as_object_mut().unwrap().remove("events");
     assert!(serde_json::from_value::<OrdersConfig>(missing).is_err());
-    let mut absent = config();
-    absent["events"]
-        .as_object_mut()
-        .unwrap()
-        .remove("broker_partitions");
-    assert!(serde_json::from_value::<OrdersConfig>(absent).is_err());
     let mut unknown = config();
     unknown["events"]["queue"] = json!("other");
     assert!(serde_json::from_value::<OrdersConfig>(unknown).is_err());
     for (key, bad) in [
-        ("broker_partitions", json!(0)),
-        ("broker_partitions", json!(4097)),
         (
             "producer_subject_id",
             json!("00000000-0000-0000-0000-000000000000"),
@@ -159,7 +151,13 @@ fn events_config_is_required_and_declares_the_broker_partition_count() {
         .unwrap()
         .producer_settings()
         .unwrap();
-    assert_eq!(settings.broker_partitions, 4);
+    assert_eq!(
+        (settings.subject_id, settings.tenant_id),
+        (
+            Uuid::parse_str("00000000-0000-0000-0000-00000000044c").unwrap(),
+            Uuid::parse_str("00000000-0000-0000-0000-00000000044d").unwrap(),
+        )
+    );
 }
 
 /// D-204: the audit minimization key is required configuration. A missing block, an unresolved

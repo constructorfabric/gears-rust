@@ -370,6 +370,16 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=cluster-pg
 
+      - name: Test postgres-event-broker-plugin (pg integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-eb-pg
+
+      - name: Test event-broker gear database (SQLite, PostgreSQL, MySQL integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        # The lane sets EB_TEST_REQUIRE_DOCKER=1 itself, so an unreachable
+        # Docker fails the step instead of skipping the suite green.
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=eb-gear-db
+
       - name: Test quota-enforcement storage plugin (pg integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=quota-enforcement-pg
@@ -1201,6 +1211,18 @@ jobs:
         uses: ./.github/actions/cargo-gears
         with:
           version: ${{ env.CARGO_GEARS_VERSION }}
+
+      # rust-lang/rust-clippy renamed `master` to `main`, but dylint (up to 6.2.0) clones it and
+      # checks out `master`, so building the dylint driver fails. Serve that clone from a local
+      # mirror whose default branch `master` is `main`. Remove once dylint checks out `main`.
+      - name: Work around dylint's hard-coded rust-clippy `master`
+        shell: bash
+        run: |
+          mirror="$RUNNER_TEMP/rust-clippy.git"
+          git clone --bare --quiet https://github.com/rust-lang/rust-clippy "$mirror"
+          git -C "$mirror" branch -f master main
+          git -C "$mirror" symbolic-ref HEAD refs/heads/master
+          git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
         run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint

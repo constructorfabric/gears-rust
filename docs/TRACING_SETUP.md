@@ -192,13 +192,8 @@ overrides, which are now `APP__OPENTELEMETRY__*`.
 | `tracing.resource` | `opentelemetry.resource.attributes` |
 | `tracing.metrics` | `opentelemetry.metrics` |
 | `tracing.exporter` | `opentelemetry.exporter`, or `opentelemetry.tracing.exporter` to override it for traces only |
-| `tracing.sampler`, `.propagation`, `.http`, `.logs_correlation` | `opentelemetry.tracing.*` |
-
-### Not yet implemented
-
-`tracing.propagation` and `tracing.http` are accepted by the config parser but
-**read by no code**. W3C propagation is always on when tracing is enabled,
-regardless of `propagation.w3c_trace_context`.
+| `tracing.sampler`, `.logs_correlation` | `opentelemetry.tracing.*` |
+| `tracing.propagation`, `.http` | — removed; they were accepted by the parser but **read by no code**. W3C `traceparent` propagation is always on when tracing is enabled, and `x-request-id` chain propagation needs no config |
 
 ---
 

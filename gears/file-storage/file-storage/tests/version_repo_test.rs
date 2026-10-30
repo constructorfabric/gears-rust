@@ -70,6 +70,7 @@ fn new_version(file_id: Uuid, version_id: Uuid, size: i64) -> FileVersion {
         backend_id: "mem".to_owned(),
         backend_path: format!("/{file_id}/{version_id}"),
         created_at: now,
+        bound_on_finalize: false,
     }
 }
 

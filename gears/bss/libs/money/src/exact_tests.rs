@@ -620,3 +620,305 @@ fn scaled_sum_survives_coefficient_and_carrier_overflow() {
         Err(ExactError::Money(MoneyError::AmountOutOfRange))
     );
 }
+
+fn big(text: &str) -> BigInt {
+    BigInt::parse_bytes(text.as_bytes(), 10).unwrap()
+}
+
+fn ten(power: u32) -> BigInt {
+    BigInt::from(10).pow(power)
+}
+
+fn parts(value: &ExactAmount) -> (BigInt, BigInt) {
+    (value.numer().clone(), value.denom().clone())
+}
+
+#[test]
+fn parts_are_the_reduced_fraction_with_the_sign_on_the_numerator() {
+    let cases = [
+        (BigInt::from(94), BigInt::from(-800), (-47, 400)),
+        (BigInt::from(-94), BigInt::from(-800), (47, 400)),
+        (BigInt::from(6), BigInt::from(3), (2, 1)),
+        (BigInt::zero(), BigInt::from(-5), (0, 1)),
+    ];
+    for (numerator, denominator, (n, d)) in cases {
+        let value = ExactAmount::from_parts(numerator, denominator).unwrap();
+        assert_eq!(parts(&value), (BigInt::from(n), BigInt::from(d)));
+    }
+    // The accessors read every constructor's value, decimal ones included.
+    assert_eq!(
+        parts(&exact("0.1175")),
+        (BigInt::from(47), BigInt::from(400))
+    );
+    assert_eq!(
+        parts(&exact("-12.50")),
+        (BigInt::from(-25), BigInt::from(2))
+    );
+}
+
+#[test]
+fn from_parts_refuses_a_zero_denominator_and_values_past_the_budget() {
+    for numerator in [BigInt::one(), BigInt::zero()] {
+        assert_eq!(
+            ExactAmount::from_parts(numerator, BigInt::zero()),
+            Err(ExactError::DivisionByZero)
+        );
+    }
+    // 256 digits are the reduced budget; an unreduced input may be wider and still reduce.
+    let widest = ten(256) - 1_u8;
+    assert_eq!(
+        ExactAmount::from_parts(widest.clone(), BigInt::one())
+            .unwrap()
+            .numer(),
+        &widest
+    );
+    assert_eq!(
+        ExactAmount::from_parts(ten(256), BigInt::one()),
+        Err(ExactError::ArithmeticLimit)
+    );
+    assert_eq!(
+        ExactAmount::from_parts(BigInt::one(), ten(256)),
+        Err(ExactError::ArithmeticLimit)
+    );
+    assert_eq!(
+        ExactAmount::from_parts(ten(300), ten(299)).unwrap(),
+        ExactAmount::from_coefficient(10, 0)
+    );
+    // Inputs past the scratch bound are refused before any reduction.
+    assert_eq!(
+        ExactAmount::from_parts(ten(513), ten(500)),
+        Err(ExactError::ArithmeticLimit)
+    );
+    assert_eq!(
+        ExactAmount::from_parts(ten(500), ten(512)),
+        Err(ExactError::ArithmeticLimit)
+    );
+}
+
+#[test]
+fn numerators_past_i128_reload_exactly() {
+    let numerator = BigInt::from(2).pow(200) + 1_u8;
+    let value = ExactAmount::from_parts(numerator.clone(), BigInt::from(3)).unwrap();
+    assert_eq!(parts(&value), (numerator, BigInt::from(3)));
+    let (n, d) = value.canonical_fraction();
+    assert_eq!(ExactAmount::parse_fraction(&n, &d).unwrap(), value);
+}
+
+#[test]
+fn floor_rounds_toward_negative_infinity_and_ceil_toward_positive() {
+    for (numerator, denominator, floor, ceil) in [
+        (7, 3, 2, 3),
+        (-7, 3, -3, -2),
+        (1, 3, 0, 1),
+        (-1, 3, -1, 0),
+        (5, 2, 2, 3),
+        (-5, 2, -3, -2),
+        (6, 3, 2, 2),
+        (-6, 3, -2, -2),
+        (0, 1, 0, 0),
+    ] {
+        let value =
+            ExactAmount::from_parts(BigInt::from(numerator), BigInt::from(denominator)).unwrap();
+        let (low, high) = (value.floor().unwrap(), value.ceil().unwrap());
+        assert_eq!(low, ExactAmount::from_coefficient(floor, 0), "{value}");
+        assert_eq!(high, ExactAmount::from_coefficient(ceil, 0), "{value}");
+        assert!(low <= value && value <= high, "{value}");
+        assert!(low.denom().is_one() && high.denom().is_one(), "{value}");
+    }
+    // A whole number past i128 floors to itself.
+    let wide = ExactAmount::from_parts(-ten(100), BigInt::one()).unwrap();
+    assert_eq!(wide.floor().unwrap(), wide);
+    let wide_third = ExactAmount::from_parts(-ten(100) - 1_u8, BigInt::from(3)).unwrap();
+    assert_eq!(
+        wide_third.floor().unwrap().numer(),
+        &(-((ten(100) + 1_u8) / 3_u8) - 1_u8)
+    );
+}
+
+#[test]
+fn wide_decimals_parse_exactly_up_to_60_integer_and_28_fractional_digits() {
+    let integer = "9".repeat(60);
+    let fraction = "1".repeat(28);
+    let value = ExactAmount::parse_decimal(&format!("-{integer}.{fraction}")).unwrap();
+    assert_eq!(
+        value,
+        ExactAmount::from_parts(-big(&format!("{integer}{fraction}")), ten(28)).unwrap()
+    );
+    // A 40-digit aggregate quantity, past every `Decimal`.
+    let forty = "1234567890123456789012345678901234567890";
+    assert_eq!(
+        parts(&ExactAmount::parse_decimal(forty).unwrap()),
+        (big(forty), BigInt::one())
+    );
+    // Within the carrier it is the same value as `from_decimal`, trailing zeros included.
+    for text in [
+        "0",
+        "10.000",
+        "-0.5",
+        "0.1175",
+        "12.34",
+        "0.0000000000000000000000000001",
+    ] {
+        assert_eq!(
+            ExactAmount::parse_decimal(text).unwrap(),
+            exact(text),
+            "{text}"
+        );
+    }
+    assert_eq!(
+        parts(&ExactAmount::parse_decimal("-0.5").unwrap()),
+        (BigInt::from(-1), BigInt::from(2))
+    );
+    // Trailing zeros do not count toward the 28 fractional digits.
+    assert_eq!(
+        ExactAmount::parse_decimal("0.00000000000000000000000000010000").unwrap(),
+        exact("0.0000000000000000000000000001")
+    );
+}
+
+#[test]
+fn wide_decimals_refuse_what_the_decimal_parser_refuses() {
+    assert_eq!(
+        ExactAmount::parse_decimal(&"9".repeat(61)),
+        Err(ExactError::Money(MoneyError::AmountOutOfRange))
+    );
+    assert_eq!(
+        ExactAmount::parse_decimal(&format!("0.{}", "1".repeat(29))),
+        Err(ExactError::Money(MoneyError::InvalidDecimal))
+    );
+    for text in [
+        "", "-", "+1", "01", "-01", "1e3", "1E3", " 1", "1 ", "1.", ".5", "-.5", "-0", "-0.000",
+        "1.2.3", "--1", "1_000", "0x10", "1,5",
+    ] {
+        assert_eq!(
+            ExactAmount::parse_decimal(text),
+            Err(ExactError::Money(MoneyError::InvalidDecimal)),
+            "{text:?}"
+        );
+    }
+    // The byte limit applies before trailing zeros are dropped.
+    let at_limit = format!("1.{}", "0".repeat(126));
+    assert_eq!(
+        ExactAmount::parse_decimal(&at_limit).unwrap(),
+        ExactAmount::from_coefficient(1, 0)
+    );
+    assert_eq!(
+        ExactAmount::parse_decimal(&format!("{at_limit}0")),
+        Err(ExactError::Money(MoneyError::InvalidDecimal))
+    );
+}
+
+#[test]
+fn canonical_fraction_text_is_reduced_and_signed_on_the_numerator() {
+    let text = |value: &ExactAmount| value.canonical_fraction();
+    assert_eq!(text(&exact("0.1175")), ("47".into(), "400".into()));
+    assert_eq!(text(&exact("-3")), ("-3".into(), "1".into()));
+    assert_eq!(text(&exact("0")), ("0".into(), "1".into()));
+    assert_eq!(text(&exact("-0.00")), ("0".into(), "1".into()));
+    let two_thirds = exact("-2").checked_div(&exact("3")).unwrap();
+    assert_eq!(text(&two_thirds), ("-2".into(), "3".into()));
+    // A field declared as a fraction stays one when the value is whole.
+    assert_eq!(text(&exact("12.00")), ("12".into(), "1".into()));
+}
+
+#[test]
+fn fraction_text_round_trips_to_the_same_value_and_text() {
+    let values = [
+        exact("0"),
+        exact("-0.1175"),
+        exact("1").checked_div(&exact("3")).unwrap(),
+        ExactAmount::from_parts(ten(255) + 1_u8, ten(255) - 1_u8).unwrap(),
+        ExactAmount::from_parts(-(ten(256) - 1_u8), BigInt::from(7)).unwrap(),
+    ];
+    for value in values {
+        let (numerator, denominator) = value.canonical_fraction();
+        let back = ExactAmount::parse_fraction(&numerator, &denominator).unwrap();
+        assert_eq!(back, value, "{numerator}/{denominator}");
+        assert_eq!(back.canonical_fraction(), (numerator, denominator));
+    }
+}
+
+#[test]
+fn fraction_text_parser_accepts_only_the_canonical_form() {
+    for (numerator, denominator) in [
+        ("+1", "2"),
+        ("01", "2"),
+        ("1", "02"),
+        ("-0", "1"),
+        ("1", "-2"),
+        ("-1", "-2"),
+        ("2", "4"),
+        ("0", "2"),
+        ("1.0", "2"),
+        ("1", "2.0"),
+        ("1", " 2"),
+        ("1 ", "2"),
+        ("", "1"),
+        ("1", ""),
+        ("-", "1"),
+        ("1e2", "1"),
+        ("1", "+2"),
+        ("1/2", "1"),
+    ] {
+        assert_eq!(
+            ExactAmount::parse_fraction(numerator, denominator),
+            Err(ExactError::Money(MoneyError::InvalidDecimal)),
+            "{numerator:?}/{denominator:?}"
+        );
+    }
+    for numerator in ["1", "0", "-1"] {
+        assert_eq!(
+            ExactAmount::parse_fraction(numerator, "0"),
+            Err(ExactError::DivisionByZero),
+            "{numerator}"
+        );
+    }
+    // 256 digits are the budget of each integer; more are refused before parsing.
+    let widest = "9".repeat(256);
+    assert_eq!(
+        ExactAmount::parse_fraction(&widest, "1").unwrap().numer(),
+        &big(&widest)
+    );
+    assert_eq!(
+        ExactAmount::parse_fraction(&format!("-{widest}"), "1")
+            .unwrap()
+            .numer(),
+        &-big(&widest)
+    );
+    let refused = |text: &str, error: ExactError| {
+        assert_eq!(
+            ExactAmount::parse_fraction(text, "1"),
+            Err(error.clone()),
+            "{} bytes",
+            text.len()
+        );
+        assert_eq!(
+            ExactAmount::parse_fraction("1", text),
+            Err(error),
+            "{} bytes",
+            text.len()
+        );
+    };
+    // A longer integer is past the budget, whichever sign it has.
+    for oversized in [
+        "9".repeat(257),
+        format!("-{}", "9".repeat(257)),
+        "9".repeat(1 << 20),
+        format!("-{}", "9".repeat(1 << 20)),
+    ] {
+        refused(&oversized, ExactError::ArithmeticLimit);
+    }
+    // Longer text that is not a canonical integer is malformed, however long.
+    for malformed in [
+        format!("{}x", "9".repeat(300)),
+        format!("x{}", "9".repeat(300)),
+        format!("{}.0", "9".repeat(300)),
+        format!("0{}", "9".repeat(256)),
+        format!("-0{}", "9".repeat(256)),
+        format!("+{}", "9".repeat(300)),
+        format!("--{}", "9".repeat(300)),
+        format!("{}x", "9".repeat(1 << 20)),
+    ] {
+        refused(&malformed, MoneyError::InvalidDecimal.into());
+    }
+}

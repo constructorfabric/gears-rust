@@ -1,17 +1,4 @@
-//! Public API for Types Registry.
-//!
-//! - [`PlatformTypesRegistryApi`] provides reads, mutations and operation polling;
-//!   [`PlatformTypesRegistryApiExt`] adds typed reads, pagination and reconciliation.
-//! - [`TypesRegistryApi`] and [`TypesRegistryApiExt`] provide tenant-context reads.
-//! - [`models`] defines requests, operations and projected entity snapshots.
-//! - [`TypesRegistryError`] provides a typed view of canonical errors;
-//!   [`AdmissionFailure`] decodes operation-item failures.
-//! - [`ReconcileReport`] decodes incomplete reconciliation errors.
-//! - [`GtsTypeId`] and [`GtsInstanceId`] are typed GTS identifiers.
-//!
-//! The legacy [`TypesRegistryClient`], its models and its `testing` mock remain
-//! available at the crate root. New consumers should use the API contracts above.
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
@@ -22,9 +9,16 @@ pub mod field;
 pub mod gts;
 pub mod item_failure;
 pub mod models;
+#[cfg(any(feature = "rest-client", feature = "rest-server"))]
+mod paths;
 pub mod precondition;
+mod publication;
 pub mod reason;
 mod reconcile;
+#[cfg(feature = "rest-server")]
+mod rest_binding;
+#[cfg(feature = "rest-client")]
+mod rest_client;
 
 #[cfg(any(test, feature = "test-util"))]
 #[expect(
@@ -33,7 +27,10 @@ mod reconcile;
 )]
 pub mod testing_platform;
 
-pub use contract::{PlatformTypesRegistryApi, TypesRegistryApi};
+pub use contract::{
+    PlatformTypesRegistryApi, TypesRegistryApi, platform_types_registry_api_ir,
+    types_registry_api_ir,
+};
 pub use error::{FieldIssue, TypesRegistryError};
 pub use ext::{PlatformTypesRegistryApiExt, TypesRegistryApiExt};
 pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
@@ -49,9 +46,20 @@ pub use models::{
     RegistrationOutcome, TypeSchema, Validator,
 };
 
+pub use publication::{PublicationError, publish_startup_entities};
 pub use reconcile::{
     ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
-    Reconciliation,
+    Reconciliation, STARTUP_PUBLICATION_DEADLINE,
+};
+#[cfg(feature = "rest-server")]
+pub use rest_binding::{
+    platform_types_registry_api_rest_http_binding, types_registry_api_rest_http_binding,
+};
+#[cfg(feature = "rest-client")]
+pub use rest_client::{
+    PLATFORM_BASE_PATH, PlatformTypesRegistryApiRestClient,
+    PlatformTypesRegistryApiRestResolvingClient, TENANT_BASE_PATH, TypesRegistryApiRestClient,
+    TypesRegistryApiRestResolvingClient,
 };
 
 // Legacy API and model re-exports.

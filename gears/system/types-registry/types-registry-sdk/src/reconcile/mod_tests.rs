@@ -227,6 +227,50 @@ async fn an_update_carries_the_read_version_and_the_callers_publisher() {
     assert_eq!(submissions[0].1.publisher, publisher());
 }
 
+#[tokio::test]
+async fn a_document_differing_only_in_number_spelling_is_submitted() {
+    // `Value` equality calls `0.0` and `-0.0` equal; the registry stores and compares
+    // canonical text, where they, like `1` and `1.0`, are different documents.
+    for (stored, desired) in [
+        (json!({ "v": 0.0 }), json!({ "v": -0.0 })),
+        (json!({ "v": 1 }), json!({ "v": 1.0 })),
+        (
+            json!({ "v": [{ "w": [0.0] }] }),
+            json!({ "v": [{ "w": [-0.0] }] }),
+        ),
+    ] {
+        let fake = MockTypesRegistry::new();
+        fake.seed(A, stored.clone());
+
+        let result = run(&fake, vec![(gid(A), desired.clone())]).await;
+
+        assert!(
+            matches!(result, Ok(Reconciliation::Reconciled(_))),
+            "{stored} -> {desired}: {result:?}"
+        );
+        let submissions = fake.submissions();
+        assert_eq!(submissions.len(), 1, "{stored} -> {desired}");
+        assert_eq!(submissions[0].1.items[0].expected_resource_version, Some(1));
+        assert_eq!(
+            submissions[0].1.items[0].content.to_string(),
+            desired.to_string()
+        );
+    }
+}
+
+#[tokio::test]
+async fn key_order_alone_is_not_a_difference() {
+    let fake = MockTypesRegistry::new();
+    let stored: Value = serde_json::from_str(r#"{"b": 1, "a": {"y": -0.0, "x": [1.5]}}"#).unwrap();
+    let desired: Value = serde_json::from_str(r#"{"a": {"x": [1.5], "y": -0.0}, "b": 1}"#).unwrap();
+    fake.seed(A, stored);
+
+    let result = run(&fake, vec![(gid(A), desired)]).await;
+
+    assert!(matches!(result, Ok(Reconciliation::UpToDate)), "{result:?}");
+    assert!(fake.submissions().is_empty());
+}
+
 #[tokio::test(start_paused = true)]
 async fn a_dependency_published_later_is_picked_up_on_the_next_pass_under_a_new_key() {
     // Decided at submit, so the base is seeded only after the first outcome.
@@ -399,6 +443,106 @@ async fn later_batches_proceed_when_an_earlier_one_waits_on_a_dependency() {
     assert_eq!(reason(&outcomes[A]), "dependency_not_found");
 }
 
+/// Unbounded passes that end when a pass can no longer make progress.
+fn until_stalled() -> ReconcileOptions {
+    ReconcileOptions {
+        passes: NonZeroU32::MAX,
+        stop_when_stalled: true,
+        ..options()
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dependency_nothing_can_store_stalls_the_call_after_one_pass() {
+    let fake = MockTypesRegistry::new();
+    fake.depends_on(A, BASE);
+
+    let outcomes = unsettled_by(
+        run_with(&fake, vec![(gid(A), json!({}))], &until_stalled()).await,
+        ReconcileStop::Stalled,
+    );
+
+    assert_eq!(reason(&outcomes[A]), "dependency_not_found");
+    assert_eq!(fake.submissions().len(), 1, "no pass after the stalled one");
+}
+
+/// A pass that admits nothing is a stall only when *every* identifier still wanted
+/// waits on a dependency: a lost compare-and-set beside a missing dependency is
+/// retried, and only once it is admitted does the dependency alone stall the call.
+#[tokio::test(start_paused = true)]
+async fn a_conflict_beside_a_missing_dependency_is_retried_before_the_stall() {
+    let fake = MockTypesRegistry::new();
+    fake.depends_on(A, BASE);
+    fake.seed(B, json!({ "v": 0 }));
+    fake.race_next_submit(B, json!({ "v": 1 }));
+
+    let outcomes = unsettled_by(
+        run_with(&fake, vec![(gid(A), json!({})), doc(B)], &until_stalled()).await,
+        ReconcileStop::Stalled,
+    );
+
+    assert!(
+        matches!(outcomes[B], ReconcileOutcome::Admitted),
+        "{:?}",
+        outcomes[B]
+    );
+    assert_eq!(reason(&outcomes[A]), "dependency_not_found");
+    assert!(fake.submissions().len() >= 2, "the conflict was retried");
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dependency_admitted_by_a_later_batch_is_progress_not_a_stall() {
+    let fake = MockTypesRegistry::new();
+    // `a` sorts, and so goes out, before the `c` it needs; `b` waits on `a`.
+    fake.depends_on(A, C);
+    fake.depends_on(B, A);
+    let options = ReconcileOptions {
+        batch_size: NonZeroUsize::new(1).expect("non-zero"),
+        ..until_stalled()
+    };
+
+    let outcomes = admitted(run_with(&fake, vec![doc(A), doc(B), doc(C)], &options).await);
+
+    assert_eq!(outcomes.len(), 3);
+    assert_eq!(
+        submitted_ids(&fake),
+        [[A], [B], [C], [A], [B]],
+        "each pass admitted something"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_conflicts_are_retried_without_a_pass_limit_or_a_stall() {
+    // Another publisher wins the compare-and-set of seven passes in a row, more than
+    // the default pass count: none of them admits anything, and none is a stall.
+    let fake = Arc::new(MockTypesRegistry::new());
+    fake.seed(A, json!({ "v": 0 }));
+    fake.race_next_submit(A, json!({ "v": 1 }));
+    let task = {
+        let fake = Arc::clone(&fake);
+        tokio::spawn(async move { run_with(&fake, vec![doc(A)], &until_stalled()).await })
+    };
+    for n in 2..=7 {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while fake.submissions().len() < n - 1 {
+                assert!(!task.is_finished(), "ended after {} submissions", n - 1);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the next pass submits");
+        fake.race_next_submit(A, json!({ "v": n }));
+    }
+
+    admitted(task.await.expect("joins"));
+    let versions: Vec<Option<u64>> = fake
+        .submissions()
+        .iter()
+        .map(|(_, r)| r.items[0].expected_resource_version)
+        .collect();
+    assert_eq!(versions, (1..=8).map(Some).collect::<Vec<_>>());
+}
+
 #[tokio::test]
 async fn a_conflicting_duplicate_alone_is_reported_not_up_to_date() {
     let fake = MockTypesRegistry::new();
@@ -462,6 +606,33 @@ async fn an_identifier_declared_twice_differently_is_rejected_and_identical_twin
     assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
     let submitted: usize = fake.submissions().iter().map(|(_, r)| r.items.len()).sum();
     assert_eq!(submitted, 1);
+}
+
+#[tokio::test]
+async fn twins_differing_only_in_number_spelling_conflict_and_reordered_twins_collapse() {
+    let fake = MockTypesRegistry::new();
+    let reordered: Value = serde_json::from_str(r#"{"b": [1.5], "a": -0.0}"#).unwrap();
+
+    let outcomes = unsettled_by(
+        run(
+            &fake,
+            vec![
+                (gid(A), json!({ "v": 0.0 })),
+                (gid(A), json!({ "v": -0.0 })),
+                (gid(B), json!({ "a": -0.0, "b": [1.5] })),
+                (gid(B), reordered),
+            ],
+        )
+        .await,
+        ReconcileStop::Completed,
+    );
+
+    assert!(
+        matches!(outcomes[A], ReconcileOutcome::Rejected(_)),
+        "0.0 is not -0.0"
+    );
+    assert!(matches!(outcomes[B], ReconcileOutcome::Admitted));
+    assert_eq!(submitted_ids(&fake), [[B]]);
 }
 
 #[tokio::test]

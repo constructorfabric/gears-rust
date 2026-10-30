@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use event_broker::test_support::{EventBrokerHarness, StaticTypesRegistry};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{
-    DirectDeduplication, IngestOutcome, Producer, ProducerIdentity, ProducerMode, Sequence,
-    TypedEvent, gts_id,
+    DirectDeduplication, EventBrokerError, GtsInstanceId, IngestOutcome, Producer,
+    ProducerIdentity, ProducerMode, Sequence, TypedEvent, gts_id,
 };
 use toolkit_security::SecurityContext;
 
@@ -42,11 +43,13 @@ async fn stored_count(harness: &EventBrokerHarness, partition: u32) -> usize {
     harness
         .backend()
         .read(
-            &SecurityContext::anonymous(),
-            TOPIC,
-            partition,
+            &TopicPartition::new(
+                GtsInstanceId::try_new(TOPIC).unwrap(),
+                Partition::new(partition),
+            ),
             Sequence::NONE,
             1024,
+            Wait::No,
         )
         .await
         .expect("read stored events")
@@ -141,11 +144,39 @@ async fn register_on_start_chained_mints_id_and_publishes_first_sequence() {
         .get_producer_cursors(&SecurityContext::anonymous(), producer_id)
         .await
         .unwrap();
-    assert_eq!(
-        cursors.last_sequence(&topic_instance(), TENANT_PARTITION),
-        Some(0)
-    );
+    assert_eq!(cursors.last_sequence(&topic_instance()), Some(0));
     wait_for_stored(&harness, TENANT_PARTITION, 1).await;
+}
+
+/// The in-process broker checks a registration's `client_agent` the way the
+/// REST surface does: an over-long one is refused before anything is written.
+#[tokio::test]
+async fn in_process_registration_rejects_an_over_long_client_agent() {
+    let harness = harness().await;
+    let broker = harness.broker();
+
+    let err = broker
+        .register_producer(
+            &SecurityContext::anonymous(),
+            ProducerMode::Chained,
+            &"a".repeat(257),
+        )
+        .await
+        .unwrap_err();
+
+    // The answer crosses the canonical error, which carries the reason but
+    // not the field name or the rule's wording.
+    match err {
+        EventBrokerError::InvalidTextField {
+            field,
+            detail,
+            reason,
+        } => assert_eq!(
+            (field, detail.as_str(), reason),
+            ("", "Request validation failed", "field_too_long")
+        ),
+        other => panic!("expected InvalidTextField, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -191,10 +222,7 @@ async fn reuse_monotonic_primes_from_broker_cursor() {
         .get_producer_cursors(&ctx, producer_id)
         .await
         .unwrap();
-    assert_eq!(
-        cursors.last_sequence(&topic_instance(), TENANT_PARTITION),
-        Some(1)
-    );
+    assert_eq!(cursors.last_sequence(&topic_instance()), Some(1));
 }
 
 /// `publish_persisted` asks for a durable-write confirmation, but the in-process

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -101,6 +102,39 @@ def clickhouse_tag() -> str:
     against another, with nothing in the diff to show it.
     """
     return os.environ.get(ENV_CLICKHOUSE_TAG, "").strip() or CLICKHOUSE_TAG
+
+
+# The MySQL, MariaDB and Kafka pins, mirrored from libs/test-containers/src/lib.rs
+# (MYSQL_TAG, MARIADB_IMAGE/MARIADB_TAG, KAFKA_TAG and their ENV_* overrides): the
+# images the event-broker MySQL and Kafka plugins' integration tests run, so the
+# E2E lane exercises the same servers. Split into repo + tag for the same reason
+# as the TimescaleDB pin.
+MYSQL_IMAGE = "mysql"
+MYSQL_TAG = "9.7"
+ENV_MYSQL_TAG = "GEARS_TEST_MYSQL_TAG"
+
+MARIADB_IMAGE = "mariadb"
+MARIADB_TAG = "11.8"
+ENV_MARIADB_TAG = "GEARS_TEST_MARIADB_TAG"
+
+KAFKA_IMAGE = "apache/kafka"
+KAFKA_TAG = "4.3.1"
+ENV_KAFKA_TAG = "GEARS_TEST_KAFKA_TAG"
+
+
+def mysql_tag() -> str:
+    """Effective MySQL tag, honoring GEARS_TEST_MYSQL_TAG (empty means the pin)."""
+    return os.environ.get(ENV_MYSQL_TAG, "").strip() or MYSQL_TAG
+
+
+def mariadb_tag() -> str:
+    """Effective MariaDB tag, honoring GEARS_TEST_MARIADB_TAG (empty means the pin)."""
+    return os.environ.get(ENV_MARIADB_TAG, "").strip() or MARIADB_TAG
+
+
+def kafka_tag() -> str:
+    """Effective Kafka tag, honoring GEARS_TEST_KAFKA_TAG (empty means the pin)."""
+    return os.environ.get(ENV_KAFKA_TAG, "").strip() or KAFKA_TAG
 
 
 # Docker label KEY every sidecar here shares. The VALUE identifies the run that
@@ -216,6 +250,9 @@ class _DockerSidecar:
     # The container-side port to map, in `docker port` syntax, e.g. "5432/tcp".
     CONTAINER_PORT = ""
     name = ""
+    # When set, the container is named `<NAME_PREFIX>-<6 hex>` so `docker ps`
+    # shows who started it.
+    NAME_PREFIX: str | None = None
 
     def __init__(self, label: str | None = None) -> None:
         # Default to a per-RUN label, not the bare class constant: `start()`
@@ -446,11 +483,17 @@ class _DockerSidecar:
         self.reap_stale(own_label=self.label)
         self.pull()
 
+        name = (
+            ["--name", f"{self.NAME_PREFIX}-{secrets.token_hex(3)}"]
+            if self.NAME_PREFIX else []
+        )
+        ports = self._port_args()
         self.container_id = _run([
-            "docker", "run", "-d", "-P",
+            "docker", "run", "-d", *ports, *name,
             "--label", self.label,
             *self._env_args(),
             self.IMAGE,
+            *self._cmd_args(),
         ])
         atexit.register(self.stop)
 
@@ -473,9 +516,31 @@ class _DockerSidecar:
         print(f"[sidecar] {self.name} ready on 127.0.0.1:{self.port} "
               f"({self.container_id[:12]})")
 
+    # When set, the host port is picked before `docker run` and published
+    # explicitly, so it is known to `_env_args` (a server that must advertise
+    # it, see KafkaSidecar) and survives a `docker stop` / `docker start` (a
+    # test that takes the server down and brings it back).
+    FIXED_HOST_PORT = False
+
+    def _port_args(self) -> list[str]:
+        """How `docker run` publishes CONTAINER_PORT: any free host port, or,
+        with FIXED_HOST_PORT, one picked here and kept as `_host_port`."""
+        if not self.FIXED_HOST_PORT:
+            return ["-P"]
+        import socket
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            self._host_port = s.getsockname()[1]
+        return ["-p", f"127.0.0.1:{self._host_port}:{self.CONTAINER_PORT}"]
+
     def _env_args(self) -> list[str]:
         """The `-e KEY=VALUE` pairs to pass to `docker run`."""
         raise NotImplementedError
+
+    def _cmd_args(self) -> list[str]:
+        """Arguments after the image: the server's command line. None by default."""
+        return []
 
     def _probe(self) -> tuple[bool, str]:
         """Run one readiness attempt: `(succeeded, error text when it did not)`.
@@ -655,6 +720,13 @@ class PostgresSidecar(_DockerSidecar):
             raise RuntimeError(f"psql failed: {result.stderr.strip()}\n--- sql ---\n{sql}")
         return result.stdout.strip()
 
+    def url(self) -> str:
+        """Superuser connection URL over the mapped host port."""
+        return (
+            f"postgres://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@127.0.0.1:{self.dsn_port}/{self.DB_NAME}"
+        )
+
 
 class ClickHouseSidecar(_DockerSidecar):
     """A throwaway ClickHouse container with a dynamically mapped host port.
@@ -726,3 +798,162 @@ class ClickHouseSidecar(_DockerSidecar):
         if resp.status_code == 200 and resp.text.strip() == "1":
             return True, ""
         return False, f"HTTP {resp.status_code}: {resp.text.strip()[:200]}"
+
+
+class _MySqlFamilySidecar(_DockerSidecar):
+    """A throwaway MySQL-protocol server: the shared shape of MySQL and MariaDB.
+
+    The superuser is `root`; `url()` names the `mysql` system database, which
+    always exists, so a gear that creates its own database (the event-broker
+    MySQL backend's `database` setting) needs nothing provisioned first.
+    """
+
+    CONTAINER_PORT = "3306/tcp"
+    DB_USER = "root"
+    DB_PASSWORD = "root"
+    DB_NAME = "mysql"
+    # The server-side client binary `_probe` runs through `docker exec`.
+    CLIENT = ""
+
+    def _cmd_args(self) -> list[str]:
+        # Room for every pool a server instance and its restarts open at once.
+        return ["--max-connections=2000"]
+
+    def _probe(self) -> tuple[bool, str]:
+        """A real query over the container's own TCP listener.
+
+        Both images start a temporary socket-only server to initialise, so a
+        probe over the socket would succeed before the real server listens;
+        `-h 127.0.0.1` forces TCP (see TimescaleDbSidecar._probe).
+        """
+        probe = subprocess.run(
+            ["docker", "exec", self.container_id,
+             self.CLIENT, "-h", "127.0.0.1", "-P", "3306",
+             f"-u{self.DB_USER}", f"-p{self.DB_PASSWORD}",
+             "-sN", "-e", "select 1"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if probe.returncode == 0 and probe.stdout.strip() == "1":
+            return True, ""
+        return False, (probe.stderr or probe.stdout).strip()
+
+    def url(self) -> str:
+        """Superuser connection URL over the mapped host port."""
+        return (
+            f"mysql://{self.DB_USER}:{self.DB_PASSWORD}"
+            f"@127.0.0.1:{self.dsn_port}/{self.DB_NAME}"
+        )
+
+
+class MySqlSidecar(_MySqlFamilySidecar):
+    """A throwaway MySQL container on the workspace pin (MYSQL_IMAGE/`mysql_tag()`).
+
+    The image's defaults already make every commit durable
+    (`innodb_flush_log_at_trx_commit=1`, binary log on with `sync_binlog=1`).
+    """
+
+    IMAGE = f"{MYSQL_IMAGE}:{mysql_tag()}"
+    LABEL = f"{LABEL_KEY}=mysql"
+    CLIENT = "mysql"
+    name = "mysql"
+
+    def _env_args(self) -> list[str]:
+        return ["-e", f"MYSQL_ROOT_PASSWORD={self.DB_PASSWORD}"]
+
+
+class MariaDbSidecar(_MySqlFamilySidecar):
+    """A throwaway MariaDB container on the workspace pin (MARIADB_IMAGE/`mariadb_tag()`).
+
+    The image runs with the binary log off and `innodb_flush_log_at_trx_commit=1`,
+    so every commit is durable without extra flags.
+    """
+
+    IMAGE = f"{MARIADB_IMAGE}:{mariadb_tag()}"
+    LABEL = f"{LABEL_KEY}=mariadb"
+    CLIENT = "mariadb"
+    name = "mariadb"
+
+    def _env_args(self) -> list[str]:
+        return ["-e", f"MARIADB_ROOT_PASSWORD={self.DB_PASSWORD}"]
+
+
+class KafkaSidecar(_DockerSidecar):
+    """A throwaway single-node KRaft Kafka broker on the workspace pin
+    (KAFKA_IMAGE/`kafka_tag()`), configured as libs/test-containers' `kafka()`:
+    topics are never auto-created, retention is checked every second, and the
+    transaction state log and offsets topic need one replica.
+
+    A client bootstraps on the published port and then connects to whatever
+    address the broker advertises, so the broker must advertise the HOST port.
+    `docker run -P` picks that port only after the environment is fixed, so this
+    sidecar picks a free port itself (FIXED_HOST_PORT). A second,
+    unpublished listener advertises `localhost` for the tools run inside the
+    container.
+
+    Ready means the broker answers metadata and the host port accepts TCP. A
+    fresh broker may still answer "coordinator load in progress" to its first
+    transactional producers; riding that out is the client's job.
+    """
+
+    IMAGE = f"{KAFKA_IMAGE}:{kafka_tag()}"
+    LABEL = f"{LABEL_KEY}=kafka"
+    CONTAINER_PORT = "9092/tcp"
+    FIXED_HOST_PORT = True
+    INTERNAL = "localhost:19092"
+    BIN = "/opt/kafka/bin"
+    name = "kafka"
+
+    def _env_args(self) -> list[str]:
+        env = {
+            "KAFKA_NODE_ID": "1",
+            "KAFKA_PROCESS_ROLES": "broker,controller",
+            "KAFKA_LISTENERS": (
+                "PLAINTEXT://0.0.0.0:9092,INTERNAL://0.0.0.0:19092,CONTROLLER://localhost:9093"
+            ),
+            "KAFKA_ADVERTISED_LISTENERS": (
+                f"PLAINTEXT://127.0.0.1:{self._host_port},INTERNAL://{self.INTERNAL}"
+            ),
+            "KAFKA_INTER_BROKER_LISTENER_NAME": "INTERNAL",
+            "KAFKA_CONTROLLER_LISTENER_NAMES": "CONTROLLER",
+            "KAFKA_LISTENER_SECURITY_PROTOCOL_MAP": (
+                "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT"
+            ),
+            "KAFKA_CONTROLLER_QUORUM_VOTERS": "1@localhost:9093",
+            "KAFKA_AUTO_CREATE_TOPICS_ENABLE": "false",
+            "KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS": "1000",
+            "KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR": "1",
+            "KAFKA_TRANSACTION_STATE_LOG_MIN_ISR": "1",
+            "KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR": "1",
+            "KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS": "0",
+            # The smallest segment the broker allows, so a test's few megabytes
+            # roll several and size-bound retention has whole segments to drop.
+            "KAFKA_LOG_SEGMENT_BYTES": "1048576",
+        }
+        return [arg for k, v in env.items() for arg in ("-e", f"{k}={v}")]
+
+    def _exec(self, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["docker", "exec", self.container_id, *args],
+            capture_output=True, text=True, timeout=timeout, check=False,
+        )
+
+    def _probe(self) -> tuple[bool, str]:
+        """The broker answers metadata on its internal listener, and the host
+        port accepts TCP."""
+        import socket
+
+        probe = self._exec(
+            f"{self.BIN}/kafka-topics.sh", "--bootstrap-server", self.INTERNAL, "--list",
+            timeout=30,
+        )
+        if probe.returncode != 0:
+            return False, (probe.stderr or probe.stdout).strip()[-500:]
+        try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=2).close()
+        except OSError as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        return True, ""
+
+    def bootstrap(self) -> str:
+        """The `host:port` bootstrap list a client on the host connects to."""
+        return f"127.0.0.1:{self.dsn_port}"

@@ -4,6 +4,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_canonical_errors::context::FieldViolation;
 use toolkit_canonical_errors::resource_error;
 
+use crate::backend::BackendError;
 use crate::ids::{ConsumerGroupId, ProducerId, SubscriptionId};
 use crate::sequence::Sequence;
 
@@ -383,7 +384,7 @@ pub enum EventBrokerError {
     StreamingInProgress { detail: String },
 
     #[error("storage backend error")]
-    StorageBackend(#[from] StorageBackendError),
+    Backend(#[from] BackendError),
 
     #[error("offset manager error")]
     OffsetManager(#[from] OffsetManagerError),
@@ -688,7 +689,7 @@ impl From<EventBrokerError> for CanonicalError {
                     )
                     .create()
             }
-            EventBrokerError::StorageBackend(err) => CanonicalError::from(err),
+            EventBrokerError::Backend(err) => CanonicalError::from(err),
             EventBrokerError::OffsetManager(err) => CanonicalError::from(err),
             EventBrokerError::Transport(_) => CanonicalError::service_unavailable().create(),
             EventBrokerError::Internal(detail) => CanonicalError::internal(detail).create(),
@@ -764,7 +765,7 @@ impl From<CanonicalError> for EventBrokerError {
                         detail,
                     },
                     Some(resources::PARTITION) => {
-                        Self::StorageBackend(StorageBackendError::PartitionNotFound { detail })
+                        Self::Backend(BackendError::PartitionNotFound { detail })
                     }
                     _ => Self::Other { canonical },
                 }
@@ -870,7 +871,7 @@ impl From<CanonicalError> for EventBrokerError {
                         } else {
                             OutOfRange::AboveCeiling
                         };
-                        Self::StorageBackend(StorageBackendError::OffsetOutOfRange {
+                        Self::Backend(BackendError::OffsetOutOfRange {
                             floor: Sequence::NONE,
                             ceiling: Sequence::NONE,
                             breached,
@@ -953,23 +954,21 @@ fn expected_previous_from_detail(detail: &str) -> i64 {
         .unwrap_or_default()
 }
 
-impl From<StorageBackendError> for CanonicalError {
-    fn from(err: StorageBackendError) -> Self {
+impl From<BackendError> for CanonicalError {
+    fn from(err: BackendError) -> Self {
         match err {
-            StorageBackendError::Unavailable { .. }
-            // Unreachable in practice: a retention pass answers no request, so
-            // its failure has no client to be mapped for. Mapped alongside
-            // `Unavailable` rather than left to a catch-all so that adding a
-            // variant stays a compile error here.
-            | StorageBackendError::RetentionFailed { .. } => {
-                CanonicalError::service_unavailable().create()
-            }
-            StorageBackendError::InvalidConfig { detail, .. } => {
-                StorageResourceError::invalid_argument()
-                    .with_field_violation("backend_config", detail, reasons::INVALID_BACKEND_CONFIG)
-                    .create()
-            }
-            StorageBackendError::OffsetOutOfRange {
+            // A topic not provisioned yet, or held under another log id, is
+            // retried by the caller the same way as an unreachable medium:
+            // provisioning or an operator may still settle it.
+            BackendError::Unavailable { .. }
+            | BackendError::AppendFailed { .. }
+            | BackendError::ReadFailed { .. }
+            | BackendError::NotProvisioned { .. }
+            | BackendError::LogConflict { .. } => CanonicalError::service_unavailable().create(),
+            BackendError::InvalidConfig { detail, .. } => StorageResourceError::invalid_argument()
+                .with_field_violation("backend_config", detail, reasons::INVALID_BACKEND_CONFIG)
+                .create(),
+            BackendError::OffsetOutOfRange {
                 floor,
                 ceiling,
                 breached,
@@ -985,15 +984,12 @@ impl From<StorageBackendError> for CanonicalError {
                     breached.reason(),
                 )
                 .create(),
-            StorageBackendError::PartitionNotFound { detail, .. } => {
+            BackendError::PartitionNotFound { detail, .. } => {
                 PartitionResourceError::not_found(detail)
                     .with_resource(resources::PARTITION)
                     .create()
             }
-            StorageBackendError::PersistFailed { .. } | StorageBackendError::ReadFailed { .. } => {
-                CanonicalError::service_unavailable().create()
-            }
-            StorageBackendError::Internal(detail) => CanonicalError::internal(detail).create(),
+            BackendError::Internal(detail) => CanonicalError::internal(detail).create(),
         }
     }
 }
@@ -1033,46 +1029,6 @@ fn display_unseeded(unseeded: &[(String, u32)]) -> String {
     } else {
         shown
     }
-}
-
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum StorageBackendError {
-    #[error("backend unavailable: {reason}")]
-    Unavailable { reason: String, detail: String },
-
-    #[error("invalid backend config")]
-    InvalidConfig { detail: String },
-
-    /// A requested position is not one a cursor may hold in this partition.
-    ///
-    /// Carries the range the partition admits and which end was crossed, and
-    /// not the submitted value - see [`PositionViolation`] for why.
-    #[error("position outside the admissible range [{floor}, {ceiling}]")]
-    OffsetOutOfRange {
-        floor: Sequence,
-        ceiling: Sequence,
-        breached: OutOfRange,
-        detail: String,
-    },
-
-    #[error("partition not found")]
-    PartitionNotFound { detail: String },
-
-    #[error("persist failed: {reason}")]
-    PersistFailed { reason: String, detail: String },
-
-    #[error("read failed: {reason}")]
-    ReadFailed { reason: String, detail: String },
-
-    /// A retention pass could not be applied. Distinct from `PersistFailed`
-    /// because nothing a caller did produced it: retention runs on the broker's
-    /// own tick, so this never answers a request and never reaches a consumer.
-    /// A failed pass removes nothing and the next one has the same work to do.
-    #[error("retention pass failed: {reason}")]
-    RetentionFailed { reason: String, detail: String },
-
-    #[error("internal: {0}")]
-    Internal(String),
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -1248,7 +1204,7 @@ mod canonical_roundtrip_tests {
                 ],
                 detail: "out of range".to_owned(),
             },
-            EventBrokerError::StorageBackend(StorageBackendError::OffsetOutOfRange {
+            EventBrokerError::Backend(BackendError::OffsetOutOfRange {
                 floor: Sequence::assigned(10),
                 ceiling: Sequence::assigned(20),
                 breached: OutOfRange::AboveCeiling,

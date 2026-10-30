@@ -43,6 +43,8 @@ pub mod registry_service;
 pub mod retry;
 // The normalized field set all three reads project by (T22b, SPEC §10.2).
 pub mod selection;
+// Startup seeding of linked inventory and configured entities (T31, SPEC D6/D11).
+pub mod seeding;
 // Freshness validators for conditional exact reads (T22d, SPEC §8.5).
 pub mod validator;
 

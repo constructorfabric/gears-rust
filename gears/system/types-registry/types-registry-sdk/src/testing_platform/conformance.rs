@@ -5,6 +5,7 @@ use std::collections::BTreeSet;
 use std::num::NonZeroU8;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
+use toolkit_gts::gts_id;
 
 use serde_json::{Value, json};
 use toolkit_canonical_errors::{CanonicalError, InvalidArgument};
@@ -24,17 +25,17 @@ use crate::models::{
 
 const DRAFT: &str = "http://json-schema.org/draft-07/schema#";
 
-const BASE: &str = "gts.cf.core.conformance.base.v1~";
-const CHILD: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.child.v1~";
-const DOOMED: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.doomed.v1~";
-const INSTANCE: &str = "gts.cf.core.conformance.base.v1~cf.core.conformance.item.v1";
+const BASE: &str = gts_id!("cf.core.conformance.base.v1~");
+const CHILD: &str = gts_id!("cf.core.conformance.base.v1~cf.core.conformance.child.v1~");
+const DOOMED: &str = gts_id!("cf.core.conformance.base.v1~cf.core.conformance.doomed.v1~");
+const INSTANCE: &str = gts_id!("cf.core.conformance.base.v1~cf.core.conformance.item.v1");
 /// Never registered.
-const ABSENT: &str = "gts.cf.core.conformance.absent.v1~";
+const ABSENT: &str = gts_id!("cf.core.conformance.absent.v1~");
 
-const LISTED: &str = "gts.cf.core.listing.*";
-const LISTED_A: &str = "gts.cf.core.listing.a.v1~";
-const LISTED_B: &str = "gts.cf.core.listing.b.v1~";
-const LISTED_CHAINED: &str = "gts.cf.core.listing.a.v1~cf.core.listing.c.v1~";
+const LISTED_WILDCARD: &str = gts_id!("cf.core.listing.*");
+const LISTED_A: &str = gts_id!("cf.core.listing.a.v1~");
+const LISTED_B: &str = gts_id!("cf.core.listing.b.v1~");
+const LISTED_CHAINED: &str = gts_id!("cf.core.listing.a.v1~cf.core.listing.c.v1~");
 
 /// How long an accepted operation may take to complete.
 const COMPLETION: Duration = Duration::from_secs(30);
@@ -379,7 +380,7 @@ impl Checker<'_> {
 
     async fn listed(&self, filter: EntityFilter) -> BTreeSet<String> {
         let filter = EntityFilter {
-            pattern: Some(gts::GtsIdPattern::try_new(LISTED).expect("a valid pattern")),
+            pattern: Some(gts::GtsIdPattern::try_new(LISTED_WILDCARD).expect("a valid pattern")),
             ..filter
         };
         self.client
@@ -678,7 +679,9 @@ impl Checker<'_> {
     async fn a_cursor_resumes_only_the_query_that_issued_it(&self) {
         let first = ListEntitiesRequest {
             filter: EntityFilter {
-                pattern: Some(gts::GtsIdPattern::try_new(LISTED).expect("a valid pattern")),
+                pattern: Some(
+                    gts::GtsIdPattern::try_new(LISTED_WILDCARD).expect("a valid pattern"),
+                ),
                 ..EntityFilter::default()
             },
             page: PageRequest {
@@ -723,7 +726,7 @@ impl Checker<'_> {
             ListEntitiesRequest {
                 filter: EntityFilter {
                     pattern: Some(
-                        gts::GtsIdPattern::try_new("gts.cf.core.listing.a.*")
+                        gts::GtsIdPattern::try_new(gts_id!("cf.core.listing.a.*"))
                             .expect("a valid pattern"),
                     ),
                     ..EntityFilter::default()
@@ -815,7 +818,7 @@ impl Checker<'_> {
     }
 
     async fn an_idempotency_key_binds_one_request(&self) {
-        const KEYED: &str = "gts.cf.core.conformance.keyed.v1~";
+        const KEYED: &str = gts_id!("cf.core.conformance.keyed.v1~");
         let request = |publisher: PublisherContext| RegisterEntitiesRequest {
             items: vec![create(KEYED, root(KEYED, None))],
             dry_run: false,
@@ -936,7 +939,7 @@ impl Checker<'_> {
     }
 
     async fn dry_runs_preview_without_allocating_versions(&self) {
-        const PREVIEW: &str = "gts.cf.core.conformance.preview.v1~";
+        const PREVIEW: &str = gts_id!("cf.core.conformance.preview.v1~");
         self.a_dry_run_creation_previews(PREVIEW).await;
         let version = self.a_creation_reports_the_stored_version(PREVIEW).await;
         self.a_dry_run_reports_an_unchanged_update(PREVIEW, version)

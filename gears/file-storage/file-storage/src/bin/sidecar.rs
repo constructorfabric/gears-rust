@@ -31,12 +31,18 @@
 //! After a successful single-part `PUT` the sidecar posts a finalize callback to
 //! `POST {control_url}/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize`
 //! with the signed token and the size and SHA-256 it measured while streaming. It answers
-//! `200 OK` only if the callback succeeds; otherwise `502 Bad Gateway`, and the client
-//! retries (the backend write overwrites, so retrying is safe).
+//! `200 OK` only if the callback succeeds; otherwise `502 Bad Gateway`. The control plane's
+//! bind outcome is echoed on the `200` (`X-FS-Bound` + `ETag` / `X-FS-Current-ETag`).
+//!
+//! The blob is published create-exclusive and never overwritten. A retry finds the object
+//! already there (`created: false`) and still calls finalize: `200` on success, `409` if the
+//! control plane rejects it, `502` on transport failure or 5xx. With no control plane a replay
+//! gets `409` (nothing can confirm it matches); a first upload stays `200`.
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -56,7 +62,9 @@ use uuid::Uuid;
 
 use file_storage::domain::error::DomainError;
 use file_storage::domain::ports::FileStorageMetricsPort;
-use file_storage::infra::backend::{BackendRegistry, LocalFsBackend, S3Backend, StorageBackend};
+use file_storage::infra::backend::{
+    BackendRegistry, LocalFsBackend, PublishOutcome, S3Backend, StorageBackend, classify_io_error,
+};
 use file_storage::infra::content::{hash, range};
 use file_storage::infra::metrics::FileStorageMetricsMeter;
 use file_storage::infra::signed_url::{Claims, Op, Verifier};
@@ -309,10 +317,18 @@ fn extract_token(q: &TokenQuery, headers: &HeaderMap) -> Option<String> {
 
 /// `PUT` upload: verifies the token (op=PUT) and streams the body to the backend.
 ///
-/// The body is never buffered whole: `StorageBackend::put_stream` writes and hashes chunks
-/// as they arrive and aborts mid-stream once `claims.upload.max_size` is exceeded.
+/// The body is never buffered whole: `publish_exclusive` writes and hashes chunks as they
+/// arrive and aborts mid-stream once `claims.upload.max_size` is exceeded.
 /// `exact_size`/`expected_hash` are final only after the stream is drained, so they are
-/// checked after `put_stream` returns.
+/// checked after it returns.
+///
+/// A body read error is `400`, not a backend failure.
+///
+/// `created: false` means an earlier PUT with the same token already published the object
+/// (left untouched). The stored object is then read back and hashed, and finalize is called
+/// with this attempt's size/hash only if the stored bytes are this attempt's bytes. Different
+/// stored bytes, a control-plane rejection (4xx) or no control plane give `409` (this PUT took
+/// no effect); a failed read-back gives `500`; transport failure or 5xx gives `502`.
 async fn upload(
     State(state): State<SidecarState>,
     Path((file_id, version_id)): Path<(Uuid, Uuid)>,
@@ -346,36 +362,35 @@ async fn upload(
         }
     };
 
-    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
-        body.into_data_stream()
-            .map(|r| r.map_err(std::io::Error::other)),
-    );
-    let (bytes_written, digest) = match backend
-        .put_stream(&claims.backend_path, byte_stream, claims.upload.max_size)
-        .await
-    {
+    let outcome = match publish_upload_body(backend.as_ref(), &claims, body).await {
         Ok(v) => v,
-        // `Validation` here is only the mid-stream `max_size` guard.
-        Err(DomainError::Validation { .. }) => {
-            return (StatusCode::PAYLOAD_TOO_LARGE, "exceeds max_size").into_response();
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "backend put_stream failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
-        }
+        Err(rejection) => return rejection.into_response(),
     };
+    let (bytes_written, digest, created) = (outcome.bytes_written, outcome.digest, outcome.created);
 
     if claims
         .upload
         .exact_size
         .is_some_and(|exact| bytes_written != exact)
     {
-        return (StatusCode::BAD_REQUEST, "size does not match exact_size").into_response();
+        return reject_upload_bad_content(
+            backend.as_ref(),
+            &claims,
+            created,
+            "size does not match exact_size",
+        )
+        .await;
     }
     if let Some(expected) = &claims.upload.expected_hash {
         let got = format!("{}:{}", hash::ALGORITHM, hex::encode(digest));
         if !expected.eq_ignore_ascii_case(&got) {
-            return (StatusCode::BAD_REQUEST, "content hash mismatch").into_response();
+            return reject_upload_bad_content(
+                backend.as_ref(),
+                &claims,
+                created,
+                "content hash mismatch",
+            )
+            .await;
         }
     }
 
@@ -385,9 +400,17 @@ async fn upload(
     #[allow(clippy::cast_precision_loss)]
     state.metrics.record_ingress_bytes(bytes_written as f64);
 
+    if !created
+        && let Some(rejection) =
+            reject_unconfirmed_replay(&state, backend.as_ref(), &claims, digest).await
+    {
+        return rejection;
+    }
+
     // Tell the control plane the bytes landed (the signed token proves the upload was
     // pre-authorized); `claims.request_id` is echoed as `x-request-id` for log correlation.
-    if let Err(rejection) = finalize_with_control_plane(
+    // A converged replay gets the same echo as the original.
+    match finalize_with_control_plane(
         &state,
         &token,
         &claims.request_id,
@@ -398,17 +421,104 @@ async fn upload(
     )
     .await
     {
-        return rejection.into_response();
+        Ok(echo) => uploaded_response(&echo),
+        Err(rejection) => {
+            finalize_rejection_response(backend.as_ref(), &claims, created, rejection).await
+        }
     }
+}
 
-    (StatusCode::OK, "uploaded").into_response()
+/// Client response for a failed finalize.
+///
+/// - `400` (the control plane rejected the content): this request created the object, so it is
+///   deleted best-effort and the client gets `400` with the control plane's message; a corrected
+///   retry then succeeds. On a replay the object is already published, so it is `409`.
+/// - `404` (the version was deleted concurrently) with `created`: the object is deleted and the
+///   client gets `404`.
+/// - Any other status (`401`/`403`/`408`/`429`/`5xx`, transport): `502`, the object is kept
+///   (another sidecar may already have finalized it, e.g. during secret rotation), and a replay
+///   is never turned into `409`.
+async fn finalize_rejection_response(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    created: bool,
+    rejection: Rejection,
+) -> Response {
+    match rejection.control_plane_status {
+        Some(StatusCode::BAD_REQUEST) if !created => (
+            StatusCode::CONFLICT,
+            "content already published for this version",
+        )
+            .into_response(),
+        Some(StatusCode::BAD_REQUEST) => {
+            delete_created_object(backend, claims, "control plane rejected the upload").await;
+            (StatusCode::BAD_REQUEST, rejection.body).into_response()
+        }
+        Some(StatusCode::NOT_FOUND) if created => {
+            delete_created_object(backend, claims, "version no longer exists").await;
+            (StatusCode::NOT_FOUND, "version not found").into_response()
+        }
+        _ => rejection.into_response(),
+    }
+}
+
+/// Build the `200 uploaded` response, echoing the auto-bind outcome headers.
+fn uploaded_response(echo: &FinalizeEcho) -> Response {
+    let mut resp = (StatusCode::OK, "uploaded").into_response();
+    for (name, value) in [
+        ("x-fs-bound", &echo.bound),
+        ("etag", &echo.etag),
+        ("x-fs-current-etag", &echo.current_etag),
+    ] {
+        if let Some(v) = value
+            && let Ok(v) = HeaderValue::from_str(v)
+        {
+            resp.headers_mut().insert(name, v);
+        }
+    }
+    resp
+}
+
+/// Rejects an upload that failed the post-publish `exact_size`/`expected_hash` check with `400`,
+/// first deleting the object `publish_exclusive` wrote **iff this request created it** (a
+/// leftover would block a corrected retry until orphan cleanup). Deletion is best-effort; with
+/// `created == false` another request owns the object and nothing is deleted.
+async fn reject_upload_bad_content(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    created: bool,
+    reason: &'static str,
+) -> Response {
+    if created {
+        delete_created_object(backend, claims, reason).await;
+    }
+    (StatusCode::BAD_REQUEST, reason).into_response()
+}
+
+/// Best-effort delete of the object this request created, after the upload was rejected.
+async fn delete_created_object(backend: &dyn StorageBackend, claims: &Claims, reason: &str) {
+    if let Err(e) = backend.delete(&claims.backend_path).await {
+        tracing::warn!(
+            error = %e,
+            backend_path = %claims.backend_path,
+            reason,
+            "failed to clean up freshly-published object after rejection; \
+             the path stays occupied until the object is deleted \
+             (there is no cleanup job yet; deleting the version or file removes it)"
+        );
+    }
 }
 
 /// A failed upload step: the status and plain-text body the client receives. Kept small
 /// (unlike a built `Response`) to stay under `clippy::result_large_err`.
+#[derive(Debug)]
 struct Rejection {
     status: StatusCode,
     body: Cow<'static, str>,
+    /// Status of the control plane's finalize response, when the failure came from it.
+    control_plane_status: Option<StatusCode>,
+    /// `Retry-After` seconds for a transient failure (`503`).
+    retry_after_secs: Option<u32>,
 }
 
 impl Rejection {
@@ -416,13 +526,42 @@ impl Rejection {
         Self {
             status,
             body: body.into(),
+            control_plane_status: None,
+            retry_after_secs: None,
         }
+    }
+}
+
+/// `Retry-After` for a transient backend failure (matches `docs/api.md`).
+const BACKEND_RETRY_AFTER_SECS: u32 = 5;
+
+/// Maps a backend error to the client rejection and logs it: a transient failure
+/// (`DomainError::BackendUnavailable`) is `503` + `Retry-After` at `warn`; anything else is
+/// `500 "backend error"` at `error`. The backend's own text never reaches the client.
+fn backend_failure(e: &DomainError, what: &'static str) -> Rejection {
+    if matches!(e, DomainError::BackendUnavailable { .. }) {
+        tracing::warn!(error = %e, "{what} (transient)");
+        Rejection {
+            retry_after_secs: Some(BACKEND_RETRY_AFTER_SECS),
+            ..Rejection::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "backend temporarily unavailable, retry",
+            )
+        }
+    } else {
+        tracing::error!(error = %e, "{what}");
+        Rejection::new(StatusCode::INTERNAL_SERVER_ERROR, "backend error")
     }
 }
 
 impl IntoResponse for Rejection {
     fn into_response(self) -> Response {
-        (self.status, self.body).into_response()
+        let mut resp = (self.status, self.body).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            resp.headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from(secs));
+        }
+        resp
     }
 }
 
@@ -433,14 +572,56 @@ fn finalize_body(size: i64, hash_hex: &str) -> Vec<u8> {
         .into_bytes()
 }
 
+/// Auto-bind outcome from the finalize response, copied onto the sidecar's `200`; all `None` for
+/// manual-bind tokens.
+#[derive(Debug, Default, Clone)]
+struct FinalizeEcho {
+    bound: Option<String>,
+    etag: Option<String>,
+    current_etag: Option<String>,
+}
+
+/// Cap on the control plane's `400` body relayed to the client.
+const FINALIZE_REJECTION_BODY_MAX: usize = 1024;
+
+fn truncate_utf8(mut s: String, max: usize) -> String {
+    if s.len() > max {
+        let mut end = max;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
+    }
+    s
+}
+
+/// Client-facing text of a control-plane `400`: the `detail` of a problem+json body, else the
+/// raw text.
+fn rejection_detail(body_text: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(body_text)
+        .ok()
+        .and_then(|v| v.get("detail").and_then(|d| d.as_str().map(str::to_owned)))
+        .unwrap_or_else(|| body_text.to_owned())
+}
+
 async fn interpret_finalize_response(
     resp: reqwest::Response,
     file_id: Uuid,
     version_id: Uuid,
-) -> Result<(), Rejection> {
+) -> Result<FinalizeEcho, Rejection> {
     if resp.status().is_success() {
         tracing::debug!(%file_id, %version_id, "finalize callback succeeded");
-        return Ok(());
+        let hdr = |name: &str| {
+            resp.headers()
+                .get(name)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned)
+        };
+        return Ok(FinalizeEcho {
+            bound: hdr("x-fs-bound"),
+            etag: hdr("etag"),
+            current_etag: hdr("x-fs-current-etag"),
+        });
     }
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
@@ -450,8 +631,23 @@ async fn interpret_finalize_response(
         body = %body_text,
         "control-plane finalize callback returned error"
     );
-    // Status/body stay in the log: the control plane's raw error must not reach the client.
-    Err(Rejection::new(StatusCode::BAD_GATEWAY, "finalize failed"))
+    // The control plane's raw error stays in the log, except a `400`: it is the control plane
+    // judging the content (policy size, MIME, uploaded-object check) whose message is
+    // client-actionable and relayed by `upload` (capped). Every other status stays opaque.
+    let body = if status == StatusCode::BAD_REQUEST {
+        Cow::Owned(truncate_utf8(
+            rejection_detail(&body_text),
+            FINALIZE_REJECTION_BODY_MAX,
+        ))
+    } else {
+        Cow::Borrowed("finalize failed")
+    };
+    Err(Rejection {
+        status: StatusCode::BAD_GATEWAY,
+        body,
+        control_plane_status: Some(status),
+        retry_after_secs: None,
+    })
 }
 
 /// Max attempts (including the first) per callback POST. Only transport-level connect/timeout
@@ -520,9 +716,9 @@ async fn finalize_with_control_plane(
     version_id: Uuid,
     size: i64,
     hash_hex: &str,
-) -> Result<(), Rejection> {
+) -> Result<FinalizeEcho, Rejection> {
     if state.control_base_url.is_empty() {
-        return Ok(());
+        return Ok(FinalizeEcho::default());
     }
 
     let url = format!(
@@ -641,6 +837,99 @@ async fn report_part_with_control_plane(
     }
 }
 
+/// A replay (`created == false`) may finalize only once the stored bytes are confirmed to be
+/// this attempt's bytes: a still-`pending` version has no recorded hash for finalize to compare
+/// against. Returns the response that ends the request otherwise.
+async fn reject_unconfirmed_replay(
+    state: &SidecarState,
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    digest: [u8; 32],
+) -> Option<Response> {
+    // Without a control plane nothing can confirm the bytes match.
+    if state.control_base_url.is_empty() {
+        return Some(
+            (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+        );
+    }
+    match stored_digest(backend, &claims.backend_path).await {
+        Ok(stored) if stored == digest => None,
+        Ok(_) => Some(
+            (
+                StatusCode::CONFLICT,
+                "content already published for this version",
+            )
+                .into_response(),
+        ),
+        Err(e) => Some(
+            backend_failure(&e, "reading back the published object for a replay failed")
+                .into_response(),
+        ),
+    }
+}
+
+/// SHA-256 of the blob stored at `path`, streamed chunk by chunk.
+async fn stored_digest(backend: &dyn StorageBackend, path: &str) -> Result<[u8; 32], DomainError> {
+    let mut stream = backend.get_stream(path).await?;
+    let mut hasher = hash::Hasher::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| classify_io_error(backend.id(), &e))?;
+        hasher.update(&chunk);
+    }
+    Ok(hash::digest_to_array(hasher.finalize()))
+}
+
+/// Streams the upload body into the backend, create-exclusive. Mid-stream `max_size` is
+/// `413`; a body read error is `400` (the client's fault; backends drop their temp data when
+/// the stream fails, so nothing is published and nothing needs cleaning up).
+async fn publish_upload_body(
+    backend: &dyn StorageBackend,
+    claims: &Claims,
+    body: Body,
+) -> Result<PublishOutcome, Rejection> {
+    let (byte_stream, body_read_failed) = body_byte_stream(body);
+    match backend
+        .publish_exclusive(&claims.backend_path, byte_stream, claims.upload.max_size)
+        .await
+    {
+        Ok(v) => Ok(v),
+        // `Validation` here is only the mid-stream `max_size` guard.
+        Err(DomainError::Validation { .. }) => Err(Rejection::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "exceeds max_size",
+        )),
+        Err(e) if body_read_failed.load(Ordering::Acquire) => {
+            tracing::error!(error = %e, "upload body stream read failed");
+            Err(Rejection::new(StatusCode::BAD_REQUEST, "body read error"))
+        }
+        Err(e) => Err(backend_failure(&e, "backend publish_exclusive failed")),
+    }
+}
+
+/// Adapts a request body to the backend's byte stream. The returned flag is set when the
+/// stream fails reading the client's body, which tells a client-side failure (`400`) from a
+/// backend one (`500`) once the backend has folded the error into its own `DomainError`.
+fn body_byte_stream(
+    body: Body,
+) -> (
+    futures::stream::BoxStream<'static, std::io::Result<bytes::Bytes>>,
+    Arc<AtomicBool>,
+) {
+    let body_read_failed = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&body_read_failed);
+    let stream = body.into_data_stream().map(move |r| {
+        r.map_err(|e| {
+            flag.store(true, Ordering::Release);
+            std::io::Error::other(e)
+        })
+    });
+    (Box::pin(stream), body_read_failed)
+}
+
 /// Writes one multipart part, returning `(body_len, backend_etag, hash_hex)` or a terminal
 /// [`Rejection`].
 ///
@@ -648,7 +937,8 @@ async fn report_part_with_control_plane(
 /// (`claims.multipart.backend_handle`); the part is buffered, bounded by the token's exact
 /// `size` claim, because `UploadPart` needs the whole body up front. Other backends
 /// (local-fs) write each part as its own object `{backend_path}.part.{n}` via `put_stream`,
-/// and `complete_multipart_upload` assembles them.
+/// and `complete_multipart_upload` assembles them. On both paths a body read error is `400`,
+/// an oversized part `413` and a backend failure `500`.
 async fn write_multipart_part(
     backend: &dyn StorageBackend,
     claims: &Claims,
@@ -712,11 +1002,8 @@ async fn write_multipart_part_native(
     {
         Ok((etag, hash)) => Ok((body_len, etag, hex::encode(hash))),
         Err(e) => {
-            tracing::error!(error = %e, part_number, "backend native upload_part failed");
-            Err(Rejection::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backend error",
-            ))
+            tracing::warn!(part_number, "native upload_part failed");
+            Err(backend_failure(&e, "backend native upload_part failed"))
         }
     }
 }
@@ -729,10 +1016,7 @@ async fn write_multipart_part_offset_object(
     body: Body,
 ) -> Result<(u64, String, String), Rejection> {
     let part_path = format!("{}.part.{}", claims.backend_path, part_number);
-    let byte_stream: futures::stream::BoxStream<'_, std::io::Result<bytes::Bytes>> = Box::pin(
-        body.into_data_stream()
-            .map(|r| r.map_err(std::io::Error::other)),
-    );
+    let (byte_stream, body_read_failed) = body_byte_stream(body);
     let (body_len, part_hash) = match backend
         .put_stream(&part_path, byte_stream, Some(claims.multipart.size))
         .await
@@ -747,12 +1031,15 @@ async fn write_multipart_part_offset_object(
                 ),
             ));
         }
+        Err(e) if body_read_failed.load(Ordering::Acquire) => {
+            // The client's body broke, not the backend. `put_stream` drops its temp data and
+            // leaves the part object untouched, so an earlier good write of this part survives.
+            tracing::error!(error = %e, part_number, "part body stream read failed");
+            return Err(Rejection::new(StatusCode::BAD_REQUEST, "body read error"));
+        }
         Err(e) => {
-            tracing::error!(error = %e, part_number, "backend part write failed");
-            return Err(Rejection::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "backend error",
-            ));
+            tracing::warn!(part_number, "part object write failed");
+            return Err(backend_failure(&e, "backend part write failed"));
         }
     };
 
@@ -937,8 +1224,7 @@ async fn download(
         Ok(true) => {}
         Ok(false) => return (StatusCode::NOT_FOUND, "not found").into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "backend existence check failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
+            return backend_failure(&e, "backend existence check failed").into_response();
         }
     }
 
@@ -964,8 +1250,7 @@ async fn download_range(
     let total = match backend.size(path).await {
         Ok(n) => n,
         Err(e) => {
-            tracing::error!(error = %e, "backend size lookup failed");
-            return (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response();
+            return backend_failure(&e, "backend size lookup failed").into_response();
         }
     };
     let Some((start, end)) = r.resolve(total) else {
@@ -996,8 +1281,7 @@ async fn download_range(
         }
         Err(e) => {
             // Existence and range were already validated: a genuine I/O fault.
-            tracing::error!(error = %e, "backend get_range failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
+            backend_failure(&e, "backend get_range failed").into_response()
         }
     }
 }
@@ -1022,10 +1306,7 @@ async fn download_whole(
             }
             resp
         }
-        Err(e) => {
-            tracing::error!(error = %e, "backend get failed after existence check");
-            (StatusCode::INTERNAL_SERVER_ERROR, "backend error").into_response()
-        }
+        Err(e) => backend_failure(&e, "backend get failed after existence check").into_response(),
     }
 }
 

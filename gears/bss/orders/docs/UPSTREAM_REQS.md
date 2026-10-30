@@ -686,8 +686,7 @@ should align examples with `#[derive(ContractError)]`, canonical status/title se
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-upreq-event-broker-runtime`
 
 A production `EventBrokerApi` runtime **MUST** be available through `ClientHub` and support the
-managed chained producer protocol used by `event-broker-sdk::DbProducer`. Deployment **MUST**
-publish the actual topic partition count so Orders can configure and verify it before readiness.
+managed chained producer protocol used by `event-broker-sdk::DbProducer`.
 The integration gate **MUST** cover eager GTS schema preparation, producer registration/cursor
 recovery, accepted/duplicate outcomes, transient retry and permanent rejection.
 
@@ -696,7 +695,7 @@ recovery, accepted/duplicate outcomes, transient retry and permanent rejection.
 [ClientHub registration](../../../system/event-broker/event-broker/src/module.rs), as well as the
 managed producer and toolkit outbox. The SDK-only statement in the platform inventory is stale.
 Orders does not implement a broker or a private relay. This stable requirement now tracks actual
-runtime wiring, schema/partition readiness, deployment and real-provider conformance, not delivery
+runtime wiring, schema readiness, deployment and real-provider conformance, not delivery
 of a missing implementation crate. Doubles permit local development but cannot satisfy this gate.
 See the [selected integration contract](DESIGN.md#contract-01-event-platform-integration).
 
@@ -704,68 +703,14 @@ See the [selected integration contract](DESIGN.md#contract-01-event-platform-int
 Chained `DbProducer` and toolkit queue `bss-orders-events`; readiness requires every prerequisite
 (evidence). These platform findings remain open:
 
-- **Partition-count read capability (requested).** No Event Broker API reports the partition
-  count. `models::Topic` deliberately omits it because it is the broker's own configuration:
-  per topic, `TopicSettingsEntry.partitions`, falling back to the instance-less topic-type
-  entry and then `BUILT_IN_PARTITIONS` (8). `list_topic_segments` returns an empty manifest for
-  any partition index, and producer cursors list only partitions already written, so neither
-  can substitute, so startup cannot compare the counts. Event Broker maintainers are asked for
-  a broker-level partition-count capability: an authorized read of a topic's resolved partition
-  count (or the hint validation below), so that Orders startup can fail on a mismatch. **DESIGN
-  §3.7 is amended by D-205** to match the platform: Orders requires an explicit, non-defaulted
-  `events.broker_partitions` and never assumes the SDK default of 8; equality with the broker
-  deployment is a deployment gate of this requirement (S6-05), set from one source and verified
-  before release; startup **MUST** fail on a mismatch once the capability exists.
-- **Silent loss under a partition-count mismatch (defect report for Event Broker / SDK
-  maintainers; S2-08 gap review, 2026-10-06). Deferred escalation:** recorded at the user's
-  request to be raised with the Event Broker owners later; nothing has been filed externally. Reproduced by the Orders PostgreSQL probe
-  `a_wrong_declared_partition_count_silently_drops_events` against the real in-process broker:
-  the producer declares 3 partitions and the broker is configured with 4. Twelve sequential
-  committed events, each settled before the next, gave **8 stored, 2 dead-lettered and 2
-  acknowledged without being stored**, with no queue retry or error. The result is deterministic.
-  The S2-08 implementation report's figures (3 stored, 7 silently acknowledged) counted
-  before the broker's asynchronous ingest outbox had persisted accepted events and are
-  superseded. The control `a_matching_partition_count_stores_every_event` (4 declared, 4
-  configured) stores all 12 events, and every publish is a first-time `Accepted`. The mechanism
-  follows.
-  1. *Producer side.* `producer/partitioning.rs` computes
-     `partition_hint = murmur3(subject) % declared` and maps each hinted broker partition to one
-     toolkit outbox partition. The chained processor (`producer/outbox.rs`
-     `ProducerOutboxProcessor::cursor_for`/`refresh_cursor`) keys its cursor by that hint.
-     `meta.sequence` is the outbox partition's `OutboxMessage.seq`.
-  2. *Broker side.* Ingest ignores `meta.partition_hint`. It selects the partition from the
-     configured count and checks the chain per `(producer, topic, selected partition)`
-     (`event-broker/src/domain/ingest.rs`, `ProducerChainCheck`). Under a mismatch, one broker
-     chain is therefore fed by several producer chains whose sequences collide.
-  3. *Silent acknowledgement.* `ProducerChainCheck::decide`
-     (`event-broker/src/domain/idempotency.rs`) returns `DuplicateIgnore` whenever
-     `sequence == last`, without checking `previous` or event identity. A **different** event
-     whose sequence equals the head of the selected chain is answered `Duplicate` and never
-     stored. The SDK maps `Duplicate` to `MessageResult::Ok`. Observed: `seq=1, previous=-1`
-     and `seq=4, previous=2`, both answered `Duplicate`.
-  4. *Dead letters.* Other collisions get `SequenceViolation`. The SDK refreshes the cursor
-     of the *hinted* partition, republishes, and on a second violation rejects with "producer
-     outbox chained sequence divergence persisted after cursor refresh". Observed for `seq=7,
-     previous=6` and `seq=3, previous=2`.
-  5. *Latent second path.* `ProducerOutboxProcessor::handle_sequence_violation` acknowledges
-     `seq <= previous` as already sequenced without publishing. Under a mismatch, `previous`
-     is read from the wrong partition, so this path can also drop an event silently; this run
-     did not exercise it.
-
-  Without a mismatch, one broker chain is fed by exactly one outbox partition, in FIFO order.
-  A sequence equal to the head is then a genuine retry: Orders observed it in the lost-ack
-  tests, before and after a restart, with the same event ID and `meta.sequence`. The
-  defect class is therefore gated on the count mismatch, which nothing currently detects.
-  Requested fixes, owner Event Broker:
-  - a broker-level partition-count read, or broker validation of `partition_hint` against
-    the selected partition (refuse instead of re-routing);
-  - `DuplicateIgnore` only when `previous` also links as for the original append, or the
-    event ID matches;
-  - an SDK guard that never acknowledges without a positive broker answer for the same
-    event.
-
-  Any producer republication protocol (`upreq-event-broker-dead-letter-recovery`) must also
-  avoid the `seq <= previous` acknowledgement for a re-driven message.
+- **No partition count in the producer (D-205).** The SDK registers one producer id per
+  outbox partition, so each id carries exactly one sequence space, and the broker places each
+  event on a topic partition by its partition key (`/subject`). The producer neither declares
+  nor needs the topic's partition count, which is broker configuration alone. The Orders
+  PostgreSQL case `every_event_is_stored_whatever_the_broker_partition_count` runs twelve
+  sequential committed events against the real in-process broker with its Orders topic at three
+  partitions: all twelve are stored, every publish is a first-time `Accepted`, and no queue
+  retry, error or dead letter appears.
 - **PostgreSQL producer-registration defect (fixed in the owner).** The SDK's managed
   registration store bound `created_at`/`updated_at` as RFC 3339 text, which PostgreSQL refuses
   for its `TIMESTAMPTZ` columns, so no managed producer could register on PostgreSQL. SDK tests

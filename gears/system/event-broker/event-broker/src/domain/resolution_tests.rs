@@ -8,13 +8,25 @@ use std::time::Duration;
 use serde_json::json;
 use toolkit_gts::GtsInstanceId;
 
-use super::{Declaration, Source, resolve};
-use crate::config::{DEFAULT_RETENTION_DURATION, EventBrokerConfig};
+use super::{Declaration, EffectiveSettings, Source, Sourced};
+use crate::config::{DEFAULT_RETENTION_DURATION, EventBrokerConfig, TopicSettingsError, checks};
+use crate::domain::backend;
 
 const TOPIC_TYPE: &str = "gts.cf.core.events.topic.v1~";
 const USAGE_TOPIC: &str = "gts.cf.core.events.topic.v1~cf.billing.usage.topic.v1";
-const SQLITE_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+const MEMORY_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.memory.v1~";
 const POSTGRES_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.postgres.v1~";
+
+/// [`super::resolve`] against the routing `cfg` itself carries, the way the
+/// specification refresh calls it.
+fn resolve(
+    cfg: &EventBrokerConfig,
+    topic: &GtsInstanceId,
+    declared: &Declaration,
+) -> Result<EffectiveSettings, TopicSettingsError> {
+    let routing = checks::routing(cfg).expect("test configuration routes every topic");
+    super::resolve(cfg, &routing, topic, declared)
+}
 
 fn topic() -> GtsInstanceId {
     GtsInstanceId::try_new(USAGE_TOPIC).expect("test topic id is a valid GTS instance id")
@@ -23,7 +35,8 @@ fn topic() -> GtsInstanceId {
 fn config(topics: &serde_json::Value) -> EventBrokerConfig {
     serde_json::from_value(json!({
         "mode": "standalone",
-        "default_storage_backend": SQLITE_BACKEND,
+        "backends": { "main": { "type": MEMORY_BACKEND } },
+        "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
         "topics": topics.clone(),
     }))
     .expect("test configuration deserializes")
@@ -161,36 +174,46 @@ fn a_partition_count_reports_the_entry_that_supplied_it() {
     assert_eq!(from_topic.partitions().source(), Source::TopicEntry);
 }
 
+/// The backend is the route, never the entry's type or settings: the record
+/// is persisted, and an entry keyed by the topic's own identifier wins over the
+/// instance-less one (feature 0005 §2.2).
 #[test]
-fn a_backend_reports_the_entry_that_supplied_it_and_resolves_whole() {
-    let built_in =
-        resolve(&config(&json!({})), &topic(), &Declaration::default()).expect("resolves");
-    assert_eq!(built_in.backend().value().r#type.as_ref(), SQLITE_BACKEND);
-    assert!(built_in.backend().value().settings.is_empty());
-    assert_eq!(built_in.backend().source(), Source::BuiltIn);
+fn a_backend_is_the_registry_name_of_the_route_that_supplied_it() {
+    let cfg: EventBrokerConfig = serde_json::from_value(json!({
+        "mode": "standalone",
+        "backends": {
+            "main": { "type": MEMORY_BACKEND },
+            "audit": { "type": POSTGRES_BACKEND, "url": "postgres://eb:hunter2@db/eb" },
+        },
+        "backend_routing": { TOPIC_TYPE: "main", USAGE_TOPIC: "audit" },
+    }))
+    .expect("test configuration deserializes");
+    let other = GtsInstanceId::try_new("gts.cf.core.events.topic.v1~cf.billing.audit.topic.v1")
+        .expect("a valid GTS instance id");
 
-    let overridden = resolve(
-        &config(&json!({
-            TOPIC_TYPE: { "backend": { "type": SQLITE_BACKEND, "path": ":memory:" } },
-            USAGE_TOPIC: { "backend": { "type": POSTGRES_BACKEND, "host": "db-1" } },
-        })),
-        &topic(),
-        &Declaration::default(),
-    )
-    .expect("resolves");
+    let routed = resolve(&cfg, &topic(), &Declaration::default()).expect("resolves");
     assert_eq!(
-        overridden.backend().value().r#type.as_ref(),
-        POSTGRES_BACKEND
+        routed.backend(),
+        &Sourced::configured_for_topic(backend::Name::parse("audit").expect("a valid name"))
     );
+    let fallen_through = resolve(&cfg, &other, &Declaration::default()).expect("resolves");
     assert_eq!(
-        overridden.backend().value().settings,
-        json!({ "host": "db-1" })
-            .as_object()
-            .expect("an object literal")
-            .clone(),
-        "the block resolves whole, so the type default's `path` does not leak into it"
+        fallen_through.backend(),
+        &Sourced::configured_for_type(backend::Name::parse("main").expect("a valid name"))
     );
-    assert_eq!(overridden.backend().source(), Source::TopicEntry);
+
+    assert_eq!(
+        serde_json::to_value(&routed).expect("settings serialize"),
+        json!({
+            "partitions": { "value": 8, "source": "built_in" },
+            "retention": {
+                "value": { "duration": { "secs": 604_800, "nanos": 0 }, "size_bytes": null },
+                "source": "built_in",
+            },
+            "backend": { "value": "audit", "source": "topic_entry" },
+        }),
+        "the persisted record names the entry and nothing of its settings"
+    );
 }
 
 #[test]
@@ -203,7 +226,7 @@ fn a_partition_count_below_one_is_refused() {
     .expect_err("zero partitions cannot describe a partitioned topic");
     assert_eq!(
         err,
-        crate::config::TopicSettingsError::PartitionsOutOfRange {
+        TopicSettingsError::PartitionsOutOfRange {
             topic: USAGE_TOPIC.to_owned(),
             partitions: 0,
         }

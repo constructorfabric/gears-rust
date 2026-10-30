@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-oagw"
 description = "OAGW module - discovers and routes to plugins"
-version = "0.6.0"
+version = "0.6.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -88,7 +88,6 @@ lru = { workspace = true }
 futures-util = { workspace = true, features = ["sink"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util = { workspace = true }
-tokio-retry = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 # Upstream proxy engine (ADR-0019)

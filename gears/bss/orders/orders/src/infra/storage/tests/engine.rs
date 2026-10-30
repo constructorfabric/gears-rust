@@ -773,7 +773,7 @@ async fn internal(
     let found = scope::discover_orders(
         &t.env.db,
         &grant,
-        &token(from),
+        token(from),
         time::OffsetDateTime::now_utc() + time::Duration::days(1),
         100,
     )

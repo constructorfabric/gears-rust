@@ -145,12 +145,13 @@ pub async fn build_db(cfg: DbConnConfig, global: Option<&GlobalDatabaseConfig>) 
 /// `SeaORM` captures the callback by value at connect time, so it can't be
 /// attached later. Lets suites like `QueryRecorder` observe every statement.
 ///
-/// Gated behind the `test-support` feature; never used by production code.
+/// Available in this crate's unit tests or with the `test-support` feature
+/// for external test suites; never used by production code.
 ///
 /// # Errors
 ///
 /// Returns `DbError` under the same conditions as [`connect_db`].
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 pub async fn connect_db_with_metric_callback<F>(
     dsn: &str,
     opts: ConnectOpts,
@@ -614,7 +615,7 @@ impl DbHandle {
     /// **Test-only**: attach a `SeaORM` metric callback to the underlying
     /// connection. See [`connect_db_with_metric_callback`] for why this must
     /// run before the handle is wrapped into `Db`.
-    #[cfg(feature = "test-support")]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_metric_callback_for_testing<F>(&mut self, callback: F)
     where
         F: Fn(&sea_orm::metric::Info<'_>) + Send + Sync + 'static,

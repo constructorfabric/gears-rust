@@ -53,8 +53,14 @@ pub fn register_routes(
              override at the target tenant is flagged for review, still resolved values \
              with the flag beside them, paged and counted over the narrowed set; a named \
              key that is visible but not flagged is absent from it. The flagged rows of \
-             the target's subtree are `GET /settings-service/v1/settings/review`. Values \
-             are masked by classification.",
+             the target's subtree are `GET /settings-service/v1/settings/review`. `q` \
+             narrows the page to the settings whose declaration text or shown value \
+             contains it; a value masked for the caller never matches. Under `q`, a \
+             dependency that is unavailable for a setting whose value the caller could \
+             have matched answers 503, since the narrowing cannot be decided; a page \
+             already full still answers, with a cursor. A cursor continues only the \
+             listing it was minted for: bound to the $filter, the target tenant and `q`, \
+             it answers 400 under another. Values are masked by classification.",
         )
         .tag(TAG)
         .authenticated()
@@ -64,14 +70,24 @@ pub fn register_routes(
             false,
             "Target tenant id; omitted, the caller's own tenant",
         )
+        .query_param(
+            "q",
+            false,
+            "Free text that narrows the page: at least two and at most two hundred \
+             characters after trimming; keeps the settings whose key, display name, \
+             description, category name, Schema Default, effective value or fallback value \
+             contains it, case-insensitively; combines with $filter; the cursor is bound \
+             to it beside the $filter and the target, and a page it narrows carries no \
+             total_count",
+        )
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::browse_settings)
         .json_response_with_schema::<crate::api::rest::page_dto::PageDto<SettingItemDto>>(
             openapi,
             StatusCode::OK,
-            "A page of per-key outcomes with its pagination cursors and the total of \
-             settings the listing holds under its filter",
+            "A page of per-key outcomes with its pagination cursors and, unless q \
+             narrows it, the total of settings the listing holds under its filter",
         )
         .with_odata_filter::<SettingFilterField>()
         .with_odata_orderby::<crate::domain::odata::SettingOrderField>()

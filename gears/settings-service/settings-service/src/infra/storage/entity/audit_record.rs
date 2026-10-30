@@ -31,6 +31,11 @@ pub struct Model {
     pub actor: String,
     /// Whether the actor identity is `public` or `pii`, as the wire string of `ActorClassification`.
     pub actor_classification: String,
+    /// The tenant the actor acted from, set once at insert; `NULL` for a
+    /// machine act with no security context and on a record written before
+    /// the column existed.
+    #[sea_orm(nullable)]
+    pub actor_tenant_id: Option<Uuid>,
     /// The value before the operation, if any.
     #[sea_orm(nullable)]
     pub pre_value: Option<Json>,

@@ -40,7 +40,6 @@ pub enum ProducerIdempotencyOutcome {
 pub struct ProducerChainCheck {
     pub producer_id: Uuid,
     pub topic: GtsInstanceId,
-    pub partition: i32,
     /// The chained-mode link to the prior sequence. Collapsed to `0` when the
     /// producer omitted it - a monotonic producer never reaches here carrying
     /// it (the ingest path rejects that shape first), and monotonic checking
@@ -57,7 +56,7 @@ impl ProducerChainCheck {
     ///
     /// `stored_last` is the producer's current `last_sequence`, or `None` when no
     /// `producer_state` row exists yet (the first publish for this
-    /// `(producer, topic, partition)`, which always seeds and admits).
+    /// `(producer, topic)`, which always seeds and admits).
     ///
     /// This is the domain's decision, kept pure so it reads no state and performs
     /// no I/O: infra supplies the stored value and performs whatever write the
@@ -100,13 +99,13 @@ impl ProducerChainCheck {
 }
 
 /// Everything one publish hands to [`IdempotencyGuard::check_and_enqueue`]:
-/// the producer chain to check (absent in stateless mode), the topic
-/// partition the event was already stamped with, and the payload to enqueue.
+/// the producer chain to check (absent in stateless mode), the ingest outbox
+/// partition the event drains through, and the payload to enqueue.
 ///
-/// `topic_partition` is here because the enqueue needs it and the chain does
-/// not always carry it: a stateless publish has no chain at all, yet its event
-/// still belongs to one topic partition whose order has to be preserved
-/// through the outbox (`crate::domain::outbox::outbox_partition_for`).
+/// `ingest_partition` is derived from the topic and the event's partition key
+/// (`crate::domain::outbox::outbox_partition_for`), so every event of one key
+/// drains in publish order. Ingest never knows the topic partition: the
+/// storage backend assigns it.
 ///
 /// Built through [`PublishEnqueue::builder`] so the optional chain is named at
 /// the call site rather than passed as an `Option` argument.
@@ -115,9 +114,8 @@ impl ProducerChainCheck {
 pub struct PublishEnqueue {
     /// The producer chain to check, or `None` for a stateless publish.
     pub chain: Option<ProducerChainCheck>,
-    /// The partition of the *topic*, as `IngestService` stamped it - not an
-    /// outbox partition.
-    pub topic_partition: i32,
+    /// The ingest outbox partition, not a topic partition.
+    pub ingest_partition: u32,
     pub payload: Vec<u8>,
     pub payload_type: String,
 }
@@ -127,13 +125,13 @@ impl PublishEnqueue {
     /// the producer chain is the one optional part and is set on the builder.
     #[must_use]
     pub fn builder(
-        topic_partition: i32,
+        ingest_partition: u32,
         payload: Vec<u8>,
         payload_type: &str,
     ) -> PublishEnqueueBuilder {
         PublishEnqueueBuilder {
             chain: None,
-            topic_partition,
+            ingest_partition,
             payload,
             payload_type: payload_type.to_owned(),
         }
@@ -143,7 +141,7 @@ impl PublishEnqueue {
 #[domain_model]
 pub struct PublishEnqueueBuilder {
     chain: Option<ProducerChainCheck>,
-    topic_partition: i32,
+    ingest_partition: u32,
     payload: Vec<u8>,
     payload_type: String,
 }
@@ -161,7 +159,7 @@ impl PublishEnqueueBuilder {
     pub fn build(self) -> PublishEnqueue {
         PublishEnqueue {
             chain: self.chain,
-            topic_partition: self.topic_partition,
+            ingest_partition: self.ingest_partition,
             payload: self.payload,
             payload_type: self.payload_type,
         }
@@ -172,16 +170,19 @@ impl PublishEnqueueBuilder {
 pub trait IdempotencyGuard: Send + Sync {
     /// Checks `request.chain` (when present) against stored
     /// `evbk_producer_state.last_sequence`, and - on `Accept` - inserts
-    /// `request.payload` as one `toolkit-db` outbox row (design.md D5), all within
-    /// **one DB transaction**: lock/check `producer_state` -> insert the
-    /// outbox row -> update `producer_state` -> commit. That shared boundary is
+    /// `request.payload` as one `toolkit-db` outbox row, all within
+    /// **one DB transaction**: read the head and decide -> insert the outbox
+    /// row -> move the head with a compare-and-set against the head read ->
+    /// commit. A writer that moved the head first makes the compare-and-set
+    /// change nothing; the transaction then rolls back and runs again against
+    /// the new head, as it does on database contention (bounded, so a
+    /// persistent failure is still reported). That shared boundary is
     /// what makes check-and-record and the durable append atomic, and it is
     /// this method's own transaction, implemented by `infra::storage::
-    /// Storage`. The backend `persist()` call itself stays deliberately
-    /// **outside** this transaction (design.md D5's component-boundary
-    /// rule: "we always work with backend out-of-tx") - it happens later,
-    /// out-of-process from this call, when the background outbox processor
-    /// (`infra::outbox::IngestOutboxHandler`) leases and drains the row.
+    /// Storage`. The backend `append()` call stays deliberately **outside**
+    /// this transaction - the broker never works with a backend in-tx - and
+    /// happens later, when the background outbox processor
+    /// (`infra::workers::IngestOutboxHandler`) leases and drains the row.
     ///
     /// When `request.chain` is `None` (the publishing event carries no
     /// producer `meta`), no `producer_state` row is touched and the outcome

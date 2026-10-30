@@ -1,6 +1,7 @@
 //! Custom-metadata queries and the atomic patch operation.
 
 use time::OffsetDateTime;
+use toolkit_db::secure::TxConfig;
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -9,6 +10,7 @@ use file_storage_sdk::CustomMetadataPatch;
 
 use crate::domain::audit::AuditEntry;
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
 use crate::infra::storage::store::Store;
 
 impl Store {
@@ -43,7 +45,13 @@ impl Store {
         let patch_scope = scope.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let files = files.clone();
+                let metadata = metadata.clone();
+                let audit_repo = audit_repo.clone();
+                let patch_scope = patch_scope.clone();
+                let patch = patch.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
                     let bumped = files
                         .touch_meta(tx, &patch_scope, file_id, expected_meta_version, now)
