@@ -151,6 +151,8 @@ COLUMN bss.pricing_price change_kind text NOT NULL DEFAULT 'set'::text
 COLUMN bss.pricing_price closed_explicitly boolean NOT NULL DEFAULT false
 COLUMN bss.pricing_price created_at timestamp with time zone NOT NULL DEFAULT -
 COLUMN bss.pricing_price created_by uuid NOT NULL DEFAULT -
+COLUMN bss.pricing_price currency text NOT NULL DEFAULT -
+COLUMN bss.pricing_price currency_scale smallint NOT NULL DEFAULT -
 COLUMN bss.pricing_price dim_value text NULL DEFAULT -
 COLUMN bss.pricing_price effective_from date NOT NULL DEFAULT -
 COLUMN bss.pricing_price effective_to date NULL DEFAULT -
@@ -221,7 +223,6 @@ COLUMN bss.pricing_reference_op updated_at timestamp with time zone NOT NULL DEF
 COLUMN bss.pricing_settings created_at timestamp with time zone NOT NULL DEFAULT -
 COLUMN bss.pricing_settings currencies jsonb NOT NULL DEFAULT '[]'::jsonb
 COLUMN bss.pricing_settings default_gl text NULL DEFAULT -
-COLUMN bss.pricing_settings default_rounding text NOT NULL DEFAULT -
 COLUMN bss.pricing_settings default_tax_category text NULL DEFAULT -
 COLUMN bss.pricing_settings default_timing text NOT NULL DEFAULT -
 COLUMN bss.pricing_settings invoice_line_templates jsonb NOT NULL DEFAULT -
@@ -291,8 +292,10 @@ COLUMN public.event_broker_producer_registrations client_agent character varying
 COLUMN public.event_broker_producer_registrations created_at timestamp with time zone NOT NULL DEFAULT now()
 COLUMN public.event_broker_producer_registrations generation bigint NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations mode character varying(32) NOT NULL DEFAULT -
+COLUMN public.event_broker_producer_registrations outbox_partition bigint NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations producer_id uuid NOT NULL DEFAULT -
-COLUMN public.event_broker_producer_registrations registration_key character varying(1024) NOT NULL DEFAULT -
+COLUMN public.event_broker_producer_registrations queue character varying(255) NOT NULL DEFAULT -
+COLUMN public.event_broker_producer_registrations registration_key character varying(255) NOT NULL DEFAULT -
 COLUMN public.event_broker_producer_registrations updated_at timestamp with time zone NOT NULL DEFAULT now()
 CONSTRAINT bss.coord_leases coord_leases_pkey PRIMARY KEY (key)
 CONSTRAINT bss.pricing_acceptance pricing_acceptance_pkey PRIMARY KEY (tenant_id, id)
@@ -353,9 +356,11 @@ CONSTRAINT bss.pricing_price pricing_price_cancelled_unit_check CHECK (((state =
 CONSTRAINT bss.pricing_price pricing_price_change_kind_check CHECK ((change_kind = ANY (ARRAY['set'::text, 'cancel'::text, 'end'::text])))
 CONSTRAINT bss.pricing_price pricing_price_change_target_check CHECK (((change_kind = 'set'::text) = (target_price_id IS NULL)))
 CONSTRAINT bss.pricing_price pricing_price_check CHECK (((effective_to IS NULL) OR (effective_from < effective_to)))
+CONSTRAINT bss.pricing_price pricing_price_currency_check CHECK ((currency ~ '^[A-Z]{3}$'::text))
+CONSTRAINT bss.pricing_price pricing_price_currency_scale_check CHECK (((currency_scale >= 0) AND (currency_scale <= 28)))
 CONSTRAINT bss.pricing_price pricing_price_dim_value_check CHECK (((dim_value IS NULL) OR (dim_value <> ''::text)))
 CONSTRAINT bss.pricing_price pricing_price_eligibility_check CHECK ((eligibility = ANY (ARRAY['all'::text, 'new'::text])))
-CONSTRAINT bss.pricing_price pricing_price_min_fee_check CHECK ((min_fee ~ '^[0-9]+(\.[0-9]+)?$'::text))
+CONSTRAINT bss.pricing_price pricing_price_min_fee_check CHECK ((min_fee ~ '^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'::text))
 CONSTRAINT bss.pricing_price pricing_price_paired_price_id_fkey FOREIGN KEY (paired_price_id) REFERENCES bss.pricing_price(id)
 CONSTRAINT bss.pricing_price pricing_price_pending_unit_id_fkey FOREIGN KEY (pending_unit_id) REFERENCES bss.pricing_approval_unit(id)
 CONSTRAINT bss.pricing_price pricing_price_pkey PRIMARY KEY (id)
@@ -406,7 +411,7 @@ CONSTRAINT public.bss_pricing_outbox_processor bss_pricing_outbox_processor_pkey
 CONSTRAINT public.bss_pricing_outbox_trace bss_pricing_outbox_trace_pkey PRIMARY KEY (id)
 CONSTRAINT public.bss_pricing_outbox_vacuum_counter bss_pricing_outbox_vacuum_counter_partition_id_fkey FOREIGN KEY (partition_id) REFERENCES bss_pricing_outbox_partitions(id)
 CONSTRAINT public.bss_pricing_outbox_vacuum_counter bss_pricing_outbox_vacuum_counter_pkey PRIMARY KEY (partition_id)
-CONSTRAINT public.event_broker_producer_registrations event_broker_producer_registrations_pkey PRIMARY KEY (registration_key)
+CONSTRAINT public.event_broker_producer_registrations event_broker_producer_registrations_pkey PRIMARY KEY (registration_key, queue, outbox_partition)
 INDEX bss coord_leases_pkey CREATE UNIQUE INDEX coord_leases_pkey ON bss.coord_leases USING btree (key)
 INDEX bss idx_pricing_audit_actor CREATE INDEX idx_pricing_audit_actor ON bss.pricing_audit USING btree (tenant_id, actor_ref, written_at)
 INDEX bss idx_pricing_audit_subject CREATE INDEX idx_pricing_audit_subject ON bss.pricing_audit USING btree (tenant_id, subject_kind, subject_id, written_at)
@@ -461,7 +466,7 @@ INDEX public bss_pricing_outbox_partitions_queue_partition_key CREATE UNIQUE IND
 INDEX public bss_pricing_outbox_processor_pkey CREATE UNIQUE INDEX bss_pricing_outbox_processor_pkey ON public.bss_pricing_outbox_processor USING btree (partition_id)
 INDEX public bss_pricing_outbox_trace_pkey CREATE UNIQUE INDEX bss_pricing_outbox_trace_pkey ON public.bss_pricing_outbox_trace USING btree (id)
 INDEX public bss_pricing_outbox_vacuum_counter_pkey CREATE UNIQUE INDEX bss_pricing_outbox_vacuum_counter_pkey ON public.bss_pricing_outbox_vacuum_counter USING btree (partition_id)
-INDEX public event_broker_producer_registrations_pkey CREATE UNIQUE INDEX event_broker_producer_registrations_pkey ON public.event_broker_producer_registrations USING btree (registration_key)
+INDEX public event_broker_producer_registrations_pkey CREATE UNIQUE INDEX event_broker_producer_registrations_pkey ON public.event_broker_producer_registrations USING btree (registration_key, queue, outbox_partition)
 INDEX public idx_bss_pricing_outbox_dl_replayable CREATE INDEX idx_bss_pricing_outbox_dl_replayable ON public.bss_pricing_outbox_dead_letters USING btree (status, deadline) WHERE ((status)::text = ANY ((ARRAY['pending'::character varying, 'reprocessing'::character varying])::text[]))
 INDEX public idx_bss_pricing_outbox_dl_status_failed CREATE INDEX idx_bss_pricing_outbox_dl_status_failed ON public.bss_pricing_outbox_dead_letters USING btree (status, failed_at DESC)
 INDEX public idx_bss_pricing_outbox_incoming_body_id CREATE INDEX idx_bss_pricing_outbox_incoming_body_id ON public.bss_pricing_outbox_incoming USING btree (body_id)

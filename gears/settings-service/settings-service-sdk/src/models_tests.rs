@@ -1,4 +1,3 @@
-// Created: 2026-08-11 by Virtuozzo International GmbH
 //! Tests for the public SDK models.
 //!
 //! Acceptance criteria: FEATURE `gear-foundation.md` §6 — models serialize
@@ -122,4 +121,53 @@ fn a_reconcile_result_reports_refusals_per_key() {
     // A set that changed nothing serializes without an `errors` key at all.
     let quiet = serde_json::to_value(ReconcileResult::default()).expect("serializes");
     assert!(quiet.get("errors").is_none());
+}
+
+#[test]
+fn a_new_contributed_declaration_has_no_display_name() {
+    // The label is opt-in: a module that says nothing gets no label, never one
+    // derived from the key by the SDK.
+    use super::{ContributedDeclaration, ScopeClass};
+    let decl = ContributedDeclaration::new(
+        crate::SettingKey::contributed(
+            "cf",
+            "settings_demo",
+            "network",
+            "proxy_enabled",
+            std::num::NonZeroU32::new(1).expect("non-zero"),
+        )
+        .expect("key"),
+        "gts.cf.core.settings.type_bool_flag.v1~",
+        serde_json::json!(false),
+        ScopeClass::Cascading,
+    );
+    assert!(decl.display_name.is_none());
+}
+
+#[test]
+fn a_contributed_display_name_round_trips_and_is_omitted_when_none() {
+    // The key is camelCase like every other field of the contribution, and is
+    // absent rather than `null` when unset, so an old reader sees no change.
+    use super::{ContributedDeclaration, ScopeClass};
+    let mut decl = ContributedDeclaration::new(
+        crate::SettingKey::contributed(
+            "cf",
+            "settings_demo",
+            "network",
+            "proxy_enabled",
+            std::num::NonZeroU32::new(1).expect("non-zero"),
+        )
+        .expect("key"),
+        "gts.cf.core.settings.type_bool_flag.v1~",
+        serde_json::json!(false),
+        ScopeClass::Cascading,
+    );
+    let quiet = serde_json::to_value(&decl).expect("serializes");
+    assert!(quiet.get("displayName").is_none(), "{quiet}");
+
+    decl.display_name = Some("Proxy enabled".to_owned());
+    let wire = serde_json::to_value(&decl).expect("serializes");
+    assert_eq!(wire["displayName"], "Proxy enabled");
+    let back: ContributedDeclaration = serde_json::from_value(wire).expect("round-trips");
+    assert_eq!(back.display_name.as_deref(), Some("Proxy enabled"));
 }

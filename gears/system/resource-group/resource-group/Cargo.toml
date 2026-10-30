@@ -1,7 +1,7 @@
 # Created: 2026-04-16 by Constructor Tech
 [package]
 name = "cf-gears-resource-group"
-version = "0.4.5"
+version = "0.4.7"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -31,7 +31,7 @@ integration = []
 
 [dependencies]
 # SDK - public API, models, and errors
-resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.5", path = "../resource-group-sdk", features = ["odata"] }
+resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.6", path = "../resource-group-sdk", features = ["odata"] }
 
 # Core dependencies
 anyhow = { workspace = true }
@@ -64,11 +64,10 @@ sea-orm-migration = { workspace = true }
 thiserror = { workspace = true }
 
 # AuthZ
-authz-resolver-sdk = { workspace = true }
+authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 
 # GTS type system — types registry for schema resolution
 types-registry-sdk = { workspace = true }
-authz-resolver = { workspace = true }
 types-registry = { workspace = true }
 gts = { workspace = true }
 
@@ -84,6 +83,7 @@ toolkit-macros = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["metrics", "testing"] }
 # "test-support" enables `connect_db_with_metric_callback` and
 # `secure::in_transaction_for_testing`, which the DB-behaviour audit's

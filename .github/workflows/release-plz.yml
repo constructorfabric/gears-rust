@@ -49,6 +49,11 @@ jobs:
       contents: write
       # release-plz resolves PR numbers and contributors for changelogs and releases.
       pull-requests: read
+    # Exposed so the publish jobs below know what was released. `releases` is a JSON
+    # array of {package_name, tag, version}; empty when nothing was published.
+    outputs:
+      releases: ${{ steps.release-plz.outputs.releases }}
+      releases_created: ${{ steps.release-plz.outputs.releases_created }}
     steps:
       # No `ref:` needed. On push, checkout defaults to github.sha, which is exactly the
       # commit that was pushed — for a release PR merge, its merge commit.
@@ -93,7 +98,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -108,7 +113,8 @@ jobs:
       # build cannot be published.
 
       - name: release-plz release
-        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.3.155
+        id: release-plz
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.3.155
         with:
           command: release
         env:
@@ -163,7 +169,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -173,8 +179,62 @@ jobs:
           rustup show
 
       - name: release-plz release-pr
-        uses: release-plz/action@b8d6b54b02889ff2ae2bb82e8b57c3a8fc1683a5 # v0.3.155
+        uses: release-plz/action@8b5bf233ecb5779f63508db7cd050e948ee77cc2 # v0.3.155
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Share one build directory across release-plz tasks to save disk space.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target
+
+  # Publish the Docker image + Helm chart for each released, publishable gear, in this
+  # same run. Driven by release-plz's `releases` output, NOT by tag pushes: release-plz
+  # creates its tags with the default GITHUB_TOKEN, which cannot trigger tag/`push`
+  # workflows, and a release of >3 crates is suppressed by GitHub anyway. Reading the
+  # output sidesteps both. (Regular gears are publish=true; examples and flight-control
+  # are git_only — either way they appear in `releases`. The toolkit-platform umbrella
+  # isn't a crate, so it's published via workflow_dispatch on publish-artifacts.yml.)
+  plan-publish:
+    name: Plan publish
+    needs: release
+    if: needs.release.outputs.releases_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      any: ${{ steps.plan.outputs.any }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build publish matrix from released packages
+        id: plan
+        # Maps release-plz's `releases` to a {component, version} matrix of the
+        # released gears that are publishable; non-gear crates are skipped.
+        env:
+          RELEASES: ${{ needs.release.outputs.releases }}
+        run: python3 tools/scripts/resolve_release.py plan
+
+  publish:
+    name: Publish (${{ matrix.entry.component }} ${{ matrix.entry.version }})
+    needs: plan-publish
+    if: needs.plan-publish.outputs.any == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      # Cap concurrent publishes so a large release doesn't saturate runners.
+      max-parallel: 4
+      matrix:
+        entry: ${{ fromJSON(needs.plan-publish.outputs.matrix) }}
+    uses: ./.github/workflows/publish-artifacts.yml
+    with:
+      component: ${{ matrix.entry.component }}
+      version: ${{ matrix.entry.version }}
+      latest: true
+    secrets: inherit

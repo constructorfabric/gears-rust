@@ -1,6 +1,6 @@
 //! Real SQLite posting attempts: journal/cache/dedup/chain atomicity and provenance.
 use super::*;
-use crate::domain::model::{AccountRow, FiscalPeriodRow};
+use crate::domain::model::{AccountRow, CurrencyScaleRow, FiscalPeriodRow};
 use crate::infra::posting::retry::retry_transaction;
 use crate::infra::storage::entity::{
     account_balance, chain_state, idempotency_dedup, journal_entry,
@@ -23,6 +23,12 @@ pub(crate) fn money(text: &str, code: &str, scale: u8) -> PostedMoney {
 }
 
 pub(crate) async fn setup() -> (PostingService, Db, NewEntry, Vec<NewLine>) {
+    setup_in("EUR").await
+}
+
+/// The fixture in currency `code` at scale 2. A non-ISO code gets its registry row first:
+/// the registry is the only source of its scale.
+async fn setup_in(code: &str) -> (PostingService, Db, NewEntry, Vec<NewLine>) {
     let db = connect_db("sqlite::memory:", ConnectOpts::default())
         .await
         .unwrap();
@@ -35,12 +41,23 @@ pub(crate) async fn setup() -> (PostingService, Db, NewEntry, Vec<NewLine>) {
     let provider = DBProvider::new(db.clone());
     let reference = ReferenceRepo::new(provider.clone());
     let tenant = Uuid::now_v7();
+    if bss_money::iso_scale(code).is_none() {
+        reference
+            .upsert_currency_scale(CurrencyScaleRow {
+                tenant_id: tenant,
+                currency: code.to_owned(),
+                currency_scale: 2,
+                source: "test".to_owned(),
+            })
+            .await
+            .unwrap();
+    }
     let entry = NewEntry {
         entry_id: Uuid::now_v7(),
         tenant_id: tenant,
         legal_entity_id: tenant,
         period_id: "202610".to_owned(),
-        entry_currency: "EUR".to_owned(),
+        entry_currency: code.to_owned(),
         source_doc_type: SourceDocType::ManualAdjustment,
         source_business_id: "first".to_owned(),
         reverses_entry_id: None,
@@ -65,7 +82,7 @@ pub(crate) async fn setup() -> (PostingService, Db, NewEntry, Vec<NewLine>) {
                 tenant_id: tenant,
                 legal_entity_id: tenant,
                 account_class: class.as_str().to_owned(),
-                currency: "EUR".to_owned(),
+                currency: code.to_owned(),
                 revenue_stream: None,
                 normal_side: side.as_str().to_owned(),
                 may_go_negative: false,
@@ -82,7 +99,7 @@ pub(crate) async fn setup() -> (PostingService, Db, NewEntry, Vec<NewLine>) {
             account_class: class,
             gl_code: None,
             side,
-            money: money("1", "EUR", 2),
+            money: money("1", code, 2),
             invoice_id: None,
             due_date: None,
             revenue_stream: Some("test".to_owned()),
@@ -309,9 +326,11 @@ async fn single_attempt_rolls_back_seal_and_rebuilds_before_retry() {
 #[tokio::test]
 async fn historical_reversal_and_replay_use_stored_money_after_registry_change() {
     use crate::infra::storage::entity::currency_scale_registry;
-    use sea_orm::ActiveValue::Set;
-    use toolkit_db::secure::SecureInsertExt;
-    let (svc, db, entry, lines) = setup().await;
+    use sea_orm::{ColumnTrait, QueryFilter};
+    use toolkit_db::secure::SecureUpdateExt;
+    // A non-ISO code: the registry is the only source of its scale. (An ISO code
+    // keeps its ISO scale, so the registry cannot change it.)
+    let (svc, db, entry, lines) = setup_in("TKA").await;
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::allow_all();
     let posted = svc
@@ -320,16 +339,14 @@ async fn historical_reversal_and_replay_use_stored_money_after_registry_change()
         .unwrap();
     // Isolated SQLite fixture simulates changed authoritative configuration;
     // the public provisioning API correctly forbids this after a posting.
-    let row = currency_scale_registry::ActiveModel {
-        tenant_id: Set(entry.tenant_id),
-        currency: Set("EUR".to_owned()),
-        currency_scale: Set(3),
-        source: Set("test".to_owned()),
-    };
-    currency_scale_registry::Entity::insert(row.clone())
+    currency_scale_registry::Entity::update_many()
+        .col_expr(
+            currency_scale_registry::Column::CurrencyScale,
+            sea_orm::sea_query::Expr::value(3),
+        )
+        .filter(currency_scale_registry::Column::Currency.eq("TKA"))
         .secure()
-        .scope_with_model(&scope, &row)
-        .unwrap()
+        .scope_with(&scope)
         .exec(&db.conn().unwrap())
         .await
         .unwrap();

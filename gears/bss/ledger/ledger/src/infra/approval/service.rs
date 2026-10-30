@@ -1,4 +1,4 @@
-//! `ApprovalService` — the dual-control lifecycle engine (VHP-1852). Owns the
+//! `ApprovalService` — the dual-control lifecycle engine. Owns the
 //! `PENDING → APPROVED | REJECTED | NEEDS_REWORK | CANCELLED | EXPIRED` state
 //! machine, the `preparer ≠ approver` rule, and the same-transaction decision
 //! audit. It dispatches the governed mutation through an [`ApprovalExecutor`]

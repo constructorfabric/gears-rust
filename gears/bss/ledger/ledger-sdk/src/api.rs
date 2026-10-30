@@ -133,15 +133,16 @@ pub trait LedgerClientV1: Send + Sync {
         payer_tenant_id: Option<Uuid>,
     ) -> Result<Vec<ArInvoiceBalanceView>, CanonicalError>;
 
-    /// Provision a tenant's ledger: seed its chart of accounts, non-ISO
-    /// currency scales, fiscal-calendar config, and initial OPEN period in
-    /// one transaction. Idempotent and additive — a re-call leaves existing
-    /// rows untouched and reports them as "existing".
+    /// Provision a tenant's ledger: seed its chart of accounts, currency scales
+    /// (non-ISO codes; an ISO code only at its ISO scale), fiscal-calendar config,
+    /// and initial OPEN period in one transaction. Idempotent and additive — a
+    /// re-call leaves existing rows untouched and reports them as "existing".
     ///
     /// # Errors
     /// A [`CanonicalError`]: `InvalidArgument` on a malformed calendar / empty
-    /// seed or a non-ISO scale beyond the supported headroom; `PermissionDenied`
-    /// when the PEP denies; `Internal` on a storage failure.
+    /// seed or a scale row that gives an ISO 4217 code another scale than its ISO
+    /// scale; `PermissionDenied` when the PEP denies; `Internal` on a storage
+    /// failure.
     async fn provision(
         &self,
         ctx: &SecurityContext,

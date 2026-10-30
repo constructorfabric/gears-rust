@@ -11,6 +11,7 @@ import httpx
 
 
 GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
+PLATFORM_API = "types-registry/v2/platform"
 # Every request carries this valid W3C `traceparent`, so the wire `trace_id` the
 # canonical error layer echoes is deterministic. `extract_trace_id` prefers the
 # live OTel span, but the request span continues this inbound `traceparent`, so
@@ -19,8 +20,8 @@ GTS_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "gts")
 # the W3C spec's example ids.
 TRACE_ID = "0af7651916cd43dd8448eb211c80319c"
 TRACEPARENT = f"00-{TRACE_ID}-b7ad6b7169203331-01"
-# Everything a registration writes except `provenance`, whose implementation
-# versions are not a scenario claim. The default projection is document-free.
+# Origin and the documents a registration writes; `provenance` is asserted only
+# where a scenario makes a waiver claim. The default projection is document-free.
 ENTITY_SELECT = "origin,content,resolved_schema,effective_traits,effective_traits_schema"
 RFC3339 = re.compile(
     r"\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})"
@@ -288,26 +289,19 @@ def namespace_pattern(document):
     return f"gts.{vendor}.{package}.{namespace}.*"
 
 
-def provenance(compat_forced):
-    """A `provenance` group; implementation versions are not a scenario claim."""
-    return {
-        "gts_spec_version": "<gts_spec_version>",
-        "gts_impl_version": "<gts_impl_version>",
-        "compat_forced": compat_forced,
-    }
+def provenance(compatibility_check_skipped):
+    """A Type Schema's selected `provenance` group."""
+    return {"compatibility_check_skipped": compatibility_check_skipped}
 
 
 def _entity(body):
-    """Mask what a test cannot predict: timestamps and implementation versions."""
+    """Mask what a test cannot predict: timestamps."""
     body = deepcopy(body)
     origin = body.get("origin")
     if origin is not None:
         assert timestamp(origin["created_at"]) <= timestamp(origin["updated_at"]), body
         origin["created_at"] = "<created_at>"
         origin["updated_at"] = "<updated_at>"
-    if "provenance" in body:
-        for field in ("gts_spec_version", "gts_impl_version"):
-            replace_text(body["provenance"], field)
     return body
 
 

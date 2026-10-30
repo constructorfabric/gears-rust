@@ -18,17 +18,29 @@
   intermediate arithmetic (thirds stay thirds). Narrow to money with
   `into_posted_exact` (must land on the grid) or `round_half_even` (one rounding, ties
   to even). `exact::sum_posted` adds postings of one currency and scale exactly.
+  `numer` / `denom` read the reduced fraction and `from_parts` builds one from two
+  integers; `canonical_fraction` writes the `{numerator, denominator}` integer strings
+  of the wire, storage and hashes, and `parse_fraction` reads back only that form.
+  `parse_decimal` reads a decimal of up to 60 integer and 28 fractional digits, wider
+  than `Decimal`; `ceil` and `floor` give whole numbers for declared business rounding.
+  `exact::BigInt` re-exports the integer type.
 - `allocate::allocate(total, weights, Residual)` (feature `exact`) — proportional
   shares rounded once each, with the exact residual assigned to the last or the largest
   slot.
+- `iso_scale(code)` — the ISO 4217 minor-unit scale of an active currency code (`EUR` 2,
+  `JPY` 0, `KWD` 3, `CLF` 4), or `None` for a code with no minor unit (`XAU`, `XXX`), a
+  lowercase or malformed code, or any non-ISO code. Every code is listed explicitly; there
+  is no default scale.
 - `serde_text` (feature `serde`) — `#[serde(with = "bss_money::serde_text")]` for a
   `Decimal` field stored or sent as canonical text; `serde_text::option` for
   `Option<Decimal>`.
 
 ## What it does not do
 
-- It holds no currency table. A gear takes scales from its registry or provisioning and
-  builds `CurrencySpec` from them.
+- It keeps no per-tenant currency registry. An ISO code always takes its `iso_scale`;
+  a gear's registry, provisioning or config row serves only a code for which `iso_scale`
+  gives `None`, and never overrides an ISO scale. The gear builds `CurrencySpec` from the
+  result. A code with no ISO 4217 minor-unit scale and no row has no implicit scale.
 - It does not choose when to round. Each gear names its rounding points and calls
   `round_half_even` there; everything else stays exact.
 - It carries no REST or storage types. Gears wrap `PostedMoney` in their own DTOs and

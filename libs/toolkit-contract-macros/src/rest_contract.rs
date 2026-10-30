@@ -303,6 +303,7 @@ fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
 fn generate_binding_fn(model: &RestContractModel, support: &TokenStream) -> TokenStream {
     let trait_name_snake = to_snake_case(&model.trait_ident.to_string());
     let fn_ident = format_ident!("{}_http_binding", trait_name_snake);
+    let static_fn_ident = format_ident!("__{}_http_binding", trait_name_snake);
     let trait_doc = format!("Build the HTTP binding IR for [`{}`].", model.trait_ident);
     let base_path = &model.base_path;
 
@@ -312,15 +313,21 @@ fn generate_binding_fn(model: &RestContractModel, support: &TokenStream) -> Toke
         .map(|m| build_method_binding(m, support));
 
     quote! {
-        #[doc = #trait_doc]
-        #[must_use]
-        pub fn #fn_ident() -> #support::ir::binding::HttpBindingIr {
-            #support::ir::binding::HttpBindingIr {
+        fn #static_fn_ident() -> &'static #support::ir::binding::HttpBindingIr {
+            static BINDING: ::std::sync::OnceLock<#support::ir::binding::HttpBindingIr> =
+                ::std::sync::OnceLock::new();
+            BINDING.get_or_init(|| #support::ir::binding::HttpBindingIr {
                 base_path: #base_path.to_owned(),
                 methods: vec![
                     #(#method_entries),*
                 ],
-            }
+            })
+        }
+
+        #[doc = #trait_doc]
+        #[must_use]
+        pub fn #fn_ident() -> #support::ir::binding::HttpBindingIr {
+            #static_fn_ident().clone()
         }
     }
 }
@@ -725,7 +732,7 @@ fn generate_client_method(
     support: &TokenStream,
 ) -> TokenStream {
     let trait_snake = to_snake_case(&trait_ident.to_string());
-    let binding_fn = format_ident!("{}_http_binding", trait_snake);
+    let binding_fn = format_ident!("__{}_http_binding", trait_snake);
     let method_name_str = method.ident.to_string();
     let method_ident = &method.ident;
 
@@ -1572,24 +1579,18 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
         },
     };
 
-    // Auth axis. `.anonymous()` lands in `LicenseSet` on its own, so
-    // `.no_license_required()` must NOT follow it — that method only exists on
-    // `LicenseNotSet`. `.authenticated()` leaves the license state unset, hence
-    // the pairing.
-    //
-    // A platform-plane method (`PlatformSecurityContext` marker) is authorized
-    // by the platform-plane `internal_auth_middleware` (which validates the
-    // `X-ToolKit-Internal-Token` and inserts the `Extension<PlatformSecurityContext>`
-    // the handler reads) — NOT by the tenant-plane `security_context_middleware`.
-    // `.authenticated()` would demand a tenant JWT and 401 a legitimate
-    // internal-token caller before the handler runs, so the tenant auth axis
-    // must be left off (`.anonymous()`) until `OperationBuilder` grows a
-    // dedicated platform axis (`cpt-cf-adr-two-plane-auth`).
+    // `.anonymous()` already transitions to `LicenseSet`, so `.no_license_required()`
+    // must not follow it: that method is only available in `LicenseNotSet`.
+    // `.authenticated()` and `.platform_authenticated()` leave the license state unset,
+    // so both need the explicit `.no_license_required()` decision below.
+    // Platform takes precedence; the parser rejects #[anonymous] on that plane.
     let is_platform_plane = method
         .params
-        .iter()
-        .any(|p| is_platform_security_context_type(&p.ty));
-    let auth_registration = if method.anonymous || is_platform_plane {
+        .first()
+        .is_some_and(|p| is_platform_security_context_type(&p.ty));
+    let auth_registration = if is_platform_plane {
+        quote! { .platform_authenticated().no_license_required() }
+    } else if method.anonymous {
         quote! { .anonymous() }
     } else {
         quote! { .authenticated().no_license_required() }

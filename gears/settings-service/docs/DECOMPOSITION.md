@@ -166,7 +166,8 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - `key` validation rejecting `/` and enforcing the 1..128 bound; `key` refused on update rather than merely discouraged, because an in-place change would re-key every declaration filed under it with nothing left pointing at the old name
   - No-orphan deletion returning `409 CategoryNotEmpty` while any declaration references the category, including `retired` declarations
   - `If-Match` and ETag optimistic concurrency on `PATCH` and `DELETE`
-  - Domain-filtered, visibility-gated, paginated list ordered by `sort_order` then `name`
+  - Domain-filtered, visibility-gated, paginated list ordered by `sort_order` then `name`, with `$orderby` over `key`, `name` and `sort_order` and `$filter` over `sort_order` beside the other fields
+  - Per-category setting counts (`setting_count`, `advanced_count`, `retired_count`) on the list and the single read, counted under the caller's own browse predicate and gated by the value `read`; `total_count` on every listing of the gear (DESIGN §4.3)
   - Category mutations audited at platform scope — the root tenant's id — through the emitter of 2.1
   - `idx_categories_name_trgm` GIN trigram index on `name`, supporting search in a later wave
 
@@ -220,7 +221,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Rejecting a non-empty `default_value` on a secret-trait type
   - The two people-gating flags: `requires_step_up`, defaulting to the protective `true`, and `anonymous_exposable`, defaulting to `false` and refused — in the handler and by a schema check — on a `secret` or `pii` classification
   - The mutation-class discipline: descriptive metadata immediate under `update` plus `If-Match`; behavior-affecting fields (`default_value`, value type, `scope_class`) immutable and rejected with `400`; retire and reactivate immediate but step-up gated through the port delivered in 2.1 and bound in 2.8; classification tightening immediate, loosening step-up gated; clearing `requires_step_up` or enabling `anonymous_exposable` step-up gated whatever the flag currently says
-  - Retire as soft-delete setting `status = retired`, retaining values in `setting_values` while excluding them from resolution, with re-declare-to-revive recovery and evolve-by-re-declaring to the next free major on the same version-stripped path
+  - Retire as soft-delete setting `status = retired`, retaining values in `setting_values` while excluding them from resolution, with re-declare-to-revive recovery, a read-only report of the retained values a revive would bring back, and evolve-by-re-declaring to the next free major on the same version-stripped path
   - Dependency Group and cross-setting constraint **declaration**
   - Declaration REST surface, visibility- and domain-gated with the predicate applied inside the query, returning the `key`, its `value_type_id`, and resolved traits for client rendering, and leaving the seam through which the licence predicate joins in R2
 
@@ -257,6 +258,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **API**:
   - POST /settings-service/v1/declarations
+  - POST /settings-service/v1/declarations/revival-preview
   - GET /settings-service/v1/declarations
   - GET /settings-service/v1/declarations/{id}
   - PATCH /settings-service/v1/declarations/{id}
@@ -330,7 +332,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - Batched resolution sharing one ancestry walk per scope, with independent per-key outcomes so a mixed batch never fails wholesale — the bulk read by category or by key set, a key the caller may not see or that does not exist reported in its own entry
   - Needs-review fallthrough: a flagged override is skipped rather than served, resolution continues to the nearest valid ancestor or the Schema Default, and the flagged override stays visible to administrators
   - Distinct not-found outcomes: a stale key after a category rename resolves as `NotFound` with no tombstone or alias, while a retired declaration resolves as the distinct `Retired`
-  - The administrative read surface over the resolver: `GET …/settings/{key}` with source, trail, leak-safe recency, the scope's own review flag and the value state tag in `ETag`; `GET …/settings` by category or key set with per-key outcomes, and the needs-review listing over the caller's subtree; hidden settings absent, standalone descendants outside the subtree, values masked by classification
+  - The administrative read surface over the resolver: `GET …/settings/{key}` with source, trail, leak-safe recency, the scope's own review flag and the value state tag in `ETag`; `GET …/settings` by category or key set with per-key outcomes; `$filter=needs_review eq true` narrowing browse to the settings whose own override at the target is flagged; `GET …/settings/review` listing every flagged override across the target's subtree, one item per setting and tenant, bounded by the subtree budget and paged by cursor over the flagged rows; hidden settings absent, standalone descendants outside the subtree, values masked by classification
   - The in-process `SettingsReaderClient` over the resolver, registered into `ClientHub` at init, with no REST contract published and startup refused on a remote binding while the release is Embedded-only
   - Revert-to-default resolution semantics, with the Schema Default independent of any override and never destroyed by setting or clearing one
   - Cache `get`, `populate`, and `invalidate` keyed by `(key, scope)`, with key-wide eviction for cascading declarations so descendants re-resolve lazily
@@ -348,6 +350,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
   - [x] `p1` - `cpt-cf-settings-service-fr-cascading-inheritance`
   - [ ] `p2` - `cpt-cf-settings-service-fr-defaults-revert`
   - [x] `p1` - `cpt-cf-settings-service-fr-bulk-effective-read`
+  - [x] `p1` - `cpt-cf-settings-service-fr-typed-value-validation` (the needs-review narrowing and the review listing; the validation itself is 2.4's)
   - [ ] `p1` - `cpt-cf-settings-service-nfr-performance-read-cache`
   - [x] `p1` - `cpt-cf-settings-service-nfr-efficiency-live-read`
 
@@ -370,7 +373,7 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - **API**:
   - GET /settings-service/v1/settings/{key}?tenant={tenant_id}
-  - GET /settings-service/v1/settings?tenant={tenant_id} (bulk by category or key set, browse)
+  - GET /settings-service/v1/settings?tenant={tenant_id} (bulk by category or key set, browse; items carry the `mode` tag and `display_name` when set)
   - SDK `SettingsReaderClient` in-process read path (`get_effective`, `get_effective_bulk`)
 
 - **Sequences**:
@@ -643,14 +646,14 @@ One requirement is counted as covered while being split across releases: `cpt-cf
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-feature-search-discoverability`
 
-- **Purpose**: Let an administrator reach any setting from one query — by key, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
+- **Purpose**: Let an administrator reach any setting from one query — by key, display name, description, category name, Schema Default or an explicitly set override — without learning the category tree, with the corpus filtered by classification and authorization before matching so that no secret or unentitled PII content is discoverable through a match, a count or a hit.
 
 - **Depends On**: `cpt-cf-settings-service-feature-value-resolution`, `cpt-cf-settings-service-feature-tenant-access`, `cpt-cf-settings-service-feature-category-management`
 
 - **Scope**:
-  - `GET /settings-service/v1/search?q=…&tenant=…` with `limit`/`cursor`: one page query over active declarations ordered by key, matching key, description, category name (subquery), Schema Default within the corpus, or an override within the corpus at the target's non-standalone subtree (subquery); one query for the page's matching overrides
+  - `GET /settings-service/v1/search?q=…&tenant=…` with `limit`/`cursor`: one page query over active declarations ordered by key, matching key, display name, description, category name (subquery), Schema Default within the corpus, or an override within the corpus at the target's non-standalone subtree (subquery); one query for the page's matching overrides
   - The corpus rule of DESIGN §4.2 *Search*: `secret` never (`secret_ref IS NULL` and classification predicate), `pii` only with `read_unmasked`, JSON `null` defaults excluded, the same predicate in both queries so the split trigram index pairs of §4.7 serve them on PostgreSQL
-  - Hits: declaration-level for key/description/category/default with the first matching field in that order; one per matching override with its tenant and scope; values masked by classification; `mode` as a tag
+  - Hits: declaration-level for key/display name/description/category/default with the first matching field in that order; one per matching override with its tenant and scope; values masked by classification; `mode` as a tag and `display_name` when set
   - Browse's gates reused: `read` on the value resource as the secure scope, target within the subtree and not standalone, domain visibility, `hidden` excluded
   - Dialect chosen at gear init from the database in use: `ILIKE` over the indexed expressions on PostgreSQL, `LIKE` with identical escaping on SQLite
   - Cursor bound to `(q, target, corpus)` so a continuation cannot be replayed against another search
@@ -716,4 +719,4 @@ cpt-cf-settings-service-feature-typed-value-validation ─→ cpt-cf-settings-se
 
 **Order of delivery within the waves.** Declarations reach the platform through two doors, and only one of them is on the critical path: gears contribute theirs through the SDK (2.10), administrators author theirs through `POST /settings-service/v1/declarations` (the write flows of 2.3). Set and read of values need declarations to exist, not an administrative way to author them, so the sequence that reaches a working value path soonest is: the `setting_type` base registered at init (2.1, step 9 of gear init), the Type Validator and the `setting_values` table (2.4), the reconciler (2.10), the read surface and the in-process reader (2.5), the audit store (2.6), the write path (2.8) — with tenant access (2.7) entering as its absent-row semantics first, which is `overridable` for everyone, and its endpoints after. The administrative declaration writes of 2.3 follow; their read surface is already in place.
 
-**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag rides every browse item and search hit. R2 then waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings, the anonymous read route, and the replica broadcast need nothing outside this gear and the broker it already publishes to.
+**What unblocks next**: 2.10 and 2.11 complete R1 — 2.11 carries cross-field search, and the `mode` tag, with `display_name` when set, rides every browse item and search hit. R2 then waits on the platform — verified machine caller identity for the out-of-process profiles and the service-write SDK path, the platform-wide elevated session behind the existing `StepUpVerifier` port, the platform Audit Subsystem behind the existing `AuditSink` port, the tenant-deleted signal, and per-feature licence entitlement — while file-valued settings, the anonymous read route, and the replica broadcast need nothing outside this gear and the broker it already publishes to.

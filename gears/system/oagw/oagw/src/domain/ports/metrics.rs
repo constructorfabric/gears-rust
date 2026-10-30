@@ -77,6 +77,27 @@ pub trait OagwMetricsPort: Send + Sync {
     /// Recorded once per session at bridge teardown. Uses coarser bucket
     /// boundaries than the request histogram (sessions live seconds → hours).
     fn record_websocket_session_duration_seconds(&self, host: &str, seconds: f64);
+
+    /// `{prefix}_rate_limit_buckets_evicted_total` — counter, and
+    /// `{prefix}_rate_limit_buckets` — gauge.
+    ///
+    /// Recorded on every idle-bucket sweep: the buckets it evicted and the
+    /// buckets still held in memory afterwards.
+    fn record_rate_limit_sweep(&self, evicted: u64, live: u64);
+
+    /// `{prefix}_registry_provisioning_failures_total` — counter
+    ///
+    /// One registry instance the reconcile skipped (`kind` `upstream` or
+    /// `route`, `reason` from [`super::metric_labels::provisioning_reason`]),
+    /// or a dropped upstream it kept because routes still use it
+    /// (`kept_in_use`).
+    fn record_registry_provisioning_failure(&self, kind: &str, reason: &str);
+
+    /// `{prefix}_registry_provisioning_runs_total` — counter
+    ///
+    /// One reconcile run, by `outcome` from
+    /// [`super::metric_labels::provisioning_outcome`].
+    fn record_registry_provisioning_run(&self, outcome: &str);
 }
 
 /// No-op implementation for tests and contexts where metrics are disabled.
@@ -95,4 +116,7 @@ impl OagwMetricsPort for NoopMetrics {
     fn increment_active_websocket_sessions(&self, _: &str) {}
     fn decrement_active_websocket_sessions(&self, _: &str) {}
     fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+    fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+    fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
+    fn record_registry_provisioning_run(&self, _: &str) {}
 }

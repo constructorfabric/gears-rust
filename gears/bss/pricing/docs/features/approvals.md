@@ -87,7 +87,7 @@ Holding multiple permissions never bypasses separation of duties.
 - [ ] `p1` - **ID**: `cpt-cf-bss-pricing-algo-approvals-submit-unit`
 
 1. [ ] - `p1` - Resolve replay before any work; collect selected business content with every item author and the common date. - `inst-approvals-submit-unit-1`
-2. [ ] - `p1` - Validate submit, pair completeness, each temporary's return against the approved chain on its shifted end (PAIR_RETURN_STALE, D-391), uncrossed temporary windows (PRICE_INSIDE_TEMPORARY, TEMPORARY_SPANS_A_CHANGE, D-406), chain rules and ownership; red checks return 400 with their code and no unit. - `inst-approvals-submit-unit-2`
+2. [ ] - `p1` - Validate submit, pair completeness, each temporary's return against the approved chain on its shifted end (PAIR_RETURN_STALE, D-391), uncrossed temporary windows (PRICE_INSIDE_TEMPORARY, TEMPORARY_SPANS_A_CHANGE, D-406), each draft's stored currency scale against the currency table's today (409 CURRENCY_SCALE_CHANGED, or 409 BOOK_CURRENCY_INVALID when the table no longer lists the book's currency; a cancel or end row is not judged, D-531), chain rules and ownership; every refusal answers with its code (400 for a rule, 409 for a conflict) and writes no unit. - `inst-approvals-submit-unit-2`
 3. [ ] - `p1` - Read kind quorum or tenant default (missing default is fail-safe one), insert unit/items and acquire ordered conditional ownership. - `inst-approvals-submit-unit-3`
 4. [ ] - `p1` - Write submission audit; if quorum is zero, apply and write terminal audit/events in the same transaction with no votes. - `inst-approvals-submit-unit-4`
 
@@ -107,7 +107,7 @@ Holding multiple permissions never bypasses separation of duties.
 
 1. [ ] - `p1` - Order affected entries by id and prices by id after the unit; use conditional guards and serializable Postgres transaction. - `inst-approvals-apply-prices-1`
 2. [ ] - `p1` - Shift selected prices to the common date with temporary duration preserved. - `inst-approvals-apply-prices-2`
-3. [ ] - `p1` - Re-read each chain, enforce usage pair guard and approved start uniqueness, and recompute effective_to independently per value. - `inst-approvals-apply-prices-3`
+3. [ ] - `p1` - Re-read each chain, enforce usage pair guard, approved start uniqueness and each draft's stored currency scale (409 CURRENCY_SCALE_CHANGED, the draft left as it is, D-531), and recompute effective_to independently per value. - `inst-approvals-apply-prices-3`
 4. [ ] - `p1` - Set keep_for_bound on the current predecessor of every new price of each touched chain, including a new price approved earlier that a price of this unit now precedes, and never clear it; preserve approved money and historical ids. - `inst-approvals-apply-prices-4`
 5. [ ] - `p1` - Replace owned pending locks with approved_by_unit_id and atomically persist audit, PricesPublished and ApprovalUnitDecided. - `inst-approvals-apply-prices-5`
 

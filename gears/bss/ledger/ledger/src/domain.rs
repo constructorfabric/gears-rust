@@ -25,5 +25,4 @@ pub mod posting;
 pub mod provisioning;
 pub mod recognition;
 pub mod reconciliation;
-pub mod scale;
 pub mod status;

@@ -2,23 +2,26 @@
 
 Plan: [`plan.md`](./plan.md) · Spec: [`SPEC.md`](./SPEC.md)
 
-34 P0 implementation tasks; existing IDs retained, except T29, renamed T22d by plan P21. T22 is deferred to P1 as
-[#4827](https://github.com/constructorfabric/gears-rust/issues/4827) under #4628 (plan P18),
-not marked complete. Phase 6 executes T22a → T22b → T22c → T22d; Phase 7 opens with T23
-(plan P21).
+**Delivery status after the foundation/consumer-migration split (2026-10-28):**
 
-Standing bar for every task, on top of its own acceptance criteria: `make fmt`, `make clippy` and
-gear tests green, no regression in other gears, behaviour verified at runtime, docs updated.
-**The full `make ci` is a checkpoint gate, not a per-task one** — it ends in `dylint` and pulls in
-four container-backed targets, which is `plan.md` P13's whole point. Naming `make ci` per task is
-what made T1–T9 record it as *partial* every time.
-Code organisation follows `docs/toolkit_unified_system/` — **not** `guidelines/DNA/languages/RUST.md`.
+T1–T31 and T33–T35 are complete in this foundation: **34 of 48 tasks**.
+**14 remain:** T32, T34a, T35a/T35b and T36–T45. T32, T34a and the AuthN/AuthZ/TR
+follow-ups below are pending in the [consumer-migration PR](https://github.com/aviator5/gears-rust/pull/1).
+Their historical check results came from the migration branch and are not verification
+of this foundation. The next SDK task is **T35a**, after its released-GTS prerequisite.
+Checkpoint 7A still requires the consumer-migration work and its verification.
+The original numeric sequence below records dependencies; the foundation now lands first.
+
+- **Phase 7 — both clients, real local AM, every gear on the persistent registry:** T31 → T38. Contracts/adapters are complete (T29 + T30); T31 makes them usable through ClientHub after database seeding, with a new gear publishing in `init()`. T32 then migrates the complete local AM/IdP/TR group and proves it through existing AM REST requests, with only the new registry client inside AM. Then both APIs over REST, the platform cache and generic lifecycle are ready (Checkpoint 7A, local application/SDK-contract handoff); then one atomic remaining-fleet/REST cutover (Checkpoint 7). T33 merged into `main` (PR #5256); T34 and T35 are done on this branch, and T35a is next.
+- **Phase 8 — publication after wiring and out-of-process operation:** T39 → T40 → T41 → T42 → T43. Collectors, ownership and selection; Account Management after wiring and remotely (Checkpoint 8A); the remaining fleet and the end of the pull; the out-of-process run (Checkpoint 8).
+- **Phase 9 — mixed-version rollout (publisher-version guard), last:** T44 → T45. Final P0 deployment is gated by Checkpoint 9; Checkpoint 7A is a development/integration handoff.
+
+Standing bar for every task, on top of its own acceptance criteria: `make fmt`, `make clippy` and gear tests green, no regression in other gears, behaviour verified at runtime, docs updated. **The full `make ci` is a checkpoint gate, not a per-task one** — it ends in `dylint` and pulls in four container-backed targets, which is P13's whole point. Naming `make ci` per task is what made T1–T9 record it as *partial* every time. Checkpoints 7A, 7, 8A, 8 and 9 retain full CI/backend gates. The real AM remote target joins CI at T41; Checkpoint 7A claims local/SDK-contract coverage only (P31). Tasks are feature-sized like Phases 1–6: each lists the commits it lands as, and each commit clears the standing bar. Code organisation follows `docs/toolkit_unified_system/` — **not** `guidelines/DNA/languages/RUST.md`.
 
 `TR/` abbreviates `gears/system/types-registry/types-registry/`, `TR-SDK/` abbreviates
 `gears/system/types-registry/types-registry-sdk/`. Other paths are from the repository root.
 
-**No new ADRs.** The no-PDP deviation is recorded in SPEC §9 (ceiling C6) and §12; the two wire
-breaks in SPEC §10.2 — `POST /entities` (D10) and the paged content-free `GET /entities` (D12).
+**No new ADRs.** The no-PDP deviation is recorded in SPEC §9 (ceiling C6) and §12; the two wire breaks in SPEC §10.2 — `POST /entities` (D10) and the paged content-free `GET /entities` (D12). P23's decisions are SPEC D18–D22 and ceilings C11–C13; P26 changes scheduling, granularity and numbering, and amends D11's dependent configured entities (T40). P28 moves seeding/local publication to T31; P29 adds the full local AM/IdP/TR group in T32. Both permit bounded coexistence until the remaining T38 cutover. P30 merges five later task IDs; P31 limits Checkpoint 7A to local AM and SDK contracts and assigns the full process proof to real AM in T41. Open question O5 and the P1-deferred O6 are in SPEC §17.
 
 ---
 
@@ -31,12 +34,10 @@ Every task below that says **gear tests** means both halves:
 cargo nextest run -p cf-gears-types-registry
 
 # PostgreSQL + MySQL, one testcontainers container per test (Docker required)
-make test-types-registry-db
+make test-integration LANE=types-registry-db
 ```
 
-**Per-task versus checkpoint.** Per task: `make fmt`, `make clippy`, gear tests. At the
-checkpoint: the full `make ci`, which adds `dylint` (whole-workspace build — `plan.md` P13),
-`deny`, `lychee`, `gts-docs` and the container targets.
+**Per-task versus checkpoint.** Per task: `make fmt`, `make clippy`, gear tests. At the checkpoint: the full `make ci`, which adds `dylint` (whole-workspace build — P13), `deny`, `lychee`, `gts-docs` and the container targets.
 
 ---
 
@@ -54,7 +55,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 **Acceptance criteria:**
 - [x] `gts`, `gts-id` and `gts-macros` are all three at **`0.12.0`** from crates.io — they move together, and `gts-dylint` / `gts-macros-cli` must not lag (SPEC §7, D8)
 - [x] Every declared GTS identifier still admits; any that does not is fixed or explicitly waived in writing. **The figure "202" is not reproducible** and is replaced by three measured populations: 118/118 entities admitted at runtime under the e2e feature set (34 Type Schemas + 84 Instances), 797 doc/JSON files validated by the 0.12.0 validator, and every macro literal compiled by the workspace test run
-- [x] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent. 9 of 118 documents differ, all by one change (a doc-commented GTS-identifier field's subschema preserved under `allOf` instead of having its `description` overwritten); shown semantically inert, including `x-gts-ref`, which `XGtsRefValidator` still enforces by recursing through `allOf`
+- [x] Every difference in `#[gts_type_schema]`-generated schema documents versus 0.11.0 is enumerated and accounted for — none silent. 9 of 118 documents differ, all by one change (a doc-commented GTS-identifier field's subschema preserved under `allOf` instead of having its `description` overwritten); shown semantically inert, including entity references (`x-gts-type-ref` / `x-gts-instance-ref`), which `XGtsRefValidator` still enforces by recursing through `allOf`
 
 **Verification:**
 - [x] `make gts-docs` — 797 files, 0 errors
@@ -83,8 +84,7 @@ published crate — so it is a genuine RED→GREEN.
 
 ## Phase 1 — One global entity of each kind, persisted, async, end to end
 
-Exercised by fixtures and REST only. Consumers stay on the in-memory path until T24, so
-nothing in this phase can regress another gear.
+Exercised by fixtures and REST only. Consumers stay on the in-memory path until T38, so nothing in this phase can regress another gear.
 
 ### - [x] T2: Migration for the 9 tables
 
@@ -233,13 +233,7 @@ in-transaction backends test, and each was confirmed to fail with its fix revert
 
 ### - [x] T5: Transient `gts-rust` store built from database rows
 
-**Description:** One function that builds a `GtsStore` from a set of database rows, for use by
-a single admission unit and dropped with it (SPEC D2, §8.2; `plan.md` P6). It takes the
-candidates plus the transitive closure of what they consume — obtained from the `dependency`
-table — reads them `gts_id`-sorted so a derived schema never loads before its base, and
-returns an owned store. Nothing is cached, published or shared: **no `ArcSwap`, no snapshot,
-no process-lifetime store.** Reads are served from the database, not from here. The old
-in-memory repository keeps serving the old trait until T24 and is not touched.
+**Description:** One function that builds a `GtsStore` from a set of database rows, for use by a single admission unit and dropped with it (SPEC D2, §8.2; P6). It takes the candidates plus the transitive closure of what they consume — obtained from the `dependency` table — reads them `gts_id`-sorted so a derived schema never loads before its base, and returns an owned store. Nothing is cached, published or shared: **no `ArcSwap`, no snapshot, no process-lifetime store.** Reads are served from the database, not from here. The old in-memory repository keeps serving the old trait until T38 and is not touched.
 
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
@@ -275,10 +269,7 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 
 ### - [x] T6: Typed configuration
 
-**Description:** Extend `TypesRegistryConfig` with `allow_compatibility_force`, `limits.*`
-(including P0's `activation_write_set`), `registration_policy` and `worker.*`, keeping the
-existing keys. The `local_client.cache.*` keys stay live — the cache is kept (SPEC §8.3) — and
-their reshaping into `freshness_window` / `store_bound` belongs to T30, not here.
+**Description:** Extend `TypesRegistryConfig` with `allow_compatibility_force`, `limits.*` (including P0's `activation_write_set`), `registration_policy` and `worker.*`, keeping the existing keys. The `local_client.cache.*` keys stay live — the cache is kept (SPEC §8.3) — and their reshaping into `freshness_window` / `store_bound` belongs to T36, not here.
 
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
@@ -320,7 +311,7 @@ T21's shapes:
 
 - [x] `resolution_closure` bounds each candidate or refreshed schema's distinct authored
   resolution graph, including its own document and the candidate overlay. Converging paths
-  count once; `x-gts-ref` and unrelated documents in the shared refresh store do not count
+  count once; entity references (`x-gts-type-ref` / `x-gts-instance-ref`) and unrelated documents in the shared refresh store do not count
 - [x] `resolved_document` bounds the canonical UTF-8 bytes of each effective artifact,
   including the conforming schema used by an Instance. Exactly-at-bound passes; exceeding
   either budget refuses admission and rolls back any revision and dependent refresh
@@ -341,16 +332,16 @@ T21's shapes:
 ### - [x] T7: Acceptance path and operation records
 
 **Description:** The synchronous half of admission: envelope and batch bounds, canonical
-identifier check, registration policy, identifier profile, Draft-07 dialect gate, `force`
+identifier check, registration policy, identifier profile, Draft-07 dialect gate, `skip_compatibility_check`
 gate, request fingerprint, `Idempotency-Key` resolution, then one transaction inserting the
 operation, its items and the outbox message. Reads no entity state.
 
 Outcome and evidence: the criteria below. The per-task report was folded into these and deleted.
 
 **Acceptance criteria:**
-- [x] SPEC §8.1 ordering: `validate` has no database access, so policy precedes existence checks. Acceptance handles steps 1–6 and 8; T18 implements step 7 in the worker using its extracted dependency edges (see SPEC §8.1). T17 replaces the temporary `force` refusal with compatibility checks and provenance.
+- [x] SPEC §8.1 ordering: `validate` has no database access, so policy precedes existence checks. Acceptance handles steps 1–6 and 8; T18 implements step 7 in the worker using its extracted dependency edges (see SPEC §8.1). T17 replaces the temporary `skip_compatibility_check` refusal with compatibility checks and provenance.
 - [x] Policy gates **every accepted candidate**, because P0 accepts only declared creations: a positive `expected_resource_version` is refused (`AcceptanceError::RevisionNotAccepted`) and deletion is refused with the envelope. SPEC §8.1's revision/deletion bypass is deliberately *not* implemented yet — gating on the caller's declared kind while nothing verified the claim let a request name a version and skip the gate outright (found at the Checkpoint 1 review). The bypass returns at T11, together with the commit-side precondition that makes the claim checkable. A refusal names the region and the parameter
-- [x] Fingerprint covers canonical body, operation kind, owner, preconditions and each `force` flag — plus dry-run mode, plane, tenant and principal, as one table-driven test over all nine inputs. Every field is **length-prefixed**, so a digest cannot confuse `("ab", "c")` with `("a", "bc")`, and the digest carries a version tag so a future change to its coverage cannot read as a matching replay
+- [x] Fingerprint covers canonical body, operation kind, owner, preconditions and each `skip_compatibility_check` flag — plus dry-run mode, plane, tenant and principal, as one table-driven test over all nine inputs. Every field is **length-prefixed**, so a digest cannot confuse `("ab", "c")` with `("a", "bc")`, and the digest carries a version tag so a future change to its coverage cannot read as a matching replay
 - [x] Replay with a matching fingerprint returns the stored operation (`202` non-terminal, `200` terminal); a different fingerprint under the same key returns `409`. The replay test submits a deliberately **reordered** body, because canonicalization is the thing that makes a replay a replay
 - [x] Concurrent acceptance on one key resolves via the unique constraint, loser returns the winner after fingerprint verification. The loser re-reads **outside** the rolled-back transaction: on PostgreSQL a constraint violation poisons the transaction, so a re-read inside it would fail for a second, unrelated reason
 - [x] `plane = 1`, `tenant_id = NULL`, `principal_id` the named P0 constant with a `TODO`; ceiling C2 (global idempotency namespace) commented on the constant and at the scope-hash call site
@@ -448,17 +439,14 @@ Outcome and evidence: the criteria below. The per-task report was folded into th
 - [x] Routes are `/types-registry/v1/...` and `.authenticated()`; DTOs live only in `api/rest/dto.rs`
 - [x] Added at the review gate: the four wire vocabularies — operation status and kind, item status, entity kind, lifecycle status — are `#[api_dto]` **enums**, not `String` fields whose admissible values lived in a docstring. A `String` publishes an unconstrained `string` in the served `OpenAPI`, so a generated client gets no vocabulary and a value this gear never emits type-checks against it; the five `*_str` helpers are gone with it (found at the Checkpoint 1 review)
 - [x] `GET /entities/{entity_key}` accepts a GTS identifier or a `gts_uuid` — classified by `EntityKey::parse` in the **domain**, so a future gRPC adapter with the same field gets it for free
-- [x] These routes are the **platform-plane** API for global entities: they keep the authentication they have and no handler assumes a tenant scope. `.anonymous()` is **not** used. Ceiling C8 is commented where the routes are registered. **Corrected after the PR's contract check:** the routes were initially `.exposed()`, but `exposed` gates gateway visibility, not `OpenAPI` inclusion — every registered operation lands in `docs/api/api.json` either way — so it bought a published interim surface with no consumer (the database path has none until T24) and cost a stale `api.json`. The v2 routes are now **internal-only** (no `.exposed()`): documented in the spec and invisible to the gateway. T24a changes their paths but must not expose mutations while C8 remains open
+- [x] Interim global API retains authenticated routes without tenant scope; C8 is documented at registration. v2 omits `.exposed()` but remains in OpenAPI: visibility controls gateway discovery, not spec inclusion. T38 promotes paths without exposing mutations while C8 remains open
 - [x] **Handlers are mapping steps only.** `RegistryService` has three methods taking and returning domain values with no `StatusCode`, `HeaderMap` or `Json`. The identifier-versus-UUID classification stays in the domain. The request's `expected_resource_version` is persisted as the worker precondition (`0` means must-not-exist) but is not echoed by the public operation outcome. The created `revision_no` likewise remains internal admission provenance; only the resulting `resource_version`, which future writes accept as their precondition, crosses that response boundary. `Idempotency-Key` is read from the header and passed as a parameter
 
 **Verification:**
 - [x] `cargo test -p cf-gears-types-registry` — `api_rest_test.rs` via `Router::oneshot`, 10 cases, driving the **real** `register_routes` with a stub `OpenApiRegistry` rather than a hand-built router: a bare router would pass while a route was registered at the wrong path or without its auth stage. 226 lib + 195 integration tests pass
-- [x] Manual: `curl` the three routes against `make example`; `/cf/docs` renders them — **done after this task, at Checkpoint 1; the blocker recorded here was the invocation and is retracted.** `oagw` (`api_egress`) is a non-optional dependency of `cf-gears-example-server` while `static-tr-plugin` sits behind the `static-tenants` feature, so a bare `cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run` builds the tenant resolver with **no plugin at all** and `oagw`'s root-tenant lookup is the first thing to notice it. `make example` passes `E2E_ARGS`, which defaults to `config/e2e-features.txt`, and `static-tenants` is in that set: with it, all 25 gears boot, `/cf/health` answers `200`, the three routes behave, and `/cf/docs` renders them. The `config/e2e-local.yaml` half stands as written — that is the old in-memory path T24 deletes. What the live run found: the `202`'s `Location` omitted api-gateway's `/cf` prefix and so could not be followed verbatim — **fixed at the review gate**, and pinned by a test that nests the real router under `/cf` and follows the receipt it hands back
+- [x] Manual at Checkpoint 1: `make example` with `E2E_ARGS` (`config/e2e-features.txt`, including `static-tenants`) boots 25 gears; health is `200`, all three routes work and `/cf/docs` renders them. Bare cargo startup omitted the tenant-resolver plugin, explaining the earlier invocation failure. The missing `/cf` prefix in receipt `Location` was fixed and pinned by a nested-router follow-through test. `config/e2e-local.yaml` retains the old store until T38
 
-**Superseded by T9a.** This task repointed the two existing v1 routes at the database path; T9a
-restores v1 and moves this surface to `/types-registry/v2/`, for the reasons in `plan.md` P12. The
-DTOs, handlers and tests below are the ones T9a re-registers under v2 — nothing here is discarded,
-only re-addressed.
+**Superseded by T9a.** This task repointed the two existing v1 routes at the database path; T9a restores v1 and moves this surface to `/types-registry/v2/`, for the reasons in P12. The DTOs, handlers and tests below are the ones T9a re-registers under v2 — nothing here is discarded, only re-addressed.
 
 **Two interim shapes, each marked in code.** The scope is `allow_all` (ceiling C6).
 Ceiling C8 is commented at the routes.
@@ -490,28 +478,14 @@ in no deployment at all.
 
 ### - [x] T9a: Restore the v1 REST contract; the async surface moves to `/types-registry/v2/`
 
-**Description:** T9 **repointed** the two existing v1 routes instead of adding new ones, which
-breaks the invariant this plan set for itself (risk table: *"The DB path has no consumer until
-T24; no dual-write"*). Three consequences, all observable today:
+**Description:** T9 **repointed** the two existing v1 routes instead of adding new ones, which breaks the invariant this plan set for itself (the historical risk-table assumption was no database consumers before the legacy-fleet cutover, now T38, and no dual write; P28/P29 later added the early local paths in T31/T32). Three consequences at that time:
 
-1. `POST /v1/entities` changed its **body shape** and gained a required `Idempotency-Key`.
-   Every existing caller gets `400`/`422`, so this is not the "expects `201`, gets `202`"
-   break T28 was scoped for.
-2. **Cross-gear registration over REST is functionally broken.**
-   `testing/e2e/gears/oagw/helpers.py:83` and
-   `testing/e2e/gears/account_management/conftest.py:182` register over REST and then resolve
-   through `TypesRegistryClient` (`account-management/src/infra/types_registry/`,
-   `usage-collector/src/domain/service.rs`). Those gears now **write to the database and read
-   from process memory**. No e2e change fixes this — only T24 does.
+1. `POST /v1/entities` changed its **body shape** and gained a required `Idempotency-Key`. Every existing caller gets `400`/`422`, so this is not the "expects `201`, gets `202`" break T38 was scoped for.
+2. **Cross-gear registration over REST is functionally broken.** `testing/e2e/gears/oagw/helpers.py:83` and `testing/e2e/gears/account_management/conftest.py:182` register over REST and then resolve through `TypesRegistryClient` (`account-management/src/infra/types_registry/`, `usage-collector/src/domain/service.rs`). Those gears now **write to the database and read from process memory**. No e2e change fixes this — only T38 does.
 3. One resource, two sources of truth: `GET /v1/entities` (list) answers from memory,
    `GET /v1/entities/{entity_key}` from the database.
 
-Restore both v1 routes from `main` verbatim and register T9's surface under
-`/types-registry/v2/`. Everything v1 needs is still in the crate —
-`TypesRegistryService::{register_validated, get, is_ready}` (`domain/service.rs:66,108,144`),
-`InMemoryGtsRepository`, `GtsEntityDto` — only two handlers and four DTOs were deleted, and they
-come back unchanged. v2 is **interim by design**: T24 deletes v1 with the repository it reads,
-and T24a promotes v2 onto the v1 paths, so P0 ends on one version.
+Restore both v1 routes from `main` verbatim and register T9's surface under `/types-registry/v2/`. Everything v1 needs is still in the crate — `TypesRegistryService::{register_validated, get, is_ready}` (`domain/service.rs:66,108,144`), `InMemoryGtsRepository`, `GtsEntityDto` — only two handlers and four DTOs were deleted, and they come back unchanged. v2 is **interim by design**: T38 deletes v1 with the repository it reads, and T38 promotes v2 onto the v1 paths, so P0 ends on one version.
 
 **Acceptance criteria:**
 - [x] `POST /types-registry/v1/entities` is contract-identical to `main`: `operation_id` `types_registry.register`, body `{"entities":[…]}`, `200`, `RegisterEntitiesResponse` with its summary, served from the in-memory service behind `is_ready()`
@@ -522,9 +496,9 @@ and T24a promotes v2 onto the v1 paths, so P0 ends on one version.
 - [x] **No route straddles the two stores:** no v1 handler takes `RegistryService`, no v2 handler takes `TypesRegistryService`. Grep-checked — three handlers take `Extension<Arc<TypesRegistryService>>` (`register_entities`, `list_entities`, `get_entity`) and three take `Extension<Option<Arc<RegistryService>>>` (`submit_entities`, `get_operation`, `get_entity_by_key`); no handler takes both
 - [x] **No dual-write and no fallback read.** Pinned by `a_v1_registration_is_absent_from_v2_and_the_reverse`: a v1 registration reads `200` on v1 and `404` on v2, a v2 admission `200` on v2 and `404` on v1. The two directions run against the *same* routes, so the `404` cannot be a missing route rather than an honest miss — the test would fail on the companion `200` first
 - [x] `RegistryService` stays per-database-optional as T9 left it: with no database bound, v2 answers `503` and v1 works. Both halves are tested — `without_a_database_the_routes_report_service_unavailable` for v2, and `without_a_database_the_v1_routes_still_serve` for v1's register, get and list
-- [x] Route paths come from one constant per version, so T24a's promotion is a constant change rather than a sweep. `routes::V1` / `routes::V2` are `pub` and the test imports **the same two constants** the routes are built from — not its own copies, which would drift at exactly the moment the promotion happens
+- [x] Route paths come from one constant per version, so T38's promotion is a constant change rather than a sweep. `routes::V1` / `routes::V2` are `pub` and the test imports **the same two constants** the routes are built from — not its own copies, which would drift at exactly the moment the promotion happens
 - [x] The tests T9 deleted from `registration_tests.rs` and `query_tests.rs` return with the routes they cover — three and two respectively, and both files now `diff` clean against `main`
-- [x] SPEC §10.2 is amended: the v1 break is **withdrawn** for the T9a–T24 window and reinstated at T24a, naming both tasks. The route table there is labelled as the post-T24a surface, so it is not read as describing today
+- [x] SPEC §10.2 is amended: the v1 break is **withdrawn** for the T9a–T38 window and reinstated at T38, naming both tasks. The route table there is labelled as the post-T38 surface, so it is not read as describing today
 
 **Verification:**
 - [ ] `make e2e-local` green **without editing a single e2e file** — that is the criterion, because the task's whole point is that the suite did not need migrating yet. **Blocked by a pre-existing T1 defect, not by this task** (see the Checkpoint 1 item below): the run never reaches pytest, because types-registry's `post_init` fails first. No e2e file was edited, which is the half of the criterion this task owns and which holds
@@ -547,13 +521,7 @@ and T24a promotes v2 onto the v1 paths, so P0 ends on one version.
 
 ### - [x] T10: Registered Instances
 
-**Moved into Phase 1** from Phase 2. Two reasons. Instances are what the platform actually
-pushes today — P4 counts *"roughly eleven plugin gears"* already registering their well-known
-Instances from their own `init()` — so they are on the critical path to T24 and are the longest
-pole, not a widening. And T9's surface accepts an Instance and then fails it in the **worker**
-(`StoreBuildError::UnsupportedKind` → `WorkerError::StoreBuild` → opaque `500`), which is a
-retryable class for a decision that is final; building the feature closes that hole instead of
-adding a refusal for it.
+**Moved into Phase 1** from Phase 2. Two reasons. Instances are what the platform actually pushes today — P4 counts *"roughly eleven plugin gears"* already registering their well-known Instances from their own `init()` — so they are on the critical path to T38 and are the longest pole, not a widening. And T9's surface accepts an Instance and then fails it in the **worker** (`StoreBuildError::UnsupportedKind` → `WorkerError::StoreBuild` → opaque `500`), which is a retryable class for a decision that is final; building the feature closes that hole instead of adding a refusal for it.
 
 **Description:** Extend admission to registered Instances: `instance_revision`, `instance`
 current pointer, conformance to the Type Schema identified by the identifier prefix through
@@ -571,7 +539,7 @@ the last `~`, and the immutable schema-revision pair.
    currently asserts that a derived Type Schema **fails**, and the comment blames T13's missing
    edges — half right, since `validate_schema` walks `chain_ids()` and would have found the base
    with no edge table involved. T13 supplies the `$ref` targets needed by the forward closure and
-   the three direct edge kinds needed by T14's reverse walk. `x-gts-ref` is neither resolved nor
+   the three direct edge kinds needed by T14's reverse walk. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is neither resolved nor
    represented by an edge.
 2. **`instance` and `instance_revision` acquire their four edits** — entity, repository with its
    mapper, port trait and types, and the forwarding block in `store.rs`. T2's migration already
@@ -591,7 +559,7 @@ the last `~`, and the immutable schema-revision pair.
 - [x] The transient store carries both kinds: both `UnsupportedKind` refusals are deleted and the dialect gate is keyed on the identifier's `~`. `type_id` is passed to `GtsEntity::new` **explicitly** from `GtsId::get_type_id()` with a `None` config — letting content name the conforming type would allow a value to claim conformance to a type it was not registered under, which is a validation bypass, not a convenience
 - [x] The closure reaches a candidate's derivation chain with **no `dependency` row present** — `closure` seeds its worklist with `GtsId::chain_ids()`, and `missing_roots` is still computed over the original roots so a chain member the seed added is not reported as one. The Phase 1 test is inverted, and its old comment was half wrong: it blamed T13's missing edges, but a derivation base is a pure function of the identifier
 - [x] A family holds one kind — `family_kind_conflict`, checked under the family lock and only for a family that already existed. Distinct from `already_exists` because the identifier *is* free; saying otherwise sends a caller looking for a conflicting entity that does not exist. Both orders are tested
-- [x] No `$ref` target is expected to resolve in T10; document-reference support belongs to T13 and is verified there by `a_ref_outside_the_chain_is_admitted`. An `x-gts-ref` target is never resolved or seeded because validating the keyword reads no target document.
+- [x] No `$ref` target is expected to resolve in T10; document-reference support belongs to T13 and is verified there by `a_ref_outside_the_chain_is_admitted`. An entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) target is never resolved or seeded because validating the keyword reads no target document.
 - [x] **An admitted Instance reads back with its value.** *Added after the task was marked done — see the correction below.* `GET /v2/entities/{entity_key}` returns either kind's authored document under the single public field `content`. The immutable `revision_no` remains an internal current-pointer and provenance detail; the public entity exposes `resource_version`, which is the token future writes accept. The three `effective_*` artifacts stay absent for an Instance, and that is the contract rather than the same omission: an Instance has no derived state, so there is nothing to materialize
 
 **The read path was missed, and the task's criteria are why.** Every criterion above is about
@@ -611,18 +579,16 @@ representable value rather than a mismatch a later edit could introduce. One sta
 `current_values` returns the pointer's revision number with the value it points at; the service
 uses that pairing internally and does not publish the revision number.
 
-**Consequence for later tasks, since it would have surfaced there as a regression.** T23's
-`get_instance` and T22a's `batchGet` both sit on this method; the SDK helpers that hydrate a
-content-free page through `batchGet` would have returned pages of null values.
+**Consequence for later tasks, since it would have surfaced there as a regression.** T29's `get_instance` and T22a's `batchGet` both sit on this method; the SDK helpers that hydrate a content-free page through `batchGet` would have returned pages of null values.
 
 **Verification:**
-- [x] Gear tests, all three backends — 454 on `SQLite`, and `make test-types-registry-db` green: 4 container tests, migration and repository primitives on both `PostgreSQL` and `MySQL`
+- [x] Gear tests, all three backends — 454 on `SQLite`, and `make test-integration LANE=types-registry-db` green: 4 container tests, migration and repository primitives on both `PostgreSQL` and `MySQL`
 - [x] Test: Instance value violating its schema is refused — `invalid_value`, distinct from `invalid_schema`: the schema is fine, the value is not
 - [x] Test: `fk_tr_instance_revision_schema` prevents dangling schema-revision references — `instance_revision_cannot_reference_a_missing_schema_revision`. Foreign keys are enabled explicitly on that connection, because `SQLite` does not enforce them by default and the test would otherwise pass while proving nothing
 - [x] Test: an Instance admits against a Type Schema committed by an **earlier** operation, with the `dependency` table asserted empty
 - [x] Test: a derived Type Schema admits against a committed base, with the `dependency` table empty
 - [x] Test: Type Schema then Instance under one `family_key` — second is refused; and the reverse order
-- [x] Test: an admitted Instance reads back over the **real routes** with its authored value under `content`, without exposing internal `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-types-registry-db` green
+- [x] Test: an admitted Instance reads back over the **real routes** with its authored value under `content`, without exposing internal `revision_no`, and with the three `effective_*` artifacts asserted absent — `api_rest_test.rs::an_instance_reads_back_with_its_authored_value`, which polls the operation first so a refused candidate cannot be mistaken for a value the read failed to reach. Plus the same Instance by its Registry Reference, pinning that the kind branch is chosen by the row and not by how it was found. Both are genuine RED→GREEN: they failed on `content: null` before the fix. Re-run on all three backends — 457 on `SQLite`, `make test-integration LANE=types-registry-db` green
 
 **Interim, and stated rather than discovered later:** *"fails retryably"* is exercisable only as a
 unit call on `run_operation`, because there is no outbox to redeliver until T21 and inline
@@ -640,7 +606,7 @@ every `WorkerError` today, not something this task introduces; T21 makes it a re
 Outcome and evidence: the criteria below.
 
 - [x] A fixture Type Schema registers over REST, the operation reaches `completed`, the entity and its resolved artifacts are readable — as a test (`api_rest_test.rs::a_registration_is_accepted_polled_and_read_back`, driving the real `register_routes`) **and now at runtime**: `POST /cf/types-registry/v1/entities` `202` → operation `completed` with one `succeeded` item → entity `active`, `rv=1`, all four artifacts materialized, readable by `gts_id` and by `gts_uuid`. **T9's boot blocker was the invocation, not the code, and is retracted:** `oagw` is a non-optional dependency of the example server while every tenant-resolver plugin sits behind a cargo feature, so a bare `cargo run` compiles the resolver with no plugin and `oagw` is the first to notice. With `--features "$(cat config/e2e-features.txt)"` — which is what `make example` passes — all 25 gears boot and `/cf/docs` renders the four routes
-- [x] Durable registration state survives closing and reopening the database pool byte-identically — `TR/tests/restart_persistence_test.rs`, two tests. One admits both a Type Schema and an Instance, drops the service/provider/pool, reopens the SQLite file, re-runs test migrations, and compares whole `Model` values in stable primary-key order across all eight affected tables; it then proves both entities are readable through a fresh service and that the persisted idempotency record replays without a write. The other pins the crash window: a committed non-terminal operation survives the reopen and completes when admitted. This is deliberately not called a process-restart test: real `TypesRegistryGear::init`, startup seeding and a new process remain T30's e2e/manual obligation
+- [x] `TR/tests/restart_persistence_test.rs` (2 tests): reopening SQLite preserves whole models across eight tables after admitting a schema and Instance; fresh reads and idempotency replay work without writes. A persisted non-terminal operation also completes after reopen. This proves pool reopen, not process restart; real init/seeding/process restart remains e2e/manual work
 - [x] Consumers untouched: the old `TypesRegistryClient` is still served from its existing in-memory repository; full workspace tests pass — **10593 passed, 368 skipped, 0 failures** (`cargo nextest run --workspace` minus the two macro crates, as `make test-no-macros` does). Structurally, the branch touches four files outside the gear — `Cargo.lock`, `Cargo.toml` (gts 0.11.0 → 0.12.0) and the two configs — and **not one file in `types-registry-sdk`**; the gear still holds `service` and `local_client` beside the new `registry`
 - [x] The new path holds no entity state between admissions: the store is built per unit and dropped, and the entity read in the first item above comes from the database — `RegistryService` has no store field and `grep ArcSwap src/gear.rs` finds nothing; `build_store` / `load_unit_store` are free functions returning an owned `UnitStore`, so there is no `self` to retain it in. T5's `two_sequential_builds_each_observe_the_committed_revision` proves the consequence, and the `503`-without-a-database case shows the read really is a database read
 - [x] Gear tests green on SQLite, PostgreSQL and MySQL (see [Commands](#commands)) — 423 tests on SQLite, and the **first ever** container run of the two backend suites, Docker having been down for T1–T9. It found a real defect: `sqlx` binds `Uuid` as 16 raw bytes on both non-native backends, so every uuid write failed on MySQL's `CHAR(36)` and was silently stored as a blob in `SQLite`'s `TEXT`. Fixed to `BINARY(16)` / `BLOB` + `ck_tr_*_uuid_len`
@@ -668,7 +634,7 @@ Outcome and evidence: the criteria below.
 - [x] **v1 is intact and the new surface is additive (T9a).** Both v1 routes are restored verbatim from `main` and the async surface sits under `/v2/`; three handlers take `TypesRegistryService`, three take `Option<Arc<RegistryService>>`, and neither falls back to the other. `make e2e-local` is green with **no e2e file edited for T9a** — the one e2e file this branch touches, `account_management/conftest.py`, belongs to the envelope fix above and would have been needed with or without T9a
 - [x] **Review follow-up: unsupported dry-run fails synchronously, and replays are explicit.** Before T20, unsupported `dry_run: true` was rejected during admission with a canonical `400` field violation, before an operation can be created or stranded in `running`. Successful idempotency replays now include `Idempotency-Replayed: true`; first submissions omit it. Domain and REST regression tests pin both contracts
 - [ ] **Human review — everything after this widens the path rather than reshaping it.** Five open items, none of them a failing check:
-  - **Another gear owns part of `/types-registry/v1/*`.** `resource-group` registers five routes — `POST|GET /types`, `GET|PUT|DELETE /types/{code}` — inside this gear's service namespace, from `gears/system/resource-group/.../api/rest/routes/types.rs`. T20a, T22a and T28 widen that namespace, so a collision waits for whichever gear registers a conflicting path first. Decide: report to the resource-group owners now, or carry it as a known hazard into T20a/T22a/T28. **T20a's widening did not collide** — it added two `/v2/entities*` routes, and `resource-group` owns only `/v1/types*`; see T20a's *Resolved hazard*. The decision for T22a and T28 is still open
+  - **Another gear owns part of `/types-registry/v1/*`.** `resource-group` registers five routes — `POST|GET /types`, `GET|PUT|DELETE /types/{code}` — inside this gear's service namespace, from `gears/system/resource-group/.../api/rest/routes/types.rs`. T20a, T22a and T38 widen that namespace, so a collision waits for whichever gear registers a conflicting path first. Decide: report to the resource-group owners now, or carry it as a known hazard into T20a/T22a/T38. **T20a's widening did not collide** — it added two `/v2/entities*` routes, and `resource-group` owns only `/v1/types*`; see T20a's *Resolved hazard*. The decision for T22a and T38 is still open
   - ~~**`Idempotency-Key` cannot be declared in OpenAPI.**~~ **Retracted — the claim was false and is now fixed.** `ParamLocation::Header` exists and `openapi_registry.rs:200` already maps it onto utoipa's `ParameterIn::Header`; the generic `OperationBuilder::param(ParamSpec)` declares it. What misled us is that there is no `header_param` convenience beside `path_param` / `query_param`, so the capability is discoverable only by reading the enum. `POST /v2/entities` now declares the header as a required parameter, pinned by `the_idempotency_key_header_is_declared_as_a_required_parameter` and mutation-checked. The remaining toolkit gap is the missing convenience method — filed upstream as constructorfabric/gears-rust#4614. Narrowed by the #4828 review follow-up: `ParamSpec` is now built through `ParamSpec::header` / `::query` / `::path` rather than a field literal, so the location no longer has to be found by reading `ParamLocation`, and the struct is `#[non_exhaustive]` so the next schema keyword added to it cannot repeat this PR's mechanical `format: None, minimum: None` across 12 declaration sites
   - **T2's three lowering decisions were flagged *worth review* and never signed off:** MySQL `DATETIME(6)` rather than `TIMESTAMP(6)`; three extra boolean-domain CHECKs on SQLite and MySQL; MySQL's four indexes declared inline as `KEY`
   - **The migration changed after T2 was marked done** (the uuid binding). Nothing to migrate forward — no deployment had run it — but the "done" marker moved
@@ -770,7 +736,7 @@ it, both interleavings are serializable — a re-read that still sees `expected`
 admission had not committed yet.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`, and `make test-types-registry-db` green on `PostgreSQL` and `MySQL`
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`, and `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`
 - [x] Tests: stale version, equal content, content equal to an *older* non-current revision (must create a new revision, ADR-0005) — `TR/tests/revision_test.rs`, eleven tests
 - [x] Test: revision numbers are contiguous per entity — three admissions yield `1, 2, 3` with `resource_version` at 3
 - [x] Test: a revision in a region the policy has since **closed** is admitted (the restored bypass), while a creation there is still refused — `a_revision_survives_a_region_the_policy_has_since_closed` drives both halves against two compiled policies, and the acceptance unit tests pin the pure half
@@ -788,13 +754,7 @@ admission had not committed yet.
   of resolving *that* revision, so a row carrying revision N+1 beside revision N's
   `resolved_schema` is a state no reader should see — and two statements would create it.
 
-**Interim implementation window (SPEC C9).** T11 makes database-backed revisions executable before T14's
-reverse-impact refresh and T17's compatibility comparison exist. No consumer or v1 cutover may
-use this path before those checkpoints (the DB path remains internal until T24). During the
-window, minor-bearing Type Schema revisions are rejected structurally, and `force` is rejected
-whenever it would have a real check to waive; T17 removes that temporary refusal only when it can
-record `compat_forced` truthfully. Major-only Type Schema revisions remain staging-only until T14
-and T17 close the dependent-refresh and compatibility gaps.
+**Interim implementation window (SPEC C9).** T11 makes database-backed revisions executable before T14's reverse-impact refresh and T17's compatibility comparison exist. No consumer or v1 cutover may use this path before those checkpoints (the DB path remains internal until T38). During the window, minor-bearing Type Schema revisions are rejected structurally, and `skip_compatibility_check` is rejected whenever it would have a real check to skip; T17 removes that temporary refusal only when it can record `compat_forced` truthfully. Major-only Type Schema revisions remain staging-only until T14 and T17 close the dependent-refresh and compatibility gaps.
 
 **Dependencies:** Checkpoint 1
 **Files touched:** `TR/src/domain/admission/{acceptance,acceptance_tests,errors,unit,worker}.rs`, `TR/src/domain/ports.rs`, `TR/src/infra/storage/repo/{entity_repo,type_schema_repo,instance_repo,operation_repo}.rs`, `TR/src/infra/storage/store.rs`, `TR/src/api/rest/{error,dto}.rs`, `TR/tests/{revision_test,api_rest_test,repo_backends_test,repo_test,common/mod}.rs`
@@ -839,7 +799,7 @@ stores it is a rule that **silently never fires** rather than one that fails lou
 own family and that an Instance probes Instance spellings.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the rules add no new SQL shape, only more `find_by_gts_id` calls, which the suite already covers
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 514 on `SQLite`; `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the rules add no new SQL shape, only more `find_by_gts_id` calls, which the suite already covers
 - [x] Table-driven test over shape and contiguity combinations — twelve rows, each its own database, `shape_and_contiguity_over_the_combinations`. Genuine RED→GREEN
 - [x] Test: family key derivation maps `v1~`, `v1.4~`, `v2~` to one row, and a preceding-segment minor survives verbatim — the pure half in `key_tests.rs` (unchanged from T8), the *one row* half in `one_family_row_holds_every_version_and_owns_its_members`, which also pins the owner projection
 - [x] ~~Test: concurrent first registration under two owners yields one winner~~ — **already covered, and deliberately not duplicated on `SQLite`.** `repo_backends_test.rs::family_race_yields_one_row` (eight concurrent callers, exactly one `created`) and `family_race_inside_a_transaction_yields_one_row` (the loser keeps reading in the same transaction) are T4's, on both container backends. A `SQLite` version cannot exist: a second concurrent writer fails the whole transaction with `database is locked` rather than losing a unique-key race — measured, not assumed. `family_test.rs` carries a named placeholder test pointing at the two that do cover it. *"Two owners"* is P1 language; P0 fixes every row to `ownership_scope = 1` (ceiling C6)
@@ -886,7 +846,7 @@ its ordering are already there.
 **Description:** Extract the edge kinds from authored content — `$ref`, immediate derivation
 base, Instance conformance — and replace the admitted entity's outgoing rows on each admission.
 
-`x-gts-ref` is not a dependency edge. Validation matches the value string against the pattern
+An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is not a dependency edge. Validation matches the value string against the pattern
 without consulting the registry, the target is not inlined into an effective artifact, and the
 keyword gives no deletion-safety guarantee. The managed–external boundary will classify candidate
 content when federation is introduced. The three stored edge kinds are `$ref`, immediate
@@ -911,22 +871,22 @@ extractor, called over the candidate document *before* the closure read, its tar
 closure roots beside the candidate's `chain_ids()`. Found at the PR #4641 review.
 
 **Acceptance criteria:**
-- [x] `x-gts-ref` creates no edge and has no reader in the P0 dependency implementation
+- [x] An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge and has no reader in the P0 dependency implementation
 - [x] Admission replaces only the admitted entity's outgoing rows, through the existing `DependencyRepo::replace_outgoing` — written and unit-tested at T4, with no caller until this task
 - [x] Derivation and conformance are materialized even though derivable from the identifier
 - [x] `$ref` extraction uses `gts-rust`'s extractor, never a local scan
 - [x] Extraction is exposed as a pure function over authored content, callable without a database — `domain::dependency::extract_edges(&GtsId, &Value)`, no clock and no ports in its signature, which is what lets the same call serve both sides of the admission
-- [x] `load_unit_store` seeds the closure with the `$ref` targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see. An `x-gts-ref` target is not seeded because validating the keyword never reads the target document
+- [x] `load_unit_store` seeds the closure with the `$ref` targets extracted from each candidate **document**, alongside the candidate's `chain_ids()` — a first admission has no stored edges of its own, so the identifier-derived seed is the only thing the closure would otherwise see. An entity-reference target is not seeded because validating the keyword never reads the target document
 - [x] For a revision the roots come from the candidate document's references, never from the previous revision's stored edge set: the overlay wins for edges as it already does for documents. **With one honest limit,** stated at `load_unit_store`: the candidate's *stale* rows are still walked, because `closure` cannot tell a candidate root from any other, so a reference a revision dropped may still be loaded. That is inert — resolution follows the document, and an extra registered schema answers no question — while the direction that is not inert holds: a reference the candidate **added** resolves
 - [x] A reference target that genuinely does not exist is distinguishable from a candidate that is not stored yet — `UnitStore::missing_references` beside `missing_candidates`. **No port change was needed.** `closure` already reports every root with no entity row; which of those roots is a candidate is `load_unit_store`'s own knowledge, so the split is one `partition` over the existing result rather than a second list crossing the seam. `missing_candidates` still has no production reader, so T19 inherits both lists and no ambiguity
 - [x] The `CLOSURE_BOUND` accounting covers the added roots: `ensure_within_bound` charges `roots.len()` before the first hop, and the seed *is* that vector — reference targets are pushed into it, not passed beside it, so no accounting change was possible to forget
 
 **The dependency reader is `gts-rust`.** `$ref` goes through `gts::extract_gts_refs`, the
 canonical definition shared with the resolution that validates the candidate. No local scan
-interprets either `$ref` or `x-gts-ref` as a dependency.
+interprets either `$ref` or an entity reference as a dependency.
 
 **An Instance carries exactly one edge, and that is a rule rather than an omission.** `$ref`
-and `x-gts-ref` are schema keywords, so the same strings inside a *value* are data.
+and the entity-reference keywords are schema keywords, so the same strings inside a *value* are data.
 Extracting them would invent an edge from a coincidence, and a malformed one would refuse a
 valid value — `an_instance_values_ref_shaped_data_is_data_and_not_an_edge` pins it.
 
@@ -940,12 +900,12 @@ does not physically remove them. No incomplete edge set is written. A malformed 
 fails at extraction as `invalid_schema`.
 
 **Verification:**
-- [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
-- [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-ref`
+- [x] Gear tests, all three backends (see [Commands](#commands)) — 531 on `SQLite`, six consecutive full-suite runs green; `make test-integration LANE=types-registry-db` green on `PostgreSQL` and `MySQL`. No new backend cases: the writes go through `replace_outgoing` and the resolution through `find_by_gts_ids`, both already exercised on both container backends by T4's `closure_walks_a_chain`. T13 adds no new SQL shape
+- [x] Table-driven test over edge-kind fixtures, including a derived schema carrying both schema edge kinds, a reference-free schema, and an Instance of a derived type; focused no-edge tests cover `x-gts-type-ref` and `x-gts-instance-ref`
 - [x] Test: re-admission removes an edge the new revision dropped — `a_revision_removes_the_edge_it_dropped_and_adds_the_one_it_gained`, with `a_revision_that_keeps_its_reference_keeps_the_edge` for the other direction, because "replace" could otherwise be read as "clear and forget"
 - [x] Test: a new schema whose `$ref` names an existing schema **outside its identifier chain** is admitted — the case that failed with `invalid_schema`. It was already pinned, inverted, as `admission_worker_test::a_ref_outside_the_chain_still_fails`; that test is now `a_ref_outside_the_chain_is_admitted` and its flip is the RED→GREEN record. `dependency_test.rs` pins the rows the same admission writes
 - [x] Test: a revision that adds one reference and drops another resolves against the new set, not the stored one — `gts_store_test::a_revision_resolves_against_the_reference_it_now_carries`. All three new store tests were verified RED with the one seeding line disabled
-- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_x_gts_ref_writes_no_row_whether_its_target_exists_or_not` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
+- [x] Test: a reference to an identifier no entity carries is reported as a missing reference, distinct from the candidate's own absence — `a_reference_no_entity_carries_is_a_missing_reference_not_a_missing_candidate`, and end to end `an_entity_ref_writes_no_row_whether_its_target_exists_or_not` against `a_ref_naming_no_entity_fails_the_candidate`: same absent identifier, two outcomes, because a pattern is satisfiable before anything matches it while a `$ref` is not
 
 **Two existing tests had to be inverted, and both were boundary markers rather than
 regressions.** `admission_worker_test::a_ref_outside_the_chain_still_fails` asserted the gap
@@ -1086,24 +1046,7 @@ the rows the store builder already walked, and only the commit side pays for the
 (`vector::derive`). One function builds the vector on both sides regardless, which is the
 property the comparison depends on.
 
-**Step 4.2's row locks over the revision vector are the wrong tool, and the documents now
-say so rather than deferring them** (`plan.md` P15; DESIGN §4 corrected, no ceiling). A lock
-guarantees only that nothing moves *after* it is taken, and the movement that matters
-happens between evaluation and the lock — the phantom dependent appears before any lock
-could be held. So the comparison is required either way and the lock is purely additive:
-it buys waiting instead of rolling back, which is liveness. It costs one round trip per
-vector member inside the commit transaction on a set the bound allows to reach 512, and it
-is the only reason step 4.2's canonical ordering had to extend past families at all. What
-serializes the rows instead was already there: the candidate's own row by the
-compare-and-swap that writes it, and a dependency by the write-write conflict its own
-refresh creates on the candidate's `type_schema` row precisely when the move affects it —
-and where it does not, the fingerprint-stability stop is the proof the staleness is inert.
-That conflict *orders* the two writes and nothing more: a refresh computes its artifacts
-before it writes, so the resumed `UPDATE` re-evaluates its predicate, not its payload. The
-refresh's write therefore carries the revision and fingerprint its own read saw, and the
-loser rolls back rather than overwriting the winner. **Found in review after this task**, and
-corrected here rather than left as a claim the code did not make good on. The missing
-`FOR UPDATE` is corroboration, not the reason.
+**Step 4.2's row locks over the revision vector are the wrong tool, and the documents now say so rather than deferring them** (P15; DESIGN §4 corrected, no ceiling). A lock guarantees only that nothing moves *after* it is taken, and the movement that matters happens between evaluation and the lock — the phantom dependent appears before any lock could be held. So the comparison is required either way and the lock is purely additive: it buys waiting instead of rolling back, which is liveness. It costs one round trip per vector member inside the commit transaction on a set the bound allows to reach 512, and it is the only reason step 4.2's canonical ordering had to extend past families at all. What serializes the rows instead was already there: the candidate's own row by the compare-and-swap that writes it, and a dependency by the write-write conflict its own refresh creates on the candidate's `type_schema` row precisely when the move affects it — and where it does not, the fingerprint-stability stop is the proof the staleness is inert. That conflict *orders* the two writes and nothing more: a refresh computes its artifacts before it writes, so the resumed `UPDATE` re-evaluates its predicate, not its payload. The refresh's write therefore carries the revision and fingerprint its own read saw, and the loser rolls back rather than overwriting the winner. **Found in review after this task**, and corrected here rather than left as a claim the code did not make good on. The missing `FOR UPDATE` is corroboration, not the reason.
 
 **One lock does survive the argument, and it orders commits.** The optimistic mechanism
 reaches everything that meets on a row. It does not reach an edge committed *after* a mover's
@@ -1201,18 +1144,7 @@ T14's refusal stays as the backstop for a set that grew in between.
   the item as `failed` — reason `revalidation_exhausted`, message naming the last drift.
   The key moved off `inert_limit_keys` and gained a zero-refusal in `validate()`, as
   `activation_write_set` did at T14
-- [x] ~~Lock order is family → entity/current rows, in canonical identifier order,
-  everywhere.~~ **Both halves are retired, for different reasons.** The row half was mistaken:
-  a lock over the revision vector cannot do the guard's job and costs a round trip per member
-  inside the commit transaction (`plan.md` P15, SPEC §8.1 step 4.2). The family half became
-  redundant and then harmful — see the lock paragraph above. What replaced both: the
-  `entity_write_order` claim orders commits, and no family lock is taken on either commit
-  path — the claim makes the whole transaction exclusive, so the family rules are already
-  serialized. Canonical order is kept where it is observable and where locks are actually many:
-  the currently uncalled `lock_order` helper sorts and dedups family keys for the next writer,
-  and the vector is `(gts_id, role)`-sorted on
-  both sides, which is what makes the comparison one merge walk and the reported drift
-  deterministic
+- [x] ~~Lock order is family → entity/current rows, in canonical identifier order, everywhere.~~ **Both halves are retired, for different reasons.** The row half was mistaken: a lock over the revision vector cannot do the guard's job and costs a round trip per member inside the commit transaction (P15, SPEC §8.1 step 4.2). The family half became redundant and then harmful — see the lock paragraph above. What replaced both: the `entity_write_order` claim orders commits, and no family lock is taken on either commit path — the claim makes the whole transaction exclusive, so the family rules are already serialized. Canonical order is kept where it is observable and where locks are actually many: the currently uncalled `lock_order` helper sorts and dedups family keys for the next writer, and the vector is `(gts_id, role)`-sorted on both sides, which is what makes the comparison one merge walk and the reported drift deterministic
 
 **Verification:**
 - [x] Gear tests, all three backends — `cargo nextest run -p cf-gears-types-registry`:
@@ -1354,23 +1286,7 @@ matter.
 
 **Two design decisions worth stating, because both are trade-offs:**
 
-**The instruments are a domain port; only the spans are process-global.** *(Record
-corrected — `plan.md` P16. This entry and the commit message both argued the opposite, for a
-process-global instrument set reached the way `tracing` is. The code that shipped does not do
-that, and the port is the shape to extend.)* `domain::ports::metrics::AdmissionMetrics` is the
-trait, `infra::metrics` the OpenTelemetry adapter, and `TypesRegistryGear::init` injects the
-`Arc<dyn AdmissionMetrics>` into the service, which carries it down
-`run_operation` → `process_item` → `commit_evaluated` → the commit transaction's `'static`
-closure → `commit_creation` / `commit_revision` → the reverse-impact refresh. The `'static`
-closure is why the parameter is an `Arc` and not a reference: each retry attempt clones the
-handle. A caller with no meter passes `NoopMetrics`, which is the pre-T16 behaviour exactly, and
-that is what the several dozen existing worker test call sites pass. The deciding argument is the
-layer boundary: an OpenTelemetry type reached from `domain` through a crate-root module hides
-from `de0301_no_infra_in_domain`, and the emission sites are all on the admission call path.
-`observability.rs` keeps the two span constructors as free functions, because a `tracing` span
-*is* a global sink the emitting code neither carries nor injects, and its module header states
-the split. The instrument names carry a configurable prefix (`MetricsConfig`, default
-`types_registry`) and the rendered names are pinned by `infra::metrics_tests`.
+**The instruments are a domain port; only the spans are process-global.** *(Record corrected — P16. This entry and the commit message both argued the opposite, for a process-global instrument set reached the way `tracing` is. The code that shipped does not do that, and the port is the shape to extend.)* `domain::ports::metrics::AdmissionMetrics` is the trait, `infra::metrics` the OpenTelemetry adapter, and `TypesRegistryGear::init` injects the `Arc<dyn AdmissionMetrics>` into the service, which carries it down `run_operation` → `process_item` → `commit_evaluated` → the commit transaction's `'static` closure → `commit_creation` / `commit_revision` → the reverse-impact refresh. The `'static` closure is why the parameter is an `Arc` and not a reference: each retry attempt clones the handle. A caller with no meter passes `NoopMetrics`, which is the pre-T16 behaviour exactly, and that is what the several dozen existing worker test call sites pass. The deciding argument is the layer boundary: an OpenTelemetry type reached from `domain` through a crate-root module hides from `de0301_no_infra_in_domain`, and the emission sites are all on the admission call path. `observability.rs` keeps the two span constructors as free functions, because a `tracing` span *is* a global sink the emitting code neither carries nor injects, and its module header states the split. The instrument names carry a configurable prefix (`MetricsConfig`, default `types_registry`) and the rendered names are pinned by `infra::metrics_tests`.
 
 **The activation-write-set histogram counts revisions, not admissions.** A creation
 observes **nothing** rather than zero, because nothing can depend on an identifier the
@@ -1433,7 +1349,7 @@ reads as scope rather than as silence.
   `pg_stat_activity` and MySQL `data_lock_waits` / `data_locks`. An isolated container
   identifies the writer; `ClaimHooks` verifies pending-before-release and progress
   afterwards. Both backends detect wrong-table and premature-return mutations.
-- [x] **`make test-types-registry-db` did not run `revision_race_backends_test`, and now does.**
+- [x] **`make test-integration LANE=types-registry-db` did not run `revision_race_backends_test`, and now does.**
   The suite that proves the `entity_write_order` claim on a backend with real row locking was
   reachable only by hand, so `make ci` never ran it — the container test the last commit added to
   close a P0 blocker was outside the gate meant to protect it. One line in the `Makefile` target
@@ -1484,10 +1400,10 @@ rejected with its own reason, never collapsed into `Incompatible`.
 - [x] `compare_documents` is the only comparison entry point; `is_minor_compatible` is not used
 - [x] `CompatibilityVerdict::Unknown` fails the candidate with a reason distinct from `Incompatible` (`principle-fail-closed`)
 - [x] Every admitted revision records `gts_spec_version`, `gts_impl_version` and `compat_forced`
-- [x] `force` waives one eligible cross-minor check when the deployment permits it. `ForceCompatibilityUnavailable` is removed; revision `compat_forced` records the effective waiver
+- [x] `skip_compatibility_check` waives one eligible cross-minor check when the deployment permits it. `ForceCompatibilityUnavailable` is removed; revision `compat_forced` records the effective waiver
 - [x] Major-0 candidates get no baseline and no verdict
 
-**Observability (`plan.md` P16 — this task instruments what it adds):**
+**Observability (P16 — this task instruments what it adds):**
 - [x] `types_registry_compat_verdicts_total{verdict,forced}` counts
       `compatible | incompatible | unknown`; refusals also increment `refusals_total`
 - [x] `forced="true"` identifies waived cross-minor verdicts
@@ -1502,10 +1418,10 @@ rejected with its own reason, never collapsed into `Incompatible`.
 **Verification:**
 - [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
       `compat_backends_test` now runs the T17/T18 matrix on PostgreSQL and MySQL and is selected
-      by `make test-types-registry-db`; its Docker execution remains to be recorded
+      by `make test-integration LANE=types-registry-db`; its Docker execution remains to be recorded
 - [x] Compatibility matrix: optional property added at a `Closed` level (compatible), at `Open` (incompatible), at `Partial` (`Unknown`)
 - [x] Test: provenance columns match `GTS_SPECIFICATION_VERSION` and the crate version
-- [x] Disabled `force` is refused (`force_is_refused_while_the_deployment_disallows_it`).
+- [x] Disabled `skip_compatibility_check` is refused (`force_is_refused_while_the_deployment_disallows_it`).
       Before T20, Dry Run is synchronously rejected before the force gate; the ordering is asserted
       by `a_forced_dry_run_is_refused_for_being_a_dry_run_before_force_is_considered`
 - [x] Test: the verdict instrument's rendered name, label keys and both label vocabularies
@@ -1534,7 +1450,7 @@ rows, and `database.sql` include the column. `compat_forced` avoids MySQL's rese
 **Description:** Identifier-derived chain validation against every managed base, the
 Draft-07 dialect pin across a major, and the ADR-0015 quarantine: a stable candidate may not
 derive from or `$ref` a major-0 identifier, and a major-0 schema may not carry a registered
-Instance. `x-gts-ref` is an instance-value constraint and is outside the quarantine.
+Instance. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is an instance-value constraint and is outside the quarantine.
 
 **No preflight scan.** ADR-0015 and DESIGN were simplified to drop it (O4): the rule's base case
 comes from the release boundary — T2's migration creates the storage in the same release this task
@@ -1544,7 +1460,7 @@ but not the check. A dev database can be exactly that between T10 and T18; delet
 reasoning about it.
 
 **Acceptance criteria:**
-- [x] Reuse `dependency::extract_edges`, which calls `chain_ids()`, for chain bases and quarantine. `x-gts-ref` produces no edge
+- [x] Reuse `dependency::extract_edges`, which calls `chain_ids()`, for chain bases and quarantine. An entity reference produces no edge
 - [x] A stable candidate whose immediate base or `$ref` targets include a major-0 identifier is refused. The base comes from `chain_ids()` and `$ref` targets come from `dependency::extract_edges`; no target document is needed to read its major
 - [x] Refuse Instances conforming to major 0 via the `instance_of` edge from `get_type_id()`
 - [x] Pin the dialect across intra-entity revisions and new minors, using the preceding minor's current definition
@@ -1560,7 +1476,7 @@ reasoning about it.
 - [~] Gear tests, all three backends (see [Commands](#commands)) — 739/739 SQLite tests pass.
       The target now selects 10 tests across four backend binaries, including the new T17/T18
       PostgreSQL/MySQL scenarios; their Docker execution remains to be recorded
-- [x] Tests: each quarantine path — a stable candidate deriving from a v0 base and one `$ref`-ing a v0 target; plus stable candidates whose `x-gts-ref` names a v0 entity exactly or through a pattern, which must be admitted because the keyword is outside quarantine. Refusal tests register the v0 target first and assert that no entity row was written
+- [x] Tests: each quarantine path — a stable candidate deriving from a v0 base and one `$ref`-ing a v0 target; plus stable candidates whose entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) names a v0 entity exactly or through a pattern, which must be admitted because the keyword is outside quarantine. Refusal tests register the v0 target first and assert that no entity row was written
 - [x] Test: dialect change across revisions is refused — both edges, the intra-entity one and the cross-minor one
 - [x] Test: the four refusals appear in `refusals_total{stage="admission"}` under those exact
       label values — asserted as label values, not as counts:
@@ -1597,7 +1513,7 @@ MySQL's integer boolean, and the SQLite insert chunk accounts for all 15 columns
 ### Checkpoint 4
 - [x] Compatibility matrix passes including the `Unknown` tier
 - [x] Provenance persisted on every revision
-- [x] Quarantine and dialect rules hold, including admission of stable schemas whose `x-gts-ref` names a major-0 entity (no preflight — O4)
+- [x] Quarantine and dialect rules hold, including admission of stable schemas whose entity reference names a major-0 entity (no preflight — O4)
 - [x] Every verdict is counted, with `Unknown` and a forced waiver each distinguishable in the
       metrics and not only in a refusal reason (T17, P16)
 - [x] Quarantine and dialect refusals each carry their own counted reason, none collapsed into
@@ -1640,7 +1556,7 @@ Ordering is pure; admitted state stays acyclic without atomic groups or condensa
 
 **Verification:**
 - [x] Gear tests, all three backends (see [Commands](#commands)) — recorded at completion:
-      SQLite 781/781; `make test-types-registry-db` 24/24 on PostgreSQL and MySQL
+      SQLite 781/781; `make test-integration LANE=types-registry-db` 24/24 on PostgreSQL and MySQL
 - [x] Tests: partial commit, blocked dependent, blocked predecessor, refused in-batch `$ref` cycle
 - [x] Test: batch over `limits.batch_candidates` refused synchronously — covered by T7's
       `a_batch_over_the_limit_is_refused_with_both_numbers`
@@ -1669,9 +1585,7 @@ Ordering is pure; admitted state stays acyclic without atomic groups or condensa
 
 ### - [x] T20: Deletion and Dry Run
 
-**Inherited from T15:** committed deletion claims `entity_write_order` as its transaction's first
-statement, before checking dependents. A revision-vector guard alone cannot serialize a new
-dependency edge against deletion. See `plan.md` P15, DESIGN §3.7 and SPEC §8.1 step 4.2.
+**Inherited from T15:** committed deletion claims `entity_write_order` as its transaction's first statement, before checking dependents. A revision-vector guard alone cannot serialize a new dependency edge against deletion. See P15, DESIGN §3.7 and SPEC §8.1 step 4.2.
 
 **Description:** The short deletion protocol — positive `expected_resource_version`, family
 and entity locks, recheck `ACTIVE` with no direct registered dependents, lifecycle to
@@ -1684,8 +1598,8 @@ deletion, predicting the whole batch against one coherent snapshot without entit
   claim-order tests matching creation/revision/`unchanged`
 - [x] Live direct registered dependants block deletion; report count only
 - [x] Transitive-only dependants do not block
-- [x] `x-gts-ref` creates no edge and does not block
-- [x] Paired service tests vary only `$ref`/`x-gts-ref` on a string property: the former
+- [x] An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge and does not block
+- [x] Paired service tests vary only `$ref`/entity reference on a string property: the former
   blocks deletion; the latter permits it and remains readable. Tenant availability is deferred
 - [x] Tombstones remain exact-readable and are excluded from lists
 - [x] Dry run issues no entity writes/claims; its mode enters the fingerprint and outcomes persist
@@ -1778,10 +1692,10 @@ Read completion belongs to T22a (P17).
   mutations pending `X-ToolKit-Internal-Token`/`PlatformIdentity` and a separate listener;
   no usable gateway mutation example
 - [x] Handlers only map the domain service (SPEC §8.4)
-- [x] All routes use `routes::V2` for T24a's promotion
+- [x] All routes use `routes::V2` for T38's promotion
 - [x] Deletion routes reuse T20's `kind="deletion"` metrics
 - [x] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
-- [x] Both breaking changelog entries belong to T24a's promotion
+- [x] Both breaking changelog entries belong to T38's promotion
 
 **Verification:**
 - [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` through
@@ -1811,7 +1725,7 @@ Read completion belongs to T22a (P17).
 routes have no duplicate path/method pair in the served document.
 
 **Recorded verification:** SQLite 894/894 (44 router tests); PostgreSQL/MySQL 36/36 in one
-`make test-types-registry-db` run. Formatting, gear clippy and link checks passed.
+`make test-integration LANE=types-registry-db` run. Formatting, gear clippy and link checks passed.
 Manual `/cf/types-registry/v2/*` checks covered register/poll/read, dry-run and committed
 deletion, tombstones, `If-Match`, missing versions, unknown UUIDs and replay.
 `make e2e-local`: 324 passed, 19 skipped; no e2e edits.
@@ -1844,7 +1758,7 @@ With `PATH="$HOME/.cargo/bin:$PATH"`, whole-workspace `make clippy`
 **Acceptance criteria:**
 - [x] Every database-backed submission goes through the outbox; acceptance and enqueue
       share a transaction, so no accepted operation lacks a driver (P3). Startup seeding
-      still writes the in-memory service; T24 moves it onto this path
+      still writes the in-memory service; T31 moves it onto this path
 - [x] Signal the exact partition after the acceptance commit; transaction-time
       signals can arrive before rows are visible.
 - [x] Handler contains no admission logic — it resolves the operation UUID and calls the worker
@@ -1854,7 +1768,7 @@ With `PATH="$HOME/.cargo/bin:$PATH"`, whole-workspace `make clippy`
 - [x] Candidate content never enters an outbox or dead-letter payload
 - [x] Add `stateful`, deferred by T2: `[system, db, rest, stateful]` (SPEC §5)
 - [x] Start the worker at the end of `init()`, before stateful `start` (P3); retain `OutboxHandle` and call `stop()` after `ctx.cancellation_token()` fires (see lifecycle deviation)
-- [x] Started before anything can submit, so an acceptance always has somewhere to enqueue. T24's seed batch takes the same path and gates client publication on its item outcomes
+- [x] Started before anything can submit, so an acceptance always has somewhere to enqueue. T31's seed batch takes the same path and gates client publication on its item outcomes
 - [x] An operation submitted from any consumer's `init()` is admitted without that consumer waiting for the `start` phase
 
 **Verification:**
@@ -1941,9 +1855,7 @@ without adding inventory registration to every declaring gear.
 
 ### - [x] T22a: REST batchGet and discovery
 
-**Description:** Add `POST /entities:batchGet` and bounded, content-free `GET /entities`
-on `/v2/`; complete seven-route OpenAPI and quickstart coverage (former T27, P17).
-First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is deferred to P1 (P18).
+**Description:** Add `POST /entities:batchGet` and bounded, content-free `GET /entities` on `/v2/`; complete seven-route OpenAPI and quickstart coverage (P17). First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. Inventory attribution metadata remains P1 (P18, #4827).
 
 **Acceptance criteria:**
 
@@ -1970,10 +1882,10 @@ First in Phase 6 after Checkpoint 5; REST/SDK share SPEC §10.1/§10.2. T22 is d
   mutations pending `X-ToolKit-Internal-Token`/`PlatformIdentity` and a separate listener;
   no usable gateway mutation example
 - [x] Handlers only map the domain service (SPEC §8.4)
-- [x] All routes use `routes::V2` for T24a's promotion
-- [x] DTOs follow SPEC §10.1/§10.2: `items`, `key`, `EntityPage`; T23 follows the same contract
+- [x] All routes use `routes::V2` for T38's promotion
+- [x] DTOs follow SPEC §10.1/§10.2: `items`, `key`, `ListEntitiesResponse`; T29 follows the same contract
 - [x] No e2e edits; `make e2e-local` stays green. Preserve v1 and its in-memory store (P12/P17)
-- [x] Both breaking changelog entries belong to T24a's promotion
+- [x] Both breaking changelog entries belong to T38's promotion
 
 **Verification:**
 - [x] Gear tests (see [Commands](#commands)), including `TR/tests/api_rest_test.rs` driven
@@ -2026,33 +1938,13 @@ and quickstart, for the seven-route completeness check)
 - **`limit` and the page ceiling live in the domain**, which is why `DiscoveryPage` carries the
   size it was read at: a handler must not read `limits.page_size_default` to fill `page_info`,
   or REST and a future gRPC adapter could report different defaults for the same read.
-- **The batch ceiling is 100, not DESIGN §3.3's 500** — SPEC §9 ceiling C10, declared rather
-  than taken silently. DESIGN's higher number bought a reconciliation the headroom to read
-  every identifier it might write before selecting its ≤100 candidates; P0 gives that up
-  because a `found` result is a full representation and §3.2 bounds a resolved document at
-  1 MB, so the key count is the only bound on one response. The upgrade path is T23's helper
-  paging its reads plus a bound on response bytes rather than on keys.
-  A constant rather than a config key because §10.3's configuration is fixed for P0. It equals
-  `limits.batch_candidates` today and is still not the same bound: raising the write ceiling
-  must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the
-  value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling
-  is served and one past it is refused.
-- **`if_none_match` is declared and not consulted.** No read emits a validator until T22d, so
-  nothing a caller could hold can be compared against; the field exists now so the wire shape
-  does not change under the callers T23 migrates. `EntityLookupStatusDto` is `found` /
-  `not_found` only — declaring `unchanged` before T22d emits one would publish a vocabulary
-  value this gear never produces.
-- **Discovery filters by `pattern`, `limit` and `cursor` only.** DESIGN's `depth`, `origin`,
-  `availability`, `scope` and `tenant_id` are each out of P0 (SPEC §2). `kind` is *not* named
-  by this task's criteria and would change `EntityRepo::list_page`'s T4 signature, so it stays
-  out; v1's `kind` / `vendor` / `package` / `namespace` / `segment_scope` filters have no v2
-  equivalent, which T28 sees when it migrates the suites onto the promoted paths.
+- **The batch ceiling is 100, not DESIGN §3.3's 500** — SPEC §9 ceiling C10, declared rather than taken silently. DESIGN's higher number bought a reconciliation the headroom to read every identifier it might write before selecting its ≤100 candidates; P0 gives that up because a `found` result is a full representation and §3.2 bounds a resolved document at 1 MB, so the key count is the only bound on one response. The upgrade path is T29's helper paging its reads plus a bound on response bytes rather than on keys. A constant rather than a config key because §10.3's configuration is fixed for P0. It equals `limits.batch_candidates` today and is still not the same bound: raising the write ceiling must not silently widen read fan-out. Two tests hold it — one pins the literal `100` so the value cannot move unnoticed, one drives the boundary off the constant so exactly-at-ceiling is served and one past it is refused.
+- **`if_none_match` is declared and not consulted.** No read emits a validator until T22d, so nothing a caller could hold can be compared against; the field exists now so the wire shape does not change under the callers migrating in T32/T38. `EntityLookupStatusDto` is `found` / `not_found` only — declaring `unchanged` before T22d emits one would publish a vocabulary value this gear never produces.
+- **Discovery filters by `pattern`, `limit` and `cursor` only.** DESIGN's `depth`, `origin`, `availability`, `scope` and `tenant_id` are each out of P0 (SPEC §2). `kind` is *not* named by this task's criteria and would change `EntityRepo::list_page`'s T4 signature, so it stays out; v1's `kind` / `vendor` / `package` / `namespace` / `segment_scope` filters have no v2 equivalent, which T38 sees when it migrates the suites onto the promoted paths.
 - **`$select` is refused on the discovery route only**, where §10.2 legislates it as a query
   parameter. `:batchGet` has no `$select` field to refuse: its one fixed field set is the full
   representation, a superset of anything a projection could name.
-- **`PageInfoDto` is `{next_cursor, limit}`**, not `toolkit-odata`'s `PageInfo`: discovery pages
-  forward only, so a `prev_cursor` that is always `null` would publish a direction this route
-  does not travel. The envelope still names its array `items`, per SPEC §10.1's `EntityPage`.
+- **`PageInfoDto` is `{next_cursor, limit}`**, not `toolkit-odata`'s `PageInfo`: discovery pages forward only, so a `prev_cursor` that is always `null` would publish a direction this route does not travel. The envelope still names its array `items`, per SPEC §10.1's `ListEntitiesResponse`.
 - **Standing bar.** `make fmt` green; gear tests green on all three backends (943 SQLite,
   39 container-backed); `RUSTFLAGS="-D warnings" cargo check --workspace --all-targets
   --all-features` clean, so no other gear regressed. `make clippy` is **red at HEAD for an
@@ -2070,13 +1962,7 @@ and quickstart, for the seven-route completeness check)
 
 ### - [x] T22b: Field projection on all three read routes
 
-**Description:** Implement DESIGN §3.3's `$select` on exact read, `:batchGet` and discovery
-before T23 publishes the SDK models and T22d computes validators (plan P19). An absent
-`$select` returns P0's document-free metadata set; callers explicitly request `content`,
-`resolved_schema`, `effective_traits`, `effective_traits_schema` or `provenance`. The
-default includes managed `origin`, as fixed in SPEC §10.2. P0 has no
-availability or tenant fields, so those unavailable DESIGN fields are not advertised or
-synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
+**Description:** Implement DESIGN §3.3's `$select` on exact read, `:batchGet` and discovery before T29 publishes the SDK models and T22d computes validators (historical decision P19). An absent `$select` returns P0's document-free metadata set; callers explicitly request `content`, `resolved_schema`, `effective_traits`, `effective_traits_schema` or the Type Schema `provenance` group. The default includes managed `origin`, as fixed in SPEC §10.2. P0 has no availability or tenant fields, so those unavailable DESIGN fields are not advertised or synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 
 **Acceptance criteria:**
 - [x] Update SPEC §§2, 8.3, 8.5, 9, 10.1, 10.2 and 16 before coding: fix the exact P0
@@ -2086,14 +1972,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   retain C7 only for absent tenant/visibility dimensions and revise C10's full-response
   rationale without silently raising the 100-key ceiling. Done in the P19 contract revision;
   implementation and verification criteria below remain open
-- [x] Define one transport-neutral normalized field set for all three routes and T23/T22d:
-  field names follow ToolKit OData's case-insensitive, whitespace-trimming rules; order
-  does not change identity, and absent `$select` equals an explicit default selection.
-  Reject duplicates, empty, unknown, unavailable, malformed or excessive selections with
-  an RFC-9457 field violation naming `$select`, honoring ToolKit's parser limits. Check raw
-  empty comma segments too: ToolKit's parser currently drops them. A document
-  field selects the whole JSON document, not a nested path within it; inapplicable Type Schema
-  fields are absent on Instances
+- [x] Define one transport-neutral normalized field set for all three routes and T29/T22d: field names follow ToolKit OData's case-insensitive, whitespace-trimming rules; order does not change identity, and absent `$select` equals an explicit default selection. Reject duplicates, empty, unknown, unavailable, malformed or excessive selections with an RFC-9457 field violation naming `$select`, honoring ToolKit's parser limits. Check raw empty comma segments too: ToolKit's parser currently drops them. A document field selects the whole JSON document, not a nested path within it; inapplicable Type Schema fields are absent on Instances
+- [x] `provenance` is a group outside the default, selected only whole (its member is not a selectable name; a path into it is a nested selection), on generic `Entity` and `TypeSchema` (`Option<Provenance>`), never on `Instance`. Its one member, `compatibility_check_skipped`, is a required boolean: `true` means an applicable cross-minor check was deliberately waived with `skip_compatibility_check`; `false` means no waiver, not that a check ran. A selected `false` is present inside the group; an Instance omits the group on every read, selected or not, and SDK `Instance::try_from` refuses a snapshot carrying it. Reads carry the stored `type_schema_revision.compat_forced`; a selected Type Schema value that does not come back is corruption, not `false`. The revision's `gts_spec_version`, `gts_impl_version` and `compat_forced` stay internal audit and are not selectable
 - [x] Exact and batch reads accept the same selection and produce the same projected
   entity for one key. Batch `"$select"` is a top-level body field applied to every key;
   per-item `if_none_match` remains declared for T22d. `key`, lookup status and future `etag`
@@ -2110,15 +1990,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   bounded batches under the same snapshot as identity/current state; no per-entity query,
   no full artifact hydration for a metadata-only read. Keep all reads in SecureORM and
   compare the same behavior on SQLite, PostgreSQL and MySQL
-- [x] REST DTOs distinguish an unselected field from JSON `null`, preserve the flat
-  document fields of DESIGN and declare optional fields accurately in OpenAPI. Specify
-  the matching transport-neutral SDK request/result shape for T23: its reconciliation
-  explicitly selects `content`, and its list helpers select the fields they hydrate.
-  T22d digests this exact normalized set, never the raw query text
-- [x] Unknown query parameters, including unsupported OData options and v1-only filters,
-  are refused rather than silently ignored. Use ToolKit's OData `$select` registration and
-  extraction for GET routes, with a gear-level allowlist for accepted options and fields;
-  batch reads reject query-string `$select`. Keep v1's in-memory routes unchanged until T24a
+- [x] REST DTOs distinguish an unselected field from JSON `null`, preserve the flat document fields of DESIGN and declare optional fields accurately in OpenAPI. Specify the matching transport-neutral SDK request/result shape for T29: its reconciliation explicitly selects `content`, and its list helpers select the fields they hydrate. T22d digests this exact normalized set, never the raw query text
+- [x] Unknown query parameters, including unsupported OData options and v1-only filters, are refused rather than silently ignored. Use ToolKit's OData `$select` registration and extraction for GET routes, with a gear-level allowlist for accepted options and fields; batch reads reject query-string `$select`. Keep v1's in-memory routes unchanged until T38
 
 **Implementation order:**
 1. Contract and normalized field-set parser, with pure tests and SPEC/OpenAPI examples.
@@ -2131,9 +2004,14 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   baseline failure (`clippy::unused_async_trait_impl` in `libs/toolkit-security`); clippy
   over this gear with only that lint allowed is clean
 - [x] Router tests: default metadata-only response; each document alone; mixed batch;
-  managed `origin` shape, selected `provenance` and its
-  Instance null, Instance inapplicable fields; tombstone with `$select=content`; absent
-  key; invalid, unknown and unsupported selections; exact/batch parity
+  managed `origin` shape, selected `provenance` (`false` kept inside a Type Schema's
+  group, the group absent on an Instance, on all three reads, `ETag` scoped to it), Instance
+  inapplicable fields; tombstone with `$select=content`; absent key; invalid, unknown and
+  unsupported selections, including a `provenance` member alone or by path; exact/batch
+  parity; generated OpenAPI lists exactly the current `EntityDto` and `ProvenanceDto`
+  properties
+- [x] A forced revision reads back `provenance.compatibility_check_skipped=true`
+  (`compat_test`, typed SDK); e2e TR-READ-005/102, TR-REG-606/902/903 assert it over HTTP
 - [x] Router tests: discovery with metadata and document selection, multiple pages,
   cursor refusal after changing selection or pattern, and equivalent default spelling;
   malformed/unsupported OData options are refused
@@ -2163,7 +2041,8 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
 - **Wire shape.** `EntityDto` omits unselected fields; only `kind` and `lifecycle_status`
   were required in OpenAPI (T22c's amendment adds `gts_id`/`gts_uuid`), metadata is non-nullable, documents are any-JSON (so a selected `null`
   stays). `origin` is `{"type":"managed",resource_version,created_at,updated_at}`;
-  `provenance` is exactly `gts_spec_version`, `gts_impl_version` and `compat_forced`;
+  `provenance` is `{"compatibility_check_skipped":false}` with a required non-null
+  boolean, omitted when unselected or inapplicable;
   `owning_gear` stays internal attribution that no read returns, and exposing it is P1
   work (SPEC §10.2). Instance artifacts are absent even when selected.
 - **Strict query parameters.** A guard extractor refuses undeclared keys
@@ -2194,24 +2073,13 @@ synthesized. Keep T22a's 100-key batch ceiling and bounded discovery page.
   QUICKSTART loop (216 ids, hydrated in 100-key batches). The T22a loop sent an empty
   `cursor=` on its first page, which is a `400`; fixed here.
 
-**Dependencies:** T22a. Must complete before T23 fixes the SDK request/result models and
-before T22d fixes validator inputs; no dependency on deferred T22 inventory metadata.
-**Files likely touched:** `docs/p0/SPEC.md`, `TR/src/domain/registry_service.rs`,
-`TR/src/domain/ports/mod.rs`, `TR/src/infra/storage/repo/`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
-`TR/tests/api_rest_test.rs`, `TR/tests/repo_backends_test.rs`, `QUICKSTART.md`.
-**Scope:** L across three read surfaces; land the three implementation slices above
-separately, each with its focused tests and a working gear.
+**Dependencies:** T22a. Must complete before T29 fixes the SDK request/result models and before T22d fixes validator inputs; no dependency on P1 inventory attribution metadata. **Files likely touched:** `docs/p0/SPEC.md`, `TR/src/domain/registry_service.rs`, `TR/src/domain/ports/mod.rs`, `TR/src/infra/storage/repo/`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`, `TR/tests/api_rest_test.rs`, `TR/tests/repo_backends_test.rs`, `QUICKSTART.md`. **Scope:** L across three read surfaces; land the three implementation slices above separately, each with its focused tests and a working gear.
 
 ---
 
 ### - [x] T22c: Discovery filters by GTS chain depth and entity kind
 
-**Description:** Add DESIGN §3.3's `depth` and `kind` filters to `GET /entities` on the
-interim v2 route before T23 publishes `EntityQuery` (plan P20, SPEC D14/§10.2). These
-filters intersect with `pattern` and active-only discovery, before pagination and
-T22b's `$select`; they do not change exact read or `batchGet`. Every discovery filter is
-exact SQL before `LIMIT limit + 1` (SPEC D14). T22a's completed pattern-only filter record
-remains historical.
+**Description:** Add DESIGN §3.3's `depth` and `kind` filters to `GET /entities` on the interim v2 route before T29 publishes `ListEntitiesRequest` (historical decision P20, SPEC D14/§10.2). These filters intersect with `pattern` and active-only discovery, before pagination and T22b's `$select`; they do not change exact read or `batchGet`. Every discovery filter is exact SQL before `LIMIT limit + 1` (SPEC D14). T22a's completed pattern-only filter record remains historical.
 
 **Acceptance criteria:**
 - [x] REST accepts optional `depth=1..255` and `kind=type_schema|instance` with typed
@@ -2240,11 +2108,7 @@ remains historical.
   it is never read as an unfiltered traversal of a filtered query. Keep ordering by
   canonical `gts_id`. The cursor is the last returned row and appears only when another
   match exists, so a page with a cursor is full; no matching row is skipped or duplicated
-- [x] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown
-  `kind`, duplicate/unknown parameters and legacy v1 `is_schema` with RFC-9457 field
-  violations. `kind` is an enum rather than a free string; neither generic `$filter`
-  nor v1 `vendor`/`package`/`namespace`/`segment_scope` is accepted. Leave v1's
-  in-memory route untouched until T24a
+- [x] Reject zero, negative, fractional, non-numeric and overflow `depth`, unknown `kind`, duplicate/unknown parameters and legacy v1 `is_schema` with RFC-9457 field violations. `kind` is an enum rather than a free string; neither generic `$filter` nor v1 `vendor`/`package`/`namespace`/`segment_scope` is accepted. Leave v1's in-memory route untouched until T38
 
 **Implementation order:**
 1. Add typed `kind` filtering through REST, domain and SQL with router/backend tests.
@@ -2270,7 +2134,7 @@ remains historical.
   wildcard cuts, bare `~*`, early-segment minors, instance tails, UUID-tail patterns —
   composed with `depth`, `kind` and `lifecycle`, returns exactly what
   `GtsId::matches_pattern` accepts on SQLite, PostgreSQL and MySQL
-  (`make test-types-registry-db` 48/48; gear tests 1088/1088)
+  (`make test-integration LANE=types-registry-db` 48/48; gear tests 1088/1088)
 - [x] `EXPLAIN` of each page's recorded statement over 18k rows, after `ANALYZE`, on all
   three backends: a
   broad pattern reads `gts_id` order with an early `LIMIT`; a sparse minor drives from
@@ -2331,36 +2195,15 @@ remains historical.
   traversal, malformed values and cursor binding; repository tombstones among many active
   rows on all three backends
 
-**Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery).
-Must complete before T23 fixes the SDK `EntityQuery` shape. No dependency on deferred
-inventory T22 or on tenancy/federation.
-**Files likely touched:** `TR/src/domain/registry_service.rs`,
-`TR/src/infra/storage/repo/{entity_repo,segment_filter}.rs`,
-`TR/src/infra/storage/entity/{entity,entity_gts_segment}.rs`,
-`TR/src/infra/storage/migrations/m20260925_000005_entity_gts_segment.rs`,
-`TR/src/api/rest/{dto,handlers,routes,cursor}.rs`,
-`TR/tests/{api_rest_test,repo_backends_test,discovery_pattern_backends_test}.rs`,
-`docs/database.sql`, `QUICKSTART.md`.
-**Scope:** L across the discovery REST/domain/repository path; split into the two
-working implementation slices above.
+**Dependencies:** T22b (projection and cursor contract); T22a (bounded discovery). Must complete before T29 fixes the SDK `ListEntitiesRequest` shape. No dependency on P1 inventory attribution metadata or on tenancy/federation. **Files likely touched:** `TR/src/domain/registry_service.rs`, `TR/src/infra/storage/repo/{entity_repo,segment_filter}.rs`, `TR/src/infra/storage/entity/{entity,entity_gts_segment}.rs`, `TR/src/infra/storage/migrations/m20260925_000005_entity_gts_segment.rs`, `TR/src/api/rest/{dto,handlers,routes,cursor}.rs`, `TR/tests/{api_rest_test,repo_backends_test,discovery_pattern_backends_test}.rs`, `docs/database.sql`, `QUICKSTART.md`. **Scope:** L across the discovery REST/domain/repository path; split into the two working implementation slices above.
 
 ---
 
 ### - [x] T22d: Freshness validators and conditional reads
 
-**Description:** The per-request validator of DESIGN §3.3 and the conditional reads it
-enables (SPEC §8.5, `plan.md` P9/P19). For a P0 managed platform-plane read the validator is a
-versioned digest over `entity.resource_version`, `type_schema.resolution_fingerprint` (Type
-Schemas only) and T22b's normalized selected-field set — every other input in DESIGN's table is
-`tenant plane only`, availability-conditional or external, so none of them applies here.
-Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key validators on
-`batchGet`.
+**Description:** The per-request validator of DESIGN §3.3 and the conditional reads it enables (SPEC §8.5, P9/P19). For a P0 managed platform-plane read the validator is a versioned digest over `entity.resource_version`, `type_schema.resolution_fingerprint` (Type Schemas only) and T22b's normalized selected-field set — every other input in DESIGN's table is `tenant plane only`, availability-conditional or external, so none of them applies here. Ships the `ETag` / `If-None-Match` → `304` path on exact reads and per-key validators on `batchGet`.
 
-**Placement.** Formerly T29. Last in Phase 6, after T22c and before T23 (`plan.md` P21), so Checkpoint 6
-closes the complete P0 REST contract on `/v2/`. The task is server-only: the domain service
-computes the validator and the REST adapter carries it. T23 then exposes that same value in the
-SDK models — P9's requirement that the field precede T25/T26 is unaffected. T22a already
-accepts and length-checks each item's `if_none_match`; this task is where it is first compared.
+**Placement.** Last in Phase 6, after T22c and before T29 (P21), so Checkpoint 6 closes the complete P0 REST contract on `/v2/`. The task is server-only: the domain service computes the validator and the REST adapter carries it. T29 then exposes that same value in the SDK models — P9's requirement that validators precede remote clients and caches is unaffected. T22a already accepts and length-checks each item's `if_none_match`; this task is where it is first compared.
 
 **Acceptance criteria:**
 - [x] Validator is **computed per request, never stored** (`cpt-cf-types-registry-principle-derive-not-store`) — no column, no cache entry holds one as authority
@@ -2375,7 +2218,7 @@ accepts and length-checks each item's `if_none_match`; this task is where it is 
 - [x] **Discovery pages carry no validator** and are never conditional (DESIGN: validators are for exact reads, *"never discovery pages"*) — `GET /entities` is unaffected
 - [x] A deleted entity still has a validator, and deletion moves it (deletion increments `resource_version`)
 - [x] Handlers stay mapping-only: the validator is computed in the domain service, so a future gRPC adapter gets it without new domain methods (SPEC §8.4)
-- [x] `types-registry-sdk` is untouched: the validator is a domain value, and T23's local client maps it into the SDK models rather than recomputing it (P21)
+- [x] `types-registry-sdk` is untouched: the validator is a domain value, and T29's local client maps it into the SDK models rather than recomputing it (P21)
 - [x] `ponytail:`-style comment where the digest is built records ceiling C7's absent tenant/visibility dimensions and names the version field as the upgrade path
 
 **Verification:**
@@ -2392,10 +2235,7 @@ accepts and length-checks each item's `if_none_match`; this task is where it is 
 - [x] Test: deletion changes the validator
 - [x] `make e2e-local` remains green with no e2e file edited — only `/v2/` routes change
 
-**Dependencies:** T22a (`batchGet` and its per-item `if_none_match`), T22b (normalized
-projection and the three read routes, Phase 6 per P19). Not T23: the SDK carries the validator
-this task computes, not the reverse (P21)
-**Files likely touched:**
+**Dependencies:** T22a (`batchGet` and its per-item `if_none_match`), T22b (normalized projection and the three read routes, Phase 6 per P19). Not T29: the SDK carries the validator this task computes, not the reverse (P21) **Files likely touched:**
 - `TR/src/domain/validator.rs`
 - `TR/src/domain/registry_service.rs` (the database read path; `service.rs` is the legacy in-memory service)
 - `TR/src/api/rest/handlers.rs`, `TR/src/api/rest/routes.rs`, `TR/src/api/rest/dto.rs`,
@@ -2415,358 +2255,1194 @@ this task computes, not the reverse (P21)
 - [x] Conditional reads work on `/v2/`: an exact read carries a per-request validator and
       honours `If-None-Match` with a `304` that carries its `ETag`; `batchGet` reports
       `unchanged` per key with its `etag`; discovery carries none (T22d, P21)
-- [x] The P0 REST contract is complete; the server work left is the cutover (T24) and the
-      path promotion (T24a), both in Phase 7 (P21)
+- [x] P0 REST is complete; the remaining server work is the atomic cutover and path
+      promotion in T38, Phase 7
 - [x] `make e2e-local` remains green with no e2e file edited; gear tests and `make lychee` pass
 - [x] Nothing is cut over yet — consumers still on the old path, and the new SDK trait is not
-      written yet (T23 opens Phase 7); T22 is deferred to P1 (P18)
+      written yet (T28 opens Phase 7 with the publisher signature, followed by T29's contract); inventory attribution metadata remains P1 (P18, #4827)
 - [x] `make dylint` — full workspace, once for the phase (P13)
 - [ ] Human review
 
 ---
 
-## Phase 7 — SDK contract, cutover and migration
+## Phase 7 — Both clients, real local AM, and every gear on the persistent registry
 
-### - [ ] T23: New SDK trait and explicit-document reconciliation helper
+Plans P26–P31 and P33. T28–T31 and T33–T35 are complete in the foundation; T32 and T34a remain pending in the consumer-migration follow-up. The next SDK task is **T35a**. The remaining SDK sequence is **T35a → T35b → T36 → T37 → T38**, with the pending T32/T34a consumer migration required for Checkpoint 7A and the T38 cutover. T35a adds the resolved-payload validation wrapper and T35b aligns mock Type Schema admission before consumer cutover; existing task numbers stay unchanged.
 
-**Description:** `TypesRegistryEntities` plus its models per SPEC §10.1, and the
-reconciliation workflow of DESIGN §3.3 over explicitly supplied desired documents, as an SDK
-helper so existing callers need not hand-roll batching, idempotency or retry (P18). Inventory
-collection and per-gear filtering are deferred to P1; the helper does not discover declarations
-or delete entities absent from its input. The old trait is **not** kept — it is deleted in
-T26 once every consumer has moved.
+- **Traits and local clients (T29, T30).** Both contracts, the platform and tenant extension helpers and both local clients land together, in one pull request.
+- **Embedded local handoff (T31).** All linked inventory and `cfg.entities` are admitted into the database before the new APIs are published in ClientHub. A new gear can reconcile in `init()` without waiting for REST, T37 or the fleet migration.
+- **Real local application (T32).** AM, both IdP writers and the tenant-resolver family use the new catalogue together. Existing tenant/metadata/IdP REST e2e prove real behavior; the rest of the fleet stays legacy until T38.
+- **SDK contract handoff (T34–T37, Checkpoint 7A).** REST/TCP contracts, resolving clients, cache and generic lifecycle are verified, alongside T32's real local AM. Full process/directory/cold-start proof belongs to real remote AM in T41.
+- **Persistent registry for every gear (T38, Checkpoint 7).** One atomic, shim-free cutover moves every remaining consumer onto the already-seeded database and new SDK; P0 then ends on one REST version.
 
-**Placement.** First in Phase 7, after Checkpoint 6 (`plan.md` P21): the SDK is written
-against the complete `/v2/` read contract, conditional reads included, and still lands before
-the cutover (T24) and before any consumer moves (T25/T26).
+**e2e windows.** T34 and T35 change routes and their e2e callers in the same commit, so `make e2e-local` stays green through Checkpoint 7A and the T38 cutover: legacy deletion, promotion of both plane paths and callers merge together (P30). No intermediate red window is accepted.
+
+### - [x] T28: Toolkit — publisher signature and publication status
+
+**Description:** Publication data, SemVer and supervision needed by T29 (D16/D18/D21).
+
+**After review:** types moved from `toolkit-gts` to SDK `publication.rs`; supervision moved from toolkit to SDK `supervised.rs`. `spawn_supervised` is crate-private; `Supervised`, `SupervisedStatus` and `TaskExit` remain public for returned handles. The unused toolkit publisher signature, test and re-exports were removed; the SDK imports `tokio_util` directly. T37 adds only generic readiness/supervision to toolkit. `PublisherContext`, `PublisherVersion` and `PublisherVersionError` later moved to `models.rs`: they are fields of the write requests, not publication state. The publication status, `supervised.rs` and their tests were then **removed** as unused before their first caller; T37 writes them under its own contract (the T28 code is in `c5f491cc8`, `TR-SDK/src/publication/`). The checked criteria below retain the initial implementation record.
 
 **Acceptance criteria:**
-- [ ] Trait is object-safe: `hub.get::<dyn TypesRegistryEntities>()` compiles
-- [ ] Models are field-for-field the SPEC §10.1 shapes, with out-of-scope fields absent rather than renamed
-- [ ] No serde, no utoipa, no HTTP types in the SDK crate
-- [ ] Models stay **gRPC-expressible** for future out-of-process use (plan decision P5): flat structures, no `Arc`-linked object graphs, no trait objects. The old trait's `Arc<GtsTypeSchema>` parent chain is exactly what must not be reproduced
-- [ ] No security-context parameter; a doc comment records that planes will add one as a deliberate breaking change, and that out-of-process use requires it
-- [ ] **Convenience read helpers as provided methods** over the two required primitives, so consumers keep familiar call shapes and the trait stays object-safe (DESIGN: *"single reads and the kind-narrowed `get_type_schema` / `get_instance` are provided methods over it"*): `get_type_schema`, `get_instance`, `get_type_schemas`, `get_instances`, the `_by_uuid` variants, `list_type_schemas`, `list_instances`. Kind narrowing costs no round trip — the kind is the trailing `~` of the identifier, so a kind-mismatched argument fails locally
-- [ ] `EntitySnapshot` exposes the materialized documents as **plain fields** (`content`, `resolved_schema`, `effective_traits`, `effective_traits_schema`) plus a `segments` accessor, so the ~40 call sites using the old models' computed methods become field reads rather than rewrites
-- [ ] `origin` is the DESIGN managed variant in P0; it carries the read `resource_version`
-  and timestamps used by reconciliation. There is no content digest (SPEC §10.2), and
-  `provenance` is the sole selectable group
-- [ ] Documents are selectable **individually**, not as an `effective` group: a caller wanting `effective_traits` must not be made to transfer the 1 MB-bounded `resolved_schema` with it (DESIGN §3.3, *Field selection*). T22b supplies the server contract; the SDK models use the same normalized selection and represent omitted fields explicitly
-- [ ] **No `effective_*` recomputation exists in the SDK** — the old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced. They resolved only the parent `$ref` and left non-parent references unresolved, and `effective_traits` was an admitted approximation (`TODO(#1723)`), so reproducing them would reintroduce both a wrong answer and a `constraint-gts-implementation` violation (SPEC §10.1)
-- [ ] `EntityQuery` carries `limit` and `cursor`, and `EntityPage` carries the next cursor — the trait already declared `EntityPage` in SPEC §10.1, and without these it is a page in name only (D12)
-- [ ] `EntityQuery::filter` carries `pattern`, `max_chain_depth`, `kind` and `lifecycle`
-  from T22c as typed fields. `list_type_schemas` and `list_instances` request their respective
-  `kind` server-side while preserving caller-supplied pattern/depth and cursor;
-  they do not fetch the opposite kind and discard it client-side
-- [ ] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The ~87 existing call sites keep reading payloads from the result. The doc comment states the trade: complete with respect to the traversal, not to an instant; `batchGet` is optional, for per-key validators and caching
-- [ ] **The validator field is in the models from this task**, carrying the value T22d's domain service computes — the local client maps it and never recomputes one. `BatchGet` accepts a validator per requested key in `BatchGetItem::if_none_match`, and a result variant for `unchanged` is part of the same shape; T30 consumes both. Adding either later would break the SDK contract after ~50 call sites have moved onto it (SPEC §8.5, `plan.md` P9)
-- [ ] **Reconciliation helper** implements DESIGN §3.3's five steps: batch-read the desired identifiers, omit content equal to current, set `expected_resource_version` from the read for differing ones and leave it unset for missing ones, return `UpToDate` with no POST when nothing remains, otherwise submit once under one idempotency key and poll to terminality
-- [ ] The helper accepts an explicit desired-document set, requests `content` for its comparisons,
-  and batches within `limits.batch_candidates`. It does not collect or filter process inventory:
-  T22 moved that work to P1 (P18, SPEC D11)
-- [ ] **Retry lives here, not in gears:** a candidate failing because a dependency is not yet registered is retried a bounded number of times; failure names the gear and identifier
-- [ ] One generated idempotency key spans an invocation's retries and polling
-- [ ] Callable from a consumer's `init()` (P3). Its doc comment states the one requirement: declare `deps = [types_registry]`, or `init` ordering is not guaranteed
+- [x] Initial `toolkit::GtsPublisher` signature: `fn(Arc<ClientHub>, PublisherContext, Vec<GtsDeclaration>, CancellationToken) -> Supervised<PublicationStatus>`, returning immediately. Declarations are `(String, serde_json::Value)` plain data; no `toolkit-gts` type crosses collector boundaries. Signature removed after review above
+- [x] Initial `toolkit-gts` publication data (now SDK): per-identifier pending/admitted/rejected/superseded. Readiness requires all admitted or superseded-live; empty sets satisfy it. Terminal means no pending identifiers. Reasons distinguish waiting, unreachable registry, blocked dependency, registry refusal and stopped publisher; superseded-deleted does not satisfy readiness
+- [x] `PublisherVersion` wraps `semver::Version`; Eq/Ord/Hash use precedence and ignore build metadata, while Display preserves it. `FromStr` checks `MAX_LEN = 128` before parsing; `TryFrom<&str>` delegates. Invalid/oversized inputs fail. T44 adds only domain stamp/name validation; workspace `semver = "1.0"` was already transitive
+- [x] Supervision owns one join handle, catches construction/poll/cancellation-drop panics, and settles unfinished status via `SupervisedStatus::stopped(exit)`. Pending identifiers become `PublisherStopped`; settled outcomes remain and terminal status ignores reports. Workers receive child cancellation tokens. `join()` waits; dropping a handle detaches without cancellation so status still settles. Initially toolkit, now SDK (review above)
+- [x] `version` is a validated SemVer value; the type has no constructor that reads the calling crate's own `CARGO_PKG_VERSION`, so the version can only come from the publishing crate (T39)
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry-sdk`
-- [ ] Test: a mock consumer round-trips submit → poll → read through the new trait
-- [ ] Gear test (`cargo nextest run -p cf-gears-types-registry`): through the real local client over `RegistryService`, a read carries T22d's validator byte for byte and a `BatchGet` naming the current validator returns `unchanged` — an SDK-crate mock cannot prove that mapping
-- [ ] Test: helper returns `UpToDate` without submitting when everything already matches
-- [ ] Test: only supplied documents are reconciled; unrelated linked inventory and existing registry entities are neither submitted nor deleted
-- [ ] Test: helper converges when a base type is admitted only on the second attempt
-- [ ] Test: helper against an operation nothing will drain fails on its deadline with a diagnosable error, not a hang
+- [x] Initial tests: `toolkit-gts/tests/publication_test.rs` (15) covers SemVer precedence/hash/128-byte bound and per-identifier readiness; `toolkit/tests/supervised_test.rs` (11) covers return/error/panic/cancellation/drop, terminal reports and child-token isolation. Disabling settlement fails 5 tests. `cargo test -p cf-gears-toolkit -p cf-gears-toolkit-gts --all-features` passed; tests later moved to SDK
+- [x] Initial `toolkit/tests/gts_publisher_test.rs` compiled using only toolkit re-exports; independent review confirmed no other extern crate was needed. Removed with the unused signature after review
+- [x] `cargo check --workspace --all-targets` green — the new root re-exports collide with no glob import; `make fmt`, `make clippy`
 
-**Dependencies:** T4 (reads), T21 (async dispatch), T22b (projection contract), T22c
-(discovery filter contract), T22d (validators). Scheduled after Checkpoint 6 so the whole read
-surface, conditional reads included, is verified before SDK integration (P21); its contract
-shape is fixed by SPEC, not by the REST DTOs
-**Files likely touched:**
-- `TR-SDK/src/entities.rs`
-- `TR-SDK/src/entity_models.rs`
-- `TR-SDK/src/reconcile.rs`
+**Dependencies:** Checkpoint 6 **Files touched:** `types-registry-sdk/src/{publication,publication_tests}.rs` (after the revision above; originally `libs/toolkit-gts/src/{lib,publication}.rs` and `libs/toolkit-gts/tests/publication_test.rs`), `types-registry-sdk/src/{supervised,supervised_tests}.rs` (after the revision above; `libs/toolkit` is untouched), `Cargo.toml` / `Cargo.lock` (`semver`) **Scope:** S
+
+---
+
+### - [x] T29: `PlatformTypesRegistryApi` contract, models, local client, reconciliation and publication
+
+**Description:** `PlatformTypesRegistryApi` plus its models per SPEC §10.1 and D15, served in process by the local client. It carries two SDK helpers so that callers need not hand-roll batching, idempotency or retry:
+- the reconciliation workflow of DESIGN §3.3 over explicitly supplied desired documents;
+- `publish_gts`, which runs that reconciliation for a gear in the background and reports a status handle (D16).
+
+The REST clients are T34 (platform) and T35 (tenant); the per-crate collectors that feed `publish_gts` are T39. The old trait is **not** kept — T38 moves every consumer and deletes it.
+
+**Placement.** T28 supplies the data/supervision types; T29 precedes T31's local handoff and T38’s remaining consumer cutover. Local reconciliation stays synchronous in `init` until T42. The complete read/validator contract and required publisher model land now to avoid another consumer API migration; adapters send publisher only from T44.
+
+**After review:** `reconcile_entities_and_await` replaces the public `register_entities_and_await`: startup declarations need read/compare/update, since creating an existing identifier yields `already_exists` even for equal content. The crate-private `await_registration` retains submit/poll deadline and cancellation tests. Callers needing their own keys/preconditions compose `register_entities` and `get_operation`.
+
+**After review, unused surface removed** (the removed code is in `c5f491cc8`):
+- `publish_gts` / `publish_gts_with` / `PublishOptions`, the publication status and the supervised task had no caller; T37 writes them with its hook and readiness contract.
+- `reconcile` moved to `TR-SDK/src/reconcile.rs` and became crate-private; the public entry is `reconcile_entities_and_await`. `Outcome` and `PendingCause` are `ReconcileOutcome` and `ReconcilePendingCause`; the `GtsDeclaration` alias is gone (`&[(String, JsonDocument)]`).
+- `ReconcileOutcome::Superseded` and `Liveness` (the post-outcome liveness re-read) are gone: the registry emits `superseded` only from T44, so before then it could not occur. A `superseded` item is an ordinary `Rejected` until T45 restores the variant.
+- `PlatformTypesRegistryApiExt::delete_entity` had no caller: a deletion is one `delete_entities` call. The fake lost its `deletions()`, `hang_read`, `panic_on_submit` and `x-fake-superseded*` hooks with their last users.
+
+The checked criteria below retain the initial implementation record.
+
+**Acceptance criteria:**
+- [x] `PlatformTypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: the `Api` suffix, `Result<_, CanonicalError>` on every method, `#[idempotency(..)]` per SPEC §10.1
+- [x] Every method takes `&PlatformSecurityContext` first. Callers pass `PlatformSecurityContext::outbound_marker()`. The local client passes it through without validating credentials, and records no principal from it (C2)
+- [x] The trait has **no default methods**. `delete_entity`, `register_entities_and_await` and the convenience reads live in `PlatformTypesRegistryApiExt`, blanket-implemented for `T: PlatformTypesRegistryApi + ?Sized`
+- [x] Object-safe: `hub.get::<dyn PlatformTypesRegistryApi>()` compiles, and the extension methods are callable on it
+- [x] Models are field-for-field the SPEC §10.1 shapes, with out-of-scope fields absent rather than renamed. The mutation and operation types are DESIGN's (`RegistrationOperation`, `DeletionOperation`, `Operation`)
+- [x] **No serde, no utoipa, no HTTP types on the semantic models.** Wire DTOs belong to T34, behind `rest-client`
+- [x] Flat, wire-expressible models: no `Arc` parent graphs or trait objects (P5)
+- [x] **Convenience reads as extension methods** over the two read primitives, so consumers keep familiar call shapes:
+  - `get_type_schema`, `get_instance`, `batch_get_type_schemas`, `batch_get_instances`;
+  - the `_by_uuid` variants;
+  - `list_type_schemas`, `list_instances`.
+
+  Kind narrowing costs no round trip: the kind is the trailing `~` of the identifier, so a kind-mismatched argument fails locally
+- [x] `Entity` exposes the materialized documents as **plain fields** (`content`, `resolved_schema`, `effective_traits`, `effective_traits_schema`) plus a `segments` accessor, so the ~40 call sites using the old models' computed methods become field reads rather than rewrites
+- [x] `origin` is the DESIGN managed variant in P0. It carries the read `resource_version` and the timestamps used by reconciliation. There is no content digest (SPEC §10.2), and selectable documents are flat; `provenance` is the one group, carrying the Type Schema waiver as `compatibility_check_skipped`
+- [x] Documents are individually selectable, with explicit omission and T22b normalized selection; selecting traits need not transfer the 1 MB-bounded resolved schema
+- [x] **No `effective_*` recomputation exists in the SDK.** The old `GtsTypeSchema::effective_schema` / `effective_properties` / `effective_required` / `effective_traits` / `effective_traits_schema` are not reproduced (SPEC §10.1)
+- [x] `ListEntitiesRequest` carries `limit` and `cursor`, and `ListEntitiesResponse` carries the next cursor (D12)
+- [x] `ListEntitiesRequest::filter` carries `pattern`, `max_chain_depth`, `kind` and `lifecycle` as typed fields. `list_type_schemas` and `list_instances` request their `kind` server-side, preserving caller-supplied pattern/depth and cursor
+- [x] `list_instances` / `list_type_schemas` **explicitly select the documents their callers read**, on the discovery page or through a following `batchGet`. The doc comment states the trade: complete with respect to the traversal, not to an instant
+- [x] **The validator field is in the models from this task**, carrying the value T22d's domain service computes; the local client maps it and never recomputes one. `BatchGetItem::if_none_match` and an `unchanged` result variant are part of the same shape (SPEC §8.5, P9)
+- [x] Mutations submit then read `get_operation`; never synthesize from receipts, including terminal replay. Read-back errors name `operation_id` for same-key replay (D19). REST handles `Retry-After` internally; semantic models omit it and `replayed`
+- [x] `register_entities_and_await` holds one monotonic deadline across submit and polling, honours cancellation, and names the `operation_id` on timeout; a timeout never cancels the accepted write
+- [x] Required request-level `PublisherContext { name, version }` on registration/deletion. `CandidateStatus` is unchanged; `superseded` carries stored/offered versions and `publisher_mismatch` stored/offered publishers. Snapshots omit publisher metadata
+- [x] **Reconciliation helper** implements DESIGN §3.3's five steps:
+  - batch-read the desired identifiers;
+  - omit content equal to current;
+  - set `expected_resource_version` from the read for differing ones, and leave it unset for missing ones;
+  - return `UpToDate` with no POST when nothing remains;
+  - otherwise submit and poll to terminality.
+- [x] The helper accepts an explicit desired-document set, requests `content` for its comparisons, and batches within `limits.batch_candidates`. It collects no inventory itself and deletes nothing absent from its input
+- [x] **Idempotency key scope:**
+  - one key spans retries of an **identical** submission and its polling;
+  - a new cycle — a re-read that changes candidates or preconditions — takes a new key (ADR-0012:168).
+- [x] `already_exists` / `precondition_failed` caused by a concurrent publisher of the same content lead to a re-read, not a failure
+- [x] **`publish_gts`** has the publisher shape T28 described and T37 defines as `toolkit::GtsPublisher`: it takes the `ClientHub` (resolving `dyn PlatformTypesRegistryApi` from it), the caller's `PublisherContext` (never built inside the SDK), plain-data declarations and a cancellation token, returns `toolkit-gts`'s publication status, and runs reconciliation in a background task supervised by the SDK's `spawn_supervised` (T28, revised):
+  - bounded retries per cycle for a dependency not yet registered, with backoff continuing across cycles;
+  - a pace set by `Retry-After`.
+- [x] It returns a status handle — *pending*, *admitted*, *rejected* or *superseded*, with per-identifier reasons. A permanently rejected or superseded candidate stops retrying, and failure names the gear and identifier. A task that panics or exits is observed and never leaves the status *pending*
+- [x] Reconciliation keeps the `UpToDate`/no-`POST` contract until T45 makes it always submit, once the server confirms a higher version (SPEC D18). Every caller supplies a `PublisherContext`, because the models require it, but until T44 neither adapter sends it to the server
+- [x] `publish_gts` and every remote use are never called from `init()`: remote clients are wired after every `init` (SPEC §8.4), so publication belongs to the post-wiring hook (T37). The doc comments say so. The one transitional exception is T31–T42: synchronous reconciliation through the **local** client inside `init`, which T41/T42 remove
+
+**Verification:**
+- [x] `cargo test -p cf-gears-types-registry-sdk`
+- [x] Test: a mock consumer round-trips submit → poll → read through the new trait
+- [x] Gear test (`cargo nextest run -p cf-gears-types-registry`): through the real local client over `RegistryService`, a read carries T22d's validator byte for byte, and a `BatchGetEntitiesRequest` naming the current validator returns `unchanged`
+- [x] Test: reconciliation returns `UpToDate` without submitting when everything already matches
+- [x] Test: only supplied documents are reconciled; unrelated entities are neither submitted nor deleted
+- [x] Test: publication converges when a base type is admitted only on a later cycle, and each cycle uses a new idempotency key
+- [x] Test: two publishers of identical content both reach `admitted`
+- [x] Test: a permanently invalid declaration reports `rejected` with its reason and stops retrying
+- [x] Test: an operation nothing will drain fails on its deadline with a diagnosable error, not a hang
+- [x] Test: a terminal replay returns the operation read back, with its real items; a read failing after an accepted submit surfaces the `operation_id`, and the retry replays (SPEC §13)
+- [x] Test: a publication task that panics reports a terminal failure, not *pending*
+
+**Outcome (five commits, `a29d9de1d` → S5).** Review findings incorporated.
+
+- Request/response envelopes adopt AIP names in DESIGN/SPEC before T38 consumer migration; resource, item and method names stay unchanged.
+- Additive sample deviations: `RegisterItem::gts_id` permits Instances without document IDs and checks schema `$id`; `register_entities_and_await` adds deadline/token cancellation. Expiry/cancellation wins before polling; timeout names a known operation, while cancellation relies on the caller’s key.
+- `item_failure` encodes `FailedPrecondition`: violation 0 is reason/key/message; remaining violations are context.<name>/value. Unknown reasons/context round-trip. Default list helpers select content and schema materializations; explicit Select is preserved.
+- `domain::local_client::LocalClient` shares the domain cursor and the error ladder with REST, and hands out the domain validator token unquoted (SPEC §8.5). Accepted-submit read-back failures are Aborted with operation ID; an injected outbox/database test proves same-key recovery. ClientHub registration was deferred; P28 assigns production local ClientHub registration to T31.
+- Reconciliation settles equal content immediately. Only explicit NotFound permits creation; missing/incomplete/Unchanged replies are protocol faults. Batches get fresh keys; identical retries reuse them. A permanent submission refusal stops the call and returns a structured canonical report; hinted `ResourceExhausted` resends the same request after the hint. The canonical category and context decide for local and remote clients alike. Require one outcome per candidate and canonical caller spelling. Publisher mismatch rejects; supersession reads liveness after the outcome.
+- Publication backs off across cycles with a 50 ms floor and clamped bounds. Unverified superseded liveness stays pending for bounded re-reads, never resubmission. Transport handles Retry-After. T37 checks its publisher signature.
+- `FakePlatformRegistry` (`test-util`) supplies deterministic admission/fault hooks.
+- Verification: 123 SDK tests, 14 real local-client/outbox tests, full gear suite 1199 green; scoped clippy and fmt clean.
+
+**Dependencies:** T4 (reads), T21 (async dispatch), T22b (projection contract), T22c (discovery filter contract), T22d (validators), T28 (publisher signature, publication status, `PublisherVersion`, supervision helper) **Files likely touched:**
+- `TR-SDK/src/contract.rs`
+- `TR-SDK/src/models.rs`
+- `TR-SDK/src/publication/reconcile.rs`
 - `TR-SDK/src/lib.rs`
 - `TR/src/domain/local_client.rs`
 **Scope:** M
 
 ---
 
-### - [ ] T24: Cutover — linked inventory seeds into the database; ready mode and in-memory repository out
+### - [x] T30: `TypesRegistryApi` tenant contract, its extension helpers and local client
 
-**Description:** types-registry keeps collecting the whole process-linked inventory and seeds
-its Type Schemas and Instances into the database inline at `init()` (P2/P18),
-then starts the outbox worker (P3). Delete `switch_to_ready`, the `temporary`/`persistent`
-split, `SystemCapability::post_init` and the in-memory repository. From here on reads are
-served from the database (SPEC D2, §8.2) — this is the task where the old in-memory read path
-is switched off, so it is where that must be true. The `local_client` cache is **not** deleted
-(SPEC §8.3, `plan.md` P7): its old model-typed implementation goes when the old models go, and
-T30 lands its replacement. Between here and T30 reads are uncached.
+**Description:** Add read-only `TypesRegistryApi` (`SecurityContext` first), its `TypesRegistryApiExt` helpers and a local adapter over the shared domain service. T29+T30 deliver all P0 traits/local clients in one PR. P27 brought the tenant contract/local adapter ahead of REST and added the tenant helpers. REST remains T34/T35; resolving wrappers and `#[provides]` belong to T35.
 
-**Operator-configured entities (`cfg.entities`).** The YAML `gears.types-registry.config.entities`
-field carries operator-controlled identities that cannot be expressed as inventory items — their
-GTS identifiers are deployment-specific (e.g. the platform-root and customer tenant types in
-`e2e-local.yaml`). Currently these are seeded only into the in-memory `TypesRegistryService`;
-T24 must seed them into the database through the same outbox admission path used for
-the linked inventory. An invalid or oversized combined seed set must fail boot loudly
-(current in-memory behaviour preserved). The `cfg.entities` field itself is not removed — it
-remains the deployment-time escape hatch for identities that no gear can own.
+Commits inside the task: (1) tenant contract and extension helpers; (2) tenant local client.
 
 **Acceptance criteria:**
-- [ ] Seeding covers all linked Type Schema and Instance inventory, including other gears, through the database admission path; no per-gear filter is introduced (D11/P18)
-- [ ] `cfg.entities` from the deployment configuration is seeded into the database at startup, through the same outbox admission path; the field is validated and any failure fails boot
-- [ ] Seeding is idempotent — a second start admits nothing new and reports `unchanged` for both linked inventory and `cfg.entities`
-- [ ] Seeding runs **after** the outbox worker starts (P3) and enqueues like any other submission; startup awaits its items and fails boot on a `failed` one
-- [ ] `init()` never waits on a registrant; it blocks only on its own seed operations, before publishing the client (`constraint-boot-path`)
-- [ ] All linked inventory and `cfg.entities` together fit within `limits.batch_candidates` and other admission limits; if they exceed them, startup fails before publishing the client, with a diagnostic naming the exceeded limit. No truncation or silent split. Admission orders cross-crate dependencies inside this single batch
-- [ ] The v1 REST routes T9a restored are deleted **together with** the repository they read —
-      `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}`
-      (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a
-      deleted repository is the failure mode; T24a then promotes v2 onto those paths
-- [ ] `TypesRegistryClient` survives this task over the database, not over the repository it
-      deletes: its `register` becomes a submit-then-poll shim for the T24–T26 window, so the
-      ~13 `register(...)` sites and every read site keep working while T25/T26 migrate them
-      (`plan.md` P12). The shim is one store and one write path — not a dual path — and T26
-      deletes it with the trait
-- [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The old model-typed cache goes with the old models, and the four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T30 replacements
-- [ ] `owning_gear = "types-registry"` remains a compatibility placeholder for P0 admissions. C3 stays open; its source comment describes incomplete attribution and the P1 upgrade, never claims that all declarations belong to the registry. Keep the column and global NOT NULL constraint; no read returns the placeholder, since exposing `owning_gear` is P1 work
-- [ ] No entity-derived state survives `init()` — no `ArcSwap`, no entity map, no `GtsOps` field on the gear or the service. Grep-checkable, and the ceilings C1/C4 struck by D2 depend on it
+- [x] `TypesRegistryApi` is declared with `#[toolkit::contract(gear = "types-registry", version = "v1")]` and compiles: `&SecurityContext` first on every method, `Result<_, CanonicalError>`, `#[idempotency(SafeRead)]`, no default methods. Object-safe: `hub.get::<dyn TypesRegistryApi>()` compiles and the extension methods are callable on it
+- [x] The tenant contract shares the platform's semantic models, projection and validators; it has no mutation and no operation access
+- [x] `TypesRegistryApiExt`, blanket-implemented for `T: TypesRegistryApi + ?Sized`, offers the read conveniences of `PlatformTypesRegistryApiExt` — `get_type_schema`, `get_instance`, their plural and `_by_uuid` variants, `list_type_schemas`, `list_instances` — with the same local kind narrowing and explicit document selection. One implementation of the helper logic serves both extension traits; no copy, and no mutation helper
+- [x] Its local client reuses the platform lookups, encodings and errors — no second domain implementation — and returns what the platform local client returns for the same request, `unchanged` and cursors included
+- [x] The local client applies no tenant scope and records no principal from the `SecurityContext` in P0; the C2/C6 source comments say so. It is verified in fixture hosts only — the existing embedded consumers stay on the legacy client until T38
 
 **Verification:**
-- [ ] Gear tests, all three backends (see [Commands](#commands))
-- [ ] Test: second `init()` against a populated database seeds nothing
-- [ ] Test: declarations from at least two linked crates seed successfully, including a cross-crate dependency; inventory selection does not require `owning_gear`
-- [ ] Test: the combined inventory + `cfg.entities` count exceeds a deliberately low `limits.batch_candidates`; startup fails explicitly before client publication, with no silent split/truncation
-- [ ] Test: `cfg.entities` entries are present and readable after boot, and a second boot reports `unchanged` for them
-- [ ] Test: an invalid entry in `cfg.entities` fails boot with a clear error
-- [ ] Test: a read issued after an entity is written directly to the database (not through the service) returns it — proving the read path holds no process-local copy. This is the single-process form of SPEC §13's two-pod criterion
-- [ ] `make quickstart` — server boots with all linked inventory present in the database; the configured batch/admission limits cover the real seed set
-- [ ] `make e2e-local` — server boots with `cfg.entities` populated (the two AM tenant types); both are readable after boot
-- [ ] Manual: restart, confirm entities and artifacts byte-identical
+- [x] `cargo test -p cf-gears-types-registry-sdk`: extension helpers over a fake tenant API — kind mismatch refused locally without a call, explicit selection preserved, list helpers select the documents their callers read
+- [x] `cargo nextest run -p cf-gears-types-registry --test tenant_local_client_test` (new target): exact read, `batchGet` `found` then `unchanged` under the same `$select`, discovery cursor, and parity with the platform local client
+- [x] Gear tests; `make fmt`, `make clippy`
 
-**Dependencies:** T19, T21, T23
-**Files likely touched:**
-- `TR/src/gear.rs`
-- `TR/src/domain/seeding.rs`
-- `TR/src/domain/service.rs`
-- `TR/src/config.rs` (doc update: `entities` field comment names the outbox seeding path)
-- `TR/src/infra/storage/in_memory_repo.rs` (deleted); `TR/src/infra/cache/` retyped in T30, not deleted
-- `TR/tests/seeding_test.rs`, `TR/tests/ready_mode_tests.rs` (deleted)
-**Scope:** M+
+**Outcome (two commits).** Verified with scoped `cargo fmt --check` and `cargo clippy -D warnings` for both crates.
+
+- `TypesRegistryApi` has two methods, `batch_get_entities` and `list_entities`: the tenant REST plane's three routes map onto them as on the platform contract, the exact read being an extension helper over the batch read.
+- `TypesRegistryApiExt` and `PlatformTypesRegistryApiExt` bind their contract and context into one private `EntityReads`; the helpers exist once. `FakePlatformRegistry` serves both contracts from one store through shared inherent reads.
+- `domain::local_client::LocalClient` (renamed from `PlatformLocalClient`) implements both traits over two shared inherent reads, so parity is structural; `tenant_local_client_test` compares every tenant answer, validators, cursors and refusals included, with the platform's. The gear registers neither client in its ClientHub; fixture hosts construct it.
+
+**Follow-up (P28):** that outcome describes T30's implementation boundary. T31 publishes both local APIs in the ordinary database-bound gear after seeding; REST resolving wrappers and descriptors belong to T35's closing stage (P30).
+
+**Dependencies:** T29 **Files likely touched:** `TR-SDK/src/{tenant_contract,ext,lib}.rs` and their tests, `TR/src/domain/local_client.rs`, `TR/tests/tenant_local_client_test.rs` **Scope:** M — two commits as listed
 
 ---
 
-### - [ ] T24a: Retire v1; promote v2 → v1
+### - [x] T31: Database seeding and local ClientHub handoff — a new gear publishes in `init()`
 
-**Description:** T24 deletes the in-memory repository, so the v1 routes T9a restored lose the
-store they read from and go with it — v1 cannot outlive T24, and repointing it at the database
-would be a compatibility shim with no consumer. This task is the other half: every v2 route moves
-onto the `/types-registry/v1/` paths, so P0 ends on **one** version rather than a permanent v2.
+**Description:** Make T29/T30's APIs usable by a new in-process gear in the ordinary embedded host. Start the real admission worker, seed all linked inventory and `cfg.entities` into the database, await successful admission, then publish both local contracts in ClientHub. Prove a consumer resolves the platform API and registers/reads its own entities from `init()` through the actual host lifecycle. This takes seeding/local publication from T38; T38 retains the remaining fleet migration and removal of the legacy path. Plan P28 and SPEC D6/D11/§8.4 record the temporary coexistence and local-init exception.
 
-**Placement.** Directly after T24 (`plan.md` P17). T20a authored the deletion routes in
-**Phase 5**, while T22a/T22b completed `:batchGet`, paged discovery and projection on
-**all three reads in Phase 6**, and T22d added conditional reads to them, all on v2. This task
-promotes all seven routes at once. The Phase 7 order is
-**T23 → T24 → T24a → T28**, with T25 then T26 alongside it: T25 needs T24, T26 needs T25 — it
-deletes the shared trait, so it cannot run beside it.
+**Host prerequisite:** a database is bound to types-registry (already true in quickstart/e2e configurations). No new API is registered in a no-db host; resolving it fails explicitly, with no legacy fallback. Legacy-only no-db hosts still boot. No REST client, resolving wrapper, T36 cache, T37 hook or publisher-version guard is required for this local handoff.
 
-**The e2e window is a consequence of this ordering, not of a defect.** `make e2e-local` goes red
-at T24 — where the wire genuinely breaks and where it could not break earlier — and green again
-at T28. T25 and T26 sit inside it and are gated by `cargo test --workspace`, `make quickstart`
-and `make example` instead. Before T24 the suite stays green, which is what T9a bought and what
-T20a and T22a preserve by not touching an e2e file.
+**Transition rule (until T38):** keep the old client/store/routes for existing consumers and seed them as before; seed the same initial declarations into the database for the new APIs. There is no continuous mirroring, shim or dual-write of subsequent mutations. A new consumer uses only the new API for its entire registry workflow, and no legacy writer owns its mutable identifiers. Shared static inventory declarations may be in both stores. A document depending on an entity registered only by a later legacy call cannot use this path until its dependency is made part of database seeding or published earlier through the new API. T38 deletes the old catalogue and this exception; Full remote application verification belongs to T41 (P31).
 
-**Acceptance criteria:**
-- [ ] No `/v2/` path remains in the crate, in OpenAPI or in `QUICKSTART.md`
-- [ ] The promotion changes paths only: registration and deletion routes remain internal-only
-      (`exposed = false`) until C8's platform listener and authorization gate exist
-- [ ] `operation_id`s are unchanged by the move — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T20a/T22a's additions keep their names, so the promotion is a path change and nothing else. It is still a *breaking* path change for anything on `/v2/`: every such route is removed here, so a caller must move its base path. What the unchanged `operation_id`s buy is that nothing but the path moves — bodies, statuses and semantics are the ones it already had, and the interim surface was never exposed beyond the platform listener
-- [ ] All **seven** routes promote together, because all seven exist by the end of Phase 6 (P17); T22d's `ETag` / `If-None-Match` and per-key `unchanged` move with them unchanged — additive, so no changelog break entry (P21)
-- [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed — verified by T24's own criterion that the in-memory repository is gone; `grep -r 'types_registry\.register\|RegisterEntitiesRequest'` finds nothing outside history
-- [ ] Every surviving v1 route reads the database; none reads process memory
-- [ ] SPEC §10.2 records the final shape and closes the interim window, naming T9a as where it opened and this task as where it closed
-- [ ] Changelog: the v1 `POST` break (body shape, `202`, submit-then-poll) and the read-shape break (`GET /entities` pagination plus document-free defaults on discovery and exact read) are **one release, two entries** — owned here outright, since this is where both breaks reach a v1 caller (P17/P19)
-- [ ] `api_rest_test.rs` needs only its per-version path constant changed — if it needs more, T9a's last criterion was not met and that is the finding, not this task's scope
+Implement sequentially in four S/M slices; do not land a client before its seed barrier works. Every slice clears the standing bar.
 
-**Verification:**
-- [ ] `cargo test -p cf-gears-types-registry`
-- [ ] `make lychee`
-- [ ] Manual: `/cf/docs` renders every operation under v1 and no v2 path resolves
-- [ ] `make e2e-local` is **expected red** until T28 and green after it; the red set must be exactly the `/entities` call sites T28 owns, and any other failure is a regression this task introduced
+**Slice 1 — seed audit and deployment limits (S, three primary files):**
+- [x] Audit derivation/`$ref`/Instance-of dependencies of the actual linked inventory and `cfg.entities`, including registry control-plane and `toolkit-gts` base types. Record and resolve dependencies previously supplied only by a later legacy `init` call before enabling immediate seed validation; do not defer unresolved inline seeds to `post_init` or wait for a later registrant. Keep the fleet-wide lifecycle audit in T38. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is syntax/pattern validation, not target existence (P14): e2e's customer `allowed_parent_types` does not require the later AM root type, so do not duplicate AM publication or pull T40/T41 forward for that value
+- [x] Measure the actual combined inventory/configured count for the quickstart, example and e2e feature sets; record counts and feature sets in the audit. Set explicit deployment `limits.batch_candidates` values that fit these sets and check their other admission budgets. The current default is 100 and a source-level macro count is not a linked-population measurement; preserve a deliberately smaller limit in the refusal test rather than weakening enforcement or assuming the default fits
+- [x] Validate the audit against cold-start seed fixtures before publishing a client. If a genuine dependency requires declaring-crate changes, record and implement those as prerequisite commits of at most five files; do not silently broaden a slice or downgrade the full-seed/green-e2e criteria
 
-**Dependencies:** T24
-**Files likely touched:**
-- `TR/src/api/rest/routes.rs`, `TR/src/api/rest/handlers.rs`, `TR/src/api/rest/dto.rs`
-- `TR/tests/api_rest_test.rs`
-- `gears/system/types-registry/QUICKSTART.md`, `CHANGELOG.md`
-- `docs/p0/SPEC.md` §10.2
-**Scope:** S
+**Verification — slice 1:**
+- [x] Record reproducible collection/count commands for each real feature set and the chosen deployment budgets. In slice 2, admit the actual configured customer schema with its linked base but without the later AM root schema; assert that a genuine missing derivation/`$ref` target, unlike an entity reference, is refused
 
----
+**Files likely touched — slice 1:** `config/quickstart.yaml`, `config/e2e-local.yaml`, the seed audit in this file. Configuration paths for a distinct example feature set are included only if that composition uses another configuration
 
-### - [ ] T25: Migrate system gears and plugins onto the new trait
+**Seed audit (slice 1, 2026-10-14).** Measured on the linked population, not on macros. The production seed path is the reproducible check: a cold start validates every seed immediately and admits it under the configured budgets, so a boot that logs `types_registry seeded the database` proves the set closes and fits; an unresolved dependency or a breached budget fails boot naming the seed. Per feature set, on a fresh data root:
 
-**Description:** Move every system gear and plugin off `TypesRegistryClient`: reads to the new
-trait, and the ~13 explicit `register(...)` sites to the reconciliation helper called from
-`init()` with explicitly supplied documents. Existing registrants await their own terminal
-results. New per-gear inventory registration calls are deferred to P1 (P18).
+```sh
+cargo build --bin cf-gears-example-server <features below>
+sed 's|home_dir: "~/.cf-gears"|home_dir: "/tmp/tr-seed"|' <configuration> > /tmp/tr-seed.yaml
+RUST_LOG=info target/debug/cf-gears-example-server --config /tmp/tr-seed.yaml run
+# cold start: `types_registry seed set schema_count=… instance_count=… configured_count=…`
+#             `types_registry seeded the database documents=N unchanged=0 admitted=N passes=1`
+# restart:    the same command again logs `unchanged=N admitted=0`
+```
 
-Covers `account-management` (+ static-idp-plugin), `authn-resolver` (+ static and oidc
-plugins), `authz-resolver` (+ static and tr plugins), `tenant-resolver` (+ static,
-single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), `cluster`,
-`credstore` (+ static plugin), `oagw`.
+All three sets were booted this way, cold and restarted, with the results above. (`make example` then stops at `bss-products`, which `config/quickstart.yaml` binds no database to: a configuration gap on `main`, after seeding and unrelated to it.) The document-level figures under **Budgets** — largest document, closure, dependents — were read from a one-off dump of the same three sets, a local `init()` patch writing the combined documents to a file; the boots above are what proves they fit.
 
-**Acceptance criteria:**
-- [ ] No system gear or plugin references `TypesRegistryClient`
-- [ ] Read sites move mechanically: T23's provided helpers keep the call shapes, so a read migration is a `use` change plus field reads where a computed method was used
-- [ ] Existing explicit registration sites call the helper with their desired documents and declare `deps = [types_registry]`; gears that only declare inventory gain no new registration call in P0
-- [ ] `RegisterResult::ensure_all_ok` sites are replaced by the helper's terminal result — no site treats `pending` as success
-- [ ] Explicit registration failure fails the calling gear's startup naming the gear and identifier; shared inventory bootstrap failures remain registry startup failures (P18)
+| Feature set | Cargo features | Configuration | Type Schemas | Instances | `entities` | Total |
+|---|---|---|---|---|---|---|
+| quickstart (`make quickstart`) | `--no-default-features --features static-tenants,static-authn,static-authz` | `config/quickstart.yaml` | 8 | 0 | 0 | **8** |
+| example (`make example`) | every example-server feature but `EXAMPLE_SERVER_FEATURE_EXCLUDES` | `config/quickstart.yaml` | 53 | 93 | 0 | **146** |
+| e2e (`make e2e-local`) | `config/e2e-features.txt` | `config/e2e-local.yaml` | 51 + 1 configured | 92 | 1 | **144** |
 
-- [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
-**Verification:**
-- [ ] `cargo test --workspace`
-- [ ] `make quickstart` and `make example` — server boots, `/health` green, every migrated gear's types present
-- [ ] Test per gear group: registration is idempotent across two starts
+- **Dependencies close inside the seed set.** Every derivation base, authored `gts://` `$ref` target and Instance-of type of all three sets is itself a seed; no identifier is duplicated; there are no minor-bearing identifiers, so no implicit predecessor edge. No seed depends on an entity a later legacy `init` call registers, and no declaring crate needs a change. The two `toolkit-gts` bases (`gts.cf.toolkit.plugins.plugin.v1~`, `gts.cf.toolkit.authz.permission.v1~`) are linked in every set. The registry declares no control-plane GTS entities of its own in P0.
+- **The configured customer** `gts.cf.core.am.tenant_type.v1~cf.core.am.customer.v1~` derives from and `$ref`s `gts.cf.core.am.tenant_type.v1~`, an AM inventory schema linked with `account-management`; the launcher's `config_prune` drops the customer from focused runs without AM. Its `allowed_parent_types` names the platform root through `x-gts-ref` only (P14), so the AM root registered later by AM `init` is not a dependency.
+- **Policy.** Every seed's last segment is vendor `cf`, the implicit platform allowance; no registration-policy entry is needed.
+- **Budgets.** `limits.batch_candidates` was **256** in `config/quickstart.yaml` and `config/e2e-local.yaml` (the default 100 refused the example and e2e sets in one operation); the 2026-10-27 amendment below batches the seed instead and removes those overrides. The largest authored document is 6682 bytes (`gts.cf.core.events.event.v1~`, limit 256 KiB); the largest reference closure is 2 documents (limit 64); the most transitive dependents of one entity is 92 (`gts.cf.toolkit.authz.permission.v1~`, limit `activation_write_set` 512). Preparatory reads page at `MAX_BATCH_GET_KEYS` (100), which stays independent of the write limit. Other configurations bind no database to types-registry and so do not seed.
 
-**Dependencies:** T24
-**Files likely touched:** `gear.rs` and the types-registry call sites of each gear above
-**Scope:** L — committed incrementally, one commit per gear; do not batch the whole set
+**Slice 2 — database seeding (M, five primary files):**
+- [x] Start the outbox before submitting; seed the complete combined Type Schema/Instance inventory + configured set through `RegistryService` and real outbox admission in one graph-ordered submission. Implement the seed orchestration in `domain/seeding.rs` with domain reads → compare → CAS → submit → await. The seed barrier admits the complete dependency graph in one operation; SDK reconciliation publishes independently batched consumer declarations. Check the whole seed set against configured limits before any submission; page preparatory reads if necessary. Reuse domain admission/validation
+- [x] Read/compare/CAS supports restart and permitted configuration changes; equal documents allocate no new revisions, omitted documents are never deleted, and ordinary compatibility/lifecycle rules still apply. Two same-version registry instances seeding the same empty or populated database concurrently converge: re-read `already_exists`/`precondition_failed` conflicts under the bounded seed deadline, reuse an idempotency key only for an identical submission and take a new key after candidates/preconditions change. Mixed-version ordering remains T44/T45
+- [x] Await every seed outcome under one monotonic deadline starting before preparatory reads: the whole seed budget is `cfg.worker.operation_timeout` (default five minutes), not multiplied by delivery attempts or reset after CAS retries. Use the runtime cancellation token; a short configured budget exercises expiry. Only successful/equal seeds permit client publication; rejection, pending/missing dependency, limit refusal, deadline and cancellation fail boot with identifiers/reasons. The registry waits only for its own seeds, never a future consumer. Publisher stamps remain Phase 9; do not add an attribution/ordering mechanism here
 
----
+**Verification — slice 2 / intermediate review:**
+- [x] `cargo nextest run -p cf-gears-types-registry --test seeding_test`; `make test-integration LANE=types-registry-db` — single-instance seed/restart/refusal on SQLite; concurrent same-version seeding on PostgreSQL, MySQL and MariaDB with independent pools and barrier-synchronised tasks. Container cases live in `seeding_backends_test.rs` behind the existing `integration` feature so the make target selects them
+- [x] At least two linked crates, a cross-crate dependency, real `toolkit-gts` base declarations, registry declarations and a configured dependent entity are readable through database-backed reads; a second boot preserves revisions/artifacts, and a permitted configured-content change updates through CAS
+- [x] Invalid/unresolved seeds and an oversized combined set fail before either new client is published; a seed failure/cancellation leaves no running worker owned by the failed startup. The configured customer schema succeeds without its entity-reference target being stored, and a real missing parent/`$ref` fails; concurrent seeders both succeed with one admitted version of each equal document. Review the audit, budgets and seed barrier before slice 3
 
-### - [ ] T26: Migrate domain gears; delete the old trait
+**Files likely touched — slice 2:** `TR/src/gear.rs`, `TR/src/domain/mod.rs`, `TR/src/domain/seeding.rs` (new), `TR/tests/seeding_test.rs` (new), `TR/tests/seeding_backends_test.rs` (new). Reuse existing DB/outbox fixtures
 
-**Description:** The remaining consumers — `bss/ledger`, `bss/rate-provider` (its shared
-`registration.rs` helper), `mini-chat` (+ static-audit and static-model-policy plugins),
-`llm-gateway`, `model-registry` — then delete `TypesRegistryClient`, its models and
-`testing::MockTypesRegistryClient`. Existing explicit registration sites use T23 with their
-documents; automatic per-gear inventory registration remains in P1 (P18).
+**Slice 3 — ClientHub and consumer `init()` (M, two primary files):**
+- [x] After the seed barrier, construct `domain::local_client::LocalClient` over the existing `RegistryService` and register `dyn PlatformTypesRegistryApi` and `dyn TypesRegistryApi` over that same service. New reads/mutations never fall back to `TypesRegistryService`, recompute artifacts or read the legacy cache; no-db/failed-seed hosts expose neither new API
+- [x] A fixture gear declares `deps = [types_registry]`, resolves the platform API directly from ClientHub in `init()` and calls `reconcile_entities_and_await` for explicit owned documents with `PlatformSecurityContext::outbound_marker()`, its own name/`CARGO_PKG_VERSION`, an explicit deadline and `ctx.cancellation_token()`. `UpToDate` or all-`Admitted` is success; every `Rejected`/`Pending` or call error fails that consumer's boot with identifier/reason. Do not treat acceptance of an operation or `Ok(Reconciled(..))` alone as success
+- [x] Exercise the real host's DB migration → registry init/seed → consumer init path before `post_init`/`start`. Build an explicit `toolkit::registry::RegistryBuilder` containing only the production registry and fixture consumer; register the registry's core/DB/system capabilities and its real `WithLifecycle` runnable, but omit REST registration in this local fixture (otherwise a REST host is required). Use `HostRuntime::new`, `DbOptions::Manager` and public `run_gear_phases()` as in toolkit runner tests. Keep the fixture in this integration-test binary, avoid `discover_and_build()`/global gear discovery, observe consumer-init results through test synchronization, then cancel and join the host. The consumer creates/reads an entity depending on a seeded base/configured type, updates on restart and succeeds unchanged on equal restart. Assert tenant API resolution and read parity from the same hub; no runtime consumer imports registry internals or needs a new test-only toolkit lifecycle API
 
-**Acceptance criteria:**
-- [ ] No crate in the workspace references `TypesRegistryClient`, `RegisterResult`, `RegisterSummary`, `TypeSchemaQuery` or `InstanceQuery`
-- [ ] `rate-provider-sdk`'s shared `register_rate_provider_plugin` uses the new trait, so every rate-provider plugin migrates with it
-- [ ] Old trait, its models and its test mock are deleted from the SDK crate
-- [ ] `types-registry-sdk` exports only the new surface
-- [ ] No consumer recomputes effective artifacts locally — every site reads the materialized group (D3)
+**Verification — slice 3 / intermediate review:**
+- [x] `cargo nextest run -p cf-gears-types-registry --test local_client_boot_test` — real ClientHub/lifecycle tests for first boot, restart, update, absent database, invalid seed, missing consumer dependency, rejected declaration, deadline and cancellation; use existing shared delivery helpers rather than test-local polling/sleeps
+- [x] The missing-dependency case terminates within the configured reconciliation budget and fails boot; it never waits for a later gear's `init`. Boot does not depend on `serve()` starting the already-running outbox
+- [x] Existing legacy consumers/legacy REST remain green; the new path writes only the database and is not silently visible to legacy reads. Review the seed barrier and lifecycle proof before the documentation handoff
 
-- [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
-**Verification:**
-- [ ] `cargo test --workspace`
-- [ ] `grep -r TypesRegistryClient` finds nothing outside history
-- [ ] `make example` — boots with every gear's types present
+**Files likely touched — slice 3:** `TR/src/gear.rs`, `TR/tests/local_client_boot_test.rs` (new, fixture gear declared in this target). Reuse `TR/tests/common/` only where shared setup is necessary
 
-**Dependencies:** T25
-**Files likely touched:** the domain-gear call sites above, `TR-SDK/src/api.rs` (deleted), `TR-SDK/src/models.rs`, `TR-SDK/src/testing.rs`
-**Scope:** L — split per gear, same rule as T25
+**Slice 4 — local integration handoff (M, three or four primary files):**
+- [x] `types-registry-sdk/README.md` leads with the new API: `PlatformTypesRegistryApi` for a gear's publication/reads and read-only `TypesRegistryApi` for tenant requests, current semantic models and canonical errors. Show complete usable examples of obtaining the client from ClientHub, reconciling entities and waiting for outcomes, then reading them; the local gear example includes dependency declaration, platform context, publisher, cancellation/deadline and exhaustive outcome handling. Move **all** legacy-client/API/model/error descriptions and examples into a separate `Legacy API` section, clearly marked for removal at T38; no main example uses the old API. QUICKSTART carries the local flow and explains the seed sources, immediate validation, no-db refusal, uncached pre-T36 behaviour and temporary independent catalogues
+- [x] Replace the SDK's duplicate crate-level `//!` introduction/legacy usage with `#![doc = include_str!("../README.md")]` in `src/lib.rs`, keeping module/API docs intact, and compile the main usage examples as `no_run` doctests (not `ignore`/text). Include the explicit dependency declaration and no-db resolution error; add missing example-only imports as workspace dev-dependencies in `TR-SDK/Cargo.toml` following dependency guidelines. Correct stale old symbols/examples when moving them into `Legacy API`. Document that `deps` orders `init` only; remote wiring is later; local tenant contexts remain unvalidated/unscoped under C2/C6. The local-init exception ends in T41/T42; publisher metadata is required in the SDK but forwarded/enforced only in T44/T45, without an early mixed-version guarantee
+- [x] `make quickstart` and the example composition boot with all linked inventory/configured entities readable through the new database API; restart is idempotent. Audit the current v2 e2e registration/discovery suites against the now-prepopulated database: scope test entities/counts to their own namespaces and do not create an already-seeded identifier expecting fresh creation. Any necessary e2e adjustments land in separate commits of at most five files, preserve admission assertions and keep `make e2e-local` green on its current routes, with no earlier legacy-v1 red window
 
----
+**Verification — handoff:**
+- [x] `cargo test -p cf-gears-types-registry-sdk`; `cargo test -p cf-gears-types-registry-sdk --doc`; `cargo nextest run -p cf-gears-types-registry`; `make test-integration LANE=types-registry-db`; `cargo check -p cf-gears-types-registry --all-targets`; `make fmt`; `make clippy`
+- [x] Run the documented local consumer example against the ordinary registry gear and repeat its startup; the existing manually assembled `platform_local_client_test` alone does not satisfy this handoff. Review every SDK README section: old `TypesRegistryClient` and its legacy models/examples appear only under `Legacy API`, and the main examples use the signatures/models actually exported by the new SDK
 
-### - [ ] T28: Update e2e suites for the `202` contract
+**Files likely touched — slice 4:** `TR-SDK/README.md`, `TR-SDK/src/lib.rs`, `gears/system/types-registry/QUICKSTART.md`, plus `TR-SDK/Cargo.toml` only if compiled examples need additional dev-dependencies; e2e namespace corrections under `testing/e2e/suites/types_registry/` are separate S/M commits if the audit identifies them
 
-Four initial async-registration scenarios are described in
-[`registration.md`](../../../../../testing/e2e/suites/types_registry/scenarios/registration.md),
-with shared JSON fixtures and pytest scenario IDs. They exercise the interim v2
-surface alongside the existing v1 tests; this does **not** complete the cutover
-and migration work below. The local launcher uses SQLite, so these runs make no
-PostgreSQL/MySQL-specific claim.
+**Done (2026-10-14).**
+- `domain::seeding` admits the combined seed set in one compare-and-set operation and awaits it under `worker.operation_timeout` and the runtime token; seeds compare by acceptance's canonical text, so `-0.0` against `0.0` is a change. A pass that loses to a concurrent seeder re-reads and resubmits under a fresh key — never a deterministic one, which would replay a system-failed operation forever. The budget is re-checked before every success. A failed seed stops the admission outbox before `init()` returns; that is verified by construction only, since the handle is never stored and nothing outside the gear can observe it.
+- With two registry instances on one database, an operation one instance sequences into a partition the other instance's processor leases waits for that processor's idle poll: one minute under `processor_low_latency`. The default five-minute seed budget covers it; the race tests use three minutes, and the SDK README and QUICKSTART tell consumers to budget for it.
+- `init()` registers `LocalClient` as both contracts only past the seed barrier. `local_client_boot_test` runs the production gear (core, DB, system and its `WithLifecycle` runnable) with a fixture consumer under `HostRuntime`, waits for `Running` and checks `Stopped`; its README-example case boots cold and restarted on the ordinary registry.
+- Real boots: quickstart 8, example 146 and e2e 144 seeds, cold and restarted (`unchanged=N`). `make e2e-local`: 506 passed on a fresh data root; e2e's v2 suites work in `gts.cf.e2e.r<uuid>` namespaces and needed no change. On the shared `~/.cf-gears` the bss ledger and pricebook suites fail on stale data from other branches, independent of this task. `make example` stops at `bss-products`, which `config/quickstart.yaml` binds no database to.
 
-**Description:** The `POST /entities` break (D10) invalidates every e2e call site that
-registers and reads the result synchronously. Those sites move to submit-then-poll: `202`,
-then `GET /operations/{id}` until terminal, then assert on the per-candidate outcome.
+**Amended (2026-10-27): batched SDK reconciliation.** Replaces the one-operation
+rule and duplicated seed loop. `seed()` calls `reconcile_entities_and_await` over
+`LocalClient` with `batch_size = limits.batch_candidates`, unbounded passes and
+opt-in `stop_when_stalled`. Removed `config/` overrides of `batch_candidates: 256`.
+Cancellation and the absolute seed deadline are checked before each poll and after
+success. Earlier admitted batches survive failure; both APIs stay unpublished.
 
-Surface: `testing/e2e/gears/types_registry/` — six test files, ~95 references to
-`/types-registry/v1/entities` — plus `testing/e2e/gears/account_management/conftest.py`,
-whose registration helper is setup for another gear's suite.
+Comparison uses canonical text for stored and duplicate documents: key order is
+insignificant, numeric spelling is significant (`0.0` ≠ `-0.0`). `SeedSummary`
+reports only `documents` and `up_to_date`; stored revisions prove idempotency.
 
-**Corrected in T9a: the surface is one file wider.** `testing/e2e/gears/oagw/helpers.py:83`
-registers a batch of OAGW schemas *and instances* over REST and then reads them back through
-`list_oagw_types` (`GET /entities`), so it needs both migrations — submit-then-poll and the
-paged list. It was missed because the earlier survey counted `/entities` references only under
-`gears/types_registry/` and `account_management/`.
+Tests: `seeding_test` covers bounded multi-operation sets, real inventory at limit 2,
+an eight-step reverse-order chain at limit 1, stalls, rejection, expiry, cancellation
+and races. `local_client_boot_test` reads all 151 configured seeds at consumer init
+and verifies an orphan in the final batch leaves earlier writes but no API. SDK
+`mod_tests` cover numeric spelling, `preserve_order`, duplicates, stalls,
+cross-batch progress and seven consecutive conflicts.
 
-**Acceptance criteria:**
-- [ ] A shared polling helper lives in `testing/e2e/gears/types_registry/helpers.py` and is reused; no test open-codes a poll loop
-- [ ] The helper has a bounded deadline and fails with the operation's per-candidate errors, never on a bare timeout
-- [ ] `account_management`'s registration helper polls to terminality before returning, so that suite's setup stays synchronous from its own point of view
-- [ ] Assertions move from the POST body to the operation's per-`gts_id` outcomes
-- [ ] `GET /entities` call sites move to the paged, document-free default (D12/D13): the shared helper pages through the cursor. Any assertion needing `content` explicitly selects it on discovery, `batchGet` or exact read; an unselected exact read no longer supplies documents
-- [ ] Legacy `is_schema` filters migrate to T22c's `kind=type_schema|instance`, and
-  callers needing a chain boundary use inclusive `depth`. A legacy
-  `vendor`/`package`/`namespace`/`segment_scope` predicate is translated only when
-  an equivalent GTS `pattern` is proved; otherwise the migration records a follow-up
-  rather than silently widening the result set
-- [ ] Tests that assert refusals still assert them **synchronously** — envelope, identifier, policy and idempotency failures stay pre-`202` (SPEC §8.1)
-
-**Verification:**
-- [ ] `make e2e-local` — full suite green, including `account_management` and `types_registry`
-- [ ] `make e2e-docker`
-- [ ] Manual: confirm a rejected candidate surfaces its reason through the polled operation, not as an opaque failure
-
-**Dependencies:** T24a
-**Files likely touched:**
-- `testing/e2e/gears/types_registry/helpers.py`
-- `testing/e2e/gears/types_registry/test_types_registry_{register,get,list,validation,error_handling}.py`
-- `testing/e2e/gears/types_registry/test_registration_debug_logging.py`
-- `testing/e2e/gears/account_management/conftest.py`
-**Scope:** L — split per test file; the `account_management` change is its own commit because it lands in another gear's suite
+**Dependencies:** T29, T30, T21 (outbox), T22b–T22d (reads/validators); no dependency on T33–T37. Execution continues with T32 after T31; Checkpoints 7A/7 and their full gates are unchanged **Scope:** four sequential S/M slices above, reviewed as one local registration feature, with small prerequisite/e2e corrections explicitly recorded by their audits. T38 must recheck these guarantees after deleting legacy, rather than reimplement seeding
 
 ---
 
-### - [ ] T30: SDK client cache — freshness window, byte bound, `fresh` bypass
+### - [ ] T32: Full Account Management local migration — one registry client and real REST proof
 
-**Description:** Port the `local_client` cache onto `EntitySnapshot` and give it DESIGN §3.3's
-contract (SPEC §8.3, `plan.md` P7). Reads have been uncached since T24; this restores caching,
-and because T22d supplies validators the cache **revalidates** rather than merely expiring —
-which is what `cpt-cf-types-registry-fr-client-cache` asks for. T22b supplies the projection
-dimension in P0; visibility and Context-Tenant dimensions remain fixed until P1 tenancy.
+**Status:** pending in the consumer-migration follow-up; no AM consumer migration is delivered by this foundation. The audit and historical migration-branch results below are retained as context, not as current completion or verification.
+
+**Description:** Translate the entire Account Management registry workflow to `PlatformTypesRegistryApi` immediately after T31, and prove it through existing product HTTP requests. AM resolves one platform client and shares it with all services: no legacy client, hidden compatibility adapter, fallback or dual write. Move the connected writer/reader group atomically so optional configurations do not lose their plugin. This is the first real local application gate; licensing and a metadata-only partial migration are outside this task (historical decision P29).
+
+**Group — seven gears:** `account-management`, `static-idp-plugin`, `keycloak-idp-plugin`, `tenant-resolver`, `static-tr-plugin`, `single-tenant-tr-plugin`, `rg-tr-plugin`. AuthZ and RG business implementations remain on their current SDKs; their public clients do not change. Keep `deps = [types_registry]` for synchronous local registration and initialization. T41, not this task, add post-wiring/remote behavior and publication readiness.
+
+**Delivery:** six sequential stages, each split into S/M commits of around five files when needed; one atomic merge of the complete group and its e2e helpers. Stage boundaries organize implementation/review and are not deployable mixed catalogue configurations. `AM/` below means `gears/system/account-management/`.
+
+**Stage 1 — prerequisites and database bindings:**
+- [ ] Audit every AM registry reader/writer and external consumer of its identifiers; classify SDK inventory, configured root, IdP instances, optional AM TR instance and runtime metadata schemas. Record why each writer and its reader move together, and check RG type-code/metadata dependencies. Audit registration policy for configurable GTS IDs, especially a non-`cf` root suffix: add only explicit intended region/vendor allowances to the affected deployment and test a closed-region refusal with clear diagnostics. Distinguish the GTS ID's last-segment vendor from `PluginV1.vendor` selection metadata; current fixed `cf` plugin IDs do not need an allowance for a metadata vendor string. RG user-group bootstrap uses its own DB and `metadata_schema = None`; preserve its seal. Resolve any real external dependency before merge, never by mirror/fallback
+- [ ] Inventory effective feature/config compositions where TR/IdP writers run and add a Types Registry database binding wherever missing. Check `config/{static-tenants,mini-chat,quickstart-windows,github-mirror-dev,e2e-launcher}.yaml`, usage-collector configs and mini-chat/resource-group suite overlays; distinguish overlay inheritance from complete configurations. Include `GEAR_SERVER_BASE_FEATURES` launchers. Keep supported boots working; no new API means an explicit failure, not legacy fallback
+- [ ] Audit immediate-admission order and preserve T31's seed barrier: AM SDK/base types and configured customer types are already in the database; every dynamic dependency must be admitted before its first consumer. Retain the current reduced RG test profile and track the pre-existing #4568 bootstrap failure separately, without adding its repair to this task
+
+**Audit (stage 1, 2026-10-14).** Writers and readers move together because each reader consults exactly one catalogue:
+
+| Group | Writers | Readers | Already in the database (T31 seed) |
+|---|---|---|---|
+| tenant-resolver instances | `static-tr-plugin`, `single-tenant-tr-plugin`, `rg-tr-plugin`, AM `tr_plugin` (opt-in) | tenant-resolver core discovery | `TenantResolverPluginSpecV1` and the toolkit plugin base |
+| IdP instances | `static-idp-plugin`, `keycloak-idp-plugin` | AM `LazyIdpProvider` | `IdpPluginSpecV1` |
+| AM root tenant type | AM `init` (`register_root_type`) | AM bootstrap preflight, tenant-type checker, tenant/TR-plugin UUID hydration | its base `gts.cf.core.am.tenant_type.v1~` |
+| configured customer type | `cfg.entities` (seeded) | the same AM readers | yes |
+| AM SDK schemas (`user`, `tenant`, `tenant_metadata` base) | inventory (seeded) | payload validation, metadata registry | yes |
+| runtime metadata schemas | REST clients (the AM e2e helper) | AM metadata registry | no — written at runtime |
+
+- **External consumers.** RG user groups register their type through `ResourceGroupTypeBootstrap` into RG's own database (`metadata_schema = None`, sealed); AuthZ and RG stay on their SDKs. Neither reads an AM-owned identifier from the registry, so neither moves.
+- **Policy.** Every shipped plugin instance, the configured root and the customer type end in vendor `cf`, the implicit allowance (`PluginV1.vendor` is a property, not a segment). The AM e2e metadata schema `gts.cf.core.am.tenant_metadata.v1~x.e2etest.am.meta.v1~` needs an allowance for vendor `x` in exactly the `gts.cf.core.am.tenant_metadata.v1~x.e2etest.*` chain region (stage 6); the existing `gts.acme.e2e.*` entry does not open it. A custom root `gts.cf.core.am.tenant_type.v1~<vendor>.…~` needs its chain region likewise; no deployment configures one, so stage 6 tests the allowed and the closed-policy refusal on a fresh database rather than adding an entry.
+- **Admission order.** Every dependency of the dynamic writers — plugin specs, the tenant-type base, the metadata base — is a seed admitted before any consumer `init()`. The root, the plugin instances and runtime metadata schemas depend on nothing registered by a later `init()`. The reduced RG profile and #4568 are untouched.
+- **Stored instances outlive their plugin.** The legacy catalogue was rebuilt at each start; the database keeps an instance published by an earlier boot after its plugin is disabled. Until T40's late-safe selection, discovery (tenant-resolver core, `LazyIdpProvider`) first lists every page, then keeps only instances whose scoped client is registered in this process, then selects by vendor and priority. That reproduces the legacy candidate set, including its pre-existing race: a discovery that runs before a better plugin's `init()` selects among the plugins already running, as legacy did.
+
+Database bindings, measured on cold and restarted boots with `limits.batch_candidates` checked against the seed count (the later failures of these ad-hoc boots are their own environment — a missing `AZURE_OPENAI_API_KEY`, the unsubstituted TimescaleDB port):
+
+| Configuration | Writers | Binding | Seeds |
+|---|---|---|---|
+| `config/quickstart.yaml`, `config/e2e-local.yaml` (and `e2e-launcher`, `make run GEAR=…`, which use them) | all | already bound (T31) | 8 / 146 / 144 |
+| `config/mini-chat.yaml`, `testing/e2e/suites/mini_chat/config/base.yaml`, mini-chat helm configmap | `single-tenant-tr-plugin` | added (SQLite) | 41 |
+| `testing/e2e/suites/usage_collector/config{,-clickhouse}.yaml` | `static-tr-plugin` | added | 17 |
+| `config/static-tenants.yaml` | `static-tr-plugin` | added | 8 |
+| `config/github-mirror-dev.yaml`, `config/quickstart-windows.yaml` | `static-tr-plugin` | added (any example feature set, up to 146; batched since the 2026-10-27 T31 amendment) | — |
+
+The resource-group suite's `tr-authz` profile overrides two plugin priorities on top of `e2e-local.yaml` and inherits its binding.
+
+**Stage 2 — complete tenant-resolver instance family:**
+- [ ] Move core discovery to `PlatformTypesRegistryApiExt::list_instances` with explicit content and complete page traversal, canonical errors and unchanged vendor/priority selection. A failure/limit must propagate, never select from a truncated page
+- [ ] Move all three standalone TR plugins to bounded/cancellable reconciliation with their own publisher context. Publish scoped clients only after `UpToDate` or all-`Admitted`; refuse `Rejected`/`Pending` with useful diagnostics. No legacy instance writer remains for this contract
+- [ ] Prove static/single-tenant behavior and the RG plugin's publication independently of RG's known bootstrap issue; include a winner on a later discovery page, missing instance, restart and changed plugin metadata. AM's optional TR instance joins this same new catalogue in stage 4
+
+**Stage 3 — all AM schema readers and models:**
+- [ ] Migrate tenant/user/service-account payload checks, parent/child type enforcement, metadata schema registry, forward/reverse UUID hydration and optional TR plugin queries to the single new platform client. Use new typed IDs/snapshots; no production `TypesRegistryClient`, legacy models or parent-graph helpers remain in AM at completion
+- [ ] Select authored content, materialized `resolved_schema` and `effective_traits` where needed; validate against those fields, not reconstructed parent chains. Handle `Result<HashMap<_, Option<_>>, CanonicalError>` correctly: unknown schema is absence, failed lookup is an error. Preserve tenant validation, metadata 404/validation mapping, dependency-unavailable behavior and UUID round-trip checks; incomplete projections are not success
+- [ ] Port adjacent tests/fakes to the new contract and materialized values without weakening behavior assertions. Use `types_registry_sdk::testing_platform::MockTypesRegistry` (`test-util`) for shared test doubles; T38 later moves that import to `types_registry_sdk::testing::MockTypesRegistry` when legacy is deleted. No private schema memo/cache is added; T36 supplies the SDK cache. Review metadata, type enforcement and UUID scenarios against real database snapshots, not only fakes
+
+**Stage 4 — root registration, bootstrap and AM TR plugin:**
+- [ ] Preserve the existing init-time stored-root binding check **before any root reconciliation/write**. A configured root UUID mismatch fails under both strict policies without creating an orphan root schema or allocating a registry revision; assert that against the real database. Then replace root registration with local `reconcile_entities_and_await` using AM's publisher, deadline and runtime cancellation; require admission before bootstrap reads. Equal restart is idempotent; permitted content changes use CAS and normal compatibility rules
+- [ ] Move bootstrap preflight and the optional AM TR plugin's instance registration and schema/UUID reads to that same new client. When enabled, the instance is visible to stage 2's migrated resolver and serves actual tenant queries; when disabled, neither instance nor scoped client is published. Test both states and vendor/priority selection without changing the opt-in default
+- [ ] Preserve current local lifecycle and `bootstrap.strict` semantics, IdP prerequisites and RG's seal. No registry call waits on a later `init()` registrant, and no pending/accepted operation is treated as ready. Root registration failures remain diagnosable; deferred supervised readiness semantics belong to T41
+
+**Stage 5 — complete IdP instance family:**
+- [ ] Move `LazyIdpProvider` discovery and both static/Keycloak writers together to the new platform API; use the complete list helper and each plugin's own publisher context. Retain required-vs-optional IdP semantics and only expose a scoped backend after admission
+- [ ] Preserve Keycloak connection/credential and backend behavior; exercise its registration and SDK/error mapping with existing test support. The local product handoff uses static IdP; do not claim an external Keycloak deployment was verified by a static test
+- [ ] Prove IdP selection, absent/delayed/rejected registrations and idempotent restart/configuration updates through the new client; no second legacy discovery or `AlreadyExists` shortcut remains
+
+**Stage 6 — existing REST e2e, restart and handoff:**
+- [ ] Move AM e2e schema writers, especially `testing/e2e/suites/account_management/conftest.py::create_metadata_schema`, to the current database REST registration contract with idempotency/preconditions and operation polling. Use the existing shared operation helper where available. Allow the suite's `x` vendor only in its metadata-test namespace; do not open unrelated regions or weaken policy. T32 uses the current `/v2/` route; T34 updates these helper paths/credentials with the platform route move, in the same commit, and T38 updates any interim tenant reads
+- [ ] Run existing AM REST scenarios through real gateway, databases, registry, authz and static IdP: tenant CRUD, unknown/incompatible tenant type refusal, metadata PUT/GET/inheritance/list UUID hydration and malformed-value rejection, plus user provision/deprovision. Assert a schema registered only through the database API is actually consumed, and the configured root/customer types are readable from the same database. Boot or registered type presence alone does not satisfy this gate
+- [ ] Add real host/database restart and configuration-drift coverage: equal root/instances preserve revisions; allowed content updates converge; root-binding mismatch fails before a registry write and incompatible edits are refused. Include a custom root's explicitly allowed policy and its closed-policy refusal. Verify optional AM TR plugin discovery and affected host/config boots. Grep the seven migrated crates (production and tests) for old client/models/helpers and remove remaining references; update their usage docs to the new local API and boundaries
+
+**Verification / review checkpoints:**
+- [ ] After stages 1–2: recorded config/ID dependency audit; affected static/single-tenant boots; registry and TR-family tests; explicit database refusal cases and no cross-catalogue fallback
+- [ ] After stages 3–5: `cargo test -p cf-gears-account-management -p cf-gears-account-management-sdk -p cf-gears-static-idp-plugin -p cf-gears-keycloak-idp-plugin -p cf-gears-tenant-resolver -p cf-gears-static-tr-plugin -p cf-gears-single-tenant-tr-plugin -p cf-gears-rg-tr-plugin`; scoped builds/lints and shared fixture tests pass. Local API/type projection/canonical-error and bootstrap policies are reviewed before the final application gate
+- [ ] Final (partially closed — see **Done**: the workspace run is red in `oagw` and `rustls-corecrypto-provider` only, mini-chat and usage-collector boots stop at their environment after the registry handoff, and the github-mirror-dev, quickstart-windows, mini-chat chart and ClickHouse usage-collector compositions were not booted): `make e2e-local SUITE=account_management`, full `make e2e-local`, `make quickstart`, affected mini-chat/static-tenants/usage-collector/config boots, AM's existing SQLite/backend coverage, `cargo test --workspace`, `make fmt`, `make clippy`. Reproduce the schema-registration → AM HTTP consume path and host restart; no external Keycloak or known-broken RG-chain success is inferred from these commands
+
+**Historical migration-branch results (2026-10-14; not delivered in this foundation).**
+- The seven gears read and write only the database catalogue through `PlatformTypesRegistryApi`; AM resolves no legacy client, and a host without a registry database fails AM init. The tenant-resolver core and `LazyIdpProvider` list every page with content and choose only among instances whose plugin registered its scoped client in this process: the database keeps instances of plugins disabled since (T40 replaces this with late-safe selection). Every writer — the three TR plugins, AM's root type and opt-in TR instance, both IdP plugins — reconciles under its own publisher, a two-minute deadline and the runtime token, and registers its scoped backend only after admission.
+- Readers select what they need: `effective_traits` for pairing, bootstrap and inheritance policy, `resolved_schema` for payload and metadata validation, nothing for UUID hydration. A snapshot without a selected document is an internal error; a deleted schema counts as unregistered for new writes — pairings and metadata values are refused, user payloads fail closed, and a tenant name falls back to AM's own and the database's guards as when the schema is absent; UUID hydration of tenant rows still names it, and metadata treats its rows as orphans. A validated field honours every sub-schema its resolved document declares — top level and `allOf` members are conjunctive.
+- Proof on real gears and databases: `gear_tests::no_seed_startup_tests` (in-memory SQLite) and `restart_tests` (SQLite files reused across boots) run the registry, Resource Group and AM gears — the root is readable with its traits right after AM init; a binding mismatch fails before any registry write under both strict policies; an equal restart keeps the root revision and an `idp_provisioning` change is a new one; a custom root vendor is refused until its region is opened; the AM TR plugin serves `tenant-resolver` when enabled, is skipped when disabled although its instance stays at the same revision, and serves again when re-enabled. Root content is AM-owned: configuration can change only `idp_provisioning`, so no incompatible root edit is reachable from it.
+- e2e: the AM suite registers its metadata schema through `/types-registry/v2/` (read, compare, create or CAS update, poll, check the item); `config/e2e-local.yaml` opens vendor `x` in `gts.cf.core.am.tenant_metadata.v1~x.e2etest.*` only. A new scenario validates values against a schema registered only in the database, hydrates its UUID on listing and follows a changed inheritance policy. `make e2e-local SUITE=account_management`: 22 passed; full `make e2e-local`: 507 passed, 21 skipped, 25 xfailed, both on fresh data roots. AM with `--features integration` (PostgreSQL): 1259 passed. `make clippy` and `cargo fmt --check` are clean.
+- Boots, cold and restarted: quickstart and `config/static-tenants.yaml` start fully (8 seeds, the static TR plugin admitted then `up_to_date`); the mini-chat and usage-collector compositions seed (41, 17) and publish their TR plugin, then stop at their own environment (`AZURE_OPENAI_API_HOST`, the unsubstituted TimescaleDB port), as before T32. No external Keycloak deployment was run: its publication is covered by `publish_instance` tests.
+- `cargo nextest run --workspace`: 19758 passed, 132 failed, 555 skipped — 118 in `oagw` (pingora's "Failed to load native certificates") and 14 in `rustls-corecrypto-provider` (host FIPS assertions). Rerun outside the sandbox, a failing `oagw` test passes alone, while the whole `oagw` crate still fails under parallel load; neither crate is changed by T32, which by itself does not establish the cause.
+
+**Dependencies:** T31, T29/T30; no dependency on T33–T37. Sequence is T31 → T32 → T33. All existing Checkpoint 7A/7/8/9 gates remain **Files likely touched:** `AM/account-management/src/{gear,domain,infra/types_registry,infra/idp,tr_plugin}/` and their tests; both `AM/plugins/{static-idp-plugin,keycloak-idp-plugin}/` registration paths; tenant-resolver core and its three plugin crates/tests; affected manifests/configs; AM e2e helpers/scenarios and usage docs. Allocate concrete files to each small implementation commit using the stage audit; this is an explicitly large delivery, not a one-session task **Scope:** L umbrella, six ordered stages above split into S/M commits; the complete AM/IdP/TR group merges atomically. T38 verifies this API migration rather than repeating it; T41/T42 still own lifecycle/remote changes
+
+---
+
+### - [x] T33: Toolkit — a platform-authenticated auth axis; one plane per route
+
+**Status:** merged into `main` by PR #5256 (`4427e5fe2`, 2026-10-16): `6f70979d4` (the branch's `af5517c38`, rebased) plus three review commits — `69f5eaa98` (one `RouteAuth` field, `layer_route_auth`), `4404ba780` (one plane per request), `befa93f56` (platform identity throttling). The criteria below record what landed; where it differs from the branch plan, the plan's wording is replaced and the change is named.
+
+**Description:** `OperationBuilder` has tenant (`.authenticated()`) and anonymous axes only. toolkit's own codegen registers platform-plane routes `.anonymous()` *"until `OperationBuilder` grows a dedicated platform axis"* (`toolkit-contract-macros/src/rest_contract.rs:1579`). T34 needs that axis for the registry's platform routes (SPEC D17, D20).
+
+**History.** P24 extended platform enforcement to every host; P25 removed the either-plane axis before use. The final API has distinct platform and tenant routes. At review the planned `authenticated` + `auth_plane` pair became one `RouteAuth` field, so an inconsistent spec cannot be built; "validate every presented credential" became "a request carries one plane"; and identity-keyed throttling on platform operations became supported instead of refused.
 
 **Acceptance criteria:**
-- [ ] Cache is typed on `EntitySnapshot`; the `GtsTypeSchema` / `GtsInstance` implementation is gone with the old models
+- [x] `.platform_authenticated()` on `OperationBuilder`, recorded in `OperationSpec` as `auth: RouteAuth { Anonymous, Authenticated, Platform }` (`toolkit-security/src/route_auth.rs`), shared by listeners and the gateway. `.authenticated()` → `Authenticated`, `.anonymous()` → `Anonymous`. One field replaces the planned `authenticated` + `auth_plane` pair, so an inconsistent spec is unrepresentable. No route accepts either plane (P25)
+- [x] `compose_oop_router` derives exact method/template `RouteAuthPolicy` from specs, and `layer_route_auth` installs policy → platform plane → tenant plane → platform gate as router layers (MethodRouter layers are too late). Undeclared HEAD inherits GET. **One plane per request:** `retain_route_plane` refuses any request carrying both an `Authorization` header (any scheme) and `X-ToolKit-Internal-Token` with `401 MIXED_CREDENTIALS` before either is validated, on every route; a lone credential of the other plane is dropped unvalidated (the bearer on a platform route, the token on an authenticated or unlisted one). The gate requires a validated non-marker platform context; a missing internal authenticator fails closed with a startup warning naming the platform routes. Anonymous routes get an anonymous `SecurityContext`
+- [x] Gateway resolves Platform policy under `prefix_path` on exact templates and applies `retain_route_plane` (`route_plane_middleware`) before both authenticators, in both auth modes. A platform route requires the gateway's inbound internal authenticator and is refused without one; no synthetic tenant context, no tenant scope checks (`PlatformAdmitted`). Identity-keyed throttling on platform operations keys on the validated workload — `platform:k8s:<ns>/<sa>`, `platform:spiffe:<td>/<name>`, `platform:shared:<name>` — so replicas share one budget; it is refused at startup only for anonymous operations and for tenant operations under `auth_disabled`. OpenAPI uses `internalToken`; discovery excludes operations requiring it in every alternative. Gateway HEAD inherits GET unless explicitly declared
+- [x] Handlers read `Extension<PlatformSecurityContext>`; behind the gate it is always present, and a refusal is a canonical `401`, never `500`
+- [x] Generated REST methods with owned/borrowed `PlatformSecurityContext` use `.platform_authenticated().no_license_required()` and reject `#[anonymous]` at compile time. `authz-resolver::evaluate` now requires a validated internal token on every host
+
+**Verification:**
+- [x] Toolkit tests on both middleware stacks, including mixed credentials:
+      - `toolkit-http-middleware` `auth_tests.rs`: platform-route matrix (neither, bearer alone, token alone, both → `MIXED_CREDENTIALS`, a non-bearer scheme beside a token), each refusal's reason, `HEAD` via `GET`, each plane unconfigured (`without_a_tenant_plane_a_platform_route_admits_only_a_token`), the outbound marker injected behind a context-free handler
+      - `toolkit` `oop_serve_tests.rs`, `host_runtime_oop_tests.rs`: the matrix through the real assembly — `OperationBuilder` specs → `route_auth_policy` → `layer_route_auth`; anonymous and authenticated routes keep their behaviour
+      - `toolkit-contract` `tests/rest_server_platform_plane.rs`: generated routes for owned and borrowed contexts declare `internalToken`; behind the real stack a validated token reaches the service, and a missing or forged one is refused before dispatch (`401`, reason asserted). trybuild `fail/rest_anonymous_platform_method.rs`
+      - `api-gateway` `tests/auth_middleware.rs`, embedded gateway with `require_auth_by_default: false`: tenant and platform `GET`/`HEAD`/`POST` across valid/forged token × valid/forged/absent bearer, mixed credentials refused before validation; refused without a gateway internal authenticator; under `prefix_path: /cf`; with `auth_disabled: true`; scope rules skipped for platform, still `403` on the tenant route. Profile 3: through `ToolKitGatewayProvider` the tenant route arrives bearer-required, `HEAD` included, and a platform path is not published
+      - Unit: `GatewayRoutePolicy` (platform wins, exact template, `HEAD` inheritance with explicit-`HEAD` precedence), workload-keyed platform throttling (`throttling_tests.rs`), OpenAPI security per axis, discovery's AND/OR/inherited `security` cases
+- [x] Re-run on `main` at `4427e5fe2` (2026-10-16): `cargo fmt --all --check`, `make clippy`; nextest `cf-gears-toolkit-http-middleware` 49, `cf-gears-toolkit --all-features` 640 (1 skipped), `cf-gears-toolkit-contract --all-features` 270, `cf-gears-toolkit-contract-macros-tests` 7 (trybuild), `cf-gears-api-gateway` + `cf-gears-toolkit-gateway` 327, `cf-gears-authz-resolver{,-sdk}` 98 — all green. Counts differ from the branch record (44/651/307) by the three review commits
+
+**Follow-ups, not T33:**
+- Method-aware proxy routing: `ProxyRegistry` routes by path, so any method on a published path is forwarded — including an `exposed = false` method sharing the path. Deny unpublished methods, with `GET` → `HEAD`.
+- api-gateway's `extract_bearer_token` reads only the first `Authorization` header, so on tenant routes a second, unvalidated one is ignored (an `oop_serve` listener refuses duplicates; on platform routes every `Authorization` header is dropped or, beside a token, refused). Reject duplicate `Authorization` headers there and add parser regression tests.
+- `oop_serve` installs the tenant plane only when a bearer authenticator is configured, so without one an `.authenticated()` route reaches its handler with no context — `500` from an extractor, or a context-free handler served. Pre-existing for every OoP gear; owned by T35 (REST contract and missing-authenticator gate).
+
+**Dependencies:** T29 **Files touched:** `libs/toolkit/src/api/{operation_builder,openapi_registry,mod}.rs`, `libs/toolkit/src/runtime/{oop_serve,host_runtime}.rs`, `libs/toolkit-security/src/{route_auth,lib,constants}.rs`, `libs/toolkit-http-middleware/src/{auth,lib}.rs`, `libs/toolkit-contract-macros/src/{rest_contract,rest_contract_parse}.rs`, `libs/toolkit-gateway/src/toolkit_provider.rs`, `gears/system/api-gateway/src/{gear,config}.rs` and `middleware/*`, tests and `OperationSpec` literals beside them, `docs/toolkit_unified_system/06_authn_authz_secure_orm.md`, `docs/arch/throttling/DESIGN.md`, `libs/toolkit-http-middleware/README.md` **Scope:** M
+
+---
+
+### REST contract — binding on T30, T34, T35
+
+A normative reference, not a task: its items carry no checkboxes. Each names its owning task in brackets, and that task's acceptance criteria track it. T30 supplies the tenant local client, T34 the platform half, T35 the tenant half, and T35 closes the contract (P27). The semantic models stay transport-free. `rest-client` gates the wire DTOs and both resolving clients; `rest-server` supplies the descriptors `provides` requires. One client instance carries no request-specific publisher or tenant context. Local adapter registration is delivered in T31 and used by the full AM/IdP/TR group in T32; other existing consumers stay legacy until T38. Clients are hand-written on toolkit-contract's runtime helpers (`build_request_url`, `attach_internal_token`, `map_http_error`, `retry_with_backoff`) and wrapped in `DirectoryResolvingClient`. Do not use `#[rest_contract]` for them: its custom-header and success-metadata limitations are why this transport is hand-written.
+
+**Client:**
+- **[`rest-client` T34; `rest-server` T35]** `TR-SDK` gains `rest-client` (and, for `#[provides]`, `rest-server`) features. The client, its wire DTOs and the resolving wrapper compile only under `rest-client`
+- **[T34; tenant DTOs T35]** Wire DTOs derive serde only, convert to and from the §10.1 models, and are not referenced by the models
+- **[T34]** The platform client implements `PlatformTypesRegistryApi` over the `/types-registry/v2/platform/` wire exactly as the handlers serve it:
+  - submission sends `Idempotency-Key` as a header;
+  - it reads `Location` / `Retry-After` and tells a replay's `200` from `202`, then reads the operation through `get_operation` (SPEC D19);
+  - it maps the exact read's `ETag` / `304`;
+  - `batchGet` is `POST …/entities:batchGet`;
+  - discovery sends `pattern`, `depth`, `kind`, `lifecycle_status`, `limit`, `cursor` and `$select`.
+- **[T34]** Every platform method attaches the process's `X-ToolKit-Internal-Token` through `attach_internal_token`, resolved on every attempt, and never `Authorization` — since T33 a request carrying both is refused `401 MIXED_CREDENTIALS` on every route of both stacks. The `PlatformSecurityContext` argument is never serialized
+- **[local client T30; REST client T35]** `TypesRegistryApi` — exact read, `batchGet` and discovery, with the platform models and the same projection, validators and `304` / `unchanged` semantics — gets a local client over the domain service and a REST client that sends the caller's bearer from its `SecurityContext` and never the internal token. Its base path is `/types-registry/v2/` until T38, held as an adapter-internal constant
+- **[T34; the tenant exact read T35]** Submission and the exact read do not use `runtime::client::send_unary`, which discards success headers and status and treats `304` as an error. They read status and headers themselves and reuse `runtime::http::map_http_error` for Problems
+- **[T34, T35]** Per-method client spans and RED metrics match what a generated client emits. Retry is enabled only for safe reads and for submissions carrying a key, under bounded deadlines and cancellation
+- **[T34, T35]** Problem responses map to `CanonicalError` without loss: category, `resource_type` / `resource_name`, field violations
+- **[T35]** types-registry declares `#[provides(transports = [local, rest], rest_client = …)]` for both APIs — preserve T31/T32's seeded local path, prove remote resolution in fixture hosts, and expose each resolving client where `#[consumes(resolving_client = …)]` expects it. T38 cuts over only the remaining legacy consumers
+
+**Server:**
+- **[T34; T33 is in `main`]** The seven platform routes move to `/types-registry/v2/platform/` with `.platform_authenticated()`; no `/v2/` platform route remains. On `oop_serve` and through api-gateway they serve a valid internal token and refuse a bearer alone (dropped unvalidated, then no token → `401`); through the gateway the token is validated by its inbound authenticator, and with none configured the routes are refused
+- **[T35]** The tenant routes — `GET /entities/{entity_key}`, `POST /entities:batchGet`, `GET /entities` on `/types-registry/v2/` — use `.authenticated()` and share their handlers' domain calls with the platform twins; they serve a valid bearer and refuse an internal token alone on both hosts. `get_operation` has no tenant route
+- **[platform T34; tenant T35]** Every refusal is a canonical `401` Problem, never `500`: with no credential, with only the other plane's credential (dropped unvalidated), with an invalid credential of the route's plane, and with both an `Authorization` header and an internal token in any combination of validity — refused `MIXED_CREDENTIALS` before either is validated, on both stacks, whether or not the gateway has an internal authenticator (T33)
+- **[T35]** The application composition supplies the tenant authenticator; the existing example server exercises `AuthNResolverBearerAuthenticator` over its linked local `AuthNResolverClient`. T35 does not require a production executable in the registry gear (SPEC §8.4). **Without this authenticator, a tenant route answers a canonical `401`** — not `500` from the handler's extractor and not a served request: `oop_serve` installs no tenant plane then, so the registry (or toolkit) adds a gate for it
+- **[T34]** Mutation routes keep `exposed = false`; tenant routes may be exposed. C8's source comment states what `exposed = false` does not bound in Profile 1
+- **[T34, T35]** Platform handlers read `Extension<PlatformSecurityContext>`, tenant handlers `Extension<SecurityContext>` — one plane per handler
+- **[T34]** No principal is recorded: `P0_PRINCIPAL_ID` stays nil, and C2's source comment names T34 as where the identity became available but unrecorded
+- **[T34]** SPEC C6/C8 source comments are updated to the D17 wording
+
+**Verification shared by T34, T35:**
+- **[T34]** `TR/tests/rest_client_contract_test.rs`: the real platform client against the real platform routes over TCP, with the platform middleware installed — submit → poll → exact read → `batchGet` (`found`, then `unchanged` under the same `$select`) → discovery; replay with the same key → `replayed`; a different request under the same key → `AlreadyExists`; `404` / `400` mapping
+- **[T35]** The tenant client against the real tenant routes: exact read with `ETag`/`304`, `batchGet` `unchanged`, discovery cursor, the forwarded bearer re-validated by the listener
+- **[platform rows T34; tenant rows T35; the full matrix on both hosts T35]** Auth matrix through the **real** api-gateway middleware and through `oop_serve`'s middleware stack:
+  - no credential → `401` on both route sets;
+  - platform: a valid token → served (at the gateway when its internal authenticator is configured, refused otherwise); a valid bearer alone → `401`; a forged token → `401`;
+  - tenant: a valid bearer → served; a valid token alone → `401`; an invalid bearer → `401`;
+  - both credentials, on either route set and whatever their validity (a valid bearer beside a valid token included) → `401` with reason `MIXED_CREDENTIALS`, on both hosts.
+- **[T35]** Bootstrap test: the registry started out of process **without** a tenant authenticator answers a canonical `401` on tenant routes and still serves platform routes; with one, it serves a valid bearer
+- **[T34, T35]** `make e2e-local` green after each task. **Platform calls need a platform token:** `config/e2e-local.yaml` (and the launcher's base config) configures the gateway's `internal_auth: shared_secret`, the root `conftest.py` gains a `platform_headers` fixture beside `auth_headers` reading the secret from the environment, and the `types_registry` suite's v2 calls split by plane — submissions, deletions and operation polling move to `/types-registry/v2/platform/` with `platform_headers`, which carry the internal token **only** — merging them into `auth_headers` would send both planes and be refused `MIXED_CREDENTIALS`; the entity reads stay on `/types-registry/v2/` with their bearer. The consumer-migration follow-up must move T32's AM schema helper to these platform paths/credentials; it remains legacy in this foundation. `oagw/helpers.py` and `types_registry/legacy/` wait for the atomic T38 cutover
+- **[platform examples T34; tenant flows and the final pass T35]** `QUICKSTART.md`: the platform examples use `/types-registry/v2/platform/` and send `X-ToolKit-Internal-Token`, with the `internal_auth` config they need; the tenant read examples use a bearer
+- **[T34]** The spike test and the spike `Cargo.toml` changes are removed or folded into the contract test
+- **[T34, T35; closed by T35]** `make dylint` clean for the SDK crate
+
+---
+
+### - [x] T34: Platform API over REST
+
+**Status:** implemented. The REST client, server routes, binding descriptors and tests use the same versioned platform API.
+
+**REST paths and T38 cutover.** Platform routes use `/types-registry/v2/platform`; tenant reads use `/types-registry/v2`. T38 deletes legacy and promotes both bases atomically to `/types-registry/v1/platform` and `/types-registry/v1`. Server/SDK constants, bindings, callers, receipts, OpenAPI and tests move together, without compatibility aliases.
+
+**Description:** Expose the seven platform operations behind `.platform_authenticated()` and the three tenant entity reads behind `.authenticated()`, sharing their domain calls.
+
+**Acceptance criteria:**
+- [x] Codecs round-trip projected snapshots, validators and operations without serde or HTTP on the semantic models; a received entity-tag becomes `Validator` without its RFC 9110 quotes and gets them back when sent, so a validator is the same token from either transport (SPEC §8.5); unknown failure reasons and context are preserved; omission and `null` stay distinct; a malformed operation payload is refused, not defaulted. Beyond the plan: a validator over the registry's 1024-byte bound is refused as the local client refuses it, and an operation item missing a member the registry always sends is refused (`TR-SDK/src/rest_client/dto_tests.rs`, mutation-checked)
+- [x] Every `PlatformTypesRegistryApi` method works over real TCP and meets the platform rows of the REST contract — `Idempotency-Key`, `Location`, `Retry-After`, `200`/`202`, read-back through `get_operation`, per-key `unchanged`, projection, bounded pagination and cursor/filter binding — with a freshly resolved internal token on every attempt and never a bearer. The exact read's `ETag`/`304` is served on the platform route but has no client method: the contract has no exact read, and the extension's single reads go through `batchGet`. A receipt is checked against its status and `Location`; a still-running operation is read back after the receipt's `Retry-After`, bounded by `retry.max_delay`; an operation read must answer the operation asked for
+- [x] Submit → poll → read returns real item outcomes, never a synthesized receipt; a lost read-back is `Aborted` `OPERATION_READ_FAILED` naming the accepted operation, and replaying the same key recovers it (D19); every platform method is a safe read or keyed, so every one retries under `ClientConfig::retry`
+- [x] The platform route set serves only `/types-registry/v2/platform/` with `.platform_authenticated()` (operation ids `types_registry.platform.*`); no tenant mutation or `get_operation` route exists; the three tenant entity reads keep their bearer and share their domain calls with the platform twins. C2, C6 and C8 source comments match the REST contract
+- [x] The async-surface e2e callers and configuration move in the same commit as the routes, including T32's AM metadata/schema-registration helper: its writes and operation polling go through the platform API with the internal token alone. AM's suite stays green; only still-legacy v1 writers are untouched
+- [x] Platform routes and `PlatformTypesRegistryApi` restrict mutations and operation reads to the platform plane and pass `CallerContext::Platform` to the domain. `RegistryService::{submit, delete, operation}` retain `CallerContext` so tenant policy can be added without changing domain signatures (SPEC §8.4). A tenant bearer reaches no mutation or operation read through REST; the tenant SDK contract exposes only entity reads.
+
+**Verification:**
+- [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (275 + 6 doctests); `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; `cargo clippy -D warnings` on the SDK under no features, `rest-client` and all features
+- [x] `cargo nextest run -p cf-gears-types-registry --test rest_client_contract_test` (new target, 5): the SDK's whole `conformance::run` over TCP — the same checks the mock and the local client pass, so local and TCP clients agree on outcomes, conditional reads, replay and errors — plus submit → poll → `batchGet` `found`/`unchanged` → discovery → replay → `AlreadyExists`; transient `503`s retried with a fresh token per attempt and one operation; a lost read-back naming the operation and recovered by replay; `404`/`400` mapping with resource and field violations. Every request is recorded: internal token, never a bearer
+- [x] `platform_local_client_test` unchanged and green; local/TCP agreement is proven by `conformance::run` above rather than a second suite
+- [x] The platform rows of the auth matrix through `oop_serve`'s stack (`layer_route_auth` with the policy derived from the registered specs) over TCP in `TR/tests/platform_routes_auth_test.rs`, and through the real api-gateway in e2e `TR-PLANE-001..003`; `api_rest_test.rs` moved to the platform paths, with `every_database_route_serves_exactly_one_plane` and `the_tenant_reads_answer_as_the_platform_reads`
+- [x] `make e2e-local SUITE=types_registry` (184 passed; 2 skipped, the same two as before) and `SUITE=account_management` (22 passed). The unscoped run is green apart from 20 bss ledger/pricebook tests failing on stale `~/.cf-gears` SQLite schemas from another branch (`no such column: ledger_account_balance.currency_scale`), not on this change. Gear tests: the `make test GEAR=types-registry` scope without fail-fast, 14 702 passed; its 157 failures are all oagw and event-broker pingora tests that cannot load native certificates here (`InvalidCert`), none in the registry, its SDK or a consumer
+
+**Follow-ups, not T34:**
+- `docs/api/api.json` drops the `/v2/` mutation and operation routes: the API-contracts check needs `breaking-api-acknowledged` on the PR.
+
+**Dependencies:** T30, T33 **Files touched:** `TR-SDK/Cargo.toml`, `TR-SDK/src/{lib,rest_client/mod,rest_client/dto,rest_client/platform}.rs` and their tests, `TR-SDK/README.md`, `TR/src/api/rest/{paths,routes,handlers}.rs`, `TR/src/domain/{registry_service,local_client,seeding,caller,enums}.rs`, `TR/src/domain/admission/{acceptance,fingerprint}.rs`, `TR/src/infra/storage/entity/{operation,enums}.rs`, `TR/tests/{rest_client_contract_test,platform_routes_auth_test,api_rest_test}.rs`, `TR/tests/common/{mod,platform_server}.rs` and the tests calling the narrowed service, `config/e2e-local.yaml`, `testing/e2e/conftest.py`, `testing/e2e/suites/types_registry/{helpers,conftest,test_*}.py`, `scenarios/planes.md`, `README.md`, the AM e2e schema helper, `QUICKSTART.md`, `docs/api/api.json` **Scope:** L
+
+---
+
+### - [ ] T34a: Account Management request-path reads on `TypesRegistryApi` with the caller's `SecurityContext`
+
+**Status:** pending in the consumer-migration follow-up, after T32. The implementation notes and historical migration-branch results below do not describe this foundation head.
+
+**Decision (P33, user, 2026-10-22).** P29/T32 shared one `PlatformTypesRegistryApi` across all of Account Management. P33 reverses that for request-path reads: every Type Schema, metadata-schema, payload-schema and UUID read AM makes while serving an incoming HTTP/API request goes through `TypesRegistryApi`/`TypesRegistryApiExt` with that request's original `&SecurityContext`, passed unchanged through every port and helper. `PlatformTypesRegistryApi` stays for publication, reconciliation, `init` and bootstrap, and for the autonomous background pipelines (retention, provisioning reaper). The task runs now, before T35; it is not deferred to T35, T41 or P1. T32's historical outcome is retained as migration-branch evidence; neither migration is delivered by this foundation.
+
+**Scope.** In-process only. T30 delivered both local clients and both extension helpers, and T31 registers both APIs in `types-registry::init`, so in-process AM needs no tenant REST (T35). In P0 the local tenant client applies no tenant scope (T30), so answers stay the same. What changes is which caller each read names; T35's REST client will forward that caller as a bearer. T35 is delivered separately by the foundation.
+
+**Acceptance criteria:**
+- [ ] AM `init` resolves `dyn TypesRegistryApi` for request paths and `dyn PlatformTypesRegistryApi` for platform paths. If either is missing, `init` fails; there is no fallback
+- [ ] Request paths read with the caller's context:
+  - tenant create: name validation, the parent/child type check, the parent's IdP context and lowering the activated tenant;
+  - `tenant_type` lowering for get, list-children, list-descendants, update, suspend, unsuspend and delete;
+  - the type check in conversion `approve`;
+  - metadata list, get, upsert, delete and resolve, including the default `resolve_ids_by_uuid` fallback, which forwards the context to each single lookup;
+  - user create/patch payload validation;
+  - the user and service-account tenant guard (`tenant_type` hydration).
+  `TenantTypeChecker::check_parent_child` and every `MetadataSchemaRegistry` method take `&SecurityContext`. `resolve_active_tenant` takes the caller's context next to its `AccessScope`, which is a PDP row filter and not a registry caller
+- [ ] No request path calls the platform API, constructs a `SecurityContext` (anonymous or system), falls back to the platform API after a tenant-API error, or keeps a request context in a shared client, service or adapter
+- [ ] Platform reads are explicit, named at their call sites, and each says why:
+  - root registration and the bootstrap saga, including bootstrap's root-name validation;
+  - `TenantService::load_tenant_context` from retention and the reaper (origin `Background`, kept apart from the create saga's origin `Request`);
+  - lazy IdP plugin discovery: a process-wide plugin selection cached across callers;
+  - the AM tenant-resolver plugin. It is a hierarchy resolver for authorization: `tr-authz-plugin` calls it with `SecurityContext::anonymous()` (gears-rust#1597), and the plugin's tenant reads already elevate to `allow_all`. This is a recorded exception. It is revisited once its callers hold a real forwarded or S2S context (#1597), with tenant REST (T35) used where needed. T35 alone does not change it, and the anonymous context is never forwarded to tenant REST.
+  User-supplied schema checks are never classed as system reads
+- [ ] Preservation policies are unchanged apart from provenance: an unknown or failed UUID lowers to `tenant_type: None`; metadata orphan rows and their error mapping; the user schema fails closed; the tenant name falls back to AM's guard when its schema is absent
+
+**Verification:**
+- [ ] A recording `TypesRegistryApi` spy keeps a full clone of each `SecurityContext` (bearer token, subject, subject tenant, token scopes), and its `PlatformTypesRegistryApi` side fails the test. The spy is needed because the SDK mock and the local client ignore the caller, so database and e2e runs cannot show propagation. Two successive callers through one shared service or adapter must be told apart on every path above
+- [ ] Retention/reaper `load_tenant_context` and bootstrap name validation read through the platform API and never through the tenant API
+- [ ] `cargo nextest run -p cf-gears-account-management`, `cargo clippy -p cf-gears-account-management --all-targets -- -D warnings`, `cargo fmt --check`
+
+**Historical migration-branch results (2026-10-22; not delivered in this foundation).**
+
+- `TypesRegistryReader::{Caller { api, ctx }, Platform(api)}` distinguishes shared
+  reads. Tenant-name checks accept either; user payload/patch validation accepts
+  only the tenant API and request context. `TenantService` dispatches through
+  `CallerOrigin::{Request(ctx), Background}`: create uses the request, retention
+  and the reaper use platform. `TenantTypeChecker`, every `MetadataSchemaRegistry`
+  method (including default batch lookup) and `resolve_active_tenant` take the
+  caller's context. AM init requires both APIs and names a missing one.
+- Platform reads remain for publication, root registration, bootstrap/root-name
+  checks, retention, the reaper and the named system reads in `infra/idp/lazy.rs`
+  and `tr_plugin/plugin_impl.rs`.
+- `CallerSpy` clones full contexts; `assert_only_caller` compares subject, type,
+  tenant, scopes and bearer. Two callers share each tested service: GTS validation,
+  checker, metadata adapter; tenant create/get/children/descendants/update/suspend/
+  unsuspend/delete (11 reads); user create/update/list/get/delete (7); service
+  account create/list/rotate/revoke (4); metadata upsert/get/list/resolve/delete
+  through default batch (6). Conversion approval uses the approver's context.
+  Tests also cover no tenant-to-platform fallback, platform-only cleanup, unknown
+  type → `None`, and init with one API missing. A serde-round-trip mutation that
+  dropped the bearer was caught by GTS validation tests.
+- Checks: AM nextest 1256 passed; clippy `--all-targets -- -D warnings`, also with
+  `--all-features`, and fmt passed. PostgreSQL `integration` (needs Docker) and AM
+  e2e were not run. P0's local client ignores callers, so e2e cannot prove provenance.
+
+**Dependencies:** T30, T31, T32 **Files likely touched:** `AM/account-management/src/{gear.rs,domain/{gts_validation,tenant/resolve,tenant/service/*,tenant_type/checker,metadata/{registry,service},user/service,service_account/service,conversion/service}.rs,infra/types_registry/*,infra/idp/lazy.rs,tr_plugin/*}` and their tests **Scope:** M
+
+---
+
+### - [x] T35: Tenant REST and both resolving clients — complete SDK transport handoff
+
+**Description:** Serve T30's `TypesRegistryApi` to a gear in another process through a bearer-forwarding REST client on the `/v2/` reads, and require a canonical-`401` gate when the application composition supplies no tenant authenticator. The contract, its extension helpers and its local client moved to T30; resolving wrappers, `#[provides]` and the contract's closure moved to T35 (P27).
+
+Commits inside the task: (1) tenant routes on shared domain calls and the tenant REST client; (2) the authenticator bootstrap/gate and SPEC §8.4. The former standalone-host requirement is superseded by the composition boundary below.
+
+**Status:** done on this branch. Historical commits, in order:
+- Stage 1: `951798dc1` (the tenant REST client over a `transport.rs` extracted from the platform client), `4dae4e3de` (the registry-local caller gate), `880b222c4` (`apps/cf-types-registry-host`, SPEC §8.4, the `types-registry-host` lane and CI step).
+- Closing stage: `3c9805acd` (resolving clients, `rest-server` binding descriptors), `39e4fb736` (their test gaps), `10ea285c8` (`#[provides]` for both contracts, fixture hosts), `ab1035c75` (seeded-handoff lifetime, positive remote resolution), `373d89540` (the full auth matrix on both hosts), `07df2a86f` (SDK dylint clean), `d95a60d9b` (QUICKSTART), `ae1c8b6e9` (mixed credentials on every `oop_serve` topology, the runtime token over `consumes`), and the closing commit with this record (the host's dev-only no-AuthN binary and its spawned-process test, `default-run`, the QUICKSTART and SPEC fixes).
+
+**Decisions (user):**
+- The canonical-`401` gate is registry-local (`require_caller` on the registry's own routes, reason `TENANT_AUTHENTICATION_UNAVAILABLE`); toolkit's `oop_serve`, which serves tenant routes unvalidated without a tenant authenticator, is unchanged.
+- **Framework scope (user, 2026-10-27):** no new production or test-composition host is required. The registry gear owns no executable, AuthN implementation dependencies or host features. Local examples and E2E use the existing `apps/cf-gears-example-server`; TCP and gateway tests cover the REST/AuthN contracts. The temporary standalone hosts and their three process tests are removed. This supersedes the earlier T35 host-delivery requirement; linked-plugin restart/selection at a real process boundary is not claimed by the current handoff.
+
+**Deviations, each named where it applies:**
+- The tenant routes and their shared handlers already existed from T34, so commit 1 added only the client.
+- Commit 2 landed as two (gate, host).
+- The exact read has no client method, as in T34: the extension reads through `batchGet`, and the route's `ETag`/`304` is checked over TCP with a real bearer.
+- The clients build URLs by fixed base-path concatenation, not `build_request_url`, which serves IR path bindings these hand-written routes do not use; `attach_internal_token`, `map_http_error` and `retry_with_backoff` are reused.
+- The private client wire types are `*Wire` in `rest_client/wire.rs`: dylint reserves `*Dto` for server DTOs under `api/rest` deriving `ToSchema`, which the contract forbids on client wire types.
+- The embedded registry can only wire its contracts `Local` (its configuration admits no `client_wiring`); the REST arm of `provides` serves other hosts.
+- `make test GEAR=types-registry` first died of a full disk (the worktree's `target/` is ~555 GiB); rerun, it stalled for over half an hour listing reverse-dependency test binaries while the local Santa daemon scanned each one. By the user's decision the local gear scope is the registry, its SDK, api-gateway and the host; the other reverse dependencies only consume the registry and are left to CI.
+
+**Review.** Codex reviewed every slice in parallel and mutated it on scratch worktrees (rounds 1–10, F1–F23). Every finding was fixed or is recorded here; every surviving mutant was killed by an added or strengthened test: the exact-read `304` over TCP, gate scope, bounded readiness polling, tenant resolving-client moves, every platform method through the resolving client, binding-to-operation mapping, the seeded handoff's lifetime and error propagation, a positive remote resolution with the runtime's token, and mixed credentials on every topology.
+
+**Acceptance criteria:**
+- [x] Real TCP tenant reads match the T30 local client: `ETag`/`304`, `unchanged` and cursor semantics, the validator as the unquoted token (SPEC §8.5); each call forwards its own `SecurityContext` bearer and never the internal token; tenant handlers read `Extension<SecurityContext>` only
+- [x] The tenant routes share their handlers' domain calls with the platform twins; `get_operation` has no tenant route
+- [x] Test the registry under an application-supplied `AuthNResolverBearerAuthenticator` and without an authenticator. `AuthNResolverClient` has no current remote contract/adapter; no unrelated RPC migration is required. Without an authenticator a tenant route answers a canonical `401` before dispatch while platform routes are served
+- [x] Provide composable gear/SDK/REST contracts, exercised by the existing example server, TCP/gateway tests and E2E suite. No additional host crate or production composition is a T35 deliverable
+- [x] Every REST-contract item owned by T35 is met; the interim tenant path is adapter-internal, so callers see the semantic API only
+
+**Verification:**
+- [x] The tenant cases of `rest_client_contract_test`
+- [x] The tenant rows of the auth matrix on both listener stacks: `platform_routes_auth_test` (including missing tenant/internal authenticators) and example-server E2E `TR-PLANE-001..004`. Gateway plane enforcement is covered separately by `api-gateway/tests/auth_middleware.rs` using test routes. These prove route authentication, not linked-plugin restart/selection in a separate process
+- [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (297 + 1 + 6 doctests with all features); `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`
+- [x] *Historical, the commands of the time:* `make e2e-local` green (526 passed, 23 skipped, 25 xfailed, on an empty `APP__SERVER__HOME_DIR`: `~/.cf-gears` holds a types-registry database from another branch whose seeds no longer admit); the local gear scope (`cargo nextest run -p cf-gears-types-registry -p cf-gears-types-registry-sdk -p cf-gears-api-gateway -p cf-types-registry-host --features cf-types-registry-host/dev-authn`: 1866 passed; the other reverse dependencies run in CI, see the deviations); `cargo clippy -p cf-types-registry-host --all-targets --features dev-authn -- -D warnings` clean
+
+**Closing stage — resolving clients, provides and both-host auth matrix:**
+
+**Description:** Expose `DirectoryResolvingClient` wrappers and `#[provides]` descriptors for both APIs, run the full auth matrix on both hosts, and close the REST contract with its documentation. After this task another developer can consume either API in either transport. Formerly tracked separately by P27; P30 now makes this the closing stage of the same T35 feature.
+
+Commits inside the task: (1) resolving wrappers, `rest-server` and `provides` with their fixture hosts; (2) the full auth matrix on both hosts; (3) QUICKSTART tenant flows and the contract's closing pass.
+
+**Acceptance criteria:**
+- [x] Both resolving wrappers sit where `#[consumes(resolving_client = …)]` expects them; local wins in a local host, a remote host has no local fallback, an unavailable target is a canonical error, and resolution rebuilds after a target moves. Preserve T31's seed barrier and local registrations; existing legacy consumers still use their catalogue until T38
+- [x] types-registry declares `#[provides(transports = [local, rest], rest_client = …)]` for both APIs; local and remote resolution are proven in fixture hosts — `consumes_local_test`, SDK `consumes_remote_test`
+- [x] The full auth matrix of the shared verification passes for both route sets through the real api-gateway and `oop_serve` stacks
+- [x] Every item of the REST contract is met for both APIs
+
+**Verification:**
+- [x] A `consumes`/`provides` fixture compiles for each API with `local` and `rest` features; focused resolving tests move a directory target — `resolving_client_test`
+- [x] The full auth matrix of the shared verification, on both hosts
+- [x] `cargo test -p cf-gears-types-registry-sdk --features rest-client`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; `make dylint` for the SDK crate (`cargo gears lint --dylint -P cf-gears-types-registry-sdk --all-features`)
+- [x] `make e2e-local` green; authenticated QUICKSTART flows use the existing example server (historically all 15 example blocks ran against the now-removed temporary host)
+
+**Follow-up — AuthN off the registry gear crate (user, 2026-10-26; composition clarified 2026-10-27).**
+
+**Description:** Remove `apps/cf-types-registry-host`, which existed only because authn-resolver and its plugins depended on the registry gear crate. authn-resolver, `oidc-authn-plugin` and `static-authn-plugin` drop `deps = [types_registry]` (OIDC also `authn_resolver`) and the gear-crate Cargo dependencies, and `#[toolkit::consumes]` `PlatformTypesRegistryApi` (SPEC §8.4, "AuthN over the platform contract"). The plugins become system gears that publish their instance in `post_init` and bind their scoped client only after admission; the resolver selects over the database-backed catalogue, among instances with a scoped client in this process. The temporary host binaries, separate composition crate and their three process tests have been removed; no registry `standalone` / `dev-authn` features or dedicated CI lane remain. The existing example server exercises the registry as part of a framework composition. Hosts linking an AuthN plugin get a registry database: `config/{flight-control,oop-flight-control,oop-api-contracts,oop-api-contracts-consumer,event-broker-standalone}.yaml` and the flight-control and api-contracts Helm values.
+
+**Not covered** (stays with T41/T42): a process without the registry publishing AuthN to a remote one, eventual readiness while it is unreachable (an unreachable registry fails boot at the publication deadline), the AuthN schema's publication from such a process, `consumer_wiring` static overrides for the AuthN gears. T41's remote AM is not touched.
+
+**Status:** pending in the consumer-migration follow-up. The implementation, test and mutation results below are historical migration-branch evidence, not verification of this foundation. AuthN still depends on the registry gear here.
+
+**Acceptance criteria:**
+- [ ] No AuthN crate depends on `cf-gears-types-registry` (normal or dev); none declares `deps` on the registry; all three consume the contract with `consumes` above `#[toolkit::gear]`
+- [ ] The resolver lists every page, filters to scoped clients present in this process before `choose_plugin_instance`, and caches no failure; a missing contract fails closed
+- [ ] A plugin binds its client only after admission; `init` binds nothing; refused, pending (deadline), cancelled and no-contract publication fail boot with nothing bound
+- Historical temporary process proof: a restart on the same database updated a changed instance and selection followed it. The fixture is removed; this process-level scenario is not claimed by the current framework handoff
+- [ ] The registry gear has no AuthN implementation dependencies or host binaries. Canonical refusal without an authenticator remains covered by `platform_routes_auth_test`; the temporary no-AuthN process fixture is removed
+- [ ] Hosts linking an AuthN plugin bind the registry to a database; the default `config/no-db.yaml` profile (resolver only, `auth_disabled`) is still ready
+
+**Verification required in the follow-up (historical migration-branch results retained):**
+- [ ] Unit: `cargo test -p cf-gears-authn-resolver` (5 selection tests), `-p cf-gears-static-authn-plugin` (23, 7 of them publication), `-p cf-gears-oidc-authn-plugin` (208 lib, 2 publication, and every integration binary)
+- [ ] *Historical, removed temporary process fixtures:* 3 passed: both planes on the host, the no-AuthN host's `TENANT_AUTHENTICATION_UNAVAILABLE`, and a restart on the same database under a new static-plugin configuration (instance version increases; moved to another vendor, the static bearer is refused by the then-selected OIDC)
+- [ ] Embedded host by hand: `flight-control --config config/flight-control.yaml` ready; `/types-registry/v2/entities` 401 without a bearer, 200 with one, selection from the database catalogue; a restart with a changed priority updates the instance; the previous configuration without a registry database fails boot in about a second (`provider types-registry is not resolvable`). `cf-gears-example-server --config config/no-db.yaml`: `/readyz` 200
+- [ ] *Historical, before removing the temporary hosts:* scope and lints, each exit 0: `cargo fmt --all -- --check`; `cargo clippy -p cf-gears-authn-resolver -p cf-gears-static-authn-plugin -p cf-gears-oidc-authn-plugin --all-targets -- -D warnings`; `cargo clippy -p cf-gears-types-registry --all-targets [--features dev-authn] -- -D warnings`; `cargo nextest run -p cf-gears-types-registry -p cf-gears-types-registry-sdk -p cf-gears-api-gateway -p cf-gears-authn-resolver -p cf-gears-static-authn-plugin -p cf-gears-oidc-authn-plugin --features cf-gears-types-registry/dev-authn` (2120 passed); `cargo nextest run -p cf-gears-types-registry` without features (1283 passed); `cargo test -p cf-gears-oidc-authn-plugin` (226 passed, 6 binaries); `cargo check --workspace --all-targets`; `make test-integration LANE=types-registry-host` (3 passed). `python3 tools/scripts/check_packaging_metadata.py` (the optional OIDC dependency carries its version). `cargo tree -e normal`: no static plugin under `standalone`, no AuthN crate without features, and no AuthN crate reaching the gear crate (normal or dev). The PostgreSQL/MySQL lanes and `make e2e-local` were not rerun
+
+**Historical framework-only correction on the migration branch (2026-10-27).** Removed temporary standalone hosts,
+the composition crate and three process tests. QUICKSTART/E2E use embedded
+`apps/cf-gears-example-server`; REST/AuthN matrices and local restart tests remain.
+Linked-plugin process restart/selection remains unverified by this handoff;
+in-process tests do not replace it. No new production composition is required.
+
+After removal: registry nextest 1283 passed; example-server E2E 191 passed,
+2 skipped; registry/example-server check, clippy `--all-targets -- -D warnings`,
+formatting and packaging metadata passed.
+
+**Follow-up — AuthZ, tenant resolution and AM off the registry gear crate (user, 2026-10-26).**
+
+**Description:** authz-resolver moves from the legacy `TypesRegistryClient` to `PlatformTypesRegistryApi` (`#[toolkit::consumes]`), selecting exactly like authn-resolver; `static-authz-plugin` and `tr-authz-plugin` move their instance from the legacy catalogue to `reconcile_entities_and_await` on the platform catalogue. tenant-resolver consumes the contract it already read. These gears, the three tenant-resolver plugins, account-management, `static-idp-plugin`, `keycloak-idp-plugin` and resource-group drop `types_registry` from `deps` and the gear-crate Cargo dependency (AM keeps it as a dev-dependency for its real-database fixtures). No gear changes lifecycle phase (SPEC §8.4, "AuthZ, tenant resolution and AM: local-only startup"): the ordinary publishers stay in `init` beside a local registry, which as a system gear initializes before every ordinary gear; the host links it. This supersedes T32's "keep `deps = [types_registry]`" for these gears; the `init`-time publications themselves are unchanged and still end at T41/T42.
+
+**Not covered** (stays with T38/T41/T42): any of these publishers beside a remote registry — they declare no `consumes` and fail boot without a local database-backed one; resource-group's legacy metadata reads (T38); `keycloak-idp-plugin` still reaches the gear crate through `credstore`.
+
+**Status:** pending in the consumer-migration follow-up. The implementation, test and mutation results below are historical migration-branch evidence, not verification of this foundation. These consumers retain their legacy clients and dependencies here.
+
+**Acceptance criteria:**
+- [ ] `cargo tree -e normal,build`: no path to `cf-gears-types-registry` from authz-resolver, both AuthZ plugins, tenant-resolver, its three plugins, resource-group, account-management or `static-idp-plugin`; `keycloak-idp-plugin` reaches it only through `credstore`
+- [ ] authz-resolver lists every page, filters to scoped clients in this process, caches no failure, and has no legacy fallback; at a `PolicyEnforcer` a plugin denial keeps its reason, a grant its constraints, a registry outage is `EvaluationFailed(ServiceUnavailable)` and any other registry fault `EvaluationFailed(Internal)` — never a scope
+- [ ] Each AuthZ plugin binds its client only after admission; refused, pending (deadline), cancelled and no-contract publication fail `init` with nothing bound; `tr-authz-plugin` without a tenant resolver fails before any registry write
+- [ ] Under a real `HostRuntime` fed by the gears' own registrations, an ordinary gear depending on account-management finds in its `init` the AM client, the registry's APIs, AM's root type and tenant-resolver plugin admitted and bound; the static IdP plugin is admitted and bound once the host runs
+- [ ] Root-binding mismatch, `bootstrap.strict`, cancellation and RG's sealed init-only bootstrap are untouched (no business code changed in AM or RG)
+
+**Verification required in the follow-up (historical migration-branch results retained):**
+- [ ] Unit: `cargo test -p cf-gears-authz-resolver` (13: 5 selection, 4 through a `PolicyEnforcer`), `-p cf-gears-static-authz-plugin` (7 publication), `-p cf-gears-tr-authz-plugin` (8 publication)
+- [ ] Runtime: `cargo test -p cf-gears-account-management --test host_runtime_order_test` — the gears' own inventory registrations under `HostRuntime` (migrations, init, wiring, `post_init`, REST, start, stop), asserting the registry's `SystemCap` and the publishers' lack of it
+- [ ] Mutations by Codex on scratch copies, each killed: the local-scope filter inverted, a denial forwarded as a grant, the static AuthZ client bound before reconciliation (by the rejected and the pending test), types-registry without `SystemCap` (killed only after the test asserted the capability: the topological order alone put the registry first by chance)
+- [ ] Each exit 0: `cargo nextest run` over the 11 touched packages (2308 passed); `cargo clippy` over the same `--all-targets -- -D warnings`; `cargo fmt --all -- --check`; `cargo check --workspace --all-targets`; `python3 tools/scripts/check_packaging_metadata.py`; `cargo tree -e normal,build` as in the first criterion
+- [ ] `make e2e-local` on a fresh `APP__SERVER__HOME_DIR`: 526 passed, 23 skipped, 25 xfailed. `cf-gears-example-server --config config/no-db.yaml` (default features): `/readyz` 200. `make e2e-tr-authz` stays reduced (#4568); the PostgreSQL/MySQL lanes were not rerun
+
+**Dependencies:** T30, T34; the platform-authenticated prerequisite is supplied by T33/T34 **Files likely touched:** TR-SDK tenant/resolving REST clients, rest-server descriptors, registry providers, existing TCP/gateway/E2E tests, and QUICKSTART **Scope:** L feature with tenant/authenticator and resolving/closure stages, each split into S/M commits; one transport handoff
+
+---
+
+### - [ ] T35a: SDK payload validation over a resolved Type Schema
+
+**Description:** Add `TypeSchema::validate_value(&serde_json::Value)` as a thin adapter to `gts::ResolvedType::validate_payload`, so consumers can use the common GTS validation rules without building a store or configuring their own `jsonschema` validator. The upstream helper is implemented locally in `gts-rust`, branch `feat/resolved-payload-validation`, commit `0b5b7b1`; merge and a compatible published release are prerequisites, not completed dependency adoption. Any GTS/spec migration required by that release must be planned and verified separately before this task, rather than hidden in the wrapper change. One implementation commit after the prerequisite is satisfied; consumer migration stays in T38.
+
+**QE consumer note (T38):** QE already wraps `gts::PayloadValidator` in `CompiledContract` and compiles each selected contract once at catalogue bootstrap. Review the SDK wrapper against this use case: a convenience `validate_value` method that recompiles on every call is insufficient for replacing QE's request-path validator. Preserve a reusable compiled-validator path over the materialized Type Schema; keep the thin QE wrapper if the SDK offers only one-shot validation. The main migration saving is in registry resolution, as recorded under T38, rather than in `domain/catalog/model.rs`.
+
+**Acceptance criteria:**
+- [ ] The public method delegates payload validation to the upstream helper, using the returned resolved schema and the selected leaf's authored metadata for abstractness. It neither reconstructs effective artifacts nor reimplements dialect, format, regex or reference rules; it creates no registry client or local store
+- [ ] Rustdoc and the SDK README state the required projection fields (including `content` and `resolved_schema`) and define the error mapping for missing fields and upstream failures without parsing diagnostic strings. Missing fields or unavailable schema resources fail explicitly; validation never silently succeeds. The wrapper does not modify the payload or insert defaults
+- [ ] The contract explicitly checks reference syntax and pattern conformance only (`GtsRefValidation::None` semantics); target presence/validity, lifecycle and availability remain separate registry checks. Type-schema admission and trait/derivation validation remain upstream responsibilities; gear-specific payload envelopes remain with their consumers
+
+**Verification:**
+- [ ] SDK tests compare valid and invalid payload outcomes with the upstream helper for Draft-07, 2019-09 and 2020-12, including format assertions, GTS references, pattern references, inherited `/$id` and concrete descendants of abstract bases
+- [ ] SDK tests reject abstract types, missing projection fields and unresolved external schema resources; defaults do not satisfy a missing required payload property, and inputs remain unchanged
+- [ ] `cargo test -p cf-gears-types-registry-sdk --all-features`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; the standing `make fmt`, `make clippy` and gear-test gates pass
+- [ ] Manual: the README example reads a Type Schema with the documented projection and validates a payload without retaining a `GtsStore` or making another registry call
+
+**Dependencies:** T29 and T30; a compatible published `gts-rust` release containing `ResolvedType::validate_payload`. T35 is the queue predecessor, not a transport dependency. **Files likely touched:** `TR-SDK/src/models.rs`, `TR-SDK/src/models_tests.rs`, `TR-SDK/README.md`; `Cargo.toml` and `Cargo.lock` only for compatible released-dependency adoption. **Scope:** M (up to five files; broader dependency/spec migration is a separate prerequisite)
+
+---
+
+### - [ ] T35b: Mock Type Schema admission uses GTS validation
+
+**Description:** Make `MockTypesRegistry` validate Type Schema creations and content revisions before reporting success or storing them. Reuse `gts-rust`'s `GtsStore::validate_schema` for schema, derivation and trait checks; an invalid registration must fail at admission, rather than succeed and later fail a document read with `Internal`. Keep explicit `reject()` admission refusals, `Fault` injection for call failures such as `ServiceUnavailable`, and `seed()` as the fixture bypass. This task covers Type Schema content validation, not a second admission engine: publisher guards, database locking, schema-evolution history and complete production-admission parity remain outside its scope.
+
+**Ordered stages — each clears the standing bar:**
+- [ ] **1. Prepare fixtures (M):** replace simplified Type Schema fixtures registered through the contract with valid GTS Type Schemas in `TR-SDK/src/{ext_tests,testing_platform_tests}.rs` and `TR-SDK/src/reconcile/{mod_tests,telemetry_tests}.rs`. Update expected documents with their fixtures; preserve each test's purpose and assertions. The existing mock still passes the complete SDK suite after this stage
+- [ ] **2. Validate admission (M):** add validation in `TR-SDK/src/testing_platform.rs`, regression tests in `testing_platform_tests.rs`, shared real-client/mock cases in `testing_platform/conformance.rs`, and the contract limits in `TR-SDK/README.md`. Do not disable validation or silently repair registration content to keep old fixtures passing
+
+**Acceptance criteria:**
+- [ ] Creation and content revision validate the candidate and its required schema context before changing stored content or resource versions. Invalid schemas, derivation or traits return a terminal item failure with `InvalidSchema`; rejected revisions preserve the previous entity and its readable artifacts. Existing lifecycle, precondition and unchanged-result semantics remain intact
+- [ ] Valid in-batch dependencies work regardless of input order, including child before parent. An invalid or otherwise refused candidate cannot supply a committed dependency to another item; independent valid branches can still succeed. Dry run uses the same validation and outcomes without changing stored entities or versions
+- [ ] Explicit `reject()` and `Fault` rules remain deterministic and preserve their documented precedence; `seed()` can still create intentionally invalid fixtures. Module docs and README state the validation scope and limits, without claiming full production-admission parity or duplicating GTS rules locally
+
+**Verification:**
+- [ ] Shared conformance cases pass against both the mock and the real local client: valid roots/derived types; malformed schema, invalid traits and invalid derivation refused at admission; failed update leaves prior content/version/artifacts unchanged; unordered and mixed-validity batches; dry-run refusal without writes
+- [ ] SDK regression tests preserve injected admission refusals, unavailable-call faults, idempotent replay and the explicit seed bypass; removing candidate validation makes the new admission tests fail
+- [ ] `cargo test -p cf-gears-types-registry-sdk --all-features`; `cargo nextest run -p cf-gears-types-registry`; `make test-integration LANE=types-registry-db`; `cargo check -p cf-gears-types-registry-sdk --all-targets --all-features`; the standing fmt/clippy gates pass
+
+**Dependencies:** T29 and T30 (mock and both contracts). Uses the existing GTS schema-validation API; does not require T35a's new helper or its upstream release. T35a is the queue predecessor only. **Files likely touched:** listed separately for each stage above. **Scope:** L umbrella over the two ordered M stages above, at most four files per stage; fixture preparation precedes enabling validation so every commit stays green
+
+---
+
+### - [ ] T36: SDK client cache — freshness window, byte bound, `fresh` bypass
+
+**Description:** Port the cache to the new `Entity` models as an SDK decorator over any `dyn PlatformTypesRegistryApi`, covering local and REST clients before T38's cutover (SPEC §8.3, DESIGN §3.3, P7/P22). T22d validators enable revalidation; T22b supplies projection isolation. Visibility and Context-Tenant dimensions stay fixed until P1 tenancy.
+
+**Acceptance criteria:**
+- [ ] Cache is typed on `Entity`; the `GtsTypeSchema` / `GtsInstance` implementation keeps serving the old trait until T38 deletes both
+- [ ] The cache lives in the SDK as a `PlatformTypesRegistryApi` decorator. Wrap the embedded host's new platform local API delivered in T31 here; the legacy cache remains until T38. T41's real AM local/resolving clients use this decorator. Where a remote consumer's cache settings come from is decided and documented without adding a per-consumer key to the registry's config (SPEC §10.3)
 - [ ] Bound is **bytes** (`store_bound`, default 64MB), LRU-evicted — not an entry count. §3.2 caps one resolved document at 1MB, so the old `capacity: 1024` permitted ~1GB
 - [ ] Freshness window (`freshness_window`, default 30s per DESIGN); `0s` is meaningful and disables the window rather than being rejected
 - [ ] `fresh` on a read bypasses the window for that call and revalidates unconditionally against the entry's validator
 - [ ] **Expiry revalidates, it does not drop:** expired keys and their validators go out in **one** batched conditional `batchGet` — DESIGN's batch poll scheduling — and an `unchanged` result refreshes the confirmation instant while keeping the snapshot. Demand-driven, no timer
 - [ ] A failed revalidation **propagates the error and never extends the window** (`principle-fail-closed`); an entry is never served while its revalidation is in flight past the window
 - [ ] A terminal successful registration or deletion outcome invalidates every local entry for each returned identifier/UUID pair, under **both** key forms. A `202` acceptance invalidates nothing — the client has not observed the mutation yet
+- [ ] **Late-fill guard (historical decision P23):** each key carries a generation advanced by an observed terminal outcome or by a `fresh` read returning a new validator; a read started before the advance never fills the entry when it completes, for any projection or key form
+- [ ] The byte bound counts canonical payload bytes, once per snapshot whichever key form indexes it; no synchronous lock is held across a network await
+- [ ] A metadata-only publisher confirmation (SPEC D18) changes no cached representation; the publisher stamp is not cached
 - [ ] Entries are indexed by identifier and by UUID, so either resolution direction hits one snapshot
 - [ ] Never cached, each asserted separately: `NotFound`, a failed read, a discovery page or its items, an operation resource
-- [ ] The key carries T22b's normalized selected-field set, with visibility context and
-  Context Tenant as fixed P0 markers. A narrow cached representation is never returned
-  for a wider selection; P1 adds real tenant dimensions without reshaping the key
-- [ ] The four old config keys are accepted-and-ignored with a warning naming `freshness_window` / `store_bound`; `ponytail:`-style comment records what is left of ceiling C7 (the key dimensions, not revalidation)
+- [ ] The key carries T22b's normalized selected-field set, with visibility context and Context Tenant as fixed P0 markers. A narrow cached representation is never returned for a wider selection; P1 adds real tenant dimensions without reshaping the key
+- [ ] `freshness_window` / `store_bound` configure the new cache; the four old keys become accepted-and-ignored in T38, when the old cache goes. A `ponytail:`-style comment records what is left of ceiling C7 (the key dimensions, not revalidation)
+- [ ] The tenant API gets no cache in P0: this task specifies none and introduces no tenant-cache semantics
 
 **Verification:**
-- [ ] `cargo test -p cf-gears-types-registry`
+- [ ] `cargo test -p cf-gears-types-registry-sdk --features rest-client` (runs SDK cache tests), plus `cargo test -p cf-gears-types-registry` for adapter parity
 - [ ] Test: read inside the window after a direct database change returns the cached value; the same read with `fresh` returns the new one
 - [ ] Test: `0s` window never serves a cached entry
 - [ ] Test: terminal outcome invalidates under identifier **and** UUID; a bare `202` invalidates nothing
 - [ ] Test: byte bound evicts on one 1MB document where a thousand small entries do not
 - [ ] Test: each of the four never-cached cases
-- [ ] Test: the same entity under two projections occupies distinct entries, while a
-  reordered, case-varied or explicit-default selection reuses its normalized entry
+- [ ] Test: the same entity under two projections occupies distinct entries, while a reordered, case-varied or explicit-default selection reuses its normalized entry
 - [ ] Test: a failed read leaves no entry and does not extend an existing window
 - [ ] Test: an expired entry whose content did not change is revalidated to `unchanged` and **kept**, not refetched — assert on the absence of a full-snapshot response, not only on the returned value
 - [ ] Test: two expired keys produce **one** conditional `batchGet`, not two
 - [ ] Test: a failed revalidation surfaces the error and leaves the window unextended
-- [ ] `make e2e-local` — no staleness surfaces in the register → poll → read flow
+- [ ] Test: `read(old)` starts, a terminal outcome invalidates, `read(old)` completes — the entry stays empty and the next read fetches the new snapshot
+- [ ] Gear test through the real local client and the REST client: register → poll → read shows no stale entry after the terminal outcome
 
-**Dependencies:** T24, T26, T22d
-**Files likely touched:**
-- `TR/src/infra/cache/cache.rs`, `TR/src/infra/cache/cache_tests.rs`
-- `TR/src/domain/local_client.rs`
-- `TR/src/config.rs`
-- `TR/tests/client_cache_test.rs`
-**Scope:** M
+**Dependencies:** T35, T29, T31 (embedded local API), T22d **Files likely touched:** `TR-SDK/src/cache/` (moved from `TR/src/infra/cache/`), `TR/src/domain/local_client.rs`, `TR/src/gear.rs`, `TR/src/config.rs`, `TR-SDK/tests/client_cache_test.rs` **Scope:** M
 
 ---
 
-### Checkpoint 7 — ready for review
-- [ ] The cutover holds: all linked inventory + `cfg.entities` seed into the database within configured limits; existing explicit callers reconcile their documents; repeat startup is idempotent and the platform stays healthy. C3 remains documented until P1
-- [ ] All 16 success criteria of SPEC §16 met
-- [ ] `make ci`, gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
-- [ ] Every ceiling in SPEC §9 has a comment at the point it binds
-- [ ] `TypesRegistryClient` is deleted and no crate references it (D6, T26)
-- [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T22d) — proved on `/v2/` at Checkpoint 6, re-checked here on the promoted v1 paths and through the SDK (T23)
-- [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T22a, D12) — proved at Checkpoint 6, re-checked here on the promoted v1 paths
-- [ ] The client cache is in place on the new models with its window, byte bound, `fresh` bypass and batched conditional revalidation (T30) — P0 does not ship an uncached read path
+### - [ ] T37: Toolkit post-wiring lifecycle — hook, supervision and `Required` readiness
+
+**Description:** Give all gears a post-wiring hook and `/readyz` contribution, including gears without REST. Existing `post_init` requires `SystemCapability`, `start` requires `RunnableCapability`, and readiness is exposed only through `RestApiCapability::healthcheck` (`libs/toolkit/src/contracts.rs:30, :172, :64`). Add generic supervision to toolkit and connect SDK publication status to readiness (D16/D21). Write `publish_gts` and its status/supervised task over reconciliation; T28/T29's unused versions are archived in `c5f491cc8`. Production gears consume this in T41 with T39's collectors.
+
+Commits inside the task: (1) the hook; (2) generic supervision moved from the SDK; (3) readiness contributions and the publisher entry.
+
+**Acceptance criteria — hook:**
+- [ ] `Gear::post_wiring(&GearCtx)` with a no-op default, invoked once for every gear right after proxy wiring in `run_init_wiring_post_init` (`host_runtime.rs:631`), so both the embedded and OoP paths run it, before `post_init` and `start`
+- [ ] The hook is for local setup and spawning only. Its doc comment forbids awaiting a remote call in it; existing gears with the default hook keep their lifecycle behaviour
+- [ ] `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md` names the hook in both lifecycle paths
+
+**Acceptance criteria — supervision and readiness:**
+- [ ] **Toolkit knows no publication semantics (T28, revised):** `toolkit` gains a generic `ReadinessStatus` trait — `is_ready()` and `is_terminal()` — and the supervised-task helper with its tests (T28's SDK `supervised.rs` in `c5f491cc8` is the starting point; its `SupervisedStatus` folds into or extends the trait); the SDK adds `publish_gts` and `PublicationStatus` and implements the trait for it (`is_ready`: every identifier admitted). Toolkit never names `PublicationStatus`, `PublisherContext` or `PublisherVersion`; `toolkit-gts` stays free of publication types
+- [ ] Construction, poll and drop panics and early exit settle the status; child cancellation, explicit join, detach-on-handle-drop and terminal reporting keep T28's semantics. A task spawned from the hook uses this helper, not only a `CancellationToken`, and is joined on shutdown and on failed startup
+- [ ] A gear without `RestApiCapability` can contribute a readiness check that `/readyz` aggregates; a gear with it composes the same contribution into its `healthcheck()`. A contribution is registered before the first readiness probe can run and is cancelled on shutdown with the rest of the healthcheck registry
+- [ ] Readiness from a publisher's status is **`Required` only** in P0: toolkit holds the gear's readiness until `is_ready()`, then latches it. What counts as ready stays in the SDK: pending and rejected are not; admitted is. The superseded states arrive with T45. `ReportOnly`, a runtime override and optional consumption are P1 (SPEC D21)
+- [ ] **Publisher contract:** the publisher receives the caller's name and version as text, the declarations as `(String, serde_json::Value)`, the `ClientHub` and a cancellation token, and returns `Supervised<S>` for any `S: ReadinessStatus`; it is reached through a generic `toolkit` helper, so no fn-pointer type names a status. `publish_gts` parses the version into `PublisherVersion`; an invalid version settles every identifier as rejected and names the gear
+
+**Verification:**
+- [ ] Toolkit tests: the hook runs once per gear after wiring, in both lifecycle paths; the default hook changes nothing
+- [ ] Toolkit tests with a test `ReadinessStatus`, for a REST and a non-REST gear: not ready holds `/readyz` at `503`; ready releases it and stays released after the status regresses; a contribution exists before the first probe
+- [ ] Toolkit test: a panicking spawned task reports a terminal status and is joined on shutdown and on failed startup
+- [ ] SDK tests for the publication matrix: pending and rejected are not ready; admitted is. Caller-version parsing tests
+- [ ] `cargo test -p cf-gears-toolkit -p cf-gears-types-registry-sdk --all-features`; both crates build together, catching re-export or type-identity drift; affected runtime targets build
+
+**Dependencies:** T28, T29 (complete). T36 is only the queue predecessor, not a toolkit-hook dependency; T41 requires both for the real remote proof **Files likely touched:** `libs/toolkit/src/{lib,contracts,supervised}.rs`, `libs/toolkit/src/runtime/host_runtime.rs`, `libs/toolkit/src/healthcheck/`, `TR-SDK/src/{publish,lib}.rs` (new `publish.rs`), focused tests, `docs/toolkit_unified_system/08_lifecycle_stateful_tasks.md` **Scope:** L — three commits as listed
+
+---
+
+### Checkpoint 7A — local application and SDK contract handoff
+- [ ] T31's database seed/local ClientHub path and T32's complete AM/IdP/TR group work through existing real AM REST scenarios
+- [ ] Both SDK APIs pass T34/T35's real TCP contract, resolving-client and auth checks; T36's local/REST cache contract and T37's generic hook/supervision/readiness tests pass
+- [ ] T35a's public payload-validation wrapper matches the released GTS helper, rejects incomplete projections and documents the reference checks that require the registry
+- [ ] T35b's mock Type Schema admission passes shared real-client conformance, including invalid candidates, unordered dependencies and dry runs; consumer fixtures remain valid through T38
+- [ ] The handoff documents local AM and verified SDK/TCP usage; it makes no complete cross-process startup/recovery guarantee yet. That application-level proof belongs to T41/Checkpoint 8A
+- [ ] `make ci`, gear tests on three backends, SDK feature builds and `make e2e-local` green; human review. The local handoff and bounded legacy/new coexistence remain as P28/P29 specify; final deployment still waits for Checkpoint 9
+
+---
+
+### - [ ] T38: Remaining-fleet cutover and one REST version — delete legacy, keep e2e green
+
+**Description:** Audit the current `init` → wiring → `post_init` barrier (`host_runtime.rs:612`) before migrating the remaining consumers and deleting the legacy store. AM bootstrap assumes a complete catalogue (`account-management/src/gear.rs:678`); oagw resolves the root tenant in `post_init` (`oagw/src/gear.rs:216`) through a configured plugin instance (`static-tr-plugin/src/gear.rs:59`).
+
+**The audit — the first commit.** Lifecycle requirements drive the cutover and Phase 8 rather than follow them (historical decision P23). It reads the existing fleet's startup.
+
+**The cutover.** Preserve and reverify T31's outbox → database seeding → local client-publication barrier; do not implement a second seeding path. T39 preserves global collection during migration; T42 narrows the seed set. Delete `switch_to_ready`, the `temporary`/`persistent` split, `SystemCapability::post_init` and the in-memory repository; reads use the database (D2, §8.2). Keep T36's new SDK cache and delete only the old model-typed cache (P7, §8.3).
+
+Switch every remaining legacy consumer to `PlatformTypesRegistryApi` atomically, deleting the old trait without a shim. Mechanical changes: add `#[consumes]` beside `deps`, pass `PlatformSecurityContext::outbound_marker()`, use extension helpers, read materialized fields and replace `register` with local reconciliation. Registration remains synchronous in `init` until Phase 8. Validation changes from staging until `post_init` to immediate admission, which requires the startup audit.
+
+**QE migration note — consume resolved artifacts:** In `gears/system/quota-enforcement/quota-enforcement/src/infra/types_registry.rs`, `reference_closure`, `enqueue_chain` and `resolve` currently load parent/transitive `$ref` dependencies into a local `GtsStore` and recompute the resolved schema and traits. Replace this roughly 80-line block with reads of the new SDK's materialized `resolved_schema` and `effective_traits`, selecting `content` for the leaf's authored metadata, including abstractness. This is an expected simplification, not a net line-count target: projections, error handling and registration migration still need code. Keep QE's metric/scope membership, contract uniqueness and active-Quota compatibility checks, bounded registry calls, and process-local catalogue; the new SDK does not replace those responsibilities. T29/T30 supply the materialized reads; T35a supplies the payload-validation API review above.
+
+**Operator-configured entities (`cfg.entities`).** Preserve `gears.types-registry.config.entities` for deployment-specific identifiers (e.g. the customer tenant type in `e2e-local.yaml`). T31 already seeds it through the outbox/database path; remove only the legacy copy here. Invalid or unresolvable combined sets still fail boot; a set larger than `limits.batch_candidates` is batched (T31 amendment).
+
+**Acceptance criteria — audit:**
+- [ ] Every registry-dependent step in `init`, `post_init`, `start`, bootstrap sagas and first plugin selection across the workspace is listed by grep, with its gear, phase and prerequisite, and recorded in this file in the first commit
+- [ ] Every registration whose document depends on a declaration another gear registers later in startup is listed — the cases immediate validation would refuse
+- [ ] The list gives Phase 8 its migration order: a consumer that waits for a publication in its own startup moves before that publication leaves `init`, or the two move in one change. It marks Account Management's host prerequisites (T41) separately
+- [ ] The toolkit documentation no longer recommends registry calls from `init` for remote-capable consumers
+
+**Acceptance criteria — cutover:**
+- [ ] QE consumes materialized artifacts without a local `GtsStore`, transitive reference fetches or effective-artifact recomputation; discovery still follows no references, so an unrelated broken contract cannot fail its bootstrap. Missing required projection fields fail explicitly
+- [ ] QE compiles selected payload validators once at catalogue bootstrap and reuses them without registry calls or schema compilation on ingress. Adopt T35a's wrapper only if it preserves this property; retain `CompiledContract` otherwise
+- [ ] T31's seeding/local-publication guarantees and tests still pass after legacy deletion: all linked inventory + `cfg.entities`, idempotent restart, no publisher stamp, worker before admission, all seeds settled before publication, batches within `limits.batch_candidates` with dependencies across batches converging under one deadline (T31 amendment). No per-gear filter is introduced; T42 later narrows the seed set
+- [ ] The legacy v1 routes T9a restored are deleted **together with** the repository they read — `POST /v1/entities` (`types_registry.register`), `GET /v1/entities/{gts_id}` (`types_registry.get`) and the in-memory `GET /v1/entities` list. A route left pointing at a deleted repository is the failure mode; T38 then promotes v2 onto those paths
+- [ ] **Every remaining legacy consumer moves onto the new SDK in this task**, mechanically; T31 supports new consumers; all seven T32 gears must have migrated in the consumer follow-up before this cutover. Record/recheck T32's API migration and ID/config audit rather than translating those crates again; keep their outstanding lifecycle calls on the Phase 8 audit. The remaining assignment is derived by grep and recorded
+- [ ] Each consumer declares `#[consumes(contract = PlatformTypesRegistryApi, from = "types-registry", …)]` **and keeps `deps = [types_registry]`**: the init order is built from `deps` (`libs/toolkit/src/registry.rs:560`), and `#[consumes]` wiring runs only after every `init`, so a consumer that still calls the registry in `init` needs the registry initialized first and resolves the local client from the `ClientHub` directly. Phase 8 drops each gear's `deps` together with its last startup call
+- [ ] Remaining legacy read sites move mechanically using T29's typed extension helpers, context arguments and materialized fields. Plural reads gain the `batch_` prefix and handle `Result<HashMap<_, Option<_>>, CanonicalError>`: absence is `None`, a failed batch is an error, never silently dropped (`settings-service/src/domain/declaration/service.rs`). After the consumer-migration follow-up delivers T32/T34a, recheck AM's checker and other readers without repeating that migration. Typed IDs and explicit projections apply everywhere; no consumer reconstructs effective artifacts locally (D3)
+- [ ] Every remaining legacy `register(...)` site becomes bounded synchronous `reconcile_entities_and_await` through the local client: read/compare, CAS for changed content, submit and wait. A bare creation is insufficient on restart/configuration drift; permitted settings-service type changes update under normal admission rules. Recheck T32's root/IdP/TR reconciliation rather than implementing it here. Handle every outcome and each gear's own publisher; no `Pending` is success and nothing sends publisher metadata before T44. `rate-provider-sdk`'s shared registration helper moves with its callers
+- [ ] Where a materialized `effective_*` field differs from what the deleted client-side method returned, the **materialized value is accepted** — the difference is the old approximation being wrong (unresolved non-parent `$ref`, trait-default order), and `gts-rust` is authoritative. A failing assertion is updated to the new value, never "fixed" back
+- [ ] `TypesRegistryClient`, its models (`RegisterResult`, `RegisterSummary`, `TypeSchemaQuery`, `InstanceQuery`, `GtsTypeSchema`, `GtsInstance`) and `testing::MockTypesRegistryClient` are deleted — the whole `TR-SDK/src/legacy/` directory and the legacy block in `TR-SDK/src/lib.rs`; `types-registry-sdk` exports only the new surface. `GtsTypeId` / `GtsInstanceId` stay as root re-exports of `gts`. `precondition.rs` and `TypesRegistryError::ParentNotRegistered` are checked: if only the old `register` pre-check emits them, they go too, and crate docs and comments stop naming the old trait. Delete the SDK README's `Legacy API` section introduced in T31
+- [ ] With the legacy `testing` module gone, `TR-SDK/src/testing_platform.rs` (with its `testing_platform/conformance.rs` module directory) becomes `testing.rs` / `testing/conformance.rs`, so `MockTypesRegistry` (renamed from `FakePlatformRegistry`; the name follows the trait it implements, as `MockAuthZResolver` does for `AuthZResolverApi`) moves to `types_registry_sdk::testing::MockTypesRegistry`. Consumers of the deleted `testing::MockTypesRegistryClient` switch to it. It serves both contracts: seeds (`seed`, `Seed`, `seed_inventory`), Type Schema documents resolved by `gts-rust`, `Fault` rules, `reject` / `depends_on`, `strict()`, `calls` / `reads` / `registered`, and `install(&ClientHub)`. Remaining hand-written old-trait stubs move onto it (the original population was ~17 across AM, products, pricing, credstore, licensing, RG and mini-chat). After the consumer-migration follow-up delivers T32, recheck/update its group's imports rather than repeating that migration. `conformance::run` stays green against the fake and `LocalClient` (`types-registry/tests/platform_local_client_test.rs::the_local_client_conforms_to_the_contract`)
+- [ ] The legacy `GtsTypeSchema` / `GtsInstance` give way to the SDK's `TypeSchema` / `Instance` at every site. Field mapping, applied at every site: `raw_schema` / `object` → `content`; `type_id`, `type_uuid`, `id`, `uuid` keep their names; `segments` → the identifier's segments; `traits` / `traits_schema` → `effective_traits` / `effective_traits_schema`, selected in the projection; `title` / `description` → read from `content`; `parent` and `type_schema: Arc<_>` → a `get_type_schema(type_id)` read, which can fail and is handled at the site. Each site's projection selects the documents it reads
+- [ ] Every registration the audit lists as depending on a later registrant is resolved here — reordered, folded into the linked inventory, or moved to the registrant that owns the dependency
+- [ ] Ready mode and the in-memory repository are gone; `ready_mode_tests.rs` deleted. The four `local_client.cache.{type_schemas,instances}.{capacity,ttl}` keys become accepted-and-ignored with a warning naming their T36 replacements, and the production host wraps its clients in the T36 cache
+- [ ] `owning_gear = "types-registry"` remains a compatibility placeholder until T44 renames the column to `publisher_name` and the first publication carrying a publisher claims the row (T44); binding it to the authenticated workload stays P1 (C3). Its source comment describes incomplete attribution and that path. Keep the column and its NOT NULL constraint; no read returns the placeholder
+- [ ] No entity-derived state survives `init()` — no `ArcSwap`, no entity map, no `GtsOps` field on the gear or the service. Grep-checkable; the ceilings C1/C4 struck by D2 depend on it
+
+**Verification:**
+- [ ] The audit list is reviewed against the `rg` output recorded in its commit
+- [ ] QE: `cargo test -p cf-gears-quota-enforcement --lib domain::catalog::`, `cargo test -p cf-gears-quota-enforcement --lib infra::types_registry::` and `cargo check -p cf-gears-quota-enforcement --all-targets`; adapter tests cover materialized local/mixin references and missing projection fields, and a request-path test proves validation makes no registry calls or repeated schema compilations
+- [ ] Gear tests, all three backends (see [Commands](#commands))
+- [ ] Re-run T31's seeding and real-host local-client boot suites after removing legacy, including restart/update, two-crate dependencies, configured entities and the over-limit/failed-seed barriers
+- [ ] Re-run T35's TCP/gateway tests and existing example-server E2E after authn consumers migrate and legacy is deleted: canonical tenant refusal without a valid credential and platform-token admission still work. This requires no new registry executable
+- [ ] Test: a consumer's configuration-built Instance — first start, configuration change, second start — is updated through reconciliation, not refused as `already_exists`; two consumers starting concurrently with the same content both converge
+- [ ] Integration test: a consumer registers during `init`, before any `post_init`, a document that depends on a declaration from the audit list, and the outcome matches the order the audit fixed
+- [ ] Test: a read issued after an entity is written directly to the database (not through the service) returns it — the single-process form of SPEC §13's two-pod criterion
+- [ ] `cargo test --workspace`; `grep -r TypesRegistryClient` finds nothing outside history
+- [ ] `make quickstart` and `make example` — server boots with all linked inventory present in the database; the configured limits cover the real seed set
+- [ ] `make e2e-local` boots with `cfg.entities` populated and readable and remains green: legacy deletion, path promotion and callers are one cutover
+- [ ] Manual: restart, confirm entities and artifacts byte-identical
+
+**Final cutover stage — both-plane path promotion and all remaining e2e callers:**
+
+**Description:** In this same cutover, after deleting legacy v1, promote the three tenant reads from `/types-registry/v2/` to `/types-registry/v1/` and platform routes from `/types-registry/v2/platform/` to `/types-registry/v1/platform/`, updating both SDK clients and migrating synchronous e2e callers (D10) atomically. The cutover merges with its e2e callers; no red window is accepted.
+
+The e2e surface: the legacy v1 suite `testing/e2e/suites/types_registry/legacy/` — six test files, ~95 references to `/types-registry/v1/entities` — plus `testing/e2e/suites/account_management/conftest.py` after its T32 migration in the consumer follow-up (recheck its platform writes/polls; update interim read paths only if used), and `testing/e2e/suites/oagw/helpers.py:74`, which registers a batch of OAGW schemas *and instances* and reads them back through `list_oagw_types` (`GET /entities`), so it needs both migrations. Four async-registration scenarios already exist in [`registration.md`](../../../../../testing/e2e/suites/types_registry/scenarios/registration.md); the local launcher uses SQLite, so these runs make no PostgreSQL/MySQL-specific claim.
+
+**Acceptance criteria — promotion:**
+- [ ] No `/v2/` path remains in the crate, in OpenAPI or in `QUICKSTART.md`
+- [ ] The promotion changes paths only: the tenant reads keep `.authenticated()`, and the platform routes move to `/types-registry/v1/platform/` while keeping `exposed = false` on mutations until C8's platform listener and authorization gate exist
+- [ ] Both REST clients move their base path constants in the same change: tenant to `/types-registry/v1/`, platform to `/types-registry/v1/platform/`; both contract tests pass on the promoted paths
+- [ ] `operation_id`s are unchanged — `types_registry.submit_entities`, `.get_operation`, `.get_entity` and T20a/T22a's additions keep their names; bodies, statuses and semantics are the ones the routes already had
+- [ ] The three tenant reads promote together; T22d's `ETag` / `If-None-Match` and per-key `unchanged` move with them unchanged — additive, so no changelog break entry (P21)
+- [ ] Old v1 handlers, DTOs and routes are **deleted**, not repointed, verified by scoped symbols rather than by type names the new SDK reuses:
+  - `TR/src/api/rest/routes.rs` has no `register_v1` and registers no `types_registry.register`, `types_registry.list` or `types_registry.get` operation (the v2 IDs `types_registry.get_entity` / `.list_entities` and the rest remain);
+  - the v1 handlers `register_entities`, `list_entities` and `get_entity` that read `TypesRegistryService` are gone from `TR/src/api/rest/handlers.rs`;
+  - the v1-only DTOs in `TR/src/api/rest/dto.rs` — `RegisterEntitiesRequest`, `RegisterResultDto`, `RegisterEntitiesResponse`, `RegisterSummaryDto`, and `GtsEntityDto`, `GtsIdSegmentDto`, `ListEntitiesQuery`, `ListEntitiesResponse` wherever only v1 uses them — are gone. The SDK's semantic `RegisterEntitiesRequest` (`TR-SDK/src/models.rs`) and the v2 wire DTOs are unaffected;
+  - no file under `TR/src/api/` references `TypesRegistryService` or the in-memory repository (T38's `TypesRegistryClient` grep covers the old trait); the generated OpenAPI lists none of the three v1 operation IDs; every surviving v1 route reads the database
+- [ ] SPEC §10.2 records the final shape and closes the interim window, naming T9a as where it opened and this task as where it closed
+- [ ] Changelog: the v1 `POST` break (it moves to `/types-registry/v1/platform/entities` with a platform token, body shape, `202`, submit-then-poll) and the read-shape break (`GET /entities` pagination plus document-free defaults) are **one release, two entries** (P17/P19, P25)
+- [ ] `api_rest_test.rs` needs only its per-version path constant changed — if it needs more, T9a's last criterion was not met and that is the finding
+
+**Acceptance criteria — e2e:**
+- [ ] Every e2e registration, deletion and operation poll — the `types_registry` suites, `account_management`'s registration helper, `oagw/helpers.py` — uses `/types-registry/v1/platform/` with T34's `platform_headers`; entity reads use `/types-registry/v1/` with their bearer
+- [ ] A shared polling helper lives in `testing/e2e/suites/types_registry/helpers.py` (the async-surface helper T34 already updated) and is reused; no test open-codes a poll loop. It has a bounded deadline and fails with the operation's per-candidate errors, never on a bare timeout
+- [ ] After the consumer follow-up lands T32's AM registration helper, recheck that it polls to terminality before returning and stays compatible with final paths; do not implement it again
+- [ ] Assertions move from the POST body to the operation's per-`gts_id` outcomes
+- [ ] `GET /entities` call sites move to the paged, document-free default (D12/D13): the shared helper pages through the cursor; an assertion needing `content` selects it explicitly
+- [ ] Legacy `is_schema` filters migrate to T22c's `kind=type_schema|instance`, and callers needing a chain boundary use inclusive `depth`. A legacy `vendor`/`package`/`namespace`/`segment_scope` predicate is translated only when an equivalent GTS `pattern` is proved; otherwise the migration records a follow-up rather than silently widening the result set
+- [ ] Tests that assert refusals still assert them **synchronously** — envelope, identifier, policy and idempotency failures stay pre-`202` (SPEC §8.1)
+
+**Verification:**
+- [ ] `cargo test -p cf-gears-types-registry`; `make lychee`
+- [ ] Manual: `/cf/docs` renders the tenant reads under `/types-registry/v1/`, the platform operations under `/types-registry/v1/platform/`, and no v2 path resolves
+- [ ] `make e2e-local` — full suite green, including `account_management` and `types_registry`; `make e2e-docker`
+- [ ] Manual: a rejected candidate surfaces its reason through the polled operation, not as an opaque failure
+
+**Dependencies:** T37 (Checkpoint 7A), T31, T32, T35 and T36 **Files likely touched:** The remaining SDK consumers and legacy deletion paths listed above; TR REST handlers/DTOs/routes, tenant/platform client path constants, API/contract tests, shared e2e polling and all remaining legacy callers, QUICKSTART and CHANGELOG **Scope:** L delivery split into S/M commits; legacy removal, both-plane v2-to-v1 promotion and caller migration merge atomically. No intermediate red e2e window
+
+---
+
+### Checkpoint 7 — every gear on the persistent registry
+- [ ] Every gear uses the new SDK against the database; `TypesRegistryClient`, ready mode, the in-memory repository and the old v1 routes are gone; reads are cached with the late-fill guard (T38, T36)
+- [ ] `PlatformTypesRegistryApi` and its helpers work through the real local client, carrying T22d's validators byte for byte; both adapters return operations read through `get_operation` (T29, T34)
+- [ ] The platform REST client passes its contract test on `/types-registry/v1/platform/` and the tenant client on `/types-registry/v1/`; platform routes serve a validated internal token only, tenant reads a validated bearer only (T34, T35, T38, P25)
+- [ ] Linked inventory and `cfg.entities` seed through the outbox; a second start reports `unchanged`; no registration the audit listed is refused by immediate validation (T38)
+- [ ] One REST version, and the e2e suites pass on the `202` contract (T38)
+- [ ] `make ci` (including the real AM remote target from T41 onward), gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
+- [ ] Human review — the contract shape is fixed here, and every gear is on it
+
+---
+
+## Phase 8 — Publication after wiring: Account Management first, then every gear out of process
+
+Runs **T39 → T40 → T41 → T42 → T43**. The SDK does not change; startup does — publication leaves `init`, each gear gates readiness on it, and T42 ends the pull. Account Management already uses only the new local API from T32. T41 adds post-wiring publication/bootstrap readiness; T41 proves it with a remote registry and moves the selected host prerequisites, before the remaining lifecycle changes in T42. From T41 until Phase 9 ends, ceiling C11 applies.
+
+### - [ ] T39: Per-crate GTS collectors and the gear's `gts(…)` publication attribute
+
+**Description:** Add crate-local collectors and gear publication ownership (D16). `declare_gts_inventory!()` defines the local entry type, `inventory::collect!` and plain-data `gts_declarations()`. `#[gts_type_schema]`, `gts_instance!` and `gts_instance_raw!` submit to `crate::__gts_inventory` and, until T42, also to the global registry for transitional seeding. The facade retains `inventory` but permits a later local switch to `linkme` (P23). The gear attribute connects collectors to T37's lifecycle.
+
+Commits inside the task: (1) the collector macro; (2) declaring crates in mechanical slices; (3) the `gts(…)` attribute; (4) independent collector compile/release-LTO checks.
+
+**Acceptance criteria — collectors:**
+- [ ] `declare_gts_inventory!()` exists; a declaring crate without it fails to compile with a message naming the macro
+- [ ] The entry type is a **newtype defined in the declaring crate**, not an alias of a shared `toolkit-gts` type — an alias would share one registry and lose the gts-rust #130 isolation
+- [ ] `gts_declarations()` returns std types only — no `toolkit-gts` or `gts` type crosses a crate boundary. Its output is sorted by identifier; two entries with one identifier and different content are a diagnosed conflict naming the crate, identical duplicates collapse
+- [ ] `#[cfg]`-gated declarations gate their submission, not only their struct
+- [ ] `crate_path` resolution still distinguishes `toolkit-gts` itself from integration targets (`toolkit-gts-macros/src/lib.rs:118`). Generic-schema restrictions are unchanged
+- [ ] Every crate in the workspace that declares GTS entities calls `declare_gts_inventory!()`, including test, example and doctest crates
+- [ ] Manual `inventory::submit!` of `toolkit_gts::Inventory*` is replaced by the new entry API: `settings-service-sdk` (`src/gts.rs:48`, `src/catalogue.rs:109`)
+- [ ] `toolkit_gts::gts_declarations()` returns the base types (`PluginV1`, `AuthzPermissionV1`) for types-registry to seed
+- [ ] The global registry is still populated (transition) and carries a comment naming T42 as its removal
+
+**Acceptance criteria — the gear's `gts` attribute:**
+- [ ] `#[toolkit::gear(…, gts(crates = [crate, some_sdk], publisher = path::to::publish))]` is accepted. The owner is the gear; the crates are only the units of collection
+- [ ] The macro emits static ownership metadata (gear name, listed crates) that T42's coverage check reads
+- [ ] The macro emits a post-wiring step that concatenates each listed crate's `gts_declarations()`, passes the gear's name and `env!("CARGO_PKG_VERSION")` **expanded in the gear's crate** to the named publisher, and composes the returned status into the gear's `Required` readiness contribution (T37)
+- [ ] Generated and handwritten `post_wiring` compose: the generated step runs once even when the gear also implements the hook
+- [ ] A gear without `gts(…)` is unchanged; a listed crate that does not call `declare_gts_inventory!()` fails to compile
+
+**Verification:**
+- [ ] `cargo test --workspace`
+- [ ] A fixture binary built in release with LTO asserts per-crate declaration counts, including a crate reached only through its `gts_declarations()`
+- [ ] Macro tests: renamed dependency, `cfg`-gated declaration, duplicate identifiers with equal and with different content; `gts(…)` gathers every listed crate once into one publisher call, forwards the gear crate's name and version (not an SDK or helper crate's), emits ownership metadata; a shared helper in a third crate forwards the caller's context and never builds one
+- [ ] Independent macro/collector compiler fixtures prove crate boundaries and declaration isolation, including release+LTO and distinct provider/consumer declaration sets. Wire them into the existing macro-test CI venue
+- [ ] `make gts-docs`, `tools/gts-analyze` unaffected
+
+**Dependencies:** T38 (Checkpoint 7), T37; independent compiler fixtures require no remote-application harness **Files likely touched:** `libs/toolkit-gts/src/lib.rs`, `libs/toolkit-gts-macros/src/lib.rs`, `libs/toolkit-macros/` (the attribute), `lib.rs` of every declaring crate, `gears/settings-service/settings-service-sdk/src/{gts,catalogue}.rs`, the collector compiler fixtures **Scope:** L — four commits as listed; the declaring-crate line lands in mechanical slices
+
+---
+
+### - [ ] T40: Publication ownership, dependent configured entities after wiring, and late-safe plugin selection
+
+**Description:** Reuse publisher assignments already fixed by T31/T32 and close only the remaining owner mappings (P23, O5); add post-wiring publication for configured entities with dependencies outside the inline seed set; and prevent incomplete plugin selections from being cached. The dependent-entity path is needed by the isolated real AM deployment in T41 and all registries after T42. `GtsPluginSelector` caches its first success until reset (`libs/toolkit/src/plugins/mod.rs:56`), so late instances could otherwise leave a worse-priority selection cached (D21).
+
+**Acceptance criteria — ownership:**
+- [ ] For the registry's control-plane types, the `toolkit-gts` base types and each kind of `cfg.entities` item, the publishing gear and the call that publishes it are decided. Registry-owned items publish as `types-registry` with the registry crate's version
+- [ ] Reuse and verify T32's AM/IdP/TR instance owners, then assign the remaining configuration-built Instances from the audit to their building gear; shared helpers only forward that context. Do not repeat the seven-gear SDK migration or reopen the same owner decisions
+- [ ] Retain the established assignments: AM owns its configured root and TR instance; each static/Keycloak IdP plugin owns its instance; each standalone TR plugin owns its instance. Deployment-specific child types stay registry-owned `cfg.entities`, published by types-registry through the path below; the isolated remote AM setup uses one. No owner is inferred from a GTS namespace or placeholder
+- [ ] SPEC §17 O5 and D11 (as amended) record the outcome
+
+**Acceptance criteria — dependent configured entities:**
+- [ ] A `cfg.entities` item whose `$ref` or chain dependencies all lie in the registry's inline seed set stays inline, unchanged. One with a dependency outside it is published by types-registry after wiring through `publish_gts`, with the registry's context, and retried until its dependency is admitted
+- [ ] The registry's client publication and readiness do not wait for those items; only the consumer that needs one waits for its status. An invalid configuration envelope still fails boot synchronously
+- [ ] While the pull lasts, an embedded host's inline set contains the linked inventory, so `e2e-local.yaml`'s customer type stays inline there; the remote AM registry, which links no consumer, takes the post-wiring path. T42 narrows the inline set and reuses this path; it adds no new mechanism
+
+**Acceptance criteria — plugin selection:**
+- [ ] The selector does not cache a selection while an instance of **the same plugin contract and vendor** with a scoped client registered in the `ClientHub` is not yet visible in the registry; an unrelated missing plugin does not block it. An error or an incomplete set is not cached, and retry resolves again
+- [ ] `choose_plugin_instance`'s priority semantics are unchanged
+
+**Verification:**
+- [ ] Walkthrough with the owner — cold `e2e-local.yaml` bootstrap after the pull ends, a plugin's configuration-built instance, the remote AM deployment's child tenant type
+- [ ] Registry test: a configured entity depending on an unpublished type — the registry boots and is ready; a second publisher publishes the dependency; the entity is admitted; restart reports `unchanged`; an invalid envelope fails boot
+- [ ] T41 real AM scenario: the registry-owned configured child type is admitted only after AM publishes its base; T40 covers the same mechanism through focused registry tests
+- [ ] Toolkit test — two instances of one contract and vendor, the worse-priority one visible first: no cached selection until both are visible, then the better one; an absent instance of another vendor does not delay it
+
+**Dependencies:** T39 **Files likely touched:** `docs/p0/{SPEC,plan,todo}.md`, `TR/src/gear.rs`, `TR/src/domain/seeding.rs`, `TR/tests/seeding_test.rs`, `libs/toolkit/src/plugins/mod.rs` and its tests, real AM deployment configuration **Scope:** M — the decision record, the registry path and the selector rule are separate commits
+
+---
+
+### - [ ] T41: AM after wiring and remotely — host dependencies, bootstrap and readiness
+
+**Description:** Move AM publication, root-type/tenant-resolver-instance registration and bootstrap after wiring, with both IdP writers, and verify the embedded host using the real static IdP path. This task requires T32 to have moved all AM registry workflows and both IdP writers to the new SDK in the consumer follow-up. This task changes lifecycle, not client/model selection: move T32's root/TR-instance reconciliation and registry-dependent bootstrap barrier out of startup. Use real AM; static IdP's development echo behavior is not a production IdP guarantee.
+
+**Acceptance criteria:**
+- [ ] AM publishes its owned crates through `gts(…)`; its configured root type and, when enabled, its tenant-resolver plugin instance publish after wiring through `publish_gts` with AM's context; their status joins AM's `Required` readiness
+- [ ] AM's `init` validates its configuration and the existing root binding and performs no registry operation or remote client lookup. Registry-dependent services receive the real new client after wiring through `#[consumes]` — no mock, legacy fallback or half-initialized public service. AM drops `deps = [types_registry]` with its last startup registry call
+- [ ] **Two failure classes stay distinct.** The root binding — the stored root's `tenant_type_uuid` against the configured root type, read from AM's own database — is checked in `init` and stays lifecycle-fatal, independent of `bootstrap.strict`. A terminal refusal of the configured root type by the registry happens after wiring and follows SPEC D21: AM stays not ready with a terminal status naming the gear, identifier and reason, bootstrap does not run, and the process does not exit. A delayed or unreachable registry holds readiness and retries under the SDK policy; neither path relaxes type enforcement or treats a receipt as success
+- [ ] The bootstrap saga runs as supervised, cancellable work: it waits for the root type and, under `idp.required`, the IdP instance, then creates or resumes the root. AM's readiness requires both its publication and completed bootstrap. Three outcomes stay distinct:
+  - **registry prerequisite pending** (registry unreachable, root type or IdP instance not yet admitted) — the saga waits and retries; this is never a saga failure, never causes premature root creation, a failed `init` or a process-terminating timeout, and is not subject to `bootstrap.strict`;
+  - **publication terminally refused** (root type or IdP instance rejected or superseded-deleted) — AM stays not ready with a terminal status per D21, the saga does not start, and `bootstrap.strict` does not turn it into an exit;
+  - **saga failures after the prerequisites are met** (business, database or IdP errors) — keep today's `handle_bootstrap_failure` policy (`account-management/src/gear.rs:1401`): `RootBindingMismatch` is lifecycle-fatal regardless of policy, any other failure is fatal under `strict = true` and logged-and-skipped under `strict = false`. `bootstrap.strict` also keeps governing configuration validation as today
+- [ ] Both static-idp-plugin and keycloak-idp-plugin move their T32 instance publication after wiring with each plugin crate's context and keep their real scoped backend client; readiness reflects admission, shutdown observes publication, and no registry call remains in either `init`. Changed configuration converges through reconciliation. Preserve backend behavior; external Keycloak tests use their existing supported environment rather than claiming static IdP is equivalent
+- [ ] AM's lazy IdP selection uses T40's selector rule: it waits while the instance or its schema is delayed, and a rejected instance never reads as success
+- [ ] Resource Group's init-only `ResourceGroupTypeBootstrap` keeps its sealed, no-REST boundary: `register_user_group_types` → RG `TypeService` uses RG's own database and schema validation without the registry (`resource-group/src/gear.rs:97-180`), so it stays in AM's `init`, proved by a test; the unscoped handle is never kept past its seal in `register_rest` or exposed remotely
+- [ ] AM and both IdP plugins retain T32's API-migrated status and are now marked lifecycle-migrated in the audit, so T42 does not repeat either change. Drop `deps = [types_registry]` and the registry implementation-crate dependency together with the last init-time registry call; keep the SDK/resolving contract dependency
+
+**Verification:**
+- [ ] AM tests: root-binding drift fails `init` under `strict = true` and `false`; a refused root type leaves AM not ready without exiting under both policies; a delayed registry holds readiness, then admission and bootstrap release it, under both policies; a business, database or IdP saga failure after the prerequisites are met is fatal under `strict = true` and skipped with a warning under `strict = false`, as today; cancellation during the wait; tenant-type checks and metadata after wiring
+- [ ] `cargo test -p cf-gears-account-management -p cf-gears-account-management-sdk -p cf-gears-static-idp-plugin -p cf-gears-keycloak-idp-plugin`; RG seal regression tests and T32's existing application scenarios
+- [ ] Delayed `IdpPluginSpecV1` admission, restart and a configured-instance change through the real registry and outbox
+- [ ] `make quickstart`; `make e2e-local SUITE=account_management` and the full `make e2e-local`
+
+**Host and remote stage — prerequisite closure, production authentication and real AM proof:**
+
+**Description:** Prove the migrated production AM application against a separately composed production registry application, using existing OoP tooling and real AM REST tests. Migrate its host prerequisites (authn-resolver, authz-resolver, resource-group, tenant-resolver and selected plugins) in T38's audited order, using production authentication. Each currently reads the registry during startup or plugin selection (`account-management/src/gear.rs:93`). This stage requires the tenant-resolver family to use the new local API from the consumer follow-up’s T32; move only its outstanding startup/lifecycle behavior here, for the selected plugins. T41 is the remote/production-auth adoption gate; real local AM REST adoption is a prerequisite delivered by T32 in the consumer follow-up; this stage owns all process/runtime scenarios for the real application.
+
+**Production authentication.** AM's gateway and the remote registry use `AuthNResolverBearerAuthenticator` over real authn-resolver, with its plugin published after wiring, with application-owned authentication; T35 proves only framework contracts through existing test hosts. Each host uses its own local AuthN client; there is no new remote AuthN transport. The registry host may link authentication declarations, but never AM/RG/TR declarations that would hide the application publishers. Its aggregate readiness waits for its authn schema/plugin admission; platform internal-token operations remain available independently. T43 rechecks that topology after the pull ends. Development auth does not satisfy this task.
+
+**Acceptance criteria:**
+- [ ] The AM host's prerequisites from the audit — authn-resolver and its plugin, authz-resolver and its plugins, resource-group, tenant-resolver and its selected plugins — are listed with their transports and each registry startup call; each publishes after wiring with its own context and readiness, in the audited order, with real `PolicyEnforcer` and authentication. No mocked AM, RG or bootstrap service and no early proxy-wiring shortcut masks an incomplete migration. Each is marked migrated for T42
+- [ ] Close the startup dependency graph of those publishers, including their callers outside AM's direct dependency list. In particular, oagw's eager `post_init` root lookup must not race static-tr's asynchronous publication: move the dependent step to supervised/lazy execution before or with that publisher. A delayed plugin publication keeps readiness pending and never fails embedded boot; do not leave this broken interval for T42
+- [ ] Before the owning publishers run, the isolated registry holds no AM schema, root type, configured instance or child tenant type. AM publishes, bootstraps an Active root; the child type (T40) is admitted after AM's base type; a real authenticated create → get → list of a child tenant succeeds with the correct `tenant_type`. Stored root and tenant state and the returned DTOs are asserted; a schema-invalid or type-incompatible request is refused
+- [ ] Verify provider isolation per declaration owner: linked authn types/plugin are expected, AM/RG/TR declarations are absent before their own publication. The registry host stays not ready until its authentication plugin is admitted and tenant reads fail closed meanwhile; platform internal-token admission still works, so authentication publication can complete without a startup cycle
+- [ ] Use real production registry and AM host entries with the existing directory/OoP launcher. Remove both `deps = [types_registry]` and the registry implementation-crate dependency from the entire AM host closure as its last init-time registry call moves after wiring, including authn/authz/RG/TR and selected plugins. The AM host's `cargo tree` contains no package named exactly `cf-gears-types-registry` (the `-sdk` package is expected); assert no local registry provider/client is registered. Do not reuse the full example-server or Payment binaries unchanged, because they link the registry and could mask remote failures
+- [ ] Prove the real application across processes: both start orders; AM starts with the registry absent and holds readiness until recovery; configured child-type dependency admitted only after AM publishes its base; refused AM publication stays not ready with a reason; directory resolution/restart without local fallback; database/entity/artifact persistence and graceful shutdown. Drive the existing authenticated AM tenant/metadata/IdP REST workflows, and reuse T34/T35/T36 transport/auth/cache helpers rather than inventing another business consumer
+- [ ] Local and remote-registry modes run the same production AM code and real persistence and authz services; the remote mode resolves SDK REST clients with no local fallback. Both start orders, delayed AM/IdP/prerequisite publications, registry and AM restarts and a configuration change converge, with readiness tied to publication and completed bootstrap
+- [ ] Both API clients' read parity, credentials and conditional reads hold against the admitted AM entities. Root-binding drift stays fatal under both strict policies; a refused root type holds readiness; a transient registry delay does not fail boot
+- [ ] Embedded AM e2e stays green; the handoff instructions name every directory, authentication and prerequisite process
+
+**Verification:**
+- [ ] `make e2e-am-remote` builds/launches the production AM composition (`apps/cf-account-management-host`) and a separately composed production registry application with directory/config/auth dependencies, reuses existing AM REST scenarios and runs the process cases above. Add this target to CI when T41 implements it; no test role switch is introduced
+- [ ] Tests of each migrated prerequisite gear, including a delayed-prerequisite test per audit entry closed here
+- [ ] Gear tests on SQLite/PostgreSQL/MySQL; `make e2e-local`; reproducible commands and the production files used are recorded
+
+**Dependencies:** T40, T32; T38 supplies the full-fleet startup dependency audit **Files likely touched:** AM and both IdP publication/bootstrap lifecycle; selected authn/authz/RG/TR host prerequisites and dependent startup callers; the real AM OoP launcher and production host entries, real authentication configuration, AM REST scenarios and audit **Scope:** L feature: local publication/bootstrap, host dependency closure, then remote/production-auth proof. Split stages into S/M commits and preserve embedded boot after every merged change
+
+---
+
+### Checkpoint 8A — Account Management after wiring and remotely
+- [ ] Real AM and static-idp-plugin publish declarations and configured entities after wiring, bootstrap an Active root and create and read child tenants through the new registry, in the embedded host and with the registry in another process (T41)
+- [ ] Both start orders, delayed dependencies, a configuration change and restarts converge; type-invalid requests are refused; root-binding drift is fatal and a refused root type holds readiness; `Required` readiness covers AM publication and bootstrap
+- [ ] The production authenticator path is exercised; RG's init-only bootstrap boundary and real authz enforcement are intact; embedded AM suites pass
+- [ ] `make ci` (including the real AM remote target from T41 onward), gear tests on three backends, `make e2e-local` green; human review before the fleet migrates. Final deployment waits for Checkpoint 9
+
+---
+
+### - [ ] T42: Every remaining gear publishes after wiring; end of the pull
+
+**Description:** T32 moved the complete AM/IdP/TR group onto the new API; T38 moved the remaining fleet. T41 then moved AM and selected prerequisites after wiring. This task changes the **startup behaviour** of every other declaring or registry-dependent gear (P22, P23), in T38's audited order, and its last commit ends the registry's process-wide pull.
+- **Declarations.** Each gear lists the crates it owns — its own crate and its SDK crate — in `#[toolkit::gear(…, gts(crates = […], publisher = types_registry_sdk::publish_gts))]` (T39). The generated post-wiring step publishes them with the gear's own `PublisherContext` and gates `Required` readiness.
+- **Explicit registrations.** The synchronous reconciliation calls introduced in T31/T32 or migrated in T38 that remain inside `init()`, and configuration-built Instances, move onto the same path. An unselected TR plugin from T32 may still need this lifecycle move; its SDK migration is never repeated
+- **Other startup calls.** Every other registry call made during `init()`, reads included, moves to the post-wiring hook or to a lazy first use, because a remote client is wired only after every `init`. Every registry-dependent step in `post_init`, `start`, bootstrap sagas and first plugin selection on the audit list moves to a supervised task that waits for its own prerequisite (SPEC D21) — e.g. oagw's root-tenant resolution and upstream materialization in `post_init`.
+
+Gears, minus those T41 already migrated: system — `authn-resolver` (+ static and oidc plugins), `authz-resolver` (+ static and tr plugins), `tenant-resolver` (+ static, single-tenant and rg plugins), `resource-group`, `usage-collector` (+ plugins), `cluster`, `credstore` (+ static plugin), `oagw`, `license-resolver` (+ static-license plugin), `event-broker`; domain — `bss/ledger`, `bss/rate-provider` (its shared `registration.rs` helper), `mini-chat` (+ static-audit and static-model-policy plugins), `llm-gateway`, `model-registry`, `settings-service`, `bss/pricing` (which registers during startup, `pricing/src/module.rs:1244`).
+
+**Acceptance criteria — publication after wiring:**
+- [ ] Every gear with a startup registry call or GTS declarations is either lifecycle-migrated here or recorded as such by T41; that evidence is verified, not redone. T32's API-migrated status alone does not imply post-wiring completion: close remaining unselected TR/IdP lifecycle calls where applicable, without redoing their SDK translation
+- [ ] Each gear with GTS declarations lists exactly the crates it owns in its `gts(crates = …, publisher = …)` attribute, and its readiness waits for the generated publication. A crate owned by another gear is not listed, e.g. `ledger-sdk`'s rate-provider plugin schema stays with ledger
+- [ ] Configuration-built Instances are published by calling `publish_gts` directly from the gear's `post_wiring` (e.g. `static-license-plugin/src/gear.rs:71`); their status joins the same readiness contribution; no site treats `pending` as success
+- [ ] `rate-provider-sdk`'s shared `register_rate_provider_plugin` publishes after wiring, taking the calling plugin gear's `PublisherContext` as a parameter, so every rate-provider plugin migrates with it
+- [ ] No registry call remains inside any `init()` — reads included; grep-checkable per gear
+- [ ] No startup phase fails because the registry is unreachable or a declaration is not yet published; each audit entry is closed with a test that delays the prerequisite
+- [ ] Explicit and configuration-built publications pass the gear's own `PublisherContext`; a shared helper only forwards it. Until T44 no adapter sends it to the server
+- [ ] Gears move in the audited order: a consumer that waits for a publication during its own startup moves before that publication leaves `init`, or both move in one change; no step reintroduces a wait on a publication already moved after wiring
+- [ ] A rejected declaration leaves the gear not ready, naming the gear, identifier and reason; it does not fail boot. Shared bootstrap failures remain registry startup failures
+- [ ] Each gear drops `deps = [types_registry]` in the same change that moves its last startup registry call after wiring; from then on it reaches the registry only through `#[consumes]`
+- [ ] Where a materialized `effective_*` value differs from an old expectation, the materialized value is accepted (P23, SPEC §13)
+
+**End of the pull — the last commit of this task.** Once every declaring gear publishes for itself the process-wide pull is redundant (SPEC D11). Remove the global `toolkit-gts` registries, T39's dual submission and `all_inventory_*`, and narrow the registry's inline seed to its own control-plane types, the `toolkit-gts` base types (`toolkit_gts::gts_declarations()`) and the `cfg.entities` whose dependencies lie within that set. The dependent `cfg.entities` take T40's post-wiring path.
+
+**Acceptance criteria — end of the pull:**
+- [ ] `toolkit_gts::InventoryTypeSchema` / `InventoryInstance`, their `inventory::collect!` and `all_inventory_*` are deleted; the macros submit only to the crate-local collector
+- [ ] The registry seeds inline its own types, the base types and the `cfg.entities` whose dependencies lie within that set, and nothing else. Every item **of that inline subset** must be `succeeded` or `unchanged` before its client is published (P2/P3); dependent `cfg.entities` are not awaited there
+- [ ] Ownership coverage, two checks, both comparing an independently derived expected set against assignments, never against what was submitted:
+  - **Workspace.** The expected set comes from `cargo metadata` plus a source scan for `declare_gts_inventory!()`, the same approach as `tools/gts-analyze`. Assignments are the gears' exported `gts(crates = …)` metadata, collected from test binaries that link each gear across its supported feature configurations. Every crate in the expected set must be listed by exactly one gear.
+  - **Per binary, feature-aware.** Enumerate the gear metadata registered in the binary and check that each enabled gear's publication callback is registered. An execution test proves the callbacks run.
+
+  Each collector exports its canonical package name (`CARGO_PKG_NAME`), so aliases and `crate` never have to be compared as spellings. Collectors in test, example and doctest crates are exempt unless a shipped binary links them. Linking a crate whose owner runs elsewhere — a consumer of another gear's SDK — is not an omission
+- [ ] The C3 source comment names only the attribution placeholder and its replacement by the first claiming publication (T44), not a pull
+
+**Verification:**
+- [ ] `cargo test --workspace`
+- [ ] `make quickstart` and `make example` — the server boots, `/health` is green and every gear's types are present
+- [ ] Test per gear group: publication is idempotent across two starts, and reports `unchanged` alongside the registry's transitional seeding (before the last commit)
+- [ ] Test: cold `e2e-local.yaml` — the registry serves admission before its configuration completes, account-management publishes its base type, then the dependent customer type is admitted; no bootstrap cycle
+- [ ] The coverage checks pass for every shipped binary configuration and fail when one ownership assignment or one publication is removed; `grep -r all_inventory_` finds nothing outside history
+- [ ] `make e2e-local` green
+
+**Dependencies:** T41 (Checkpoint 8A) **Files likely touched:** `gear.rs` and the types-registry call sites of each gear above, `libs/toolkit-gts/src/lib.rs`, `libs/toolkit-gts-macros/src/lib.rs`, `TR/src/gear.rs`, `TR/src/domain/seeding.rs`, a coverage test per binary under `apps/` **Scope:** L — one commit per gear, never the whole set at once; the end of the pull is the last commit
+
+---
+
+### - [ ] T43: Out-of-process e2e run, HA and the deployment chart
+
+**Description:** Prove SPEC §16 criteria 17, 18 and 20 with types-registry in its own process on the real platform, before the guard exists (P22, P23); criterion 19 needs the guard and is T45's. T39 supplies independently tested collectors; T41 already proves the real AM application's cold-start, publication, readiness and recovery scenarios.
+
+**P30 unique scope:** add the end-of-pull production composition, real two-replica failover and chart/PDB checks. Run existing T41 remote, auth, dependency and readiness scenarios against this topology through shared helpers; do not author another copy of their suites. Their regression execution remains part of this gate.
+
+**Acceptance criteria:**
+- [ ] An e2e configuration runs types-registry in its own process, with at least one declaring gear in another, using the existing OoP host tooling. `cfg.entities`, discovery and the promoted v1 routes behave as in `make e2e-local`
+- [ ] **HA (SPEC D20):** the configuration runs two registry replicas over one database; stopping one during a submit/poll leaves the client resolving the remaining replica, the retry under the same key replays rather than writes, and the operation completes
+- [ ] types-registry ships a Profile 3 deployment chart, following `gears/mini-chat/deploy/helm/`, with at least two replicas and a PodDisruptionBudget (`minAvailable: 1`); a rendering check (`helm template` / `helm lint`) asserts both
+- [ ] Reuse T41 flows in the final composition: remote resolution/publication/readback without code or local fallback; pending readiness until admission; one-direction cross-process dependencies in both start orders; a stopped-at-start registry followed by recovery without consumer startup failure. These remain required regression cases, not new test implementations
+- [ ] Reuse T34/T35 auth helpers and T41 production-auth composition: every route refuses no credential with `401`, bearer-only mutation is refused, and the real platform token succeeds. Verify the T35-selected production tenant-authenticator topology after the pull ends, including the linked variant when selected
+- [ ] Manual: kill and restart the registry process; consumers recover without restart
+
+**Verification:** run the real out-of-process e2e configuration alongside `make e2e-local` and `make e2e-docker`; execute the two-replica failover scenario and the chart rendering checks. Record the exact OoP launch/test command with its config.
+
+**Dependencies:** T42 (end of the pull) **Files likely touched:** an out-of-process e2e configuration and its launcher, the shared e2e helpers, `gears/system/types-registry/deploy/helm/` (new chart) **Scope:** M
+
+---
+
+### Checkpoint 8 — out-of-process operation
+- [ ] Per-crate collectors, the `gts(…)` attribute, `post_wiring`, `Required` readiness and supervised publication are in toolkit; the plugin selector caches no incomplete selection (T37, T39, T40)
+- [ ] Every declaring gear publishes its own crates after wiring and gates its readiness on them; no registry call remains in any `init()`, and no startup phase fails on an unpublished or unreachable registry (T41, T42)
+- [ ] No process-global GTS inventory remains; the registry seeds inline only its own types, the base types and the `cfg.entities` whose dependencies lie within that set; dependent configured entities publish after wiring; the coverage test is green (T40, T42)
+- [ ] With types-registry in its own process, two replicas and the chart, a remote gear publishes its own crates after wiring, is not ready until they are admitted, and reads them through the same trait (T43)
+- [ ] `make ci` (including the real AM remote target from T41 onward), gear tests on three backends, `make e2e-local`, `make e2e-docker`, the out-of-process run, `make dylint`, `make lychee` green; ceiling C11 still applies
 - [ ] Human review
+
+---
+
+## Phase 9 — Mixed-version rollout: the publisher-version guard
+
+Plan P23, SPEC D18. **T44 → T45** completes mixed-version support after fleet migration, verified through the real database, worker and outbox. This phase renames `owning_gear` to `publisher_name`, adds `publisher_version`, the wire field and the guard. T45 requires publisher on every global platform mutation, with no activation switch or adoption manifest. Pre-migration rows are unclaimed until their first publication. Requests may omit publisher before T45 and skip the guard; intermediate tasks are never deployed.
+
+### - [ ] T44: Publisher guard — durable state, wire context and commit-time ordering
+
+**Description:** Everything the guard compares, stored and carried end to end: the domain stamp (the SemVer type and its precedence are T28's), the columns of SPEC §9 *Publication state* in one forward migration that reinterprets no stored content, the request-level `publisher` carried from acceptance through the operation record to every candidate, and the `publisher` body field of SPEC §10.2 on both adapters. The first stage carries the field; the commit-ordering stage enforces it, and T45 makes it required for every writer.
+
+Commits inside the task: (1) stamp; (2) migration; (3) durable context and fingerprint; (4) adapters.
+
+**Acceptance criteria:**
+- [ ] A stamp value carries `publisher_name` and `PublisherVersion`; versions under different names are not comparable, and comparing them is `publisher_mismatch`, not an ordering. An unclaimed stamp — version absent, name a placeholder — compares as claimable by any publisher; the placeholder is never compared as a name. No API derives a version from the SDK's own crate; there is no override
+- [ ] `entity.owning_gear` is renamed to `entity.publisher_name` on all three backends (`RENAME COLUMN`; SQLite ≥ 3.25), and `ck_tr_entity_owner` follows the rename; the `"types-registry"` placeholder stays in place on existing rows. `entity.publisher_version` is added, nullable, with no backfill: `NULL` marks an unclaimed row
+- [ ] The operation's durable `publisher_name` / `publisher_version` are added, nullable for operations accepted before the migration, both or neither, platform plane only. No item status or column is added: `superseded` and `publisher_mismatch` are reasons on a `failed` item, in `error_payload`. A CHECK admits a stamp only on a global entity with a publisher name
+- [ ] The ORM entity, repositories and every Rust reference move to `publisher_name`; raw SQL only inside the migration infrastructure; `docs/database.sql` matches
+- [ ] Acceptance validates `publisher` (both fields, SemVer within its bound) and stores it on the operation; the worker reads it for every candidate and never derives it from its own package version or configuration. The request fingerprint includes it: the same key with a different `publisher` is a `409`. Idempotency records accepted before the migration keep their replay semantics; an outcome round-trip loses no stamp information
+- [ ] The REST DTOs of `POST /entities` and `POST /entities:batchDelete` carry a top-level `publisher: { name, version }`; the SDK's REST client sends `RegisterEntitiesRequest::publisher` / `DeleteEntitiesRequest::publisher` there, and the local client passes it through — until this task both adapters dropped it. `publisher` is accepted from the local client and a validated platform-plane caller only; from a tenant bearer it is refused before an operation exists. The context belongs to the call, never to the shared client in `ClientHub`
+
+**Verification:**
+- [ ] Focused tests — ordering through the stamp, `publisher_mismatch`, an unclaimed row
+- [ ] Migration tests — a populated pre-migration database keeps every row with its placeholder name and `NULL` version; `make test-integration LANE=types-registry-db` on PostgreSQL and MySQL, SQLite in the plain gear tests
+- [ ] Acceptance and storage tests — same body with a different `publisher`, a lost response retried under the same key, a pending item re-read from a real database
+- [ ] The real local client and the real TCP contract test — mixed credentials, an invalid SemVer, strict operation-result parsing
+
+**Commit-ordering stage — claim/check, metadata-only confirmation and deletion:**
+
+**Description:** SPEC §8.1 step 1a inside the existing serialized commit, without a new lock order: the stamp check and claim, metadata-only confirmation on every `unchanged` path, and an ordered deletion (SPEC D18).
+
+Commits inside the task: (1) check and claim, including early refusals; (2) metadata-only confirmation; (3) versioned deletion.
+
+**Acceptance criteria — check and claim:**
+- [ ] After the `entity_write_order` claim and **before** the caller precondition: another `publisher_name` on a claimed row → `failed` with reason `publisher_mismatch` (stored and offered name in its context); lower → `failed` with reason `superseded` (stored and offered version in its context), nothing written; equal or higher → continue
+- [ ] **Claim:** on an unclaimed row the check passes for any publisher, and a successful commit writes both `publisher_name` and `publisher_version`; a creation writes the stamp with the entity
+- [ ] On success, content and stamp commit in one transaction; failed, refused, CAS-refused and dry-run items never move or claim a stamp
+- [ ] A lower version with a stale `expected_resource_version` reports `superseded`, not `precondition_failed`
+- [ ] **Early refusals too:** SPEC §8.1 step 3 terminalizes `precondition_failed`, `entity_deleted`, compatibility and dependency refusals (`dependency_not_found`, `dependency_deleted`, `blocked_by_dependency`) before the commit transaction. The stamp check takes priority over all of them: a candidate is checked against the stamp before any such refusal is finalized, and a mismatched or lower one is `publisher_mismatch` or `superseded` instead; the check and the recording of the refusal are serialized under the `entity_write_order` claim, because a stamp read earlier can be overtaken by a concurrent publication. Scenario: a newer release widened a schema, an older release restarts and offers the narrower one → `superseded`, not a compatibility refusal
+- [ ] Two pods of one version with different content — configuration-built Instances during a rollout — are ordinary admissions; the last writer wins and the stamp is unchanged (SPEC D18, C11)
+- [ ] Partial admission is per entity: A@2 committing does not make B@2 conflict with a B@1 still stored
+- [ ] A request without `publisher` skips the check and writes no stamp until T45 refuses it
+
+**Acceptance criteria — metadata-only confirmation:**
+- [ ] Higher + identical content advances the stamp, and identical content on an unclaimed row claims it; `resource_version`, revision, `updated_at`, artifacts, `resolution_fingerprint` and the validator are byte-identical, and no reverse-impact refresh runs
+- [ ] Both `PreparedUnit::Unchanged` and the in-transaction `unchanged` re-run step 1a under the claim
+- [ ] For a minor-bearing Type Schema, confirmation is metadata-only and allowed only on exact authored equality; changed content is still refused by ADR-0004
+- [ ] A lower confirmation never lowers a stamp; a dry run persists nothing
+
+**Acceptance criteria — versioned deletion:**
+- [ ] A deletion with the same `publisher_name` and a `publisher_version` ≥ the stamp passes the existing CAS, lifecycle and dependant checks and writes the tombstone and the stamp in one transaction; a lower one is `superseded` and another name `publisher_mismatch`, both before the precondition
+- [ ] A deletion of an unclaimed row claims it with the tombstone; a deleted entity is not resurrected by a later publication; nothing is deleted because a manifest stops naming it; failed and dry-run deletions never move a stamp
+
+**Verification:**
+- [ ] Real SQLite transaction tests with controlled ordering — another name on a claimed row → `publisher_mismatch`; the first publication on an unclaimed row claims it, a second name then mismatches; a newer release dropped a reference and deleted its target, an older release offers the old document → `superseded`, not `dependency_deleted` and not a retry loop; delayed old operation (0.1 accepted, 0.2 commits, 0.1 commits → `superseded`), partial A/B; the concurrency cases on PostgreSQL and MySQL
+- [ ] Snapshot and validator byte-equality tests; delayed metadata-only 0.1 after 0.2; a metadata-only claim of an unclaimed row; a negative minor content update through the real acceptance path
+- [ ] Real API and worker deletion tests by identifier and by UUID key through `:batchDelete`, a delayed old deletion after a higher confirmation, dry run, dependant refusal
+- [ ] Local and REST outcomes match, including `superseded` and `publisher_mismatch`; no adapter synthesizes a successful result from a receipt
+
+**Dependencies:** T43 (Checkpoint 8) **Files likely touched:** Domain publication/stamp/acceptance/fingerprint/commit/unchanged/deletion paths, storage ports/entities/repos, forward migration and database.sql, local/REST adapters and guard/backend tests **Scope:** L server feature: stamp/migration, durable request context/adapters, then serialized check/claim/confirmation/deletion. Implementation stages use small reviewable commits; no intermediate deployment
+
+---
+
+### - [ ] T45: Publisher activation and mixed-version rollout proof
+
+**Description:** `publish_gts`, reconciliation and every other writer submit with a publisher context against the guard, end to end; then the unversioned path closes (SPEC D18, §10.2). Every P0 mutation is global and platform-plane, so after this task no write bypasses the guard.
+
+**Acceptance criteria:**
+- [ ] Reconciliation always submits, equal documents included, so the registry sees and confirms a higher version; the `UpToDate`/no-`POST` shortcut is gone from the platform helper. Retries of an identical submission reuse one key, a new cycle takes a new one
+- [ ] `superseded` and `publisher_mismatch` are terminal and diagnosable, with the stored and the offered value; a new cycle never raises its own version or reads one from the registry
+- [ ] `ReconcileOutcome` regains a `Superseded` variant, separate from `Rejected`, with a liveness re-read after the outcome (live, deleted, or unverified when the read fails); `PublicationStatus` gains superseded-live (ready, with a warning and a metric carrying both versions) and superseded-deleted (not ready). T29 removed the first version as unreachable before T44; `c5f491cc8` has it
+- [ ] The registry's own writes carry its own context: its control-plane types, the base types it seeds and `cfg.entities`, inline and after wiring, are published as `types-registry` with the registry crate's version (SPEC §17 O5)
+- [ ] Every other writer in the workspace — e2e helpers, fixtures, real AM deployments, scripts and examples that `POST` or delete — sends a `publisher`; a grep over request bodies finds none without it
+- [ ] A lost submit or `get_operation` response keeps the operation identity; deadline and cancellation hold; a panicking or exiting task is observed
+- [ ] A new `POST /entities` or `POST /entities:batchDelete` without `publisher` is refused with `400` before allocating an operation; OpenAPI marks it required and the local client refuses likewise. An exact same-key replay of a historical accepted request is a read of its stored operation, not a new unversioned mutation; it cannot enqueue/write again. Adding publisher to that old same-key body changes the fingerprint and conflicts; resubmission with publisher uses a new key
+- [ ] The single-key `DELETE /entities/{entity_key}`, which has no body to carry a publisher, is removed from the P0 route set; DESIGN keeps it for the tenant plane
+- [ ] The commit-time "no publisher, no check" branch of T44 is deleted. For an old operation with no durable publisher, terminalize only unfinished items as `failed` with reason `publisher_required`, before any new entity write; preserve already-committed items, operation identity and stored replay/read outcomes. Add `AdmissionFailureReason::PublisherRequired` and its wire vocabulary, and map it to terminal `ReconcileOutcome::Rejected`, never `Pending`; do not infer a publisher/version. Test partial pre-migration operations, exact replay, publisher-added fingerprint conflict and fresh-key resubmission alongside row adoption
+- [ ] Operator documentation names the field, the owner rule — an operator editing another publisher's entity gets `publisher_mismatch` — and that reverting content takes a newer version
+
+**Verification:**
+- [ ] SDK tests and real-adapter flows — all-equal documents confirmed, repeated startup, delayed dependency batches, `superseded` without a retry storm; the readiness matrix for superseded live and deleted
+- [ ] API tests — a request without `publisher` on each route, the removed route returning `404`/`405`
+- [ ] `make e2e-local` green with every request carrying a publisher
+
+**Final rollout stage — mixed versions, pre-migration rows and real platform profiles:**
+
+**Description:** Extend the real AM remote scenarios from T41 and final topology from T43 with the guard (SPEC D18, D22); reuse their launchers and API flows, adding mixed-version cases rather than another application or cold-start suite.
+
+**Acceptance criteria:**
+- [ ] 0.1 → 0.2 → restart 0.1, a delayed old operation and partial A/B leave the newer content and stamp; the restarted 0.1 is ready with a superseded warning, like a 0.1 pod that never restarted, while a superseded entity that 0.2 deleted holds 0.1 not ready
+- [ ] Global validation uses the current registry schema while the older pod decodes with its own DTO; a read-modify-write of a newer payload by the older DTO is not reported as safe
+- [ ] A database populated before T44's migration starts under the new release: its rows are claimed by their first publications, and a second publisher of a claimed identifier gets `publisher_mismatch`
+- [ ] On three backends and in embedded and out-of-process e2e: publish 0.2, restart 0.1 → newer state persists and 0.1 is ready with a warning; a tenant bearer and a request without `publisher` are refused. These are T43's guard scenarios, run here
+
+**Verification:** `make e2e-am-remote` with its directory/auth prerequisites, real TCP client, real outbox and controlled delays; the out-of-process e2e configuration of T43; `make quickstart`, workspace tests and the full checkpoint `make ci`
+
+**Dependencies:** T44 (complete server-side guard) **Files likely touched:** SDK reconciliation/publisher, all registry and workspace writers, request validation/DTOs/routes, operator docs, shared real AM runtime scenarios from T41 and T43 real-platform e2e **Scope:** L activation feature: update writers/SDK, require publisher/remove bypasses, then pass the complete mixed-version proof before Checkpoint 9; no separate rollout application or harness
+
+---
+
+### Checkpoint 9 — ready for review
+- [ ] The cutover holds: `cfg.entities` and the registry's own types seed into the database within configured limits; every declaring gear publishes its own crates; repeat startup is idempotent and the platform stays healthy. C3 (cooperative attribution) remains documented until P1
+- [ ] All 20 success criteria of SPEC §16 met
+- [ ] Out of process: with types-registry in its own process, a remote gear publishes its own crates after wiring, is not ready until they are admitted, and reads them through the same trait (T43)
+- [ ] The publisher-version guard is active and `publisher` is required on every mutation: rows written before the migration were claimed by their first publication, and an older restart leaves newer content and stamps (T44/T45)
+- [ ] The REST clients pass their contract tests on the final paths (T34, T35, T38)
+- [ ] No process-global GTS inventory remains; the registry seeds only its own types, the base types and `cfg.entities`; the coverage test is green (T42)
+- [ ] Every route refuses a caller without the credential it needs with `401`; mutations on the registry's listener serve the platform plane only (T33, T34, T35)
+- [ ] No registry call remains inside any `init()`, and no startup phase fails on an unpublished or unreachable registry (T38's audit, T41/T42)
+- [ ] `make ci` (including the real AM remote target from T41 onward), gear tests on three backends, `make e2e-local`, `make e2e-docker`, `make dylint`, `make lychee` green
+- [ ] Every ceiling in SPEC §9 has a comment at the point it binds
+- [ ] `TypesRegistryClient` is deleted and no crate references it (D6, T38)
+- [ ] Conditional reads work end to end: an exact read carries a validator and honours `If-None-Match` with `304`, `batchGet` reports `unchanged` per key (T22d) — proved on `/v2/` at Checkpoint 6, re-checked here on the promoted v1 paths and through the SDK (T29)
+- [ ] Discovery is bounded: no response is unbounded in items or bytes, and a cursor traverses the whole set exactly once (T22a, D12) — proved at Checkpoint 6, re-checked here on the promoted v1 paths
+- [ ] The client cache is in place on the new models with its window, byte bound, `fresh` bypass, batched conditional revalidation and late-fill guard (T36) — P0 does not ship an uncached read path
+- [ ] Human review
+
+## Scope outside P0
+
+Inventory attribution metadata and exposing ownership on the wire/reads remain P1 [#4827](https://github.com/constructorfabric/gears-rust/issues/4827), under [#4628](https://github.com/constructorfabric/gears-rust/issues/4628) (ceiling C3). Per-crate collection and publication after wiring are included in P0 (T39–T42); they are not deferred with attribution.

@@ -26,10 +26,12 @@ use crate::domain::error::DomainError;
 use crate::domain::exact_money::map_money_error;
 use crate::domain::model::RepoError;
 use crate::domain::payment::chargeback::DisputeVariant;
+use crate::domain::payment::dispute_state::check_outcome;
 use crate::infra::adjustment::map_adjustment_repo_err;
 use crate::infra::events::payloads::{LedgerDisputeRecorded, LedgerSettlementReturned};
 use crate::infra::events::publisher::LedgerEventPublisher;
 use crate::infra::posting::service::{PostSidecar, PostedFacts};
+use crate::infra::storage::repo::dispute_repo::DisputeState;
 use crate::infra::storage::repo::payment_repo::{NewAllocationRow, SettlementCounter};
 use crate::infra::storage::repo::{DisputeRepo, PaymentRepo};
 use time::OffsetDateTime;
@@ -298,6 +300,38 @@ impl PostSidecar for SettlementReturnSidecar {
 
 #[async_trait::async_trait]
 impl PostSidecar for ChargebackSidecar {
+    /// A `won` / `lost` reads the dispute again in the post transaction. It
+    /// refuses with `InvalidDisputeTransition` unless the dispute is still
+    /// `OPENED` at this cycle.
+    ///
+    /// The other outcome can commit after this post's out-of-txn guard. It then
+    /// has already emptied the hold that this outcome releases. Without this
+    /// check, the projector refuses first, with `NegativeBalance`. The losing
+    /// outcome must be an invalid transition instead.
+    ///
+    /// An `opened` has no check here: its own write checks the state machine.
+    async fn check_before_projection(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+    ) -> Result<(), DomainError> {
+        let ChargebackDisputeOp::Advance { last_phase, .. } = &self.op else {
+            return Ok(());
+        };
+        let observed = self
+            .dispute
+            .read_dispute_in(txn, scope, self.tenant, &self.dispute_id)
+            .await
+            .map_err(map_repo_err)?;
+        check_outcome(
+            &self.dispute_id,
+            observed.as_ref().map(DisputeState::observed),
+            *last_phase,
+            self.cycle,
+        )
+        .map_err(|e| DomainError::InvalidDisputeTransition(e.to_string()))
+    }
+
     async fn run(
         &self,
         txn: &DbTx<'_>,

@@ -1,8 +1,11 @@
-//! Domain layer: the storage plugin skeleton, its bootstrap, and the store
-//! port the SQL adapter implements.
+//! Domain layer: the storage plugin, its bootstrap, the Quota primitives it
+//! forwards, and the store ports the SQL adapters implement.
 
 pub mod bootstrap;
+pub mod consumption;
+pub mod leases;
 pub mod ports;
+pub mod quotas;
 
 pub use bootstrap::StoragePlugin;
-pub use ports::{FoundationStore, SeedReport, StoreError};
+pub use ports::{Actor, ConsumptionStore, FoundationStore, QuotaStore, SeedReport, StoreError};

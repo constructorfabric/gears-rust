@@ -1,8 +1,9 @@
 //! Postgres-only: the scale-immutability guard. Once a journal_line
 //! exists for a (tenant, currency), a changed scale is rejected
 //! (`CurrencyScaleLocked`); the same scale is idempotent; a currency with
-//! no postings is freely (re)scalable. Ignored by default; run with
-//! `cargo test -p cf-gears-bss-ledger -- --ignored`.
+//! no postings is freely (re)scalable. The currencies are non-ISO codes (`TKA`,
+//! `TKB`): the registry cannot give an ISO 4217 code another scale. Ignored by
+//! default; run with `cargo test -p cf-gears-bss-ledger -- --ignored`.
 
 #![allow(
     clippy::non_ascii_literal,
@@ -45,11 +46,11 @@ async fn scale_locked_once_postings_exist() {
     let entry = Uuid::now_v7();
     let reference = ReferenceRepo::new(DBProvider::<DbError>::new(tdb));
 
-    // Register USD@2 and post a balanced USD entry (DR AR / CR CASH_CLEARING).
+    // Register TKA@2 and post a balanced TKA entry (DR AR / CR CASH_CLEARING).
     reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
-            currency: "USD".to_owned(),
+            currency: "TKA".to_owned(),
             currency_scale: 2,
             source: "iso".to_owned(),
         })
@@ -64,7 +65,7 @@ async fn scale_locked_once_postings_exist() {
             (entry_id, tenant_id, legal_entity_id, period_id, entry_currency,
              source_doc_type, source_business_id, posted_at_utc, effective_at,
              origin, posted_by_actor_id, correlation_id)
-         VALUES ('{entry}','{tenant}','{tenant}','202606','USD',
+         VALUES ('{entry}','{tenant}','{tenant}','202606','TKA',
                  'MANUAL_ADJUSTMENT','biz-1', now(), CURRENT_DATE,
                  'SYSTEM','{tenant}','{tenant}')"
     )))
@@ -77,7 +78,7 @@ async fn scale_locked_once_postings_exist() {
                 (line_id, entry_id, tenant_id, period_id, payer_tenant_id, account_id,
                  account_class, side, amount, currency, currency_scale, mapping_status)
              VALUES ('{line}','{entry}','{tenant}','202606','{tenant}','{tenant}',
-                     '{class}','{side}', '10', 'USD', 2, 'RESOLVED')"
+                     '{class}','{side}', '10', 'TKA', 2, 'RESOLVED')"
         )))
         .await
         .unwrap();
@@ -88,7 +89,7 @@ async fn scale_locked_once_postings_exist() {
     reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
-            currency: "USD".to_owned(),
+            currency: "TKA".to_owned(),
             currency_scale: 2,
             source: "iso".to_owned(),
         })
@@ -99,7 +100,7 @@ async fn scale_locked_once_postings_exist() {
     let locked = reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
-            currency: "USD".to_owned(),
+            currency: "TKA".to_owned(),
             currency_scale: 3,
             source: "iso".to_owned(),
         })
@@ -114,20 +115,20 @@ async fn scale_locked_once_postings_exist() {
     reference
         .upsert_currency_scale(CurrencyScaleRow {
             tenant_id: tenant,
-            currency: "EUR".to_owned(),
+            currency: "TKB".to_owned(),
             currency_scale: 2,
             source: "iso".to_owned(),
         })
         .await
-        .expect("EUR has no postings; upsert must succeed");
+        .expect("TKB has no postings; upsert must succeed");
 
     // Defense-in-depth: a DIRECT SQL UPDATE bypassing the app-level lock is
     // rejected by the `trg_currency_scale_immutable` trigger once a posting
-    // exists — USD has a posted line, so re-denominating its scale must fail.
+    // exists — TKA has a posted line, so re-denominating its scale must fail.
     let raw_update = raw
         .execute_raw(pg(format!(
             "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 3 \
-             WHERE tenant_id = '{tenant}' AND currency = 'USD'"
+             WHERE tenant_id = '{tenant}' AND currency = 'TKA'"
         )))
         .await;
     assert!(
@@ -138,7 +139,7 @@ async fn scale_locked_once_postings_exist() {
     // The trigger fires only on a genuine change: a same-value UPDATE passes.
     raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 2 \
-         WHERE tenant_id = '{tenant}' AND currency = 'USD'"
+         WHERE tenant_id = '{tenant}' AND currency = 'TKA'"
     )))
     .await
     .expect("same-value UPDATE must pass the trigger");
@@ -146,8 +147,8 @@ async fn scale_locked_once_postings_exist() {
     // And a currency with no postings can be re-denominated by direct SQL.
     raw.execute_raw(pg(format!(
         "UPDATE bss.ledger_currency_scale_registry SET currency_scale = 3 \
-         WHERE tenant_id = '{tenant}' AND currency = 'EUR'"
+         WHERE tenant_id = '{tenant}' AND currency = 'TKB'"
     )))
     .await
-    .expect("EUR has no postings; direct UPDATE must pass the trigger");
+    .expect("TKB has no postings; direct UPDATE must pass the trigger");
 }

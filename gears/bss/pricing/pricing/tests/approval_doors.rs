@@ -160,7 +160,7 @@ impl Gov {
         let mut r = entry_support::price(&p);
         r.version_no = version_no;
         r.state = "approved".into();
-        r.price_json = json!({"rate":"0.20"});
+        r.price_json = json!({"rate":"0.2"});
         r.effective_from =
             time::Date::parse(from, &time::format_description::well_known::Iso8601::DATE).unwrap();
         price_repo::insert(&conn, &scope, r).await.unwrap().id
@@ -543,6 +543,88 @@ async fn a_unit_whose_added_partner_does_not_read_is_a_corrupt_row_at_the_vote()
     assert_eq!(card["state"], "pending", "{card}");
     assert_eq!(card["decisions"], json!([]));
     assert_eq!(g.price(&price["id"]).await.state, "pending");
+}
+
+/// D-539: each price of a prices snapshot, `before` and `after`, carries its `currency` and
+/// `currency_scale`, on the submit receipt and the card alike. A unit stored before D-539 carries
+/// none: every read puts them beside each price from the price rows, and leaves the stored
+/// snapshot as it is.
+#[tokio::test]
+async fn snapshot_prices_carry_their_currency_spec_and_an_older_unit_gets_it_at_read() {
+    let g = gov(1).await;
+    let back = g.approved(1, "2031-01-01").await;
+    let price = &g.draft("a", body("2031-03-01")).await[0];
+    let (status, receipt, _) = g.submit_as(&g.f.ctx, price, "submit").await;
+    assert_eq!(status, 201, "{receipt}");
+    let spec = |p: &Value| (p["currency"].clone(), p["currency_scale"].clone());
+    let eur = (json!("EUR"), json!(2));
+    let unit = &receipt["unit"];
+    let first = &unit["snapshot"]["prices"][0];
+    assert_eq!(spec(&first["after"]), eur, "the receipt's after: {first}");
+    assert_eq!(first["before"]["price_id"], back.to_string(), "{first}");
+    assert_eq!(spec(&first["before"]), eur, "the receipt's before: {first}");
+    let card = g.card(unit).await;
+    let first = &card["snapshot"]["prices"][0];
+    assert_eq!(spec(&first["after"]), eur, "the card's after: {first}");
+    assert_eq!(spec(&first["before"]), eur, "the card's before: {first}");
+    // A unit stored before D-539: strip the spec from the stored snapshot.
+    let id: Uuid = unit["id"].as_str().unwrap().parse().unwrap();
+    let tenant = g.f.ctx.subject_tenant_id();
+    let conn = g.f.db.conn().unwrap();
+    let scope = AccessScope::for_tenant(tenant);
+    let mut snapshot = approval_unit::Entity::find_by_id(id)
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    for half in ["before", "after"] {
+        let half = snapshot["prices"][0][half].as_object_mut().unwrap();
+        half.remove("currency");
+        half.remove("currency_scale");
+    }
+    approval_unit::Entity::update_many()
+        .secure()
+        .scope_with(&scope)
+        .col_expr(
+            approval_unit::Column::Snapshot,
+            sea_orm::sea_query::Expr::value(snapshot.clone()),
+        )
+        .filter(
+            sea_orm::Condition::all().add(sea_orm::ColumnTrait::eq(&approval_unit::Column::Id, id)),
+        )
+        .exec(&conn)
+        .await
+        .unwrap();
+    let card = g.card(unit).await;
+    let first = &card["snapshot"]["prices"][0];
+    assert_eq!(
+        spec(&first["after"]),
+        eur,
+        "filled from the draft's row: {first}"
+    );
+    assert_eq!(
+        spec(&first["before"]),
+        eur,
+        "filled from the predecessor's row: {first}"
+    );
+    let (status, listing, _) =
+        g.f.call("GET", "/approval-units", json!({}), None, None)
+            .await;
+    assert_eq!(status, 200, "{listing}");
+    let listed = &listing["items"][0]["snapshot"]["prices"][0];
+    assert_eq!(spec(&listed["after"]), eur, "the list too: {listed}");
+    let stored = approval_unit::Entity::find_by_id(id)
+        .secure()
+        .scope_with(&scope)
+        .one(&conn)
+        .await
+        .unwrap()
+        .unwrap()
+        .snapshot;
+    assert_eq!(stored, snapshot, "the stored snapshot is left as it was");
 }
 
 /// A vote's refusal that names the generation (400 `GENERATION_MISMATCH`, and the committed
@@ -1437,7 +1519,7 @@ async fn an_entry_with_only_draft_or_rejected_prices_is_deleted_with_them() {
     assert_eq!(card["state"], "rejected");
     assert_eq!(
         card["snapshot"]["prices"][0]["after"]["price"],
-        json!({"rate":"0.10"}),
+        json!({"rate":"0.1"}),
         "the rejected proposal's history survives its price"
     );
 }

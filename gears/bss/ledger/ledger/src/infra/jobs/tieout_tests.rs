@@ -1030,7 +1030,7 @@ fn payment_allocation_with_no_settlement_row_is_flagged() {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// VHP-1843 incremental tie-out — pure projection unit tests (no container).
+// Incremental tie-out — pure projection unit tests (no container).
 // Exercise the `(grain, grain_key)` string-space helpers that the daily / recon
 // incremental path shares with the close-time baseline snapshot.
 // ────────────────────────────────────────────────────────────────────────────
@@ -1112,7 +1112,7 @@ fn cache_baseline_rows_roundtrip() {
     assert_eq!(rows[0].balance, usd_cents(123));
 }
 
-/// VHP-1843 (PG) — the incremental tie-out equals the full fold across a CLOSED +
+/// PG: the incremental tie-out equals the full fold across a CLOSED +
 /// OPEN period split: post in period 1, close it + snapshot the baseline (what
 /// period-close does), post in period 2; the incremental path (baseline[p1] +
 /// open-fold[p2]) must reconcile clean and agree with the full all-time fold.

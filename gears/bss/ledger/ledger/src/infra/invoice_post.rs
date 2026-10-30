@@ -66,7 +66,7 @@ use time::OffsetDateTime;
 const ORIGIN_SYSTEM: &str = "SYSTEM";
 
 /// In-transaction sidecar that emits `billing.ledger.entry.reversed` (architecture
-/// §6, VHP-1837) on the explicit reversal path. It rides the post's own
+/// §6) on the explicit reversal path. It rides the post's own
 /// transaction (the transactional outbox), so the event row commits atomically
 /// with the reversing entry or rolls back with it. It carries the operator
 /// `reason` (which is NOT persisted on the entry header) and the original entry
@@ -127,7 +127,7 @@ pub trait InvoicePoster: Send + Sync {
     /// Reverse the full immutable original referenced by the caller header. Caller
     /// lines never size history. The payer gate is intentionally bypassed.
     /// `reason` is `Some(audit reason)` for an explicit reversal — it is announced
-    /// on the `billing.ledger.entry.reversed` event (VHP-1837), not persisted on
+    /// on the `billing.ledger.entry.reversed` event, not persisted on
     /// the row — or `None` for a mapping-correction's internal reversal leg, which
     /// announces nothing (a correction is not a §6 reversal).
     ///
@@ -177,9 +177,9 @@ pub struct InvoicePostService {
     rate_locker: RateLocker,
     /// Event publisher, retained so the reversal path can attach a
     /// [`ReversalEventSidecar`] that emits `billing.ledger.entry.reversed` in the
-    /// post txn (VHP-1837). The same handle is threaded into the posting engine.
+    /// post txn. The same handle is threaded into the posting engine.
     publisher: Arc<LedgerEventPublisher>,
-    /// Tenant posting policy (VHP-1853): the missing-mapping mode (the hard-block
+    /// Tenant posting policy: the missing-mapping mode (the hard-block
     /// gate below) + the AR-aging buckets. Read effective in the orchestrator
     /// on the supplied attempt; absent a row the gear default (`SUSPENSE`) applies.
     posting_policy_repo: PostingPolicyRepo,

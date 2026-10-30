@@ -167,7 +167,7 @@ mod tests {
             }),
             responses: vec![],
             handler_id: "test".to_owned(),
-            authenticated: false,
+            auth: toolkit::api::RouteAuth::Anonymous,
             exposed: false,
             license_requirement: None,
             throttling: None,

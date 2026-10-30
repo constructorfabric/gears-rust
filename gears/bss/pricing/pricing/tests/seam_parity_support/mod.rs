@@ -5,7 +5,10 @@ use crate::{
     plan_support as p, seam_support as s,
 };
 use bss_pricing::infra::storage::entity::{price_book_entry, usage_rating_policy};
-use bss_pricing::infra::storage::repo::plan_revision_repo;
+use bss_pricing::infra::storage::{
+    RepoError,
+    repo::{plan_revision_repo, price_book_entry_repo, price_repo},
+};
 use bss_pricing_sdk::{
     acceptance::{AcceptanceQuery, CommandMeta, PricingAcceptanceV1, SellabilityV1},
     read::{CatalogRef, PlanQuery, PricingReadV1},
@@ -129,7 +132,45 @@ pub async fn explicit_price_close_race(f: AcceptanceFixture) {
 pub async fn money_digest_stability(f: AcceptanceFixture) {
     let first = accept(&f).await;
     let price = first.bindings[0].price.clone();
+    // The digest does not depend on the spelling: `10.0000` is the same money as `10`.
+    let mut spelled = price.clone();
+    spelled.model = bss_pricing_sdk::read::PriceModel::PerUnit {
+        unit_amount: rust_decimal::Decimal::from_str_exact("10.0000").unwrap(),
+    };
+    assert_eq!(
+        bss_pricing_sdk::digest::money_digest(&spelled),
+        price.money_digest
+    );
+    // Storage holds one spelling: a stored `10.0000` is a corrupt row, never other money.
     f.execute("UPDATE pricing_price SET price_json='{\"rate\":\"10.0000\"}',version=version+1")
+        .await;
+    let refused = f.try_resolved().await.unwrap_err();
+    assert_eq!(
+        (refused.status_code(), refused.diagnostic()),
+        (500, Some("pricing storage failure")),
+        "a corrupt stored row is an internal error"
+    );
+    // The cause is the row: its reader refuses the stored `price_json`.
+    let tenant = f.ctx.subject_tenant_id();
+    let scope = toolkit_db::secure::AccessScope::for_tenant(tenant);
+    let conn = f.fixture.db.conn().unwrap();
+    let row = price_repo::find(&conn, &scope, tenant, price.price_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let entry = price_book_entry_repo::find(&conn, &scope, tenant, row.price_book_entry_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            price_repo::to_domain(&row, price_book_entry_repo::model_of(&entry).unwrap()),
+            Err(RepoError::CorruptRow(what))
+                if what.contains(" price_json: rate is not canonical decimal text")
+        ),
+        "the stored price_json is a corrupt row, and the refusal says why"
+    );
+    f.execute("UPDATE pricing_price SET price_json='{\"rate\":\"10\"}',version=version+1")
         .await;
     let resolved = f.resolved().await;
     assert_eq!(

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-cluster-sdk"
-version = "0.2.8"
+version = "0.3.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,6 +19,11 @@ name = "cluster_sdk"
 workspace = true
 
 [features]
+# `cluster_sdk::test_support::StubClusterClient`: a `ClusterClient` over
+# hand-supplied backends, so a consumer's tests resolve a profile without
+# linking the cluster gear. Never enable it outside dev-dependencies or a
+# crate's own test-utils feature.
+test-util = []
 # Pulls in the OpenTelemetry-backed `ClusterMetrics` adapter
 # (`observability::otel::OtelClusterMetrics`). Off by default so the SDK core
 # carries no OpenTelemetry dependency; plugins that emit metrics enable it.

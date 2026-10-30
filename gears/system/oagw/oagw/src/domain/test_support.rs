@@ -33,6 +33,15 @@ pub fn allow_all_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(MockAuthZResolverClient))
 }
 
+/// Install the process-wide rustls `CryptoProvider` if none is set yet
+/// (idempotent). Tests skip the runtime bootstrap that installs it, and TLS
+/// configs fail closed without one under `fips`.
+pub fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        toolkit::bootstrap::init_crypto_provider().expect("crypto provider initialization");
+    }
+}
+
 /// Build a self-signed `rustls::ServerConfig` for localhost / 127.0.0.1.
 ///
 /// Installs the process-wide rustls `CryptoProvider` if none is set yet
@@ -41,11 +50,7 @@ pub fn allow_all_enforcer() -> PolicyEnforcer {
 pub fn test_server_config() -> rustls::ServerConfig {
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    // Ensure a crypto provider is available; tests don't go through the full
-    // bootstrap, so one may not be installed yet.
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        toolkit::bootstrap::init_crypto_provider().expect("crypto provider initialization");
-    }
+    ensure_crypto_provider();
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let cert = rcgen::generate_simple_self_signed(subject_alt_names).expect("cert generation");
@@ -172,6 +177,151 @@ pub use credstore_sdk::test_util::MockCredStoreClient;
 
 /// Re-export for tests that need a `CredStoreClientV1` mock.
 pub use MockCredStoreClient as TestCredStoreClient;
+
+#[cfg(test)]
+/// Metrics that keep only what the registry reconcile records.
+#[derive(Default)]
+pub struct ProvisioningMetrics {
+    /// `(kind, reason)` per skipped or kept instance, in order.
+    pub failures: std::sync::Mutex<Vec<(String, String)>>,
+    /// Run outcomes, in order.
+    pub runs: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl ProvisioningMetrics {
+    /// The recorded `(kind, reason)` pairs, sorted.
+    pub fn failures(&self) -> Vec<(String, String)> {
+        let mut failures = self.failures.lock().unwrap().clone();
+        failures.sort();
+        failures
+    }
+}
+
+#[cfg(test)]
+impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
+    fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
+    fn record_error(&self, _: &str, _: &str, _: &str) {}
+    fn record_request_duration_seconds(&self, _: &str, _: &str, _: &str, _: f64) {}
+    fn increment_in_flight(&self, _: &str) {}
+    fn decrement_in_flight(&self, _: &str) {}
+    fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
+    fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+    fn increment_active_websocket_sessions(&self, _: &str) {}
+    fn decrement_active_websocket_sessions(&self, _: &str) {}
+    fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+    fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+    fn record_registry_provisioning_failure(&self, kind: &str, reason: &str) {
+        self.failures
+            .lock()
+            .unwrap()
+            .push((kind.to_owned(), reason.to_owned()));
+    }
+    fn record_registry_provisioning_run(&self, outcome: &str) {
+        self.runs.lock().unwrap().push(outcome.to_owned());
+    }
+}
+
+#[cfg(test)]
+/// A credential store answering every call with one error.
+pub struct ErroringCredStore(pub fn() -> credstore_sdk::CredStoreError);
+
+#[cfg(test)]
+#[async_trait]
+impl CredStoreClientV1 for ErroringCredStore {
+    async fn get(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+    ) -> Result<Option<credstore_sdk::GetSecretResponse>, credstore_sdk::CredStoreError> {
+        Err((self.0)())
+    }
+    async fn put_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _precondition: credstore_sdk::WritePrecondition,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        Err((self.0)())
+    }
+    async fn create_opts(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _value: credstore_sdk::SecretValue,
+        _sharing: credstore_sdk::SharingMode,
+        _opts: credstore_sdk::WriteOptions,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        Err((self.0)())
+    }
+    async fn delete(
+        &self,
+        _ctx: &SecurityContext,
+        _key: &credstore_sdk::SecretRef,
+        _precondition: credstore_sdk::WritePrecondition,
+    ) -> Result<(), credstore_sdk::CredStoreError> {
+        Err((self.0)())
+    }
+}
+
+#[cfg(test)]
+/// A tenant resolver that refuses OAGW itself (`Unauthorized`) on every
+/// call, as a misconfigured resolver client would.
+pub struct UnauthorizedTenantResolver;
+
+#[cfg(test)]
+#[async_trait]
+impl TenantResolverClient for UnauthorizedTenantResolver {
+    async fn get_tenant(
+        &self,
+        _ctx: &SecurityContext,
+        _id: TenantId,
+    ) -> Result<TenantInfo, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+    async fn get_root_tenant(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<TenantInfo, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+    async fn get_tenants(
+        &self,
+        _ctx: &SecurityContext,
+        _ids: &[TenantId],
+        _options: &GetTenantsOptions,
+    ) -> Result<Vec<TenantInfo>, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+    async fn get_ancestors(
+        &self,
+        _ctx: &SecurityContext,
+        _id: TenantId,
+        _options: &GetAncestorsOptions,
+    ) -> Result<GetAncestorsResponse, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+    async fn get_descendants(
+        &self,
+        _ctx: &SecurityContext,
+        _id: TenantId,
+        _options: &GetDescendantsOptions,
+    ) -> Result<GetDescendantsResponse, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+    async fn is_ancestor(
+        &self,
+        _ctx: &SecurityContext,
+        _ancestor_id: TenantId,
+        _descendant_id: TenantId,
+        _options: &IsAncestorOptions,
+    ) -> Result<bool, TenantResolverError> {
+        Err(TenantResolverError::Unauthorized)
+    }
+}
 
 /// Mock `TenantResolverClient` for tests.
 ///
@@ -616,23 +766,25 @@ impl TestDpBuilder {
             .unwrap_or_else(|| Arc::new(MockAuthZResolverClient));
         let policy_enforcer = PolicyEnforcer::new(authz_client);
 
-        let server_conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        let pingora_proxy = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(3600),
-            Arc::new(SsrfGuard::disabled()),
-        )
-        .with_skip_upstream_tls_verify(self.skip_upstream_tls_verify);
-        let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
-            &server_conf,
-            pingora_proxy,
-        ));
+        ensure_crypto_provider();
+        let engine = Arc::new(
+            crate::infra::proxy::engine::ProxyEngine::new(
+                &crate::infra::proxy::engine::EngineSettings {
+                    connect_timeout: Duration::from_secs(10),
+                    read_timeout: Duration::from_secs(30),
+                    protocol_cache_ttl: Duration::from_secs(3600),
+                    #[cfg(feature = "test-utils")]
+                    skip_upstream_tls_verify: self.skip_upstream_tls_verify,
+                },
+                Arc::new(SsrfGuard::disabled()),
+            )
+            .expect("test proxy engine"),
+        );
 
         let backend_selector: Arc<dyn EndpointSelector> =
             self.backend_selector.unwrap_or_else(|| {
                 Arc::new(
-                    crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                    crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
                         SsrfGuard::disabled(),
                     )),
                 )
@@ -645,7 +797,7 @@ impl TestDpBuilder {
             self.token_http_config,
             self.token_cache_config,
             backend_selector,
-            proxy,
+            engine,
             std::sync::Arc::new(crate::domain::ports::NoopMetrics),
         )
         .with_allow_http_upstream(true);
@@ -690,7 +842,7 @@ pub fn build_test_app_state(
     dp_builder: TestDpBuilder,
 ) -> TestAppState {
     let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
-        crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+        crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
             SsrfGuard::disabled(),
         )),
     );
@@ -701,8 +853,11 @@ pub fn build_test_app_state(
     let dp = dp_builder
         .with_backend_selector(backend_selector.clone())
         .build_and_register(hub, cp.clone());
-    let facade: Arc<dyn ServiceGatewayClientV1> =
-        Arc::new(ServiceGatewayClientV1Facade::new(cp.clone(), dp.clone()));
+    let facade: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(
+        cp.clone(),
+        dp.clone(),
+        backend_selector.clone(),
+    ));
     hub.register::<dyn ServiceGatewayClientV1>(facade.clone());
     TestAppState {
         state: crate::gear::AppState {
@@ -728,9 +883,125 @@ pub fn build_test_gateway(
     cp_builder: TestCpBuilder,
     dp_builder: TestDpBuilder,
 ) -> Arc<dyn ServiceGatewayClientV1> {
+    let backend_selector: Arc<dyn EndpointSelector> =
+        dp_builder.backend_selector.clone().unwrap_or_else(|| {
+            Arc::new(
+                crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
+                    SsrfGuard::disabled(),
+                )),
+            )
+        });
     let cp = cp_builder.build_and_register(hub);
-    let dp = dp_builder.build_and_register(hub, cp.clone());
-    let oagw: Arc<dyn ServiceGatewayClientV1> = Arc::new(ServiceGatewayClientV1Facade::new(cp, dp));
+    let dp = dp_builder
+        .with_backend_selector(backend_selector.clone())
+        .build_and_register(hub, cp.clone());
+    let oagw: Arc<dyn ServiceGatewayClientV1> =
+        Arc::new(ServiceGatewayClientV1Facade::new(cp, dp, backend_selector));
     hub.register::<dyn ServiceGatewayClientV1>(oagw.clone());
     oagw
+}
+
+#[cfg(test)]
+pub use unavailable::UnavailableStorage;
+
+#[cfg(test)]
+mod unavailable {
+    use std::collections::HashSet;
+
+    use async_trait::async_trait;
+    use uuid::Uuid;
+
+    use crate::domain::model::{ListQuery, Route, Upstream};
+    use crate::domain::repo::{
+        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, Tags,
+        UpstreamRepository,
+    };
+
+    /// Repositories whose every call fails, as a database outage would.
+    pub struct UnavailableStorage;
+
+    fn unavailable() -> RepositoryError {
+        RepositoryError::Internal("storage unavailable".into())
+    }
+
+    #[async_trait]
+    impl UpstreamRepository for UnavailableStorage {
+        async fn create(&self, _: Upstream) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn get_by_id(&self, _: Uuid, _: Uuid) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list(&self, _: Uuid, _: &ListQuery) -> Result<Vec<Upstream>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn update(&self, _: Upstream) -> Result<Upstream, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_by_alias_for_tenants(
+            &self,
+            _: &str,
+            _: &HashSet<Uuid>,
+            _: Tags,
+        ) -> Result<Vec<Upstream>, RepositoryError> {
+            Err(unavailable())
+        }
+    }
+
+    #[async_trait]
+    impl RegistryRowRepository for UnavailableStorage {
+        async fn list_upstreams(&self) -> Result<Vec<Upstream>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_routes(&self) -> Result<Vec<Route>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete_upstream_if_unused(
+            &self,
+            _: Uuid,
+            _: Uuid,
+        ) -> Result<DeleteOutcome, RepositoryError> {
+            Err(unavailable())
+        }
+    }
+
+    #[async_trait]
+    impl RouteRepository for UnavailableStorage {
+        async fn create(&self, _: Route) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn get_by_id(&self, _: Uuid, _: Uuid) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list(
+            &self,
+            _: Uuid,
+            _: Option<Uuid>,
+            _: &ListQuery,
+        ) -> Result<Vec<Route>, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn find_matching_in_tenants(
+            &self,
+            _: &[Uuid],
+            _: &[Uuid],
+            _: &str,
+            _: &str,
+            _: Tags,
+        ) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn update(&self, _: Route) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+        async fn delete_by_upstream(&self, _: Uuid, _: Uuid) -> Result<(), RepositoryError> {
+            Err(unavailable())
+        }
+    }
 }

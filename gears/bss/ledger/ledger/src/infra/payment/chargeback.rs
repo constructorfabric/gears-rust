@@ -7,11 +7,14 @@
 //! Sequence for one phase (mirrors
 //! [`crate::infra::payment::settlement_return::SettlementReturnService`] plus a
 //! dispute pre-read + the net cash-leg read):
-//! 1. **dedup short-circuit** — a replayed phase returns the prior entry BEFORE
-//!    the state-dependent transition guard (which would spuriously reject a
-//!    replayed `opened`).
-//! 2. **read the dispute** — out-of-txn, scoped. Drives the variant selection,
+//! 1. **read the dispute** — out-of-txn, scoped. Drives the variant selection,
 //!    the transition guard, and the out-of-order decision.
+//! 2. **dedup short-circuit** — a replayed phase returns the prior entry BEFORE
+//!    the state-dependent transition guard (which would refuse a replayed
+//!    phase: its first post already moved the dispute). It runs AFTER the
+//!    dispute read: when that read sees the dispute write of a post with the
+//!    same key, this lookup sees that post's `POSTED` dedup row (both commit in
+//!    one transaction).
 //! 3. **out-of-order** (`won`/`lost` with NO prior dispute row, §4.7) — durably
 //!    ENQUEUE the request on `ledger_pending_event_queue` (`flow = CHARGEBACK`,
 //!    `business_id = dispute_id:cycle:phase`) and return [`ChargebackOutcome::Queued`]
@@ -25,7 +28,7 @@
 //! 6. **`CHARGEBACK_ON_REFUNDED` pre-check** — a `lost` whose clawback cannot fit
 //!    under the total money-out cap because the payment was already refunded
 //!    routes to a minimal exception stub (logged + a distinct `DomainError`;
-//!    the full exception queue is Slice 7 / VHP-1859).
+//!    the full exception queue is Slice 7).
 //! 7. **build → overwrite header → bind chart → post** with [`ChargebackSidecar`]
 //!    (the dispute-row write + the clawback counter bump + the in-txn
 //!    `dispute.recorded` outbox publish, all atomic with the entry).
@@ -259,7 +262,9 @@ enum IntakeOutcome {
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// The `opened` landed and the queued outcome posted — the queue row was
-    /// flipped `→APPLIED` atomically in the post txn.
+    /// flipped `→APPLIED` atomically in the post txn. When another drain claimed
+    /// the same row and applied it first, the post finds the dedup `POSTED` and
+    /// replays that entry ([`PostingRef::replayed`]): no second effect.
     Applied(PostingRef),
     /// The dispute's `opened` is STILL absent: leave the row `QUEUED`, do NOT
     /// bump attempts (an `opened` post will retry the drain).
@@ -274,8 +279,16 @@ pub enum ApplyOutcome {
 /// dispute phases (mirrors [`crate::infra::payment::allocate::DrainReport`]).
 #[derive(Debug, Default)]
 pub struct DrainReport {
+    /// Rows that posted + flipped `→APPLIED` this pass.
     pub applied: u64,
+    /// Rows another drain had already applied: the apply replayed the posted
+    /// entry and changed nothing.
+    pub replayed: u64,
+    /// Rows left `QUEUED` because the dispute's `opened` has not landed (no
+    /// attempt bump).
     pub not_ready: u64,
+    /// Rows left `QUEUED` after an apply-time guard/cap rejection (attempts
+    /// bumped).
     pub blocked: u64,
 }
 
@@ -409,6 +422,7 @@ impl ChargebackService {
                         tracing::info!(
                             tenant_id = %tenant,
                             applied = report.applied,
+                            replayed = report.replayed,
                             not_ready = report.not_ready,
                             blocked = report.blocked,
                             "bss-ledger: drain-on-opened applied queued dispute phases"
@@ -434,26 +448,38 @@ impl ChargebackService {
         scope: &AccessScope,
         req: ChargebackRequest,
     ) -> Result<ChargebackOutcome, DomainError> {
-        // 0. Early dedup short-circuit (BEFORE the dispute read + transition
-        //    guard), mirroring the allocate/credit short-circuit. The transition
-        //    guard below is state-dependent, so a replayed `opened` would
-        //    otherwise be spuriously rejected (its row is already `OPENED`). A
-        //    `POSTED` row returns the prior entry as a `Recorded` replay; a
-        //    `QUEUED` row (an out-of-order phase already enqueued) returns the
-        //    same `Queued` handle. Racy by nature (the authoritative dedup is the
-        //    engine's in-txn claim / the intake's `claim_queued`).
-        let business_id = req.business_id();
-        if let Some(outcome) = self.replay_short_circuit(scope, &req, &business_id).await? {
-            return Ok(outcome);
-        }
-
-        // 1. Read the dispute's current state (out-of-txn, scoped). Drives the
+        // 0. Read the dispute's current state (out-of-txn, scoped). Drives the
         //    variant selection + transition guard + the out-of-order decision.
         let existing = self
             .dispute_repo
             .read_dispute(scope, req.tenant_id, &req.dispute_id)
             .await
             .map_err(|e| DomainError::Internal(format!("read dispute: {e}")))?;
+
+        // 1. Dedup short-circuit (BEFORE the transition guard), mirroring the
+        //    allocate/credit short-circuit. The transition guard below is
+        //    state-dependent: a replayed phase finds the dispute already moved by
+        //    its first post (a replayed `opened` finds it `OPENED`, a replayed
+        //    `won`/`lost` finds it resolved), so the guard would refuse it. A
+        //    `POSTED` row returns the prior entry as a `Recorded` replay; a
+        //    `QUEUED` row (an out-of-order phase already enqueued) returns the
+        //    same `Queued` handle.
+        //
+        //    The lookup runs AFTER the dispute read. A post commits its dedup row
+        //    and its dispute write in one transaction, so when the read above
+        //    sees the dispute write of a post with this key, this lookup sees its
+        //    `POSTED` row. A lookup before the read misses a post that commits
+        //    between the two reads, and the guard then refuses this repeat as an
+        //    invalid transition instead of replaying it. Otherwise racy by nature
+        //    (the authoritative dedup is the engine's in-txn claim / the intake's
+        //    `claim_queued`). The later out-of-txn reads are not covered: a repeat
+        //    whose lookup runs before the first post commits, and whose refund
+        //    guard or cross-currency carry-forward reads after it, can still fail
+        //    there before it reaches the engine's claim.
+        let business_id = req.business_id();
+        if let Some(outcome) = self.replay_short_circuit(scope, &req, &business_id).await? {
+            return Ok(outcome);
+        }
 
         // 2. Out-of-order (§4.7): a `won`/`lost` whose dispute has NO prior row
         //    (no `opened` landed yet) MUST NOT post a partial outcome — enqueue it
@@ -558,7 +584,7 @@ impl ChargebackService {
         // 5. `CHARGEBACK_ON_REFUNDED` pre-check: a `lost` cash-out whose clawback
         //    cannot fit under the total money-out cap because the payment was
         //    already refunded routes to a minimal exception stub (logged + a
-        //    distinct error; the full exception queue is Slice 7 / VHP-1859). The
+        //    distinct error; the full exception queue is Slice 7). The
         //    cap CHECK is the authoritative backstop; this pre-check turns the
         //    specific already-refunded case into its own signal rather than a
         //    generic `ChargebackExceedsSettled`.
@@ -632,10 +658,12 @@ impl ChargebackService {
     ///   return a [`ChargebackOutcome::Recorded`] replay.
     /// - `QUEUED` ⇒ an out-of-order phase already enqueued: read the queue row's
     ///   `queued_at` and return the same [`ChargebackOutcome::Queued`] handle.
-    /// - `CLAIMED` / absent ⇒ `None`: fall through to the dispute read.
+    /// - `CLAIMED` / absent ⇒ `None`: fall through to the transition guard.
     ///
     /// Runs out-of-txn (racy by nature); the authoritative dedup is the engine's
-    /// in-txn claim (inline) or the intake's `claim_queued`.
+    /// in-txn claim (inline) or the intake's `claim_queued`. Call it after the
+    /// dispute read that the transition guard checks, never before it (see
+    /// [`Self::record_inner`]).
     async fn replay_short_circuit(
         &self,
         scope: &AccessScope,
@@ -810,8 +838,9 @@ impl ChargebackService {
     /// does the dispute writes AND flips the queue row `→APPLIED`, both in the
     /// post txn. Returns [`ApplyOutcome::NotReady`] when the `opened` is STILL
     /// absent (leave `QUEUED`, no attempt bump), [`ApplyOutcome::Applied`] on a
-    /// successful post, or [`ApplyOutcome::Blocked`] on an apply-time guard/cap
-    /// rejection (caller bumps attempts + leaves `QUEUED`).
+    /// successful post (or on a replay when another drain applied the row first,
+    /// [`PostingRef::replayed`]), or [`ApplyOutcome::Blocked`] on an apply-time
+    /// guard/cap rejection (caller bumps attempts + leaves `QUEUED`).
     ///
     /// `pub(crate)` so the [`crate::infra::jobs::queue_applier`] sweep can drive a
     /// single row; the public surface is [`Self::drain`].
@@ -976,7 +1005,8 @@ impl ChargebackService {
     /// Drain up to `limit` due queued dispute phases for one tenant: claim them
     /// under `SKIP LOCKED` in a short claim txn, then apply EACH in its OWN txn
     /// (the "apply is a second txn" shape, §4.7). `Blocked` ⇒ bump attempts +
-    /// back off via `apply_after`; `NotReady` ⇒ skip (no bump). Mirrors
+    /// back off via `apply_after`; `NotReady` ⇒ skip (no bump); a replay of a row
+    /// another drain applied first ⇒ `replayed`, not `applied`. Mirrors
     /// [`crate::infra::payment::allocate::AllocationService::drain`].
     ///
     /// # Errors
@@ -1008,6 +1038,7 @@ impl ChargebackService {
         let mut report = DrainReport::default();
         for row in claimed {
             match self.apply_queued_row(ctx, scope, &row).await {
+                Ok(ApplyOutcome::Applied(posting)) if posting.replayed => report.replayed += 1,
                 Ok(ApplyOutcome::Applied(_)) => report.applied += 1,
                 Ok(ApplyOutcome::NotReady) => report.not_ready += 1,
                 Ok(ApplyOutcome::Blocked(err)) => {
@@ -1127,7 +1158,7 @@ impl ChargebackService {
     /// (`refunded_minor + clawed_back_minor + clawed_back > settled_minor`) AND
     /// where the payment was already refunded (`refunded_minor > 0`) routes to the
     /// minimal exception stub: a logged skip + [`DomainError::ChargebackOnRefunded`]
-    /// (the full exception queue is Slice 7 / VHP-1859). When the payment was NOT
+    /// (the full exception queue is Slice 7). When the payment was NOT
     /// refunded the over-cap is a plain `ChargebackExceedsSettled` (left to the
     /// sidecar's cap CHECK). A missing settlement is left to the sidecar too (the
     /// clawback bump's `rows_affected == 0` surfaces as Internal — a chargeback on
@@ -1345,9 +1376,10 @@ impl ChargebackService {
 /// posting transaction) with the one dispute state machine
 /// ([`check_transition`], design §2): `∅ → opened` at cycle 1,
 /// `{won,lost} → opened` at the next cycle for the same payment, and
-/// `opened → {won,lost}` at the open cycle. The repository write re-checks the
-/// same rules on the row it reads inside the transaction, so a race between
-/// this read and the post is still refused.
+/// `opened → {won,lost}` at the open cycle. The post re-checks the same rules on
+/// the row it reads inside its transaction (an outcome before projection, see
+/// `ChargebackSidecar::check_before_projection`), so a race between this read
+/// and the post is still refused as an invalid transition.
 fn guard_transition(
     existing: Option<&DisputeState>,
     req: &ChargebackRequest,
@@ -1517,6 +1549,14 @@ struct QueuedChargebackApplySidecar {
 
 #[async_trait::async_trait]
 impl PostSidecar for QueuedChargebackApplySidecar {
+    async fn check_before_projection(
+        &self,
+        txn: &DbTx<'_>,
+        scope: &AccessScope,
+    ) -> Result<(), DomainError> {
+        self.inner.check_before_projection(txn, scope).await
+    }
+
     async fn run(
         &self,
         txn: &DbTx<'_>,
@@ -1558,3 +1598,7 @@ fn clawback_fits(
 #[cfg(test)]
 #[path = "chargeback_cap_tests.rs"]
 mod cap_tests;
+
+#[cfg(test)]
+#[path = "chargeback_sidecar_tests.rs"]
+mod sidecar_tests;

@@ -1,10 +1,8 @@
 Created:  2026-07-07 by Virtuozzo International GmbH
 Updated:  2026-07-07 by Virtuozzo International GmbH
 
-<!-- migration-note: converted from the legacy vhp-architecture design slice
-     docs/bss/design/DESIGN-billing-ledger-balances-202606091200/04-DESIGN-billing-ledger-asc606-recognition-202606091400.md
-     to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows). The original is preserved unchanged in the
-     vhp-architecture repository. All Foundation
+<!-- migration-note: converted from the legacy design slice
+     to the gears-sdlc design-slice layout (cpt-* sub-IDs, CDSL flows). All Foundation
      engine mechanics (PostingService, IdempotencyGate, BalanceProjector, MoneyModule, FiscalPeriodGuard, commit
      trigger, TieOutJob, outbox relay, total fixed lock order) are specified in ./01-repository-foundation.md and are referenced
      here, not restated. -->

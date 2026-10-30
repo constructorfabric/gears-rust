@@ -271,7 +271,7 @@ pub enum ImplementationPayload {
     AdapterRef { definition_id: String },
 }
 
-/// Function definition. Identity is the GTS instance address (external).
+/// Function definition. Identity is the registered GTS type ID (external, ends in `~`).
 /// Function type (function/workflow) is derived from the GTS chain.
 #[derive(Clone, Debug)]
 pub struct FunctionDefinition {
@@ -407,9 +407,9 @@ pub struct DeadLetterQueueConfig {
     pub enabled: bool,
     /// Retry policy before moving to DLQ.
     pub retry_policy: RetryPolicy,
-    /// GTS type ID of the topic to publish dead-lettered events to,
-    /// or None for the platform-default DLQ topic. Topic type and
-    /// management are defined by the EventBroker.
+    /// GTS instance ID of the topic to publish dead-lettered events to
+    /// (an instance of `gts.cf.core.events.topic.v1~`), or None for the
+    /// platform-default DLQ topic. Topics are managed by the EventBroker.
     pub dlq_topic: Option<GtsId>,
 }
 

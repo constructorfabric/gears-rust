@@ -1449,7 +1449,7 @@ configuration values and the startup nesting check),
 **Decision**: the six named process events are published through
 `event-broker-sdk::DbProducer` with feature `outbox`, backed by `toolkit_db::outbox`, in managed
 `ProducerMode::Chained` — the same path Orders Lifecycle adopted in its
-[`ADR-0006`](../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md)
+[`ADR-0006`](../../orders/docs/ADR/0006-cpt-cf-bss-orders-adr-outbox-publication.md)
 and D-17. The producer queue is `bss-orders-workflow-events` with `Partitions::of(16)` and the
 high-throughput profile; `orderId` is the GTS event partition key; envelope tenancy is
 platform-root per the Lifecycle D-95 precedent, with the resource and seller axes as `data`
@@ -1582,8 +1582,8 @@ belong to the identity platform. No identity-erasure UPDATE grant, historical ac
 chain recalculation or verifier exemption exists; the store's triggers reject the UPDATE an
 in-place pseudonymisation would need. Identity stability, non-reuse and deletion lifecycle are the
 shared p2 platform follow-up Lifecycle registered as
-`cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`
-([Lifecycle `UPSTREAM_REQS.md §2.8`](../../orders-lifecycle/docs/UPSTREAM_REQS.md#28-identity-platform));
+`cpt-cf-bss-orders-upreq-audit-identity-lifecycle`
+([Lifecycle `UPSTREAM_REQS.md §2.8`](../../orders/docs/UPSTREAM_REQS.md#28-identity-platform));
 this gear references it and does not copy it. The privacy ruling of `UPSTREAM_REQS.md` §2.6 stays
 open and is not waived.
 
@@ -1794,7 +1794,7 @@ engine data as much as task inputs are: the start trigger's input is the raw `$w
 (Serverless Workflow DSL 1.0.0, dsl.md *Runtime expression arguments*) and a `listen` output is
 the array of consumed events (dsl-reference.md *Listen*), while Lifecycle's events as published
 carry tenant axes, per-line net components, the deciding authority and actor and reason fields
-([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
 lines 2396–2406). The start trigger and every Lifecycle, Generic Approval and Subscriptions
 `listen` **MUST** keep only references. Two routes are registered and either closes the gap: the
 platform persists only the members the definition selects
@@ -3214,7 +3214,7 @@ operator's action had no consumer and the SLA never breached (OW2-12). Nothing w
 at `pre-fence`, because the order continues, and its only meaningful resolution was always a new
 cancel. **Precedent**: Lifecycle's late authorization conflict is a refusal with an audit entry,
 "with no automatic reauthorization"; "a subsequent attempt must … obtain fresh authorization"
-([Lifecycle `08-read-and-authz.md:1286-1293`](../../orders-lifecycle/docs/features/08-read-and-authz.md)).
+([Lifecycle `08-read-and-authz.md:1286-1293`](../../orders/docs/features/08-read-and-authz.md)).
 
 **Propagated**: `design/08-hold-and-cancel.md` §1.2, §3.2, §3.3, §3.6, §4.3;
 `design/09-read-and-authz.md` §4.4; `design/07-manual-tasks.md` §3.2, §3.3, §4.4;
@@ -3300,7 +3300,7 @@ what a fire sends. A probe that replayed its first `available` would never detec
 `circuit-breaker-open` would, under D-114, fault the invocation exactly when the approval service
 is down. **Precedent**: Lifecycle's expiry scheduler answers `expiry-not-due` against the stored
 effective TTL and records the outcome
-([Lifecycle `07-hold-and-expiry.md:358`](../../orders-lifecycle/docs/features/07-hold-and-expiry.md)).
+([Lifecycle `07-hold-and-expiry.md:358`](../../orders/docs/features/07-hold-and-expiry.md)).
 The round rule is D-102.
 
 **Propagated**: `design/03-approval-execution.md` §3.2, §3.3, §3.6, §3.7.
@@ -6191,7 +6191,7 @@ contradict by silence; none warrants a design of its own here.
 
 ### D-200 (H) The intent outcome event is `SubscriptionTransitionOutcome`; the two listen arms are its outcomes
 
-**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-transition-outcome-echo`; carries `SUB-O16`)*
+**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-upreq-transition-outcome-echo`; carries `SUB-O16`)*
 
 **Decision**: the event Subscriptions emits for every provisioning intent — create, activate,
 draft void, activated cancel — is one `SubscriptionTransitionOutcome { transition_request_id,
@@ -6233,7 +6233,7 @@ would have to resolve.
 
 ### D-202 (M) `reconcile-intent` settles a timed-out create through Subscriptions' `settle_create` before declaring it unresolved
 
-**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-settle-create`; extends `SUB-O13`)*
+**Accepted (2026-10-02).** *(co-signed with Lifecycle `cpt-cf-bss-orders-upreq-settle-create`; extends `SUB-O13`)*
 
 **Decision**: when `reconcile-intent` finds a wave-1 create with no outcome and no row at
 Subscriptions, it calls `settle_create(create_key) → NoDraft { tombstone_id } | DraftFound {

@@ -14,7 +14,7 @@
 //! today (D-440: `current_price` and the approved prices by date) are left out by [`undated`]
 //! before that: a frozen document holds nothing computed from the day it is read.
 //!
-//! The calendar (tenant settings: timing `arrears`, rounding `half_even`, GL `9000`, tax `std`,
+//! The calendar (tenant settings: timing `arrears`, GL `9000`, tax `std`,
 //! invoice-line templates for `recurring` and `usage`; dimension `region` = eu, us, apac, latam —
 //! apac and latam registered after revision 2 was published, `mena` registered before and
 //! removed, never priced):
@@ -441,6 +441,8 @@ impl Writer<'_> {
                 version_no: p.version_no,
                 dim_value: p.dim.map(str::to_owned),
                 price_json: p.price,
+                currency: "EUR".into(),
+                currency_scale: 2,
                 min_fee: p.min_fee.map(str::to_owned),
                 eligibility: p.eligibility.into(),
                 effective_from: date(p.from),
@@ -478,7 +480,9 @@ impl Writer<'_> {
             version_no: p.version_no,
             dim_value: p.dim_value.clone(),
             price_json: serde_json::to_value(p.price.as_ref().unwrap()).unwrap(),
-            min_fee: p.min_fee.map(|fee| fee.to_string()),
+            currency: p.currency.code().into(),
+            currency_scale: i16::from(p.currency.scale()),
+            min_fee: p.min_fee.map(bss_money::canonical_decimal),
             eligibility: p.eligibility.as_str().into(),
             effective_from: p.effective_from,
             effective_to: p.effective_to,
@@ -903,7 +907,6 @@ async fn book_and_entries(w: &mut Writer<'_>) {
         settings::Model {
             tenant_id: w.tenant,
             default_timing: "arrears".into(),
-            default_rounding: "half_even".into(),
             default_gl: Some("9000".into()),
             default_tax_category: Some("std".into()),
             invoice_line_templates: json!({
@@ -1011,7 +1014,7 @@ async fn pro_prices(w: &mut Writer<'_>) {
             "entry:pro",
             1,
             "flat",
-            flat("10.00"),
+            flat("10"),
             "2026-01-01",
             U1,
         )
@@ -1025,7 +1028,7 @@ async fn pro_prices(w: &mut Writer<'_>) {
             "entry:pro",
             2,
             "flat",
-            flat("12.00"),
+            flat("12"),
             "2026-11-01",
             U3,
         )
@@ -1038,16 +1041,16 @@ async fn pro_prices(w: &mut Writer<'_>) {
             "entry:pro",
             3,
             "flat",
-            flat("15.00"),
+            flat("15"),
             "2026-12-01",
             U3,
         )
     })
     .await;
     for (name, version_no, amount, from, state) in [
-        ("price:pro-draft", 4, "18.00", "2027-01-01", "draft"),
-        ("price:pro-pending", 5, "19.00", "2027-02-01", "pending"),
-        ("price:pro-rejected", 6, "20.00", "2027-03-01", "rejected"),
+        ("price:pro-draft", 4, "18", "2027-01-01", "draft"),
+        ("price:pro-pending", 5, "19", "2027-02-01", "pending"),
+        ("price:pro-rejected", 6, "20", "2027-03-01", "rejected"),
     ] {
         w.price(P {
             state,
@@ -1072,21 +1075,21 @@ async fn usage_prices(w: &mut Writer<'_>) {
     // `new` from October; latam a temporary price on a value with no chain of its own (one closed
     // price, no return).
     w.price(P {
-        min_fee: Some("5.00"),
+        min_fee: Some("5"),
         to: Some("2027-01-01"),
         ..P::approved(
             "price:storage-default",
             "entry:storage",
             1,
             "per_unit",
-            rate("0.10"),
+            rate("0.1"),
             "2026-01-01",
             U1,
         )
     })
     .await;
     w.price(P {
-        min_fee: Some("5.00"),
+        min_fee: Some("5"),
         ..P::approved(
             "price:storage-default-2027",
             "entry:storage",
@@ -1200,7 +1203,7 @@ async fn usage_prices(w: &mut Writer<'_>) {
             None,
             "graduated",
             json!({ "tiers": [
-                { "up_to": "1000", "rate": "0.010" },
+                { "up_to": "1000", "rate": "0.01" },
                 { "up_to": null, "rate": "0.008" }
             ] }),
         ),
@@ -1221,7 +1224,7 @@ async fn usage_prices(w: &mut Writer<'_>) {
             1,
             Some("us"),
             "package",
-            json!({ "package_size": "1000", "package_price": "5.00" }),
+            json!({ "package_size": "1000", "package_price": "5" }),
         ),
     ] {
         w.price(P {
@@ -1433,6 +1436,7 @@ async fn nested_pairs(w: &mut Writer<'_>, catalog: &Catalog) {
         version_no,
         dim_value: None,
         model: Model::Flat,
+        currency: bss_money::CurrencySpec::try_new("EUR".into(), 2).unwrap(),
         price: Some(PriceData::Flat {
             amount: amount.parse().unwrap(),
         }),
@@ -1449,10 +1453,10 @@ async fn nested_pairs(w: &mut Writer<'_>, catalog: &Catalog) {
     let mut chain = vec![flat_price(
         w.names.mint("price:promo-base"),
         1,
-        "10.00",
+        "10",
         "2026-01-01",
     )];
-    let outer = flat_price(w.names.mint("price:promo-outer"), 2, "8.00", "2026-10-01");
+    let outer = flat_price(w.names.mint("price:promo-outer"), 2, "8", "2026-10-01");
     let outer = chains::temporary(
         &chain,
         outer,
@@ -1462,7 +1466,7 @@ async fn nested_pairs(w: &mut Writer<'_>, catalog: &Catalog) {
     .unwrap();
     chain.extend(outer);
     chains::normalize_windows(&mut chain);
-    let inner = flat_price(w.names.mint("price:promo-inner"), 4, "5.00", "2026-10-15");
+    let inner = flat_price(w.names.mint("price:promo-inner"), 4, "5", "2026-10-15");
     let inner = chains::temporary(
         &chain,
         inner,
@@ -1534,7 +1538,7 @@ async fn other_tenant(f: &Fixture, names: &mut Names) -> Uuid {
         "entry:other-tenant",
         1,
         "flat",
-        flat("10.00"),
+        flat("10"),
         "2026-01-01",
         ("unit:other-tenant", PRICES_1),
     ))
@@ -1729,7 +1733,7 @@ fn contract(golden: &str) -> (&'static str, Vec<Ask>) {
              version's template, else the tenant template for the charge kind (an item without an entry: its SKU's type), \
              else null; GL code, tax category and billing timing from the SKU version, else the tenant (PRD AC #13: advance \
              on the SKU beats arrears as the tenant default); a SKU Products does not know has no version; the revision \
-             carries the book's currency and scale and the tenant's rounding",
+             carries the book's currency and scale",
             vec![
                 ask(
                     "revision 1 on 2026-09-15: the entry's line, the tenant's line, no line at all",

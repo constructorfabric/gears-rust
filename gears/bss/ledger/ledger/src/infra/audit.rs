@@ -1,6 +1,6 @@
 //! Secured audit (Slice 6 Phase 2 Group 2A store + the Slice 3 ↔ Slice 6 sink seam).
 //!
-//! Slice 6 (audit, VHP-1858) owns the append-only `secured_audit_record` store
+//! Slice 6 (audit) owns the append-only `secured_audit_record` store
 //! with its own per-tenant tamper-evidence hash chain (`event_type` / `retrieval`
 //! / `store`). Each appended record is born sealed (`row_hash` / `prev_hash`
 //! non-NULL) and is never updated.

@@ -7,8 +7,8 @@ provenance = ["inst-tb-supersession-units (backup)", "inst-pk-window (backup)", 
 #
 # `package-size-change-rejected` says "the block price may move freely; the block
 # size may not" - and it moves **both** fields on its successor: 1000 -> 500 and
-# 2500 -> 1400. So it cannot tell the two apart. A gear that had put
-# `package_price_minor` into the preserved set alongside `package_size` would
+# 25 -> 14. So it cannot tell the two apart. A gear that had put
+# `package_price` into the preserved set alongside `package_size` would
 # have reproduced that case exactly, and the corpus would have agreed with it,
 # because the only thing either side observes is that *something* moved and the
 # row was refused.
@@ -37,7 +37,7 @@ meter                   = "api.calls"
 billing_granularity     = "whole_unit"
 tier_aggregation_window = "invoice_period"
 package_size            = 1000
-package_price_minor     = 2500
+package_price           = "25"
 
 [successor]
 model_kind              = "package"
@@ -47,7 +47,7 @@ meter                   = "api.calls"
 billing_granularity     = "whole_unit"
 tier_aggregation_window = "invoice_period"
 package_size            = 1000
-package_price_minor     = 3000
+package_price           = "30"
 
 [[assert]]
 expect = { publish = "accepted" }

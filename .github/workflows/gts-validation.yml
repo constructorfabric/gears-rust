@@ -38,19 +38,19 @@ jobs:
           rustup show
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # cache-bin caches ${CARGO_HOME}/bin, so the gts-validator binary is
           # restored across runs instead of being recompiled from source every
           # time (doc-only PRs were paying a multi-minute build otherwise).
           cache-bin: true
           cache-targets: false
-          shared-key: gts-validator-0.10.1
+          shared-key: gts-validator-0.16.1
 
       - name: Install gts-validator
         # Pinned + --locked for reproducibility. On a cache hit the binary is
         # already present, so cargo install detects it and skips the compile.
-        run: cargo install gts-validator --version 0.10.1 --locked
+        run: cargo install gts-validator --version 0.16.1 --locked
 
       - name: Validate GTS identifiers
         run: make gts-docs

@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The resolver over the real repositories and an in-memory database.
 //!
 //! The tree is `root → a → b`, with `c` a sibling of `a` and `s` a standalone
@@ -513,6 +512,7 @@ mod access {
                         tenant_id: tenant,
                         access,
                         set_by: "root-admin".to_owned(),
+                        set_by_tenant: None,
                     },
                     None,
                 )
@@ -552,6 +552,29 @@ mod access {
     }
 }
 
+/// The review listing's rows over `tenants`, under an unrestricted caller.
+async fn review_rows(h: &Harness, tenants: &[Uuid]) -> Vec<crate::domain::value::StoredValue> {
+    use crate::domain::category::visibility::DomainVisibility;
+    use crate::domain::value::ReviewRequest;
+    let conn = h.db.conn().expect("connection");
+    let query = toolkit_odata::ODataQuery::default();
+    h.resolver
+        .review_page(
+            &conn,
+            &ReviewRequest {
+                scope: &AccessScope::allow_all(),
+                visibility: &DomainVisibility::Unrestricted,
+                hidden_for: &[],
+                tenant_ids: tenants,
+                declarations: None,
+                query: &query,
+            },
+        )
+        .await
+        .expect("listing")
+        .items
+}
+
 #[tokio::test]
 async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_listing_shows() {
     let h = Harness::new().await;
@@ -576,18 +599,13 @@ async fn a_flagged_override_stays_in_storage_and_is_what_the_administrative_list
     // The administrative listing is the other half: it reads rows rather than
     // resolved values, so the flagged one is exactly what it reports, with the
     // detail that explains it.
-    let conn = h.db.conn().expect("connection");
     let (mut tenants, _) = h
         .hierarchy
         .descendants_bfs(t.root, 100)
         .await
         .expect("descendants");
     tenants.push(t.root);
-    let flagged = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &tenants, 1_000)
-        .await
-        .expect("listing");
+    let flagged = review_rows(&h, &tenants).await;
     assert_eq!(flagged.len(), 1);
     assert_eq!(flagged[0].tenant_id, t.a);
     assert_eq!(flagged[0].value, Some(json!("no longer a boolean")));
@@ -609,7 +627,6 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
 
     // The listing walks the caller's subtree as the hierarchy reports it, and
     // the hierarchy does not traverse into a standalone tenant from above.
-    let conn = h.db.conn().expect("connection");
     let (mut tenants, _) = h
         .hierarchy
         .descendants_bfs(t.root, 100)
@@ -617,21 +634,13 @@ async fn the_flagged_listing_stops_at_a_standalone_descendant() {
         .expect("descendants");
     tenants.push(t.root);
     assert!(!tenants.contains(&t.s), "the subtree stops at the seam");
-    let flagged = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &tenants, 1_000)
-        .await
-        .expect("listing");
+    let flagged = review_rows(&h, &tenants).await;
     let listed: Vec<uuid::Uuid> = flagged.iter().map(|r| r.tenant_id).collect();
     assert_eq!(listed, vec![t.a]);
 
     // The row is there; it is simply not this caller's to see. Asked for
     // directly, the standalone tenant's own listing reports it.
-    let own = h
-        .resolver
-        .flagged_overrides(&conn, &[d], &[t.s], 1_000)
-        .await
-        .expect("listing");
+    let own = review_rows(&h, &[t.s]).await;
     assert_eq!(own.len(), 1);
     assert_eq!(own[0].value, Some(json!("bad at s")));
 }
@@ -1113,4 +1122,396 @@ async fn a_subtree_walk_reads_each_class_the_way_a_read_does() {
             .await,
         Err(DomainError::Retired { .. })
     ));
+}
+
+#[tokio::test]
+async fn the_named_keys_a_caller_may_see_come_from_one_read_through_the_pages_own_gates() {
+    use crate::domain::access::TenantAccess;
+    use crate::domain::category::visibility::DomainVisibility;
+    use crate::domain::declaration::repo::DeclarationRepository as _;
+    use crate::infra::storage::declaration_repo::DeclarationRepo;
+
+    let h = Harness::new().await;
+    let open = h.declare("open", scope_class::CASCADING, json!(1)).await;
+    let walled = h.declare("walled", scope_class::CASCADING, json!(1)).await;
+    let concealed = h
+        .declare("concealed", scope_class::CASCADING, json!(1))
+        .await;
+    h.bind_domain(walled, "commercial").await;
+    {
+        use crate::domain::access::AccessRepository as _;
+        let conn = h.db.conn().expect("connection");
+        crate::infra::storage::access_repo::AccessRepo
+            .upsert(
+                &conn,
+                &AccessScope::allow_all(),
+                crate::domain::access::RestrictionDraft {
+                    declaration_id: concealed,
+                    tenant_id: h.tree.a,
+                    access: TenantAccess::Hidden,
+                    set_by: "test".to_owned(),
+                    set_by_tenant: None,
+                },
+                None,
+            )
+            .await
+            .expect("restriction");
+    }
+    let named: Vec<String> = ["open", "walled", "concealed", "never_declared"]
+        .iter()
+        .map(|n| h.key(n).to_string())
+        .collect();
+    let conn = h.db.conn().expect("connection");
+    let chain = vec![h.tree.root, h.tree.a];
+    let seen = |visibility: DomainVisibility, scope: AccessScope, chain: Vec<Uuid>| {
+        let (conn, named) = (&conn, &named);
+        async move {
+            let mut keys = DeclarationRepo
+                .visible_keys(conn, &scope, &visibility, &chain, named)
+                .await
+                .expect("keys");
+            keys.sort();
+            keys
+        }
+    };
+    let key = |n: &str| h.key(n).to_string();
+
+    // Another domain's administrator, on a chain that hides one setting: only
+    // the undomained, unhidden one; a key never declared is not an answer.
+    assert_eq!(
+        seen(
+            DomainVisibility::Restricted(vec!["infra".to_owned()]),
+            AccessScope::allow_all(),
+            chain.clone()
+        )
+        .await,
+        vec![key("open")]
+    );
+    // The domain's own administrator sees its setting too, still not the hidden.
+    assert_eq!(
+        seen(
+            DomainVisibility::Restricted(vec!["commercial".to_owned()]),
+            AccessScope::allow_all(),
+            chain.clone()
+        )
+        .await,
+        {
+            let mut v = vec![key("open"), key("walled")];
+            v.sort();
+            v
+        }
+    );
+    // A chain with no restriction on it hides nothing.
+    assert_eq!(
+        seen(
+            DomainVisibility::Unrestricted,
+            AccessScope::allow_all(),
+            vec![h.tree.root]
+        )
+        .await
+        .len(),
+        3
+    );
+    // A grant on one declaration leaves the others unseen.
+    assert_eq!(
+        seen(
+            DomainVisibility::Unrestricted,
+            AccessScope::for_resource(open),
+            Vec::new()
+        )
+        .await,
+        vec![key("open")]
+    );
+}
+
+#[tokio::test]
+async fn a_browse_batch_reads_the_values_once_whatever_its_size() {
+    use crate::domain::declaration::DeclarationRepository as _;
+    let (h, recorder) = Harness::recorded().await;
+    let (root, b) = (h.tree.root, h.tree.b);
+    let mut ids = Vec::new();
+    for i in 0..12 {
+        let class = [
+            scope_class::GLOBAL,
+            scope_class::CASCADING,
+            scope_class::LOCAL,
+        ][i % 3];
+        let id = h
+            .declare(&format!("bulk_{i:02}"), class, json!("default"))
+            .await;
+        h.set(id, root, json!(format!("root-{i}"))).await;
+        if i.is_multiple_of(2) {
+            h.set(id, b, json!(format!("own-{i}"))).await;
+        }
+        ids.push(id);
+    }
+    let conn = h.db.conn().expect("connection");
+    let declarations = crate::infra::storage::declaration_repo::DeclarationRepo
+        .find_by_ids(&conn, &AccessScope::allow_all(), &ids)
+        .await
+        .expect("declarations");
+    assert_eq!(declarations.len(), 12);
+    recorder.clear();
+    let outcomes = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    assert_eq!(value_reads(&recorder), 1, "one value read for the batch");
+    assert_eq!(h.hierarchy.chain_calls(), 1, "one chain for the batch");
+    for (declaration, outcome) in declarations.iter().zip(outcomes) {
+        let effective = outcome.expect("resolves");
+        let i: usize = declaration.leaf_slug[5..].parse().expect("index");
+        let own = i.is_multiple_of(2);
+        let expected = match (declaration.scope_class.as_str(), own) {
+            (scope_class::GLOBAL, _) | (scope_class::CASCADING, false) => format!("root-{i}"),
+            (_, true) => format!("own-{i}"),
+            // A local setting reads its own row only: none, so its default.
+            (_, false) => "default".to_owned(),
+        };
+        assert_eq!(effective.value, json!(expected), "{}", declaration.key);
+        if declaration.scope_class == scope_class::GLOBAL {
+            assert!(effective.own_row.is_none(), "{}", declaration.key);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_batch_whose_chain_cannot_be_read_fails_each_miss_and_serves_the_cached() {
+    use crate::domain::declaration::DeclarationRepository as _;
+    let h = Harness::new().await;
+    let b = h.tree.b;
+    let cached = h.declare("warm", scope_class::CASCADING, json!("x")).await;
+    let cold = h.declare("cold", scope_class::CASCADING, json!("x")).await;
+    let conn = h.db.conn().expect("connection");
+    let declarations = crate::infra::storage::declaration_repo::DeclarationRepo
+        .find_by_ids(&conn, &AccessScope::allow_all(), &[cached, cold])
+        .await
+        .expect("declarations");
+    h.resolve("warm", tenant(b)).await.expect("warms the cache");
+    h.hierarchy.set_unavailable(true);
+    let mut outcomes = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    let first_cold = declarations
+        .iter()
+        .position(|d| d.id == cold)
+        .expect("cold");
+    let failed = outcomes.remove(first_cold);
+    assert!(
+        matches!(failed, Err(DomainError::Unavailable { .. })),
+        "{failed:?}"
+    );
+    assert!(outcomes.remove(0).is_ok(), "the cached one is served");
+}
+
+/// A validator that counts the trait lookups it is asked for.
+struct CountingValidator {
+    inner: crate::infra::type_validator::GtsTypeValidator<crate::test_support::FakeSource>,
+    traits: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::validation::TypeValidator for CountingValidator {
+    async fn validate_value(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<crate::domain::validation::ValidationResult, DomainError> {
+        self.inner.validate_value(value_type_id, value).await
+    }
+
+    async fn resolve_traits(
+        &self,
+        value_type_id: &str,
+    ) -> Result<crate::domain::validation::TraitSet, DomainError> {
+        self.traits
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.resolve_traits(value_type_id).await
+    }
+}
+
+async fn declarations_of(
+    h: &Harness,
+    ids: &[Uuid],
+) -> Vec<crate::domain::declaration::Declaration> {
+    use crate::domain::declaration::DeclarationRepository as _;
+    let conn = h.db.conn().expect("connection");
+    crate::infra::storage::declaration_repo::DeclarationRepo
+        .find_by_ids(&conn, &AccessScope::allow_all(), ids)
+        .await
+        .expect("declarations")
+}
+
+fn value_reads(recorder: &toolkit_db::test_support::QueryRecorder) -> usize {
+    recorder
+        .events()
+        .iter()
+        .filter(|event| event.table.as_deref() == Some("setting_values"))
+        .count()
+}
+
+#[tokio::test]
+async fn a_batch_resolves_exactly_as_the_single_reads_do() {
+    let h = Harness::new().await;
+    let (root, a, b) = (h.tree.root, h.tree.a, h.tree.b);
+    let global = h.declare("g", scope_class::GLOBAL, json!("d")).await;
+    h.set(global, root, json!("g-root")).await;
+    let cascading = h.declare("c", scope_class::CASCADING, json!("d")).await;
+    for (tenant, value) in [(root, "c-root"), (a, "c-a"), (b, "c-b")] {
+        h.set(cascading, tenant, json!(value)).await;
+    }
+    let local = h.declare("l", scope_class::LOCAL, json!("d")).await;
+    h.set(local, b, json!("l-b")).await;
+    h.set(local, root, json!("l-root")).await;
+    let flagged = h.declare("f", scope_class::CASCADING, json!("d")).await;
+    h.set(flagged, root, json!("f-root")).await;
+    h.set_flagged(flagged, b, json!("f-bad")).await;
+    let secret = h
+        .declare_typed("s", scope_class::CASCADING, json!("d"), SECRET, "secret")
+        .await;
+    h.set_secret(secret, root, "handle").await;
+    let subject = h.declare("x", scope_class::CASCADING, json!("d")).await;
+    h.set(subject, root, json!("x-root")).await;
+    h.set_for_subject(subject, b, json!("x-subject")).await;
+    let retired = h.declare("r", scope_class::CASCADING, json!("d")).await;
+    h.retire(retired).await;
+    let warm = h.declare("w", scope_class::CASCADING, json!("d")).await;
+    h.set(warm, a, json!("w-a")).await;
+    h.resolve("w", tenant(b)).await.expect("warms the cache");
+
+    let ids = [
+        global, cascading, local, flagged, secret, subject, retired, warm,
+    ];
+    let declarations = declarations_of(&h, &ids).await;
+    let conn = h.db.conn().expect("connection");
+    let bulk = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    for (declaration, outcome) in declarations.iter().zip(bulk) {
+        let name = declaration.leaf_slug.as_str();
+        // `w` was cached before the batch: for it the test only shows that the
+        // cached entry is served and equals a re-read, not that the bulk walk
+        // computed it.
+        if name != "w" {
+            h.cache.invalidate_key(&declaration.key);
+        }
+        let single = h.resolve(name, tenant(b)).await;
+        match (outcome, single) {
+            (Ok(bulk), Ok(single)) => assert_eq!(*bulk, *single, "{name}"),
+            (Err(DomainError::Retired { .. }), Err(DomainError::Retired { .. })) => {}
+            (bulk, single) => panic!("{name}: {bulk:?} against {single:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn global_and_local_misses_resolve_without_the_chain() {
+    let h = Harness::new().await;
+    let (root, b) = (h.tree.root, h.tree.b);
+    let global = h.declare("g", scope_class::GLOBAL, json!("d")).await;
+    h.set(global, root, json!("g-root")).await;
+    let local = h.declare("l", scope_class::LOCAL, json!("d")).await;
+    h.set(local, b, json!("l-b")).await;
+    let cascading = h.declare("c", scope_class::CASCADING, json!("d")).await;
+    let declarations = declarations_of(&h, &[global, local]).await;
+    let conn = h.db.conn().expect("connection");
+    h.hierarchy.set_unavailable(true);
+    let outcomes = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(h.hierarchy.chain_calls(), 0, "no chain for them");
+
+    // A cascading miss in the same batch is the only one that fails.
+    let mixed = declarations_of(&h, &[global, local, cascading]).await;
+    let outcomes = h
+        .resolver
+        .resolve_declarations(&conn, &mixed, tenant(b))
+        .await;
+    for (declaration, outcome) in mixed.iter().zip(outcomes) {
+        if declaration.scope_class == scope_class::CASCADING {
+            assert!(matches!(outcome, Err(DomainError::Unavailable { .. })));
+        } else {
+            assert!(outcome.is_ok(), "{}", declaration.key);
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_second_identical_batch_is_served_from_the_cache() {
+    let (h, recorder) = Harness::recorded().await;
+    let b = h.tree.b;
+    let mut ids = Vec::new();
+    for i in 0..4 {
+        ids.push(
+            h.declare(&format!("d{i}"), scope_class::CASCADING, json!("d"))
+                .await,
+        );
+    }
+    let declarations = declarations_of(&h, &ids).await;
+    let conn = h.db.conn().expect("connection");
+    let first = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    assert!(first.iter().all(Result::is_ok));
+    recorder.clear();
+    let second = h
+        .resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    assert!(second.iter().all(Result::is_ok));
+    assert_eq!(value_reads(&recorder), 0, "the batch populated the cache");
+}
+
+#[tokio::test]
+async fn a_batch_asks_the_registry_once_per_distinct_value_type() {
+    let h = Harness::new().await;
+    let b = h.tree.b;
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        ids.push(
+            h.declare(&format!("flag{i}"), scope_class::CASCADING, json!(true))
+                .await,
+        );
+    }
+    for i in 0..2 {
+        ids.push(
+            h.declare_typed(
+                &format!("text{i}"),
+                scope_class::CASCADING,
+                json!("t"),
+                crate::test_support::TEXT,
+                "public",
+            )
+            .await,
+        );
+    }
+    let counting = Arc::new(CountingValidator {
+        inner: crate::infra::type_validator::GtsTypeValidator::new(
+            crate::test_support::resolution_catalogue(),
+        ),
+        traits: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let resolver = crate::domain::resolution::ValueResolver::new(
+        crate::infra::storage::declaration_repo::DeclarationRepo,
+        crate::infra::storage::value_repo::ValueRepo,
+        crate::infra::storage::access_repo::AccessRepo,
+        Arc::clone(&h.hierarchy) as Arc<dyn TenantHierarchy>,
+        Arc::new(crate::test_support::FixedScope(h.tree.root)),
+        Arc::clone(&counting) as Arc<dyn crate::domain::validation::TypeValidator>,
+        Arc::new(crate::domain::resolution::EffectiveCache::new(
+            Duration::from_secs(30),
+        )),
+    );
+    let declarations = declarations_of(&h, &ids).await;
+    let conn = h.db.conn().expect("connection");
+    let outcomes = resolver
+        .resolve_declarations(&conn, &declarations, tenant(b))
+        .await;
+    assert!(outcomes.iter().all(Result::is_ok), "{outcomes:?}");
+    assert_eq!(counting.traits.load(std::sync::atomic::Ordering::SeqCst), 2);
 }

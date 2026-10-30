@@ -18,9 +18,12 @@ Three invariants, all of which have broken a real release before:
        not inert: the crate inherits the `[workspace]` defaults and silently
        starts writing its own changelog section and its own Release page.
      - `gears/**` gets its own changelog section and Release from those same
-       defaults, so it must have no entry at all.
+       defaults, so it must have no entry, except one that sets nothing but
+       `semver_check` (an opt-out for a crate the check cannot build).
      - A crate with `publish = false` in its manifest is skipped by release-plz
-       entirely, so an entry for it is dead config.
+       entirely, so an entry for it is dead config -- UNLESS the entry sets
+       `git_only = true`, which makes release-plz version-manage and git-tag it
+       (no crates.io publish) so it can get a Docker image + Helm chart release.
 
 3. A dev-dependency that closes a cycle must be path-only, with no version.
    Cargo allows the cycle (`A` regular-depends on `B`, `B` dev-depends on `A`)
@@ -58,6 +61,10 @@ FRAMEWORK_RELEASE_CRATE = "cf-gears-toolkit"
 
 # Flags a folded-in `libs/**` crate must set, and the values it must set them to.
 FOLDED_IN_FLAGS = {"changelog_update": False, "git_release_enable": False}
+
+# The only keys a `gears/**` entry may set: everything else comes from the
+# [workspace] defaults.
+GEARS_ENTRY_KEYS = {"name", "semver_check"}
 
 
 def is_release_target(package: dict) -> bool:
@@ -223,9 +230,17 @@ def check_release_plz(config: dict, crates: Dict[str, dict]) -> List[str]:
             )
             continue
         if not info["publishable"]:
+            # `git_only = true` is the documented exception: it tells release-plz to
+            # version-manage and TAG a `publish = false` crate from git (no crates.io
+            # publish) so it appears in the release action's output and gets its Docker
+            # image + Helm chart published. Such an entry is required, not dead config.
+            if entry.get("git_only") is True:
+                continue
             problems.append(
                 f"release-plz.toml: entry for `{name}`, which has `publish = false` in "
-                f"{info['rel_path']} -> release-plz skips it anyway, remove the entry"
+                f"{info['rel_path']} -> release-plz skips it anyway (set `git_only = true` "
+                f"if it should be git-tagged for a Docker/Helm release, otherwise remove "
+                f"the entry)"
             )
             continue
         if "publish" in entry:
@@ -233,10 +248,11 @@ def check_release_plz(config: dict, crates: Dict[str, dict]) -> List[str]:
                 f"release-plz.toml: entry for `{name}` sets `publish` -> the Cargo "
                 f"manifest is the only source of truth for that, remove the key"
             )
-        if info["area"] == "gears":
+        if info["area"] == "gears" and not set(entry) <= GEARS_ENTRY_KEYS:
             problems.append(
                 f"release-plz.toml: entry for `{name}` ({info['rel_path']}) -> crates "
-                f"under gears/** inherit the [workspace] defaults, remove the entry"
+                f"under gears/** inherit the [workspace] defaults, remove the entry "
+                f"(only `semver_check` may be set)"
             )
 
     for name, info in sorted(crates.items()):

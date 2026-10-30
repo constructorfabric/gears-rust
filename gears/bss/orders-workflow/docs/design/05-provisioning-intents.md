@@ -184,8 +184,8 @@ through a definition `listen` over the platform event-trigger path (`01 §4.8`).
 wave it names, and only the non-terminal status read (`SUB-O13`, §4.1) that `reconcile-intent`
 performs may move an intent or a task. This is the consumer obligation Lifecycle `01 §4.4` states
 for every event consumer (Lifecycle
-[`ADR-0006`](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md),
-Lifecycle [D-87](../../../orders-lifecycle/docs/DECISIONS.md)), in its strongest form: a replayed, reordered or forged confirmation can at most cause one
+[`ADR-0006`](../../../orders/docs/ADR/0006-cpt-cf-bss-orders-adr-outbox-publication.md),
+Lifecycle [D-87](../../../orders/docs/DECISIONS.md)), in its strongest form: a replayed, reordered or forged confirmation can at most cause one
 additional read. A timeout, 503 or authorization failure on that read is retryable, never
 evidence that the confirmation is stale or already applied. The unmatched-confirmation rule is
 §4.4.
@@ -275,7 +275,7 @@ service-activation date is never backdated to it — therefore rests on this gea
 `dispatch-wave2-activate` submits only once expected fulfillment time is reached (the barrier,
 ADR-0004), so the commit instant is the actual activation instant. No quoted date is sent, consistent
 with the sibling Orders Lifecycle design
-([`06-workflow-seam.md` §4.3](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
+([`06-workflow-seam.md` §4.3](../../../orders/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
 
 **ADRs**: `cpt-cf-bss-orders-workflow-adr-two-wave-activation-barrier`
 
@@ -534,7 +534,7 @@ keeps them on the successor (`SUB-O18`, §4.1).
 
 Orders Lifecycle's cancel guard reads a recorded spawn signal — the first activation intent of the
 current attempt — rather than the order state (Lifecycle
-[`06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
+[`06 §4.3`](../../../orders/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)).
 Its commit is the fence activation dispatch waits on, so it is a `protected` step with its own
 seam call rather than a side effect of the wave-2 call.
 
@@ -704,7 +704,7 @@ operation's round. Every step key is recomposed server-side from the body
 |-------|-------|
 | `protection` | `protected` — Waves stage: after `re-check-pre-activation`, before `dispatch-wave2-activate` (`10 §4.1`) |
 | `input` | `ref`, `round` (0 on first entry, else the previous answer's `nextRound`) |
-| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders-lifecycle/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
+| `output` | `spawnSignal` (`recorded` · `already-recorded` — Lifecycle refused `spawn-signal-already-recorded`: the fence is committed, by a report under another key or by this key's own earlier report once Lifecycle's 24-hour window has forgotten it — a self-loop row admits such a re-run to that guard, which refuses it with no second signal and no event (Lifecycle `06-workflow-seam.md:451`, `:456-459`, `:761`); a settled success that records no instant, which nothing reads, since `dispatch-wave2-activate`'s guard reads the settlement (`inst-pi-wave2-guard`, decision D-188) · `held` — Lifecycle refused `not-admissible` and the order read shows `on_hold`, a settled success after which the definition waits in `heldWait` — the fork of the resume arm and a `PT5M` tick, `10 §3.6` (b) — re-runs `re-check-pre-activation` after the resume, as Lifecycle prescribes, and calls again under the next round · `not-dispatchable` — Lifecycle refused `not-admissible` and the order read shows a terminal state: a cancel committed before the signal, the race Lifecycle declares normal ([`06 §4.3`](../../../orders/docs/features/06-workflow-seam.md#43-begin-fulfillment-and-the-spawn-signal-normative)), a settled success after which the definition dispatches nothing and returns to the barrier loop, whose lifecycle arm consumes `OrderCancelled`); `nextRound` |
 | `idempotency_key` | Lifecycle-transition family: `{tenant}:{orderId}:{orderVersion}:report-spawn-signal:{round}`, the same key passed to Lifecycle, so a replay of one round returns Lifecycle's stored outcome and a refusal of one round is never replayed into the next ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations) rule 4) |
 | `declared_event` | none |
 | `compensation` | none — the spawn signal is written once and never cleared (Lifecycle `06 §4.3`) |
@@ -820,7 +820,7 @@ outcome event and no failure twin, so the name stays this gear's ask (D-209).
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|----------|
-| orders-lifecycle | `OrdersLifecycleWorkflowV1::report_spawn_signal(OrderRef, CallMeta)` through `ClientHub` — Lifecycle's Workflow SDK contract (Lifecycle D-155; decision D-193), the SDK form of `POST …/orders/{orderId}/spawn-signal` ([`06-workflow-seam.md` §3.3](../../../orders-lifecycle/docs/features/06-workflow-seam.md)); and `get_version(orderId, orderVersion)` for the version's external references and `activation_deadline` (§2.2) | `report-spawn-signal` (seam rule R1); the intent payloads of §3.3 |
+| orders-lifecycle | `OrdersLifecycleWorkflowV1::report_spawn_signal(OrderRef, CallMeta)` through `ClientHub` — Lifecycle's Workflow SDK contract (Lifecycle D-155; decision D-193), the SDK form of `POST …/orders/{orderId}/spawn-signal` ([`06-workflow-seam.md` §3.3](../../../orders/docs/features/06-workflow-seam.md)); and `get_version(orderId, orderVersion)` for the version's external references and `activation_deadline` (§2.2) | `report-spawn-signal` (seam rule R1); the intent payloads of §3.3 |
 
 #### serverless-runtime
 
@@ -1518,7 +1518,7 @@ slice operations (D-80, D-81).
   (`cpt-cf-bss-orders-workflow-seq-def-fulfillment`), §4.1 the fence, §4.6
 - **Foundation**: [`01-foundation.md`](./01-foundation.md) §3.3 (envelope, contract,
   `settle-from-lookup`), §3.8 (worker roster), §4.3, §4.5, §4.8, §4.12
-- **Sibling design**: [`gears/bss/orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders-lifecycle/docs/features/06-workflow-seam.md) §4.3 (spawn signal, activation-instant rule, `SUB-O10`)
+- **Sibling design**: [`gears/bss/orders-lifecycle/docs/features/06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md) §4.3 (spawn signal, activation-instant rule, `SUB-O10`)
 - **Canonical upstream register**: [`gears/bss/subscriptions/docs/SEAMS.md`](../../../subscriptions/docs/SEAMS.md) (`SUB-O1`..`SUB-O6` canonical; `SUB-O1`, `SUB-O5` and `SUB-O10`…`SUB-O16` answered in PR #5131, pending merge)
 - **Platform**: [serverless-runtime DESIGN](../../../../serverless-runtime/docs/DESIGN.md) §3.3 (*Invocation API*, *Event Trigger Management API*), `TenantRuntimePolicy`
 - **Prior slice**: [`04-fulfillment-plan.md`](./04-fulfillment-plan.md) (Fulfillment Plan / `FulfillmentTask` this slice's intents drive)

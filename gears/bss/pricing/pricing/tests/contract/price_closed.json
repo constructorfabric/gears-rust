@@ -15,11 +15,12 @@
         "period": "month",
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 1,
         "dim_value": null,
         "model": "flat",
         "price": {
-          "amount": "10.00"
+          "amount": "10"
         },
         "min_fee": null,
         "eligibility": "all",
@@ -47,6 +48,7 @@
         "period": null,
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 5,
         "dim_value": "latam",
         "model": "per_unit",

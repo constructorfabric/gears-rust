@@ -32,7 +32,7 @@ use super::closed_sets::{
 use crate::{
     authz::{self, ResourceRef, actions, resource_types},
     domain::{
-        book, dimension,
+        dimension,
         resolve::{ItemResolution, Pin, Resolved},
     },
     infra::{
@@ -40,7 +40,7 @@ use crate::{
             PriceResource, PriceSnapshot, ReadSnapshot, load_legacy_resolution, load_price,
             plan_denied, plan_invalid, price_conflict, price_denied, read_failure,
         },
-        storage::RepoError,
+        storage::{RepoError, repo::price_repo},
     },
 };
 use authz_resolver_sdk::PolicyEnforcer;
@@ -186,6 +186,7 @@ fn render_price(snapshot: PriceSnapshot) -> Result<PricingPinnedPriceDto, DoorEr
     let PriceSnapshot { row, entry, book } = snapshot;
     let id = row.id;
     let e = entry.id;
+    let currency = price_repo::currency_of(&row)?;
     Ok(PricingPinnedPriceDto {
         price_id: row.id,
         price_book_entry_id: entry.id,
@@ -200,7 +201,8 @@ fn render_price(snapshot: PriceSnapshot) -> Result<PricingPinnedPriceDto, DoorEr
             .map(|p| PricingPeriod::stored(p, &format_args!("entry {e} period")))
             .transpose()?,
         book_id: book.id,
-        currency: book.currency,
+        currency: currency.code().to_owned(),
+        currency_scale: currency.scale(),
         version_no: row.version_no,
         dim_value: row.dim_value,
         model: PricingModel::stored(&entry.model, &format_args!("entry {e} model"))?,
@@ -335,10 +337,13 @@ fn render(
                     let row = stored.rows.get(&b.price.id).ok_or_else(|| {
                         CanonicalError::internal("a bound price has no stored row").create()
                     })?;
+                    let currency = price_repo::currency_of(row).map_err(stored_failure)?;
                     Ok::<_, CanonicalError>(PricingResolveBindingDto {
                         price_id: row.id,
                         dim_used: b.dim_used().map(str::to_owned),
                         pinned_from: b.pinned_from,
+                        currency: currency.code().to_owned(),
+                        currency_scale: currency.scale(),
                         price: row.price_json.clone(),
                         min_fee: row.min_fee.clone(),
                         eligibility: PricingEligibility::stored(
@@ -401,8 +406,6 @@ fn render(
         .map_err(stored_failure)?,
         book_id: stored.revision.book_id,
         currency: stored.currency.clone(),
-        currency_minor_digits: book::minor_digits(&stored.currency),
-        rounding_policy: stored.rounding.clone(),
         date: date.to_string(),
         items,
     })

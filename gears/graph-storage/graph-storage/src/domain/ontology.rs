@@ -13,7 +13,9 @@ use std::collections::BTreeMap;
 use toolkit_macros::domain_model;
 
 use graph_storage_sdk::models::{EffectiveTraits, GtsTypeId, TypeKind};
-use gts::{GtsId, GtsIdPattern};
+use gts::schema_modifiers::{X_GTS_ABSTRACT, X_GTS_FINAL};
+use gts::schema_traits::{X_GTS_TRAITS, X_GTS_TRAITS_SCHEMA};
+use gts::{GtsId, GtsIdPattern, X_GTS_INSTANCE_REF, X_GTS_PATTERN_REF, X_GTS_TYPE_REF};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -78,12 +80,14 @@ pub const BASE_SCHEMAS: [(&str, &str); 9] = [
 /// keyword of its own, so this list is exactly what `gts` defines; anything
 /// else spelled `x-*` is rejected rather than ignored, because an annotation
 /// silently skipped is a constraint the producer believes exists.
-const KNOWN_EXTENSIONS: [&str; 5] = [
-    "x-gts-abstract",
-    "x-gts-final",
-    "x-gts-ref",
-    "x-gts-traits",
-    "x-gts-traits-schema",
+const KNOWN_EXTENSIONS: [&str; 7] = [
+    X_GTS_ABSTRACT,
+    X_GTS_FINAL,
+    X_GTS_INSTANCE_REF,
+    X_GTS_PATTERN_REF,
+    X_GTS_TRAITS,
+    X_GTS_TRAITS_SCHEMA,
+    X_GTS_TYPE_REF,
 ];
 
 /// Everything registration derives from one schema.

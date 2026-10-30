@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -332,6 +333,27 @@ def run_launcher(python: str, suite: dict[str, Any], binary: Path, suite_name: s
     env.update(sidecar_env)
     for key, value in (suite.get("env") or {}).items():
         env[str(key)] = expand(str(value), binary, suite_name)
+    # A suite whose migrations change in place can fail at boot or answer 500 on a data root
+    # left by an older build. `clean_home: true` starts the suite on an
+    # empty one. Only a directory under the repository's `target/` is ever removed.
+    if suite.get("clean_home"):
+        home = env.get("APP__SERVER__HOME_DIR")
+        if not home:
+            print("ERROR: clean_home needs env.APP__SERVER__HOME_DIR in the suite manifest", file=sys.stderr)
+            return 2
+        path = Path(home).resolve()
+        if (ROOT / "target").resolve() not in path.parents:
+            print(f"ERROR: clean_home refuses {path}: not under {ROOT / 'target'}", file=sys.stderr)
+            return 2
+        if dry_run:
+            print(f"rm -rf {path}")
+        else:
+            try:
+                if path.exists():
+                    shutil.rmtree(path)
+            except OSError as exc:
+                print(f"ERROR: clean_home could not remove {path}: {exc}", file=sys.stderr)
+                return 2
 
     cmd = [python, "tools/scripts/ci.py", "e2e-local"]
     # A focused run rewrites config/e2e-local.yaml down to the gears it built; a

@@ -1,6 +1,5 @@
 //! D-427: the pricing model belongs to the price book entry, fixed for its life and part of its
-//! key. A FORWARD migration (D-412 is closed: the chain is deployed and no shipped migration is
-//! edited again).
+//! key. A FORWARD migration. A shipped migration is edited in place only under D-534.
 //!
 //! It runs inside the toolkit runner's transaction on both dialects, so it uses no PRAGMA and no
 //! table rebuild: `ADD COLUMN` on the entry and `DROP COLUMN` on the price.

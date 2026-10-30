@@ -13,8 +13,13 @@ pub struct Model {
     pub dim_value: Option<String>,
     /// Money in its entry's model (D-427): the price has no model column of its own.
     pub price_json: Json,
-    /// Canonical decimal text ("30.00"): exact on both dialects. sea-orm decodes a `SQLite`
-    /// `Decimal` through `f64`, which drops the scale and every digit past `f64`'s precision.
+    /// The price's currency, a copy of its book's: the price's money reads on its own.
+    pub currency: String,
+    /// The currency's scale when the price was written (0 to 28). Reads use it, never the current
+    /// currency table. `price_repo::currency_of` reads it as a `u8`; another value is a corrupt row.
+    pub currency_scale: i16,
+    /// Canonical decimal text (`30`, never `30.00`): exact on both dialects. sea-orm decodes a
+    /// `SQLite` `Decimal` through `f64`, which drops every digit past `f64`'s precision.
     pub min_fee: Option<String>,
     pub eligibility: String,
     pub effective_from: TimeDate,

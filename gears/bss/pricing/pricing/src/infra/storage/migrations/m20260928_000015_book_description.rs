@@ -1,5 +1,5 @@
-//! D-444: a price book has an optional description. A FORWARD migration (D-427 closed D-412: the
-//! chain is deployed and no shipped migration is edited again).
+//! D-444: a price book has an optional description. A FORWARD migration (D-427). A shipped
+//! migration is edited in place only under D-534.
 //!
 //! `ADD COLUMN` only, inside the toolkit runner's transaction, on both dialects:
 //! `pricing_price_book.description`, nullable `text`: NULL on every book written before this

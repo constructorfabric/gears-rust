@@ -29,3 +29,5 @@ env:
   # pre-PriceBook `bss_pricing.db` whose legacy tables break the new chain at
   # boot, and a test run must never write to a developer's data root.
   APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Pricing migrations are edited in place until production: start from an empty data root.
+clean_home: true

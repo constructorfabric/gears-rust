@@ -23,6 +23,7 @@ use crate::domain::admission::{
     Accepted, OperationDispatch, StoredFailure, SubmitRequest, UnreadableFailure,
 };
 pub use crate::domain::admission::{DeleteRequest, DeleteTarget};
+use crate::domain::caller::CallerContext;
 use crate::domain::enums::{
     EntityKind, LifecycleFilter, LifecycleStatus, OperationItemStatus, OperationKind,
     OperationStatus,
@@ -75,7 +76,18 @@ pub struct EntityRecord {
     pub resolved_schema: Option<Box<RawValue>>,
     pub effective_traits: Option<Box<RawValue>>,
     pub effective_traits_schema: Option<Box<RawValue>>,
+    /// Managed Type Schemas only: how the current revision was admitted.
     pub provenance: Option<Provenance>,
+}
+
+/// Admission metadata of the current revision, selected as one group.
+#[domain_model]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Provenance {
+    /// Whether an applicable cross-minor compatibility check was deliberately waived
+    /// with `skip_compatibility_check` (ADR-0004). `false` is not evidence that a
+    /// check ran.
+    pub compatibility_check_skipped: bool,
 }
 
 /// Where a managed entity's current state came from.
@@ -87,27 +99,10 @@ pub struct ManagedOrigin {
     pub updated_at: OffsetDateTime,
 }
 
-#[domain_model]
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Provenance {
-    pub gts_spec_version: String,
-    pub gts_impl_version: String,
-    /// `None` for an Instance.
-    pub compat_forced: Option<bool>,
-}
-
 /// One key's read result; absence is an answer, not a failure. Every answer but
 /// `NotFound` carries the current validator (RFC 9110 §15.4.5).
 #[domain_model]
 #[derive(Clone, Debug)]
-// `Found` already owns heap JSON up to the 1 MB document bound, so the 240 bytes
-// `NotFound` pays for the shared discriminant are not what makes a batch large.
-// Boxing would buy that back and charge an allocation and an indirection per found
-// record — the wrong trade for the variant that carries every successful read.
-#[expect(
-    clippy::large_enum_variant,
-    reason = "boxing Found penalises every successful read with an allocation and an indirection; NotFound's discriminant overhead is acceptable"
-)]
 pub enum EntityLookup {
     Found {
         record: EntityRecord,
@@ -188,7 +183,7 @@ pub struct DiscoveryPage {
 /// resolved document at 1 MB, so the ceiling is what bounds a single response —
 /// 500 keys is a response this gear should never be asked to build. A
 /// reconciliation that wants to inspect more identifiers than it writes pages its
-/// reads instead, which the T23 helper owns. The upgrade path is that helper
+/// reads instead, which the T29 helper owns. The upgrade path is that helper
 /// plus a bound on response *bytes* rather than on keys; until then the key count
 /// is the only bound there is.
 ///
@@ -231,6 +226,15 @@ pub enum ServiceError {
     /// The discovery pattern is not a GTS identifier pattern.
     #[error("the discovery pattern is not a GTS pattern: {message}")]
     InvalidPattern { message: String },
+    /// A discovery cursor longer than any token this registry issues.
+    #[error("a cursor must be at most 4096 bytes; this one is {len}")]
+    CursorTooLong { len: usize },
+    /// A cursor that will not decode, or that was issued for another query.
+    #[error("the cursor cannot be used for this request: {detail}")]
+    CursorNotUsable { detail: String },
+    /// A page cursor would not serialize: a defect here, never the caller's.
+    #[error("the registry could not construct a page cursor")]
+    CursorUnencodable,
 }
 
 impl ServiceError {
@@ -249,6 +253,9 @@ impl ServiceError {
             Self::ValidatorTooLong { .. } => "validator_too_long",
             Self::PageSizeOutOfRange { .. } => "page_size_out_of_range",
             Self::InvalidPattern { .. } => "invalid_pattern",
+            Self::CursorTooLong { .. } => "cursor_too_long",
+            Self::CursorNotUsable { .. } => "cursor_not_usable",
+            Self::CursorUnencodable => "cursor_unencodable",
         }
     }
 }
@@ -355,6 +362,7 @@ impl RegistryService {
     /// fingerprint conflict.
     pub async fn submit(
         &self,
+        _caller: CallerContext<'_>,
         request: &SubmitRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -407,6 +415,7 @@ impl RegistryService {
     /// Registry Reference is not one: its item fails in the worker.
     pub async fn delete(
         &self,
+        _caller: CallerContext<'_>,
         request: &DeleteRequest,
         now: OffsetDateTime,
     ) -> Result<Accepted, ServiceError> {
@@ -432,7 +441,22 @@ impl RegistryService {
     /// # Errors
     /// [`ServiceError::Storage`] for a read failure. An absent operation is
     /// `Ok(None)`, because "not found" is an answer rather than a fault.
-    pub async fn operation(&self, id: Uuid) -> Result<Option<OperationRecord>, ServiceError> {
+    pub async fn operation(
+        &self,
+        _caller: CallerContext<'_>,
+        id: Uuid,
+    ) -> Result<Option<OperationRecord>, ServiceError> {
+        self.operation_record(id).await
+    }
+
+    /// [`Self::operation`] for the registry's own driver, which acts for no caller.
+    ///
+    /// # Errors
+    /// As [`Self::operation`].
+    pub(crate) async fn operation_record(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<OperationRecord>, ServiceError> {
         let provider: DBProvider<ServiceError> = DBProvider::new(self.db.clone());
         let scope = Self::scope();
         let stores = Arc::clone(&self.stores);
@@ -489,10 +513,11 @@ impl RegistryService {
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn entity(
         &self,
+        caller: CallerContext<'_>,
         key: &EntityKey,
         selection: FieldSelection,
     ) -> Result<Option<EntityRecord>, ServiceError> {
-        Ok(match self.lookup(key, selection, None).await? {
+        Ok(match self.lookup(caller, key, selection, None).await? {
             EntityLookup::Found { record, .. } => Some(record),
             EntityLookup::Unchanged { .. } | EntityLookup::NotFound => None,
         })
@@ -504,6 +529,7 @@ impl RegistryService {
     /// As [`Self::batch_get`].
     pub async fn lookup(
         &self,
+        caller: CallerContext<'_>,
         key: &EntityKey,
         selection: FieldSelection,
         if_none_match: Option<IfNoneMatch>,
@@ -513,7 +539,7 @@ impl RegistryService {
             if_none_match,
         };
         let mut results = self
-            .batch_get(std::slice::from_ref(&item), selection)
+            .batch_get(caller, std::slice::from_ref(&item), selection)
             .await?;
         Ok(results
             .pop()
@@ -540,6 +566,7 @@ impl RegistryService {
     /// [`ServiceError::CorruptDocument`] if a stored document is not JSON.
     pub async fn batch_get(
         &self,
+        _caller: CallerContext<'_>,
         items: &[BatchGetItem],
         selection: FieldSelection,
     ) -> Result<Vec<(EntityKey, EntityLookup)>, ServiceError> {
@@ -672,7 +699,11 @@ impl RegistryService {
     /// [`ServiceError::PageSizeOutOfRange`] for a refused `limit`,
     /// [`ServiceError::InvalidPattern`] for a pattern `gts-rust` will not compile,
     /// or [`ServiceError::Storage`] for a read failure.
-    pub async fn discover(&self, query: &DiscoveryQuery) -> Result<DiscoveryPage, ServiceError> {
+    pub async fn discover(
+        &self,
+        _caller: CallerContext<'_>,
+        query: &DiscoveryQuery,
+    ) -> Result<DiscoveryPage, ServiceError> {
         let max = self.config.limits.page_size_max;
         let limit = match query.limit {
             None => self.config.limits.page_size_default,
@@ -867,14 +898,12 @@ fn into_records(
             EntityField::EffectiveTraitsSchema,
             state.effective_traits_schema,
         )?;
-        let provenance = if selection.contains(EntityField::Provenance) {
-            let revision = state
-                .provenance
-                .ok_or_else(|| missing_state(&row.gts_id, "selected provenance"))?;
+        let provenance = if is_schema && selection.contains(EntityField::Provenance) {
+            let skipped = state.compat_forced.ok_or_else(|| {
+                missing_state(&row.gts_id, "provenance.compatibility_check_skipped")
+            })?;
             Some(Provenance {
-                gts_spec_version: revision.gts_spec_version,
-                gts_impl_version: revision.gts_impl_version,
-                compat_forced: revision.compat_forced,
+                compatibility_check_skipped: skipped,
             })
         } else {
             None
@@ -964,7 +993,7 @@ mod tests {
                 resolved_schema: None,
                 effective_traits: None,
                 effective_traits_schema: None,
-                provenance: None,
+                compat_forced: None,
             },
         )])
     }
@@ -1036,13 +1065,52 @@ mod tests {
         );
     }
 
+    fn provenance() -> FieldSelection {
+        FieldSelection::parse(&["provenance"]).expect("valid")
+    }
+
     #[test]
-    fn selected_provenance_that_did_not_come_back_is_corruption() {
-        let selection = FieldSelection::parse(&["provenance"]).expect("valid");
-        let result = into_records(vec![row(EntityKind::Instance)], state(None), selection);
+    fn a_selected_schema_provenance_that_did_not_come_back_is_corruption() {
+        let result = into_records(vec![row(EntityKind::TypeSchema)], state(None), provenance());
         assert!(
-            matches!(result, Err(ServiceError::CorruptDocument(_))),
+            matches!(result, Err(ServiceError::CorruptDocument(ref d)) if d.contains("compatibility_check_skipped")),
             "{result:?}"
         );
+    }
+
+    #[test]
+    fn selected_schema_provenance_keeps_its_stored_value_false_included() {
+        for stored in [true, false] {
+            let mut current = state(None);
+            current.get_mut(&7).expect("row").compat_forced = Some(stored);
+            let records = into_records(vec![row(EntityKind::TypeSchema)], current, provenance())
+                .expect("valid");
+            assert_eq!(
+                records[&7].provenance,
+                Some(Provenance {
+                    compatibility_check_skipped: stored
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn an_instance_has_no_provenance_even_when_it_is_selected() {
+        let records = into_records(vec![row(EntityKind::Instance)], state(None), provenance())
+            .expect("an Instance has no provenance to read");
+        assert_eq!(records[&7].provenance, None);
+    }
+
+    #[test]
+    fn unselected_schema_provenance_is_absent() {
+        let mut current = state(None);
+        current.get_mut(&7).expect("row").compat_forced = Some(true);
+        let records = into_records(
+            vec![row(EntityKind::TypeSchema)],
+            current,
+            FieldSelection::default(),
+        )
+        .expect("valid");
+        assert_eq!(records[&7].provenance, None);
     }
 }

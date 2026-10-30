@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Routes of the tenant access restriction surface.
 
 use std::sync::Arc;
@@ -180,7 +179,7 @@ pub fn register_routes(
         .no_license_required()
         .path_param("key", "The setting key, a URL-encoded GTS type id")
         .handler(handlers::list_access)
-        .json_response_with_schema::<toolkit_odata::Page<RestrictionDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<RestrictionDto>>(
             openapi,
             StatusCode::OK,
             "The stored restrictions",

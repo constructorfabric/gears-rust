@@ -1,11 +1,14 @@
-# Generalized multi-stage build for a single OoP gear image.
+# Generalized multi-stage build for one OoP gear image.
 #
-# Parameterized by build args so one Dockerfile produces a minimal image per
-# gear. Because OoP dependency resolution goes through the DirectoryService +
-# REST clients (not in-process linking), a gear image only compiles the target
-# gear crate + its SDK/client deps - not the full gear set.
+# One image per gear via build args: an OoP gear compiles only its own crate +
+# SDK/client deps (resolution is REST, not in-process linking), not the full gear
+# set.
 #
-# Build the hello OoP gear:
+# The per-gear recipe (package, binary, features, config, port) lives in
+# deploy/components.yaml, fed to this Dockerfile by
+# .github/workflows/publish-artifacts.yml — add a gear there, not here.
+#
+# Build by hand:
 #   docker build -f deploy/docker/oop-gear.Dockerfile \
 #     --build-arg GEAR_PACKAGE=hello \
 #     --build-arg GEAR_BIN=hello-oop \
@@ -16,7 +19,7 @@
 # ---------------------------------------------------------------------------
 # Stage 1: Builder
 # ---------------------------------------------------------------------------
-FROM rust:1.98.1-bookworm@sha256:93ce27a88655056a51dbdd8f5f2d7ddc071c7b0070fb288a37b5a285fc83971e AS builder
+FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
 
 # Cargo package (crate) name, e.g. "hello".
 ARG GEAR_PACKAGE
@@ -55,7 +58,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM debian:13.7-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+FROM debian:13.7-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
 # Default gear config baked into the image; override by mounting a ConfigMap
 # over /app/config/gear.yaml in Kubernetes.

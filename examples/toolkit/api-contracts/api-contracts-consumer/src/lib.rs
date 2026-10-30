@@ -11,9 +11,11 @@
 //! `#[toolkit::provides]` the same `PaymentApi`). See
 //! `tests/provider_consumer.rs` for the two-gear boot.
 
+pub mod cluster;
 pub mod domain;
 pub mod gear;
 pub mod rest;
 
+pub use cluster::AuditProfile;
 pub use domain::ChargeProxyService;
 pub use gear::ApiContractsConsumer;

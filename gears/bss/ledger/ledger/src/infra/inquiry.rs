@@ -1,6 +1,5 @@
 //! `InquiryService` + `AuditPackExporter` — the filtered audit-inquiry / drill
-//! reads and the audit-pack CSV export (Slice 6 Phase 4 Group 4A, plan
-//! `docs/superpowers/plans/2026-06-23-vhp-1858-phase4-inquiry-metrics.md`).
+//! reads and the audit-pack CSV export (Slice 6 Phase 4 Group 4A).
 //!
 //! All reads go through the `SecureORM` layer (`.secure().scope_with(scope)`),
 //! so the scope the caller passes IS the SQL-level BOLA filter — a row outside

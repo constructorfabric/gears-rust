@@ -1,12 +1,14 @@
 //! License resolver gear.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
-use license_resolver_sdk::LicenseResolverClient;
-use toolkit::Gear;
+use license_resolver_sdk::LicenseResolverApi;
+use toolkit::api::OpenApiRegistry;
 use toolkit::context::GearCtx;
 use toolkit::contracts::SystemCapability;
+use toolkit::{Gear, RestApiCapability};
+use toolkit_contract::policy::PolicyStack;
 use tracing::info;
 
 use crate::config::LicenseResolverConfig;
@@ -18,34 +20,30 @@ use crate::infra::{GtsContractRegistry, metrics};
 /// The licensing base types and the `LicenseResolverPluginSpecV1` schema reach
 /// `types-registry` on their own via the `toolkit-gts` link-time inventory — no
 /// per-init registration is needed here.
+///
+/// `LicenseResolverApi` is a `#[toolkit::contract]`: `provides` wires the local
+/// impl into `ClientHub`, and the `rest` capability hosts its REST projection
+/// (`/license-resolver/v1/is-licensed`, internal, not edge-exposed).
 #[toolkit::gear(
     name = "license-resolver",
     deps = [types_registry],
-    capabilities = [system]
+    capabilities = [system, rest]
 )]
-pub(crate) struct LicenseResolver {
-    service: OnceLock<Arc<Service>>,
-}
+#[toolkit::provides(
+    contract = license_resolver_sdk::LicenseResolverApi,
+    local = Self::build_local,
+    transports = [local, rest],
+)]
+#[derive(Default)]
+pub(crate) struct LicenseResolver;
 
-impl Default for LicenseResolver {
-    fn default() -> Self {
-        Self {
-            service: OnceLock::new(),
-        }
-    }
-}
-
-// Marked as `system` so that init() runs in the system-gear phase, making the
-// client available in ClientHub before other system gears that gate on a license.
-impl SystemCapability for LicenseResolver {}
-
-#[async_trait]
-impl Gear for LicenseResolver {
-    #[tracing::instrument(skip_all, fields(vendor))]
-    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+impl LicenseResolver {
+    fn build_local(
+        ctx: &GearCtx,
+        _policies: Arc<PolicyStack>,
+    ) -> anyhow::Result<Arc<dyn LicenseResolverApi>> {
         let cfg: LicenseResolverConfig = ctx.config_or_default()?;
-        tracing::Span::current().record("vendor", cfg.vendor.as_str());
-        info!(vendor = %cfg.vendor);
+        info!(vendor = %cfg.vendor, "wiring license-resolver local client");
 
         let hub = ctx.client_hub();
         let validator = ContractValidator::new(Arc::new(GtsContractRegistry::new(hub.clone())));
@@ -55,14 +53,35 @@ impl Gear for LicenseResolver {
             validator,
             metrics::build_default_adapter(&cfg.vendor),
         ));
-        self.service
-            .set(svc.clone())
-            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        Ok(Arc::new(LicenseResolverLocalClient::new(svc)))
+    }
+}
 
-        let api: Arc<dyn LicenseResolverClient> = Arc::new(LicenseResolverLocalClient::new(svc));
-        ctx.client_hub().register::<dyn LicenseResolverClient>(api);
+// Marked as `system` so that init() runs in the system-gear phase, making the
+// client available in ClientHub before other system gears that gate on a license.
+impl SystemCapability for LicenseResolver {}
 
+#[async_trait]
+impl Gear for LicenseResolver {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        self.wire_license_resolver_api(ctx).await?;
         Ok(())
+    }
+}
+
+impl RestApiCapability for LicenseResolver {
+    fn register_rest(
+        &self,
+        ctx: &GearCtx,
+        router: axum::Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<axum::Router> {
+        let service = ctx.client_hub().get::<dyn LicenseResolverApi>()?;
+        Ok(
+            license_resolver_sdk::rest::register_license_resolver_api_rest_routes(
+                router, openapi, service,
+            ),
+        )
     }
 }
 

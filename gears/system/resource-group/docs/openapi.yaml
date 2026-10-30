@@ -172,12 +172,12 @@ paths:
                         default: false
                       allowed_parents:
                         type: array
-                        items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
-                        description: "Well-known instances of allowed parent RG types."
+                        items: { type: string, x-gts-type-ref: "gts.cf.core.rg.type.v1~" }
+                        description: "GTS type identifiers of allowed parent RG types."
                         default: []
                       allowed_memberships:
                         type: array
-                        items: { type: string, x-gts-ref: "gts.*" }
+                        items: { type: string, x-gts-type-ref: "gts.*" }
                         description: "Resource types allowed as members."
                         default: []
                   x-gts-traits:
@@ -346,12 +346,12 @@ paths:
                           default: false
                         allowed_parents:
                           type: array
-                          items: { type: string, x-gts-ref: "gts.cf.core.rg.type.v1~" }
-                          description: "Well-known instances of allowed parent RG types."
+                          items: { type: string, x-gts-type-ref: "gts.cf.core.rg.type.v1~" }
+                          description: "GTS type identifiers of allowed parent RG types."
                           default: []
                         allowed_memberships:
                           type: array
-                          items: { type: string, x-gts-ref: "gts.*" }
+                          items: { type: string, x-gts-type-ref: "gts.*" }
                           description: "Resource types allowed as members."
                           default: []
                     x-gts-traits:

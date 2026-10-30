@@ -154,7 +154,7 @@ engineering.
   modules are Apple corecrypto, AWS-LC FIPS Provider, and Microsoft Windows CNG.
 - **Non-TLS crypto in the binary.** JWT signature validation (`jsonwebtoken`) uses `ring` / non-FIPS
   `aws-lc-rs`. `ring`, non-FIPS `aws-lc-rs`, and `chacha20` are linked into the macOS+fips binary via transitive deps
-  from `pingora-pool`, `ureq`, and rustls's default feature set; they are dead-at-runtime on the TLS path but
+  from `sqlx-core`'s rustls features, `ureq`, and rustls's default feature set; they are dead-at-runtime on the TLS path but
   physically present. Dependency policy Phase B (see [ADR 0005](adrs/0005-fips-dependency-policy.md)) tracks the
   cleanup.
 - **TLS 1.2 FIPS claim on macOS.** Apple does not expose a CAVS-listed TLS-PRF primitive; `fips_provider()` on macOS is

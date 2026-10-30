@@ -40,7 +40,7 @@ env:
   CARGO_INCREMENTAL: "0"
   # Pinned nightly required by `cargo shear --expand`. Authoritative for CI:
   # passed through to `make shear` below so the toolchain this job installs and
-  # caches is provably the one that compiles. The Makefile's RUST_NIGHTLY
+  # caches is provably the one that compiles. RUST_NIGHTLY's default in gears.mk
   # default only covers local runs.
   RUSTUP_TOOLCHAIN_NIGHTLY: nightly-2026-08-21
   # Notified in the issue body when the nightly fails. A username or team;
@@ -56,6 +56,11 @@ jobs:
   shear:
     name: Unused Deps (cargo-shear)
     runs-on: ubuntu-latest
+    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
+    # No environment until the S3_BUCKET variable is set, so the job runs without one.
+    environment:
+      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
+      deployment: false
     # Measured ~57m. Generous headroom on purpose: a false timeout costs the
     # only signal of the day and stays invisible for another 24h, while an
     # over-long cap on a genuinely hung job costs runner minutes once.
@@ -77,7 +82,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: protoc@3.34.1
 
@@ -90,29 +95,26 @@ jobs:
           toolchain: ${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}
 
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: nightly-${{ runner.os }}-${{ env.RUSTUP_TOOLCHAIN_NIGHTLY }}-shear
 
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      # Only main writes to the cache. See .github/actions/sccache.
+      - name: Set up sccache
+        uses: ./.github/actions/sccache
+        with:
+          s3-endpoint: ${{ vars.S3_ENDPOINT }}
+          s3-region: ${{ vars.S3_REGION }}
+          s3-bucket: ${{ vars.S3_BUCKET }}
+          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
 
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
-
-      # Keep this version in sync with SHEAR_VERSION in the Makefile, so a local
+      # Keep this version in sync with SHEAR_VERSION in gears-rust.mk, so a local
       # `make shear` and this job reach the same verdict.
       - name: Install cargo-shear
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
         with:
           tool: cargo-shear@1.13.1
 
@@ -122,98 +124,54 @@ jobs:
         shell: bash
         run: make shear RUST_NIGHTLY="$RUSTUP_TOOLCHAIN_NIGHTLY" 2>&1 | tee "$RUNNER_TEMP/shear.txt"
 
+      # The issue quotes the cargo-shear output. It names the package and the
+      # dependency, so one `git log` finds the commit.
+      - name: Write issue details
+        if: failure() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          out="$RUNNER_TEMP/shear.txt"
+          max=3000
+          # The backticks are Markdown, not command substitution.
+          # shellcheck disable=SC2016
+          {
+            echo 'A missing `[workspace.metadata.cargo-shear] ignored` entry is the usual'
+            echo 'cause. See the gear-dependencies section of CONTRIBUTING.md. To find the'
+            echo 'commit: `git log --since=yesterday -- path/to/Cargo.toml`.'
+            echo
+            if [ -s "$out" ]; then
+              echo '<details><summary>cargo-shear output</summary>'
+              echo
+              echo '```'
+              if [ "$(wc -c < "$out")" -gt "$max" ]; then
+                echo '…(truncated, see run log)'
+              fi
+              tail -c "$max" "$out"
+              # Add a newline if the output has none, so the closing fence
+              # starts on its own line.
+              [ -z "$(tail -c 1 "$out")" ] || echo
+              echo '```'
+              echo '</details>'
+            else
+              echo '_No output captured. The job failed before `cargo shear` ran. See the run log._'
+            fi
+          } > "$RUNNER_TEMP/issue.md"
+
       - name: Open or update issue on nightly failure
         if: failure() && github.event_name == 'schedule'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: ./.github/actions/nightly-issue
         with:
-          script: |
-            const fs = require('fs');
-            const { owner, repo } = context.repo;
-            const title = process.env.SHEAR_ISSUE_TITLE;
-            const mention = (process.env.SHEAR_ISSUE_MENTION || '').trim();
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-
-            // Quoting cargo-shear's own output is what makes triage a single
-            // `git log` away — it names the package and the dependency.
-            let captured = '';
-            try {
-              captured = fs.readFileSync(`${process.env.RUNNER_TEMP}/shear.txt`, 'utf8');
-            } catch (e) {
-              core.info(`No shear output captured: ${e.message}`);
-            }
-            const MAX = 3000;
-            const tail = (captured.length > MAX
-              ? `…(truncated, see run log)\n${captured.slice(-MAX)}`
-              : captured).trim();
-
-            const details = tail
-              ? ['<details><summary>cargo-shear output</summary>', '', '```', tail, '```', '</details>'].join('\n')
-              : '_No output captured — the job failed before `cargo shear` ran. See the run log._';
-
-            const lines = [];
-            if (mention) lines.push(mention, '');
-            lines.push(
-              '`cargo shear` failed on `main`.',
-              '',
-              `- Commit: ${context.sha}`,
-              `- Run: ${runUrl}`,
-              '',
-              'A missing `[workspace.metadata.cargo-shear] ignored` entry is the usual',
-              'cause — see the gear-dependencies section of CONTRIBUTING.md. To find the',
-              'commit: `git log --since=yesterday -- path/to/Cargo.toml`.',
-              '',
-              details,
-            );
-            const body = lines.join('\n');
-
-            // Find the previous run's issue by exact title. listForRepo rather
-            // than the search API: no index lag, no separate rate limit. The
-            // `creator` filter narrows to bot-authored issues so this is
-            // normally one request; paginate keeps it correct even if that
-            // filter is ignored. listForRepo returns PRs too, hence the guard.
-            const candidates = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
-            });
-            const existing = candidates.filter((i) => !i.pull_request && i.title === title);
-
-            if (existing.length > 0) {
-              await github.rest.issues.createComment({
-                owner, repo, issue_number: existing[0].number, body,
-              });
-              core.info(`Commented on #${existing[0].number}`);
-            } else {
-              // Only pre-existing labels: creating a new one needs rights we
-              // don't assume, and an unknown label would be a needless failure.
-              const created = await github.rest.issues.create({
-                owner, repo, title, body, labels: ['bug', 'ci'],
-              });
-              core.info(`Created #${created.data.number}`);
-            }
+          title: ${{ env.SHEAR_ISSUE_TITLE }}
+          subject: '`cargo shear`'
+          result: failure
+          details-file: ${{ runner.temp }}/issue.md
+          mention: ${{ env.SHEAR_ISSUE_MENTION }}
 
       # Without this the issue outlives the breakage and stops meaning anything.
       - name: Close nightly issue on success
         if: success() && github.event_name == 'schedule'
-        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        uses: ./.github/actions/nightly-issue
         with:
-          script: |
-            const { owner, repo } = context.repo;
-            const title = process.env.SHEAR_ISSUE_TITLE;
-            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
-
-            const candidates = await github.paginate(github.rest.issues.listForRepo, {
-              owner, repo, state: 'open', creator: 'github-actions[bot]', per_page: 100,
-            });
-            const open = candidates.filter((i) => !i.pull_request && i.title === title);
-
-            for (const issue of open) {
-              await github.rest.issues.createComment({
-                owner,
-                repo,
-                issue_number: issue.number,
-                body: `Resolved — \`cargo shear\` passed on ${context.sha}.\n\n- Run: ${runUrl}`,
-              });
-              await github.rest.issues.update({
-                owner, repo, issue_number: issue.number, state: 'closed',
-              });
-              core.info(`Closed #${issue.number}`);
-            }
+          title: ${{ env.SHEAR_ISSUE_TITLE }}
+          subject: '`cargo shear`'
+          result: success

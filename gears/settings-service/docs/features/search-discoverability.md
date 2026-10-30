@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-17 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-23 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Search & Discoverability
 
@@ -34,7 +34,7 @@
 
 ### 1.1 Overview
 
-One query reaches any setting without learning the category tree: `GET /settings-service/v1/search?q=…` matches a setting's key, description, category name, Schema Default and the overrides explicitly set inside the caller's visible subtree, and answers a flat list of hits, each naming its category, the field that matched, and — for a value match — the scope where that value is set.
+One query reaches any setting without learning the category tree: `GET /settings-service/v1/search?q=…` matches a setting's key, display name, description, category name, Schema Default and the overrides explicitly set inside the caller's visible subtree, and answers a flat list of hits, each naming its category, the field that matched, and — for a value match — the scope where that value is set.
 
 ### 1.2 Purpose
 
@@ -58,7 +58,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 ### 1.4 References
 
 - **PRD**: [PRD.md](../PRD.md) — §5.3 Search & Discoverability
-- **Design**: [DESIGN.md](../DESIGN.md) — §4.2 (Component: Search), §4.3 (REST API — Search, History & Preferences), §4.7 (the classification-split trigram index pairs on `setting_declarations.default_value` and `setting_values.value`), §3 (portability: value search degrades on SQLite)
+- **Design**: [DESIGN.md](../DESIGN.md) — §4.2 (Component: Search), §4.3 (REST API — Search, History & Preferences), §4.7 (the classification-split trigram index pairs on `setting_declarations.default_value` and `setting_values.value`, and the plain trigram indexes on `key`, `display_name` and `description`), §3 (portability: value search degrades on SQLite)
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.11
 - **Dependencies**: entry 2.5, whose browse path this feature mirrors and whose resolver supplies the root tenant, the hierarchy and effective access; entry 2.7, whose `hidden` access excludes a setting from every administrative read; entry 2.2, whose categories are the breadcrumb
 - **Not applicable**: Licence gating of the corpus — the License Resolver does not exist yet; the seam is the same one browse leaves open (R2). Domain-affinity filtering of hits beyond the domain visibility browse already applies (R3). Snippets and relevance ranking: the contract returns the matched field, not the matched text.
@@ -72,7 +72,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- A flat page of hits: declaration-level hits for a key, description, category name or Schema Default match, carrying no scope; one hit per matching override, naming the scope where it is set
+- A flat page of hits: declaration-level hits for a key, display name, description, category name or Schema Default match, carrying no scope; one hit per matching override, naming the scope where it is set
 
 **Error Scenarios**:
 - `q` shorter than two characters after trimming, or longer than two hundred
@@ -82,17 +82,17 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 - The target's subtree exceeds the subtree budget, or the page's matching overrides exceed the override bound: refused with the bound named, never answered incomplete
 
 **Steps**:
-1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit`, `cursor` and `$filter`; **IF** `$orderby` or `$select` is present → **RETURN** `400`; the filter is read by the code browse reads it with — `category_id` and `key` select declarations, `needs_review eq true` narrows the corpus to settings with a flagged override — and one outside the grammar → **RETURN** `400`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
+1. [x] - `p2` - Actor sends GET /settings-service/v1/search with `q`, optional `tenant`, `limit`, `cursor` and `$filter`; **IF** `$orderby` or `$select` is present → **RETURN** `400`; the filter is read by the code browse reads it with — `category_id` and `key` select declarations, `needs_review eq true` narrows to settings whose own override at the target is flagged for review — and one outside the grammar → **RETURN** `400`; **IF** `q` trimmed is shorter than two characters or longer than two hundred → **RETURN** `400`, since below two characters every row matches and above two hundred a trigram scan stops being cheap - `inst-sd-search-1`
 2. [x] - `p2` - Authorize `read` on the value resource once for the request; its constraints are the secure scope of the declarations query, so a setting the caller may not read is absent from the results and from the count - `inst-sd-search-2`
 3. [x] - `p2` - Confirm the target is the caller's own tenant or a descendant that is not standalone; **IF** not → **RETURN** `403` - `inst-sd-search-3`
 4. [x] - `p2` - Bound the override corpus to the target and its non-standalone descendants, obtained from the tenant resolver under the shared subtree budget; **IF** the budget cuts the subtree → **RETURN** `400` naming the bound, since a silently incomplete corpus would hide overrides: an override the caller could not read is never matched - `inst-sd-search-4`
 5. [x] - `p2` - Decide the classification corpus once, before any match: `public`, and `pii` only for a caller holding `read_unmasked` on the value resource; `secret` never - `inst-sd-search-5`
 6. [x] - `p2` - Bind the pagination cursor to the query text, the target, the corpus and the parsed filter, so a cursor minted for one search is refused for another — a cursor minted under one filter would otherwise page on under another - `inst-sd-search-6`
-7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus, narrowed by the filter's declaration selectors and, under `needs_review eq true`, to declarations with a flagged override at one of the bounded tenants — in the query, never over a page already cut; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
-8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus and never a secret row, one row past the override bound; **IF** more than the bound matched → **RETURN** `400` naming the bound, so a page is never cut short of its hits - `inst-sd-search-8`
-9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set - `inst-sd-search-9`
+7. [x] - `p2` - DB: SELECT a page of active declarations, ordered by key, that match on key, display name, description, the name of their category, their Schema Default within the corpus, or an override set at one of the bounded tenants within the corpus, narrowed by the filter's declaration selectors and, under `needs_review eq true`, to declarations with a flagged subject-less override at the target tenant — in the query, never over a page already cut; domain visibility and the secure scope apply in the same query - `inst-sd-search-7`
+8. [x] - `p2` - DB: SELECT the overrides of the page's declarations at the bounded tenants whose text projection matches, within the corpus, never a secret row and never a row flagged for review, one row past the override bound; **IF** more than the bound matched → **RETURN** `400` naming the bound, so a page is never cut short of its hits - `inst-sd-search-8`
+9. [x] - `p2` - Attribute each declaration-level match to the first field that matched — key, display name, description, category name, Schema Default — and emit one hit per matching override naming the tenant and scope where it is set; a flagged override is never itself a hit; the setting's other overrides match as usual - `inst-sd-search-9`
 10. [x] - `p2` - Exclude every hit whose declaration is `hidden` for the caller, silently, exactly as browse excludes it — in the page query, on the caller's root-to-self chain, so the page is cut after the exclusion and comes back full - `inst-sd-search-10`
-11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag, and, where a value matched, that value masked by classification — and the page cursors - `inst-sd-search-11`
+11. [x] - `p2` - **RETURN** `200` with the flat list — each hit carrying its category, its matched field, its declaration's `mode` as a tag and its `display_name` when set (omitted otherwise), and, where a value matched, that value masked by classification — the page cursors, and `page_info.total_count`, the settings that match in all under the same corpus, filter and exclusions as the page - `inst-sd-search-11`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -132,7 +132,7 @@ Search runs over stored rows, not resolved values. An inherited value is a hit a
 **Output**: The hits for that declaration
 
 **Steps**:
-1. [x] - `p2` - Test the fields in the order a client is told about them — key, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
+1. [x] - `p2` - Test the fields in the order a client is told about them — key, display name, description, category name, Schema Default — and attribute the declaration-level hit to the first that contains the needle case-insensitively; a declaration on the page only because an override matched yields no declaration-level hit - `inst-sd-attr-1`
 2. [x] - `p2` - Match a JSON value by its text projection: a string as itself, anything else as its JSON text — the same projection the database indexes; on SQLite that projection is spelled with `json_type`, since `json_extract(…, '$')` alone would project a boolean as the integer `1`/`0`, which no word matches - `inst-sd-attr-2`
 3. [x] - `p2` - **IF** the database matched a declaration but no field and no override names the match in Rust — whitespace inside a JSON projection, or a case fold the two engines disagree on — attribute it to the Schema Default when that is in the corpus, else to the key, so a row the database returned is never silently dropped - `inst-sd-attr-3`
 
@@ -146,7 +146,7 @@ No stateful entity: search reads and stores nothing.
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-surface`
 
-`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit`, `cursor` and an OData `$filter` in the grammar `GET /settings` takes — `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`, read by the same code — applied in the page query so the cursor pages the filtered set, with `needs_review eq true` narrowing to settings that carry an override flagged for review in the target's subtree; **MUST** refuse `$orderby` and `$select`; and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing. Both fan-outs **MUST** be bounded — the corpus by the subtree budget, a page by the override bound — and a request past either **MUST** be refused with the bound named rather than answered incomplete.
+`GET /settings-service/v1/search` **MUST** be served authenticated, take `q`, `tenant`, `limit`, `cursor` and an OData `$filter` in the grammar `GET /settings` takes — `category_id eq`, `key eq`, `key in (...)` and `needs_review eq true`, joined by `and`, read by the same code — applied in the page query so the cursor pages the filtered set, with `needs_review eq true` narrowing to settings whose own subject-less override at the target is flagged for review, as browse narrows, while a flagged override itself is never a hit; **MUST** refuse `$orderby` and `$select`; and answer a cursor-paginated flat list of hits under the same authorization, target, visibility and `hidden` rules as browsing. Both fan-outs **MUST** be bounded — the corpus by the subtree budget, a page by the override bound — and a request past either **MUST** be refused with the bound named rather than answered incomplete.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-search-discoverability-search`
@@ -158,7 +158,7 @@ No stateful entity: search reads and stores nothing.
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-corpus`
 
-A `secret` value **MUST NOT** be matched under any query; a `pii` value **MUST** be matched only for a caller holding `read_unmasked`; an override **MUST** be matched only at the target and its non-standalone descendants; a JSON `null` default **MUST NOT** match.
+The `display_name`, like the `key` and the `description`, is public declaration text: it **MUST** be matched for every caller who may see the declaration and never masked. A `secret` value **MUST NOT** be matched under any query; a `pii` value **MUST** be matched only for a caller holding `read_unmasked`; an override **MUST** be matched only at the target and its non-standalone descendants; a JSON `null` default **MUST NOT** match.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-search-discoverability-corpus`
@@ -170,7 +170,7 @@ A `secret` value **MUST NOT** be matched under any query; a `pii` value **MUST**
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-hits`
 
-A hit **MUST** carry the setting key, declaration id, leaf slug, description, its category as `{id, key, name}`, the matched field from `key | description | category_name | default_value | value`, and the declaration's `mode`; an override hit **MUST** name `scope` and `tenant_id`; a value **MUST** be present only on a `value` or `default_value` hit and masked by classification as a read would mask it.
+A hit **MUST** carry the setting key, declaration id, leaf slug, `display_name` when set (omitted otherwise), description, its category as `{id, key, name}`, the matched field from `key | display_name | description | category_name | default_value | value`, and the declaration's `mode`; an override hit **MUST** name `scope` and `tenant_id`; a value **MUST** be present only on a `value` or `default_value` hit and masked by classification as a read would mask it.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-search-discoverability-attribution`
@@ -182,7 +182,7 @@ A hit **MUST** carry the setting key, declaration id, leaf slug, description, it
 
 - [x] `p2` - **ID**: `cpt-cf-settings-service-dod-search-discoverability-dialect`
 
-On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed expressions; on SQLite they **MUST** use `LIKE` with the same escaping; the query **MUST** be one statement per page plus one per override set, whatever the dialect.
+On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed expressions, `display_name` included (`idx_declarations_display_name_trgm`); on SQLite they **MUST** use `LIKE` with the same escaping; the query **MUST** be one statement per page plus one per override set, whatever the dialect.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-search-discoverability-needle`
@@ -207,8 +207,14 @@ On PostgreSQL the predicates **MUST** use `ILIKE` over the exact indexed express
 - [x] A declaration `hidden` for the caller is absent from the results, and the page is still full: the exclusion happens before the page is cut, not after
 - [x] A search whose target subtree exceeds the subtree budget, or whose page would carry more matching overrides than the override bound, is refused `400` naming the bound
 - [x] `q` of one character, or of two hundred and one, is refused `400` on field `q`
-- [x] `$filter` in browse's grammar narrows the search in the query: a filtered search reaches matches beyond its first page, every page holds only the filtered set, and the cursor follows it to its end without a repeat or a gap; `needs_review eq true` keeps the settings with a flagged override, `category_id eq`, `key eq` and `key in (...)` select declarations, and a conjunction narrows further
+- [x] `$filter` in browse's grammar narrows the search in the query: a filtered search reaches matches beyond its first page, every page holds only the filtered set, and the cursor follows it to its end without a repeat or a gap; `needs_review eq true` keeps the settings whose own override at the target is flagged, `category_id eq`, `key eq` and `key in (...)` select declarations, and a conjunction narrows further
+- [x] A setting flagged only below the target is not kept by `needs_review eq true`
+- [x] A needle matching only the value of a flagged override yields no hit
 - [x] A `$filter` outside the grammar — an unmapped field, `needs_review eq false` — is refused `400` with the refusal browse gives, and `$orderby` or `$select` is refused `400`
 - [x] A cursor minted under one filter is refused under another, and a filtered search hides what an unfiltered one hides
 - [x] A page holds at most `limit` settings, ordered by key, and the cursor continues from the last one; a cursor from a different needle, target or corpus is refused
 - [x] Every hit carries its declaration's `mode`, and no hit is withheld by it
+- [x] A needle matching only a display name yields one declaration-level hit with `matched_field: display_name` and no scope, carrying the `display_name`
+- [x] A hit on a setting whose display name is unset carries no `display_name` field, and a hit on one whose display name is set carries it, on an override hit as well
+- [x] A needle found in both `display_name` and `description` attributes to `display_name`, and one found in both `key` and `display_name` attributes to `key`
+- [x] A `hidden` declaration whose display name matches the needle is not returned

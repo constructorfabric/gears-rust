@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The search service: one page of declarations, its matching overrides, and
 //! the attribution of every hit to the field that matched.
 //!
@@ -49,6 +48,9 @@ pub struct SearchPage {
     pub hits: Vec<Hit>,
     /// The cursors of the underlying page of settings.
     pub page_info: PageInfo,
+    /// How many settings match in all — settings, not hits: the walk pages
+    /// settings, and a setting's hits travel with it.
+    pub total_count: u64,
 }
 
 /// The service.
@@ -172,12 +174,13 @@ impl<R: SearchRepository> SearchService<R> {
         Ok(SearchPage {
             hits,
             page_info: page.page_info,
+            total_count: page.total_count,
         })
     }
 }
 
 /// The field a declaration-level hit is attributed to: the first that contains
-/// the needle, in the order a client is told about them — key, description,
+/// the needle, in the order a client is told about them — key, display name, description,
 /// category name, Schema Default. `None` when none does, which is the case
 /// for a declaration on the page only because an override matched.
 ///
@@ -193,6 +196,13 @@ pub fn declaration_match(
     // @cpt-begin:cpt-cf-settings-service-algo-search-discoverability-attribution:p2:inst-sd-attr-1
     if needle.matches(&declaration.key) {
         return Some(MatchedField::Key);
+    }
+    if declaration
+        .display_name
+        .as_deref()
+        .is_some_and(|d| needle.matches(d))
+    {
+        return Some(MatchedField::DisplayName);
     }
     if declaration
         .description

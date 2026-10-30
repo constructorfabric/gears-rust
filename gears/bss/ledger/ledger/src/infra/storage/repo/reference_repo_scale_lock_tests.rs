@@ -1,4 +1,5 @@
-//! First registration of a currency scale against posted history, on SQLite.
+//! First registration of a currency scale on SQLite: against posted history,
+//! and against the ISO 4217 scale of an ISO code.
 #![allow(clippy::unwrap_used)]
 
 use sea_orm::{EntityTrait, IntoActiveModel};
@@ -24,7 +25,8 @@ async fn setup() -> (ReferenceRepo, Db) {
     (ReferenceRepo::new(DBProvider::new(db.clone())), db)
 }
 
-/// Seed one posted EUR@2 line whose functional money is JPY@0.
+/// Seed one posted TKA@2 line whose functional money is TKB@0. Both codes are
+/// non-ISO: the registry cannot hold another scale for an ISO code.
 async fn seed_line(db: &Db, tenant: Uuid) {
     let conn = db.conn().unwrap();
     let scope = AccessScope::allow_all();
@@ -34,7 +36,7 @@ async fn seed_line(db: &Db, tenant: Uuid) {
         tenant_id: tenant,
         legal_entity_id: tenant,
         period_id: "202606".to_owned(),
-        entry_currency: "EUR".to_owned(),
+        entry_currency: "TKA".to_owned(),
         source_doc_type: "MANUAL_ADJUSTMENT".to_owned(),
         source_business_id: "seed".to_owned(),
         reverses_entry_id: None,
@@ -72,14 +74,14 @@ async fn seed_line(db: &Db, tenant: Uuid) {
         gl_code: None,
         side: "DR".to_owned(),
         amount: "10".to_owned(),
-        currency: "EUR".to_owned(),
+        currency: "TKA".to_owned(),
         currency_scale: 2,
         invoice_id: None,
         due_date: None,
         revenue_stream: None,
         mapping_status: "RESOLVED".to_owned(),
         functional_amount: Some("1500".to_owned()),
-        functional_currency: Some("JPY".to_owned()),
+        functional_currency: Some("TKB".to_owned()),
         functional_currency_scale: Some(0),
         tax_jurisdiction: None,
         tax_filing_period: None,
@@ -146,7 +148,7 @@ async fn a_first_registration_that_disagrees_with_posted_lines_is_locked() {
     let tenant = Uuid::now_v7();
     seed_line(&db, tenant).await;
     let scope = AccessScope::for_tenant(tenant);
-    for (currency, scale) in [("EUR", 3), ("JPY", 2)] {
+    for (currency, scale) in [("TKA", 3), ("TKB", 2)] {
         assert!(
             matches!(
                 register(&repo, &db, tenant, currency, scale).await,
@@ -163,13 +165,42 @@ async fn a_first_registration_that_disagrees_with_posted_lines_is_locked() {
         );
     }
     // The scale the history already uses registers, once.
-    assert!(register(&repo, &db, tenant, "EUR", 2).await.unwrap());
-    assert!(!register(&repo, &db, tenant, "EUR", 2).await.unwrap());
-    assert!(register(&repo, &db, tenant, "JPY", 0).await.unwrap());
+    assert!(register(&repo, &db, tenant, "TKA", 2).await.unwrap());
+    assert!(!register(&repo, &db, tenant, "TKA", 2).await.unwrap());
+    assert!(register(&repo, &db, tenant, "TKB", 0).await.unwrap());
     // Another tenant's history does not lock this tenant.
     assert!(
-        register(&repo, &db, Uuid::now_v7(), "EUR", 3)
+        register(&repo, &db, Uuid::now_v7(), "TKA", 3)
             .await
             .unwrap()
     );
+}
+
+#[tokio::test]
+async fn a_first_registration_never_overrides_an_iso_scale() {
+    let (repo, db) = setup().await;
+    let tenant = Uuid::now_v7();
+    let scope = AccessScope::for_tenant(tenant);
+    match register(&repo, &db, tenant, "HUF", 0).await {
+        Err(RepoError::InvalidRequest(message)) => {
+            assert_eq!(
+                message,
+                "currency HUF is an ISO 4217 code with scale 2; \
+                 the registry cannot set scale 0 for it",
+                "the refusal names the code, its ISO scale and the refused scale"
+            );
+        }
+        _ => panic!("an ISO code at another scale must be refused"),
+    }
+    assert!(
+        repo.find_currency_scale(&scope, tenant, "HUF")
+            .await
+            .unwrap()
+            .is_none(),
+        "the refused row was never written"
+    );
+    // The ISO scale registers, once; a non-ISO code registers at its own scale.
+    assert!(register(&repo, &db, tenant, "HUF", 2).await.unwrap());
+    assert!(!register(&repo, &db, tenant, "HUF", 2).await.unwrap());
+    assert!(register(&repo, &db, tenant, "XTS", 6).await.unwrap());
 }

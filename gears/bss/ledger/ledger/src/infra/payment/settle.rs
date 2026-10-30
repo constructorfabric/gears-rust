@@ -167,6 +167,7 @@ impl SettlementService {
                         tracing::info!(
                             tenant_id = %tenant,
                             applied = report.applied,
+                            replayed = report.replayed,
                             not_ready = report.not_ready,
                             blocked = report.blocked,
                             "bss-ledger: drain-on-settle applied queued allocations"

@@ -1,4 +1,5 @@
-//! Frozen schema-1 DTOs. Extend through a new version module, never reinterpret these fields.
+//! Schema-1 receipt and hold DTOs. A shape changes in place and keeps schema version 1 (D-532);
+//! a stored field is never reinterpreted.
 use super::scalars;
 use bss_pricing_sdk::{Digest, acceptance as a, read as r, terms as t};
 use rust_decimal::Decimal;
@@ -203,17 +204,22 @@ impl From<a::AcceptanceReceipt> for AcceptanceReceipt {
         }
     }
 }
-impl From<AcceptanceReceipt> for a::AcceptanceReceipt {
-    fn from(v: AcceptanceReceipt) -> Self {
-        Self {
+impl TryFrom<AcceptanceReceipt> for a::AcceptanceReceipt {
+    type Error = PriceSpecError;
+    fn try_from(v: AcceptanceReceipt) -> Result<Self, Self::Error> {
+        Ok(Self {
             acceptance_id: v.acceptance_id,
             request_digest: v.request_digest,
             terms_digest: v.terms_digest,
             query: v.query.into(),
             accepted_at: v.accepted_at,
             hold_until: v.hold_until,
-            bindings: v.bindings.into_iter().map(Into::into).collect(),
-        }
+            bindings: v
+                .bindings
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -244,15 +250,20 @@ impl From<a::HeldBindings> for HeldBindings {
         }
     }
 }
-impl From<HeldBindings> for a::HeldBindings {
-    fn from(v: HeldBindings) -> Self {
-        Self {
+impl TryFrom<HeldBindings> for a::HeldBindings {
+    type Error = PriceSpecError;
+    fn try_from(v: HeldBindings) -> Result<Self, Self::Error> {
+        Ok(Self {
             hold_id: v.hold_id,
             acceptance_id: v.acceptance_id,
             terms_digest: v.terms_digest,
             activation_at: v.activation_at,
-            bindings: v.bindings.into_iter().map(Into::into).collect(),
-        }
+            bindings: v
+                .bindings
+                .into_iter()
+                .map(TryInto::try_into)
+                .collect::<Result<_, _>>()?,
+        })
     }
 }
 
@@ -367,6 +378,10 @@ pub(super) struct ImmutablePrice {
 
     pub currency: String,
 
+    /// The scale stored with the price when it was written; never the current table's.
+    #[serde(with = "scalars::integer")]
+    pub currency_scale: u8,
+
     pub model: PriceModel,
 
     #[serde(with = "scalars::decimal_option")]
@@ -386,7 +401,8 @@ impl From<r::ImmutablePrice> for ImmutablePrice {
             price_id: v.price_id,
             price_book_entry_id: v.price_book_entry_id,
             money_digest: v.money_digest,
-            currency: v.currency,
+            currency: v.currency.code().into(),
+            currency_scale: v.currency.scale(),
             model: v.model.into(),
             minimum_fee: v.minimum_fee,
             effective_from: v.effective_from,
@@ -394,19 +410,38 @@ impl From<r::ImmutablePrice> for ImmutablePrice {
         }
     }
 }
-impl From<ImmutablePrice> for r::ImmutablePrice {
-    fn from(v: ImmutablePrice) -> Self {
-        Self {
+/// A stored receipt price whose currency and scale make no valid spec. It names the price, the code
+/// and the scale, so the corrupt row can be found from the log.
+#[derive(Debug, thiserror::Error)]
+#[error("price {price_id}: currency {currency:?} at scale {scale}: {source}")]
+pub(super) struct PriceSpecError {
+    price_id: Uuid,
+    currency: String,
+    scale: u8,
+    source: bss_money::MoneyError,
+}
+/// The stored currency and scale must make a valid spec; the current currency table is never read.
+impl TryFrom<ImmutablePrice> for r::ImmutablePrice {
+    type Error = PriceSpecError;
+    fn try_from(v: ImmutablePrice) -> Result<Self, Self::Error> {
+        let currency = bss_money::CurrencySpec::try_new(v.currency.clone(), v.currency_scale)
+            .map_err(|source| PriceSpecError {
+                price_id: v.price_id,
+                currency: v.currency,
+                scale: v.currency_scale,
+                source,
+            })?;
+        Ok(Self {
             price_id: v.price_id,
             price_book_entry_id: v.price_book_entry_id,
             money_digest: v.money_digest,
-            currency: v.currency,
+            currency,
             model: v.model.into(),
             minimum_fee: v.minimum_fee,
             effective_from: v.effective_from,
             ends_on: v.ends_on,
             state: r::PriceState::Approved,
-        }
+        })
     }
 }
 
@@ -502,9 +537,10 @@ impl From<r::AcceptedBinding> for AcceptedBinding {
         }
     }
 }
-impl From<AcceptedBinding> for r::AcceptedBinding {
-    fn from(v: AcceptedBinding) -> Self {
-        Self {
+impl TryFrom<AcceptedBinding> for r::AcceptedBinding {
+    type Error = PriceSpecError;
+    fn try_from(v: AcceptedBinding) -> Result<Self, Self::Error> {
+        Ok(Self {
             item_id: v.item_id,
             price_book_entry_id: v.price_book_entry_id,
             dimension_key: v.dimension_key,
@@ -515,13 +551,13 @@ impl From<AcceptedBinding> for r::AcceptedBinding {
             sku_name: v.sku_name,
             unit: v.unit,
             meter: v.meter.map(Into::into),
-            price: v.price.into(),
+            price: v.price.try_into()?,
             kind: v.kind.into(),
             recurring_period: v.recurring_period.map(Into::into),
             via_default: v.via_default,
             usage_rating_policy: v.usage_rating_policy.map(Into::into),
             invoice: v.invoice.into(),
-        }
+        })
     }
 }
 
@@ -886,9 +922,6 @@ pub(super) struct InvoiceInputs {
 
     pub timing: BillingTiming,
 
-    #[serde(with = "scalars::integer")]
-    pub currency_scale: u32,
-
     pub rounding: Rounding,
 }
 impl From<t::InvoiceInputs> for InvoiceInputs {
@@ -900,7 +933,6 @@ impl From<t::InvoiceInputs> for InvoiceInputs {
             gl_code: v.gl_code,
             tax_category: v.tax_category,
             timing: v.timing.into(),
-            currency_scale: v.currency_scale,
             rounding: v.rounding.into(),
         }
     }
@@ -914,7 +946,6 @@ impl From<InvoiceInputs> for t::InvoiceInputs {
             gl_code: v.gl_code,
             tax_category: v.tax_category,
             timing: v.timing.into(),
-            currency_scale: v.currency_scale,
             rounding: v.rounding.into(),
         }
     }

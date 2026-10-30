@@ -1,6 +1,21 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 use super::*;
 use crate::domain::test_support::date;
+use std::collections::BTreeMap;
+
+/// The book rules over the ISO table alone, which most of these tests do not care about.
+fn validate(book: &Book) -> Vec<RuleError> {
+    super::validate(book, &CurrencyScales::default())
+}
+fn with_currency(currency: &str) -> Book {
+    Book {
+        currency: currency.into(),
+        ..book()
+    }
+}
+fn xts_at_two() -> CurrencyScales {
+    CurrencyScales::try_new(BTreeMap::from([("XTS".to_owned(), 2)])).unwrap()
+}
 
 fn book() -> Book {
     Book {
@@ -34,6 +49,35 @@ fn prototype_l83_currency_uppercase() {
             .code,
         "BOOK_CURRENCY_INVALID"
     );
+}
+#[test]
+fn a_code_the_table_does_not_know_is_refused() {
+    let iso_only = CurrencyScales::default();
+    for code in ["ZZZ", "XTS", "XAU", "BTC"] {
+        let errors = super::validate(&with_currency(code), &iso_only);
+        assert_eq!(errors.len(), 1, "an unknown code is one refusal");
+        assert_eq!(errors[0].code, "BOOK_CURRENCY_INVALID");
+    }
+    for code in ["EUR", "USD", "JPY", "KWD", "CHF"] {
+        assert!(super::validate(&with_currency(code), &iso_only).is_empty());
+    }
+}
+#[test]
+fn a_configured_non_iso_code_is_accepted_only_when_configured() {
+    let errors = super::validate(&with_currency("XTS"), &CurrencyScales::default());
+    assert_eq!(errors[0].code, "BOOK_CURRENCY_INVALID");
+    assert!(super::validate(&with_currency("XTS"), &xts_at_two()).is_empty());
+    let errors = super::validate(&with_currency("ZZZ"), &xts_at_two());
+    assert_eq!(
+        errors[0].code, "BOOK_CURRENCY_INVALID",
+        "only the listed codes"
+    );
+}
+#[test]
+fn a_write_that_keeps_the_currency_judges_its_shape_only() {
+    assert!(validate_shape(&with_currency("ZZZ")).is_empty());
+    let errors = validate_shape(&with_currency("zzz"));
+    assert_eq!(errors[0].code, "BOOK_CURRENCY_INVALID");
 }
 #[test]
 fn prototype_l84_name_required() {
@@ -96,11 +140,4 @@ fn prototype_l231_book_validity_invalid() {
         .is_empty(),
         "one day is a window"
     );
-}
-#[test]
-fn matrix_18_minor_digits_follow_the_book_currency() {
-    assert_eq!(minor_digits("EUR"), 2);
-    assert_eq!(minor_digits("USD"), 2);
-    assert_eq!(minor_digits("JPY"), 0);
-    assert_eq!(minor_digits("KWD"), 3);
 }

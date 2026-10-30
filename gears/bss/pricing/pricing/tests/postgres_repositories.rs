@@ -92,6 +92,8 @@ async fn postgres_unique_codes_and_price_decimal_roundtrip() {
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.123456789"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: Some("12.34".into()),
         eligibility: "all".into(),
         effective_from: now.date(),
@@ -181,5 +183,162 @@ async fn postgres_audit_rows_refuse_deletion_and_edits() {
     ] {
         let refused = raw.execute_unprepared(statement).await.unwrap_err();
         assert!(refused.to_string().contains("append-only"), "{refused}");
+    }
+}
+/// A book, one of its entries and a draft price of it, as the PostgreSQL column tests write them.
+async fn draft_parent(
+    conn: &impl toolkit_db::secure::DBRunner,
+    scope: &AccessScope,
+    tenant: Uuid,
+) -> price::Model {
+    let now = time::OffsetDateTime::now_utc();
+    let b = price_book::Model {
+        id: Uuid::new_v4(),
+        tenant_id: tenant,
+        code: "columns".into(),
+        name: "Columns".into(),
+        currency: "EUR".into(),
+        valid_from: None,
+        valid_until: None,
+        description: None,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+        archived_at: None,
+        archived_by: None,
+    };
+    book_repo::insert(conn, scope, b.clone()).await.unwrap();
+    let p = price_book_entry::Model {
+        id: Uuid::new_v4(),
+        tenant_id: tenant,
+        book_id: b.id,
+        sku_id: Uuid::new_v4(),
+        charge_kind: "usage".into(),
+        period: None,
+        model: "per_unit".into(),
+        usage_policy_id: None,
+        usage_policy_version: None,
+        usage_policy_digest: None,
+        usage_sku_version: None,
+        dimension_key: None,
+        invoice_line_override: None,
+        reservation_id: Uuid::new_v4(),
+        reference_state: "confirmed".into(),
+        version: 1,
+        created_at: now,
+        updated_at: now,
+    };
+    price_book_entry_repo::insert(conn, scope, p.clone())
+        .await
+        .unwrap();
+    price::Model {
+        id: Uuid::new_v4(),
+        tenant_id: tenant,
+        price_book_entry_id: p.id,
+        version_no: 1,
+        dim_value: None,
+        price_json: serde_json::json!({"rate":"0.1"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
+        min_fee: Some("12.34".into()),
+        eligibility: "all".into(),
+        effective_from: now.date(),
+        effective_to: None,
+        keep_for_bound: false,
+        closed_explicitly: false,
+        temporary_until: None,
+        paired_price_id: None,
+        return_of_price_id: None,
+        change_kind: "set".into(),
+        target_price_id: None,
+        cancelled_by_unit_id: None,
+        state: "draft".into(),
+        pending_unit_id: None,
+        approved_by_unit_id: None,
+        note: None,
+        created_by: Uuid::new_v4(),
+        approved_at: None,
+        version: 1,
+        created_at: now,
+        updated_at: now,
+    }
+}
+/// The PostgreSQL twins of the `SQLite` column tests: the `min_fee` CHECK takes canonical
+/// unsigned decimal text only, the `currency` CHECK three uppercase letters and the
+/// `currency_scale` CHECK 0 to 28. The vectors are the `SQLite` ones; the expressions differ.
+#[tokio::test]
+#[ignore = "needs the Postgres harness"]
+async fn postgres_price_columns_refuse_a_non_canonical_fee_and_a_spec_out_of_range() {
+    let pg = pg_support::Pg::applied().await;
+    let provider = DBProvider::<DbError>::new(pg.db().await);
+    let conn = provider.conn().unwrap();
+    let tenant = Uuid::new_v4();
+    let scope = AccessScope::for_tenant(tenant);
+    let draft = draft_parent(&conn, &scope, tenant).await;
+    let mut version_no = 0;
+    let mut next = || {
+        version_no += 1;
+        price::Model {
+            id: Uuid::new_v4(),
+            version_no,
+            ..draft.clone()
+        }
+    };
+    for text in [
+        "-1", "1.", "1.2.3", "1e5", "", " 3", "30.00", "0.10", "01", "00", "0.0", ".5",
+    ] {
+        let r = price::Model {
+            min_fee: Some(text.into()),
+            ..next()
+        };
+        assert!(
+            price_repo::insert(&conn, &scope, r).await.is_err(),
+            "the column must refuse a fee that is not canonical unsigned decimal text"
+        );
+    }
+    for text in ["0", "0.5", "30", "12.34", "100.01"] {
+        let r = price::Model {
+            min_fee: Some(text.into()),
+            ..next()
+        };
+        let stored = price_repo::insert(&conn, &scope, r)
+            .await
+            .expect("the column takes a canonical fee");
+        assert_eq!(
+            stored.min_fee.as_deref(),
+            Some(text),
+            "the fee reads back as written"
+        );
+    }
+    for (code, scale) in [
+        ("eur", 2),
+        ("EU", 2),
+        ("EURO", 2),
+        ("E1R", 2),
+        ("EUR", -1),
+        ("EUR", 29),
+    ] {
+        let r = price::Model {
+            currency: code.into(),
+            currency_scale: scale,
+            ..next()
+        };
+        assert!(
+            price_repo::insert(&conn, &scope, r).await.is_err(),
+            "the columns must refuse a malformed code or a scale outside 0 to 28"
+        );
+    }
+    for scale in [0, 28] {
+        let r = price::Model {
+            currency_scale: scale,
+            ..next()
+        };
+        let stored = price_repo::insert(&conn, &scope, r).await.unwrap();
+        let spec = price_repo::currency_of(&stored).unwrap();
+        assert_eq!(
+            (spec.code(), i16::from(spec.scale())),
+            ("EUR", scale),
+            "the stored spec reads back as written"
+        );
     }
 }

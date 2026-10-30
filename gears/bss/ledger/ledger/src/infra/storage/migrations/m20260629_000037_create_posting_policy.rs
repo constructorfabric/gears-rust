@@ -1,6 +1,6 @@
 //! Create the effective-dated posting-policy table in schema `bss`:
 //! `tenant_posting_policy` (per-tenant, append-only `version`ed rows that pin the
-//! two invoice-posting policies the design names tenant-overridable, VHP-1853):
+//! two invoice-posting policies the design names tenant-overridable):
 //! the missing-mapping mode (`SUSPENSE` route-to-suspense default vs `HARD_BLOCK`)
 //! and the AR-aging bucket thresholds (CSV upper-bounds, e.g. `30,60,90`). The
 //! orchestrator / aging read resolves the row in effect at decision time (latest

@@ -58,7 +58,7 @@ pub struct Candidate {
     /// field and a literal `0` is more likely a serialization accident than an
     /// intent (`database.sql`).
     pub expected_resource_version: Option<i64>,
-    /// ADR-0004 `force`: waive one cross-minor compatibility check.
+    /// ADR-0004 `skip_compatibility_check`: waive one cross-minor compatibility check.
     pub force: bool,
 }
 
@@ -177,7 +177,7 @@ impl Accepted {
 /// The port lives in the domain, so its error type does too; the outbox
 /// transport ([`OperationDispatch`]'s implementation) maps the underlying
 /// `toolkit_db` failure into [`Backend`](Self::Backend).
-#[toolkit::domain_model]
+#[domain_model]
 #[derive(Debug, thiserror::Error)]
 pub enum OutboxError {
     /// The underlying outbox operation failed — starting it, building the record,

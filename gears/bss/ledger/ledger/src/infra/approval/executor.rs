@@ -1,6 +1,6 @@
 //! `LedgerApprovalExecutor` — the concrete [`ApprovalExecutor`] that replays an
-//! approved [`ApprovalIntent`] against the real mutation surfaces (VHP-1852,
-//! Group E). Reverse goes through the posting engine (read-back the original →
+//! approved [`ApprovalIntent`] against the real mutation surfaces.
+//! Reverse goes through the posting engine (read-back the original →
 //! `build_reversal` → `post_reversal`); credit-grant and chargeback-loss go
 //! through the `LedgerClientV1` surfaces (which re-apply their own PEP gate +
 //! idempotency). Replay is idempotent: a re-approve short-circuits on the
@@ -141,7 +141,7 @@ impl ApprovalExecutor for LedgerApprovalExecutor {
                     original.correlation_id,
                 )
                 .map_err(|e| DomainError::Internal(format!("build_reversal on approve: {e:?}")))?;
-                // Approved explicit reversal — announce `entry.reversed` (VHP-1837)
+                // Approved explicit reversal — announce `entry.reversed`
                 // with the intent's audit reason.
                 self.posting
                     .post_reversal(ctx, scope, reversal, Some(i.reason.clone()))

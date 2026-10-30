@@ -81,13 +81,14 @@ finished CA / enrollment story delays everything. SA tokens are a real, K8s-nati
 abstraction, not throwaway work.
 
 **Why not network-level trust (Option D):** UDS perms and NetworkPolicy block the wrong attackers (external) and do
-nothing against a compromised sibling pod inside the trust domain — except in the one narrow Profile 2 single-node case
-where all gears share a uid over UDS.
+nothing against a compromised sibling pod inside the trust domain. The one accepted use is the narrow Profile 2
+single-node case where all gears share a uid over UDS. That is a trusted single-node mode: it still cannot detect a
+compromised sibling gear.
 
 | Profile            | First-phase mechanism                       | End-state mechanism                | Notes                                                        |
 |--------------------|---------------------------------------------|------------------------------------|--------------------------------------------------------------|
 | 1 (Embedded)       | n/a (same process)                          | n/a                                | No transport, no auth needed                                 |
-| 2 (single-node)    | Bootstrap token over UDS, or plain UDS      | mTLS over loopback (optional)      | OS process boundary + fs perms acceptable if all gears run as same uid |
+| 2 (single-node)    | Bootstrap token over UDS, or plain UDS      | mTLS over loopback (optional)      | Same-uid plain UDS is a trusted single-node mode, not ZTA-aligned      |
 | 2 (multi-node, P2) | Bootstrap token for first enrollment        | **mTLS with platform CA (required)** | Plain TCP rejected at the listener once mTLS lands           |
 | 3 (K8s)            | **K8s SA token + TokenReview**              | **mTLS + SPIFFE (cert-manager)**   | NetworkPolicy is defense-in-depth, not the primary boundary  |
 
@@ -153,7 +154,11 @@ platform-plane call to `Authorization`.
   that AuthZ-exempt platform handlers consume. Neither is ever passed to the tenant `PolicyEnforcer`, and neither
   substitutes for tenant-plane JWT validation.
 * Profile 2 single-node MAY skip mTLS if all gears run as the same uid and communicate over UDS — the OS process
-  boundary plus filesystem perms is the trust root in that narrow case (the one place Option D applies).
+  boundary plus filesystem perms is the trust root in that narrow case (the one place Option D applies). This
+  shared-uid mode cannot tell a compromised sibling gear from a legitimate one, so it does not meet the zero-trust
+  requirement for protected inter-service transport
+  ([SECURITY.md §15, requirement 7](../../../security/SECURITY.md#requirements-for-a-zta-aligned-gears-service)).
+  A ZTA-aligned deployment needs a separate OS identity per gear or mTLS.
 * The optional JWT mode (`internal_auth.mode = "jwt"`, Option E) coexists as an escape hatch for operators who want one
   auth backend for users and gears; it is **not** the default.
 * The platform plane SHOULD be served on a listener separate from business endpoints.

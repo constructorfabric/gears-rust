@@ -1,6 +1,6 @@
 //! Axum handlers + router for the reconciliation surface (Slice 7 Phase 3,
 //! design §4.3 / §4 / §5). Two operations under `/bss-ledger/v1/ledger`,
-//! tenant-scoped WITHOUT a tenant in the path (the vhp-core convention — the
+//! tenant-scoped WITHOUT a tenant in the path (the platform convention — the
 //! tenant is the caller's auth context).
 //!
 //! - `POST /ledger/reconciliation-runs` — trigger one named reconciliation check

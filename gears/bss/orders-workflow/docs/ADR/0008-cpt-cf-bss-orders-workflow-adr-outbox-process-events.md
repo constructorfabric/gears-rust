@@ -37,7 +37,7 @@ writes the step's audit entry and settles its idempotency record in one database
 
 The repository already provides the supported producer path: `event-broker-sdk::DbProducer` with
 its `outbox` feature, backed by `toolkit_db::outbox`. The sibling gear adopted it in
-[Lifecycle ADR-0006](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md)
+[Lifecycle ADR-0006](../../../orders/docs/ADR/0006-cpt-cf-bss-orders-adr-outbox-publication.md)
 and recorded the consequences in its D-17, D-87 and D-95. The earlier revision of this ADR chose a
 Workflow-owned outbox table (`owf_event_outbox`) with its own drain, lease, retry cap, dead-letter
 column and purge; keeping it would fork the platform's sequencing, leasing, retry classification,
@@ -169,12 +169,12 @@ D-58, and any relaxation of the number is a Product decision, not a silent widen
   capacity test, not an assumption.
 * **No operator re-drive surface in this gear.** Dead-letter recovery uses the shared platform
   operator interface and SDK republication that Lifecycle requests as
-  `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery`; Workflow co-signs it in
+  `cpt-cf-bss-orders-upreq-event-broker-dead-letter-recovery`; Workflow co-signs it in
   [`UPSTREAM_REQS.md §2.7`](../UPSTREAM_REQS.md#27-event-broker) and exposes no REST re-drive.
   Toolkit's claim operation alone is insufficient.
 * **Runtime gate.** `docs/GEARS.md` currently says “SDK landed — impl crate TODO”. Workflow cannot
   be ready for event-producing traffic until `EventBrokerApi` has a runtime implementation
-  (`cpt-cf-bss-orders-lifecycle-upreq-event-broker-runtime`) and the producer integration gate
+  (`cpt-cf-bss-orders-upreq-event-broker-runtime`) and the producer integration gate
   passes.
 * **Audit and events can disagree transiently.** Committed process state and the audit entry
   remain true while a message waits, retries or is dead-lettered. Reads use the gear's own audit
@@ -256,10 +256,10 @@ dead letter then advances it on `Reject`. Toolkit outbox rejects payloads above 
 
 This revision replaces the earlier Workflow-owned outbox and drain with the platform producer
 outbox, following
-[Lifecycle ADR-0006](../../../orders-lifecycle/docs/ADR/0006-cpt-cf-bss-orders-lifecycle-adr-outbox-publication.md)
+[Lifecycle ADR-0006](../../../orders/docs/ADR/0006-cpt-cf-bss-orders-adr-outbox-publication.md)
 and its register entries D-17 (platform producer outbox, no re-drive API), D-87 (partition
 ordering; permanent reject may create a gap) and D-95 (platform-root tenancy) in
-[`orders-lifecycle/docs/DECISIONS.md`](../../../orders-lifecycle/docs/DECISIONS.md). This ADR
+[`orders-lifecycle/docs/DECISIONS.md`](../../../orders/docs/DECISIONS.md). This ADR
 does not repeat Lifecycle's eleven-event enumeration. `DECISIONS.md` D-58 records this decision
 and its propagation; Q-07 is resolved by it.
 

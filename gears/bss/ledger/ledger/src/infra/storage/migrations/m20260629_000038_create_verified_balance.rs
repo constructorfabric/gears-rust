@@ -1,5 +1,5 @@
 //! Create the cumulative tie-out baseline table in schema `bss`:
-//! `ledger_verified_balance` (VHP-1843 incremental tie-out). One row per
+//! `ledger_verified_balance` (the incremental tie-out). One row per
 //! `(tenant_id, grain, grain_key)` holding the cumulative VERIFIED balance
 //! through the last closed period. Written atomically in the period-close
 //! SERIALIZABLE txn right after the clean full tie-out passes (the closing

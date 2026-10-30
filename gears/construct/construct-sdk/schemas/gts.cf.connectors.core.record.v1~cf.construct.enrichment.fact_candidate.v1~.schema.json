@@ -1,0 +1,109 @@
+{
+  "$id": "gts://gts.cf.connectors.core.record.v1~cf.construct.enrichment.fact_candidate.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.connectors.core.record.v1~"
+    },
+    {
+      "properties": {
+        "payload": {
+          "additionalProperties": false,
+          "properties": {
+            "confidence": {
+              "description": "The connector's confidence in this value, from 0 to 1.",
+              "format": "double",
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "evidence": {
+              "description": "A verbatim span from the source that supports the value. Absent when\nthe source gave none.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            "field": {
+              "description": "What the value is.",
+              "enum": [
+                "openalex_author_id",
+                "affiliation",
+                "research_areas",
+                "linkedin_url",
+                "linkedin_headline",
+                "location",
+                "current_job_title",
+                "skills",
+                "role",
+                "news",
+                "award",
+                "board",
+                "publication",
+                "profile",
+                "bio",
+                "mention"
+              ],
+              "type": "string"
+            },
+            "identity_confidence": {
+              "description": "The connector's identity-match confidence for the person, from 0 to 1:\nhow sure it is that the sources it used are about this person.",
+              "format": "double",
+              "maximum": 1,
+              "minimum": 0,
+              "type": "number"
+            },
+            "rationale": {
+              "description": "The connector's short account, in prose, of how it matched the person\nand which sources it used. Never page content.",
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": "string"
+            },
+            "source_url": {
+              "description": "The page the value was found on. Absent when the value came without a\npage.",
+              "format": "uri",
+              "pattern": "^https?://",
+              "type": "string"
+            },
+            "trust_tier": {
+              "description": "Whether the connector asserts the value (`saved`) or only found it\n(`found`).",
+              "enum": [
+                "found",
+                "saved"
+              ],
+              "type": "string"
+            },
+            "value": {
+              "description": "The value of the field, or the found fact's statement, as the source\nstates it.",
+              "items": {
+                "minLength": 1,
+                "pattern": "^\\S(?:[\\s\\S]*\\S)?$",
+                "type": "string"
+              },
+              "minItems": 1,
+              "minLength": 1,
+              "pattern": "\\S",
+              "type": [
+                "string",
+                "array"
+              ]
+            }
+          },
+          "required": [
+            "field",
+            "value",
+            "confidence",
+            "trust_tier",
+            "identity_confidence"
+          ],
+          "type": "object"
+        }
+      },
+      "type": "object"
+    }
+  ],
+  "description": "One fact the Enrichment connector found about one person, in the connector's own vocabulary: this connector owns the payload and its field list. field names what the value is. value is the fact as the source states it: for research_areas and skills, a list of the items the source gave, cleaned; for every other field, one string. confidence, trust_tier and identity_confidence are the connector's own judgment. The record's subject_id is always set. observed_at is when the connector formed the record. Provenance and version are SHA-256 content digests, written sha256: plus 64 lower-case hex digits; the provenance covers the subject in its canonical lower-case form, the field and the normalized value, and the version covers the payload's canonical JSON, as the Construct SDK's fact-candidate-identity.md specifies. The results API checks the value's form per field and the digests' form, which this schema cannot express.",
+  "type": "object",
+  "x-gts-traits": {
+    "subject_required": true
+  }
+}

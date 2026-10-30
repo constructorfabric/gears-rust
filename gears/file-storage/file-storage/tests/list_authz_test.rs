@@ -153,13 +153,13 @@ async fn list_files_foreign_owner_without_admin_is_denied() {
     let ctx_b = ctx(tenant, user_b);
 
     h.file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
     let result = h
         .file_svc
-        .list_files(&ctx_b, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_b, owner_filter(user_a), Some(10), None)
         .await;
     assert!(
         matches!(result, Err(DomainError::Forbidden)),
@@ -176,16 +176,16 @@ async fn list_files_self_owner_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
 
     let found = h
         .file_svc
-        .list_files(&ctx_a, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_a, owner_filter(user_a), Some(10), None)
         .await
         .expect("self-owner list should succeed");
-    assert!(found.iter().any(|f| f.file_id == ticket.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
 }
 
 #[tokio::test]
@@ -199,15 +199,15 @@ async fn list_files_foreign_owner_with_admin_scope_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(user_a), None)
+        .create_file(&ctx_a, new_file(user_a), None, false)
         .await
         .expect("user A creates own file");
     h.authz.set_admin(true);
 
     let found = h
         .file_svc
-        .list_files(&ctx_admin, owner_filter(user_a), Some(10), 0)
+        .list_files(&ctx_admin, owner_filter(user_a), Some(10), None)
         .await
         .expect("admin should be able to list foreign owner's files");
-    assert!(found.iter().any(|f| f.file_id == ticket.file_id));
+    assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
 }

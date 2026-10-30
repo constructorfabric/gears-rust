@@ -20,12 +20,12 @@ tier_aggregation_window = "invoice_period"
   [[predecessor.bands]]
   from_qty = 0
   to_qty   = 1000
-  unit_amount_minor = 5
+  rate              = "0.05"
 
   [[predecessor.bands]]
   from_qty = 1000
   to_qty   = "open"
-  unit_amount_minor = 3
+  rate              = "0.03"
 
 [successor]
 model_kind              = "volume"
@@ -38,12 +38,12 @@ tier_aggregation_window = "invoice_period"
   [[successor.bands]]
   from_qty = 0
   to_qty   = 1000
-  unit_amount_minor = 5
+  rate              = "0.05"
 
   [[successor.bands]]
   from_qty = 1000
   to_qty   = "open"
-  unit_amount_minor = 3
+  rate              = "0.03"
 
 [[assert]]
 expect = { publish = "rejected", error_code = "SUPERSESSION_UNIT_MISMATCH" }

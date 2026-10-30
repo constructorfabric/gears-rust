@@ -162,8 +162,8 @@ impl CreditApplicationService {
 
     /// The payer's unallocated pool in `currency` as a balance: the stored pool
     /// at its own stored scale, or, for a payer with no pool row yet, a zero at
-    /// the currency's registry scale (a registry row, else the ISO-4217 default)
-    /// by the same absent-pool rule as the grant cap ([`unallocated_or_zero`]).
+    /// the currency's scale (the ISO-4217 scale of an ISO code, else its registry
+    /// row) by the same absent-pool rule as the grant cap ([`unallocated_or_zero`]).
     /// An unprovisioned currency is refused, never a fabricated zero. Acquires a
     /// connection and delegates to [`Self::read_unallocated_balance_in`].
     ///
@@ -188,8 +188,8 @@ impl CreditApplicationService {
     /// and, for an absent pool, the registry scale lookup both run on `runner`.
     ///
     /// # Errors
-    /// [`DomainError::InvalidRequest`] when the currency has no registry row and no
-    /// ISO-4217 default, or its code is malformed; [`DomainError::ConcurrentModification`]
+    /// [`DomainError::InvalidRequest`] when the currency is not an ISO-4217 code and
+    /// has no registry row, or its code is malformed; [`DomainError::ConcurrentModification`]
     /// on classified database contention; [`DomainError::Internal`] on a storage
     /// failure or a corrupt stored pool or registry scale.
     pub async fn read_unallocated_balance_in<R: DBRunner>(

@@ -9,7 +9,9 @@ const PG_UP: &[&str] = &[
   id uuid PRIMARY KEY, tenant_id uuid NOT NULL, price_book_entry_id uuid NOT NULL REFERENCES bss.pricing_price_book_entry(id),
   version_no integer NOT NULL, dim_value text,
   model text NOT NULL CHECK (model IN ('flat','per_unit','graduated','volume','package')), price_json jsonb NOT NULL,
-  min_fee text CHECK (min_fee ~ '^[0-9]+(\.[0-9]+)?$'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (currency ~ '^[A-Z]{3}$'),
+  currency_scale smallint NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee ~ '^(0|[1-9][0-9]*)(\.[0-9]*[1-9])?$'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from date NOT NULL, effective_to date, keep_for_bound boolean NOT NULL DEFAULT false,
   closed_explicitly boolean NOT NULL DEFAULT false,
   temporary_until date, paired_price_id uuid REFERENCES bss.pricing_price(id),
@@ -29,13 +31,20 @@ const PG_UP: &[&str] = &[
 ];
 // `min_fee` is canonical decimal TEXT on both dialects: sea-orm decodes a SQLite `Decimal`
 // through `f64` whatever the column affinity ("30.00" read back as "30"; digits past f64's
-// precision lost), and a fee is money. The CHECK admits unsigned plain decimals only.
+// precision lost), and a fee is money. The CHECK admits canonical unsigned decimals only: no
+// leading zero before another digit, no trailing fractional zero, no lone point (`30`, never
+// `30.00`).
+// `currency` and `currency_scale` are the price's own currency spec: the book's currency and the
+// scale the currency table gave it when the price was written. Reads use them, never the
+// current table.
 const SQLITE_UP: &[&str] = &[
     r"CREATE TABLE IF NOT EXISTS pricing_price (
   id text PRIMARY KEY, tenant_id text NOT NULL, price_book_entry_id text NOT NULL REFERENCES pricing_price_book_entry(id),
   version_no integer NOT NULL, dim_value text,
   model text NOT NULL CHECK (model IN ('flat','per_unit','graduated','volume','package')), price_json text NOT NULL,
-  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+  currency_scale integer NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.' AND min_fee NOT GLOB '0[0-9]*' AND min_fee NOT GLOB '*.*0'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from text NOT NULL, effective_to text, keep_for_bound integer NOT NULL DEFAULT 0,
   closed_explicitly integer NOT NULL DEFAULT 0,
   temporary_until text, paired_price_id text REFERENCES pricing_price(id),

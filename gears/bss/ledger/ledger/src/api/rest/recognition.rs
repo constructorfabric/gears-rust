@@ -1,6 +1,6 @@
 //! Axum handler + router for the ledger's recognition-run REST surface
 //! (architecture §5, the ASC 606 S6 release). One write operation under
-//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the vhp-core
+//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the platform
 //! convention, matching the payment / dispute surfaces): the `tenant_id` is in
 //! the **body**.
 //!
@@ -19,7 +19,7 @@
 //! operation with its declared request / response schemas. Mirrors the
 //! `record_dispute_phase` handler in [`crate::api::rest::disputes`].
 //!
-// TODO(VHP-1855 I4): the benidorm recognition-lifecycle e2e (deferred post →
+// TODO: the recognition-lifecycle e2e (deferred post →
 // run → schedule GET → change) is cluster-gated and lives in the separate e2e
 // suite; not implemented here (it needs a live cluster, out of this slice's
 // build-only scope).
@@ -115,7 +115,7 @@ impl RecognitionApprovalGate for crate::infra::approval::service::ApprovalServic
 pub struct ApiState {
     /// In-process data-access client (the gear's own local impl).
     pub client: Arc<dyn LedgerClientV1>,
-    /// Dual-control gate (VHP-1852): a schedule change/cancel whose un-recognized
+    /// Dual-control gate: a schedule change/cancel whose un-recognized
     /// deferred remainder crosses the D2 threshold routes to the preparer→approver
     /// queue (409); below-threshold changes apply inline. Taken behind
     /// [`RecognitionApprovalGate`] so the gated path is
@@ -655,7 +655,7 @@ async fn change_recognition_schedule(
     crate::domain::recognition::change::gate_treatment(&cmd.treatment)
         .map_err(CanonicalError::from)?;
 
-    // Dual-control gate (VHP-1852): a schedule change/cancel whose un-recognized
+    // Dual-control gate: a schedule change/cancel whose un-recognized
     // deferred remainder (the revenue it re-plans / strands) crosses the D2
     // threshold routes to the preparer→approver queue (409 DUAL_CONTROL_REQUIRED);
     // a below-threshold change applies inline. The remainder is read from the

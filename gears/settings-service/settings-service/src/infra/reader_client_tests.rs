@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The SDK contract as a consumer sees it, over the resolution harness.
 
 use std::sync::Arc;
@@ -327,6 +326,7 @@ async fn a_category_holding_a_row_whose_key_does_not_parse_is_refused_whole_not_
                     source: "admin_authored".to_owned(),
                     owner_module: None,
                     licence_feature: None,
+                    display_name: None,
                     description: None,
                     created_by: "test".to_owned(),
                 },

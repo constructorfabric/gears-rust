@@ -1,5 +1,5 @@
 //! Forward-fix: add `MANUAL_ADJUSTMENT` to the dual-control `ledger_approval.kind`
-//! CHECK (Slice 3 Group 5 / Phase 3 governance, VHP-1856) on clusters where
+//! CHECK (Slice 3 governance) on clusters where
 //! `m20260624_000012` was ALREADY applied with its prior kind set.
 //!
 //! `m20260624_000012` was amended in place to add `MANUAL_ADJUSTMENT` to the

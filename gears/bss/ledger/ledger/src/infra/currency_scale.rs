@@ -1,12 +1,14 @@
-//! Resolves the currency posting scale for a (tenant, currency): registry row
-//! first (tenant overrides + non-ISO codes), then the ISO-4217 default;
-//! a non-ISO currency with no row is an error (no implicit scale).
+//! Resolves the currency posting scale for a (tenant, currency): the ISO 4217 scale from
+//! `bss_money::iso_scale` first, then the registry row for a code with no ISO 4217 minor-unit
+//! scale. The
+//! registry never overrides an ISO scale (provisioning refuses such a row, and a stored one
+//! is ignored); a non-ISO currency with no row is an error (no implicit scale).
 
+use bss_money::iso_scale;
 use toolkit_db::secure::{AccessScope, DBRunner};
 use uuid::Uuid;
 
 use crate::domain::money::ScaleError;
-use crate::domain::scale::iso_default_scale;
 use crate::infra::storage::repo::ReferenceRepo;
 
 /// Registry-backed currency-scale resolver.
@@ -20,8 +22,9 @@ impl CurrencyScaleResolver {
         Self { reference }
     }
 
-    /// Resolve the scale for `(tenant_id, currency)`: a registry row wins,
-    /// else the ISO-4217 default, else [`ScaleError::UnknownCurrencyScale`].
+    /// Resolve the scale for `(tenant_id, currency)`: the ISO-4217 scale of an ISO
+    /// code (the registry is not read), else the registry row, else
+    /// [`ScaleError::UnknownCurrencyScale`].
     ///
     /// # Errors
     /// [`ScaleError::Repo`] on a storage failure; [`ScaleError::UnknownCurrencyScale`]
@@ -33,15 +36,14 @@ impl CurrencyScaleResolver {
         tenant_id: Uuid,
         currency: &str,
     ) -> Result<u8, ScaleError> {
-        if let Some(row) = self
-            .reference
+        if let Some(scale) = iso_scale(currency) {
+            return Ok(scale);
+        }
+        self.reference
             .find_currency_scale(scope, tenant_id, currency)
             .await
             .map_err(ScaleError::from)?
-        {
-            return Ok(row.currency_scale);
-        }
-        iso_default_scale(currency)
+            .map(|row| row.currency_scale)
             .ok_or_else(|| ScaleError::UnknownCurrencyScale(currency.to_owned()))
     }
 
@@ -58,15 +60,14 @@ impl CurrencyScaleResolver {
         tenant_id: Uuid,
         currency: &str,
     ) -> Result<u8, ScaleError> {
-        if let Some(row) = self
-            .reference
+        if let Some(scale) = iso_scale(currency) {
+            return Ok(scale);
+        }
+        self.reference
             .find_currency_scale_in(runner, scope, tenant_id, currency)
             .await
             .map_err(ScaleError::from)?
-        {
-            return Ok(row.currency_scale);
-        }
-        iso_default_scale(currency)
+            .map(|row| row.currency_scale)
             .ok_or_else(|| ScaleError::UnknownCurrencyScale(currency.to_owned()))
     }
 }

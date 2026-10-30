@@ -742,3 +742,112 @@ async fn rd_watch_010_disabled_mode_degrades_honestly() {
 
     handle.stop().await;
 }
+
+/// Publishes `count` lock-release messages from one script, so they reach the
+/// subscriber back to back. A burst that must lag the stream is many times the
+/// capacity: TCP can split it across reads and let the fan-out drain between
+/// them.
+async fn release_burst(raw: &fred::clients::Client, key_prefix: &str, count: u32) {
+    use fred::interfaces::LuaInterface;
+    let _: i64 = raw
+        .eval(
+            "for i = 1, tonumber(ARGV[2]) do redis.call('PUBLISH', ARGV[1], 'R') end return 1",
+            Vec::<String>::new(),
+            vec![format!("{key_prefix}:e:l:burst"), count.to_string()],
+        )
+        .await
+        .expect("the burst script runs");
+}
+
+/// `RD-WATCH-011` — a burst of lock releases does not reset an unrelated watcher,
+/// and a burst past the configured capacity still does.
+#[tokio::test]
+async fn rd_watch_011_a_release_burst_within_capacity_resets_no_watcher() {
+    // Default capacity.
+    let (_container, handle, cache, raw) = fixture(json!({})).await;
+    let mut watch = cache.watch("unrelated:key").await.expect("watch succeeds");
+    release_burst(&raw, "cluster", 1_024).await;
+    expect_silence(&mut watch, "a release burst within the default capacity").await;
+    drop(watch);
+    handle.stop().await;
+
+    // A deliberately small capacity: a burst past it must lag, and say so.
+    let (_container, handle, cache, raw) =
+        fixture(json!({ "subscriber_buffer_capacity": 32 })).await;
+    let mut watch = cache.watch("unrelated:key").await.expect("watch succeeds");
+    release_burst(&raw, "cluster", 1_024).await;
+    assert!(
+        matches!(next_event(&mut watch).await, Some(CacheWatchEvent::Reset)),
+        "a burst past the capacity loses messages, and the watcher must be told Reset"
+    );
+    drop(watch);
+    handle.stop().await;
+}
+
+/// `RD-WATCH-012` — a lag-triggered `Reset` does not stall delivery behind a
+/// watcher that has stopped draining. The `Reset` send to a full buffer waits up
+/// to `TERMINAL_GRACE` (5 s); that wait must not block the fan-out.
+#[tokio::test]
+async fn rd_watch_012_a_lag_reset_does_not_stall_delivery_behind_a_stalled_watcher() {
+    // The capacity is well above the 80 setup puts, so setup cannot lag the stream
+    // and start a `Reset` that holds the terminal lock behind `stalled`; only the
+    // burst below does.
+    let (_container, handle, cache, raw) =
+        fixture(json!({ "subscriber_buffer_capacity": 128 })).await;
+
+    // A watcher that never reads, with its 64-slot buffer filled.
+    let stalled = cache.watch("stalled:key").await.expect("watch succeeds");
+    for _ in 0..80 {
+        cache
+            .put(PutRequest {
+                key: "stalled:key",
+                value: VALUE,
+                ttl: Ttl::Indefinite,
+            })
+            .await
+            .expect("put succeeds");
+    }
+    let mut live = cache.watch("live:key").await.expect("watch succeeds");
+    // Let the fan-out finish dispatching the puts above.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Lag the stream: `live` gets its `Reset` at once while the send to
+    // `stalled` waits out its grace.
+    release_burst(&raw, "cluster", 8_192).await;
+    assert!(
+        matches!(next_event(&mut live).await, Some(CacheWatchEvent::Reset)),
+        "the lag must reset the live watcher"
+    );
+
+    // While that send is still pending, a write to the live key must arrive
+    // promptly.
+    let written_at = std::time::Instant::now();
+    cache
+        .put(PutRequest {
+            key: "live:key",
+            value: VALUE,
+            ttl: Ttl::Indefinite,
+        })
+        .await
+        .expect("put succeeds");
+    // Other events may arrive first; only the write's latency is asserted.
+    let mut seen = Vec::new();
+    let latency = loop {
+        match tokio::time::timeout(Duration::from_secs(10), live.recv()).await {
+            Ok(Some(CacheWatchEvent::Event(CacheEvent::Changed { .. }))) => {
+                break written_at.elapsed();
+            }
+            Ok(Some(other)) => seen.push((written_at.elapsed(), other)),
+            other => panic!("the live watcher must still see its write, got {other:?}"),
+        }
+    };
+    assert!(
+        latency < Duration::from_secs(1),
+        "delivery to a draining watcher must not wait behind a stalled one's Reset; the \
+         Changed took {latency:?} (TERMINAL_GRACE is 5 s), after {seen:?}"
+    );
+
+    drop(stalled);
+    drop(live);
+    handle.stop().await;
+}

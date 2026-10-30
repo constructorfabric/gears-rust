@@ -708,7 +708,7 @@ curl http://127.0.0.1:8087/cf/healthz  <span class="hljs-comment"># liveness &qu
 make all             <span class="hljs-comment"># build + check + SQLite integration + E2E + OpenAPI</span>
 make <span class="hljs-built_in">test</span>            <span class="hljs-comment"># unit tests (workspace)</span>
 make <span class="hljs-built_in">test</span> GEAR=file-parser  <span class="hljs-comment"># unit tests for one gear + SDK scope</span>
-make test-sqlite     <span class="hljs-comment"># integration tests (SQLite, no external DB)</span>
+make test-integration LANE=toolkit-db-sqlite  <span class="hljs-comment"># integration tests (SQLite, no external DB)</span>
 make e2e-local       <span class="hljs-comment"># E2E — builds + starts server automatically</span>
 make e2e-local SUITE=file-parser  <span class="hljs-comment"># suite E2E scope + default E2E target</span>
 make coverage-unit   <span class="hljs-comment"># unit-test coverage</span>

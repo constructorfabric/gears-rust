@@ -53,11 +53,16 @@ pub struct ProvisionAccount {
     pub may_go_negative: bool,
 }
 
-/// One non-ISO currency-scale row to seed.
+/// One currency-scale row to seed: a code with no ISO 4217 minor-unit scale, at its posting scale.
+///
+/// An ISO 4217 code always has its ISO scale, and the registry never overrides it.
+/// A row for an ISO code is accepted only at that ISO scale (so a provisioning
+/// script can run again); any other scale for an ISO code is refused as an invalid
+/// request that names the code and its ISO scale.
 #[derive(Clone, Debug)]
 pub struct ProvisionCurrencyScale {
-    /// The currency code and its posting scale (0..=28, e.g. `2` for USD and
-    /// `8` for BTC), validated by construction.
+    /// The currency code and its posting scale (0..=28, e.g. `8` for BTC),
+    /// validated by construction.
     pub currency: CurrencySpec,
     pub source: String,
 }

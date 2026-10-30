@@ -47,7 +47,7 @@ const LEDGER_REVENUE_RECOGNIZED_TOTAL: &str = "ledger_revenue_recognized_total";
 const LEDGER_OVER_RECOGNITION: &str = "ledger_over_recognition_total";
 const LEDGER_RECOGNITION_DOUBLE_CREDIT: &str = "ledger_recognition_double_credit_total";
 const LEDGER_RECOGNITION_PERIOD_QUEUE_DEPTH: &str = "ledger_recognition_period_queue_depth";
-// Dual-control governance (VHP-1852): pending created, decisions by outcome, and
+// Dual-control governance: pending created, decisions by outcome, and
 // self-approval-denied attempts.
 const LEDGER_DUAL_CONTROL_PENDING: &str = "ledger_dual_control_pending_total";
 const LEDGER_DUAL_CONTROL_DECIDED: &str = "ledger_dual_control_decided_total";

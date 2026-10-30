@@ -2,7 +2,7 @@
 //! (via `#[toolkit_macros::api_dto]`) so the SDK value types
 //! (`bss_ledger_sdk::provisioning`) stay infra-free. The `api_dto` macro is
 //! the platform-mandated DTO wrapper (dylint DE0203) and fixes the wire shape
-//! to `snake_case` — the uniform vhp-core REST convention, overriding the
+//! to `snake_case` — the uniform platform REST convention, overriding the
 //! architecture doc's illustrative camelCase.
 
 use std::str::FromStr;
@@ -38,7 +38,9 @@ pub struct AccountDto {
     pub may_go_negative: Option<bool>,
 }
 
-/// One non-ISO currency-scale row to seed.
+/// One currency-scale row to seed: a code with no ISO 4217 minor-unit scale (such as `XTS`, or a
+/// code ISO does not list), at its posting scale. A row for an ISO 4217 code with a scale may only
+/// repeat that scale; another scale refuses the whole request (400).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
 pub struct CurrencyScaleDto {
@@ -63,7 +65,7 @@ pub struct FiscalCalendarDto {
 /// The provisioning request body: the target seller tenant, accounts, currency
 /// scales, and the fiscal-calendar config to seed in one transaction. The
 /// tenant is carried in the **body** (not the path) — the gear's REST surface is
-/// tenant-from-context/body per the vhp-core convention (RBAC/RMS), and a
+/// tenant-from-context/body per the platform convention (RBAC/RMS), and a
 /// provision targets a seller the caller authorizes via the PEP gate.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -427,7 +429,7 @@ fn lower_tax(
 
 /// The `POST /journal-entries` request body: a fully-recognized invoice
 /// (Variant A) to post. The target seller ledger is the body's own `tenant_id`
-/// (tenant in body, not path — the vhp-core REST convention); the `(entry,
+/// (tenant in body, not path — the platform REST convention); the `(entry,
 /// post)` PEP gate authorizes it.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -1103,7 +1105,7 @@ impl From<Vec<AgingBucket>> for ArAgingDto {
 
 /// The `POST /payments` request body: a settled payment to record (the
 /// **money-in** side). The target seller ledger is the body's own `tenant_id`
-/// (tenant in body, not path — the vhp-core REST convention); the `(payment,
+/// (tenant in body, not path — the platform REST convention); the `(payment,
 /// write)` PEP gate authorizes it. `gross` and `fee` carry their currency and
 /// stored scale; the scale is validated against the provisioned currency
 /// config at post time (a mismatch is rejected, never rescaled). `effective_at`
@@ -1272,7 +1274,7 @@ impl From<bss_ledger_sdk::PostingRef> for ReturnPaymentResponse {
 /// The `POST /disputes/{dispute_id}/phases` request body: record one phase of a
 /// chargeback dispute. `{dispute_id}` (the dispute's external id) comes from the
 /// PATH; the target seller ledger is the body's own `tenant_id` (tenant in body,
-/// not path — the vhp-core REST convention); the `(dispute, write)` PEP gate
+/// not path — the platform REST convention); the `(dispute, write)` PEP gate
 /// authorizes it. The LEDGER chooses the variant at `opened` from `funds_at_open`
 /// (`"withheld"` ⇒ cash-hold, `"not_moved"` ⇒ AR-reclass); `phase` is one of
 /// `"opened" | "won" | "lost" | "partial"` (Group B implements `opened`).
@@ -1652,7 +1654,7 @@ struct CreditApplicationResource;
 
 /// The `POST /credit-applications` request body: ONE wire shape for both wallet
 /// kinds, discriminated by `kind` (`"grant"` | `"apply"`). The target seller
-/// ledger is the body's own `tenant_id` (tenant in body, not path — the vhp-core
+/// ledger is the body's own `tenant_id` (tenant in body, not path — the platform
 /// REST convention); the `(credit_application, write)` PEP gate authorizes it.
 /// `currency` + `currency_scale` constrain the whole application: a grant's
 /// `money` and every apply target must carry the same pair (a mismatch is a
@@ -1861,7 +1863,7 @@ impl From<bss_ledger_sdk::CreditApplicationApplied> for CreditApplicationRespons
 /// The `POST /recognition-runs` request body: trigger an ASC 606 recognition
 /// run for one fiscal period (release the period's due `PENDING` segments). The
 /// target seller ledger is the body's own `tenant_id` (tenant in body, not path
-/// — the vhp-core REST convention); the `(entry, post)` PEP gate authorizes it
+/// — the platform REST convention); the `(entry, post)` PEP gate authorizes it
 /// (a run posts `DR CL / CR Revenue` journal entries). `run_id` is the
 /// run-trigger idempotency key: `None` ⇒ the ledger mints a fresh one (a first,
 /// un-keyed trigger); a stable one makes retries idempotent (a replay returns
@@ -2053,7 +2055,7 @@ impl TryFrom<ChangeSegmentDto> for bss_ledger_sdk::ChangeSegment {
 /// The `POST /recognition-schedules/{schedule_id}/changes` request body: change or
 /// cancel an ASC 606 recognition schedule (design §3.6 / §4.6). `{schedule_id}`
 /// (the ACTIVE schedule to change) comes from the PATH; the target seller ledger
-/// is the body's own `tenant_id` (tenant in body, not path — the vhp-core REST
+/// is the body's own `tenant_id` (tenant in body, not path — the platform REST
 /// convention); the `(entry, post)` PEP gate authorizes it (a change marks/mints
 /// schedule state). `change_id` is the idempotency key (a replay returns the prior
 /// result, minting no second schedule). `action` is `"cancel"` | `"replace"`.
@@ -2365,7 +2367,7 @@ pub struct ReidentifyResponseDto {
 
 /// The `POST /credit-notes` request body: a compensating credit note against a
 /// posted invoice (design §4.2). The target seller ledger is the body's own
-/// `tenant_id` (tenant in body, not path — the vhp-core REST convention); the
+/// `tenant_id` (tenant in body, not path — the platform REST convention); the
 /// `(entry, post)` PEP gate authorizes it (a credit note posts a balanced
 /// compensating journal entry — the same data-plane post action as the
 /// recognition run / invoice post). Idempotent on `credit_note_id` (the
@@ -2823,7 +2825,7 @@ pub struct InvoiceExposureResponse {
 
 /// The `POST /refunds` request body: one PSP refund phase to record (the
 /// **money-out** side that unwinds a settled receipt). The target seller ledger
-/// is the body's own `tenant_id` (tenant in body, not path — the vhp-core REST
+/// is the body's own `tenant_id` (tenant in body, not path — the platform REST
 /// convention); the `(entry, post)` PEP gate authorizes it (a refund posts a
 /// balanced journal entry into the seller's ledger, like the credit/debit notes,
 /// design §8 / Phase-1 precedent). `pattern` selects the economic shape
@@ -3536,7 +3538,7 @@ fn check_free_text(field: &str, value: &str, max: usize) -> Result<(), DomainErr
 /// decision 2). Upsert-keyed on `(tenant_id, base_currency, quote_currency,
 /// provider)`: re-posting the same tuple overwrites the quote (`rate` /
 /// `as_of` / `fallback_order`) — idempotent on `(tenant, base, quote, provider,
-/// as_of)`. `tenant_id` rides the body (the vhp-core write convention, no tenant
+/// as_of)`. `tenant_id` rides the body (the platform write convention, no tenant
 /// in the path).
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(request)]
@@ -3664,7 +3666,7 @@ impl From<crate::infra::storage::repo::fx_repo::RateSnapshotRow> for FxRateSnaps
 
 /// Trigger an unrealized (Mode-B) revaluation for one period across the monetary
 /// scopes `{AR, UNALLOCATED, REUSABLE_CREDIT}` (design §4.5). `tenant_id` rides
-/// the body (the vhp-core write convention). Each scope is idempotent on
+/// the body (the platform write convention). Each scope is idempotent on
 /// `(tenant, period_id, scope)` — re-posting the same period replays the
 /// already-posted scopes. A no-op when the tenant is Mode-A
 /// (`revaluation_enabled = false`).

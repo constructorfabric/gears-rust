@@ -600,7 +600,7 @@ async fn change_with_catch_up_treatment_refuses_before_the_gate() {
     );
 }
 
-/// #3 (VHP-1855): a change against a non-ACTIVE (REPLACED) schedule — the shape of an
+/// #3: a change against a non-ACTIVE (REPLACED) schedule — the shape of an
 /// idempotent replay of an already-applied change — skips the gate and falls through
 /// to the change-service (200), instead of recomputing the stale remainder off the
 /// REPLACED row and raising a spurious 409.

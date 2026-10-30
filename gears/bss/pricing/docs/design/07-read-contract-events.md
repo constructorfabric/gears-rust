@@ -73,7 +73,7 @@ Feature algorithm: `cpt-cf-bss-pricing-algo-read-contract-events-period-slices-a
 1. [ ] - `p1` - Split the period at every price boundary inside the bound chain, including a temporary end. - `inst-read-contract-events-period-slices-and-quote-1`
 2. [ ] - `p1` - Prorate recurring slices by calendar days; rate usage by reading timestamp with tier counters per slice. - `inst-read-contract-events-period-slices-and-quote-2`
 3. [ ] - `p1` - Aggregate per price/subscription/period (no plan carries an included quantity to deduct since D-467) and apply the coverage-prorated min_fee once per price; not built in pricing, Rating applies the floor (D-415). - `inst-read-contract-events-period-slices-and-quote-3`
-4. [ ] - `p1` - Apply period-start promotion after floors, then the bound rounding/currency policy; quote returns totals while resolve never does; quote is not built (D-415). - `inst-read-contract-events-period-slices-and-quote-4`
+4. [ ] - `p1` - Apply period-start promotion after floors, then HALF_EVEN rounding at the bound price's currency scale (D-533, D-535); quote returns totals while resolve never does; quote is not built (D-415). - `inst-read-contract-events-period-slices-and-quote-4`
 
 ### typed-events
 
@@ -126,10 +126,11 @@ price_id }` values. Its result is a matrix of `ResolvedCell { selection, binding
 cell has `binding=None`. Complete bindings carry entry identity, dimension key/requested value,
 dated SKU version/code/name/unit, typed exact-decimal money, invoice inputs with template provenance,
 and `via_default`. Legacy entries carry `usage_rating_policy=None`. D-502 stores immutable entry policies and D-503 projects their materialized
-content here; the semantic provider is required only at new-entry and publication gates. Missing priced-cell descriptors or a rounding value not representable by the initial
-`HalfEven` projection returns the typed `IncompleteCommercialInputs` canonical precondition violation
+content here; the semantic provider is required only at new-entry and publication gates. Missing priced-cell descriptors return
+the typed `IncompleteCommercialInputs` canonical precondition violation
 (type `INCOMPLETE_COMMERCIAL_INPUTS`, subject the missing field).
-REST retains nullable descriptors and its existing rounding vocabulary and goldens. Neither transport
+Invoice inputs carry `Rounding::HalfEven` (D-535); the line posts at the bound price's `currency.scale()` (D-533).
+REST retains nullable descriptors and its goldens. Neither transport
 computes totals. Both adapters map the shared local snapshot, matrix and invoice inputs explicitly;
 dated Products reads occur only after the local read transaction finishes.
 
@@ -140,7 +141,7 @@ key), although catch-up may persist the already-approved switch. Other read meth
 
 The digest helpers implement restricted RFC 8785 canonical JSON, wrapped as `{domain,payload}` before
 SHA-256. Domains delivered here are `pricing.money.v1`, `pricing.bindings.v1`, `pricing.policy.v1` and
-`pricing.template.v1`. Money payload is `{currency, model, minimum_fee}` with every model operand,
+`pricing.template.v1`. Money payload is `{currency, currency_scale, model, minimum_fee}` with every model operand (D-532),
 excluding IDs, all dates, closing observations and its own digest. Binding payload is
 `{plan_id, revision_id, bindings:[{selection,binding}]}` and contains every declared binding field,
 including entry, requested dimensions, dated unit, complete price observation, policy identity/version/
@@ -166,8 +167,7 @@ Resolution is a per-item matrix of default and value chains (D-420) with each it
 | Level | Field | Content |
 | --- | --- | --- |
 | revision | plan_revision_id, plan_id, rev_no, state | The revision resolved; state is published, superseded or scheduled, as the revision reads today (D-454). |
-| revision | book_id, currency, currency_minor_digits | The revision's book, its currency and that currency's scale (domain::book::minor_digits). |
-| revision | rounding_policy | The tenant default_rounding: half_up, half_even, half_down, up or down since D-437; a value stored before it reads as stored. |
+| revision | book_id, currency | The revision's book and its currency. The scale is on each binding (D-531). |
 | revision | date | The date resolved (YYYY-MM-DD). |
 | revision | items | One per item of the revision, or the one item_id names. |
 | item | item_id, sku_id | The item and its SKU; since D-467 an item carries no treatment, included_qty or qty_min. |
@@ -186,15 +186,16 @@ Resolution is a per-item matrix of default and value chains (D-420) with each it
 | binding | price_id | The bound price. |
 | binding | dim_used | The chain the bound price belongs to: the value, or null for the default chain. |
 | binding | pinned_from | The pin the renewal walk started from; null for a signup. |
+| binding | currency, currency_scale | The bound price's stored currency (its book's) and scale, a JSON integer: the scale its invoice line posts at. A later change of the currency table changes neither (D-531). |
 | binding | price, min_fee | The price's money object as stored, in the item's model (the binding carries no model of its own, D-427): { amount } for flat; { rate } for per_unit; { tiers: [{ up_to, rate }] } for graduated and volume, the last up_to null; { package_size, package_price } for package. Every amount is exact decimal text; min_fee is null when the price has none. |
 | binding | eligibility | all or new. |
 | binding | effective_from, effective_to, temporary_until | The stored window and the temporary end, if any. effective_to is for information: a successor's start sets it, including a new successor that a pinned subscription does not take. |
 | binding | ends_on | Where the binding ends for its holder (D-425): temporary_until for a temporary price, the stored end of an explicitly closed price, null when it has none. A consumer slices a period at ends_on, never at effective_to. |
 | binding | keep_for_bound | Whether the price is kept for pinned subscriptions (the predecessor of a new price). |
 
-In the served OpenAPI, the revision's state, charge_kind, period, model, each input's source and eligibility are enums of exactly the tokens above; rounding_policy stays a string, because no CHECK guards default_rounding (D-439). The pinned price read's charge_kind, period, model and eligibility are the same enums.
+In the served OpenAPI, the revision's state, charge_kind, period, model, each input's source and eligibility are enums of exactly the tokens above (D-439). The pinned price read's charge_kind, period, model and eligibility are the same enums.
 
-The pinned price read returns one approved price's stored facts with its entry's SKU, charge kind, period, model (D-427), book and currency (D-422). Pricing prices are read forever; consumer pins persist outside this gear. Events use toolkit outbox envelopes, not a second pricing schema.
+The pinned price read returns one approved price's stored facts with its entry's SKU, charge kind, period, model (D-427), book, and its stored currency and currency_scale (D-422, D-531). Pricing prices are read forever; consumer pins persist outside this gear. Events use toolkit outbox envelopes, not a second pricing schema.
 
 Tenant-scoped parent validation is required even where foreign keys use entity ids. Never substitute a
 cross-gear read for transactional local ownership/version guards. Approved money and historical pins survive.
@@ -278,8 +279,9 @@ TEXT without database JSON reformatting. No expiry column or cleanup path exists
 new-sale BillingTerms validation adapter. Acceptance schema 1 stores the full query, including the
 BillingTerms snapshot's own schema version, accepted/deadline timestamps, digests and all selected
 bindings. Hold schema 1 stores its frozen bindings and activation; the retained acceptance supplies
-the referenced BillingTerms. The v1 reader is frozen: a later additive format gets another explicit
-version reader without changing stored digest meaning or supplying missing historical fields.
+the referenced BillingTerms. Each stored price carries its `currency` and `currency_scale`. The v1 shapes
+change in place and keep schema 1 (D-532); a reader never changes stored digest meaning or supplies
+missing historical fields.
 Exact decimal/time adapters reject lossy input. Receipt reading does not recalculate digests, choose
 anchors, replace descriptors or require currently sellable catalog content.
 

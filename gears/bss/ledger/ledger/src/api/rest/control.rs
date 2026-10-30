@@ -1,7 +1,7 @@
 //! Axum handlers + router for the control-feed ingest surface (Slice 7 Phase 3,
 //! design §0 decision 3 / §3.4). Three POST operations under
 //! `/bss-ledger/v1/ledger/control`, tenant-scoped WITHOUT a tenant in the path
-//! (the vhp-core convention): each write carries `tenant_id` in the **body**.
+//! (the platform convention): each write carries `tenant_id` in the **body**.
 //!
 //! These are CALL-DRIVEN control feeds — the owning module (Invoice /
 //! Orchestration / the PSP adapter) PUSHES into the ledger; they are never posting

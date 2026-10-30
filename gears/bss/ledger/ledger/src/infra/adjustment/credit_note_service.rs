@@ -111,7 +111,7 @@ pub struct CreditNoteHandler {
     /// per attempt, labelled posted / replayed / `blocked_split` / `blocked_headroom`
     /// / rejected.
     metrics: Arc<dyn LedgerMetricsPort>,
-    /// The dual-control engine (VHP-1852). `Some` ⇒ a credit note whose amount
+    /// The dual-control engine. `Some` ⇒ a credit note whose amount
     /// crosses the tenant's D2 threshold is gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) instead of posting inline; `None` ⇒
     /// gating is disabled (the executor's approved replay, and the unit tests that
@@ -167,7 +167,7 @@ impl CreditNoteHandler {
         self
     }
 
-    /// Attach the dual-control engine (VHP-1852): a credit note whose amount crosses
+    /// Attach the dual-control engine: a credit note whose amount crosses
     /// the tenant's D2 threshold is then gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) rather than posting inline. The approved
     /// replay re-enters through [`Self::post_credit_note_approved`], which skips the
@@ -212,7 +212,7 @@ impl CreditNoteHandler {
         result
     }
 
-    /// The approved-replay entry (VHP-1852): re-drive a held credit note WITHOUT the
+    /// The approved-replay entry: re-drive a held credit note WITHOUT the
     /// dual-control gate. Called only by the `ApprovalExecutor` after a second actor
     /// approves the PENDING credit-note approval — the threshold was already crossed
     /// at gate time, so re-checking it would re-open a second approval (an infinite
@@ -278,7 +278,7 @@ impl CreditNoteHandler {
             )));
         }
 
-        // 1c. Dual-control gate (VHP-1852, design §1.4 D2 / §4.2). Gated on the
+        // 1c. Dual-control gate (design §1.4 D2 / §4.2). Gated on the
         //     credit note's amount crossing the tenant's D2 threshold, AFTER the
         //     shape gate (a malformed request 400s) AND the originating-invoice link
         //     gate (an absent origin 404s) — so neither opens an approval — but

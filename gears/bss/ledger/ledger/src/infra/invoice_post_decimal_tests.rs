@@ -52,7 +52,11 @@ async fn seeded(db: Db) -> (Db, InvoicePostService, PostedInvoice) {
         FxConfig::default(),
     );
     let tenant = Uuid::now_v7();
-    for code in ["EUR", "USD"] {
+    // The invoice currency (TKA) and the functional currency (TKB) are non-ISO codes, so
+    // the registry row is the only source of their scale. A test can then change the
+    // registry and prove that a replay or a reversal keeps the stored scale (an ISO code
+    // always keeps its ISO scale, and the registry cannot change it).
+    for code in ["TKA", "TKB"] {
         svc.reference
             .upsert_currency_scale(CurrencyScaleRow {
                 tenant_id: tenant,
@@ -76,7 +80,7 @@ async fn seeded(db: Db) -> (Db, InvoicePostService, PostedInvoice) {
                 tenant_id: tenant,
                 legal_entity_id: tenant,
                 account_class: class.as_str().into(),
-                currency: "EUR".into(),
+                currency: "TKA".into(),
                 revenue_stream: class.is_per_stream().then(|| "test".into()),
                 normal_side: side.as_str().into(),
                 may_go_negative: false,
@@ -115,8 +119,8 @@ async fn seeded(db: Db) -> (Db, InvoicePostService, PostedInvoice) {
         due_date: None,
         period_id: "202610".into(),
         items: vec![InvoiceItem {
-            amount_ex_tax: money("12.34", "EUR", 2),
-            deferred: money("0", "EUR", 2),
+            amount_ex_tax: money("12.34", "TKA", 2),
+            deferred: money("0", "TKA", 2),
             revenue_stream: "test".into(),
             catalog_class: Some(AccountClass::Revenue),
             contract_class: None,
@@ -128,7 +132,7 @@ async fn seeded(db: Db) -> (Db, InvoicePostService, PostedInvoice) {
             pricing_snapshot_ref: Some("pricing".into()),
         }],
         tax: vec![TaxBreakdown {
-            amount: money("1.23", "EUR", 2),
+            amount: money("1.23", "TKA", 2),
             tax_jurisdiction: "EU".into(),
             tax_filing_period: "2026Q4".into(),
             tax_rate_ref: Some("tax-policy".into()),
@@ -198,7 +202,7 @@ async fn fx(svc: &InvoicePostService, inv: &PostedInvoice) {
         fiscal_tz: Set("UTC".into()),
         granularity: Set("MONTH".into()),
         fy_start_month: Set(1),
-        functional_currency: Set(Some("USD".into())),
+        functional_currency: Set(Some("TKB".into())),
     };
     fiscal_calendar::Entity::insert(row.clone())
         .secure()
@@ -210,8 +214,8 @@ async fn fx(svc: &InvoicePostService, inv: &PostedInvoice) {
     FxRepo::new(svc.db.clone())
         .upsert_rate(&crate::infra::storage::repo::NewFxRate {
             tenant_id: tenant,
-            base_currency: "EUR".into(),
-            quote_currency: "USD".into(),
+            base_currency: "TKA".into(),
+            quote_currency: "TKB".into(),
             provider: "ecb".into(),
             rate: bss_ledger_sdk::parse_decimal("1.5").unwrap(),
             as_of: OffsetDateTime::now_utc(),
@@ -240,7 +244,7 @@ async fn typed_invoice_tax_deferral_replay_and_complete_recognition_identity() {
             .find(|l| l.account_class == "AR")
             .unwrap()
             .money,
-        money("13.57", "EUR", 2)
+        money("13.57", "TKA", 2)
     );
     assert_eq!(
         entry
@@ -249,7 +253,7 @@ async fn typed_invoice_tax_deferral_replay_and_complete_recognition_identity() {
             .find(|l| l.account_class == "CONTRACT_LIABILITY")
             .unwrap()
             .money,
-        money("12.34", "EUR", 2)
+        money("12.34", "TKA", 2)
     );
     assert_eq!(
         entry
@@ -284,7 +288,7 @@ async fn typed_invoice_tax_deferral_replay_and_complete_recognition_identity() {
     );
     let before = state(&db).await;
     inv.correlation_id = Uuid::now_v7();
-    inv.items[0].amount_ex_tax = money("12.3400", "EUR", 2);
+    inv.items[0].amount_ex_tax = money("12.3400", "TKA", 2);
     assert!(
         svc.post_invoice(&ctx, &scope, &inv, false)
             .await
@@ -305,9 +309,9 @@ async fn metadata_and_policy_rejections_leave_full_state_untouched() {
     let ctx = SecurityContext::anonymous();
     let before = state(&db).await;
     let mut bad = inv.clone();
-    bad.items[0].amount_ex_tax = money("12.34", "EUR", 3);
-    bad.items[0].deferred = money("0", "EUR", 3);
-    bad.tax[0].amount = money("1.23", "EUR", 3);
+    bad.items[0].amount_ex_tax = money("12.34", "TKA", 3);
+    bad.items[0].deferred = money("0", "TKA", 3);
+    bad.tax[0].amount = money("1.23", "TKA", 3);
     assert!(matches!(
         svc.post_invoice(&ctx, &scope, &bad, true).await,
         Err(DomainError::InconsistentScale(_))
@@ -405,7 +409,7 @@ fn reversal(inv: &PostedInvoice, original: Uuid) -> PostEntry {
         entry_id: Uuid::now_v7(),
         tenant_id: inv.seller_tenant_id,
         period_id: inv.period_id.clone(),
-        entry_currency: "EUR".into(),
+        entry_currency: "TKA".into(),
         source_doc_type: SourceDocType::Reversal,
         source_business_id: crate::domain::invoice::reversal::reversal_business_id(original),
         effective_at: inv.effective_at,
@@ -439,7 +443,7 @@ async fn historical_case(db: Db, svc: InvoicePostService, inv: PostedInvoice) {
         before
             .lines
             .iter()
-            .all(|l| l.functional_money.as_ref().unwrap().currency().code() == "USD")
+            .all(|l| l.functional_money.as_ref().unwrap().currency().code() == "TKB")
     );
     if db.backend() == sea_orm::DbBackend::Sqlite {
         changed_registry(&db, inv.seller_tenant_id).await;
@@ -448,7 +452,7 @@ async fn historical_case(db: Db, svc: InvoicePostService, inv: PostedInvoice) {
             svc.reference
                 .upsert_currency_scale(CurrencyScaleRow {
                     tenant_id: inv.seller_tenant_id,
-                    currency: "EUR".into(),
+                    currency: "TKA".into(),
                     currency_scale: 3,
                     source: "changed".into(),
                 })
@@ -660,7 +664,7 @@ impl AttemptHook for Refresh {
                 currency_scale_registry::Column::CurrencyScale,
                 sea_orm::sea_query::Expr::value(if index == 3 { 3 } else { 2 }),
             )
-            .filter(currency_scale_registry::Column::Currency.eq("USD"))
+            .filter(currency_scale_registry::Column::Currency.eq("TKB"))
             .secure()
             .scope_with(&scope)
             .exec(txn)
@@ -679,7 +683,7 @@ impl AttemptHook for Refresh {
         fiscal_calendar::Entity::update_many()
             .col_expr(
                 fiscal_calendar::Column::FunctionalCurrency,
-                sea_orm::sea_query::Expr::value(if index == 2 { None } else { Some("USD") }),
+                sea_orm::sea_query::Expr::value(if index == 2 { None } else { Some("TKB") }),
             )
             .secure()
             .scope_with(&scope)
@@ -740,7 +744,7 @@ async fn whole_attempt_refresh_uses_attempt_local_rate_functional_lookup_and_no_
             .find(|line| line.account_class == "AR")
             .unwrap()
             .functional_money,
-        Some(money("40.71", "USD", 3))
+        Some(money("40.71", "TKB", 3))
     );
     assert_eq!(
         stored
@@ -877,7 +881,7 @@ async fn changed_registry(db: &Db, tenant: Uuid) {
             currency_scale_registry::Column::CurrencyScale,
             sea_orm::sea_query::Expr::value(3),
         )
-        .filter(currency_scale_registry::Column::Currency.eq("EUR"))
+        .filter(currency_scale_registry::Column::Currency.eq("TKA"))
         .secure()
         .scope_with(&AccessScope::for_tenant(tenant))
         .exec(&db.conn().unwrap())
@@ -926,7 +930,7 @@ async fn correction_retains_fresh_business_identity_and_original_policy_referenc
             .unwrap()
             .replayed
     );
-    correction.lines[0].money = money("13.58", "EUR", 2);
+    correction.lines[0].money = money("13.58", "TKA", 2);
     assert!(matches!(
         svc.post_correction(&ctx, &scope, correction).await,
         Err(DomainError::IdempotencyConflict(_))
@@ -1031,7 +1035,7 @@ async fn every_header_item_and_tax_field_is_bound_before_replay() {
     let before = state(&db).await;
     let variants: Vec<(&str, InvoiceMutation)> = vec![
         ("item amount", |i| {
-            i.items[0].amount_ex_tax = money("12.35", "EUR", 2);
+            i.items[0].amount_ex_tax = money("12.35", "TKA", 2);
         }),
         ("item revenue stream", |i| {
             i.items[0].revenue_stream = "other".into();
@@ -1055,7 +1059,7 @@ async fn every_header_item_and_tax_field_is_bound_before_replay() {
             i.items[0].catalog_class = None;
         }),
         ("tax amount", |i| {
-            i.tax[0].amount = money("1.24", "EUR", 2);
+            i.tax[0].amount = money("1.24", "TKA", 2);
         }),
         ("tax jurisdiction", |i| {
             i.tax[0].tax_jurisdiction = "EU-DE".into();
@@ -1165,7 +1169,7 @@ async fn reversal_header_guards_reject_without_effects() {
         }),
         ("entry currency differs from the original", {
             let mut r = reversal(&inv, original.entry_id);
-            r.entry_currency = "USD".into();
+            r.entry_currency = "TKB".into();
             r
         }),
         ("original period differs", {

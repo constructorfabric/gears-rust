@@ -1,4 +1,3 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! The coordinator: what survives a concurrent writer, what a batch does with
 //! one step-up verification, what a clone copies, and what the impact walk
 //! counts.
@@ -185,6 +184,7 @@ impl Harness {
                 id,
                 DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: None,
                     licence_feature: None,
@@ -211,6 +211,7 @@ impl Harness {
                 id,
                 DeclarationMetadata {
                     mode: "standard".to_owned(),
+                    display_name: None,
                     description: None,
                     domain_affinity: Some(domain.to_owned()),
                     licence_feature: None,

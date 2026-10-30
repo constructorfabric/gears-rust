@@ -41,7 +41,7 @@ fn price(rate: &str) -> ImmutablePrice {
         price_id: uuid::Uuid::from_u128(1),
         price_book_entry_id: uuid::Uuid::from_u128(2),
         money_digest: [0; 32],
-        currency: "EUR".into(),
+        currency: bss_money::CurrencySpec::try_new("EUR".into(), 2).unwrap(),
         model: PriceModel::PerUnit {
             unit_amount: Decimal::from_str_exact(rate).unwrap(),
         },
@@ -81,7 +81,7 @@ fn semantic_inputs_are_normalized_before_hashing() {
                     hex(bss_pricing_sdk::digest::money_digest(&p)),
                     vector["sha256"]
                 );
-                json!({"currency":"EUR","model":{"kind":"per_unit","unit_amount":Decimal::from_str_exact(input).unwrap().normalize().to_string()},"minimum_fee":null})
+                json!({"currency":"EUR","currency_scale":"2","model":{"kind":"per_unit","unit_amount":Decimal::from_str_exact(input).unwrap().normalize().to_string()},"minimum_fee":null})
             }
             "u64" => json!({"version":input.parse::<u64>().unwrap().to_string()}),
             "instant" => {
@@ -114,13 +114,45 @@ fn money_ignores_identity_and_closure_but_covers_every_operand() {
     changed.ends_on = Some(original.effective_from);
     changed.money_digest = [9; 32];
     assert_eq!(baseline, bss_pricing_sdk::digest::money_digest(&changed));
-    changed.currency = "USD".into();
+    changed.currency = bss_money::CurrencySpec::try_new("USD".into(), 2).unwrap();
     assert_ne!(baseline, bss_pricing_sdk::digest::money_digest(&changed));
     changed = original;
     changed.minimum_fee = Some(Decimal::ONE);
     assert_ne!(baseline, bss_pricing_sdk::digest::money_digest(&changed));
     changed = price("0.048");
     assert_ne!(baseline, bss_pricing_sdk::digest::money_digest(&changed));
+}
+/// The scale is part of the money: the same amounts at another scale are other money, since the
+/// minimum fee and the invoice line post at it. Only the scale changes here.
+#[test]
+fn money_digest_covers_the_currency_scale() {
+    use bss_pricing_sdk::digest::money_digest;
+    let original = price("0.047");
+    let mut rescaled = original.clone();
+    rescaled.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap();
+    assert_eq!(rescaled.currency.code(), original.currency.code());
+    assert_eq!(rescaled.model, original.model);
+    assert_ne!(
+        money_digest(&original),
+        money_digest(&rescaled),
+        "another scale is other money"
+    );
+}
+/// A binding's price carries its scale on its own, not only through its money digest: with the
+/// money digest held still, the scale alone still changes the accepted terms.
+#[test]
+fn the_binding_price_projection_carries_the_scale() {
+    use bss_pricing_sdk::digest::terms_digest;
+    let q = commercial_query();
+    let original = sample_binding();
+    let mut rescaled = original.clone();
+    rescaled.price.currency = bss_money::CurrencySpec::try_new("EUR".into(), 3).unwrap();
+    assert_eq!(rescaled.price.money_digest, original.price.money_digest);
+    assert_ne!(
+        terms_digest(&q, &[original]),
+        terms_digest(&q, &[rescaled]),
+        "the price projection names the scale"
+    );
 }
 
 #[test]
@@ -182,7 +214,6 @@ fn sample_binding() -> read::AcceptedBinding {
             gl_code: "usage".into(),
             tax_category: "standard".into(),
             timing: terms::BillingTiming::Arrears,
-            currency_scale: 2,
             rounding: terms::Rounding::HalfEven,
         },
     }
@@ -487,8 +518,7 @@ fn rules_only_policy_digest_covers_the_five_rating_rules() {
     use bss_pricing_sdk::digest::{policy_digest, selected_bindings_digest};
     const OLD_POLICY: &str = "c9dc411f7758532dcb616eeeb4389fc9b6fb10169fd52e60c9df1a599a707c7b";
     const NEW_POLICY: &str = "2bf1fcebb5742b520e2162b6ab65bcad5d04dc8c1100055d77757eaa87a60abc";
-    const OLD_BINDINGS: &str = "b4be41c8abdd4ba9a808b3a1ab54ce85bec603982d81e19347ccc3cb6aba3e86";
-    const NEW_BINDINGS: &str = "268fe0a1b05d7eaa4092bd5a4415d2669d028c865db702d73b761595e5d74457";
+    const NEW_BINDINGS: &str = "afa8076d53d6fbf900c49f20065c5bba1a8311bb154b82d4f516861c19cf9678";
     // A second policy that differed only in a former quantity_semantics field
     // (meter, unit, accrual) cannot be built: those fields are not on the type.
     let rules = terms::UsageRatingPolicyInput {
@@ -538,10 +568,6 @@ fn rules_only_policy_digest_covers_the_five_rating_rules() {
     let new_bindings =
         hex(selected_bindings_digest(&resolved, std::slice::from_ref(&selection)).unwrap());
     assert_eq!(new_bindings, NEW_BINDINGS);
-    assert_ne!(
-        new_bindings, OLD_BINDINGS,
-        "selected_bindings_digest old {OLD_BINDINGS} -> new {new_bindings} (policy part only)"
-    );
     let mut other_meter = binding;
     other_meter.meter = None;
     let resolved_without = read::ResolvedBindings {

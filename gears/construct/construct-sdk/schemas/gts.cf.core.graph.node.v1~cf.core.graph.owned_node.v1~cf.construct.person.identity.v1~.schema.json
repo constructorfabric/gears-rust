@@ -1,0 +1,149 @@
+{
+  "$id": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.person.identity.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "A person's identity: names, external ids, public profiles, location, background. One node is one fact. Its payload holds one property, which names the fact, and the origin of the fact. It also holds record, the record the fact came from, exactly when the fact came from a record.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "origin"
+          ],
+          "properties": {
+            "origin": {
+              "$ref": "gts://gts.cf.core.graph.attribute.v1~cf.core.graph.provenance.v1~"
+            },
+            "record": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "connector",
+                "provenance",
+                "version"
+              ],
+              "description": "The record a fact came from, when it came from one: the connector that sent it and the record's identity.",
+              "properties": {
+                "connector": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The connector that sent the record."
+                },
+                "provenance": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The record's identity within the connector."
+                },
+                "version": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 500,
+                  "pattern": "\\S",
+                  "description": "The record's version."
+                }
+              }
+            },
+            "background": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2000,
+              "pattern": "\\S"
+            },
+            "full_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "google_scholar_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]+$",
+              "maxLength": 100
+            },
+            "headline": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "location": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "name_variants": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "openalex_author_id": {
+              "type": "string",
+              "pattern": "^A\\d+$",
+              "maxLength": 100
+            },
+            "orcid_id": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{4}-\\d{4}-\\d{3}[\\dX]$"
+            },
+            "public_mentions": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500,
+              "pattern": "\\S"
+            },
+            "public_profiles": {
+              "type": "string",
+              "format": "uri",
+              "pattern": "^https?://",
+              "maxLength": 2048
+            },
+            "scopus_author_id": {
+              "type": "string",
+              "pattern": "^\\d+$",
+              "maxLength": 100
+            },
+            "timezone": {
+              "type": "string",
+              "pattern": "^(UTC|[A-Za-z_]+(/[A-Za-z0-9_+-]+){1,2})$",
+              "description": "A time zone name in the IANA form, such as Europe/Berlin, or UTC. The pattern checks the form, not that the zone exists.",
+              "maxLength": 100
+            }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "record"
+              ],
+              "minProperties": 3,
+              "maxProperties": 3
+            },
+            {
+              "not": {
+                "required": [
+                  "record"
+                ]
+              },
+              "minProperties": 2,
+              "maxProperties": 2
+            }
+          ]
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  ]
+}

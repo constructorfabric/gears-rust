@@ -8,29 +8,49 @@
 //!
 //! The `QuotaEnforcementStoragePluginV1` implementation is wired only once
 //! every primitive the trait names exists. Until then this type is reached by
-//! the plugin gear and by tests only.
+//! the plugin gear and by tests only. The Quota primitives it forwards live in
+//! `domain::quotas`.
 
 use std::sync::Arc;
 
-use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, StorageError};
+use quota_enforcement_sdk::{BootstrapBundle, ConfigDefaults, PolicyScope, StorageError};
 use toolkit_macros::domain_model;
+use toolkit_security::SecurityContext;
 
-use super::ports::{FoundationStore, SeedReport, StoreError};
+use super::ports::{
+    ConsumptionStore, FoundationStore, LeaseStore, PolicyStore, QuotaStore, SeedReport, StoreError,
+};
 
 const LOG_TARGET: &str = "qe.storage";
 
-/// Storage plugin over its foundation store.
+/// Storage plugin over its foundation and Quota stores.
 #[domain_model]
 #[derive(Clone)]
 pub struct StoragePlugin {
     store: Arc<dyn FoundationStore>,
+    pub(super) quotas: Arc<dyn QuotaStore>,
+    pub(super) policies: Arc<dyn PolicyStore>,
+    pub(super) consumption: Arc<dyn ConsumptionStore>,
+    pub(super) leases: Arc<dyn LeaseStore>,
 }
 
 impl StoragePlugin {
-    /// Bind the plugin to a store.
+    /// Bind the plugin to its stores.
     #[must_use]
-    pub fn new(store: Arc<dyn FoundationStore>) -> Self {
-        Self { store }
+    pub fn new(
+        store: Arc<dyn FoundationStore>,
+        quotas: Arc<dyn QuotaStore>,
+        policies: Arc<dyn PolicyStore>,
+        consumption: Arc<dyn ConsumptionStore>,
+        leases: Arc<dyn LeaseStore>,
+    ) -> Self {
+        Self {
+            store,
+            quotas,
+            policies,
+            consumption,
+            leases,
+        }
     }
 
     /// Verify the schema major and seed the default configuration rows.
@@ -78,7 +98,53 @@ impl StoragePlugin {
             .seed_configuration_defaults(&bundle.config_defaults)
             .await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-gear-bootstrap:p1:inst-boot-seed-config
+
+        self.seed_global_policy(bundle).await?;
         Ok(report)
+    }
+
+    /// Seed the `global` policy when the caller supplied one and the scope is
+    /// empty.
+    ///
+    /// Idempotent by re-reading the scope rather than by catching a unique
+    /// violation, so an operator who has since updated or rolled back the
+    /// global policy keeps their version: a later bootstrap finds the scope
+    /// occupied and writes nothing. Concurrent replicas that both find it
+    /// empty are arbitrated by the live-scope unique index, and the loser
+    /// treats `PolicyScopeOccupied` as success for the same reason.
+    ///
+    /// Engine registration happens before this runs, so no active policy can
+    /// reference an unregistered engine.
+    async fn seed_global_policy(&self, bundle: &BootstrapBundle) -> Result<(), StorageError> {
+        let Some(draft) = bundle.global_policy.clone() else {
+            return Ok(());
+        };
+        if self
+            .policies
+            .read_policy(&PolicyScope::Global)
+            .await?
+            .is_some()
+        {
+            return Ok(());
+        }
+        // Bootstrap has no principal; the nil subject records that absence.
+        match self
+            .policies
+            .create_policy(&SecurityContext::anonymous(), draft, &[])
+            .await
+        {
+            Ok(seeded) => {
+                tracing::info!(
+                    target: LOG_TARGET,
+                    engine_id = %seeded.engine_id,
+                    "seeded the global resolution policy"
+                );
+                Ok(())
+            }
+            // A concurrent replica won the race; its row is as good as ours.
+            Err(StorageError::PolicyScopeOccupied { .. }) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The installed contract major, if any.
@@ -139,16 +205,32 @@ impl StoragePlugin {
     }
 }
 
-/// Lift of the store port errors onto the contract error.
-trait FromStore {
+/// Lift of the store port errors onto the contract error. The four
+/// quota-lifecycle variants, `SubjectOutOfScope`, and `InvalidCursor` map one
+/// to one; caller input the contract has no variant for (filter bounds), a
+/// patch the gear cannot produce, and every inconsistency are `Internal`, as
+/// the contract documents.
+pub(super) trait FromStore {
     fn from_store(err: StoreError) -> Self;
 }
 
 impl FromStore for StorageError {
     fn from_store(err: StoreError) -> Self {
         match err {
-            StoreError::DefaultOutOfRange { .. } => Self::Internal(err.to_string()),
             StoreError::Unavailable { .. } => Self::Unavailable(err.to_string()),
+            StoreError::QuotaNotFound { id } => Self::QuotaNotFound { id },
+            StoreError::QuotaDeactivated { id } => Self::QuotaDeactivated { id },
+            StoreError::CapBelowConsumed { new_cap, consumed } => {
+                Self::CapBelowConsumed { new_cap, consumed }
+            }
+            StoreError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
+            StoreError::SubjectOutOfScope => Self::SubjectOutOfScope,
+            StoreError::InvalidCursor => Self::InvalidCursor,
+            StoreError::DefaultOutOfRange { .. }
+            | StoreError::InvalidPatch { .. }
+            | StoreError::InvalidFilter { .. }
+            | StoreError::ValueOutOfRange { .. }
+            | StoreError::Corrupt { .. } => Self::Internal(err.to_string()),
         }
     }
 }

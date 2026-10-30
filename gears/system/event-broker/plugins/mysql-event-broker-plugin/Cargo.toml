@@ -1,0 +1,75 @@
+[package]
+name = "cf-gears-mysql-event-broker-plugin"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MySQL and MariaDB storage backend plugin for the event-broker gear: segmented per-partition event tables and fenced deduplication"
+keywords = ["constructorfabric", "cf-gears", "event-broker"]
+categories = ["database"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "mysql_event_broker_plugin"
+
+# `testcontainers`/`testcontainers-modules` are optional `[dependencies]`, not
+# `[dev-dependencies]`: Cargo does not allow optional dev-dependencies, and the
+# `integration` feature names them with `dep:`. Every reference to them lives in
+# `tests/`.
+[package.metadata.cargo-shear]
+ignored = ["testcontainers", "testcontainers-modules"]
+
+[lints]
+workspace = true
+
+[features]
+# Gates the tests that need a Docker daemon, so a default `cargo test` never
+# does.
+integration = ["dep:testcontainers", "dep:testcontainers-modules"]
+
+[dependencies]
+# The `backend::Backend` contract this crate implements. This crate depends on
+# the SDK only, never on the gear.
+event-broker-sdk = { workspace = true }
+
+async-trait = { workspace = true }
+chrono = { workspace = true, features = ["clock", "serde"] }
+futures-util = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync", "time", "macros"] }
+tokio-util = { workspace = true }
+toolkit-gts = { workspace = true }
+toolkit-taskward = { workspace = true }
+toolkit-utils = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+# Direct sqlx, not `libs/toolkit-db`: see the crate docs in `src/lib.rs`.
+sqlx = { workspace = true, features = ["mysql", "migrate", "macros", "chrono", "uuid"] }
+testcontainers = { workspace = true, optional = true }
+testcontainers-modules = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Path only, no version: the suite is not published.
+event-broker-backend-conformance = { package = "cf-gears-event-broker-backend-conformance", path = "../event-broker-backend-conformance" }
+event-broker-backend-bench = { package = "cf-gears-event-broker-backend-bench", path = "../event-broker-backend-bench" }
+test-containers = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+[[test]]
+name = "conformance"
+required-features = ["integration"]
+
+[[test]]
+name = "mysql"
+required-features = ["integration"]
+
+# Needs a MySQL or MariaDB server: a container (Docker) unless
+# EB_BENCH_MYSQL_URL names one, so it is gated like the tests that do.
+[[bench]]
+name = "backend"
+harness = false
+required-features = ["integration"]

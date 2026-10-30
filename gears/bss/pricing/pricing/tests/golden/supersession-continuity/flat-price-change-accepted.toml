@@ -24,7 +24,7 @@ provenance = ["inst-tb-supersession-units (backup)", "inst-mk-chargekind (backup
 # whose `model_kind`, `meter` (absent), `dimensionKey` (absent) and windows
 # (absent) all match and still have to decide what to do with the one field that
 # moved - and the plain reading of "the successor MUST carry the predecessor's
-# fields unchanged" catches `amount_minor` if the scope clause is dropped. A
+# fields unchanged" catches `amount` if the scope clause is dropped. A
 # catalog that could not reprice a flat recurring charge without a plan revision
 # has lost the mechanism for the most common price change there is.
 #
@@ -37,13 +37,13 @@ provenance = ["inst-tb-supersession-units (backup)", "inst-mk-chargekind (backup
 model_kind   = "flat"
 charge_kind  = "recurring"
 currency     = "USD"
-amount_minor = 9900
+amount       = "99"
 
 [successor]
 model_kind   = "flat"
 charge_kind  = "recurring"
 currency     = "USD"
-amount_minor = 12900
+amount       = "129"
 
 [[assert]]
 expect = { publish = "accepted" }

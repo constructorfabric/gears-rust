@@ -62,13 +62,13 @@ pub(crate) struct LedgerRuntime {
     /// orchestrators + the adjustment repo behind `POST /credit-notes`,
     /// `POST /debit-notes`, and `GET /invoices/{id}/exposure`.
     pub adjustments: Arc<crate::api::rest::adjustments::ApiState>,
-    /// REST dual-control approval-queue state (VHP-1852): the `ApprovalService`
+    /// REST dual-control approval-queue state: the `ApprovalService`
     /// lifecycle engine behind the approve / reject / rework / comment surface.
     pub approvals: Arc<crate::api::rest::approvals::ApiState>,
-    /// REST tenant invoice-posting-policy state (VHP-1853): the missing-mapping
+    /// REST tenant invoice-posting-policy state: the missing-mapping
     /// mode + AR-aging bucket thresholds write / read surface.
     pub posting_policy: Arc<crate::api::rest::posting_policy::ApiState>,
-    /// REST per-tenant FX revaluation-mode state (VHP-1986): the Mode A/B
+    /// REST per-tenant FX revaluation-mode state: the Mode A/B
     /// write / read config surface.
     pub fx_revaluation_mode: Arc<crate::api::rest::fx_revaluation_mode::ApiState>,
     /// The dual-control engine itself (Group G): threaded into the queue-applier
@@ -79,7 +79,7 @@ pub(crate) struct LedgerRuntime {
     /// credit-note handler) + the adjustment repo behind `POST /refunds`,
     /// `POST /refund-with-credit-note`, and `GET /refunds/{refundId}`.
     pub refunds: Arc<crate::api::rest::refunds::ApiState>,
-    /// REST payer-closure state (VHP-1852 Phase 2): the dual-control engine + the
+    /// REST payer-closure state: the dual-control engine + the
     /// payer lifecycle repo behind `POST /payers/{id}/close`.
     pub payers: Arc<crate::api::rest::payers::ApiState>,
     /// REST fiscal-period-closure state (Slice 7 Group C): the in-process client
@@ -125,7 +125,7 @@ pub(crate) struct LedgerRuntime {
     /// Tie-out tick cadence.
     pub tie_out_tick: Duration,
     /// How often the daily tie-out folds the full all-time history instead of the
-    /// incremental (baseline + open-period) path — every `N`th tick (VHP-1843).
+    /// incremental (baseline + open-period) path — every `N`th tick.
     pub tie_out_full_every_n: u64,
     /// Fiscal-period-open tick cadence.
     pub period_open_tick: Duration,
@@ -465,7 +465,7 @@ impl BssLedgerGear {
             tokio::spawn(async move {
                 let mut iv = tokio::time::interval(rt.tie_out_tick);
                 iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                // VHP-1843: most ticks take the incremental tie-out (baseline + open
+                // Most ticks take the incremental tie-out (baseline + open
                 // fold); every Nth tick (and the first after startup) folds the full
                 // all-time history as a drift backstop. `N <= 1` → always full.
                 let full_every_n = rt.tie_out_full_every_n;
@@ -572,7 +572,7 @@ impl BssLedgerGear {
                             if let Err(e) = job.run().await {
                                 tracing::error!(error = %e, "bss-ledger: aged-alarm job tick failed");
                             }
-                            // Dual-control maintenance (VHP-1852), on the aged-alarm
+                            // Dual-control maintenance, on the aged-alarm
                             // cadence: the DC12 TTL sweep + the Z8-1 stuck-APPROVING
                             // probe. Best-effort — faults are logged inside, never
                             // fatal to the tick.
@@ -846,7 +846,7 @@ impl BssLedgerGear {
     }
 }
 
-/// One dual-control maintenance tick (VHP-1852), run on the aged-alarm cadence:
+/// One dual-control maintenance tick, run on the aged-alarm cadence:
 /// the DC12 TTL sweep (flip stale `PENDING`/`NEEDS_REWORK` approvals past their
 /// `expires_at` to `EXPIRED`, cross-tenant `allow_all`, complementing the lazy
 /// expire-on-read in `create_pending`) plus the Z8-1 stuck-`APPROVING` probe
@@ -1250,7 +1250,7 @@ impl Gear for BssLedgerGear {
         ctx.client_hub()
             .register::<dyn LedgerClientV1>(Arc::clone(&client));
 
-        // Dual-control (VHP-1852): the approval lifecycle engine + its executor,
+        // Dual-control: the approval lifecycle engine + its executor,
         // which replays an approved mutation through the same client / posting
         // surfaces the inline path uses (idempotent execute-then-mark).
         let approval_poster: Arc<dyn crate::infra::invoice_post::InvoicePoster> =
@@ -1262,7 +1262,7 @@ impl Gear for BssLedgerGear {
         // wires a SEPARATE gated handler (`.with_approval(...)`) onto the refund REST
         // surface for the inline preparer path.
         // The secured-audit sink for the `unknown_final` disposition (Group F /
-        // Slice 6 seam). NO-OP until Slice 6 (VHP-1858) merges — it logs the
+        // Slice 6 seam). NO-OP until Slice 6 merges — it logs the
         // would-be `secured_audit_record` + bumps a metric, persisting nothing
         // durable; the real `SecuredAuditStore` binds here at merge with no
         // call-site change. Also feeds `with_metrics` so the disposition's §9
@@ -1494,7 +1494,7 @@ impl Gear for BssLedgerGear {
             ),
             fleet_revaluation_enabled: cfg.fx.revaluation_enabled,
         });
-        // VHP-1986: the per-tenant FX revaluation-mode config REST surface (its own
+        // The per-tenant FX revaluation-mode config REST surface (its own
         // repo clone; mirrors the posting-policy config surface).
         let fx_revaluation_mode = Arc::new(crate::api::rest::fx_revaluation_mode::ApiState {
             fx_revaluation_mode: crate::infra::storage::repo::FxRevaluationModeRepo::new(

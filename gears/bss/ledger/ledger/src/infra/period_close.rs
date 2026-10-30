@@ -88,7 +88,7 @@ pub struct CloseControlFeeds {
     /// Block close until the bill-run-finished signal is asserted (`bill_run_enforcement`).
     pub bill_run_enforcement: bool,
     /// Block close until the period-end Mode-B FX revaluation recorded a COMPLETE
-    /// marker (`fx.revaluation_enabled`, VHP-1859 review C3). Inert while Mode-B is
+    /// marker (`fx.revaluation_enabled`). Inert while Mode-B is
     /// off (the v1 default).
     pub fx_revaluation_enforcement: bool,
 }
@@ -310,7 +310,7 @@ impl PeriodCloseService {
     }
 
     /// Reopen a CLOSED fiscal period (design §7 / N-core-3) — the last
-    /// dual-control seam (VHP-1852). Flips `fiscal_period CLOSED→OPEN` and
+    /// dual-control seam. Flips `fiscal_period CLOSED→OPEN` and
     /// `period_close → REOPENED`, and writes a Slice-6 `period-reopen`
     /// secured-audit record, all in one `SERIALIZABLE` txn under the single-active
     /// close lease. Called ONLY by the dual-control executor on approve (reopen is
@@ -488,7 +488,7 @@ async fn close_in_txn(
     }
 
     // 2d. (The Mode-B FX-revaluation-incomplete gate — design §4.5 / PRD F7 — is the
-    // `control.fx_revaluation_enforcement` block below, resolved PER-TENANT (VHP-1986):
+    // `control.fx_revaluation_enforcement` block below, resolved PER-TENANT:
     // only an effective-Mode-B tenant must have a COMPLETE marker. Inert while
     // enforcement is off, the v1 default.)
 
@@ -560,7 +560,7 @@ async fn close_in_txn(
                 Err(e) => reasons.push(format!("manifest feed error (fail-loud): {e}")),
             }
         }
-        // Mode-B FX-revaluation completeness (VHP-1859 review C3): when Mode-B is
+        // Mode-B FX-revaluation completeness: when Mode-B is
         // enabled the period-end revaluation MUST have recorded a COMPLETE marker
         // for this period. Without it (a failed/lagged run) close BLOCKS and emits
         // FxRevaluationIncomplete — never certifying a period whose missing
@@ -568,7 +568,7 @@ async fn close_in_txn(
         // Entry-existence cannot prove the run happened (a clean run legitimately
         // posts zero entries), so the marker is required.
         if control.fx_revaluation_enforcement {
-            // VHP-1986: enforce the COMPLETE marker only for a tenant that is
+            // Enforce the COMPLETE marker only for a tenant that is
             // effectively Mode B (BSS = ledger of record). An explicit Mode-A tenant
             // (its ERP revalues) is exempt; an unconfigured tenant follows the fleet
             // default (enforcement-on ⇒ Mode B).
@@ -677,7 +677,7 @@ async fn close_in_txn(
     // same lease — `rows_affected == 0`). In-txn (transactional outbox), so the
     // event commits atomically with the flip or rolls back with it.
     if res.rows_affected > 0 {
-        // VHP-1843: snapshot the just-verified caches as the cumulative tie-out
+        // Snapshot the just-verified caches as the cumulative tie-out
         // baseline through this closing period — in the SAME txn, so it rolls back
         // with the close on abort. The pre-close tie-out (2a) proved the caches,
         // so they ARE the verified total through `period_id`; the daily / recon

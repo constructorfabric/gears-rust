@@ -11,4 +11,12 @@ launcher: e2e-launcher
 config_gears:
   - bss-ledger
   - account-management
+  # Linked through account-management; it boots only with its database block.
+  - resource-group
   - static-idp-plugin
+env:
+  # An isolated data root: a test run must never use a developer's `~/.cf-gears`, whose
+  # ledger database may predate the current migrations.
+  APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
+# Ledger migrations are edited in place until production: start from an empty data root.
+clean_home: true

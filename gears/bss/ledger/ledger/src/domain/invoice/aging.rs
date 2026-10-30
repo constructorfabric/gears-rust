@@ -3,7 +3,7 @@
 //!
 //! Days past due = `today − due_date`; an invoice with no `due_date` is treated
 //! as not-yet-due (`current`). The bucket boundaries are the tenant's configured
-//! [`AgingThresholds`] (VHP-1853); the default `[30, 60, 90]` reproduces the
+//! [`AgingThresholds`]; the default `[30, 60, 90]` reproduces the
 //! classic `current`, `1-30`, `31-60`, `61-90`, `90+`. Only rows with
 //! `balance > 0` age — a settled (`0`) or credit (`< 0`) row carries
 //! nothing to chase. Exact summation with bounded final totals; no rounding.

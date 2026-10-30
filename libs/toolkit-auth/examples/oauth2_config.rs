@@ -3,7 +3,7 @@
 
 //! Configuration reference: form-based auth, all config fields, error handling.
 
-use toolkit_auth::{ClientAuthMethod, OAuthClientConfig, SecretString, Token, TokenError};
+use toolkit_auth::{ClientAuthMethod, OAuthClientConfig, SecretString, TokenError, TokenProvider};
 use toolkit_http::HttpClientBuilder;
 
 /// Form-based auth: some `IdPs` require credentials in the POST body
@@ -12,14 +12,13 @@ use toolkit_http::HttpClientBuilder;
 async fn form_auth() -> Result<(), Box<dyn std::error::Error>> {
     use toolkit_auth::HttpClientBuilderExt;
 
-    let token = Token::new(OAuthClientConfig {
+    let token = TokenProvider::new(OAuthClientConfig {
         token_endpoint: Some("https://idp.example.com/oauth/token".parse()?),
         client_id: "my-service".into(),
         client_secret: SecretString::new("my-secret"),
         auth_method: ClientAuthMethod::Form,
         ..Default::default()
-    })
-    .await?;
+    })?;
 
     let client = HttpClientBuilder::new().with_bearer_auth(token).build()?;
 
@@ -75,7 +74,7 @@ fn config_overview() {
 async fn error_handling() {
     println!("\n=== Error handling ===");
 
-    let result = Token::new(OAuthClientConfig {
+    let result = TokenProvider::new(OAuthClientConfig {
         token_endpoint: Some(
             "https://unreachable.example.com/token"
                 .parse()
@@ -84,9 +83,12 @@ async fn error_handling() {
         client_id: "my-service".into(),
         client_secret: SecretString::new("my-secret"),
         ..Default::default()
-    })
-    .await;
+    });
 
+    let result = match result {
+        Ok(provider) => provider.get().await,
+        Err(error) => Err(error),
+    };
     match result {
         Ok(_) => println!("  Token acquired"),
         Err(TokenError::Http(msg)) => println!("  HTTP error: {msg}"),
@@ -100,6 +102,7 @@ async fn error_handling() {
     }
 }
 
+/// Demonstrate provider construction and authenticated requests to an external service.
 #[tokio::main]
 async fn main() {
     config_overview();

@@ -2560,6 +2560,119 @@ async fn applied_clawback_replay_returns_posted() {
     );
 }
 
+/// A claw-back drain that claimed a row another drain has since applied counts
+/// that apply as `replayed`, not `applied`. A deterministic stand-in for two
+/// racing drains: the claw-back defers, the matching outbound lands, and a drain
+/// applies it (the winner). The test then puts the queue row back to `QUEUED`
+/// (the row a losing drain holds after its own claim) and drains again. The post
+/// finds the dedup `POSTED` and replays it before the sidecar's underflow check:
+/// no second decrement, no second claw-back row.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_clawback_drain_that_replays_an_applied_clawback_counts_a_replay() {
+    let container = test_containers::postgres().start().await.unwrap();
+    let port = container.get_host_port_ipv4(5432).await.unwrap();
+    let url = format!("postgres://postgres:postgres@127.0.0.1:{port}/postgres");
+    let (raw, provider, s) = setup(&url).await;
+    let ctx = SecurityContext::anonymous();
+    let scope = AccessScope::for_tenant(s.tenant);
+    let handler = refund_handler(&provider);
+
+    settle(&provider, &s, "PAY-CBR", 1000).await;
+    let deferred = handler
+        .post_refund(
+            &ctx,
+            &scope,
+            clawback_req(
+                &s,
+                "RF-CBR",
+                "PSP-CBR",
+                "PAY-CBR",
+                RefundPattern::AUnallocated,
+                RefundPhase::Initiated,
+                None,
+                400,
+                "RF-OUTR",
+            ),
+        )
+        .await;
+    assert!(
+        matches!(deferred, Err(DomainError::RefundClawbackDeferred(_))),
+        "the claw-back before its outbound defers"
+    );
+    handler
+        .post_refund(
+            &ctx,
+            &scope,
+            refund_req(
+                &s,
+                "RF-OUTR",
+                "PSP-OUTR",
+                "PAY-CBR",
+                RefundPattern::AUnallocated,
+                RefundPhase::Initiated,
+                None,
+                400,
+            ),
+        )
+        .await
+        .expect("outbound posts");
+    let first = handler
+        .drain_clawbacks(&ctx, &scope, s.tenant, 100)
+        .await
+        .expect("first drain succeeds");
+    assert_eq!(first.applied, 1, "the first drain applies the claw-back");
+    assert_eq!(clawback_queue_rows(&raw, &s, "APPLIED").await, 1);
+
+    raw.execute_raw(pg(format!(
+        "UPDATE bss.ledger_pending_event_queue SET status = 'QUEUED' \
+         WHERE tenant_id='{}' AND flow='REFUND_CLAWBACK'",
+        s.tenant
+    )))
+    .await
+    .expect("put the queue row back to QUEUED");
+
+    let second = handler
+        .drain_clawbacks(&ctx, &scope, s.tenant, 100)
+        .await
+        .expect("second drain succeeds");
+    assert_eq!(
+        second.applied, 0,
+        "a replayed apply is not counted as applied"
+    );
+    assert_eq!(
+        second.replayed, 1,
+        "the apply of an already-applied row is counted as replayed"
+    );
+    assert_eq!(second.still_deferred, 0, "the replay is not deferred");
+    assert_eq!(second.escalated, 0, "the replay is not escalated");
+
+    // No second effect.
+    assert_eq!(
+        settlement_counter(&raw, &s, "PAY-CBR", "refunded").await,
+        Some(text(0)),
+        "refunded is netted once (400 - 400), not decremented again"
+    );
+    assert_eq!(
+        refund_rows(&raw, &s, "PSP-CBR", "initiated").await,
+        Some(1),
+        "one claw-back refund row"
+    );
+    assert_eq!(
+        scalar_i64(
+            &raw,
+            &format!(
+                "SELECT count(*) FROM bss.ledger_journal_entry \
+                 WHERE tenant_id='{}' AND source_business_id LIKE 'PSP-CBR:%'",
+                s.tenant
+            ),
+        )
+        .await,
+        Some(1),
+        "one claw-back journal entry"
+    );
+}
+
 /// Idempotency-conflict capture (AC #19, Z14-1): a same-key
 /// `(psp_refund_id, phase)` quarantine re-intake with a DIFFERENT payload is a
 /// `IdempotencyConflict` and the conflict is captured on the secured-audit sink; an

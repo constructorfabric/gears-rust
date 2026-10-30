@@ -58,11 +58,20 @@ pub struct PostedFacts {
     pub created_seq: i64,
 }
 
-/// An in-transaction hook the posting engine runs AFTER balance projection and
-/// BEFORE the dedup row is finalized, on the fresh-post path only (a replay
-/// returns before projection). The sidecar writes counter rows (e.g. the
-/// payment settlement / allocation caches) inside the SAME serializable
-/// transaction, so they commit atomically with the entry or roll back with it.
+/// An in-transaction hook of the posting engine, on the fresh-post path only (a
+/// replay returns before it). It has two parts:
+///
+/// - [`Self::check_before_projection`]: a read-only state check. It runs before
+///   the journal insert.
+/// - [`Self::run`]: the sidecar's writes. It runs AFTER balance projection (or
+///   before it, see [`Self::run_before_projection`]) and BEFORE the dedup row is
+///   finalized.
+///
+/// The sidecar writes counter rows (e.g. the payment settlement / allocation
+/// caches) inside the SAME serializable transaction, so they commit atomically
+/// with the entry or roll back with it. A sidecar that wraps another sidecar
+/// must delegate BOTH parts. The check has a default no-op, so a wrapper that
+/// forgets to delegate it silently drops the check.
 ///
 /// An `Err(DomainError)` rolls the whole post back; the engine encodes it as a
 /// business sentinel; ConcurrentModification is decoded as retryable contention.
@@ -92,6 +101,30 @@ pub trait PostSidecar: Send + Sync {
     /// both before the cap classification can refine the error).
     fn run_before_projection(&self) -> bool {
         false
+    }
+
+    /// A read-only check of the state that this sidecar's write changes. The
+    /// engine runs it in the post transaction, before the journal insert and
+    /// before balance projection. The default is no check.
+    ///
+    /// The caller checks the state out-of-txn before the post. A concurrent
+    /// writer can change the state after that check and commit first. Then the
+    /// balances this entry moves can already be moved. Without this check, the
+    /// projector's no-negative guard refuses the post first, as a raw
+    /// `NegativeBalance`. This check reads the state again inside the post and
+    /// answers the state refusal instead.
+    ///
+    /// It must only read. A read takes no row lock, so the lock order of the
+    /// post does not change. A wrapping sidecar must delegate this call.
+    ///
+    /// # Errors
+    /// A [`DomainError`] rolls the post back. Only ConcurrentModification retries.
+    async fn check_before_projection(
+        &self,
+        _txn: &DbTx<'_>,
+        _scope: &AccessScope,
+    ) -> Result<(), DomainError> {
+        Ok(())
     }
 }
 
@@ -803,6 +836,13 @@ impl PostingService {
             .check(txn, scope, &entry_for_proj, &lines_for_proj)
             .await?;
 
+        // 3c. The sidecar's read-only state check
+        // (`PostSidecar::check_before_projection`). Like the period gate and the
+        // policy guard, it runs before the insert, so a refused post (a race
+        // loser) writes no journal rows. It also runs before projection, so it
+        // refuses before the projector's no-negative guard can.
+        check_sidecar_state(sidecar.as_ref(), txn, scope).await?;
+
         // 4. Append-only insert of the header + lines.
         let entry_ref = self
             .journal
@@ -811,8 +851,9 @@ impl PostingService {
             .map_err(repo_to_db)?;
 
         // 6 / 6b. Balance projection + in-transaction sidecar (non-replay path
-        // only — a replay, in either `ClaimMode`, returns above). Their ORDER
-        // depends on the sidecar: a refund / claw-back sidecar
+        // only — a replay, in either `ClaimMode`, returns above). The sidecar's
+        // read-only state check already ran at 3c. The ORDER of projection and
+        // sidecar writes depends on the sidecar: a refund / claw-back sidecar
         // (`run_before_projection() == true`) runs its rank-1 money-out cap /
         // underflow CHECK BEFORE projection, so an over-refund / out-of-order
         // claw-back surfaces as the canonical `RefundExceedsSettled` /
@@ -974,6 +1015,23 @@ impl PostingService {
             normal_sides.insert(line.account_id, side);
         }
         Ok(normal_sides)
+    }
+}
+
+/// Run the sidecar's read-only state check
+/// ([`PostSidecar::check_before_projection`]); a refusal is a business sentinel
+/// that rolls the post back. No sidecar, no check.
+async fn check_sidecar_state(
+    sidecar: Option<&Arc<dyn PostSidecar>>,
+    txn: &DbTx<'_>,
+    scope: &AccessScope,
+) -> Result<(), DbError> {
+    match sidecar {
+        Some(sc) => sc
+            .check_before_projection(txn, scope)
+            .await
+            .map_err(business),
+        None => Ok(()),
     }
 }
 

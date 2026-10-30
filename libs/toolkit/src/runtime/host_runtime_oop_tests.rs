@@ -196,6 +196,8 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
         bearer_authenticator: None,
         internal_authenticator: None,
+        // No authenticator: the raw `/ping` route runs only in development mode.
+        auth_disabled: true,
         labels: std::collections::BTreeMap::new(),
     };
 
@@ -273,4 +275,339 @@ async fn e2e_oop_gear_boots_serves_registers_and_shuts_down() {
         1,
         "the gear should deregister exactly once on graceful shutdown"
     );
+}
+
+const AXIS_SA: &str = "good-sa-token";
+
+/// Rejects every bearer so tenant credentials cannot admit these routes.
+struct RejectingBearer;
+
+impl toolkit_security::BearerAuthenticator for RejectingBearer {
+    async fn authenticate(
+        &self,
+        _token: &str,
+    ) -> Result<toolkit_security::SecurityContext, toolkit_security::AuthNError> {
+        Err(toolkit_security::AuthNError::InvalidToken)
+    }
+}
+
+/// Platform authenticator: `good-sa-token` is a workload, the rest rejected.
+struct AxisInternal;
+
+impl toolkit_security::InternalAuthenticator for AxisInternal {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Result<toolkit_security::PlatformIdentity, toolkit_security::InternalAuthNError> {
+        if token == AXIS_SA {
+            Ok(
+                toolkit_security::PlatformIdentity::KubernetesServiceAccount {
+                    namespace: "toolkit".to_owned(),
+                    service_account: "axis".to_owned(),
+                    pod: None,
+                },
+            )
+        } else {
+            Err(toolkit_security::InternalAuthNError::InvalidToken)
+        }
+    }
+}
+
+/// Uses `OperationBuilder` specs to test `compose_oop_router` auth derivation.
+#[derive(Default)]
+struct AxisGear;
+
+#[async_trait]
+impl Gear for AxisGear {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for AxisGear {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        use crate::api::OperationBuilder;
+        let router = OperationBuilder::get("/anon")
+            .operation_id("axis.anon")
+            .anonymous()
+            .handler(|| async { "anon" })
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi);
+        Ok(OperationBuilder::get("/platform")
+            .operation_id("axis.platform")
+            .platform_authenticated()
+            .no_license_required()
+            .handler(|| async { "platform" })
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi))
+    }
+}
+
+/// A raw HTTP/1.1 GET with extra headers, returning the status.
+async fn http_status(addr: SocketAddr, path: &str, headers: &[(&str, &str)]) -> Option<u16> {
+    let mut stream = tokio::net::TcpStream::connect(addr).await.ok()?;
+    let mut req = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n");
+    for (name, value) in headers {
+        req.push_str(name);
+        req.push_str(": ");
+        req.push_str(value);
+        req.push_str("\r\n");
+    }
+    req.push_str("Connection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.ok()?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.ok()?;
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+}
+
+#[tokio::test]
+async fn the_composed_router_enforces_each_routes_declared_auth() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let gear = Arc::new(AxisGear);
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("axis-gear", &[], gear.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("axis-gear", gear as Arc<dyn RestApiCapability>);
+    let registry = builder.build_topo_sorted().unwrap();
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        registry,
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "axis-gear".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: Some(toolkit_security::DynBearerAuthenticator::new(
+            RejectingBearer,
+        )),
+        internal_authenticator: Some(toolkit_security::DynInternalAuthenticator::new(
+            AxisInternal,
+        )),
+        auth_disabled: false,
+        labels: std::collections::BTreeMap::new(),
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+    assert!(
+        poll_status(addr, "/healthz", 200, Duration::from_secs(5)).await,
+        "the gear boots"
+    );
+
+    // Without the derived policy every route would demand a bearer.
+    assert_eq!(
+        http_status(addr, "/anon", &[]).await,
+        Some(200),
+        "an anonymous route needs no credential"
+    );
+    assert_eq!(
+        http_status(addr, "/platform", &[("X-ToolKit-Internal-Token", AXIS_SA)]).await,
+        Some(200),
+        "a platform route admits a validated internal token"
+    );
+    assert_eq!(
+        http_status(addr, "/platform", &[]).await,
+        Some(401),
+        "and refuses a caller without one"
+    );
+
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("finishes after cancel")
+        .expect("does not panic");
+    assert!(result.is_ok(), "{result:?}");
+}
+
+/// Serves one tenant operation, so it needs a tenant authenticator to start.
+struct TenantGear;
+
+#[async_trait]
+impl Gear for TenantGear {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for TenantGear {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        use crate::api::OperationBuilder;
+        Ok(OperationBuilder::get("/tenant")
+            .operation_id("tenant.get")
+            .authenticated()
+            .no_license_required()
+            .handler(|| async { "tenant" })
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi))
+    }
+}
+
+#[tokio::test]
+async fn a_worker_without_a_tenant_authenticator_fails_before_it_is_advertised() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let gear = Arc::new(TenantGear);
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("tenant-gear", &[], Arc::clone(&gear) as Arc<dyn Gear>);
+    builder.register_rest_with_meta("tenant-gear", gear as Arc<dyn RestApiCapability>);
+    let registry = builder.build_topo_sorted().unwrap();
+    let host = HostRuntime::new(
+        registry,
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        CancellationToken::new(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "tenant-gear".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: None,
+        auth_disabled: false,
+        labels: std::collections::BTreeMap::new(),
+    };
+
+    let result = tokio::time::timeout(Duration::from_secs(5), host.run_oop_serving(options))
+        .await
+        .expect("startup fails promptly");
+    let error = result
+        .expect_err("a tenant route without an authenticator")
+        .to_string();
+    assert!(error.contains("tenant authenticator"), "{error}");
+    assert_eq!(
+        directory.register_calls.load(Ordering::SeqCst),
+        0,
+        "the gear is never advertised"
+    );
+    let served = tokio::time::timeout(Duration::from_secs(5), http_get(addr, "/tenant"))
+        .await
+        .expect("the probe finishes promptly");
+    assert_eq!(
+        served, None,
+        "the listener is torn down without serving the route"
+    );
+}
+
+/// Accepts the bearer `tenant-token` as a tenant subject, rejects the rest.
+struct TenantBearer;
+
+impl toolkit_security::BearerAuthenticator for TenantBearer {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Result<toolkit_security::SecurityContext, toolkit_security::AuthNError> {
+        if token == "tenant-token" {
+            toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(1))
+                .subject_tenant_id(Uuid::from_u128(2))
+                .build()
+                .map_err(|_| toolkit_security::AuthNError::InvalidToken)
+        } else {
+            Err(toolkit_security::AuthNError::InvalidToken)
+        }
+    }
+}
+
+/// The startup check sees the tenant authenticator a linked gear registers in `ClientHub`
+/// (as `authn-resolver` does): the worker starts and checks each tenant request.
+#[tokio::test]
+async fn a_worker_with_a_hub_tenant_authenticator_starts_and_checks_bearers() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let gear = Arc::new(TenantGear);
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("tenant-gear", &[], Arc::clone(&gear) as Arc<dyn Gear>);
+    builder.register_rest_with_meta("tenant-gear", gear as Arc<dyn RestApiCapability>);
+    let registry = builder.build_topo_sorted().unwrap();
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<toolkit_security::DynBearerAuthenticator>(Arc::new(
+        toolkit_security::DynBearerAuthenticator::new(TenantBearer),
+    ));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        registry,
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "tenant-gear".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: None,
+        auth_disabled: false,
+        labels: std::collections::BTreeMap::new(),
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+
+    // Gear routes answer 503 until attached; poll until the tenant route serves.
+    let bearer = [("Authorization", "Bearer tenant-token")];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut status = None;
+    while tokio::time::Instant::now() < deadline {
+        status = http_status(addr, "/tenant", &bearer).await;
+        if status == Some(200) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(status, Some(200), "a valid bearer is admitted");
+    assert_eq!(
+        http_status(addr, "/tenant", &[]).await,
+        Some(401),
+        "a missing bearer is refused"
+    );
+
+    cancel.cancel();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("finishes after cancel")
+        .expect("does not panic");
+    assert!(result.is_ok(), "{result:?}");
 }

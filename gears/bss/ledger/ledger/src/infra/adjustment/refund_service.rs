@@ -214,7 +214,7 @@ const ORIGIN_SYSTEM: &str = "SYSTEM";
 /// amount on the `SUSPENSE` clearing account — the standard "known amount, unknown
 /// attribution" holding account — pending reconciliation. The terminal disposition
 /// (loss / release / paid) is a separate governed step once the status resolves
-/// (the `exception_queue`, Slice 7 / VHP-1859). `SUSPENSE` already exists in the
+/// (the `exception_queue`, Slice 7). `SUSPENSE` already exists in the
 /// chart (no SDK enum / provisioning change), and the park carries no P&L sign, so
 /// it neither prematurely recognizes a loss nor a gain.
 const UNKNOWN_FINAL_PARK_CLASS: AccountClass = AccountClass::Suspense;
@@ -300,7 +300,7 @@ pub struct RefundHandler {
     /// the out-of-band `ClawbackUnderflow` alarm (Group E). The posting engine also
     /// holds its own clone (threaded at `new`).
     publisher: Arc<LedgerEventPublisher>,
-    /// The dual-control engine (VHP-1852, Group D). `Some` ⇒ a forward refund whose
+    /// The dual-control engine. `Some` ⇒ a forward refund whose
     /// cash crosses the tenant's D2 threshold is gated to the preparer→approver
     /// queue (`DualControlRequired`) instead of posting inline; `None` ⇒ gating is
     /// disabled (the executor's approved replay, and the Group-B unit tests that
@@ -897,7 +897,7 @@ impl RefundHandler {
             return Err(DomainError::RefundDisputeHeld(token));
         }
 
-        // 2b. Dual-control gate (VHP-1852, Group D / design §1.4 D2 / §4.4). Gated
+        // 2b. Dual-control gate (design §1.4 D2 / §4.4). Gated
         //     on the STAGE-1 cash commitment ONLY (`initiated` — where the money-out
         //     cap is reserved and the human decision belongs). `confirmed` is the
         //     mechanical stage-2 drain of an ALREADY-approved disbursement (no fresh
@@ -1925,6 +1925,8 @@ impl RefundHandler {
     /// SAME [`Self::post_forward`] path:
     /// - the decrement now FITS (the matching outbound refund stage-1 has landed) ⇒
     ///   the post commits + the queue row flips `→APPLIED`;
+    /// - another drain claimed the same row and applied it first ⇒ the post
+    ///   replays that entry and the row counts as `replayed`, not `applied`;
     /// - it STILL underflows AND the row is YOUNGER than the aging horizon ⇒ leave it
     ///   `QUEUED`, back off (a later drain retries);
     /// - it STILL underflows AND the row is OLDER than the aging horizon
@@ -1965,6 +1967,7 @@ impl RefundHandler {
         for row in claimed {
             match self.apply_queued_clawback(ctx, scope, &row).await {
                 Ok(ClawbackApply::Applied) => report.applied += 1,
+                Ok(ClawbackApply::Replayed) => report.replayed += 1,
                 Ok(ClawbackApply::StillDeferred) => {
                     report.still_deferred += 1;
                     if let Err(e) = self
@@ -1994,9 +1997,11 @@ impl RefundHandler {
 
     /// Apply ONE queued claw-back row (the drain): deserialize the payload,
     /// reconstruct the [`RefundRequest`], and RE-DRIVE it through the inline
-    /// claw-back post path. Three terminal shapes:
+    /// claw-back post path. Four terminal shapes:
     /// - the decrement FITS now ⇒ [`ClawbackApply::Applied`] (post committed; the
     ///   composite sidecar flipped the row `→APPLIED` in the same txn);
+    /// - another drain applied the row first ⇒ [`ClawbackApply::Replayed`] (the
+    ///   post found the dedup `POSTED` and replayed it; no effect);
     /// - it STILL underflows but the row is within the aging horizon ⇒
     ///   [`ClawbackApply::StillDeferred`] (the caller backs off + leaves it QUEUED);
     /// - it STILL underflows AND the row aged out ⇒ [`ClawbackApply::Escalated`]
@@ -2023,6 +2028,7 @@ impl RefundHandler {
             .post_clawback_queued_apply(ctx, scope, &req, &row.business_id)
             .await
         {
+            Ok(posting) if posting.replayed => Ok(ClawbackApply::Replayed),
             Ok(_) => Ok(ClawbackApply::Applied),
             // Still underflows: defer again UNLESS the row has aged out, in which
             // case it never reconciled → escalate (design §4.4).
@@ -2081,7 +2087,7 @@ impl RefundHandler {
 
     /// A claw-back that never reconciled past the aging horizon: flip the queue row
     /// `→CANCELLED` (terminal) and ESCALATE (design §4.4 — never hard-fail). The
-    /// exception-queue is Slice 7 (VHP-1859), so this is a minimal exception STUB: a
+    /// exception-queue is Slice 7, so this is a minimal exception STUB: a
     /// logged escalation + the out-of-band `ClawbackUnderflow` alarm (which mirrors
     /// into `ledger_invariant_alarm_total` and pages Finance). The CANCELLED flip is
     /// its own short txn (the apply already rolled back).
@@ -3098,6 +3104,9 @@ pub enum ClawbackApply {
     /// The decrement fit (the matching outbound landed) — posted + flipped
     /// `→APPLIED`.
     Applied,
+    /// Another drain claimed the same row and applied it first: the post found
+    /// the dedup `POSTED` and replayed that entry. No second effect.
+    Replayed,
     /// The decrement STILL underflows but the row is within the aging horizon —
     /// leave `QUEUED`, back off.
     StillDeferred,
@@ -3110,8 +3119,16 @@ pub enum ClawbackApply {
 /// allocation/chargeback `DrainReport`).
 #[derive(Debug, Default)]
 pub struct ClawbackDrainReport {
+    /// Rows that posted + flipped `→APPLIED` this pass.
     pub applied: u64,
+    /// Rows another drain had already applied: the apply replayed the posted
+    /// entry and changed nothing.
+    pub replayed: u64,
+    /// Rows that still underflow, left `QUEUED` and backed off (attempts
+    /// bumped).
     pub still_deferred: u64,
+    /// Rows that aged out without reconciling: flipped `→CANCELLED` and
+    /// escalated.
     pub escalated: u64,
 }
 

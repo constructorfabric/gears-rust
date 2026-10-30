@@ -1,6 +1,6 @@
 //! Create the effective-dated per-tenant FX **revaluation-mode** table in schema
 //! `bss`: `ledger_tenant_fx_revaluation_mode` (per-tenant, append-only `version`ed
-//! rows, VHP-1986) pinning whether BSS runs the period-end unrealized revaluation
+//! rows) pinning whether BSS runs the period-end unrealized revaluation
 //! for a tenant (`MODE_B` = BSS is the ledger of record) or defers to the tenant's
 //! ERP (`MODE_A`, the fail-safe default — BSS must not double-count). The
 //! revaluation job / period-close resolve the row in effect at decision time

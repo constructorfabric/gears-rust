@@ -329,7 +329,7 @@ impl From<DomainError> for CanonicalError {
             D::RefundDisputeHeld(d) => EntryResource::aborted(d)
                 .with_reason("REFUND_DISPUTE_HELD")
                 .create(),
-            // Dual-control (VHP-1852): an over-threshold mutation needs a second
+            // Dual-control: an over-threshold mutation needs a second
             // actor; self-approval, a non-actionable target (wrong state / lost
             // race / expired), and out-of-range policy config are all well-formed
             // requests that conflict with current governance state → 409.

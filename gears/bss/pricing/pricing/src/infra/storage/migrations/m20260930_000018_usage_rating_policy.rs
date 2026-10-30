@@ -1,7 +1,9 @@
 //! D-502: immutable entry policies. Legacy entries keep all three reference columns null.
 //! `SQLite` rebuilds the entry and its two children inside the runner transaction, as migration
-//! 17 does, without disabling foreign keys. Prices retain their self references and indexes;
-//! items retain their legacy columns and constraints. No commercial history is inferred.
+//! 17 does, without disabling foreign keys. Prices are copied by column name, so the copy does
+//! not depend on the column order `m20260926_000013` left. Prices retain their self references
+//! and indexes; items retain their legacy columns and constraints. No commercial history is
+//! inferred.
 use sea_orm_migration::prelude::*;
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -62,7 +64,9 @@ const SQLITE_UP: &[&str] = &[
   id text PRIMARY KEY, tenant_id text NOT NULL, price_book_entry_id text NOT NULL REFERENCES pricing_price_book_entry__d502(id),
   version_no integer NOT NULL, dim_value text,
   price_json text NOT NULL,
-  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
+  currency text NOT NULL CHECK (length(currency) = 3 AND currency NOT GLOB '*[^A-Z]*'),
+  currency_scale integer NOT NULL CHECK (currency_scale BETWEEN 0 AND 28),
+  min_fee text CHECK (min_fee GLOB '[0-9]*' AND min_fee NOT GLOB '*[^0-9.]*' AND min_fee NOT GLOB '*.*.*' AND min_fee NOT GLOB '*.' AND min_fee NOT GLOB '0[0-9]*' AND min_fee NOT GLOB '*.*0'), eligibility text NOT NULL CHECK (eligibility IN ('all','new')),
   effective_from text NOT NULL, effective_to text, keep_for_bound integer NOT NULL DEFAULT 0,
   closed_explicitly integer NOT NULL DEFAULT 0,
   temporary_until text, paired_price_id text REFERENCES pricing_price__d502(id),
@@ -75,7 +79,7 @@ const SQLITE_UP: &[&str] = &[
   UNIQUE (price_book_entry_id, version_no), CHECK (dim_value IS NULL OR dim_value <> ''),
   CHECK (effective_to IS NULL OR effective_from < effective_to)
 )",
-    r"INSERT INTO pricing_price__d502 SELECT * FROM pricing_price",
+    r"INSERT INTO pricing_price__d502 (id, tenant_id, price_book_entry_id, version_no, dim_value, price_json, currency, currency_scale, min_fee, eligibility, effective_from, effective_to, keep_for_bound, closed_explicitly, temporary_until, paired_price_id, return_of_price_id, state, pending_unit_id, approved_by_unit_id, note, created_by, approved_at, version, created_at, updated_at) SELECT id, tenant_id, price_book_entry_id, version_no, dim_value, price_json, currency, currency_scale, min_fee, eligibility, effective_from, effective_to, keep_for_bound, closed_explicitly, temporary_until, paired_price_id, return_of_price_id, state, pending_unit_id, approved_by_unit_id, note, created_by, approved_at, version, created_at, updated_at FROM pricing_price",
     r"CREATE TABLE pricing_plan_item__d502 (
   id text PRIMARY KEY, tenant_id text NOT NULL, revision_id text NOT NULL REFERENCES pricing_plan_revision(id),
   sku_id text NOT NULL, price_book_entry_id text REFERENCES pricing_price_book_entry__d502(id),

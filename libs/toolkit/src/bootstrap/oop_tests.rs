@@ -805,6 +805,46 @@ mod full_oop_config {
         let gear_config = final_config.gears.get("test_gear").unwrap();
         assert_eq!(gear_config["config"]["master_setting"], "value");
     }
+
+    #[test]
+    fn config_gear_name_defaults_to_the_registration_name() {
+        let opts = OopRunOptions {
+            gear_name: "event-broker".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(opts.config_gear_name(), "event-broker");
+    }
+
+    #[test]
+    fn a_role_files_the_rendered_config_under_its_config_name() {
+        // A role registers under its own directory name but reads the gear's
+        // section: the master's blob must land where `GearCtx::config()` looks.
+        let opts = OopRunOptions {
+            gear_name: "event-broker-ingest".to_owned(),
+            config_gear_name: Some("event-broker".to_owned()),
+            ..Default::default()
+        };
+        assert_eq!(opts.config_gear_name(), "event-broker");
+
+        let rendered = RenderedGearConfig {
+            database: None,
+            config: json!({"master_setting": "value"}),
+            logging: None,
+            opentelemetry: None,
+        };
+        let (final_config, _, _) = build_oop_config_and_db(
+            &minimal_app_config(),
+            opts.config_gear_name(),
+            Some(&rendered),
+        )
+        .unwrap();
+
+        assert_eq!(
+            final_config.gears["event-broker"]["config"]["master_setting"],
+            "value"
+        );
+        assert!(!final_config.gears.contains_key("event-broker-ingest"));
+    }
 }
 
 // =============================================================================
@@ -1054,6 +1094,52 @@ mod directory_client_bootstrap {
         assert!(
             !msg.contains("service-account token"),
             "endpoint must be validated before credential work; got credential error: {msg}"
+        );
+    }
+}
+
+/// `oop_http.auth_disabled` reaches the serve options: off when omitted, as written
+/// otherwise.
+mod auth_disabled {
+    use super::*;
+    use crate::bootstrap::config::OopHttpConfig;
+    use crate::directory::LocalDirectoryClient;
+    use crate::runtime::GearManager;
+
+    async fn serve_auth_disabled(extra: serde_json::Value) -> bool {
+        let mut raw = serde_json::json!({
+            "listen_addr": "127.0.0.1:0",
+            "allow_loopback_advertise": true,
+        });
+        if let (Some(raw), Some(extra)) = (raw.as_object_mut(), extra.as_object()) {
+            raw.extend(extra.clone());
+        }
+        let cfg: OopHttpConfig = serde_json::from_value(raw).expect("valid oop_http");
+        let directory: Arc<dyn DirectoryClient> =
+            Arc::new(LocalDirectoryClient::new(Arc::new(GearManager::new())));
+        build_oop_serve_options(
+            &cfg,
+            "gear",
+            Uuid::new_v4(),
+            None,
+            Duration::from_secs(5),
+            directory,
+        )
+        .await
+        .expect("options build")
+        .auth_disabled
+    }
+
+    #[tokio::test]
+    async fn is_read_from_config() {
+        assert!(!serve_auth_disabled(serde_json::json!({})).await, "omitted");
+        assert!(
+            !serve_auth_disabled(serde_json::json!({ "auth_disabled": false })).await,
+            "false"
+        );
+        assert!(
+            serve_auth_disabled(serde_json::json!({ "auth_disabled": true })).await,
+            "true"
         );
     }
 }

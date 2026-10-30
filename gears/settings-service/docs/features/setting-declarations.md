@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-09-24 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
 
 # Feature: Setting Declarations and Scope Class
 
@@ -19,6 +19,7 @@
   - [Update Declaration Metadata](#update-declaration-metadata)
   - [Retire Declaration](#retire-declaration)
   - [Reactivate Declaration](#reactivate-declaration)
+  - [Report a Revival](#report-a-revival)
   - [Evolve Declaration](#evolve-declaration)
   - [Declare Dependency Group](#declare-dependency-group)
   - [Read Declarations](#read-declarations)
@@ -36,6 +37,7 @@
   - [Derived Data Classification](#derived-data-classification)
   - [Mutation Class Discipline](#mutation-class-discipline)
   - [Retire and Reactivate Lifecycle](#retire-and-reactivate-lifecycle)
+  - [Revival Report](#revival-report)
   - [Contributed Declaration Protection](#contributed-declaration-protection)
   - [Dependency Group Declaration](#dependency-group-declaration)
   - [Declaration Read Surface](#declaration-read-surface)
@@ -96,19 +98,20 @@ The hardest constraint here is not any single field but the rule connecting them
 - Actor not authorized, or the decision cannot be obtained
 - Target category does not exist
 - A key segment violates the GTS grammar
+- `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character
 - Schema Default fails validation against the value type
 - A non-empty Schema Default supplied on a secret-trait value type
 - `secret` classification supplied by the author on a non-secret value type
 - Duplicate `key`, or a leaf slug already held by an active declaration in the category
 
 **Steps**:
-1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations with `value_type_id`, `vendor`, leaf `name`, `category_id`, `default_value`, `scope_class`, and optional `display_name`, `description`, `mode`, `requires_step_up`, `anonymous_exposable`, `domain_affinity`, `licence_feature`, `data_classification` - `inst-decl-create-1`
 2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` through the `PolicyEnforcer` PEP - `inst-decl-create-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-create-3`
 4. [x] - `p1` - DB: SELECT the target category WHERE id = {category_id} - `inst-decl-create-4`
 5. [x] - `p1` - **IF** the category does not exist → **RETURN** `404` - `inst-decl-create-5`
 6. [x] - `p1` - Invoke setting instance key construction using `value_type_id`, `vendor`, the category's slug, and the leaf `name` - `inst-decl-create-6`
-7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment - `inst-decl-create-7`
+7. [x] - `p1` - **IF** any segment violates the GTS grammar → **RETURN** `400` naming the offending segment; **IF** `display_name` is present and not `null` **AND**, after trimming, it is empty, longer than 256 Unicode characters or contains a control character → **RETURN** `400` naming the field; an explicit `null` counts as unsupplied, and the trimmed value is what the rest of the flow stores - `inst-decl-create-7`
 8. [x] - `p1` - Resolve the value type's trait set through the Type Validator trait - `inst-decl-create-8`
 9. [x] - `p1` - Invoke classification and secret-trait derivation using the resolved traits and any author-supplied `data_classification` - `inst-decl-create-9`
 10. [x] - `p1` - **IF** derivation rejects the combination → **RETURN** `400` - `inst-decl-create-10`
@@ -118,11 +121,11 @@ The hardest constraint here is not any single field but the rule connecting them
 14. [x] - `p1` - **IF** `anonymous_exposable` is requested **AND** the derived `data_classification` is `secret` or `pii` → **RETURN** `400`, because the two classifications that must never leave are excluded from the anonymous surface in the schema as well as here - `inst-decl-create-14`
 15. [x] - `p1` - Set `source` to `admin_authored`, `status` to `active`, `mode` to its default when unsupplied, `requires_step_up` to `true` when unsupplied, and `created_by` from the authenticated principal - `inst-decl-create-15`
 16. [x] - `p1` - Register the composed setting type in the types registry — derived from the Settings base, composed with the `value_type_id`, and carrying no `default` — before the row is inserted; registration is idempotent, so a retry after a failed create reuses the type rather than minting a second one - `inst-decl-create-16`
-17. [x] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, and derived columns - `inst-decl-create-17`
+17. [x] - `p1` - DB: INSERT INTO setting_declarations with the constructed `key`, `leaf_slug`, `value_type_id`, `category_id`, `display_name` (trimmed, `NULL` when unsupplied), and derived columns - `inst-decl-create-17`
 18. [x] - `p1` - **IF** unique violation on `uq_declaration_key` → **RETURN** `409` - `inst-decl-create-18`
 19. [x] - `p1` - **IF** unique violation on `uq_declaration_category_slug` → **RETURN** `409` stating the leaf name is held by an active declaration in this category - `inst-decl-create-19`
 20. [x] - `p1` - Emit a declaration-created audit record - `inst-decl-create-20`
-21. [x] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, and its resolved traits - `inst-decl-create-21`
+21. [x] - `p1` - **RETURN** `201` with the declaration, its `key`, its `value_type_id`, its `display_name` when set (omitted otherwise, never derived from `leaf_slug`), and its resolved traits - `inst-decl-create-21`
 
 ### Update Declaration Metadata
 
@@ -137,22 +140,23 @@ The hardest constraint here is not any single field but the rule connecting them
 - Declaration is `module_contributed` and therefore not admin-editable
 - Request carries a behavior-affecting field
 - Request loosens `data_classification` without a step-up assertion
+- `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character
 - `If-Match` absent or stale
 
 **Steps**:
-1. [x] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
+1. [x] - `p1` - Actor sends PATCH /settings-service/v1/declarations/{id} with `If-Match` and any of `display_name`, `description`, `mode`, `domain_affinity`, `licence_feature`, `requires_step_up`, `anonymous_exposable`, `data_classification` - `inst-decl-update-1`
 2. [x] - `p1` - Authorize `update` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-update-2`
 3. [x] - `p1` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-update-3`
 4. [x] - `p1` - DB: SELECT the declaration WHERE id = {id} - `inst-decl-update-4`
 5. [x] - `p1` - **IF** not found → **RETURN** `404` - `inst-decl-update-5`
 6. [x] - `p1` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, because gear declarations change only through their owning module - `inst-decl-update-6`
 7. [x] - `p1` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-update-7`
-8. [x] - `p1` - Invoke declaration mutation class resolution over every field present in the request - `inst-decl-update-8`
+8. [x] - `p1` - Invoke declaration mutation class resolution over every field present in the request; a `400` the resolution returns for a field's shape or length is the response - `inst-decl-update-8`
 9. [x] - `p1` - **IF** any field resolves to the immutable class → **RETURN** `400` naming the field and stating that the change is expressible only as a replacement declaration - `inst-decl-update-9`
 10. [x] - `p1` - **IF** any field resolves to the step-up class → require a valid credential step-up assertion - `inst-decl-update-10`
 11. [x] - `p1` - **IF** step-up is required and absent or invalid → **RETURN** `403` - `inst-decl-update-11`
 12. [x] - `p1` - **IF** the request enables `anonymous_exposable` on a declaration whose `data_classification` is `secret` or `pii` → **RETURN** `400`, preserving the database check as the backstop - `inst-decl-update-12`
-13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata}, `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET {supplied metadata} (an explicit `null` clears a nullable field — `display_name`, `description`, `domain_affinity`, `licence_feature` — and an absent field is unchanged, and a supplied `display_name` is stored trimmed), `updated_at` = now(), and `last_change_at` = now() only when a field that changes what a reader is served changed — classification, step-up, anonymous exposure, licence feature, domain affinity; a description, display name or mode edit leaves the definition recency alone — WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412`; invalidate the local cache for the key — inside the transaction and again once it commits, as retire does — since the cached effective value carries the declaration's classification and domain affinity - `inst-decl-update-13`
 14. [x] - `p1` - Emit a declaration-updated audit record with pre-image and post-image - `inst-decl-update-14`
 15. [x] - `p1` - **RETURN** `200` with the updated declaration and a refreshed ETag - `inst-decl-update-15`
 
@@ -209,14 +213,47 @@ The hardest constraint here is not any single field but the rule connecting them
 5. [x] - `p1` - **IF** no row exists → continue as an ordinary create - `inst-decl-react-5`
 6. [x] - `p1` - **IF** a row exists with `status` = 'active' → **RETURN** `409` for the duplicate key; an active declaration anywhere on the setting's version-stripped path is found first and the request is an evolution or a `409` (Evolve Declaration), so a revive considers only a path with no active major - `inst-decl-react-6`
 7. [x] - `p1` - **IF** the retired declaration is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, nothing written: a gear's declaration changes only through its owning module, a revive would replace its Schema Default and metadata, and the `settings` package an admin key is composed with is not reserved from modules — judged right after the key is looked up, before the request's value type, classification or default is resolved and before step-up, so no refusal about them stands in front of it - `inst-decl-react-15`
-8. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
-9. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
-10. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
-11. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
-12. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
-13. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
-14. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
-15. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+8. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
+9. [x] - `p1` - Validate the Schema Default and the remaining body fields against the stored value type before step-up is asked, as the create does - `inst-decl-react-16`
+10. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
+11. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
+12. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
+13. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
+14. [x] - `p1` - Invalidate the local cache for the affected scopes, since retained values re-enter resolution - `inst-decl-react-10`
+15. [x] - `p1` - Emit a declaration-reactivated audit record - `inst-decl-react-11`
+16. [x] - `p1` - **RETURN** `200` with the revived declaration - `inst-decl-react-12`
+
+### Report a Revival
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-revival-report`
+
+**Actor**: `cpt-cf-settings-service-actor-platform-admin`
+
+**Success Scenarios**:
+- For a create body that would revive a retired declaration, the retained values that revive would bring back within the caller's administration, each masked by the stricter of its stored classification and the one the body derives and marked when the revive's re-validation would flag it, with the counts — nothing written, no step-up asked, and nothing the revive later requires or checks
+- More retained values than `limit`, or a subtree past the node budget: the first `limit` in traversal order, and `complete` false with lower-bound counts when the budget cut the walk
+- Values at standalone descendants and below them: neither listed nor counted
+- No retained value within the caller's administration: an empty list with `total` 0
+
+**Error Scenarios**:
+- The body is refused as the create would refuse it — the create's own `400`, `404` or `409`, in the create's order — or an active declaration off the body's path — another vendor or package — holds the leaf name in the category (`409 LeafNameTaken`)
+- The body would create, evolve or duplicate rather than revive (`404 nothing_to_revive`)
+- The caller may not create declarations or may not read values (`403`, whatever exists); a retired declaration the caller could not read answers as no retired declaration does (`404 nothing_to_revive`)
+- The Type Validator cannot answer (`503`)
+- A `limit` below 1 (`400`)
+
+**Steps**:
+1. [x] - `p1` - Actor sends POST /settings-service/v1/declarations/revival-preview with the create body and an optional `limit` (default 100; above 500 clamped to it; below 1 refused `400`) - `inst-decl-revival-1`
+2. [x] - `p1` - Authorize `create` on `gts.cf.core.settings.declaration.v1~` and `read` on the settings value base type, as browse does; **IF** either decision is deny or cannot be obtained → **RETURN** `403`, before the body is looked at, so the answer does not depend on what exists - `inst-decl-revival-2`
+3. [x] - `p1` - Run the create's own checks on the body in the create's order up to the lookup at the composed key and on its version-stripped path — body shape (the create's JSON answers: `400`, `415`, `422`), category (`404`), key segments, display name, Scope Class present and valid (`400`) — and an active `module_contributed` declaration on the path (`409 ContributedDeclarationImmutable`); **IF** one refuses → **RETURN** the create's answer - `inst-decl-revival-3`
+4. [x] - `p1` - **IF** the body would not revive a retired declaration — no retired declaration at the key, or an active declaration on the path, which makes the create an evolution — **OR** the retired declaration fails the single read's gates for the caller — its grant on the key, the administrative domain, `hidden`, licence → **RETURN** `404 nothing_to_revive`, the same answer either way, so beyond the create's own refusals in step 3 the answer reveals nothing of a declaration the caller could not read; the licence predicate joins in R2, as for the single read - `inst-decl-revival-4`
+5. [x] - `p1` - Run the rest of the create's checks on the revive in the create's order, stopping where the create would ask for step-up — the retired declaration `module_contributed` (`409 ContributedDeclarationImmutable`), the value type's traits and the derived classification, the secret boundary (`409 SecretnessChanged`), the Scope Class unchanged (`409 ScopeClassChanged`), the value type unchanged (`409 ValueTypeChanged`), the Schema Default and the remaining body fields (`400`); **IF** one refuses → **RETURN** the create's answer - `inst-decl-revival-5`
+6. [x] - `p1` - **IF** an active declaration off the body's path — another vendor or package — holds the retired declaration's leaf name in the category → **RETURN** `409 LeafNameTaken` - `inst-decl-revival-6`
+7. [x] - `p1` - Walk the caller's own tenant and its descendants breadth-first under the subtree node budget, standalone descendants and their subtrees left out, noting whether the budget or the depth ceiling cut the walk - `inst-decl-revival-7`
+8. [x] - `p1` - DB: under the caller's value-read scope, COUNT the retired declaration's subject-less rows at the walked tenants, SELECT its distinct values there grouped with their multiplicity, and SELECT the listed rows in the walk's order, a batch of tenants at a time, until `limit` rows are in hand - `inst-decl-revival-8`
+9. [x] - `p1` - Re-validate each distinct value, once, as the revive would re-validate it, so every row holding a value that would be flagged is counted and marked, one that validates again is reported clear and a secret is never flagged; **IF** the Type Validator cannot answer → **RETURN** `503` - `inst-decl-revival-9`
+10. [x] - `p1` - Mask each listed value by the stricter of its stored classification and the one the body derives, and withhold the re-validation detail whenever the value is masked - `inst-decl-revival-10`
+11. [x] - `p1` - **RETURN** `200` with the declaration's `key` and id, the first `limit` values in traversal order, `total`, `total_needs_review`, `scanned` and `complete`; nothing stored, no step-up, no audit, no cache touched - `inst-decl-revival-11`
 
 ### Evolve Declaration
 
@@ -240,7 +277,7 @@ The hardest constraint here is not any single field but the rule connecting them
 4. [x] - `p1` - Require a valid credential step-up assertion, because evolution retires a live setting's current major; **IF** absent or invalid → **RETURN** `401`/`403` - `inst-decl-evolve-3`
 5. [x] - `p1` - **IF** the new value type flips the secret trait → **RETURN** `409`, since stored values would be re-interpreted rather than moved - `inst-decl-evolve-4`
 6. [x] - `p1` - Mint the next free major: one above the highest major the path has ever used, retired ones included, composed as `<vendor>.settings.<category>.<name>.vN~` - `inst-decl-evolve-5`
-7. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
+7. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, carrying `set_by` and `set_by_tenant` unchanged, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
 8. [x] - `p1` - Invalidate the local cache for both keys, and **RETURN** `200` with the successor and `evolved: true` - `inst-decl-evolve-7`
 
 ### Declare Dependency Group
@@ -275,7 +312,7 @@ The hardest constraint here is not any single field but the rule connecting them
 **Actor**: `cpt-cf-settings-service-actor-tenant-admin`
 
 **Success Scenarios**:
-- A single declaration, or a filtered page of declarations, returned with resolved traits for client rendering
+- A single declaration, or a filtered page of declarations, returned with resolved traits and `display_name` when set, for client rendering
 
 **Error Scenarios**:
 - Declaration outside the caller's visibility, domain, or licence gate
@@ -290,7 +327,7 @@ The hardest constraint here is not any single field but the rule connecting them
 6. [x] - `p1` - DB: SELECT declarations with the combined predicate applied inside the query - `inst-decl-read-6`
 7. [x] - `p1` - **IF** a single-declaration read is filtered out → **RETURN** `404` rather than `403`, so a gated declaration's existence is not disclosed - `inst-decl-read-7`
 8. [x] - `p1` - Resolve each returned declaration's trait set for client rendering - `inst-decl-read-8`
-9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, and resolved traits - `inst-decl-read-9`
+9. [x] - `p1` - **RETURN** `200` with the declaration or page, each carrying `key`, `value_type_id`, resolved traits, and `display_name` when set (omitted otherwise, never derived from `leaf_slug`); a page carries `page_info.total_count`, the declarations the whole listing holds under its filter and visibility, counted without the cursor - `inst-decl-read-9`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -316,11 +353,11 @@ The hardest constraint here is not any single field but the rule connecting them
 
 **Input**: The set of fields present in an update request, and the declaration's current `data_classification`
 
-**Output**: A per-field class of immediate, immutable, or step-up-gated
+**Output**: A per-field class of immediate, immutable, or step-up-gated, or a `400` naming a field whose shape or length is wrong
 
 **Steps**:
 1. [x] - `p1` - **FOR EACH** field present in the request - `inst-decl-mutcls-1`
-   1. [x] - `p1` - **IF** the field is `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate - `inst-decl-mutcls-2`
+   1. [x] - `p1` - **IF** the field is `display_name`, `description`, `mode`, `domain_affinity`, or `licence_feature`, or it tightens a gate — sets `requires_step_up` true or `anonymous_exposable` false → classify as immediate; a `display_name` must be `null` or a string of 1..256 Unicode characters after trimming with no control character, and any other shape, length or content → **RETURN** `400` naming the field - `inst-decl-mutcls-2`
    2. [x] - `p1` - **IF** the field is `default_value`, the value type, or `scope_class` → classify as immutable, because each would change a live setting's resolution without any gate - `inst-decl-mutcls-3`
    3. [x] - `p1` - **IF** the field is `data_classification` **AND** the change tightens from `public` toward `pii` → classify as immediate - `inst-decl-mutcls-4`
    4. [x] - `p1` - **IF** the field is `data_classification` **AND** the change loosens from `pii` toward `public` → classify as step-up-gated, because it un-masks content previously withheld - `inst-decl-mutcls-5`
@@ -369,7 +406,7 @@ The hardest constraint here is not any single field but the rule connecting them
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-entity-schema`
 
-The system **MUST** persist declarations in a `setting_declarations` table carrying `key` unique via `uq_declaration_key`, `leaf_slug` unique per category **among active declarations** via the partial `uq_declaration_category_slug`, a non-null `category_id` foreign key to `categories` declared `ON DELETE RESTRICT`, a **non-null** `default_value`, `requires_step_up` defaulting to `true`, `anonymous_exposable` defaulting to `false`, and check constraints enforcing the `scope_class`, `mode`, `status`, `source`, and `data_classification` vocabularies. Two cross-field checks **MUST** hold in the database, not only in application code: an `anonymous_exposable` declaration may not be classified `secret` or `pii`, and `data_classification` being `secret` must be equivalent to `has_secret_trait`.
+The system **MUST** persist declarations in a `setting_declarations` table carrying `key` unique via `uq_declaration_key`, `leaf_slug` unique per category **among active declarations** via the partial `uq_declaration_category_slug`, a non-null `category_id` foreign key to `categories` declared `ON DELETE RESTRICT`, a nullable `display_name` `varchar(256)` whose 1..256-Unicode-characters-after-trimming bound is enforced in the domain layer, added by an additive migration with no backfill so that pre-existing rows read as absent, with its trigram index `idx_declarations_display_name_trgm` on PostgreSQL only, a **non-null** `default_value`, `requires_step_up` defaulting to `true`, `anonymous_exposable` defaulting to `false`, and check constraints enforcing the `scope_class`, `mode`, `status`, `source`, and `data_classification` vocabularies. Two cross-field checks **MUST** hold in the database, not only in application code: an `anonymous_exposable` declaration may not be classified `secret` or `pii`, and `data_classification` being `secret` must be equivalent to `has_secret_trait`.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-create`
@@ -439,7 +476,7 @@ The system **MUST** derive `has_secret_trait` from the value type's resolved tra
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-mutation-classes`
 
-The system **MUST** partition declaration changes into descriptive metadata applied immediately under `update` permission plus `If-Match` — the write itself conditional on the version the tag was compared against — behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate. A metadata change **MUST** evict the key's cached effective values, so a reclassification masks on the next read rather than when the cache TTL runs out.
+The system **MUST** partition declaration changes into descriptive metadata (`display_name`, `description`, `mode`, `domain_affinity`, `licence_feature`) applied immediately under `update` permission plus `If-Match` — the write itself conditional on the version the tag was compared against — behavior-affecting fields rejected as immutable, and behavior-affecting actions gated by credential step-up. `data_classification` tightening **MUST** be immediate while loosening **MUST** require step-up. No declaration edit may change a live setting's effective resolution without a gate, and an unrecognized field **MUST** be treated as immutable rather than immediate. A metadata change **MUST** evict the key's cached effective values, so a reclassification masks on the next read rather than when the cache TTL runs out.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-setting-declarations-mutation-class`
@@ -455,7 +492,7 @@ The system **MUST** partition declaration changes into descriptive metadata appl
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-lifecycle`
 
-Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; every retained value **MUST** be re-validated against the value type before it goes live, and the re-declaration **MUST** be refused when it flips the secret trait, changes the Scope Class or names a different value type — the setting's own GTS type is registered with its value type, and the Types Registry does not replace a registered type. Evolution **MUST** be expressed as re-declaring an active setting with a different value type, Schema Default or scope class, step-up gated: it **MUST** insert the next free major under a new key and type, copy and re-validate every value of the active major, and retire that major, all in one transaction, and **MUST** refuse a request matching the active declaration, a contributed declaration, and a new value type across the secret boundary. None of these actions goes through the value write path, and none deletes values.
+Retire **MUST** be an immediate soft delete setting `status` to `retired` in one transaction with cache invalidation and signal publication, **MUST** require credential step-up, and **MUST** retain every stored value while excluding the declaration from resolution. Reactivation **MUST** be expressed as re-declaring the key, also step-up gated; every retained value **MUST** be re-validated against the value type before it goes live, and the re-declaration **MUST** be refused when it flips the secret trait, changes the Scope Class or names a different value type — the setting's own GTS type is registered with its value type, and the Types Registry does not replace a registered type. Evolution **MUST** be expressed as re-declaring an active setting with a different value type, Schema Default or scope class, step-up gated: it **MUST** insert the next free major under a new key and type, copy and re-validate every value of the active major, and retire that major, all in one transaction, and **MUST** refuse a request matching the active declaration, a contributed declaration, and a new value type across the secret boundary. None of these actions goes through the value write path, and none deletes values. The copy of every value on evolution **MUST** carry its `set_by` and `set_by_tenant` unchanged.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-retire`
@@ -470,6 +507,21 @@ Retire **MUST** be an immediate soft delete setting `status` to `retired` in one
 - API: `POST /settings-service/v1/declarations`
 - DB Table: `setting_declarations`
 - Entities: `DeclarationStatus`
+
+### Revival Report
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-revival-report`
+
+The system **MUST** serve `POST /settings-service/v1/declarations/revival-preview`, taking the body of the create that would revive a retired declaration. It **MUST** authorize `create` on the declaration type and `read` on the settings value base type before looking at the body, refusing `403` whatever exists; **MUST** answer the create's own refusals in the create's order, then `409 LeafNameTaken` for an active declaration off the body's path — another vendor or package — holding the leaf name in the category; and **MUST** answer `404 nothing_to_revive` both when the body would not revive and when the retired declaration fails the single read's gates for the caller. It **MUST** report the declaration's retained subject-less values within the caller's administration — the caller's tenant and its descendants under the subtree node budget, standalone descendants left out of the list and the counts — each re-validated as the revive would (a value that validates again reported clear, a secret never flagged), masked by the stricter classification with its detail withheld when masked; the first `limit` (default 100, above 500 clamped, below 1 refused `400`) in traversal order, `total`, `total_needs_review`, `scanned` and `complete`. It **MUST** store nothing, ask no step-up, emit no audit and touch no cache, **MUST** answer `503` when the Type Validator cannot answer, and is advisory: reactivation neither requires it nor checks it. Beyond the create's own refusals, which a caller allowed to create gets from the create as well, it **MUST** disclose nothing of a retired declaration the caller could not read.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-setting-declarations-revival-report`
+
+**Constraints**: `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
+
+**Touches**:
+- API: `POST /settings-service/v1/declarations/revival-preview`
+- DB Table: `setting_values`
 
 ### Contributed Declaration Protection
 
@@ -502,7 +554,7 @@ The system **MUST** let an authorized author declare a named Dependency Group ov
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-read-surface`
 
-Declaration reads **MUST** be visibility- and domain-gated with the predicate applied inside the query, **MUST** leave the seam through which the licence gate joins that predicate in R2, **MUST** return the setting `key`, its `value_type_id`, and the resolved trait set for client rendering, and **MUST** report a gated single-declaration read as absent rather than forbidden.
+Declaration reads **MUST** be visibility- and domain-gated with the predicate applied inside the query, **MUST** leave the seam through which the licence gate joins that predicate in R2, **MUST** return the setting `key`, its `value_type_id`, and the resolved trait set for client rendering, **MUST** return `display_name` when set and omit it otherwise, never deriving one from `leaf_slug`, and **MUST** report a gated single-declaration read as absent rather than forbidden.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-setting-declarations-read`
@@ -564,6 +616,20 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] Re-declaring a retired key with step-up revives the row to `active` and its retained values participate in resolution again
 - [x] Re-declaring a retired key with a different value type is refused `409 value_type_changed` with nothing written; a revive under the same type re-validates every retained value, one that validates goes live and one that does not is flagged `needs_review` with its detail
 - [x] Re-declaring a retired key with a type that flips the secret trait, or with a different scope class, returns `409` and leaves the row retired and its values untouched
+- [x] The revival report for a create body that would revive a retired declaration lists its retained values at the caller's tenant and descendants in traversal order with `total`, `total_needs_review`, `scanned` and `complete`, a value the revive would flag marked with its detail, a previously flagged one that validates again reported clear; nothing is written, no audit is recorded and no step-up is asked
+- [x] A retained value at a standalone descendant, or below one, is neither listed nor counted by the revival report
+- [x] A `pii` retained value is masked, with its detail withheld, for a caller without the PII entitlement; a secret one is the mask token for every caller and never flagged; a stored `public` value under a body deriving `pii` is masked
+- [x] A retired declaration with no retained value in the caller's administration gives `200` with an empty list, `total` 0 and `complete` true
+- [x] The revival report answers `404 nothing_to_revive` for a body that would create, evolve or duplicate, distinct from a missing category's `404`
+- [x] The revival report answers the create's own refusals in the create's order: a missing category `404`, a malformed segment `400`, an active module-contributed declaration on the path `409 ContributedDeclarationImmutable`, an invalid Schema Default `400`
+- [x] The revival report answers the revive's refusals `409 SecretnessChanged`, `409 ScopeClassChanged` and `409 ValueTypeChanged`, and `409 LeafNameTaken` for a leaf name held by an active declaration off the body's path — another vendor or package — in the category, judged after the create's checks so an invalid Schema Default answers first
+- [x] A body that changes both the Scope Class and the value type gets `409 ScopeClassChanged`
+- [x] The revival report answers `403` without `create` or without `read` on the settings value base type, whatever exists, and `404 nothing_to_revive` for a retired declaration `hidden` from the caller — the same answer as when nothing is retired
+- [ ] The revival report answers `404 nothing_to_revive` for a retired declaration outside the caller's grant on its key or its administrative domain, or behind a licence its tenant lacks — the same answer as when nothing is retired
+- [x] An active module-contributed declaration on the body's path answers `409 ContributedDeclarationImmutable` exactly as the create with the same body does, whether or not the caller could read it
+- [x] More retained values than `limit` give the first `limit` and exact counts; a subtree past the node budget gives `complete` false and lower-bound counts; a `limit` above 500 is clamped and one below 1 refused `400`
+- [x] A Type Validator that cannot answer makes the revival report `503`
+- [x] A revive with step-up succeeds whether or not the revival report was requested first, and nothing the report answered is consulted by it
 - [x] Re-declaring an active setting with a different value type evolves it: `200` with `evolved: true`, the next major created and active, every value copied and re-validated with failures flagged `needs_review`, the previous major retired
 - [x] A later shape change evolves the active major, not a retired one, and a repeat of a request that matches the active declaration returns `409` without minting a major
 - [x] An evolution without step-up, of a contributed declaration, or across the secret boundary is refused and leaves the active declaration and its values untouched
@@ -573,3 +639,10 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [ ] A declaration read outside the caller's visibility, domain, or licence gate returns `404` rather than `403`
 - [ ] Every declaration read returns the `key`, the `value_type_id`, and the resolved trait set
 - [x] Every create, update, retire, and reactivate produces exactly one audit record, and update and retire records carry pre-images
+- [x] Creating a declaration with a `display_name` returns it in the `201` body and on every later declaration read, creating one without it omits the field, and nothing derives a `display_name` from `leaf_slug`
+- [x] A `display_name` empty or whitespace-only after trimming, longer than 256 Unicode characters, or containing a control character, is refused `400` naming the field on create and on `PATCH`, while 1 and 256 Unicode characters (multi-byte included) are accepted, and a value exceeding 256 only by surrounding whitespace is accepted and stored trimmed
+- [x] A `PATCH` with `display_name` sets it, with `display_name: null` clears it, and without the field leaves it unchanged, and the edit refreshes `updated_at` and the ETag without moving `last_change_at`
+- [x] A `PATCH` of `display_name` on a `module_contributed` declaration returns `409 ContributedDeclarationImmutable`
+- [x] A declaration row that predates the `display_name` column reads as having no display name
+- [x] An evolution copies every value with its original `set_by` and `set_by_tenant` unchanged
+- [x] A tenant administrator's own value stays shown to that tenant after evolve

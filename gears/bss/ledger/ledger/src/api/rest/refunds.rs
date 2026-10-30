@@ -1,6 +1,6 @@
 //! Axum handlers + router for the ledger's refund (money-OUT) REST surface
 //! (Slice 3, Phase 2, design §4.4 / §5 / §7, Group G). Three operations under
-//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the vhp-core
+//! `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the path (the platform
 //! convention, matching the adjustment / payment / dispute surfaces): the writes
 //! carry `tenant_id` in the **body**, the by-id read takes the refund id in the
 //! path + the owning seller `tenant_id` in the query.

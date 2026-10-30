@@ -24,7 +24,6 @@ use bss_ledger::infra::audit::event_type::AuditEventType;
 use bss_ledger::infra::audit::store::SecuredAuditStore;
 use bss_ledger::infra::storage::migrations::Migrator;
 
-use bss_ledger::domain::instant::from_unix_millis;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
@@ -450,7 +449,9 @@ async fn rewalk_record(
 
     let before_after: serde_json::Value = serde_json::from_str(&before_after_text).unwrap();
     let correlation_id = correlation_text.map(|s| Uuid::parse_str(&s).unwrap());
-    let at_utc = from_unix_millis((at_micros) / 1000).unwrap();
+    // At the seal's own precision: `audit_row_hash` hashes `timestamp_micros`, so a time
+    // rebuilt from milliseconds would drop the last three digits and miss the seal.
+    let at_utc = OffsetDateTime::from_unix_timestamp_nanos(i128::from(at_micros) * 1_000).unwrap();
 
     let recomputed = audit_row_hash(
         &AuditHashInput {

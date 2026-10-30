@@ -86,7 +86,7 @@ fn each_variant_maps_to_expected_category() {
         (DomainError::IdempotencyConflict(d()), 409),
         (DomainError::CurrencyScaleLocked(d()), 409),
         (DomainError::OverRecognition(d()), 409),
-        // Dual-control (VHP-1852): over-threshold / self-approval / non-actionable
+        // Dual-control: over-threshold / self-approval / non-actionable
         // target / out-of-range policy are all well-formed requests that conflict
         // with current governance state → ABORTED → 409 (no platform 422).
         (DomainError::DualControlRequired(d()), 409),

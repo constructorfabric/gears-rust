@@ -2,6 +2,13 @@
 # package ecosystems to update and where the package manifests are located.
 # Please see the documentation for all configuration options:
 # https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+#
+# Shape of the weekly batch. One PR per crate/action/image used to mean ~10 PRs at
+# once, each starting ~25 workflows: the burst exhausted the GITHUB_TOKEN rate limit
+# and the runner pool (2026-10-14), every Cargo.lock merge forced a rebase of all
+# the others, and the PRs sat red for reasons unrelated to the bump. Groups keep a
+# week down to a few PRs; anything that can break the build stays individual.
+# Security updates ignore `groups` and `cooldown`, so they still arrive at once.
 
 version: 2
 updates:
@@ -9,25 +16,103 @@ updates:
     directory: "/" # Location of package manifests
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Etc/UTC"
+    # Skip same-week re-releases (e.g. x.y.0 then x.y.1 a few days later).
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # RustCrypto crates share trait versions (digest/signature): bumping one
+      # alone does not compile (#5350: sha2 0.11 against rsa's digest 0.10).
+      # Listed first so these never fall into the patch group below.
+      # pkcs8/sec1 are direct deps locked to rsa's generation (rustls-corecrypto-provider).
+      rustcrypto:
+        patterns:
+          - "aes*"
+          - "block-buffer"
+          - "cipher"
+          - "crypto-common"
+          - "digest"
+          - "ecdsa"
+          - "ed25519*"
+          - "elliptic-curve"
+          - "hkdf"
+          - "hmac"
+          - "p256"
+          - "p384"
+          - "pbkdf2"
+          - "pkcs8"
+          - "rsa"
+          - "sec1"
+          - "sha1"
+          - "sha2"
+          - "sha3"
+          - "signature"
+      # Patch only: in cargo a 0.x minor bump is a breaking change (#4900:
+      # base64 0.22 -> 0.23), and one breaking crate would block the whole group.
+      # Minor bumps stay individual PRs.
+      cargo-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "patch"
 
   # Container base images. Without this, every `FROM ...@sha256:` in the repo is
   # updated by hand, i.e. not at all - which is how the builder pin sat on Rust
   # 1.95.0 long after rust-toolchain.toml moved to 1.97.0 (#4798).
   - package-ecosystem: "docker"
     directories:
+      - "/deploy/docker"
       - "/testing/docker"
       - "/gears/mini-chat/deploy/docker"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # One PR for all three directories: the same rust image bump used to
+      # arrive as three PRs (#5393, #5394, #5396).
+      docker-images:
+        patterns:
+          - "*"
 
   # Pinned action SHAs. Pinning by commit (#2093) is only half of the practice:
   # a frozen SHA never picks up the action's own security releases unless
   # something moves it forward.
   - package-ecosystem: "github-actions"
-    directory: "/"
+    # "/" covers only .github/workflows. The composite actions pin actions too.
+    directories:
+      - "/"
+      - "/.github/actions/*"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "02:00"
+      timezone: "Etc/UTC"
+    cooldown:
+      default-days: 5
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
     groups:
+      # codeql-action stays its own group: its init/analyze/upload parts must move together.
       codeql:
         patterns:
           - "github/codeql-action*"
+      # Major action bumps stay individual: they can change inputs/outputs.
+      actions:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"

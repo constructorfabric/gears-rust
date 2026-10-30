@@ -47,6 +47,7 @@ from .conftest import EVENT_TYPE_LONGPOLL, SUBJECT_TYPE, TOPIC_LONGPOLL, SseFram
 DELIVERY_BOUND = 15.0
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(60, func_only=True)
 async def test_published_event_reaches_open_stream_within_bound(api, test_env):
     """An event published while a stream is open is delivered within the bound.

@@ -34,7 +34,8 @@ async fn a_published_revision_resolves_every_item_in_the_frozen_shape_and_writes
     // D-427: the model is the item's (its entry's); the binding carries none.
     let binding = json!({
         "price_id": w.price, "dim_used": null, "pinned_from": null,
-        "price": {"amount": "30.00"}, "min_fee": null,
+        "currency": "EUR", "currency_scale": 2,
+        "price": {"amount": "30"}, "min_fee": null,
         "eligibility": "all", "effective_from": "2026-09-01",
         "effective_to": null, "temporary_until": null, "ends_on": null,
         "keep_for_bound": false
@@ -55,9 +56,8 @@ async fn a_published_revision_resolves_every_item_in_the_frozen_shape_and_writes
         b,
         json!({
             "plan_revision_id": w.revision, "plan_id": w.plan, "rev_no": 1, "state": "published",
-            "book_id": w.book, "currency": "EUR", "currency_minor_digits": 2,
-            // No settings row: the default rounding, half_even (D-437).
-            "rounding_policy": "half_even", "date": "2026-10-05", "items": [item]
+            "book_id": w.book, "currency": "EUR",
+            "date": "2026-10-05", "items": [item]
         })
     );
     assert_eq!(
@@ -241,7 +241,7 @@ async fn a_renewal_walks_to_the_all_successor_and_a_signup_binds_the_new_price()
         &f,
         entry,
         Row {
-            price: flat("10.00"),
+            price: flat("10"),
             to: Some("2026-10-01"),
             ..Row::default()
         },
@@ -251,7 +251,7 @@ async fn a_renewal_walks_to_the_all_successor_and_a_signup_binds_the_new_price()
         &f,
         entry,
         Row {
-            price: flat("12.00"),
+            price: flat("12"),
             from: "2026-10-01",
             to: Some("2026-11-01"),
             keep: true,
@@ -264,7 +264,7 @@ async fn a_renewal_walks_to_the_all_successor_and_a_signup_binds_the_new_price()
         &f,
         entry,
         Row {
-            price: flat("15.00"),
+            price: flat("15"),
             from: "2026-11-01",
             eligibility: "new",
             version_no: 3,
@@ -280,7 +280,7 @@ async fn a_renewal_walks_to_the_all_successor_and_a_signup_binds_the_new_price()
     assert_eq!(s, 200, "{renewal}");
     let binding = &renewal["items"][0]["chains"][0]["binding"];
     assert_eq!(binding["price_id"], json!(twelve), "{renewal}");
-    assert_eq!(binding["price"], flat("12.00"));
+    assert_eq!(binding["price"], flat("12"));
     assert_eq!(binding["pinned_from"], json!(ten));
     assert_eq!(binding["keep_for_bound"], true);
     assert_eq!(binding["eligibility"], "all");
@@ -323,7 +323,7 @@ async fn a_binding_says_where_it_ends_for_its_holder() {
         },
     )
     .await;
-    let returned = put(&f, entry, usage("0.10", "2026-11-10", 2)).await;
+    let returned = put(&f, entry, usage("0.1", "2026-11-10", 2)).await;
     let closed = put(
         &f,
         entry,
@@ -365,11 +365,11 @@ async fn the_matrix_carries_every_registered_value_and_an_uncovered_chain_is_exp
     let usage = |dim, rate: &str, version_no| Row {
         dim,
         price: json!({ "rate": rate }),
-        min_fee: Some("5.00"),
+        min_fee: Some("5"),
         version_no,
         ..Row::default()
     };
-    let default = put(&f, entry, usage(None, "0.10", 1)).await;
+    let default = put(&f, entry, usage(None, "0.1", 1)).await;
     let eu = put(&f, entry, usage(Some("eu"), "0.08", 2)).await;
     let bare_sku = catalog.sku(SkuType::Usage);
     let bare = entry_of(&f, eur, bare_sku, "usage", (None, Some("region"), None)).await;
@@ -405,7 +405,7 @@ async fn the_matrix_carries_every_registered_value_and_an_uncovered_chain_is_exp
         "{b}"
     );
     assert_eq!(first[1]["binding"]["price"], json!({"rate":"0.08"}));
-    assert_eq!(first[1]["binding"]["min_fee"], "5.00", "exact decimal text");
+    assert_eq!(first[1]["binding"]["min_fee"], "5", "exact decimal text");
     let second = chains(1);
     assert_eq!(
         second
@@ -435,7 +435,7 @@ async fn a_pin_foreign_to_the_revision_or_not_approved_is_400_pin_foreign() {
     let entry = entry_of(&f, eur, sku, "usage", (None, Some("region"), None)).await;
     // D-427: a usage entry is `per_unit`, so its prices' money is a rate.
     let usage = Row {
-        price: json!({"rate":"0.10"}),
+        price: json!({"rate":"0.1"}),
         ..Row::default()
     };
     put(&f, entry, usage.clone()).await;
@@ -520,7 +520,7 @@ async fn a_cancelled_price_and_a_change_row_are_never_resolved_or_pinned() {
         &w.f,
         w.entry,
         Row {
-            price: flat("40.00"),
+            price: flat("40"),
             from: "2026-10-01",
             state: "cancelled",
             version_no: 2,
@@ -532,7 +532,7 @@ async fn a_cancelled_price_and_a_change_row_are_never_resolved_or_pinned() {
         &w.f,
         w.entry,
         Row {
-            price: flat("40.00"),
+            price: flat("40"),
             from: "2026-10-01",
             version_no: 3,
             change_kind: "cancel",
@@ -562,7 +562,7 @@ async fn a_cancelled_price_and_a_change_row_are_never_resolved_or_pinned() {
         assert_eq!(s, 200, "{b}");
         let binding = &b["items"][0]["chains"][0]["binding"];
         assert_eq!(binding["price_id"], json!(w.price), "{date}: {b}");
-        assert_eq!(binding["price"], flat("30.00"), "{date}");
+        assert_eq!(binding["price"], flat("30"), "{date}");
         assert_eq!(binding["effective_to"], json!(null), "{date}");
     }
     for pin in [cancelled, cancel, end] {
@@ -584,7 +584,7 @@ async fn a_cancelled_price_and_a_change_row_are_never_resolved_or_pinned() {
         )
         .await;
     assert_eq!(s, 200, "{b}");
-    assert_eq!(b["price"], flat("40.00"));
+    assert_eq!(b["price"], flat("40"));
     assert_eq!(b["status"], "cancelled", "{b}");
     let (s, b, _) =
         w.f.call(
@@ -911,7 +911,7 @@ async fn a_sku_products_does_not_know_resolves_with_a_null_sku_version() {
     publish(&f, id_of(&created["id"]), revision).await;
     settings(
         &f,
-        json!({"default_timing":"arrears","default_rounding":"half_even","default_gl":"9000",
+        json!({"default_timing":"arrears","default_gl":"9000",
                "default_tax_category":"std","invoice_line_templates":{"recurring":"{sku} per {period}"},"currencies":[]}),
     )
     .await;
@@ -933,7 +933,10 @@ async fn a_sku_products_does_not_know_resolves_with_a_null_sku_version() {
         item["billing_timing"],
         json!({"value":"arrears","source":"tenant"})
     );
-    assert_eq!(b["rounding_policy"], "half_even");
+    assert!(
+        b.get("rounding_policy").is_none(),
+        "resolve names no rounding policy"
+    );
     assert_eq!(item["chains"][0]["binding"]["price_id"], json!(price));
 }
 
@@ -958,7 +961,7 @@ async fn september_binds_sku_version_one_and_october_version_two() {
     catalog.version(sku, 2, "2026-10-01", v2);
     settings(
         &f,
-        json!({"default_timing":"arrears","default_rounding":"half_up","default_gl":"9000",
+        json!({"default_timing":"arrears","default_gl":"9000",
                "default_tax_category":"std","invoice_line_templates":{"usage":"{sku} usage"},"currencies":[]}),
     )
     .await;
@@ -967,7 +970,7 @@ async fn september_binds_sku_version_one_and_october_version_two() {
         &f,
         entry,
         Row {
-            price: json!({"rate":"0.10"}),
+            price: json!({"rate":"0.1"}),
             ..Row::default()
         },
     )
@@ -1071,6 +1074,118 @@ async fn price_read(
     (s, b)
 }
 
+/// A stored price outside its contract is a corrupt row, never served as stored: not by the pinned
+/// read, the authoring list or the resolve, nor by the in-process read. Each corruption is made
+/// alone over a price every read serves, and repaired after, so each 500 is its own; the shared
+/// reader every read goes through (`price_repo::in_book`) names the column and the cause. The
+/// column CHECKs refuse a non-canonical fee and a scale out of range, so the rows are written with
+/// the CHECKs off, as another writer or a drifted schema would write them.
+#[tokio::test]
+async fn a_stored_price_out_of_its_contract_is_a_corrupt_row_in_every_read() {
+    use bss_pricing::api::pricing_read::PricingReadProvider;
+    use bss_pricing::infra::storage::{
+        RepoError,
+        repo::{price_book_entry_repo, price_repo},
+    };
+    use bss_pricing_sdk::read::{CatalogRef, PriceQuery, PricingReadV1};
+    use sea_orm::{ConnectOptions, ConnectionTrait, Database};
+    use toolkit_db::secure::AccessScope;
+    let w = world().await;
+    let f = &w.f;
+    let tenant = f.ctx.subject_tenant_id();
+    let provider = PricingReadProvider::new(
+        f.state.clone(),
+        std::sync::Arc::new(plan_support::entry_support::enforcer_for(tenant)),
+    );
+    let query = PriceQuery {
+        catalog: CatalogRef { tenant_id: tenant },
+        price_id: w.price,
+    };
+    let list = format!("/price-book-entries/{}/prices", w.entry);
+    let resolved = format!("plan_revision_id={}&date=2026-10-05", w.revision);
+    let reads = || async {
+        let (pinned, _) = price_read(f, &f.ctx, w.price).await;
+        let (listed, _, _) = f.call("GET", &list, json!({}), None, None).await;
+        let (bound, _) = resolve(f, &resolved).await;
+        (pinned, listed, bound)
+    };
+    assert_eq!(
+        reads().await,
+        (200, 200, 200),
+        "the stored price is served by every read"
+    );
+    let mut options = ConnectOptions::new(String::from(&f.dsn));
+    options.max_connections(1).min_connections(1);
+    let db = Database::connect(options).await.unwrap();
+    db.execute_unprepared("PRAGMA ignore_check_constraints = ON")
+        .await
+        .unwrap();
+    let repair = r#"UPDATE pricing_price SET price_json = '{"amount":"30"}', min_fee = NULL,
+        currency = 'EUR', currency_scale = 2"#;
+    for (corruption, cause) in [
+        (
+            r#"UPDATE pricing_price SET price_json = '{"amount":"30.00"}'"#,
+            "price_json: amount is not canonical decimal text",
+        ),
+        (
+            "UPDATE pricing_price SET min_fee = '1.50'",
+            "min_fee: \"1.50\" is not canonical",
+        ),
+        (
+            "UPDATE pricing_price SET min_fee = '1.555'",
+            "min_fee: 1.555 is off the increment of currency_scale 2",
+        ),
+        (
+            "UPDATE pricing_price SET currency_scale = 29",
+            "currency_scale: 29 is outside 0 to 28",
+        ),
+        (
+            "UPDATE pricing_price SET currency = 'USD'",
+            "currency: USD is not its book's EUR",
+        ),
+    ] {
+        db.execute_unprepared(corruption).await.unwrap();
+        assert_eq!(
+            reads().await,
+            (500, 500, 500),
+            "no read serves the corrupt row"
+        );
+        assert_eq!(
+            provider
+                .price(&f.ctx, query.clone())
+                .await
+                .unwrap_err()
+                .status_code(),
+            500,
+            "the in-process read refuses the corrupt row"
+        );
+        let conn = f.db.conn().unwrap();
+        let scope = AccessScope::for_tenant(tenant);
+        let row = price_repo::find(&conn, &scope, tenant, w.price)
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = price_book_entry_repo::find(&conn, &scope, tenant, w.entry)
+            .await
+            .unwrap()
+            .unwrap();
+        let model = price_book_entry_repo::model_of(&entry).unwrap();
+        let Err(RepoError::CorruptRow(what)) = price_repo::in_book(&row, model, "EUR") else {
+            panic!("the shared reader refuses the corrupt row");
+        };
+        assert!(
+            what.contains(cause),
+            "the shared reader names the corrupt column and why"
+        );
+        db.execute_unprepared(repair).await.unwrap();
+        assert_eq!(
+            reads().await,
+            (200, 200, 200),
+            "the repaired row is served again"
+        );
+    }
+}
+
 /// AC `dod-price-read-forever`: an approved price is served with its original money whatever
 /// its window, with its entry's SKU, charge kind, period, book and currency, and nothing
 /// computed from today or of its authoring (D-422).
@@ -1084,7 +1199,7 @@ async fn an_approved_price_is_served_forever_whatever_its_window() {
         &f,
         entry,
         Row {
-            price: flat("10.00"),
+            price: flat("10"),
             from: "2025-01-01",
             to: Some("2025-06-01"),
             closed: true,
@@ -1096,7 +1211,7 @@ async fn an_approved_price_is_served_forever_whatever_its_window() {
         &f,
         entry,
         Row {
-            price: flat("12.00"),
+            price: flat("12"),
             from: "2025-06-01",
             to: Some("2026-01-01"),
             keep: true,
@@ -1109,8 +1224,8 @@ async fn an_approved_price_is_served_forever_whatever_its_window() {
         &f,
         entry,
         Row {
-            price: flat("15.00"),
-            min_fee: Some("1.50"),
+            price: flat("15"),
+            min_fee: Some("1.5"),
             from: "2026-01-01",
             eligibility: "new",
             version_no: 3,
@@ -1126,16 +1241,17 @@ async fn an_approved_price_is_served_forever_whatever_its_window() {
         json!({
             "price_id": open, "price_book_entry_id": entry, "sku_id": sku,
             "charge_kind": "recurring", "period": "month", "book_id": eur, "currency": "EUR",
-            "version_no": 3, "dim_value": null, "model": "flat", "price": {"amount": "15.00"},
-            "min_fee": "1.50", "eligibility": "new", "effective_from": "2026-01-01",
+            "currency_scale": 2, "version_no": 3, "dim_value": null, "model": "flat",
+            "price": {"amount": "15"},
+            "min_fee": "1.5", "eligibility": "new", "effective_from": "2026-01-01",
             "effective_to": null, "temporary_until": null, "keep_for_bound": false,
             "closed_explicitly": false, "paired_price_id": null, "return_of_price_id": null,
             "approved_by_unit_id": null, "approved_at": null
         })
     );
     for (id, money, to, keep) in [
-        (closed, "10.00", json!("2025-06-01"), false),
-        (kept, "12.00", json!("2026-01-01"), true),
+        (closed, "10", json!("2025-06-01"), false),
+        (kept, "12", json!("2026-01-01"), true),
     ] {
         let (s, b) = price_read(&f, &f.ctx, id).await;
         assert_eq!(s, 200, "{b}");
@@ -1280,11 +1396,11 @@ async fn exactly_the_reads_that_declare_an_etag_answer_one() {
         assert_eq!(!tag.is_empty(), declares, "{path}: ETag {tag:?}");
         measured += 1;
     }
-    // 26 with run 9.7's batch checks read (D-482); 25 was run 9.8b's plans counts (D-485). 24 was run
-    // 9.6's reservations read and
-    // effective-policy read (D-480, D-481), which
-    // declare no ETag. 22 was run 9.3's unit counts (D-470).
-    assert_eq!(measured, 26, "every GET operation is measured");
+    // 27 with the currency table (D-537), which declares no ETag; 26 was run 9.7's batch checks
+    // read (D-482); 25 was run 9.8b's plans counts (D-485). 24 was run 9.6's reservations read and
+    // effective-policy read (D-480, D-481), which declare no ETag. 22 was run 9.3's unit counts
+    // (D-470).
+    assert_eq!(measured, 27, "every GET operation is measured");
 }
 
 // ------------------------------------------------------------------ phase 9 review R27: the writes' ETag
@@ -1492,7 +1608,7 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
             let mut price = plan_support::entry_support::price(&stored);
             price.version_no = version_no;
             price.state = "approved".into();
-            price.price_json = json!({"rate": "1.00"});
+            price.price_json = json!({"rate": "1"});
             price.effective_from =
                 time::Date::parse(from, &time::format_description::well_known::Iso8601::DATE)
                     .unwrap();
@@ -1663,7 +1779,7 @@ async fn exactly_the_writes_that_declare_an_etag_answer_one() {
         unmeasured.is_empty(),
         "every write op is measured: {unmeasured:?}"
     );
-    assert_eq!(measured.len(), 34, "the 34 write ops of the 60");
+    assert_eq!(measured.len(), 34, "the 34 write ops of the 61");
 }
 
 // ------------------------------------------------------------------ phase 4 review F1: what was refused

@@ -53,7 +53,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - **Scope**:
   - Domain entities: Upstream, Route, Plugin, ServerConfig, Endpoint
-  - All `oagw_*` database tables and migrations
+  - Opt-in upstream and route storage: ADR-0009 tables (except `oagw_plugin`) and migrations when a database is configured, in-memory repositories otherwise (ADR-0018)
   - ToolKit gear wiring (`gear.rs`, `config.rs`, `OagwConfig`)
   - SDK crate (`oagw-sdk`): `ServiceGatewayClientV1` trait, SDK models, `ServiceGatewayError`
   - GTS type provisioning (`type_provisioning.rs`): schema and instance registration
@@ -66,6 +66,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - **Requirements Covered**:
   - [ ] `p1` - `cpt-cf-oagw-nfr-multi-tenancy`
+  - [ ] `p1` - `cpt-cf-oagw-fr-config-persistence`
 
 - **Design Principles Covered**:
   - `cpt-cf-oagw-principle-tenant-scope`
@@ -235,7 +236,7 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - [ ] `p1` - **ID**: `cpt-cf-oagw-feature-proxy-engine`
 
-- **Purpose**: Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain (Auth→Guard→Transform), forward HTTP request via Pingora in-memory bridge, transform response, and return with error source distinction.
+- **Purpose**: Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain (Auth→Guard→Transform), forward HTTP request through the `toolkit-http-proxy` upstream engine, transform response, and return with error source distinction.
 
 - **Depends On**: `cpt-cf-oagw-feature-management-api`, `cpt-cf-oagw-feature-plugin-system`
 
@@ -249,7 +250,7 @@ The OAGW design is decomposed into eight features organized along functional bou
   - Guard rules: method allowlist, query allowlist, path suffix validation
   - Error source distinction: `X-OAGW-Error-Source: gateway|upstream` header
   - RFC 9457 Problem Details for all gateway errors
-  - Pingora proxy engine with connection pooling and load balancing
+  - Upstream proxy engine (`toolkit-http-proxy`) with connection pooling, ALPN and load balancing
   - Proxy endpoint: `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]`
 
 - **Out of scope**:

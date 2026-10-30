@@ -319,6 +319,46 @@ mod tests {
         assert!(instances[0].grpc_services.contains_key("test.Service"));
     }
 
+    /// A worker's presence loop and the hub register the same instance, each
+    /// with its own half, in any order and again on every self-heal or
+    /// retry: neither erases the other's gRPC services or `OpenAPI` spec.
+    #[tokio::test]
+    async fn presence_and_hub_registrations_keep_each_others_half() {
+        for hub_first in [true, false] {
+            // A fresh directory per order, so each starts from nothing.
+            let api = LocalDirectoryClient::new(Arc::new(GearManager::new()));
+            let id = Uuid::new_v4().to_string();
+            // What `OopServer`'s presence loop sends.
+            let presence = RegisterInstanceInfo::new("worker", &id)
+                .with_rest_endpoint(ServiceEndpoint::http("127.0.0.1", 8080))
+                .with_openapi_spec(r#"{"openapi":"3.1.0"}"#);
+            // What grpc-hub sends.
+            let hub = RegisterInstanceInfo::new("worker", &id)
+                .with_grpc_services(vec![(
+                    "worker.Svc".to_owned(),
+                    ServiceEndpoint::http("127.0.0.1", 50051),
+                )])
+                .with_version("1.0.0");
+            let order = if hub_first {
+                [&hub, &presence, &presence, &hub]
+            } else {
+                [&presence, &hub, &hub, &presence]
+            };
+            for info in order {
+                api.register_instance(info.clone()).await.unwrap();
+            }
+            let instances = api.list_instances("worker").await.unwrap();
+            assert_eq!(instances.len(), 1);
+            assert_eq!(instances[0].grpc_services.len(), 1, "gRPC services kept");
+            assert!(instances[0].rest_endpoint.is_some(), "REST endpoint kept");
+            assert_eq!(
+                api.get_openapi_spec("worker").await.unwrap(),
+                r#"{"openapi":"3.1.0"}"#,
+                "OpenAPI spec kept"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn register_rejects_invalid_labels_at_store_boundary() {
         // Validation is enforced at the store, not only at the gRPC front-end:

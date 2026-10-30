@@ -314,7 +314,9 @@ struct BuiltAllocation {
 #[derive(Debug)]
 pub enum ApplyOutcome {
     /// The settlement landed and the queued allocation posted — the queue row was
-    /// flipped `→APPLIED` atomically in the post txn.
+    /// flipped `→APPLIED` atomically in the post txn. When another drain claimed
+    /// the same row and applied it first, the post finds the dedup `POSTED` and
+    /// replays that entry ([`PostingRef::replayed`]): no second effect.
     Applied(PostingRef),
     /// The payment is STILL not settled: leave the row `QUEUED`, do NOT bump
     /// attempts (this is not a failure — a settle/sweep will retry once the
@@ -334,6 +336,9 @@ pub enum ApplyOutcome {
 pub struct DrainReport {
     /// Rows that posted + flipped `→APPLIED` this pass.
     pub applied: u64,
+    /// Rows another drain had already applied: the apply replayed the posted
+    /// entry and changed nothing.
+    pub replayed: u64,
     /// Rows left `QUEUED` because the payment is not yet settled (no attempt bump).
     pub not_ready: u64,
     /// Rows left `QUEUED` after an apply-time cap/precondition rejection
@@ -1127,6 +1132,8 @@ impl AllocationService {
     /// - [`ApplyOutcome::NotReady`] when the settlement is STILL absent (leave the
     ///   row `QUEUED`, no attempt bump — a settle/sweep retries),
     /// - [`ApplyOutcome::Applied`] on a successful post (row flipped `→APPLIED`),
+    ///   or on a replay when another drain applied the row first
+    ///   ([`PostingRef::replayed`], no effect),
     /// - [`ApplyOutcome::Blocked`] on an apply-time cap/precondition rejection
     ///   (`MoneyOutCapExceeded` / `NegativeBalance` / `PeriodClosed` /
     ///   `AllocationSplitInvalid`) — the caller bumps attempts + leaves `QUEUED`.
@@ -1228,6 +1235,9 @@ impl AllocationService {
     /// lock; the authoritative work-state flip (`→APPLIED`) rides each apply's post
     /// txn. (Chosen over claim+apply-in-one-txn so a long apply doesn't hold the
     /// claim lock across the whole batch, and so a per-row failure is isolated.)
+    /// The claim does not flip the status, so two concurrent drains can claim the
+    /// same row: the second apply replays the first one's posted entry and counts
+    /// as `replayed`, not `applied`.
     ///
     /// Per-row infra errors are isolated (logged, counted as neither applied nor
     /// blocked) so one bad row doesn't abort the batch — mirrors the tie-out job's
@@ -1265,6 +1275,7 @@ impl AllocationService {
         let mut report = DrainReport::default();
         for row in claimed {
             match self.apply_queued_row(ctx, scope, &row).await {
+                Ok(ApplyOutcome::Applied(posting)) if posting.replayed => report.replayed += 1,
                 Ok(ApplyOutcome::Applied(_)) => report.applied += 1,
                 Ok(ApplyOutcome::NotReady) => report.not_ready += 1,
                 Ok(ApplyOutcome::Blocked(err)) => {

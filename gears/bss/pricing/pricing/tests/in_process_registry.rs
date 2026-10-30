@@ -290,7 +290,7 @@ async fn a_revision_resolves_through_an_in_process_registry() {
     let mut approved = plan_support::entry_support::price(&stored);
     approved.state = "approved".into();
     // D-427: the recurring entry is `flat`, so its price's money is a flat amount.
-    approved.price_json = json!({"amount":"30.00"});
+    approved.price_json = json!({"amount":"30"});
     approved.min_fee = None;
     approved.effective_from = time::Date::parse(
         "2020-01-01",

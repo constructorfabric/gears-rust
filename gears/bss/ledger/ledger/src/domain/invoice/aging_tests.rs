@@ -154,7 +154,7 @@ fn empty_input_yields_no_buckets() {
     );
 }
 
-/// VHP-1853: custom tenant thresholds reshape the buckets AND their labels.
+/// Custom tenant thresholds reshape the buckets AND their labels.
 #[test]
 fn custom_thresholds_reshape_buckets_and_labels() {
     let today = naive(2026, 6, 30);

@@ -1,5 +1,5 @@
 //! `SeaORM` entity for `bss.ledger_verified_balance` — the cumulative VERIFIED
-//! tie-out baseline per grain through the last closed period (VHP-1843
+//! tie-out baseline per grain through the last closed period (the
 //! incremental tie-out). One row per `(tenant_id, grain, grain_key)`; the daily
 //! job and the `AR_DERIVED` recon check verify `baseline + fold(open periods) ==
 //! cache` instead of folding all-time. Written in the period-close txn right

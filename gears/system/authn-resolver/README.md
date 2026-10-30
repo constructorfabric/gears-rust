@@ -6,8 +6,8 @@ Authentication resolution for Gears — validates bearer tokens and produces a `
 
 The authorization design that Gears operate on is described in [DESIGN.md](../../../docs/arch/authorization/DESIGN.md).
 The decision to split authentication and authorization into separate resolvers is documented in
-[ADR-0002](../../../docs/arch/authorization/adr/0002-split-authn-and-authz-resolvers.md) and
-the minimalist interface choice in [ADR-0003](../../../docs/arch/authorization/adr/0003-authn-resolver-minimalist-interface.md).
+[ADR-0002](../../../docs/arch/authorization/ADR/0002-split-authn-authz-resolvers.md) and
+the minimalist interface choice in [ADR-0003](../../../docs/arch/authorization/ADR/0003-authn-resolver-minimalist-interface.md).
 
 The **authn_resolver** gear provides a single responsibility: convert a bearer token into a validated identity (`SecurityContext`). The resolver is a integration point — it discovers and delegates to a vendor-specific plugin via the types-registry. The actual token validation logic lives in the plugin.
 

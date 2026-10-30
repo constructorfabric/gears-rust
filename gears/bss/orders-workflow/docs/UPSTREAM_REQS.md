@@ -178,7 +178,7 @@ enum and its ETF/credit scoping are owned by Subscriptions.
 - **Value named by both Orders gears (2026-10-02)**: `CancelReason::OrderCompensation { order_id,
   order_version }`, accepted from `draft` and from `active`; void is cancel-from-draft (Subscriptions
   SUB-D-11), so this gear sends one operation with two preconditions. Lifecycle
-  `cpt-cf-bss-orders-lifecycle-upreq-compensation-cancel-reason` carries the same wording.
+  `cpt-cf-bss-orders-upreq-compensation-cancel-reason` carries the same wording.
 - **Note**: reason values ride event payloads and downstream consumers key on them, so adding a
   value after Billing consumes the contract is a **breaking** change — this is the ask materially
   cheaper now than later.
@@ -289,7 +289,7 @@ completion this gear records as `activated`; `oss_unconfirmed` is a failure this
   an idempotency key ages out, confirm outcomes by lookup rather than resubmission; this is the
   read-only discovery mechanism cancellation fencing's "reconcile in-flight intents" step depends
   on.
-- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-intent-status-read`
+- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-upreq-intent-status-read`
   asks for the same read with the same states; the settlement of a timed-out create is the separate
   ask below (D-202).
 - **Consequence if it does not land**: the sweep cannot drive aged-out intents to a terminal
@@ -317,11 +317,11 @@ delayed create from committing after the order was acknowledged failed.
   (`design/05-provisioning-intents.md` §4.1), but neither excludes a create that commits after the
   key aged out and attaches a subscription to a settled order (Lifecycle fixture F12; the Seam
   Atlas states that a status read alone is not proof).
-- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-settle-create`.
+- **Co-signed (2026-10-02)**: Lifecycle `cpt-cf-bss-orders-upreq-settle-create`.
 - **Agreement status**: **withdrawn (D-209).** Subscriptions PR #5131 provides no settlement operation;
   this gear settles a timed-out create by resubmitting it under the same key and voiding the draft
   if it is not needed (`design/05` §3.3), and asks instead for the de-duplication lifetime below.
-  Lifecycle's co-signed `cpt-cf-bss-orders-lifecycle-upreq-settle-create` is Lifecycle's to close.
+  Lifecycle's co-signed `cpt-cf-bss-orders-upreq-settle-create` is Lifecycle's to close.
 - **Source**: `DECISIONS.md` D-202. Raised against `gears/bss/subscriptions/docs/SEAMS.md`.
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-correlation-propagation`
@@ -487,7 +487,7 @@ lookup, and so a callback that echoes nothing this gear issued is rejectable as 
   `SubscriptionTransitionOutcome { transition_request_id, source { order_id, order_version,
   order_line_id }, wave, kind, wave_attempt, correlation_id, transition, outcome: applied | failed
   { reason_code } | oss_unconfirmed }`, the twin of `SubscriptionActivated`; this gear's two listen
-  arms are its outcomes. Co-signed by Lifecycle `cpt-cf-bss-orders-lifecycle-upreq-transition-outcome-echo`.
+  arms are its outcomes. Co-signed by Lifecycle `cpt-cf-bss-orders-upreq-transition-outcome-echo`.
 - **Agreement status**: answered in Subscriptions PR #5131 (`fr-intent-protocol` item 4). **Still open**:
   #5131 names no outcome event and no failure twin, so the event name of D-200 stays this gear's ask.
   Pending merge (D-209).
@@ -831,7 +831,7 @@ projection loses it nothing.
 - [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-failure-reason-coverage`
 
 Orders Lifecycle **MUST** add one value to the closed `failure_reason` enumeration of
-`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders-lifecycle/docs/features/06-workflow-seam.md#44-acknowledgement-normative),
+`acknowledge-failed` ([Lifecycle `06 §4.4`](../../orders/docs/features/06-workflow-seam.md#44-acknowledgement-normative),
 its D-136), or name the existing value this gear should send for each:
 
 | Proposed value | Raised when | This gear's reason |
@@ -860,7 +860,7 @@ its D-136), or name the existing value this gear should send for each:
 - [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-upreq-lifecycle-workflow-key-retention`
 
 Orders Lifecycle **MUST** either **retain the idempotency records of the workflow-trigger class**
-(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders-lifecycle/docs/features/01-foundation.md#41-the-transition-contract-normative)),
+(the triggers of the five seam operations, [Lifecycle `01 §4.1`](../../orders/docs/features/01-foundation.md#41-the-transition-contract-normative)),
 scoped to the Workflow service principal, for **at least 30 days** from the record's creation —
 this gear's key lifetime (`design/01-foundation.md` §3.7 *Key lifetime*, D-185), after which it
 never re-issues the same key — **or expose a read of a seam operation's stored outcome by its
@@ -869,7 +869,7 @@ record".
 
 - **Owning upstream gear**: Orders Lifecycle (`gears/bss/orders-lifecycle`).
 - **Why this gear cannot satisfy it alone**: Lifecycle owns the registry and, before its D-173, its 24-hour window
-  ([Lifecycle `01 §2.2`](../../orders-lifecycle/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
+  ([Lifecycle `01 §2.2`](../../orders/docs/features/01-foundation.md#the-idempotency-window-is-24-hours-and-is-not-a-commercial-bound)).
   This gear re-issues an unchanged Lifecycle key after a lease death or an interruption that can
   last days — a hold, a ceiling park, an `invocation-dead` task awaiting its re-drive — and the
   keys of `begin-fulfillment`, `report-spawn-signal` and `report-outcome` carry no attempt, so
@@ -895,9 +895,9 @@ record".
 
 **Received from Orders Lifecycle (D-208, 2026-10-05).** Lifecycle's design is merged on `main`
 (#4775, `b26ef8720`) with D-179…D-186; its asks toward this gear are answered here, not re-asked:
-`cpt-cf-bss-orders-lifecycle-upreq-workflow-overdue-escalation` (D-182) by PRD §6.3 *Overdue
+`cpt-cf-bss-orders-upreq-workflow-overdue-escalation` (D-182) by PRD §6.3 *Overdue
 Escalation* and §6.1 *Process Termination on Terminal Order Events*, acceptance criterion 15b,
-`design/02` §3.6 step 9 and `design/06` §4.9; `cpt-cf-bss-orders-lifecycle-upreq-event-consumer-conformance`
+`design/02` §3.6 step 9 and `design/06` §4.9; `cpt-cf-bss-orders-upreq-event-consumer-conformance`
 (D-186) by `design/02` §4.8 and acceptance criterion 15c, this gear building the `orders-events`
 corpus as the first consumer; and the D-179 occupancy tuple by the overlap-presence read of §2.1.
 Both D-182 items and the corpus are production release prerequisites on Lifecycle's side.
@@ -1059,8 +1059,8 @@ erasure request.
   D-50, D-59). The actor itself is an opaque `SecurityContext` subject UUID, never a name or an
   email (D-61), and the identity-lifecycle guarantees that reference relies on — stability,
   non-reuse, deletion across caches and backups — are the shared p2 platform follow-up Lifecycle
-  registered as `cpt-cf-bss-orders-lifecycle-upreq-audit-identity-lifecycle`
-  ([Lifecycle `UPSTREAM_REQS.md` §2.8](../../orders-lifecycle/docs/UPSTREAM_REQS.md#28-identity-platform)),
+  registered as `cpt-cf-bss-orders-upreq-audit-identity-lifecycle`
+  ([Lifecycle `UPSTREAM_REQS.md` §2.8](../../orders/docs/UPSTREAM_REQS.md#28-identity-platform)),
   which this gear cites rather than duplicates; pseudonymisation is not anonymisation, so this
   ruling is still required.
 - **Consequence if it does not land**: the gear's retention posture and its erasure posture are in
@@ -1081,20 +1081,20 @@ Orders Workflow publishes its six process events through the platform producer o
 (`event-broker-sdk::DbProducer` over `toolkit_db::outbox`, `ADR/0008`, `DECISIONS.md` D-58),
 exactly as Orders Lifecycle does. The platform prerequisites that decision depends on are already
 registered, in full, by the sibling gear in
-[`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7](../../orders-lifecycle/docs/UPSTREAM_REQS.md#27-event-broker),
+[`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.7](../../orders/docs/UPSTREAM_REQS.md#27-event-broker),
 and this gear **co-signs them by reference rather than restating them**:
 
-- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-runtime` — a production `EventBrokerApi`
+- `cpt-cf-bss-orders-upreq-event-broker-runtime` — a production `EventBrokerApi`
   runtime through `ClientHub` supporting the managed chained producer protocol, with the deployed
   topic partition count published;
-- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-cursor-retry` — SDK cursor-recovery and retry
+- `cpt-cf-bss-orders-upreq-event-broker-cursor-retry` — SDK cursor-recovery and retry
   semantics for the managed chained producer;
-- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-dead-letter-recovery` — a shared operator
+- `cpt-cf-bss-orders-upreq-event-broker-dead-letter-recovery` — a shared operator
   interface and SDK republication that preserves event ID and business payload, so no gear needs
   a REST re-drive wrapper;
-- `cpt-cf-bss-orders-lifecycle-upreq-event-broker-root-tenancy` — the authoritative
+- `cpt-cf-bss-orders-upreq-event-broker-root-tenancy` — the authoritative
   platform-root tenant UUID source and broker authorization behaviour for root-tagged events;
-- `cpt-cf-bss-orders-lifecycle-upreq-event-delivery-observability` — producer-queue depth, age,
+- `cpt-cf-bss-orders-upreq-event-delivery-observability` — producer-queue depth, age,
   lag and dead-letter measurements exposed per queue.
 
 Each of those asks **MUST** be satisfied for the `bss-orders-workflow-events` producer queue and
@@ -1149,7 +1149,7 @@ capability is needed. Nothing replaces it here; the provisioning of that grant i
 
 **Owner**: platform authorization and deployment owners — the `authz-resolver` PDP provider and
 its policy and role provisioning. Mirrors and should be provisioned together with Orders
-Lifecycle's `cpt-cf-bss-orders-lifecycle-upreq-pdp-policy-integration`
+Lifecycle's `cpt-cf-bss-orders-upreq-pdp-policy-integration`
 (`gears/bss/orders-lifecycle/docs/UPSTREAM_REQS.md` §2.9).
 
 **Ownership boundary: follow Lifecycle's integration pattern, which is Pricing's.** Workflow
@@ -1361,7 +1361,7 @@ Lifecycle's `OrderSubmitted` carries the tenant axes, per-line references and pi
 total's per-line net components; `OrderApproved` and `OrderRejected` the deciding authority;
 `OrderHeld` the hold reason; `OrderCancelled` the cancelling actor and the cancel reason;
 `OrderCompleted` the line-to-subscription mapping
-([Lifecycle `01 §4.4`](../../orders-lifecycle/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
+([Lifecycle `01 §4.4`](../../orders/docs/features/01-foundation.md#44-events-audit-and-the-outbox-normative),
 lines 2396–2406); the Subscriptions outcome event carries a `subscriptionId`; the approval policy adapter
 decision event has no specification (§2.3, Q-05). The platform has no data-classification model
 for execution history ([NEXT_ADR_SCOPE.md](../../../serverless-runtime/docs/NEXT_ADR_SCOPE.md)

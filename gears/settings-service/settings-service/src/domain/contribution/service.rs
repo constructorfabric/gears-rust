@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconcile itself, one declaration at a time.
 
 use std::sync::Arc;
@@ -15,11 +14,11 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{SettingTypeRegistrar, reason};
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
-use crate::domain::declaration::admin::is_empty_placeholder;
+use crate::domain::declaration::admin::{is_empty_placeholder, normalise_display_name};
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository, DeclarationStatus,
 };
 use crate::domain::error::DomainError;
 use crate::domain::validation::TypeValidator;
@@ -110,6 +109,7 @@ impl Derived {
     fn metadata(&self, contributed: &ContributedDeclaration) -> DeclarationMetadata {
         DeclarationMetadata {
             mode: self.mode.to_owned(),
+            display_name: trimmed_display_name(contributed),
             description: contributed.description.clone(),
             domain_affinity: contributed.domain_affinity.clone(),
             licence_feature: contributed.licence_feature.clone(),
@@ -117,6 +117,36 @@ impl Derived {
             requires_step_up: self.requires_step_up,
             anonymous_exposable: self.anonymous_exposable,
         }
+    }
+}
+
+/// The contributed display name as it is stored: trimmed. Already refused when
+/// empty, over-long or carrying a control character by [`check_display_name`],
+/// which runs first.
+fn trimmed_display_name(contributed: &ContributedDeclaration) -> Option<String> {
+    contributed
+        .display_name
+        .as_deref()
+        .map(|raw| raw.trim().to_owned())
+}
+
+/// Refuse a supplied display name that is empty, over-long or carries a
+/// control character after trimming, with the field named so the module sees
+/// which item and why; the other items of the batch continue.
+fn check_display_name(contributed: &ContributedDeclaration) -> Result<(), ItemError> {
+    match contributed
+        .display_name
+        .as_deref()
+        .map(normalise_display_name)
+    {
+        None | Some(Ok(_)) => Ok(()),
+        Some(Err(DomainError::Validation { message, .. })) => {
+            Err(refused(reason::DISPLAY_NAME_INVALID, message))
+        }
+        // Whatever else the normalisation may one day refuse, it refuses the
+        // supplied value: the item is turned away, never failed as a batch and
+        // never let through.
+        Some(Err(other)) => Err(refused(reason::DISPLAY_NAME_INVALID, other.wire_message())),
     }
 }
 
@@ -135,6 +165,7 @@ fn major_of(declaration: &Declaration) -> Option<u32> {
 fn metadata_differs(existing: &Declaration, metadata: &DeclarationMetadata) -> bool {
     existing.mode != metadata.mode
         || existing.description != metadata.description
+        || existing.display_name != metadata.display_name
         || existing.domain_affinity != metadata.domain_affinity
         || existing.licence_feature != metadata.licence_feature
         || existing.data_classification != metadata.data_classification
@@ -149,8 +180,9 @@ fn snapshot(declaration: &Declaration) -> Value {
         "default_value": declaration.default_value,
         "scope_class": declaration.scope_class,
         "mode": declaration.mode,
-        "status": declaration.status,
+        "status": declaration.status.as_str(),
         "description": declaration.description,
+        "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
         "licence_feature": declaration.licence_feature,
         "data_classification": declaration.data_classification,
@@ -240,6 +272,7 @@ where
         let derived = self.derive(contributed).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-1
         // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
+        check_display_name(contributed)?;
         self.check_default(contributed).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-2
 
@@ -299,7 +332,7 @@ where
             (None, Some(highest)) => {
                 let predecessor = on_path
                     .iter()
-                    .find(|d| major_of(d) == Some(highest) && d.status == "active")
+                    .find(|d| major_of(d) == Some(highest) && d.status.is_active())
                     .cloned();
                 match predecessor {
                     Some(predecessor) => {
@@ -379,7 +412,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-2
         // @cpt-begin:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-3
-        if existing.status == "retired" {
+        if existing.status.is_retired() {
             return Ok(false);
         }
         // @cpt-end:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-3
@@ -388,7 +421,7 @@ where
         // resolution, and the type stays registered so a re-registration is a
         // lookup rather than a re-mint.
         self.declarations
-            .set_status(conn, &scope, existing.id, "retired", None)
+            .set_status(conn, &scope, existing.id, DeclarationStatus::Retired, None)
             .await?;
         let retired = self.reload(conn, &scope, key).await?;
         self.record(
@@ -542,6 +575,7 @@ where
             source: "module_contributed".to_owned(),
             owner_module: Some(owner_module.to_owned()),
             licence_feature: contributed.licence_feature.clone(),
+            display_name: trimmed_display_name(contributed),
             description: contributed.description.clone(),
             created_by: owner_module.to_owned(),
         };
@@ -608,7 +642,7 @@ where
         let changed = metadata_differs(&existing, &metadata);
         let classification_changed = existing.data_classification != metadata.data_classification;
 
-        if existing.status == "retired" {
+        if existing.status.is_retired() {
             // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-6
             // Revive in place: the row keeps its id and its values stay where
             // they are.
@@ -617,7 +651,7 @@ where
                 .update_metadata(conn, scope, existing.id, metadata, None, redefines)
                 .await?;
             self.declarations
-                .set_status(conn, scope, existing.id, "active", None)
+                .set_status(conn, scope, existing.id, DeclarationStatus::Active, None)
                 .await?;
             if classification_changed {
                 self.values
@@ -713,7 +747,13 @@ where
             })
         })?;
         self.declarations
-            .set_status(conn, scope, predecessor.id, "retired", None)
+            .set_status(
+                conn,
+                scope,
+                predecessor.id,
+                DeclarationStatus::Retired,
+                None,
+            )
             .await?;
         let retired = self.reload(conn, scope, &predecessor_key).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-upgrade:p1:inst-mc-up-1
@@ -765,6 +805,7 @@ where
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -896,8 +937,18 @@ where
         pre: Option<Value>,
         post: Option<Value>,
     ) -> Result<(), DomainError> {
-        let mut rec =
-            AuditRecord::new(key.as_str(), None, owner_module, operation, request_id).by_module();
+        // A machine act has no security context to take a tenant from: the
+        // record names no actor tenant, so no tenant reader is shown its actor
+        // and a platform administrator is.
+        let mut rec = AuditRecord::new(
+            key.as_str(),
+            None,
+            owner_module,
+            ActorTenant::machine(),
+            operation,
+            request_id,
+        )
+        .by_module();
         if let Some(pre) = pre {
             rec = rec.with_pre_image(AuditValue::definition(pre));
         }

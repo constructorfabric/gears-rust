@@ -1,5 +1,5 @@
-//! D-445: an approval unit carries its submitter's note. A FORWARD migration (D-427 closed D-412:
-//! the chain is deployed and no shipped migration is edited again).
+//! D-445: an approval unit carries its submitter's note. A FORWARD migration (D-427). A shipped
+//! migration is edited in place only under D-534.
 //!
 //! The approval library's `ddl::up()` is the body of `m20260926_000002` and stays as it shipped;
 //! this migration runs the library's separate step, `bss_approval::ddl::apply_add_submit_note`:

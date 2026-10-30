@@ -65,7 +65,54 @@ pub struct OagwConfig {
     /// Metrics naming configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
+    /// The registry reconcile on a database backend (ADR-0018 *Startup
+    /// Provisioning*).
+    #[serde(default)]
+    pub registry_provisioning: RegistryProvisioningConfig,
 }
+
+/// The registry reconcile on a database backend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryProvisioningConfig {
+    /// The deployment's generation, monotonic across releases and rollbacks
+    /// (Helm: `.Release.Revision`). A pod whose generation is older than the
+    /// one stored by another pod does not reconcile. Unset: the guard is off
+    /// (a startup warning says so), and an older pod can revert newer
+    /// registry content. Ignored on the in-memory backend. At most
+    /// `i64::MAX` (stored as BIGINT).
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// How often every pod re-checks the registry state after a run, whatever
+    /// its outcome (an unchanged state costs one query), with ±20% jitter.
+    /// Humantime (`5m`). From 1 second to 24 hours. Default: 5 minutes.
+    /// Ignored on the in-memory backend, which reconciles once at startup.
+    #[serde(
+        default = "default_recheck_interval",
+        with = "toolkit_utils::humantime_serde"
+    )]
+    pub recheck_interval: Duration,
+}
+
+impl Default for RegistryProvisioningConfig {
+    fn default() -> Self {
+        Self {
+            generation: None,
+            recheck_interval: default_recheck_interval(),
+        }
+    }
+}
+
+fn default_recheck_interval() -> Duration {
+    Duration::from_mins(5)
+}
+
+/// Bounds of `registry_provisioning.recheck_interval`: below a second every
+/// pod hammers the registry-state row; above a day a reverted or failed
+/// state waits too long (and the jitter's arithmetic stays far from
+/// `Duration`'s range).
+const RECHECK_INTERVAL_MIN: Duration = Duration::from_secs(1);
+const RECHECK_INTERVAL_MAX: Duration = Duration::from_hours(24);
 
 /// Metrics configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -106,6 +153,7 @@ impl Default for OagwConfig {
             management_api_enabled: true,
             ssrf_policy: SsrfPolicy::default(),
             metrics: MetricsConfig::default(),
+            registry_provisioning: RegistryProvisioningConfig::default(),
         }
     }
 }
@@ -158,6 +206,20 @@ impl OagwConfig {
         }
         if self.streaming_idle_timeout_secs == 0 {
             return Err("streaming_idle_timeout_secs must be > 0".to_owned());
+        }
+        let recheck = self.registry_provisioning.recheck_interval;
+        if !(RECHECK_INTERVAL_MIN..=RECHECK_INTERVAL_MAX).contains(&recheck) {
+            return Err(format!(
+                "registry_provisioning.recheck_interval must be between 1s and 24h, got {recheck:?}"
+            ));
+        }
+        if let Some(generation) = self.registry_provisioning.generation
+            && i64::try_from(generation).is_err()
+        {
+            return Err(format!(
+                "registry_provisioning.generation must be at most {} (stored as BIGINT), got {generation}",
+                i64::MAX
+            ));
         }
         #[cfg(feature = "fips")]
         if self.allow_http_upstream {
@@ -243,6 +305,7 @@ impl fmt::Debug for OagwConfig {
             .field("protocol_cache_ttl_secs", &self.protocol_cache_ttl_secs)
             .field("management_api_enabled", &self.management_api_enabled)
             .field("ssrf_policy", &self.ssrf_policy)
+            .field("registry_provisioning", &self.registry_provisioning)
             .finish()
     }
 }
@@ -323,6 +386,74 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn registry_provisioning_defaults_to_no_generation_and_five_minutes() {
+        let config = OagwConfig::default();
+        assert_eq!(config.registry_provisioning.generation, None);
+        assert_eq!(
+            config.registry_provisioning.recheck_interval,
+            Duration::from_mins(5)
+        );
+    }
+
+    #[test]
+    fn registry_provisioning_reads_generation_and_humantime_interval() {
+        let config: OagwConfig = serde_json::from_value(serde_json::json!({
+            "registry_provisioning": { "generation": 42, "recheck_interval": "30s" }
+        }))
+        .unwrap();
+        assert_eq!(config.registry_provisioning.generation, Some(42));
+        assert_eq!(
+            config.registry_provisioning.recheck_interval,
+            Duration::from_secs(30)
+        );
+        let unknown = serde_json::from_value::<OagwConfig>(serde_json::json!({
+            "registry_provisioning": { "generations": 1 }
+        }));
+        assert!(unknown.is_err(), "unknown keys are rejected");
+    }
+
+    /// ADR-0018: PERS-LOOP-010.
+    #[test]
+    fn validate_bounds_the_recheck_interval_from_one_second_to_a_day() {
+        let with = |interval| {
+            let mut config = OagwConfig::default();
+            config.registry_provisioning.recheck_interval = interval;
+            config.validate()
+        };
+        for rejected in [
+            Duration::ZERO,
+            Duration::from_millis(999),
+            Duration::from_hours(24) + Duration::from_secs(1),
+            Duration::MAX,
+        ] {
+            let err = with(rejected).expect_err("out of range");
+            assert!(
+                err.contains("registry_provisioning.recheck_interval"),
+                "{err}"
+            );
+        }
+        for accepted in [
+            Duration::from_secs(1),
+            Duration::from_mins(5),
+            Duration::from_hours(24),
+        ] {
+            assert_eq!(with(accepted), Ok(()));
+        }
+    }
+
+    #[test]
+    fn validate_rejects_a_generation_beyond_bigint() {
+        let with = |generation| {
+            let mut config = OagwConfig::default();
+            config.registry_provisioning.generation = Some(generation);
+            config.validate()
+        };
+        assert_eq!(with(i64::MAX as u64), Ok(()));
+        let err = with(i64::MAX as u64 + 1).expect_err("beyond BIGINT");
+        assert!(err.contains("registry_provisioning.generation"), "{err}");
     }
 
     #[cfg(feature = "fips")]

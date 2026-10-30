@@ -28,7 +28,7 @@ configurations that are hard to test, document, and support. How should the plat
 ## Considered Options
 
 * **Option A**: Arbitrary composition — operators choose per-gear placement with no predefined profiles.
-* **Option B**: Three named profiles — Embedded (1), Host+Workers (2), K8s Native (3).
+* **Option B**: Three named profiles — Embedded (1), Self-Hosted (2), K8s Native (3).
 * **Option C**: Two profiles only — Embedded and K8s Native (skip the on-premise multi-process case).
 
 ## Decision Outcome
@@ -42,7 +42,7 @@ on-premise customers who cannot run Kubernetes.
 All gears run in a single process managed by `HostRuntime`. This is the current default — no changes needed. Inter-gear
 calls are in-process via ClientHub.
 
-### Profile 2: Host + Workers
+### Profile 2: Self-Hosted (formerly Host + Workers)
 
 Flight Control spawns OoP Worker processes on the same host (or across hosts for the multi-node P2 variant). Workers
 communicate with it via UDS (single-node) or TCP+mTLS (multi-node). Flight Control runs the DirectoryService
@@ -95,3 +95,50 @@ This decision directly addresses the following requirements or design elements:
 * `cpt-cf-fr-k8s-native` — Profile 3 is dedicated to K8s
 * `cpt-cf-principle-deploy-transparency` — The deployment transparency principle is grounded in this decision
 * `cpt-cf-constraint-backward-compat` — Profile 1 preserves the existing embedded behavior
+
+## Amendment 2026-09-09: Profile 2 is named Self-Hosted
+
+**The name changes; the topology does not.** Profile 2 is still Flight Control
+spawning OoP Workers, still the on-premise answer for operators who cannot run
+Kubernetes, and still the same test matrix entry. Nothing in the decision above
+is withdrawn.
+
+What changes is the label, for two reasons.
+
+**"Host + Workers" names internal roles rather than the operator's choice.** An
+operator picks *where the product runs* — in one process, on their own machines,
+or in a cluster. "Host + Workers" answers a different question: how the processes
+inside that choice relate to each other. That is a real fact, and it belongs in
+the body of this ADR, but it is not the name of the option on the menu that
+Decision Drivers calls "a clear menu, not an unbounded configuration space".
+
+**It also reads as a shape a deployment need not have.** The phrase suggests a
+host beside a fleet of workers. Measured on Gearbox's demo product in this
+profile: the host process holds nine gears and spawns exactly one worker. That
+host is not the platform's Flight Control image -- Gearbox generates the host
+application, linking Flight Control's control-plane gears and, beside them,
+whichever product gears the product keeps in-process. So the ratio depends on the
+product, and a name that promises a fleet starts a reader from the wrong mental
+model.
+
+The documents here had already noticed, and were compensating in prose. Before
+this amendment `DESIGN.md` headed the section "Profile 2: Host + Workers
+**(On-Premise)**" and `PRD.md` glossed it "single-node on-premise" — the
+parenthesis was doing the work the name should do. `Self-Hosted` promotes that
+gloss to the name, and those two places now carry the name alone.
+
+**What is unchanged and must stay unchanged.** The `host` and `worker` roles are
+load-bearing and keep their names. The host is Flight Control
+(`apps/cf-gears-flight-control`): the control plane -- service-discovery
+(DirectoryService), grpc-hub, api-gateway, types-registry and authn-resolver --
+and it spawns the workers; workers run the AuthZ plane and application gears.
+This amendment renames the *profile*, not the roles inside it.
+
+**Downstream.** Gearbox implements only the single-node half of this profile —
+its resolver reports `GBX0604` to say the one spawn backend is local, and directs
+multi-machine topologies to Profile 3 — so `self_hosted` is also the name it uses
+for the corresponding deployment target. Recorded in
+`gearbox/docs/ADR/0014-cpt-gearbox-adr-deployment-target.md`. The
+multi-node P2 variant described above remains in scope for this ADR, and
+`Self-Hosted` covers it: deploying across your own machines is still
+self-hosting, so adopting the multi-node variant will not require renaming again.

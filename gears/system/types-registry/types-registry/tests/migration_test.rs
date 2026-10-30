@@ -12,7 +12,7 @@
 //! `ascii_bin` collation, FK `RESTRICT`) is not reachable from `SQLite`. The
 //! per-backend statement lists are pinned by the in-source tests beside the
 //! migration; real up/down on the other two backends is covered by
-//! `make test-pg` / `make test-mysql` once Docker is available.
+//! `make test-integration LANE=toolkit-db-pg` / `make test-integration LANE=toolkit-db-mysql` once Docker is available.
 
 #![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
 

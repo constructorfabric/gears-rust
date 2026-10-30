@@ -1,11 +1,43 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
-//! Query options this gear declines across every listing, and the fields a
-//! listing orders by.
+//! Query options this gear declines across every listing, the fields a
+//! listing orders by, and the shape every listing answers with.
 
 use toolkit_macros::domain_model;
+use toolkit_odata::PageInfo;
 use toolkit_odata::filter::{FieldKind, FilterField};
 
 use crate::domain::error::DomainError;
+
+/// One page of a listing, with the size of the set it was cut from.
+///
+/// `total_count` is what a client needs that a cursor cannot give it: how
+/// many rows the walk would return in all, for a count beside a heading and
+/// for a scrollbar that is the right length. It is counted under the same
+/// predicate as the page — the caller's scope, the administrative-domain
+/// visibility, the `hidden` exclusion and the `$filter` — and never under the
+/// cursor, so every page of one walk reports the same total; a row the caller
+/// may not see is absent from it as it is absent from the page.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct Listing<T> {
+    /// The page.
+    pub items: Vec<T>,
+    /// Its cursors and the page size applied.
+    pub page_info: PageInfo,
+    /// How many rows the whole walk holds, at the time of this read.
+    pub total_count: u64,
+}
+
+impl<T> Listing<T> {
+    /// The same listing with each item mapped — a domain row to its wire
+    /// shape, the cursors and the total untouched.
+    pub fn map_items<U>(self, f: impl FnMut(T) -> U) -> Listing<U> {
+        Listing {
+            items: self.items.into_iter().map(f).collect(),
+            page_info: self.page_info,
+            total_count: self.total_count,
+        }
+    }
+}
 
 /// Refuse the `OData` options no listing here implements.
 ///
@@ -74,27 +106,33 @@ impl FilterField for DeclarationOrderField {
     }
 }
 
-/// The fields `GET /categories` orders by: its filter fields less the optional
-/// `domain_affinity`, for the reason [`DeclarationOrderField`] gives.
+/// The fields `GET /categories` orders by: its filter fields (`key`, `name`,
+/// `sort_order`) less the optional `domain_affinity`, for the reason
+/// [`DeclarationOrderField`] gives.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CategoryOrderField {
     Key,
     Name,
+    SortOrder,
 }
 
 impl FilterField for CategoryOrderField {
-    const FIELDS: &'static [Self] = &[Self::Key, Self::Name];
+    const FIELDS: &'static [Self] = &[Self::Key, Self::Name, Self::SortOrder];
 
     fn name(&self) -> &'static str {
         match self {
             Self::Key => "key",
             Self::Name => "name",
+            Self::SortOrder => "sort_order",
         }
     }
 
     fn kind(&self) -> FieldKind {
-        FieldKind::String
+        match self {
+            Self::Key | Self::Name => FieldKind::String,
+            Self::SortOrder => FieldKind::I64,
+        }
     }
 }
 
@@ -125,6 +163,33 @@ impl FilterField for SettingOrderField {
             Self::Key => FieldKind::String,
             Self::CategoryId => FieldKind::Uuid,
         }
+    }
+}
+
+/// The fields the review listing is keyset-paged by: the order is fixed —
+/// declaration, then tenant, which `uq_value_scope` makes unique for
+/// subject-less rows — and these are not a surface a caller can order by
+/// (`$orderby` is refused), only what the cursor carries. Both are non-null
+/// identifiers and compare as UUIDs.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ReviewOrderField {
+    DeclarationId,
+    TenantId,
+}
+
+impl FilterField for ReviewOrderField {
+    const FIELDS: &'static [Self] = &[Self::DeclarationId, Self::TenantId];
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::DeclarationId => "declaration_id",
+            Self::TenantId => "tenant_id",
+        }
+    }
+
+    fn kind(&self) -> FieldKind {
+        FieldKind::Uuid
     }
 }
 

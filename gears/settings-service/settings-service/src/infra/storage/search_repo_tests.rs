@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The corpus, matched on a real database: what a needle may reach and what it
 //! may never reach, on the `SQLite` dialect the tests run on.
 
@@ -68,6 +67,7 @@ async fn declare_described(
                 source: "module_contributed".to_owned(),
                 owner_module: Some("test".to_owned()),
                 licence_feature: None,
+                display_name: None,
                 description: description.map(str::to_owned),
                 created_by: "test".to_owned(),
             },
@@ -100,6 +100,7 @@ async fn set_classified(
                 needs_review: false,
                 needs_review_detail: None,
                 set_by: "test".to_owned(),
+                set_by_tenant: None,
             },
         )
         .await
@@ -112,7 +113,7 @@ async fn page_of(
     corpus: Corpus,
     tenants: &[Uuid],
     query: &ODataQuery,
-) -> Result<toolkit_odata::Page<crate::domain::declaration::Declaration>, DomainError> {
+) -> Result<crate::domain::odata::Listing<crate::domain::declaration::Declaration>, DomainError> {
     let conn = h.db.conn().expect("connection");
     let n = needle(raw);
     let mut q = query.clone();
@@ -127,6 +128,7 @@ async fn page_of(
                 visibility: &DomainVisibility::Unrestricted,
                 needle: &n,
                 corpus,
+                target: h.tree.root,
                 tenant_ids: tenants,
                 hidden_for: &[],
                 override_limit: 1_000,
@@ -135,6 +137,55 @@ async fn page_of(
             },
         )
         .await
+}
+
+/// The same as [`page_of`], narrowed to the settings flagged at `target`.
+async fn flagged_keys(
+    h: &ResolutionHarness,
+    raw: &str,
+    target: Uuid,
+    tenants: &[Uuid],
+) -> Vec<String> {
+    let conn = h.db.conn().expect("connection");
+    let n = needle(raw);
+    let mut q = query(50);
+    q.filter_hash = Some(cursor_binding(&n, target, Corpus::Public, None));
+    let page = repo()
+        .declarations(
+            &conn,
+            &SearchRequest {
+                scope: &AccessScope::allow_all(),
+                visibility: &DomainVisibility::Unrestricted,
+                needle: &n,
+                corpus: Corpus::Public,
+                target,
+                tenant_ids: tenants,
+                hidden_for: &[],
+                override_limit: 1_000,
+                flagged_only: true,
+                query: &q,
+            },
+        )
+        .await
+        .expect("search runs");
+    page.items.into_iter().map(|d| d.key).collect()
+}
+
+#[tokio::test]
+async fn the_flagged_narrowing_follows_the_target_whatever_the_order_of_the_tenants() {
+    let h = ResolutionHarness::new().await;
+    let at_root = h.declare("flag_root", "cascading", json!(true)).await;
+    let below = h.declare("flag_below", "cascading", json!(true)).await;
+    h.set_flagged(at_root, h.tree.root, json!(false)).await;
+    h.set_flagged(below, h.tree.a, json!(false)).await;
+
+    // The target is named, not inferred from where it sits in the list: either
+    // order narrows to the setting flagged at the target.
+    for tenants in [[h.tree.root, h.tree.a], [h.tree.a, h.tree.root]] {
+        let keys = flagged_keys(&h, "flag_", h.tree.root, &tenants).await;
+        assert_eq!(keys.len(), 1, "{tenants:?}: {keys:?}");
+        assert!(keys[0].contains("flag_root"), "{keys:?}");
+    }
 }
 
 async fn declaration_keys(
@@ -547,16 +598,6 @@ fn the_predicates_render_for_each_dialect_with_the_pattern_bound_in_place() {
     assert_eq!(
         values.0.last(),
         Some(&sea_orm::Value::from("%nee\\_dle%".to_owned()))
-    );
-
-    // The JSON-null guard on the Schema Default, per dialect.
-    assert_eq!(
-        super::Dialect::Postgres.not_json_null("setting_declarations.default_value"),
-        "jsonb_typeof(setting_declarations.default_value) <> 'null'"
-    );
-    assert_eq!(
-        super::Dialect::Sqlite.not_json_null("setting_declarations.default_value"),
-        "json_type(setting_declarations.default_value) <> 'null'"
     );
 }
 

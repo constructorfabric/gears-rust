@@ -25,8 +25,8 @@ permissions:
   issues: write
 
 concurrency:
-  group: e2e-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -128,7 +128,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -171,7 +171,7 @@ jobs:
 
       - name: Upload E2E test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-tests-docker
           path: test-results/e2e/*.xml
@@ -186,6 +186,11 @@ jobs:
 
   e2e:
     runs-on: ubuntu-latest
+    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
+    # No environment until the S3_BUCKET variable is set, so the job runs without one.
+    environment:
+      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
+      deployment: false
     timeout-minutes: 45
 
     steps:
@@ -200,7 +205,7 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.11"
 
@@ -216,26 +221,21 @@ jobs:
       # ci.yml — same actions, same pinned SHAs, same cache-targets: false
       # (rust-cache holds the registry; sccache holds the compiled objects).
       - name: Cache Cargo/target
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-bin: false
           cache-targets: false
           shared-key: pr-${{ runner.os }}-e2e-${{ hashFiles('rust-toolchain.toml') }}
 
-      # Install sccache (cross-platform)
-      - name: Install sccache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-
-      # Probe sccache; if startup fails, fall back to plain rustc (no hard CI failure).
-      - name: Probe sccache & set RUSTC_WRAPPER
-        shell: bash
-        run: |
-          if sccache --start-server >/dev/null 2>&1; then
-            echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
-            echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
-          else
-            echo "sccache failed, falling back to plain rustc"
-          fi
+      # Only main writes to the cache. See .github/actions/sccache.
+      - name: Set up sccache
+        uses: ./.github/actions/sccache
+        with:
+          s3-endpoint: ${{ vars.S3_ENDPOINT }}
+          s3-region: ${{ vars.S3_REGION }}
+          s3-bucket: ${{ vars.S3_BUCKET }}
+          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
 
       - name: Install Python dependencies
         id: setup
@@ -244,11 +244,11 @@ jobs:
       # `make e2e-local` (no SUITE) runs only the shared-server suites
       # (launcher: e2e-launcher) against a single server. Self-managed suites
       # (launcher: pytest — mini-chat, usage-collector) and profile lanes
-      # (tr-authz) are NOT covered by it, so they run as their own steps below.
-      # Each test step writes its own JUnit file via PYTEST_ADDOPTS (both
-      # run_e2e.py and ci.py hand their env to pytest), and runs even when an
-      # earlier one failed (`!cancelled()`) so one broken suite no longer hides
-      # the others; the job still fails if any did. Gated on `setup` so a
+      # (tr-authz, oagw-sqlite) are NOT covered by it, so they run as their own
+      # steps below. Each test step writes its own JUnit file via PYTEST_ADDOPTS
+      # (both run_e2e.py and ci.py hand their env to pytest), and runs even when
+      # an earlier one failed (`!cancelled()`) so one broken suite no longer
+      # hides the others; the job still fails if any did. Gated on `setup` so a
       # broken environment does not cascade.
       - name: Run E2E tests
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
@@ -269,7 +269,7 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/mini-chat.xml -o junit_suite_name=e2e-mini-chat"
-        run: tools/scripts/with_rust_annotations.sh make e2e-mini-chat
+        run: tools/scripts/with_rust_annotations.sh make e2e-local SUITE=mini-chat
 
       # tr-authz is a PROFILE of the resource-group suite (not a standalone
       # suite), so `make e2e-local` does not run it — keep it as its own step.
@@ -279,6 +279,15 @@ jobs:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/tr-authz.xml -o junit_suite_name=e2e-tr-authz"
         run: tools/scripts/with_rust_annotations.sh make e2e-tr-authz
 
+      # sqlite is a PROFILE of the oagw suite: OAGW on SQLite, with an upstream
+      # and a route provisioned from types-registry `entities`. The default
+      # oagw run keeps OAGW in memory.
+      - name: Run OAGW E2E tests (SQLite storage, types-registry provisioning)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oagw-sqlite.xml -o junit_suite_name=e2e-oagw-sqlite"
+        run: tools/scripts/with_rust_annotations.sh make e2e-oagw-sqlite
+
       # Self-managed suite (launcher: pytest): starts its own server plus a
       # TimescaleDB or ClickHouse container, so it needs a reachable Docker daemon.
       # Two steps, in the order `make e2e-usage-collector` runs them, because
@@ -287,13 +296,13 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-timescaledb.xml -o junit_suite_name=e2e-usage-collector-timescaledb"
-        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-timescaledb
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector BACKEND=timescaledb
 
       - name: Run usage-collector E2E tests (ClickHouse container)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/usage-collector-clickhouse.xml -o junit_suite_name=e2e-usage-collector-clickhouse"
-        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector-clickhouse
+        run: tools/scripts/with_rust_annotations.sh make e2e-usage-collector BACKEND=clickhouse
 
       # Self-managed OoP (loopback, no k8s) suite: builds flight-control + three
       # oop_module gear binaries and orchestrates them as processes itself, so it
@@ -303,6 +312,22 @@ jobs:
         env:
           PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/oop.xml -o junit_suite_name=e2e-oop"
         run: tools/scripts/with_rust_annotations.sh make e2e-oop
+
+      # Self-managed suite (launcher: pytest): its own server binary. The whole
+      # suite runs on the in-process memory backend; the `backend_sensitive`
+      # tests run again on PostgreSQL (a container, so the second step needs a
+      # reachable Docker daemon).
+      - name: Run event-broker E2E tests (memory backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker.xml -o junit_suite_name=e2e-event-broker"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker
+
+      - name: Run event-broker E2E tests (PostgreSQL backend)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        env:
+          PYTEST_ADDOPTS: "--junitxml=${{ github.workspace }}/test-results/e2e/event-broker-pg.xml -o junit_suite_name=e2e-event-broker-pg"
+        run: tools/scripts/with_rust_annotations.sh make e2e-event-broker-pg
 
       # pytest records the assertion but not where it failed; take that from
       # the traceback so the report can annotate the test's source line.
@@ -321,7 +346,7 @@ jobs:
 
       - name: Upload E2E test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-tests-local
           path: test-results/e2e/*.xml
@@ -330,7 +355,7 @@ jobs:
 
       - name: Upload E2E logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-logs-${{ github.run_id }}
           if-no-files-found: ignore

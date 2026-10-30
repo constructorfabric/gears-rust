@@ -1,4 +1,4 @@
-//! Cache infrastructure for [`TypesRegistryLocalClient`](crate::domain::local_client::TypesRegistryLocalClient).
+//! Cache infrastructure for [`TypesRegistryLocalClient`](crate::domain::legacy_local_client::TypesRegistryLocalClient).
 //!
 //! Provides bounded LRU caches for resolved [`GtsTypeSchema`] and [`GtsInstance`]
 //! values, keyed by GTS id. Both kinds share a generic [`Cache<V>`] backbone.
@@ -134,7 +134,7 @@ struct Entry<V> {
     inserted: Instant,
 }
 
-/// Abstract cache contract used by [`TypesRegistryLocalClient`](crate::domain::local_client::TypesRegistryLocalClient).
+/// Abstract cache contract used by [`TypesRegistryLocalClient`](crate::domain::legacy_local_client::TypesRegistryLocalClient).
 ///
 /// Designed for swappable implementations: today the registry runs entirely
 /// in-process with [`InMemoryCache`], tomorrow we may add a Redis-backed

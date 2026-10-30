@@ -453,13 +453,18 @@ pub fn holding(f: &Fixture, grant: &str) -> SecurityContext {
 pub fn stranger() -> SecurityContext {
     entry_support::user_of(Uuid::new_v4())
 }
-/// A book of the fixture tenant, through its door.
+/// A `EUR` book of the fixture tenant, through its door.
 pub async fn book(f: &Fixture, code: &str) -> Uuid {
+    book_in(f, code, "EUR").await
+}
+/// A book of the fixture tenant in `currency`, through its door: the fixture's currency table
+/// must know the currency.
+pub async fn book_in(f: &Fixture, code: &str, currency: &str) -> Uuid {
     let (s, b, _) = f
         .call(
             "POST",
             "/price-books",
-            json!({"code":code,"name":code,"currency":"EUR"}),
+            json!({"code":code,"name":code,"currency":currency}),
             None,
             Some(&format!("book-{code}")),
         )

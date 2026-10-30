@@ -1,4 +1,4 @@
-//! Axum handlers + router for the dual-control approval queue (VHP-1852, Group G).
+//! Axum handlers + router for the dual-control approval queue.
 //! All operations live under `/bss-ledger/v1/approvals`, tenant-scoped to the
 //! caller's own tenant (no tenant in the path/body). The decision routes
 //! (approve / reject / request-changes / get / list) gate on the `(entry, approve)`

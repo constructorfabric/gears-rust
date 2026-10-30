@@ -1,0 +1,138 @@
+[
+  {
+    "name": "a-publication-candidate-is-added",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "publication",
+        "value": "Elena Marsh co-authored 'Sparse Coding in the Visual Cortex' (2019).",
+        "confidence": 0.8,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/papers/sparse-coding"
+      }
+    },
+    "expect": { "publications": "add" }
+  },
+  {
+    "name": "an-award-candidate-is-added",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "award",
+        "value": "Elena Marsh received the Wolfson Research Fellowship in 2021.",
+        "confidence": 0.75,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/news/fellowships-2021"
+      }
+    },
+    "expect": { "awards": "add" }
+  },
+  {
+    "name": "a-board-candidate-is-added",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "board",
+        "value": "Elena Marsh serves on the board of the Northern Neuroscience Society.",
+        "confidence": 0.7,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/society/board"
+      }
+    },
+    "expect": { "board_memberships": "add" }
+  },
+  {
+    "name": "a-mention-candidate-is-a-public-mention",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "mention",
+        "value": "Elena Marsh was quoted in a national newspaper on brain imaging.",
+        "confidence": 0.6,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/press/brain-imaging"
+      }
+    },
+    "expect": { "public_mentions": "add" }
+  },
+  {
+    "name": "an-orcid-candidate-is-added",
+    "profile": [],
+    "record": {
+      "fact_candidate": {
+        "field": "profile",
+        "value": "Elena Marsh's ORCID iD is 0000-0000-0000-0044.",
+        "confidence": 0.9,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/people/elena-marsh"
+      }
+    },
+    "expect": { "orcid_id": "add" }
+  },
+  {
+    "name": "a-role-candidate-never-replaces-the-role",
+    "profile": [
+      { "property": "role", "value": "postdoctoral researcher" },
+      { "property": "current_affiliation", "value": "University of York" }
+    ],
+    "record": {
+      "fact_candidate": {
+        "field": "role",
+        "value": "Elena Marsh is an associate professor at the University of Leeds.",
+        "confidence": 0.8,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/staff/marsh"
+      }
+    }
+  },
+  {
+    "name": "a-publication-held-is-not-added-again",
+    "profile": [
+      { "property": "publications", "value": { "title": "Sparse Coding in the Visual Cortex", "year": 2019 } }
+    ],
+    "record": {
+      "fact_candidate": {
+        "field": "publication",
+        "value": "Elena Marsh co-authored 'Sparse Coding in the Visual Cortex' (2019).",
+        "confidence": 0.8,
+        "trust_tier": "found",
+        "identity_confidence": 0.9,
+        "source_url": "https://example.org/papers/sparse-coding"
+      }
+    }
+  },
+  {
+    "name": "a-candidate-for-a-held-orcid-changes-nothing",
+    "profile": [{ "property": "orcid_id", "value": "0000-0002-1825-0097" }],
+    "record": { "fact_candidate": { "field": "profile", "value": "Elena Marsh's ORCID is 0000-0002-1825-0097.", "confidence": 0.8, "trust_tier": "found", "identity_confidence": 0.9, "source_url": "https://example.org/elena-marsh" } }
+  },
+  {
+    "name": "a-news-candidate-is-a-public-mention",
+    "profile": [],
+    "record": { "fact_candidate": { "field": "news", "value": "Elena Marsh was quoted in The Guardian on climate models in 2024.", "confidence": 0.8, "trust_tier": "found", "identity_confidence": 0.9, "source_url": "https://example.org/elena-marsh" } },
+    "expect": { "public_mentions": "add" }
+  },
+  {
+    "name": "a-board-candidate-for-a-held-seat-changes-nothing",
+    "profile": [{ "property": "board_memberships", "value": { "organization": "Royal Society of Biology" } }],
+    "record": { "fact_candidate": { "field": "board", "value": "Elena Marsh serves on the board of the Royal Society of Biology.", "confidence": 0.8, "trust_tier": "found", "identity_confidence": 0.9, "source_url": "https://example.org/elena-marsh" } }
+  },
+  {
+    "name": "a-second-publication-candidate-is-added",
+    "profile": [{ "property": "publications", "value": { "title": "Sparse Coding in the Visual Cortex", "year": 2019 } }],
+    "record": { "fact_candidate": { "field": "publication", "value": "Elena Marsh co-authored 'Predictive Coding in Auditory Cortex' (2022).", "confidence": 0.8, "trust_tier": "found", "identity_confidence": 0.9, "source_url": "https://example.org/elena-marsh" } },
+    "expect": { "publications": "add" }
+  },
+  {
+    "name": "a-homepage-candidate-is-a-public-profile",
+    "profile": [],
+    "record": { "fact_candidate": { "field": "profile", "value": "Elena Marsh's homepage is https://example.net/elena-marsh.", "confidence": 0.8, "trust_tier": "found", "identity_confidence": 0.9, "source_url": "https://example.org/elena-marsh" } },
+    "expect": { "public_profiles": "add" }
+  }
+]

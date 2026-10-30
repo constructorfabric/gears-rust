@@ -225,4 +225,11 @@ pub trait GrpcHubCapability: Send + Sync {
     ///
     /// Returns `None` if the server hasn't started listening yet.
     fn bound_endpoint(&self) -> Option<String>;
+
+    /// Whether the hub has settled on binding nothing (`listen_addr: none`, or
+    /// no services to serve), so [`bound_endpoint`](Self::bound_endpoint)
+    /// stays `None` for good.
+    fn serves_no_endpoint(&self) -> bool {
+        false
+    }
 }

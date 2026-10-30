@@ -14,6 +14,9 @@
 //! claims nothing (or replays the POSTED winner) never lands a second effect.
 //! (2) A `settle` (which drains) racing a `QueueApplierJob::run()` on the same
 //! tenant: both complete without deadlock and the allocation applies once.
+//! (3) A drain that claimed a row another drain has since applied counts that
+//! apply as `replayed`, not `applied`, with no second effect (a deterministic
+//! reset stand-in for (1)'s losing drain).
 //!
 //! Self-contained: re-declares the small `boot` / `setup_seller` / `settle_svc`
 //! / `allocate_svc` / `seed_ar_invoice` / `pg` / `retry_on_serialization`
@@ -660,4 +663,105 @@ async fn drain_and_sweep_race_without_deadlock() {
         Some("APPLIED")
     );
     assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
+}
+
+/// A drain that claimed a row another drain has since applied must count that
+/// apply as a replay, not as a second apply. A deterministic stand-in for the
+/// race above: drain once (the winner), then put the queue row back to `QUEUED`
+/// (the row the losing drain holds after its own claim) and drain again. The
+/// losing drain read open AR before the winner committed; here a second open
+/// invoice gives the re-run decide/build the same view, so the apply reaches the
+/// post. The post finds the dedup `POSTED` and replays it: no second effect, and
+/// the report counts the row as `replayed`, not `applied`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_drain_that_replays_an_applied_allocation_counts_a_replay() {
+    let (_c, raw, provider) = boot().await;
+    let s = setup_seller(&raw, &provider).await;
+    let ctx = SecurityContext::anonymous();
+    let scope = AccessScope::for_tenant(s.tenant);
+
+    let allocation_id = queue_with_seeded_settlement(&raw, &provider, &s, "PAY-REPLAY").await;
+    let svc = allocate_svc(&provider);
+
+    let first = svc
+        .drain(&ctx, &scope, s.tenant, 16)
+        .await
+        .expect("first drain ok");
+    assert_eq!(
+        first.applied, 1,
+        "the first drain applies the queued allocation"
+    );
+    assert_eq!(
+        queue_status(&raw, &s, allocation_id).await.as_deref(),
+        Some("APPLIED"),
+        "the first drain flips the queue row to APPLIED"
+    );
+    let (_, first_entry) = dedup_status(&raw, &s, allocation_id)
+        .await
+        .expect("dedup row present after the first drain");
+
+    // With no open AR left, the re-run decide/build refuses (Blocked) before it
+    // reaches the post; a second open invoice lets it reach the POSTED replay.
+    seed_ar_invoice(
+        &provider,
+        &s,
+        "INV-B",
+        300,
+        OffsetDateTime::now_utc() - time::Duration::hours(1),
+    )
+    .await;
+    raw.execute_raw(pg(format!(
+        "UPDATE bss.ledger_pending_event_queue SET status = 'QUEUED' \
+         WHERE tenant_id='{}' AND flow='PAYMENT_ALLOCATE' AND business_id='{allocation_id}'",
+        s.tenant
+    )))
+    .await
+    .expect("put the queue row back to QUEUED");
+
+    let second = svc
+        .drain(&ctx, &scope, s.tenant, 16)
+        .await
+        .expect("second drain ok");
+    assert_eq!(
+        second.applied, 0,
+        "a replayed apply is not counted as applied"
+    );
+    assert_eq!(
+        second.replayed, 1,
+        "the apply of an already-applied row is counted as replayed"
+    );
+    assert_eq!(second.blocked, 0, "the replay reached the post unblocked");
+
+    // No second effect: one allocation row, one apply's worth allocated, the
+    // dedup still points at the first entry, and the second invoice is untouched.
+    assert_eq!(
+        count_allocations(&raw, &s, "PAY-REPLAY").await,
+        1,
+        "exactly one payment_allocation row after the replay"
+    );
+    let row = PaymentRepo::new(provider.clone())
+        .read_settlement(&scope, s.tenant, "PAY-REPLAY")
+        .await
+        .unwrap()
+        .expect("settlement row present");
+    assert_eq!(
+        row.allocated,
+        usd(300),
+        "allocated reflects one apply (3.00) after the replay"
+    );
+    let (status, entry) = dedup_status(&raw, &s, allocation_id)
+        .await
+        .expect("dedup row present after the replay");
+    assert_eq!(status, "POSTED");
+    assert_eq!(
+        entry, first_entry,
+        "the replay posts no new entry; the dedup keeps the first one"
+    );
+    assert_eq!(ar_invoice_balance(&raw, &s, "INV-A").await, Some(text(0)));
+    assert_eq!(
+        ar_invoice_balance(&raw, &s, "INV-B").await,
+        Some(text(300)),
+        "the replay does not allocate to the second invoice"
+    );
 }

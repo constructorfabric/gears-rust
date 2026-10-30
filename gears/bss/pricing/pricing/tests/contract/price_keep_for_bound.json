@@ -15,11 +15,12 @@
         "period": "month",
         "book_id": "<book:eur>",
         "currency": "EUR",
+        "currency_scale": 2,
         "version_no": 2,
         "dim_value": null,
         "model": "flat",
         "price": {
-          "amount": "12.00"
+          "amount": "12"
         },
         "min_fee": null,
         "eligibility": "all",

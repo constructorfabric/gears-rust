@@ -1,6 +1,6 @@
 //! Axum handlers + router for the ledger's FX & multi-currency REST surface
 //! (Slice 5, design §5). Two operations under `/bss-ledger/v1`, tenant-scoped
-//! WITHOUT a tenant in the path (the vhp-core convention): the write carries
+//! WITHOUT a tenant in the path (the platform convention): the write carries
 //! `tenant_id` in the **body**, the read takes a `?tenant_id=` **query** param.
 //!
 //! - `POST /fx/rates` — the SECONDARY manual / seed ingest of one rate into the
@@ -57,7 +57,7 @@ pub struct ApiState {
     /// Mode-B unrealized-revaluation runner (the `POST /fx/revaluation-runs`
     /// trigger). `Arc` because the runner holds non-`Clone` posting/repo handles.
     pub revaluation_run: Arc<UnrealizedRevaluationRun>,
-    /// Per-tenant FX revaluation mode (VHP-1986): the trigger resolves the target
+    /// Per-tenant FX revaluation mode: the trigger resolves the target
     /// tenant's effective Mode A/B and only runs the revaluation for Mode B.
     pub fx_revaluation_mode: FxRevaluationModeRepo,
     /// The global `fx.revaluation_enabled` fleet default for a tenant with no
@@ -311,7 +311,7 @@ async fn trigger_revaluation(
     .map_err(authz_error_to_canonical)?;
 
     body.validate()?;
-    // VHP-1986 per-tenant gate: resolve the target tenant's effective Mode A/B (an
+    // Per-tenant gate: resolve the target tenant's effective Mode A/B (an
     // explicit row wins; else the fleet default). Mode A defers to the tenant's ERP
     // → every scope reports `disabled` (no double-count); Mode B runs the revaluation.
     let revalue = state

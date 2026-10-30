@@ -1,5 +1,5 @@
 //! `PayerStateRepo` — the payer lifecycle row (`bss.ledger_payer_state`) plus the
-//! closure balance check (VHP-1852 Phase 2). Absence of a row means OPEN; closure
+//! closure balance check. Absence of a row means OPEN; closure
 //! upserts the row to `CLOSED` with the approver + the closed-with-open-balance
 //! marker. The outstanding-balance check reads the per-payer AR cache
 //! (`ledger_ar_payer_balance`); a non-zero grain means closing strands a balance,

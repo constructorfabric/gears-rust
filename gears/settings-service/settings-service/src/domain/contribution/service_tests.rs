@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconciler, run through the SDK contract over an in-memory database.
 //!
 //! Every test goes through `SettingsContributionClient` — the door a gear uses
@@ -21,7 +20,7 @@ use uuid::Uuid;
 use crate::audit::AuditOperation;
 use crate::domain::category::{CategoryKey, CategoryRepository};
 use crate::domain::contribution::{ContributionService, reason};
-use crate::domain::declaration::{Declaration, DeclarationRepository};
+use crate::domain::declaration::{Declaration, DeclarationRepository, DeclarationStatus};
 use crate::domain::value::ValueRepository;
 use crate::infra::contribution_client::ContributionClient;
 use crate::infra::storage::category_repo::CategoryRepo;
@@ -235,6 +234,7 @@ impl Harness {
                     needs_review: false,
                     needs_review_detail: None,
                     set_by: "an-admin".to_owned(),
+                    set_by_tenant: None,
                 },
             )
             .await
@@ -338,7 +338,7 @@ async fn a_fresh_set_registers_every_declaration_and_its_categories() {
         .expect("row");
     assert_eq!(stored.source, "module_contributed");
     assert_eq!(stored.owner_module.as_deref(), Some(MODULE));
-    assert_eq!(stored.status, "active");
+    assert_eq!(stored.status, DeclarationStatus::Active);
     assert_eq!(stored.data_classification, "public");
     assert!(!stored.has_secret_trait);
     assert!(
@@ -602,7 +602,7 @@ async fn retire_then_re_register_revives_the_same_row() {
             .await
             .expect("row")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
 
     // Retiring again counts nothing and is not an error.
@@ -618,7 +618,7 @@ async fn retire_then_re_register_revives_the_same_row() {
         .await
         .expect("row");
     assert_eq!(revived.id, original.id, "revived in place, not re-minted");
-    assert_eq!(revived.status, "active");
+    assert_eq!(revived.status, DeclarationStatus::Active);
     assert!(
         h.reactivated_events()
             .contains(&key("network", "proxy_enabled", 1).to_string()),
@@ -650,7 +650,7 @@ async fn retire_refuses_unknown_keys_and_other_modules_keys() {
             .await
             .expect("row")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -722,14 +722,14 @@ async fn re_registering_a_retired_lower_major_beside_an_active_higher_one_is_a_r
             .await
             .expect("v1")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
     assert_eq!(
         h.stored(&key("network", "listen_port", 2))
             .await
             .expect("v2")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -757,7 +757,7 @@ async fn a_retired_lower_major_stays_retired_when_the_higher_one_is_retired_too(
             .await
             .expect("v1")
             .status,
-        "retired"
+        DeclarationStatus::Retired
     );
     // The highest major is the one that comes back.
     let result = h.register(vec![v2]).await;
@@ -794,8 +794,11 @@ async fn a_higher_major_carries_every_value_across_and_retires_the_predecessor()
         .stored(&key("network", "listen_port", 2))
         .await
         .expect("v2");
-    assert_eq!(successor.status, "active");
-    assert_eq!(h.stored(&v1).await.expect("v1").status, "retired");
+    assert_eq!(successor.status, DeclarationStatus::Active);
+    assert_eq!(
+        h.stored(&v1).await.expect("v1").status,
+        DeclarationStatus::Retired
+    );
 
     // Every value carried across at the same scope; the failing one flagged
     // with its detail rather than coerced or dropped.
@@ -848,13 +851,16 @@ async fn a_higher_major_over_an_all_retired_path_is_an_ordinary_registration() {
     let result = h.register(vec![v2]).await;
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.registered, 1);
-    assert_eq!(h.stored(&v1).await.expect("v1").status, "retired");
+    assert_eq!(
+        h.stored(&v1).await.expect("v1").status,
+        DeclarationStatus::Retired
+    );
     assert_eq!(
         h.stored(&key("network", "listen_port", 2))
             .await
             .expect("v2")
             .status,
-        "active"
+        DeclarationStatus::Active
     );
 }
 
@@ -885,7 +891,10 @@ async fn reactivating_re_validates_the_retained_values_against_the_type() {
         .await;
     assert_eq!(result.errors, Vec::new());
     assert_eq!(result.reactivated, 1);
-    assert_eq!(narrowed.stored(&key_v1).await.expect("v1").status, "active");
+    assert_eq!(
+        narrowed.stored(&key_v1).await.expect("v1").status,
+        DeclarationStatus::Active
+    );
 
     let rows = narrowed.values_of(stored.id).await;
     let ok = rows
@@ -1106,7 +1115,7 @@ async fn another_module_cannot_take_over_a_path_by_shipping_a_higher_major() {
     );
     // The predecessor is untouched: still active, still owned, its value in place.
     let still = h.stored(&v1).await.expect("v1");
-    assert_eq!(still.status, "active");
+    assert_eq!(still.status, DeclarationStatus::Active);
     assert_eq!(still.owner_module.as_deref(), Some(MODULE));
     assert_eq!(h.values_of(predecessor.id).await.len(), 1);
     assert!(
@@ -1204,7 +1213,7 @@ async fn an_upgrade_that_fails_at_its_last_step_leaves_the_predecessor_active_an
 
     // The predecessor: active, its two values where they were.
     let kept = h.stored(&v1).await.expect("v1 is still there");
-    assert_eq!(kept.status, "active");
+    assert_eq!(kept.status, DeclarationStatus::Active);
     assert_eq!(kept.id, predecessor.id);
     let values = h.values_of(predecessor.id).await;
     assert_eq!(values.len(), 2);
@@ -1260,6 +1269,37 @@ struct JournalingDeclarations(Journal);
 
 #[async_trait::async_trait]
 impl DeclarationRepository for JournalingDeclarations {
+    async fn visible_keys<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        keys: &[String],
+    ) -> Result<Vec<String>, crate::domain::error::DomainError> {
+        DeclarationRepo
+            .visible_keys(conn, scope, visibility, hidden_for, keys)
+            .await
+    }
+    async fn list_candidates<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
+        query: &toolkit_odata::ODataQuery,
+        narrowing: &crate::domain::declaration::BrowseNarrowing<'_>,
+    ) -> Result<
+        toolkit_odata::Page<crate::domain::declaration::BrowseCandidate>,
+        crate::domain::error::DomainError,
+    > {
+        DeclarationRepo
+            .list_candidates(
+                conn, scope, visibility, hidden_for, flagged_at, query, narrowing,
+            )
+            .await
+    }
     async fn find_by_key<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
@@ -1308,7 +1348,7 @@ impl DeclarationRepository for JournalingDeclarations {
         conn: &C,
         scope: &AccessScope,
         id: Uuid,
-        status: &str,
+        status: DeclarationStatus,
         expected: Option<time::OffsetDateTime>,
     ) -> Result<(), crate::domain::error::DomainError> {
         DeclarationRepo
@@ -1361,16 +1401,40 @@ impl DeclarationRepository for JournalingDeclarations {
             .find_by_category(conn, scope, category_id)
             .await
     }
+    async fn find_by_ids<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        ids: &[Uuid],
+    ) -> Result<Vec<Declaration>, crate::domain::error::DomainError> {
+        DeclarationRepo.find_by_ids(conn, scope, ids).await
+    }
     async fn list<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,
         scope: &AccessScope,
         visibility: &crate::domain::category::visibility::DomainVisibility,
         hidden_for: &[Uuid],
+        flagged_at: Option<Uuid>,
         query: &toolkit_odata::ODataQuery,
-    ) -> Result<toolkit_odata::Page<Declaration>, crate::domain::error::DomainError> {
+    ) -> Result<crate::domain::odata::Listing<Declaration>, crate::domain::error::DomainError> {
         DeclarationRepo
-            .list(conn, scope, visibility, hidden_for, query)
+            .list(conn, scope, visibility, hidden_for, flagged_at, query)
+            .await
+    }
+    async fn tally_by_category<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        visibility: &crate::domain::category::visibility::DomainVisibility,
+        hidden_for: &[Uuid],
+        category_ids: &[Uuid],
+    ) -> Result<
+        std::collections::HashMap<Uuid, crate::domain::declaration::CategoryTally>,
+        crate::domain::error::DomainError,
+    > {
+        DeclarationRepo
+            .tally_by_category(conn, scope, visibility, hidden_for, category_ids)
             .await
     }
 }
@@ -1493,4 +1557,296 @@ async fn a_module_declares_settings_of_a_value_type_it_registered_itself() {
         "the module type's secret trait is honoured"
     );
     assert_eq!(token.data_classification, "secret");
+}
+
+// ── The display name ─────────────────────────────────────────────────────────
+
+/// A flag as `flag` builds it, carrying the label a console shows.
+fn labelled_flag(category: &str, name: &str, display_name: &str) -> ContributedDeclaration {
+    let mut declaration = flag(category, name);
+    declaration.display_name = Some(display_name.to_owned());
+    declaration
+}
+
+#[tokio::test]
+async fn a_contributed_display_name_is_stored_with_the_new_row() {
+    // The label is the module's to give; a console reads it back from the
+    // declaration rather than deriving one from the slug.
+    let h = Harness::new().await;
+    let result = h
+        .register(vec![labelled_flag(
+            "network",
+            "proxy_enabled",
+            "Proxy enabled",
+        )])
+        .await;
+    assert_eq!(result.errors, Vec::new());
+
+    let stored = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("row");
+    assert_eq!(
+        stored.display_name.as_deref(),
+        Some("Proxy enabled"),
+        "the contributed label is stored"
+    );
+}
+
+#[tokio::test]
+async fn a_contributed_display_name_is_stored_trimmed() {
+    // Search matches the stored text, so padding must not outlive the write.
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag(
+        "network",
+        "proxy_enabled",
+        "  Padded  ",
+    )])
+    .await;
+    let stored = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("row");
+    assert_eq!(stored.display_name.as_deref(), Some("Padded"));
+}
+
+#[tokio::test]
+async fn a_changed_display_name_is_updated_in_place_and_moves_only_the_edit_tag() {
+    // The label changes no effective value: `last_change_at` is the tag a
+    // value write compares, and a label edit must not invalidate it. The edit
+    // tag (`updated_at`) does move, so a console holding the old one is told.
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+    let before = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("row");
+    h.set_value(before.id, Uuid::new_v4(), json!(true)).await;
+
+    let result = h
+        .register(vec![labelled_flag(
+            "network",
+            "proxy_enabled",
+            "Egress proxy",
+        )])
+        .await;
+    assert_eq!(result.updated, 1, "{result:?}");
+
+    let after = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("row");
+    assert_eq!(after.display_name.as_deref(), Some("Egress proxy"));
+    assert!(after.updated_at > before.updated_at, "the edit tag moved");
+    assert_eq!(
+        after.last_change_at, before.last_change_at,
+        "the value-resolution tag did not"
+    );
+    assert_eq!(
+        h.values_of(after.id).await.len(),
+        1,
+        "every administrator-set value is left intact"
+    );
+    assert!(
+        h.updated_events()
+            .contains(&key("network", "proxy_enabled", 1).to_string()),
+        "the change rides the existing in-place update event"
+    );
+}
+
+#[tokio::test]
+async fn re_registering_without_a_display_name_clears_the_stored_one() {
+    // The owning module is the sole authority over its metadata, as it is for
+    // the description: leaving the label out is saying it is gone.
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+
+    let result = h.register(vec![flag("network", "proxy_enabled")]).await;
+    assert_eq!(result.updated, 1, "{result:?}");
+    assert_eq!(
+        h.stored(&key("network", "proxy_enabled", 1))
+            .await
+            .expect("row")
+            .display_name,
+        None,
+        "omitting the label clears it"
+    );
+}
+
+#[tokio::test]
+async fn an_unchanged_display_name_is_not_an_update() {
+    // A boot that changes nothing announces nothing; the label is part of the
+    // metadata compared, not a reason to write on every start.
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+    let result = h
+        .register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+    assert_eq!((result.updated, result.registered), (0, 0), "{result:?}");
+}
+
+#[tokio::test]
+async fn an_empty_or_over_long_display_name_refuses_that_item_and_names_the_field() {
+    // A label a console cannot show is refused like any invalid field -- for
+    // that item alone, with the field named, while its neighbours reconcile.
+    let too_long = "x".repeat(257);
+    for bad in ["", "   ", too_long.as_str()] {
+        let h = Harness::new().await;
+        let result = h
+            .register(vec![
+                flag("network", "before"),
+                labelled_flag("network", "refused", bad),
+                flag("network", "after"),
+            ])
+            .await;
+
+        assert_eq!(
+            result.registered, 2,
+            "the other items are reconciled: {result:?}"
+        );
+        assert_eq!(result.errors.len(), 1, "{result:?}");
+        let error = &result.errors[0];
+        assert_eq!(error.key, key("network", "refused", 1).to_string());
+        assert!(
+            error.message.contains("display_name"),
+            "the refusal names the field: {error:?}"
+        );
+        assert!(h.stored(&key("network", "refused", 1)).await.is_none());
+        assert!(h.stored(&key("network", "before", 1)).await.is_some());
+        assert!(h.stored(&key("network", "after", 1)).await.is_some());
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_display_name_on_an_existing_declaration_leaves_the_row_untouched() {
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+
+    let result = h
+        .register(vec![labelled_flag("network", "proxy_enabled", "   ")])
+        .await;
+    assert_eq!(result.errors.len(), 1, "{result:?}");
+    assert_eq!(
+        h.stored(&key("network", "proxy_enabled", 1))
+            .await
+            .expect("row")
+            .display_name
+            .as_deref(),
+        Some("Proxy"),
+        "a refused re-registration changes nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_reactivation_carries_the_new_display_name() {
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Old label")])
+        .await;
+    h.retire_as(MODULE, vec![key("network", "proxy_enabled", 1)])
+        .await;
+
+    let result = h
+        .register(vec![labelled_flag("network", "proxy_enabled", "New label")])
+        .await;
+    assert_eq!(result.reactivated, 1, "{result:?}");
+    let revived = h
+        .stored(&key("network", "proxy_enabled", 1))
+        .await
+        .expect("row");
+    assert_eq!(revived.status, DeclarationStatus::Active);
+    assert_eq!(
+        revived.display_name.as_deref(),
+        Some("New label"),
+        "the revival applies the module's current label, not the retired one"
+    );
+}
+
+#[tokio::test]
+async fn an_upgrade_gives_the_successor_row_the_contributed_display_name() {
+    let h = Harness::new().await;
+    h.register(vec![port("listen_port", json!(8080))]).await;
+
+    let mut v2 = ContributedDeclaration::new(
+        key("network", "listen_port", 2),
+        NARROW_PORT.to_owned(),
+        json!(8080),
+        ScopeClass::Global,
+    );
+    v2.display_name = Some("  Listen port  ".to_owned());
+    let result = h.register(vec![v2]).await;
+    assert_eq!(result.errors, Vec::new());
+
+    let successor = h
+        .stored(&key("network", "listen_port", 2))
+        .await
+        .expect("v2");
+    assert_eq!(
+        successor.display_name.as_deref(),
+        Some("Listen port"),
+        "the successor carries the contributed, trimmed label"
+    );
+}
+
+#[tokio::test]
+async fn a_display_name_with_a_control_character_refuses_that_item_and_names_the_field() {
+    // Same refusal as an empty label, for that item alone: the neighbours
+    // still register.
+    let h = Harness::new().await;
+    let result = h
+        .register(vec![
+            flag("network", "before"),
+            labelled_flag("network", "refused", "a\u{0}b"),
+            flag("network", "after"),
+        ])
+        .await;
+
+    assert_eq!(result.registered, 2, "{result:?}");
+    assert_eq!(result.errors.len(), 1, "{result:?}");
+    let error = &result.errors[0];
+    assert_eq!(error.key, key("network", "refused", 1).to_string());
+    assert!(
+        error.message.contains("display_name"),
+        "the refusal names the field: {error:?}"
+    );
+    assert!(h.stored(&key("network", "refused", 1)).await.is_none());
+    assert!(h.stored(&key("network", "before", 1)).await.is_some());
+    assert!(h.stored(&key("network", "after", 1)).await.is_some());
+}
+
+#[tokio::test]
+async fn the_in_place_update_record_carries_the_old_and_new_display_name() {
+    // The audit record is the only trace of a label edit by a module.
+    let h = Harness::new().await;
+    h.register(vec![labelled_flag("network", "proxy_enabled", "Proxy")])
+        .await;
+    h.register(vec![labelled_flag(
+        "network",
+        "proxy_enabled",
+        "Egress proxy",
+    )])
+    .await;
+
+    let records = h.audit.records();
+    let change = records
+        .iter()
+        .rfind(|r| r.operation == AuditOperation::Change)
+        .expect("the edit was recorded");
+    let label = |image: Option<&crate::audit::AuditValue>| {
+        serde_json::to_value(image.expect("an image")).expect("serialises")["value"]["display_name"]
+            .clone()
+    };
+    assert_eq!(
+        label(change.pre_image.as_ref()),
+        json!("Proxy"),
+        "the old label"
+    );
+    assert_eq!(
+        label(change.post_image.as_ref()),
+        json!("Egress proxy"),
+        "the new label"
+    );
 }

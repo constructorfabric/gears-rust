@@ -1,4 +1,5 @@
-//! Registry-backed currency scale resolution errors.
+//! Currency scale resolution errors, and the rule that the registry never
+//! overrides an ISO 4217 scale.
 
 use toolkit_macros::domain_model;
 
@@ -20,6 +21,43 @@ pub enum ScaleError {
         currency: String,
         currency_scale: i16,
     },
+}
+
+/// A registry row that gives an ISO 4217 code a scale other than its ISO scale.
+///
+/// The text names the code, its ISO scale and the refused scale.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "currency {currency} is an ISO 4217 code with scale {iso_scale}; \
+     the registry cannot set scale {requested} for it"
+)]
+pub struct IsoScaleConflict {
+    /// The ISO 4217 code.
+    pub currency: String,
+    /// Its ISO 4217 minor-unit scale.
+    pub iso_scale: u8,
+    /// The scale the row asks for.
+    pub requested: u8,
+}
+
+/// Check that a registry row does not override an ISO 4217 scale.
+///
+/// An ISO code always has its ISO scale, so the registry holds only the codes with no ISO
+/// minor-unit scale. A row equal to the ISO scale is allowed, so a provisioning script can
+/// run again.
+///
+/// # Errors
+/// [`IsoScaleConflict`] when `currency` is an ISO code and `scale` is not its ISO scale.
+pub fn check_iso_scale(currency: &str, scale: u8) -> Result<(), IsoScaleConflict> {
+    match bss_money::iso_scale(currency) {
+        Some(iso_scale) if iso_scale != scale => Err(IsoScaleConflict {
+            currency: currency.to_owned(),
+            iso_scale,
+            requested: scale,
+        }),
+        _ => Ok(()),
+    }
 }
 
 /// Integer minor units of a validated posted amount, for the parked `v1`

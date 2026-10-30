@@ -1101,6 +1101,10 @@ impl HostRuntime {
                 return Some(endpoint);
             }
 
+            if hub.serves_no_endpoint() {
+                tracing::debug!("gRPC hub binds no endpoint");
+                return None;
+            }
             if start.elapsed() > MAX_WAIT {
                 tracing::warn!("Timed out waiting for gRPC hub to bind");
                 return None;
@@ -1178,12 +1182,11 @@ impl HostRuntime {
 
         let instance_id = self.instance_id.to_string();
         for gear in rest_gears {
-            // The directory keys instances by (gear, instance_id) and replaces
-            // wholesale. grpc-hub may have already registered this same
-            // (gear, instance_id) with gRPC services during the start phase, so
-            // carry the grpc services and version forward instead of clobbering
-            // them to empty — adding the REST endpoint must augment, not
-            // replace, the entry.
+            // The directory keys instances by (gear, instance_id). grpc-hub
+            // registers this same (gear, instance_id) with its gRPC services, in
+            // the start phase or later on a retry; the store keeps them when this
+            // registration carries none (`GearInstance::with_metadata_of`).
+            // Carrying them forward also carries the version.
             //
             // Labels are deliberately NOT read-and-rewritten here. Carrying them
             // through would make this a cross-process read-modify-write with no
@@ -1395,6 +1398,10 @@ impl HostRuntime {
     }
 }
 
+/// Composed `OoP` router, serialized `OpenAPI`, and auth policy from the same specs.
+#[cfg(feature = "bootstrap")]
+type ComposedOopRouter = (Router, String, toolkit_http_middleware::RouteAuthPolicy);
+
 /// Out-of-process HTTP serving lifecycle (`cpt-cf-component-oop-bootstrap`).
 #[cfg(feature = "bootstrap")]
 impl HostRuntime {
@@ -1407,7 +1414,7 @@ impl HostRuntime {
         &self,
         options: &crate::runtime::OopServeOptions,
         hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
-    ) -> anyhow::Result<(Router, String)> {
+    ) -> anyhow::Result<ComposedOopRouter> {
         use crate::api::{OpenApiInfo, OpenApiRegistryImpl};
         use anyhow::Context as _;
 
@@ -1447,8 +1454,9 @@ impl HostRuntime {
             .build_openapi(&info)
             .context("OoP router: build OpenAPI document")?;
         let json = serde_json::to_string(&openapi).context("OoP router: serialize OpenAPI")?;
+        let route_auth = super::oop_serve::route_auth_policy(registry.operation_specs.iter());
 
-        Ok((router, json))
+        Ok((router, json, route_auth))
     }
 
     /// Run the full `OoP` gear lifecycle: phases (`pre_init` … `start`), then
@@ -1511,7 +1519,7 @@ impl HostRuntime {
         // gear's healthcheck into the shared registry). Grouped so a failure
         // tears the probe server down cleanly.
         let mut started = false;
-        let composed: anyhow::Result<(Router, String)> = async {
+        let composed: anyhow::Result<ComposedOopRouter> = async {
             self.run_pre_init_phase()?;
             #[cfg(feature = "db")]
             self.run_db_phase().await?;
@@ -1533,14 +1541,15 @@ impl HostRuntime {
         }
         .await;
 
-        let serve_result = match composed {
-            Ok((gear_router, openapi_json)) => {
-                // Publish gear routes (they go live) + start directory presence.
-                // Dependency resolution already ran in the proxy-wiring phase.
-                server.attach(gear_router, openapi_json);
-                // Serve until cancelled, drain, then deregister.
-                server.join().await
-            }
+        // Check the route policy, then publish gear routes (they go live) and start
+        // directory presence. Dependency resolution already ran in the proxy-wiring
+        // phase. A policy whose plane has no validator stops here, before serving.
+        let attached = composed.and_then(|(gear_router, openapi_json, route_auth)| {
+            server.attach(gear_router, openapi_json, route_auth)
+        });
+        let serve_result = match attached {
+            // Serve until cancelled, drain, then deregister.
+            Ok(()) => server.join().await,
             Err(e) => {
                 tracing::error!(error = %e, "OoP startup failed before serving gear routes");
                 // Tear down the probe server that is already bound.

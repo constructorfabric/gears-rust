@@ -166,10 +166,173 @@ async fn f07_successor_and_deprecation_keep_exact_original_bindings() {
 }
 
 async fn fixture() -> AcceptanceFixture {
-    let mut f = AcceptanceFixture::new().await;
+    later(AcceptanceFixture::new().await)
+}
+/// The sale starts at ten; the clock follows.
+fn later(mut f: AcceptanceFixture) -> AcceptanceFixture {
     f.query.start_at += time::Duration::hours(10);
     f.clock.advance(time::Duration::hours(10));
     f
+}
+
+/// Issue, persist, change the currency table: an issued receipt is stored as issued and its price
+/// reads at the stored scale. `XTS` (no ISO scale) is configured at 2 when its price is written and
+/// the receipt is issued, then a state over the same database configures it at 3. (The replay, the
+/// fulfilment check and the hold under the changed table are `a_receipt_keeps_its_snapshot` in
+/// `numeric_boundaries`.) A stored price scale edited without its money digest, or with it but
+/// without the terms digest, is a corrupt row at fulfilment: a 500, never a client refusal.
+#[tokio::test]
+async fn a_currency_table_change_leaves_an_issued_receipt_as_it_was() {
+    use bss_pricing::{
+        api::{
+            pricing_acceptance::PricingAcceptanceProvider, pricing_read::PricingReadProvider,
+            rest::authoring::AuthoringState, sellability::SellabilityProvider,
+        },
+        config::SellerHoldPolicy,
+        domain::currency::CurrencyScales,
+        infra::{
+            commercial_terms::{CommercialTermsService, wire},
+            storage::repo::acceptance_repo,
+        },
+    };
+    use bss_pricing_sdk::{digest::money_digest, read::PriceQuery};
+    use std::sync::Arc;
+    let catalog = Arc::new(plan_support::Catalog::default());
+    let fixture = plan_support::Fixture::with_currency_scales(catalog.clone(), &[("XTS", 2)]).await;
+    let f = later(AcceptanceFixture::in_currency(fixture, catalog, "XTS").await);
+    let issued = accept(&f).await;
+    let price = &issued.bindings[0].price;
+    assert_eq!(
+        (price.currency.code(), price.currency.scale()),
+        ("XTS", 2),
+        "the price is issued at the table's scale"
+    );
+    assert_eq!(
+        price.model,
+        PriceModel::PerUnit {
+            unit_amount: 10.into()
+        }
+    );
+    let tenant = f.ctx.subject_tenant_id();
+    let scope = toolkit_db::secure::AccessScope::for_tenant(tenant);
+    let stored = acceptance_repo::find(
+        &f.fixture.db.conn().unwrap(),
+        &scope,
+        tenant,
+        issued.acceptance_id,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        wire::decode_acceptance(&stored.receipt_json).unwrap(),
+        issued,
+        "the stored receipt is the issued one"
+    );
+
+    // The deployment's table changes; the database does not.
+    let state = Arc::new(
+        AuthoringState::new(f.fixture.db.clone(), f.fixture.state.hub.clone())
+            .await
+            .unwrap()
+            .with_currency_scales(Arc::new(
+                CurrencyScales::try_new([("XTS".to_owned(), 3)].into()).unwrap(),
+            )),
+    );
+    assert_eq!(
+        state
+            .currency_scales()
+            .resolve("XTS")
+            .map(|spec| spec.scale()),
+        Some(3),
+        "the table now says 3"
+    );
+    let enforcer = Arc::new(plan_support::entry_support::enforcer_for(tenant));
+    let service = Arc::new(CommercialTermsService::new(
+        state.clone(),
+        enforcer.clone(),
+        f.clock.clone(),
+        SellerHoldPolicy::default(),
+    ));
+    let sellability = SellabilityProvider::new(service.clone());
+    let acceptance = PricingAcceptanceProvider::new(service);
+    let read = PricingReadProvider::new(state, enforcer)
+        .price(
+            &f.ctx,
+            PriceQuery {
+                catalog: CatalogRef { tenant_id: tenant },
+                price_id: price.price_id,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (read.currency, read.money_digest),
+        (price.currency.clone(), price.money_digest),
+        "the price reads at its stored scale"
+    );
+    let q = AcceptanceFixture::fulfilment_query(&issued);
+
+    // A price scale edited in the stored receipt without its money digest is other money: the
+    // receipt fails its own terms (`MONEY_DIGEST_MISMATCH`), so the row is corrupt.
+    let edited = stored
+        .receipt_json
+        .replace("\"currency_scale\":\"2\"", "\"currency_scale\":\"3\"");
+    assert_ne!(edited, stored.receipt_json, "the receipt stores the scale");
+    store_receipt(&f, &edited).await;
+    corrupt(
+        &sellability
+            .check_fulfilment(&f.ctx, q.clone())
+            .await
+            .unwrap_err(),
+    );
+    // With its money digest recomputed, the terms digest still names the issued content
+    // (`ACCEPTANCE_MISMATCH` on the stored receipt): corrupt at the check and at the hold.
+    let mut forged = wire::decode_acceptance(&edited).unwrap();
+    forged.bindings[0].price.money_digest = money_digest(&forged.bindings[0].price);
+    store_receipt(&f, &wire::encode_acceptance(&forged).unwrap()).await;
+    corrupt(
+        &sellability
+            .check_fulfilment(&f.ctx, q.clone())
+            .await
+            .unwrap_err(),
+    );
+    corrupt(
+        &acceptance
+            .hold(&f.ctx, q, meta("another"))
+            .await
+            .unwrap_err(),
+    );
+}
+/// A stored receipt that fails its own terms is a corrupt row: an internal error with no
+/// commercial reason, the same answer as a receipt that does not decode.
+fn corrupt(e: &toolkit_canonical_errors::CanonicalError) {
+    assert_eq!(e.status_code(), 500, "a corrupt stored receipt is a 500");
+    assert_eq!(
+        e.diagnostic(),
+        Some("invalid stored commercial receipt"),
+        "the stored receipt is reported as corrupt"
+    );
+    assert_eq!(
+        bss_pricing::infra::commercial_terms::errors::commercial_reason(e),
+        None,
+        "a corrupt stored receipt is no client refusal"
+    );
+}
+/// Overwrite the one stored acceptance's receipt, as a tampered row would hold it.
+async fn store_receipt(f: &AcceptanceFixture, receipt_json: &str) {
+    use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
+    let changed = Database::connect(&*f.fixture.dsn)
+        .await
+        .unwrap()
+        .execute_raw(Statement::from_sql_and_values(
+            DbBackend::Sqlite,
+            "UPDATE pricing_acceptance SET receipt_json = ?",
+            [receipt_json.into()],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(changed.rows_affected(), 1, "one acceptance is stored");
 }
 
 #[tokio::test]

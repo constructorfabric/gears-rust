@@ -1,0 +1,45 @@
+[package]
+name = "cf-gears-firebase-authn-plugin"
+version = "0.1.1"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "AuthN resolver plugin verifying Firebase ID tokens, with configured identity and tenant mappings"
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "firebase_authn_plugin"
+
+[lints]
+workspace = true
+
+[dependencies]
+toolkit = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-security = { workspace = true }
+toolkit-http = { workspace = true }
+toolkit-gts = { workspace = true }
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.39", path = "../../authn-resolver-sdk" }
+types-registry = { workspace = true }
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", version = "0.4.1", path = "../../../types-registry/types-registry-sdk" }
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+inventory = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+jsonwebtoken = { workspace = true }
+thiserror = { workspace = true }
+http = { workspace = true }
+secrecy = { workspace = true }
+
+[dev-dependencies]
+base64 = { workspace = true }
+chrono = { workspace = true }
+rsa = { workspace = true }

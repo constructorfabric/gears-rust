@@ -1,0 +1,62 @@
+{
+  "$id": "gts://gts.cf.core.events.event.v1~cf.core.tasks.config_updated.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Task Engine lifecycle event type 'configUpdated'. Published when runtime configuration changes (concurrency, queue depth, priority, timeouts, retry) are applied (PRD cpt-cf-task-engine-fr-runtime-config). One event is published per affected queue: a single /admin/config save that touches several queues emits one event for each, and a change not tied to one queue (a task-type-pattern override or a global default) emits one event for every queue whose effective settings it changes. All events of one save share config_version. Subject is the affected queue. Derived from the Event Broker base event type; routed to the task_events topic and partitioned by subject (the queue ID) for per-queue ordering.",
+  "x-gts-traits": {
+    "topic": "gts.cf.core.events.topic.v1~cf.core.tasks.task_events.v1",
+    "partition_key": "/subject",
+    "allowed_subject_types": [
+      "gts.cf.core.tasks.queue.v1~"
+    ]
+  },
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.events.event.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "gts.cf.core.events.event.v1~cf.core.tasks.config_updated.v1~",
+          "$comment": "Pins the event-type identifier so an editor can validate a payload against this schema alone."
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "queue": {
+              "description": "Queue whose configuration changed (event subject).",
+              "type": "string",
+              "x-gts-instance-ref": "gts.cf.core.tasks.queue.v1~"
+            },
+            "config_version": {
+              "description": "Runtime configuration version (te_runtime_config) that produced this change; shared by all events emitted for one save.",
+              "type": "integer",
+              "format": "int64",
+              "minimum": 1
+            },
+            "actor": {
+              "description": "Subject that applied the change.",
+              "type": "string"
+            },
+            "changed_keys": {
+              "description": "Configuration keys whose effective value for this queue changed.",
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "queue",
+            "config_version",
+            "actor",
+            "changed_keys"
+          ]
+        }
+      }
+    }
+  ]
+}

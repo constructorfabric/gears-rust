@@ -104,13 +104,13 @@ pub struct ManualAdjustmentHandler {
     publisher: Arc<LedgerEventPublisher>,
     /// The Slice-6 secured-audit port — the write-off path captures the actor on its
     /// OWN committed transaction (the post was rejected, so there is no post txn to
-    /// ride). No-op until Slice 6 (VHP-1858) merges its real store.
+    /// ride). No-op until Slice 6 merges its real store.
     audit: Arc<dyn SecuredAuditSink>,
     /// Provider held to open the out-of-band write-off capture transaction (the
     /// reject has no post txn to ride). A cheap clone of the same provider the
     /// posting engine + repos wrap.
     db: DBProvider<DbError>,
-    /// The dual-control engine (VHP-1852, Group 5 / Phase 3). `Some` ⇒ a governed
+    /// The dual-control engine. `Some` ⇒ a governed
     /// manual adjustment whose gross crosses the tenant's D2 threshold is gated to the
     /// preparer→approver queue ([`DomainError::DualControlRequired`]) instead of
     /// posting inline; `None` ⇒ gating is disabled (the executor's approved replay,
@@ -259,7 +259,7 @@ impl ManualAdjustmentHandler {
         }
         let payer = req.payer_tenant_id.unwrap_or(req.tenant_id);
 
-        // 2b. Dual-control gate (VHP-1852, Group 5 / Phase 3 / design §1.4 D2 / §4.6).
+        // 2b. Dual-control gate (design §1.4 D2 / §4.6).
         //     A governed manual adjustment is a money-affecting governed posting, gated
         //     BEFORE the post (the journal entry does not exist at gate time — like a
         //     refund). Above the tenant's D2 threshold ⇒ a PENDING approval is created

@@ -2,7 +2,7 @@
 //!
 //! Kind-agnostic: returns the internal [`GtsEntity`] / [`ListQuery`] types.
 //! All kind discrimination, parent resolution, caching, and SDK type
-//! construction live in [`crate::domain::local_client`].
+//! construction live in [`crate::domain::legacy_local_client`].
 
 use std::sync::Arc;
 

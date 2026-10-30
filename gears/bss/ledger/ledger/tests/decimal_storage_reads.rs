@@ -177,15 +177,17 @@ async fn registry_validates_boundaries_and_locks_both_historical_money_columns()
     let scope = AccessScope::for_tenant(tenant);
     assert_eq!(resolver.resolve(&scope, tenant, "TOKEN").await.unwrap(), 28);
     assert!(resolver.resolve(&scope, tenant, "UNKNOWN").await.is_err());
+    // Non-ISO codes: the registry cannot give an ISO code another scale, so the
+    // lock is exercised on codes whose scale the registry owns.
     post(
         &provider,
         tenant,
-        money("1", "EUR", 2),
-        Some(money("1.001", "USD", 3)),
+        money("1", "TKA", 2),
+        Some(money("1.001", "TKB", 3)),
         SourceDocType::PaymentSettle,
     )
     .await;
-    for (code, matching, different) in [("EUR", 2, 3), ("USD", 3, 2)] {
+    for (code, matching, different) in [("TKA", 2, 3), ("TKB", 3, 2)] {
         assert!(matches!(
             reference.upsert_currency_scale(row(code, different)).await,
             Err(RepoError::CurrencyScaleLocked(_))

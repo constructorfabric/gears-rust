@@ -31,12 +31,18 @@ async fn price_in(f: &Fixture, entry: Uuid, state: &str, version_no: i32) {
         .await
         .unwrap()
         .unwrap();
+    let book = book_repo::find(&conn, &scope(f), f.ctx.subject_tenant_id(), e.book_id)
+        .await
+        .unwrap()
+        .unwrap();
     let mut p = entry_support::price(&e);
     // The money in the entry's model (D-427): an entry read chooses its price in force from its
-    // approved prices, read as the model's money (D-440).
+    // approved prices, read as the model's money (D-440). The price carries its book's currency,
+    // as every read checks.
     if e.model == "flat" {
-        p.price_json = json!({"amount": "10.00"});
+        p.price_json = json!({"amount": "10"});
     }
+    p.currency = book.currency;
     p.version_no = version_no;
     p.state = state.into();
     p.effective_from = time::Date::from_calendar_date(2031, time::Month::January, 1).unwrap()

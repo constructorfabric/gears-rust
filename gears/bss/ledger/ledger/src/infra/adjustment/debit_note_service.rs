@@ -111,7 +111,7 @@ pub struct DebitNoteHandler {
     /// Metrics sink (`ledger_debit_note_total{outcome}`, Group F): one increment
     /// per attempt, labelled posted / replayed / rejected.
     metrics: Arc<dyn LedgerMetricsPort>,
-    /// The dual-control engine (VHP-1852). `Some` ⇒ a debit note whose amount
+    /// The dual-control engine. `Some` ⇒ a debit note whose amount
     /// crosses the tenant's D2 threshold is gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) instead of posting inline; `None` ⇒
     /// gating is disabled (the executor's approved replay, and the unit tests that
@@ -168,7 +168,7 @@ impl DebitNoteHandler {
         self
     }
 
-    /// Attach the dual-control engine (VHP-1852): a debit note whose amount crosses
+    /// Attach the dual-control engine: a debit note whose amount crosses
     /// the tenant's D2 threshold is then gated to the preparer→approver queue
     /// ([`DomainError::DualControlRequired`]) rather than posting inline. The approved
     /// replay re-enters through [`Self::post_debit_note_approved`], which skips the
@@ -215,7 +215,7 @@ impl DebitNoteHandler {
         result
     }
 
-    /// The approved-replay entry (VHP-1852): re-drive a held debit note WITHOUT the
+    /// The approved-replay entry: re-drive a held debit note WITHOUT the
     /// dual-control gate. Called only by the `ApprovalExecutor` after a second actor
     /// approves the PENDING debit-note approval — the threshold was already crossed
     /// at gate time, so re-checking it would re-open a second approval (an infinite
@@ -292,7 +292,7 @@ impl DebitNoteHandler {
             )));
         }
 
-        // 1c. Dual-control gate (VHP-1852, design §1.4 D2 / §4.3). Gated on the debit
+        // 1c. Dual-control gate (design §1.4 D2 / §4.3). Gated on the debit
         //     note's amount crossing the tenant's D2 threshold, AFTER the payer-close
         //     gate + shape gate (a malformed request 400s) AND the originating-invoice
         //     link gate (an absent origin 404s) — so none of those open an approval —

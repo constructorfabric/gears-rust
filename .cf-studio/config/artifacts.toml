@@ -156,6 +156,10 @@ patterns = [
 ]
 
 [[ignore]]
+reason = "Ignore credstore out-of-scope list — out-of-scope.md lists, in prose, the cases the gear does not handle in this version; a companion to DESIGN.md §6 and ADR-0006, not a standalone SDLC artifact. Same class as the file-storage operations.md entry above."
+patterns = ["gears/credstore/docs/out-of-scope.md"]
+
+[[ignore]]
 reason = "Ignore chat-engine companion doc — WEBHOOK-PROTOCOL.md documents the webhook JSON Schema (docs/webhook-protocol.json), the HTTP contract Chat Engine calls backend plugins over. A protocol reference supplementary to DESIGN.md, not a standalone SDLC artifact. Same class as the file-storage api.md/operations.md entry above."
 patterns = ["gears/chat-engine/docs/WEBHOOK-PROTOCOL.md"]
 
@@ -172,7 +176,7 @@ reason = "Ignore module 'contracts' (PRD is a placeholder: sections 7-12 are TBD
 patterns = ["gears/bss/contracts/*"]
 
 [[ignore]]
-reason = "BSS multi-slice design sets (gears/bss/*/docs/design/*.md — pricing 12, rating 16, subscriptions 9 slices): DELIBERATELY outside cfs autodetect/traceability. cfs hardcodes the artifact-kind set, so a DESIGN_SLICE kind cannot be registered via the kit manifest (attempted + reverted 2026-07-28); a brace-glob on the DESIGN pattern breaks DESIGN.md matching. The slice docs follow the DESIGN template, declare cpt-cf-bss-* ids, and are review-audited (2026-07-22/28 waves) instead of cfs-validated. Revisit when cfs supports custom kinds — tracked in pricing DECISIONS.md (2026-07-28 review, finding 15)."
+reason = "BSS multi-slice design sets (gears/bss/*/docs/design/*.md — pricing 12, subscriptions 9 slices; rating moved its 16 slices into DESIGN.md §6, DECOMPOSITION.md and features/ on 2026-10-06, all cfs-validated): DELIBERATELY outside cfs autodetect/traceability. cfs hardcodes the artifact-kind set, so a DESIGN_SLICE kind cannot be registered via the kit manifest (attempted + reverted 2026-07-28); a brace-glob on the DESIGN pattern breaks DESIGN.md matching. The slice docs follow the DESIGN template, declare cpt-cf-bss-* ids, and are review-audited (2026-07-22/28 waves) instead of cfs-validated. Revisit when cfs supports custom kinds — tracked in pricing DECISIONS.md (2026-07-28 review, finding 15)."
 patterns = ["gears/bss/*/docs/design/*"]
 
 [[systems]]
@@ -370,6 +374,26 @@ extensions = [".rs"]
 [[systems.autodetect.codebase]]
 name = "Storage Plugin Tests"
 path = "{system_root}/plugins/{system}-storage-plugin/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Most Restrictive Engine src"
+path = "{system_root}/plugins/{system}-engine-most-restrictive/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Most Restrictive Engine tests"
+path = "{system_root}/plugins/{system}-engine-most-restrictive/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "CEL Engine src"
+path = "{system_root}/plugins/{system}-engine-cel/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "CEL Engine tests"
+path = "{system_root}/plugins/{system}-engine-cel/tests"
 extensions = [".rs"]
 
 # Nested sub-plugin scope: account-management/docs/tr-plugin/ carries its own PRD/DESIGN/ADR.

@@ -1,0 +1,23 @@
+{
+  "$id": "gts://gts.cf.core.qe.scope.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Concrete QE scope-discriminator type (ADR-0007). Its well-known instances classify caller-supplied subject references; each subject projection carries one as its required scope trait. Registered idempotently by QE at bootstrap together with the P1 well-known instances.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "x-gts-instance-ref": "/$id",
+      "description": "The well-known scope instance id."
+    },
+    "type": {
+      "type": "string",
+      "x-gts-type-ref": "/$id",
+      "description": "Always the scope-discriminator type itself."
+    }
+  },
+  "required": [
+    "id",
+    "type"
+  ]
+}

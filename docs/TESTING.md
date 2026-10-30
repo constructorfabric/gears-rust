@@ -16,7 +16,7 @@ build whenever feasible.
 
 | Layer | Scope | Tooling | Feature gate | Runs in CI |
 |-------|-------|---------|--------------|------------|
-| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR (`ci.yml` — `test` job, all OS) |
+| **Unit** | Single function / struct / gear in isolation | `cargo test --workspace` | none (always compiled) | Every PR on Ubuntu (`ci.yml` — `test` job); macOS and Windows nightly (`macos-windows-tests.yml`) |
 | **Integration** | Cross-crate or DB-backed logic (SQLite, Postgres, MySQL) | `cargo test -p <pkg> --features integration` | `#[cfg(feature = "integration")]` | Every PR (`ci.yml` — `integration` job, Ubuntu) |
 | **E2E** | Full HTTP request → response through a running server | pytest + httpx against `cf-gears-example-server` | n/a (Python tests) | PRs to `main`, nightly schedule (`e2e.yml`) |
 | **Fuzz** | Parser / validator robustness against arbitrary input | `cargo-fuzz` (libFuzzer) | nightly toolchain | PRs + nightly (`clusterfuzzlite.yml`) |
@@ -34,24 +34,24 @@ make check                  # full quality gate (fmt + clippy + test + security)
 make build                 # whole-project example server release binary
 make run                   # default example server
 make test                  # unit tests (workspace, all OS)
-make test-sqlite           # integration — SQLite
-make test-pg               # integration — PostgreSQL
-make test-pgq              # integration — PostgreSQL 19 SQL/PGQ (Docker)
-make test-mysql            # integration — MySQL
+make test-integration LANE=toolkit-db-sqlite  # integration — SQLite
+make test-integration LANE=toolkit-db-pg  # integration — PostgreSQL
+make test-integration LANE=toolkit-db-pgq  # integration — PostgreSQL 19 SQL/PGQ (Docker)
+make test-integration LANE=toolkit-db-mysql  # integration — MySQL
 make test-db               # all DB integration tests (sqlite, pg, pgq, mysql)
-make test-users-info-pg    # users-info gear integration (Postgres)
+make test-integration LANE=users-info-pg  # users-info gear integration (Postgres)
 make e2e-docker            # E2E — Docker environment
 make e2e-docker-smoke      # E2E — Docker environment (smoke subset only)
 make e2e-local             # E2E — local: run every shared-server suite against one shared server
 make e2e-local-smoke       # E2E — smoke subset only
-make e2e-mini-chat         # E2E — mini-chat lane (dedicated binary, offline mode)
+make e2e-local SUITE=mini-chat  # E2E — mini-chat lane (dedicated binary, offline mode)
 make e2e-tr-authz          # E2E — AuthZ -> TR -> RG chain (resource_group/e2e.yaml, profile: tr-authz)
-make e2e-usage-collector   # E2E — usage-collector lane, both backends (aggregate of the two targets below)
-make e2e-usage-collector-timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
-make e2e-usage-collector-clickhouse   # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
+make e2e-usage-collector   # E2E — usage-collector lane, both backends (BACKEND= for one, below)
+make e2e-usage-collector BACKEND=timescaledb  # E2E — usage-collector lane, TimescaleDB only (dedicated binary; needs Docker)
+make e2e-usage-collector BACKEND=clickhouse  # E2E — usage-collector lane, ClickHouse only (dedicated binary; needs Docker)
 make fuzz                  # fuzz — 30 s smoke per target
 make check                 # full quality gate (fmt + clippy + test + security)
-make all                   # full pipeline (build + check + test-sqlite + e2e-local)
+make all                   # full pipeline (build + check + toolkit-db-sqlite lane + e2e-local)
 
 # CI gate: no database container built outside libs/test-containers (4.4)
 cargo xtask check-test-container-pins
@@ -143,19 +143,21 @@ behind the `integration` Cargo feature so that `cargo test --workspace` (without
 |---------|----------|---------|
 | `cf-gears-toolkit-db` | `sqlite,integration` | SQLite (in-process) |
 | `cf-gears-toolkit-db` | `pg,integration` | PostgreSQL (requires running instance) |
-| `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-pgq`) |
+| `cf-gears-toolkit-db` | `pgq,integration` | PostgreSQL 19 SQL/PGQ (testcontainers; `make test-integration LANE=toolkit-db-pgq`) |
 | `cf-gears-toolkit-db` | `mysql,integration` | MySQL (requires running instance) |
 | `users-info` | `integration` | PostgreSQL |
+| `cf-gears-event-broker` | `integration` | Gear database on SQLite, PostgreSQL and MySQL (testcontainers, or `EB_TEST_POSTGRES_URL` / `EB_TEST_MYSQL_URL`; `make test-integration LANE=eb-gear-db`) |
 
 ### 4.2 Running
 
 ```bash
-make test-sqlite           # quick, no external services needed
-make test-pg               # requires Postgres
-make test-pgq              # requires Docker; PostgreSQL 19 SQL/PGQ lane (testcontainers)
-make test-mysql            # requires MySQL
-make test-db               # all of the above, test-pgq included
-make test-users-info-pg    # users-info Postgres integration
+make test-integration LANE=toolkit-db-sqlite  # quick, no external services needed
+make test-integration LANE=toolkit-db-pg      # requires Postgres
+make test-integration LANE=toolkit-db-pgq     # requires Docker; PostgreSQL 19 SQL/PGQ lane (testcontainers)
+make test-integration LANE=toolkit-db-mysql   # requires MySQL
+make test-db                                  # all of the above, toolkit-db-pgq included
+make test-integration LANE=users-info-pg      # users-info Postgres integration
+make test-integration                         # every integration lane (`make help` lists them)
 ```
 
 ### 4.3 CI
@@ -198,7 +200,7 @@ let container = test_containers::postgres_tagged("16-alpine").start().await?;
 ```
 
 Helpers: `postgres()`, `postgres_named()`, `postgres_tagged()`, `postgres_graph()`, `mysql()`,
-`timescaledb()`, `mariadb()`, `clickhouse()`.
+`redis()`, `timescaledb()`, `mariadb()`, `clickhouse()`.
 
 `timescaledb()`, `mariadb()` and `clickhouse()` return a `GenericImage` rather than a
 `ContainerRequest`: there is no `testcontainers-modules` image module for them, so the caller
@@ -219,6 +221,7 @@ An unset *or empty* variable means "use the pinned constant".
 | `GEARS_TEST_TIMESCALEDB_TAG` | `TIMESCALEDB_TAG` |
 | `GEARS_TEST_MARIADB_TAG` | `MARIADB_TAG` |
 | `GEARS_TEST_CLICKHOUSE_TAG` | `CLICKHOUSE_TAG` |
+| `GEARS_TEST_REDIS_TAG` | `REDIS_TAG` |
 
 ```bash
 GEARS_TEST_PG_TAG=16-alpine cargo nextest run -p cf-gears-toolkit-db --features pg,integration
@@ -292,9 +295,9 @@ set the default local-mode binary does not carry, so they cannot share the commo
 server: they are `launcher: pytest` suites that own their server (and, for
 usage-collector, a TimescaleDB container) in their own `conftest.py`. A plain
 `make e2e-local` (no `SUITE`) runs **only** the shared-server suites (`launcher:
-e2e-launcher`) and therefore **skips these** — run them via their dedicated
-`make e2e-mini-chat` / `make e2e-usage-collector` targets (or `make e2e-local
-SUITE=<suite>`), which CI invokes as separate steps.
+e2e-launcher`) and therefore **skips these** — run them via
+`make e2e-local SUITE=mini-chat` and `make e2e-usage-collector`, which CI
+invokes as separate steps.
 
 The usage-collector lane additionally needs a reachable Docker daemon — its storage
 plugin connects and migrates a real TimescaleDB (or ClickHouse) at gear init, which
@@ -432,7 +435,7 @@ cargo install cargo-llvm-cov                    # coverage backend (works on Win
 The `Makefile` wraps the same operations for convenience:
 
 ```bash
-make all        # build + check + test-sqlite + e2e-local
+make all        # build + check + toolkit-db-sqlite lane + e2e-local
 make check      # fmt + clippy + test + security
 make build      # whole-project example server release binary
 make run        # default example server
@@ -455,7 +458,9 @@ Gear runtime settings are YAML-driven under `gears:<gear_name>:` with a `config`
 ```
 PR opened / updated
   ├── ci.yml
-  │     ├── test          — fmt + clippy + unit tests (Ubuntu, macOS, Windows)
+  │     ├── clippy        — clippy
+  │     ├── repo-checks   — repo file checks (gear names, release config)
+  │     ├── test          — unit tests (Ubuntu)
   │     ├── integration   — DB integration tests (Ubuntu)
   │     ├── test-fips     — FIPS verification / platform-specific FIPS test lanes
   │     ├── security      — cargo-deny
@@ -476,12 +481,74 @@ Additional quality workflows
   └── pr-reviewer-check.yml — reviewer assignment hygiene
 
 Nightly (schedule)
+  ├── macos-windows-tests.yml — unit tests on macOS and Windows (auto-creates issue on failure)
   ├── e2e.yml              — full E2E + specialized E2E lanes (auto-creates issue on failure)
   ├── clusterfuzzlite      — fuzz testing
   ├── codeql.yml           — scheduled code scanning
   ├── pr-governance.yml    — governance / follow-up automation
   └── pr-reviewer-check.yml — reviewer assignment checks
 ```
+
+### 7.4 CI build cache (sccache)
+
+CI jobs compile with sccache, set up by `.github/actions/sccache`. It uses the first of
+these that works:
+
+1. S3-compatible storage (AWS S3, Cloudflare R2, MinIO and others), if set up as below.
+2. The GitHub Actions cache. This is the default.
+3. No cache. The job builds with plain rustc. Cache problems never fail a job.
+
+Only runs on `main` write to the cache. Other runs, PRs included, only read it, so PRs
+don't fill the 10 GB GitHub Actions cache. Each job log has a `sccache backend:` line with
+the backend and its mode. A `main` run that can't write (for example, with a wrong key)
+also shows a warning.
+
+#### S3 setup
+
+Add these repository variables (Settings > Secrets and variables > Actions > Variables):
+
+| Variable | Value |
+|----------|-------|
+| `S3_BUCKET` | bucket name |
+| `S3_ENDPOINT` | empty for AWS S3, else the provider URL, like `https://<account>.r2.cloudflarestorage.com` for R2 |
+| `S3_REGION` | AWS S3: the bucket region. R2: `auto`. Default: `us-east-1` |
+
+Put the keys in two environments (Settings > Environments), each with the secrets
+`S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY`:
+
+| Environment | Key | Deployment branches |
+|-------------|-----|---------------------|
+| `ci-cache-write` | read and write | `main` only |
+| `ci-cache-read` | read only, same bucket | any |
+
+Jobs on `main` use `ci-cache-write`. Other runs use `ci-cache-read`. PR code can read its
+job's key, so only the branch rule keeps the write key out of PRs.
+
+Jobs use these environments only when `S3_BUCKET` is set. Create both environments
+first, then set `S3_BUCKET`. A job that names a missing environment fails before it starts.
+
+- Don't add reviewers or a wait timer to `ci-cache-read`. Every PR job would wait.
+- Don't add the keys as repository or organization secrets. Then every job could read them.
+
+Treat the write key like a deploy key. CI builds binaries from cached crates, so anyone
+with this key can change what later CI runs execute. To rotate a key, put a new one with
+the same access in the environment. Revoke the old one after a green run.
+
+PRs from forks and Dependabot get no secrets, so they use the GitHub Actions cache. With S3
+set up, `main` doesn't write to that cache, so these runs compile everything.
+
+sccache never deletes objects. Add a bucket rule that deletes objects under
+`gears-rust/sccache/` 30 days after they were written. Each crate then misses the cache
+once a month and is written again.
+
+On Linux with S3, the action turns off TCP timestamps. Some S3 servers close each
+connection after one request. Behind the runners' shared NAT, about 3% of new connections
+then stalled for about 20 s. Turning timestamps off halved Ubuntu test job time.
+
+#### Keep the cache keys stable
+
+sccache puts every `CARGO_*` environment variable and `RUSTFLAGS` in its Rust cache keys.
+Adding or changing one makes the job's next run compile everything.
 
 ---
 

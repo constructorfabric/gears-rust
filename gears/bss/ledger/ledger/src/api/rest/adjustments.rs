@@ -1,7 +1,7 @@
 //! Axum handlers + router for the ledger's adjustment (credit-note / debit-note /
 //! exposure) REST surface (Slice 3, design §4.2 / §4.3 / §4.7 / §5, Group E).
 //! Three operations under `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the
-//! path (the vhp-core convention, matching the payment / dispute / recognition
+//! path (the platform convention, matching the payment / dispute / recognition
 //! surfaces): the writes carry `tenant_id` in the **body**, the exposure read
 //! takes the invoice id in the path + the owning seller `tenant_id` in the query.
 //!

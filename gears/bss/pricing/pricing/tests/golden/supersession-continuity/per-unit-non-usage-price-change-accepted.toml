@@ -30,14 +30,14 @@ model_kind      = "per_unit"
 charge_kind     = "recurring"
 currency        = "USD"
 quantity_source = "subscription_seat_count"
-amount_minor    = 1500
+rate            = "15"
 
 [successor]
 model_kind      = "per_unit"
 charge_kind     = "recurring"
 currency        = "USD"
 quantity_source = "subscription_seat_count"
-amount_minor    = 1900
+rate            = "19"
 
 [[assert]]
 expect = { publish = "accepted" }

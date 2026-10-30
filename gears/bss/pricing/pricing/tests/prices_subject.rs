@@ -124,6 +124,7 @@ impl Setup {
             self.f.state.hub.clone(),
             self.book,
             time::OffsetDateTime::now_utc(),
+            Arc::default(),
         );
         let conn = self.f.db.conn().unwrap();
         let entries = price_book_entry_repo::for_book(
@@ -348,7 +349,7 @@ fn body(from: &str) -> Value {
 async fn collect_is_business_content_with_the_pair_partner_and_the_chain_predecessor() {
     let s = setup(0).await;
     let back = s
-        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let mut promo = body("2031-03-01");
     promo["temporary_until"] = json!("2031-03-11");
@@ -390,7 +391,7 @@ async fn collect_is_business_content_with_the_pair_partner_and_the_chain_predece
         );
     }
     let promo_item = items.iter().find(|i| i.item_id == promo_id).unwrap();
-    assert_eq!(promo_item.after["price"], json!({"rate":"0.10"}));
+    assert_eq!(promo_item.after["price"], json!({"rate":"0.1"}));
     assert_eq!(promo_item.after["paired_price_id"], pair[1].to_string());
     assert_eq!(
         promo_item.before.as_ref().unwrap()["price_id"],
@@ -399,10 +400,140 @@ async fn collect_is_business_content_with_the_pair_partner_and_the_chain_predece
     );
 }
 
+// Every price decimal is stored as canonical text: `30.00` is stored, snapshotted and read as
+// `30`, `0.10` as `0.1`, and a rate finer than the currency (`0.047`) keeps every digit.
+#[tokio::test]
+async fn a_draft_stores_snapshots_and_reads_canonical_decimal_text() {
+    let s = setup(0).await;
+    let ids = s
+        .draft(
+            "canonical",
+            json!({"price":{"rate":"0.047"},"min_fee":"30.00","eligibility":"all","effective_from":"2031-05-01"}),
+        )
+        .await;
+    let trailing = s.draft("trailing", body("2031-06-01")).await;
+    let row = s.price(ids[0]).await;
+    assert_eq!(row.price_json, json!({"rate":"0.047"}));
+    assert_eq!(row.min_fee.as_deref(), Some("30"));
+    assert_eq!(s.price(trailing[0]).await.price_json, json!({"rate":"0.1"}));
+    let (status, read, _) =
+        s.f.call(
+            "GET",
+            &format!("/price-book-entries/{}/prices", s.price_book_entry_id()),
+            json!({}),
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "the entry's prices are read");
+    let served = read["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == ids[0].to_string())
+        .unwrap();
+    assert_eq!(served["price_json"], json!({"rate":"0.047"}));
+    assert_eq!(served["min_fee"], "30");
+    let subject = s.subject().await;
+    let id = ids[0];
+    let items = s
+        .tx(move |tx, _| {
+            let subject = subject.clone();
+            Box::pin(async move { Ok(subject.collect(tx, &[id]).await?) })
+        })
+        .await
+        .unwrap();
+    assert_eq!(items[0].after["price"], json!({"rate":"0.047"}));
+    assert_eq!(items[0].after["min_fee"], "30");
+}
+
+// The door refuses a decimal sent as a JSON number, text with spaces and precision beyond a
+// field's limit, and stores nothing.
+#[tokio::test]
+async fn a_draft_with_a_json_number_spaces_or_excess_precision_is_refused() {
+    let s = setup(0).await;
+    let with = |price: Value, fee: Option<&str>| {
+        let mut b = body("2031-05-01");
+        b["price"] = price;
+        if let Some(fee) = fee {
+            b["min_fee"] = json!(fee);
+        }
+        b
+    };
+    for (n, (draft, code)) in [
+        (with(json!({"rate": 0.047}), None), "AMOUNT_INVALID"),
+        (with(json!({"rate": " 0.047"}), None), "AMOUNT_INVALID"),
+        (with(json!({"rate": "0.047 "}), None), "AMOUNT_INVALID"),
+        (
+            with(json!({"rate": "0.0000000000001"}), None),
+            "AMOUNT_OUT_OF_RANGE",
+        ),
+        (with(json!({"rate": "0.1"}), Some(" 30")), "MIN_FEE_INVALID"),
+        (
+            with(json!({"rate": "0.1"}), Some("30.00 ")),
+            "MIN_FEE_INVALID",
+        ),
+        (
+            with(json!({"rate": "0.1"}), Some("30.001")),
+            "MIN_FEE_INVALID",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let answer = s.try_draft(&format!("refused-{n}"), draft).await;
+        refused_with(&answer, 400, code);
+    }
+    let stored = price_repo::for_entry(
+        &s.f.db.conn().unwrap(),
+        &AccessScope::for_tenant(s.tenant()),
+        s.tenant(),
+        s.price_book_entry_id(),
+    )
+    .await
+    .unwrap();
+    assert!(stored.is_empty(), "nothing is stored");
+}
+
+/// A minimum fee the shared parser refuses is `MIN_FEE_INVALID` whose message says why: text that
+/// is not plain decimal text (a space, an exponent, a trailing point) is told the format, and a
+/// value over 28 digits is told the limit.
+#[tokio::test]
+async fn a_refused_minimum_fee_says_why() {
+    let s = setup(0).await;
+    for (n, (fee, why)) in [
+        (" 30", "plain decimal text"),
+        ("30.00 ", "plain decimal text"),
+        ("1e2", "plain decimal text"),
+        ("30.", "plain decimal text"),
+        ("12345678901234567890123456789", "at most 28 digits in all"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut draft = body("2031-05-01");
+        draft["min_fee"] = json!(fee);
+        let (status, answer) = s.try_draft(&format!("fee-{n}"), draft).await;
+        assert_eq!(status, 400, "the fee is refused");
+        let violation = &answer["context"]["field_violations"][0];
+        assert_eq!(
+            (&violation["field"], &violation["reason"]),
+            (&json!("min_fee"), &json!("MIN_FEE_INVALID")),
+            "the refusal keeps its code"
+        );
+        assert!(
+            violation["description"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("min_fee") && d.contains(why)),
+            "the refusal says why"
+        );
+    }
+}
+
 #[tokio::test]
 async fn validate_submit_reruns_the_rules_the_pair_rule_and_book_ownership() {
     let s = setup(0).await;
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let single = s.draft("single", body("2031-05-01")).await;
     let mut promo = body("2031-03-01");
@@ -428,7 +559,7 @@ async fn validate_submit_reruns_the_rules_the_pair_rule_and_book_ownership() {
         .unwrap_err();
     assert_eq!(code(&err), "PAIR_SPLIT");
     // Another unit approved the same start meanwhile.
-    s.approved(9, "2031-05-01", "per_unit", json!({"rate":"0.30"}))
+    s.approved(9, "2031-05-01", "per_unit", json!({"rate":"0.3"}))
         .await;
     let err = s
         .submit(s.subject().await, single.clone(), 1)
@@ -449,7 +580,7 @@ async fn the_chain_guard_reads_sku_metering_as_of_each_start() {
         (day("2030-01-01"), Some("GB".into()), Some("storage".into())),
         (day("2031-06-01"), Some("TB".into()), Some("storage".into())),
     ]);
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let early = s.draft("early", body("2031-03-01")).await;
     let late = s.draft("late", body("2031-07-01")).await;
@@ -556,7 +687,7 @@ fn first_unit_like(tenant: Uuid) -> Unit {
 async fn apply_normalizes_the_chain_and_marks_the_new_prices_predecessor_keep_for_bound() {
     let s = setup(0).await;
     let old = s
-        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let mut signup = body("2031-06-01");
     signup["eligibility"] = json!("new");
@@ -587,7 +718,7 @@ async fn apply_normalizes_the_chain_and_marks_the_new_prices_predecessor_keep_fo
 async fn apply_shifts_a_pair_by_one_delta() {
     let s = setup(0).await;
     let base = s
-        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+        .approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let mut promo = body("2031-03-01");
     promo["temporary_until"] = json!("2031-03-11");
@@ -615,7 +746,7 @@ async fn apply_shifts_a_pair_by_one_delta() {
 #[tokio::test]
 async fn approving_a_later_default_price_keeps_a_closed_value_price() {
     let s = setup_with(0, true).await;
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let mut eu = body("2031-03-01");
     eu["dim_value"] = json!("eu");
@@ -645,7 +776,7 @@ async fn apply_refuses_the_whole_unit_when_the_environment_changed() {
         Some("GB".into()),
         Some("storage".into()),
     ));
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let first = s.draft("first", body("2031-05-01")).await;
     let second = s.draft("second", body("2031-08-01")).await;
@@ -655,7 +786,7 @@ async fn apply_refuses_the_whole_unit_when_the_environment_changed() {
         .unwrap()
         .unit;
     // Another unit approved one of the starts meanwhile.
-    s.approved(9, "2031-08-01", "per_unit", json!({"rate":"0.30"}))
+    s.approved(9, "2031-08-01", "per_unit", json!({"rate":"0.3"}))
         .await;
     let err = s.approve(s.subject().await, &unit).await.unwrap_err();
     assert_eq!(code(&err), "APPLY_REFUSED");
@@ -674,7 +805,7 @@ async fn apply_refuses_the_whole_unit_when_the_environment_changed() {
         Some("GB".into()),
         Some("storage".into()),
     ));
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let ids = s.draft("x", body("2031-09-01")).await;
     let unit = s
@@ -1024,7 +1155,7 @@ async fn a_price_approved_before_an_existing_new_price_is_marked_keep_for_bound(
 async fn a_products_refusal_of_the_dated_read_reaches_the_caller_with_its_code() {
     use std::sync::atomic::Ordering::SeqCst;
     let s = setup(0).await;
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let ids = s.draft("x", body("2031-03-01")).await;
     let submit = format!("/prices/{}/submit", ids[0]);
@@ -1070,7 +1201,7 @@ async fn a_price_before_the_first_sku_version_is_guarded_by_the_earliest_version
         Some("GB".into()),
         Some("storage".into()),
     ));
-    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.20"}))
+    s.approved(1, "2031-01-01", "per_unit", json!({"rate":"0.2"}))
         .await;
     let same = s.draft("same", body("2031-07-01")).await;
     assert!(

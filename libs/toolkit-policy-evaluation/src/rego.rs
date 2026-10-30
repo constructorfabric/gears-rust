@@ -135,6 +135,49 @@ pub fn screen_denylist(doc: &dyn CompiledDocument) -> BTreeSet<String> {
         .collect()
 }
 
+/// Why [`compile_screened`] rejected a document.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ScreenedCompileError {
+    /// The document does not compile.
+    #[error(transparent)]
+    Compile(#[from] CompileError),
+    /// The document compiles but references denylisted builtins.
+    #[error(
+        "references denylisted builtin(s): {}",
+        .builtins.iter().map(String::as_str).collect::<Vec<_>>().join(", ")
+    )]
+    Denylisted {
+        /// The denylisted builtins it references.
+        builtins: BTreeSet<String>,
+    },
+}
+
+/// Compiles `source` (named `document_name`, value rule `entrypoint`) with
+/// `backend` and screens it with [`screen_denylist`]: the one way to turn
+/// stored or configured Rego into a document that may be evaluated.
+///
+/// Synchronous CPU work, like [`EvaluationBackend::compile`].
+///
+/// # Errors
+///
+/// - [`ScreenedCompileError::Compile`] as [`EvaluationBackend::compile`];
+/// - [`ScreenedCompileError::Denylisted`] naming every denylisted builtin
+///   the document references.
+pub fn compile_screened(
+    backend: &dyn EvaluationBackend,
+    document_name: &str,
+    source: &str,
+    entrypoint: &str,
+) -> Result<Arc<dyn CompiledDocument>, ScreenedCompileError> {
+    let compiled = backend.compile(document_name, source, entrypoint)?;
+    let builtins = screen_denylist(compiled.as_ref());
+    if builtins.is_empty() {
+        Ok(compiled)
+    } else {
+        Err(ScreenedCompileError::Denylisted { builtins })
+    }
+}
+
 impl EvaluationBackend for RegoBackend {
     fn validate_syntax(&self, source: &str) -> Result<(), CompileError> {
         catch_compile_panic(AssertUnwindSafe(|| {
@@ -332,7 +375,7 @@ impl CompiledDocument for RegoDocument {
         &self,
         ctx: &EvaluationContext,
         bound: CostBound,
-    ) -> Result<serde_json::Value, EvaluationError> {
+    ) -> Result<Option<serde_json::Value>, EvaluationError> {
         // The engine is a per-call clone and is dropped on unwind, so no
         // state a panic may have left half-updated is observed afterwards.
         panic::catch_unwind(AssertUnwindSafe(|| self.evaluate_unguarded(ctx, bound)))
@@ -349,7 +392,7 @@ impl RegoDocument {
         &self,
         ctx: &EvaluationContext,
         bound: CostBound,
-    ) -> Result<serde_json::Value, EvaluationError> {
+    ) -> Result<Option<serde_json::Value>, EvaluationError> {
         let input =
             regorus::Value::deserialize(ctx.document()).map_err(|err| EvaluationError::Failed {
                 message: format!("evaluation input is not representable: {err}"),
@@ -372,9 +415,9 @@ impl RegoDocument {
         within_bound(started, bound.limit)?;
 
         if value == regorus::Value::Undefined {
-            return Ok(serde_json::Value::Null);
+            return Ok(None);
         }
-        to_json(&value, started, bound.limit)
+        to_json(&value, started, bound.limit).map(Some)
     }
 }
 

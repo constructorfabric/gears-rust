@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
+use authz_resolver_sdk::PolicyEnforcer;
 use tenant_resolver_sdk::TenantResolverClient;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
@@ -34,9 +34,10 @@ use crate::infra::types_registry::GtsSecretTypeResolver;
 // `init`. System modules initialize before non-system ones
 // (`modules_by_system_priority`), so credstore must also be a system module to
 // register its client before those consumers init.
+#[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "credstore",
-    deps = [authz_resolver, tenant_resolver, types_registry],
+    deps = [tenant_resolver, types_registry],
     capabilities = [system, db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
@@ -108,15 +109,13 @@ impl Gear for CredStoreGear {
 
         let repo = Arc::new(SecretRepoImpl::new(Arc::clone(&db)));
 
-        let authz_client = ctx
-            .client_hub()
-            .get::<dyn AuthZResolverApi>()
-            .map_err(|e| anyhow::anyhow!("failed to get AuthZResolverApi: {e}"))?;
         // No PDP capabilities: credstore projects no authorization tables
         // (no `tenant_closure`), so the PDP hands it pre-expanded, flat
-        // tenant predicates (AUTHZ_USAGE_SCENARIOS S09–S11).
-        let enforcer = PolicyEnforcer::new(authz_client);
-        info!("authz-resolver client resolved from client hub; PolicyEnforcer wired");
+        // tenant predicates (AUTHZ_USAGE_SCENARIOS S09–S11). The resolver is
+        // consumed, wired after `init` (locally or remotely), so the enforcer
+        // fetches it from the hub per call.
+        let enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
+        info!("PolicyEnforcer wired to the consumed authz-resolver");
 
         let tr_client = ctx
             .client_hub()
@@ -204,3 +203,7 @@ impl RestApiCapability for CredStoreGear {
         Ok(router)
     }
 }
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;

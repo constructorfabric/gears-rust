@@ -1,5 +1,5 @@
 //! Repository for the per-tenant FX revaluation mode
-//! (`ledger_tenant_fx_revaluation_mode`, VHP-1986): resolve the version in effect
+//! (`ledger_tenant_fx_revaluation_mode`): resolve the version in effect
 //! (latest `effective_from <= at`, highest `version` on a tie) and append a new
 //! effective-dated version. Mirrors [`PostingPolicyRepo`](super::PostingPolicyRepo).
 //! Tenant-scoped via `SecureORM` (SQL-level BOLA); out-of-txn on a fresh scoped

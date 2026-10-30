@@ -1,4 +1,3 @@
-// Created: 2026-09-29 by Virtuozzo International GmbH
 //! The `$filter` grammar the settings surfaces share.
 //!
 //! Browse and search take the same expression — `category_id eq`, `key eq`,
@@ -16,10 +15,10 @@ use crate::field;
 
 /// What a settings filter asks for, once interpreted.
 ///
-/// Browse reads `needs_review` as a switch — the page lists flagged rows
-/// instead of resolving — and search as a narrowing: only settings with a
-/// flagged override in the corpus. The remainder selects declarations on
-/// either.
+/// Browse and search read `needs_review` as a narrowing of the page: only
+/// settings whose own override at the target is flagged. The review listing is
+/// the flagged rows themselves and refuses it. The remainder selects
+/// declarations on all three.
 #[derive(Debug, Default)]
 pub(crate) struct SettingFilter {
     /// `needs_review eq true`.
@@ -76,7 +75,9 @@ fn split(expr: &Expr, out: &mut SettingFilter) -> Result<Option<Expr>, DomainErr
             {
                 if !flag {
                     return Err(unsupported(
-                        "`needs_review eq false` is not a listing; omit the filter to browse",
+                        "`needs_review eq false` is not a listing, and not a narrowing either: \
+                         the filter keeps the settings flagged for review; omit it to keep \
+                         them all",
                     ));
                 }
                 out.needs_review = true;

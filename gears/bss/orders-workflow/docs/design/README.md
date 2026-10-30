@@ -113,7 +113,7 @@ step's operation is not an edge: it dispatches through the operation registry (`
 the step route does. Each back-edge is a port the later slice owns: the earlier slice is built and
 unit-tested against a double of that port, and its integration test runs once the owner lands —
 the way Orders Lifecycle builds capture against an `EventBrokerApi` double
-([`../../../orders-lifecycle/docs/DECOMPOSITION.md` §3.1](../../../orders-lifecycle/docs/DECOMPOSITION.md#31-upstream-and-release-prerequisites),
+([`../../../orders-lifecycle/docs/DECOMPOSITION.md` §3.1](../../../orders/docs/DECOMPOSITION.md#31-upstream-and-release-prerequisites),
 *Phase 0/1*). The purge's edges are table deletes, not ports: each slice's purge predicate and
 retention index join the worker's roster in that slice's own build step, where their test runs.
 

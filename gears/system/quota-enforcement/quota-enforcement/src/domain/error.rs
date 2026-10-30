@@ -7,9 +7,14 @@
 use std::fmt;
 
 use authz_resolver_sdk::EnforcerError;
-use quota_enforcement_sdk::{LeaseToken, PolicyId, StorageError};
+use quota_enforcement_sdk::{LeaseToken, PolicyId, PolicyScope, StorageError};
 use toolkit::plugins::ChoosePluginError;
 use toolkit_macros::domain_model;
+
+use super::ports::metrics::ValidationReason;
+use quota_enforcement_sdk::engine::DebitPlanInvariant;
+
+use super::tokens;
 
 /// Which plugin family a binding error is about.
 ///
@@ -42,6 +47,10 @@ pub enum Dependency {
     Pdp,
     /// The types registry.
     TypesRegistry,
+    /// The projection contract catalogue built from the configured projections.
+    Catalog,
+    /// The statically registered resolution engines and their artifacts.
+    Engine,
 }
 
 impl Dependency {
@@ -53,6 +62,8 @@ impl Dependency {
             Self::Cluster => "cluster",
             Self::Pdp => "pdp",
             Self::TypesRegistry => "types_registry",
+            Self::Catalog => "catalog",
+            Self::Engine => "engine",
         }
     }
 }
@@ -112,6 +123,50 @@ pub enum DomainError {
         reason: &'static str,
     },
 
+    // --- engine evaluation (DESIGN section 3.3) ---
+    /// The engine reported its wall-time budget spent. The partial Decision
+    /// is discarded and no counter moves (`inst-eb-timeout`).
+    #[error("engine {engine_id} exceeded its evaluation budget")]
+    EngineTimeout {
+        /// The engine that ran out of time.
+        engine_id: String,
+    },
+    /// The engine spent its cost budget before finishing.
+    #[error("engine {engine_id} exceeded its evaluation cost limit")]
+    EngineCostExceeded {
+        /// The engine that ran out of budget.
+        engine_id: String,
+    },
+    /// A Decision broke the closed Debit-Plan invariant set; nothing was
+    /// mutated (`inst-eb-violation`).
+    #[error("engine {engine_id} produced a decision violating {invariant}")]
+    InvariantViolation {
+        /// The engine whose Decision was refused.
+        engine_id: String,
+        /// Which invariant, from the closed set of four.
+        invariant: DebitPlanInvariant,
+    },
+    /// A type or internal failure inside the engine. The detail is for the
+    /// log; the response carries an opaque `Internal`.
+    #[error("engine {engine_id} failed: {detail}")]
+    EngineFailure {
+        /// The engine that failed.
+        engine_id: String,
+        /// What the engine reported.
+        detail: String,
+    },
+
+    /// A policy input failed bounded validation before persistence.
+    #[error("invalid policy {field}: {reason}: {detail}")]
+    InvalidPolicy {
+        /// Public field name.
+        field: &'static str,
+        /// Stable machine-readable reason.
+        reason: &'static str,
+        /// Safe diagnostic without the submitted configuration.
+        detail: String,
+    },
+
     // --- readiness and binding ---
     /// Bootstrap has not completed; the dependency is not usable yet.
     #[error("quota enforcement is not ready: {dependency} is not bound")]
@@ -122,6 +177,15 @@ pub enum DomainError {
     /// The types registry could not answer.
     #[error("types registry unavailable: {0}")]
     TypesRegistryUnavailable(String),
+    /// The configured projection contract catalogue failed a bootstrap
+    /// consistency check. `subject` names the offending definition.
+    #[error("projection contract catalogue rejected {subject}: {reason}")]
+    CatalogInvalid {
+        /// Which check failed.
+        reason: ValidationReason,
+        /// The GTS id, metric, or pair the check failed on.
+        subject: String,
+    },
     /// No plugin instance matched the configured vendor.
     #[error("no {kind} plugin instance registered for vendor {vendor}")]
     PluginNotFound {
@@ -188,6 +252,30 @@ pub enum DomainError {
     /// The acquisition contention timeout elapsed.
     #[error("acquisition contention timeout elapsed")]
     LeaseContentionTimeout,
+    /// A batch's evaluation outlasted the batch-level timeout; nothing was
+    /// written.
+    #[error("batch evaluation exceeded the batch timeout")]
+    BatchTimeout,
+
+    // --- batch debit ---
+    /// One batch item's field is invalid; the whole envelope is refused.
+    #[error("invalid batch item {index} {field}: {reason}")]
+    InvalidBatchItem {
+        /// The item's position in the request.
+        index: usize,
+        /// The item field.
+        field: &'static str,
+        /// Closed `UPPER_SNAKE` reason token.
+        reason: &'static str,
+    },
+    /// The batch has more items than the configured maximum.
+    #[error("batch of {items} items exceeds the maximum of {max}")]
+    BulkTooLarge {
+        /// Items submitted.
+        items: usize,
+        /// The configured maximum.
+        max: usize,
+    },
     /// Commit amount exceeds the reserved amount.
     #[error("commit amount {actual} exceeds reserved amount {reserved}")]
     OverCommitNotAuthorized {
@@ -207,6 +295,27 @@ pub enum DomainError {
         /// Found version.
         actual: u32,
     },
+    /// An active policy already occupies the exact scope.
+    #[error("policy scope already occupied: {scope:?}")]
+    PolicyScopeOccupied {
+        /// Occupied scope.
+        scope: PolicyScope,
+    },
+    /// The policy identifier was never created.
+    #[error("policy {policy_id} not found")]
+    PolicyNotFound {
+        /// Missing policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The policy was soft-deleted and cannot be reactivated.
+    #[error("policy {policy_id} is deleted")]
+    PolicyDeleted {
+        /// Deleted policy identifier.
+        policy_id: PolicyId,
+    },
+    /// The global fallback policy cannot be deleted.
+    #[error("cannot delete seeded global policy")]
+    CannotDeleteSeededGlobalPolicy,
     /// The named policy version does not exist.
     #[error("unknown version {version} of policy {policy_id}")]
     UnknownPolicyVersion {
@@ -252,11 +361,48 @@ pub enum DomainError {
         /// The metric.
         metric: String,
     },
+    /// The projection is registered but outside the configured catalogue.
+    #[error("projection {projection} is not resolvable in the configured catalogue")]
+    ProjectionNotResolvable {
+        /// The projection type identifier.
+        projection: String,
+    },
     /// The projection is not registered.
     #[error("projection {projection} is not registered")]
     ProjectionNotRegistered {
         /// The projection type.
         projection: String,
+    },
+
+    // --- quota lifecycle, decided before storage ---
+    /// A reserved capability: the `rate` quota type in P1.
+    #[error("{feature} is not yet implemented")]
+    NotYetImplemented {
+        /// The reserved capability.
+        feature: &'static str,
+    },
+    /// A negative cap. Caps live in `0..=i64::MAX`; `0` and unbounded are valid.
+    #[error("cap {cap} is negative")]
+    CapMustBeNonNegative {
+        /// The requested cap.
+        cap: i64,
+    },
+    /// Notification thresholds on an unbounded cap: percentages of nothing.
+    /// Raised by the gear's pre-check and by storage on the merged row (I14).
+    #[error("notification thresholds require a bounded cap")]
+    ThresholdsRequireBoundedCap,
+    /// Quota metadata violates the metric owner's constraint contract.
+    #[error("metadata violates constraint contract {contract}")]
+    ConstraintContractMismatch {
+        /// The constraint contract type.
+        contract: String,
+    },
+    /// The metric is registered but its instance carries no usable
+    /// classification (kind and enforcement mode). Never defaulted.
+    #[error("metric {metric} carries no usable classification")]
+    MetricClassificationInvalid {
+        /// The metric.
+        metric: String,
     },
 
     /// Last-resort opaque failure. Never carries caller-facing detail.
@@ -267,6 +413,8 @@ pub enum DomainError {
 impl DomainError {
     /// Closed reason token when the PDP permit carried no usable constraints.
     pub const CONSTRAINT_COMPILE_FAILED: &'static str = "CONSTRAINT_COMPILE_FAILED";
+    /// Closed reason token when a projection is registered but not configured.
+    pub const PROJECTION_NOT_RESOLVABLE: &'static str = "PROJECTION_NOT_RESOLVABLE";
     /// Closed reason token when storage caught a subject outside the scope.
     pub const SUBJECT_OUT_OF_SCOPE: &'static str = "SUBJECT_OUT_OF_SCOPE";
 
@@ -310,12 +458,18 @@ impl DomainError {
 }
 
 /// 1:1 lift of the storage contract errors (DESIGN section 3.3).
+// @cpt-algo:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1
 impl From<StorageError> for DomainError {
     fn from(err: StorageError) -> Self {
         match err {
+            StorageError::LeaseNotFound { token } => Self::NotFound {
+                kind: ResourceKind::Lease,
+                id: token.to_string(),
+            },
             StorageError::LeaseNotActive { token } => Self::LeaseNotActive { token },
             StorageError::LeaseInflightLimitExceeded => Self::LeaseInflightLimitExceeded,
             StorageError::LeaseContentionTimeout => Self::LeaseContentionTimeout,
+            StorageError::BatchTimeout => Self::BatchTimeout,
             StorageError::OverCommitNotAuthorized { reserved, actual } => {
                 Self::OverCommitNotAuthorized { reserved, actual }
             }
@@ -323,6 +477,10 @@ impl From<StorageError> for DomainError {
             StorageError::VersionConflict { expected, actual } => {
                 Self::VersionConflict { expected, actual }
             }
+            StorageError::PolicyScopeOccupied { scope } => Self::PolicyScopeOccupied { scope },
+            StorageError::PolicyNotFound { policy_id } => Self::PolicyNotFound { policy_id },
+            StorageError::PolicyDeleted { policy_id } => Self::PolicyDeleted { policy_id },
+            StorageError::CannotDeleteSeededGlobalPolicy => Self::CannotDeleteSeededGlobalPolicy,
             StorageError::UnknownPolicyVersion { policy_id, version } => {
                 Self::UnknownPolicyVersion { policy_id, version }
             }
@@ -332,11 +490,17 @@ impl From<StorageError> for DomainError {
             StorageError::CapBelowConsumed { new_cap, consumed } => {
                 Self::CapBelowConsumed { new_cap, consumed }
             }
+            StorageError::ThresholdsRequireBoundedCap => Self::ThresholdsRequireBoundedCap,
             StorageError::QuotaNotFound { id } => Self::NotFound {
                 kind: ResourceKind::Quota,
                 id: id.to_string(),
             },
             StorageError::QuotaDeactivated { id } => Self::QuotaDeactivated { id: id.to_string() },
+            // Keep missing, non-mutating, and unauthorized operations indistinguishable.
+            StorageError::OperationNotFound { key } => Self::NotFound {
+                kind: ResourceKind::Operation,
+                id: key,
+            },
             StorageError::PeriodClosed => Self::PeriodClosed,
             StorageError::MetricNotRegistered { metric } => Self::MetricNotRegistered { metric },
             StorageError::MetricNotQuotaGated { metric } => Self::MetricNotQuotaGated { metric },
@@ -347,9 +511,22 @@ impl From<StorageError> for DomainError {
             StorageError::SubjectOutOfScope => Self::PdpDenied {
                 reason: Some(Self::SUBJECT_OUT_OF_SCOPE.to_owned()),
             },
+            StorageError::InvalidCursor => Self::InvalidArgument {
+                field: "cursor",
+                reason: tokens::CURSOR_INVALID,
+            },
+            // The transaction has already rolled back this evaluation failure.
+            // @cpt-begin:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
+            StorageError::EvaluationFailed { engine_id, failure } => {
+                super::engines::lift_evaluation(&engine_id, failure)
+            }
+            // @cpt-end:cpt-cf-quota-enforcement-algo-evaluation-pipeline:p1:inst-pipe-fail
+            // Reaching this lift means the preparation retry budget was exhausted.
+            StorageError::PreparationRequired { policy_id, version } => Self::Internal(format!(
+                "artifact for policy {policy_id} version {version} was never prepared"
+            )),
             StorageError::Unavailable(detail) => Self::BackendUnavailable(detail),
-            // Detected at bootstrap and fatal there. A runtime occurrence is a
-            // contract violation of the plugin, hence internal.
+            // A post-bootstrap mismatch violates the storage contract.
             StorageError::SchemaVersionMismatch {
                 installed,
                 expected,

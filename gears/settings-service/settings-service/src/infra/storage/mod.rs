@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! Persistence.
 //!
 //! Holds the migration harness today. Entities and repositories arrive with the
@@ -14,6 +13,7 @@ pub mod category_repo;
 pub mod clock;
 pub mod declaration_odata_mapper;
 pub mod declaration_repo;
+pub(crate) mod listing;
 // The tables' entities stay inside the crate: each store is the one way its
 // table is written, and the audit store the one way `audit_records` is — an
 // entity reachable from outside would be a second, unguarded path.
@@ -22,4 +22,5 @@ pub mod migrations;
 pub mod odata_mapper;
 pub mod pending_secret_repo;
 pub mod search_repo;
+pub(crate) mod text_match;
 pub mod value_repo;

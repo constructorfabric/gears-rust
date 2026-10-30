@@ -60,7 +60,22 @@ impl AcceptanceFixture {
     }
     /// Build the same real service and catalog scenario on either migrated backend.
     pub async fn on(fixture: p::Fixture, catalog: Arc<p::Catalog>) -> Self {
-        let book = p::book(&fixture, "acceptance").await;
+        Self::in_currency(fixture, catalog, "EUR").await
+    }
+    /// [`Self::on`] with the book, its price and the sale's market in `currency`. The price is
+    /// stored at the scale the fixture's currency table gives the currency now.
+    pub async fn in_currency(
+        fixture: p::Fixture,
+        catalog: Arc<p::Catalog>,
+        currency: &'static str,
+    ) -> Self {
+        let scale = fixture
+            .state
+            .currency_scales()
+            .resolve(currency)
+            .expect("the fixture's currency table knows the currency")
+            .scale();
+        let book = p::book_in(&fixture, "acceptance", currency).await;
         let sku = catalog.sku(bss_products_sdk::models::SkuType::Usage);
         let entry = p::policy_entry(&fixture, book, sku, "usage", None).await;
         s::put(
@@ -68,6 +83,8 @@ impl AcceptanceFixture {
             entry,
             s::Row {
                 price: serde_json::json!({"rate":"10"}),
+                currency,
+                currency_scale: i16::from(scale),
                 ..s::Row::default()
             },
         )
@@ -85,6 +102,7 @@ impl AcceptanceFixture {
         let enforcer = Arc::new(p::entry_support::enforcer_for(ctx.subject_tenant_id()));
         let read = PricingReadProvider::new(fixture.state.clone(), enforcer.clone());
         let mut query = s::sale_query();
+        query.market.currency = currency.into();
         let resolved = read
             .resolve(
                 &ctx,
@@ -157,6 +175,13 @@ impl AcceptanceFixture {
             .unwrap();
     }
     pub async fn resolved(&self) -> bss_pricing_sdk::read::ResolvedBindings {
+        self.try_resolved().await.unwrap()
+    }
+    /// [`Self::resolved`] as the provider answers it, refusals included.
+    pub async fn try_resolved(
+        &self,
+    ) -> Result<bss_pricing_sdk::read::ResolvedBindings, toolkit_canonical_errors::CanonicalError>
+    {
         self.read
             .resolve(
                 &self.ctx,
@@ -171,7 +196,6 @@ impl AcceptanceFixture {
                 },
             )
             .await
-            .unwrap()
     }
     pub fn hook(
         &self,

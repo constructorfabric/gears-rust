@@ -436,7 +436,7 @@ async fn contra_revenue_write_off_is_not_allowed_and_does_not_post() {
     );
 }
 
-// TODO(VHP-1856 Slice 3 Phase 3): a payer-gate `#[ignore]` test — an AR /
+// TODO(Slice 3): a payer-gate `#[ignore]` test — an AR /
 // UNALLOCATED leg with `payer_tenant_id = None` must reject with
 // `ManualAdjustmentNotAllowed("AR/UNALLOCATED leg requires payer_tenant_id")`, and
 // the same legs WITH a payer must post (the AR / UNALLOCATED grain attributing to

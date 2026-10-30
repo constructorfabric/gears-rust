@@ -1,6 +1,6 @@
 //! Axum handlers + router for the ledger's journal-entry / balance REST surface
 //! (architecture §6). Eight operations under `/bss-ledger/v1`, all tenant-scoped
-//! WITHOUT a tenant in the path (the vhp-core convention, matching the
+//! WITHOUT a tenant in the path (the platform convention, matching the
 //! provisioning surface): writes carry `tenant_id` in the **body**, reads take a
 //! `?tenant_id=` **query** param (the caller's own tenant by default); both are
 //! PDP-`In` scoped (SQL-level BOLA).
@@ -92,7 +92,7 @@ pub struct ApiState {
     /// Invoice-post write port (writes: post / reversal / mapping-correction).
     /// A trait object so the router tests can stub the post path without a DB.
     pub posting: Arc<dyn InvoicePoster>,
-    /// Dual-control lifecycle engine (VHP-1852): the reverse gate routes a
+    /// Dual-control lifecycle engine: the reverse gate routes a
     /// high-value reversal to the preparer→approver queue instead of posting it.
     /// `None` disables the gate (router unit tests without a governance DB).
     pub approval: Option<Arc<crate::infra::approval::service::ApprovalService>>,
@@ -109,7 +109,7 @@ pub struct ApiState {
     /// `ApiState` with `None` (mirrors `approval`); production ALWAYS wires `Some`
     /// (see `module.rs`).
     pub journal_repo: Option<JournalRepo>,
-    /// Tenant posting-policy repo (VHP-1853) — the AR-aging read resolves the
+    /// Tenant posting-policy repo — the AR-aging read resolves the
     /// tenant's configured bucket thresholds through it. `Option` for the stub
     /// REST tests (`None` ⇒ the gear default buckets); production wires `Some`.
     pub posting_policy: Option<PostingPolicyRepo>,
@@ -493,7 +493,7 @@ async fn post_invoice(
         .into_domain(ctx.subject_id())
         .map_err(CanonicalError::from)?;
 
-    // Dual-control gate (VHP-1852, Group J): a post whose `effective_at` predates
+    // Dual-control gate: a post whose `effective_at` predates
     // the tenant's A6 backdating window is a *material backdating* — route it to
     // the preparer→approver queue (409) instead of posting inline. The ledger
     // object does not exist yet (the gate fires before the post) and the source
@@ -621,7 +621,7 @@ async fn reverse_entry(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // Dual-control gate (VHP-1852): a reversal whose magnitude crosses the D2
+    // Dual-control gate: a reversal whose magnitude crosses the D2
     // threshold routes to the preparer→approver queue (409) instead of posting
     // inline; below threshold it stays single-actor (unchanged).
     if let Some(approval) = &state.approval {
@@ -1039,7 +1039,7 @@ async fn ar_aging_handler(
         .client
         .list_ar_invoice_balances(&ctx, tenant_id, query.payer)
         .await?;
-    // VHP-1853: bucket by the tenant's configured AR-aging thresholds (the gear
+    // Bucket by the tenant's configured AR-aging thresholds (the gear
     // default when no policy row / a stub state). The policy read is scoped on
     // `ENTRY:read` — the same grant the AR balance read above already requires,
     // so this adds no new authorization surface.

@@ -1,54 +1,78 @@
-//! Types Registry SDK
-//!
-//! This crate provides the public API for the `types-registry` gear:
-//! - `TypesRegistryClient` trait for inter-gear communication. Per
-//!   [ADR 0005][adr] every fallible method (and every per-item `Result` it
-//!   returns) carries [`toolkit_canonical_errors::CanonicalError`].
-//! - `GtsTypeSchema` / `GtsInstance` typed entity models
-//! - `TypeSchemaQuery` / `InstanceQuery` for filtering
-//! - `GtsTypeId` / `GtsInstanceId` typed identifiers
-//! - [`TypesRegistryError`] — opt-in `From<CanonicalError>` projection (see
-//!   [`error`]) plus its co-located wire vocabulary ([`field`],
-//!   [`precondition`], [`gts`])
-//!
-//! ## Usage
-//!
-//! Consumers obtain the client from `ClientHub`:
-//! ```ignore
-//! use types_registry_sdk::{TypeSchemaQuery, TypesRegistryClient};
-//!
-//! let client = hub.get::<dyn TypesRegistryClient>()?;
-//!
-//! let schema = client.get_type_schema(gts_id!("acme.core.events.user.v1~")).await?;
-//! let schemas = client
-//!     .list_type_schemas(TypeSchemaQuery::default().with_pattern(format!("{GTS_ID_PREFIX}acme.*")))
-//!     .await?;
-//! ```
-//!
-//! [adr]: https://github.com/constructorfabric/gears-rust/blob/main/docs/arch/errors/ADR/0005-cpt-cf-adr-sdk-canonical-projection.md
-
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
-pub mod api;
+pub mod contract;
 pub mod error;
+pub mod ext;
 pub mod field;
 pub mod gts;
+pub mod item_failure;
 pub mod models;
+#[cfg(any(feature = "rest-client", feature = "rest-server"))]
+mod paths;
 pub mod precondition;
+mod publication;
+pub mod reason;
+mod reconcile;
+#[cfg(feature = "rest-server")]
+mod rest_binding;
+#[cfg(feature = "rest-client")]
+mod rest_client;
+
+#[cfg(any(test, feature = "test-util"))]
+#[expect(
+    clippy::expect_used,
+    reason = "test support: a malformed fixture identifier is a bug in the test"
+)]
+pub mod testing_platform;
+
+pub use contract::{
+    PlatformTypesRegistryApi, TypesRegistryApi, platform_types_registry_api_ir,
+    types_registry_api_ir,
+};
+pub use error::{FieldIssue, TypesRegistryError};
+pub use ext::{PlatformTypesRegistryApiExt, TypesRegistryApiExt};
+pub use gts::{OPERATION_RESOURCE_TYPE, TYPE_RESOURCE_TYPE};
+pub use item_failure::{AdmissionFailure, AdmissionFailureReason, DependencyKind};
+pub use models::{
+    BatchGetEntitiesRequest, BatchGetEntitiesResponse, BatchGetItem, CandidateStatus, Cursor,
+    DeleteEntitiesRequest, DeleteItem, DeletionItemResult, DeletionOperation, DeletionOutcome,
+    Entity, EntityField, EntityFilter, EntityKey, EntityKind, EntityLookup, FieldSelection,
+    IdempotencyKey, Instance, JsonDocument, LifecycleFilter, LifecycleStatus, ListEntitiesRequest,
+    ListEntitiesResponse, Operation, OperationStatus, Origin, PageRequest, Projection, Provenance,
+    PublisherContext, PublisherVersion, PublisherVersionError, ReadOptions,
+    RegisterEntitiesRequest, RegisterItem, RegistrationItemResult, RegistrationOperation,
+    RegistrationOutcome, TypeSchema, Validator,
+};
+
+pub use publication::{PublicationError, publish_startup_entities};
+pub use reconcile::{
+    ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
+    Reconciliation, STARTUP_PUBLICATION_DEADLINE,
+};
+#[cfg(feature = "rest-server")]
+pub use rest_binding::{
+    platform_types_registry_api_rest_http_binding, types_registry_api_rest_http_binding,
+};
+#[cfg(feature = "rest-client")]
+pub use rest_client::{
+    PLATFORM_BASE_PATH, PlatformTypesRegistryApiRestClient,
+    PlatformTypesRegistryApiRestResolvingClient, TENANT_BASE_PATH, TypesRegistryApiRestClient,
+    TypesRegistryApiRestResolvingClient,
+};
+
+// Legacy API and model re-exports.
+mod legacy;
 
 #[cfg(feature = "test-util")]
-pub mod testing;
+pub use legacy::testing;
 
-pub use api::TypesRegistryClient;
-pub use error::{FieldIssue, TypesRegistryError};
-pub use gts::TYPE_RESOURCE_TYPE;
-pub use models::{
-    GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, RegisterSummary,
+pub use legacy::api::TypesRegistryClient;
+pub use legacy::models::{
+    AncestorIter, GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, RegisterSummary,
     TypeSchemaQuery, is_type_schema_id,
 };
 
-// Re-export the underlying gts identifier types so consumers don't need a
-// direct dependency on `gts` for typed IDs. Leading `::` selects the external
-// `gts` crate over this crate's local `gts` gear (the canonical-error vocab).
-pub use ::gts::GtsInstanceId;
+// Re-export GTS types needed to construct requests.
+pub use ::gts::{GtsId, GtsIdPattern, GtsIdSegment, GtsInstanceId, GtsTypeId};

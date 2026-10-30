@@ -1,7 +1,7 @@
 Created:  2026-07-07 by Virtuozzo International GmbH
 Updated:  2026-08-24 by Virtuozzo International GmbH
 
-<!-- migration-note: converted from the legacy VHP architecture design slice to the gears-sdlc design-slice format. Original preserved unchanged at vhp-architecture/docs/bss/design/DESIGN-billing-ledger-balances-202606091200/06-DESIGN-billing-ledger-fx-multicurrency-202606091600.md (Slice 5 — FX & Multi-Currency). Inherited engine mechanics (PostingService, IdempotencyGate, MoneyModule, BalanceProjector, dual-column commit trigger, TieOutJob, outbox relay) are specified in ./01-repository-foundation.md. -->
+<!-- migration-note: converted from the legacy design slice to the gears-sdlc design-slice format (Slice 5 — FX & Multi-Currency). Inherited engine mechanics (PostingService, IdempotencyGate, MoneyModule, BalanceProjector, dual-column commit trigger, TieOutJob, outbox relay) are specified in ./01-repository-foundation.md. -->
 <!-- CONFLUENCE_TITLE: [BSS]: Billing Ledger — FX & Multi-Currency (Design, Slice 5) -->
 
 # DESIGN — FX & Multi-Currency (Slice 5)

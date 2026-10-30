@@ -97,7 +97,7 @@ Nothing else about the relation reaches a v0 entity either: ADR-0003 records the
 * **Type Derivation Compatibility.** `Valid(derived) ⊆ Valid(base)` is a property of the identifier chain, not of evolution — the specification separates the two relations precisely so they can be reasoned about apart (§4.1 against §4.2). Waiving it would make a chained identifier state a substitutability that does not hold, which is a lie in the one place GTS encodes meaning in the string itself.
 * **Dependent revalidation.** ADR-0005 requires every affected registered dependent to remain valid before a new revision becomes current, and that rule stands. It is consequently still possible for a v0 reshape to be refused: if a v0 derived type would stop satisfying its base, the base's reshape fails. The remedy is to fix or delete the dependent, not to weaken the chain.
 * **The dialect profile.** ADR-0014 pins Draft-07 and pins it for the life of the logical entity. A v0 entity is not exempt: the dialect governs what `Valid(S)` even means, and the derivation check above still needs both sides evaluated under one semantics.
-* **The minor-version rules of ADR-0004.** A major-0 identifier may carry a minor wherever any identifier may. The exemption reaches the *check* on the cross-minor edge and not the contiguity rule, which governs which identifiers may exist rather than what a candidate is compared against — so a major-0 major still opens at `v0.0~` and still admits no gaps; nor does it reach immutability, so a major-0 minor is admitted once like any other and reshaping means publishing `v0.2~`. That is where the two profiles compose: an author wanting to reshape freely *and* leave existing dependents in place gets both. It is also why `force` is refused on a major-0 candidate — there is no check left for it to waive.
+* **The minor-version rules of ADR-0004.** A major-0 identifier may carry a minor wherever any identifier may. The exemption reaches the *check* on the cross-minor edge and not the contiguity rule, which governs which identifiers may exist rather than what a candidate is compared against — so a major-0 major still opens at `v0.0~` and still admits no gaps; nor does it reach immutability, so a major-0 minor is admitted once like any other and reshaping means publishing `v0.2~`. That is where the two profiles compose: an author wanting to reshape freely *and* leave existing dependents in place gets both. It is also why `skip_compatibility_check` is refused on a major-0 candidate — there is no check left for it to waive.
 * **Everything else on the admission path.** GTS validity and the rest of the managed identity profile, reference resolvability, deletion safety, ownership, registration authority, and the write-path preconditions of ADR-0012 all apply unchanged. An unstable type is unstable in its shape, not in its governance.
 
 ### The quarantine rule
@@ -107,7 +107,7 @@ Nothing else about the relation reaches a v0 entity either: ADR-0003 records the
 * a `$ref` target;
 * the immediate derivation base.
 
-`x-gts-ref` is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and relative JSON pointers. None creates a dependency or guarantee over the target.
+An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is outside this rule because it validates an Instance value without resolving or inlining the named entity. This includes exact and patterned major-0 identifiers, `gts.*`, and the `/$id` pointer. None creates a dependency or guarantee over the target.
 
 The whole resolution closure follows by induction. Any transitive path to v0 must contain a stable entity with a direct resolution-bearing dependency on v0, which admission refuses. ADR-0003 uses the same argument shape to derive a whole-history guarantee from candidate-versus-baseline checks.
 
@@ -207,7 +207,7 @@ This decision is confirmed when:
   records a failed item with `stable_refs_major_zero` or
   `stable_derives_from_major_zero` respectively; independent items in
   that batch remain eligible to succeed;
-* admission admits a v1 Type Schema whose `x-gts-ref` names a v0 entity exactly or through a pattern, as well as one using `gts.*` or a relative JSON pointer, proving that instance-value constraints are outside quarantine;
+* admission admits a v1 Type Schema whose entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) names a v0 entity exactly or through a pattern, as well as one using `gts.*` or the `/$id` pointer, proving that instance-value constraints are outside quarantine;
 * admission accepts a v0 Type Schema that references and derives from v1 targets, proving the quarantine relation is one-way;
 * a v0 reshape that would leave a v0 derived type no longer satisfying its base is refused by dependent revalidation;
 * registration of a managed registered Instance whose own last segment carries major 0 is rejected;

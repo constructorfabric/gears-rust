@@ -21,24 +21,24 @@ billing_granularity     = "whole_unit"
   [[snapshot.bands]]
   from_qty = 0
   to_qty   = 1000
-  unit_amount_minor = 5
+  rate              = "0.05"
 
   [[snapshot.bands]]
   from_qty = 1000
   to_qty   = "open"
-  unit_amount_minor = 3
+  rate              = "0.03"
 
 [[assert]]
 given  = { q = 999 }
-expect = { charge_minor = 4995 }
+expect = { charge = "49.95" }
 why    = "Variant A selects the band holding q and applies its rate to the whole q"
 
 [[assert]]
 given  = { q = 1000 }
-expect = { charge_minor = 3000 }
-why    = "the cliff: one more unit selects band 2 and the bill drops by 2000. Catalog volume is Variant A only — Variant B (per-tier block fee) was dropped 2026-07-04 and is not authorable"
+expect = { charge = "30" }
+why    = "the cliff: one more unit selects band 2 and the bill drops by 20. Catalog volume is Variant A only — Variant B (per-tier block fee) was dropped 2026-07-04 and is not authorable"
 
 [[assert]]
 given  = { q = 1500 }
-expect = { charge_minor = 4500 }
+expect = { charge = "45" }
 why    = "still band 2's rate applied to the whole quantity, not just the excess"

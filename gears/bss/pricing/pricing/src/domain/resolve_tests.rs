@@ -34,6 +34,7 @@ fn flat(
         version_no: i32::try_from(n % 1_000).unwrap(),
         dim_value: dim.map(str::to_owned),
         model: Model::Flat,
+        currency: crate::domain::test_support::spec("EUR", 2),
         price: Some(PriceData::Flat {
             amount: dec(amount),
         }),

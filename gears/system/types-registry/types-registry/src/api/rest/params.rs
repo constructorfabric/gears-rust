@@ -7,6 +7,7 @@ use axum::extract::{FromRequestParts, Query};
 use axum::http::request::Parts;
 use toolkit::api::odata::{ODataQuery, extract_odata_query};
 use toolkit_canonical_errors::CanonicalError;
+use types_registry_sdk::field;
 
 use super::error::{
     depth_not_recognized, duplicate_query_param, kind_not_recognized,
@@ -22,7 +23,7 @@ use crate::domain::enums::{EntityKind, LifecycleFilter};
 use crate::domain::selection::FieldSelection;
 
 /// Parameters `GET /entities/{entity_key}` accepts.
-pub const EXACT_READ: &[&str] = &["$select"];
+pub const EXACT_READ: &[&str] = &[field::SELECT_FIELD];
 
 /// `POST /entities:batchGet` carries everything in its body, `$select` included.
 pub const BATCH_READ: &[&str] = &[];
@@ -87,7 +88,7 @@ async fn odata<S: Send + Sync>(
     state: &S,
     pairs: &[(String, String)],
 ) -> Result<(ODataQuery, FieldSelection), CanonicalError> {
-    if let Some((_, raw)) = pairs.iter().find(|(key, _)| key == "$select") {
+    if let Some((_, raw)) = pairs.iter().find(|(key, _)| key == field::SELECT_FIELD) {
         select::check_raw(raw)?;
     }
     let query = extract_odata_query(parts, state).await?;
@@ -122,15 +123,15 @@ impl<S: Send + Sync> FromRequestParts<S> for NoQuery {
 /// Parameters `GET /entities` accepts; `limit`/`$top` and `cursor`/`$skiptoken`
 /// are `ToolKit`'s two spellings of one slot each.
 pub const DISCOVERY: &[&str] = &[
-    "pattern",
-    "depth",
-    "kind",
-    "lifecycle_status",
-    "limit",
-    "$top",
-    "cursor",
-    "$skiptoken",
-    "$select",
+    field::PATTERN_FIELD,
+    field::DEPTH_FIELD,
+    field::KIND_FIELD,
+    field::LIFECYCLE_STATUS_FIELD,
+    field::LIMIT_FIELD,
+    field::TOP_FIELD,
+    field::CURSOR_FIELD,
+    field::SKIPTOKEN_FIELD,
+    field::SELECT_FIELD,
 ];
 
 /// The discovery query, validated but with its cursor still unbound: the binding
@@ -195,19 +196,23 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
         let pairs = raw_pairs(parts, state).await?;
         guard(&pairs, DISCOVERY)?;
-        let limit = slot(&pairs, ["limit", "$top"])?;
-        let cursor = slot(&pairs, ["cursor", "$skiptoken"])?;
+        let limit = slot(&pairs, [field::LIMIT_FIELD, field::TOP_FIELD])?;
+        let cursor = slot(&pairs, [field::CURSOR_FIELD, field::SKIPTOKEN_FIELD])?;
         // Checked before ToolKit's extraction so the refusal names the spelling
-        // the caller used and carries the gear's cursor diagnostics.
-        if let Some((name, "0")) = limit {
+        // the caller used and carries the gear's cursor diagnostics. Any spelling
+        // ToolKit would read as zero (`00`, `+0`) is refused here, or it would answer
+        // with its own `$top` / `INVALID_LIMIT`.
+        if let Some((name, raw)) = limit
+            && raw.parse::<u64>() == Ok(0)
+        {
             return Err(page_size_zero(name));
         }
         let cursor = cursor
-            .map(|(_, token)| super::cursor::read(token))
+            .map(|(_, token)| crate::domain::cursor::read(token))
             .transpose()?;
 
         let (query, selection) = odata(parts, state, &pairs).await?;
-        let pattern = value(&pairs, "pattern").map(str::to_owned);
+        let pattern = value(&pairs, field::PATTERN_FIELD).map(str::to_owned);
         if let Some(p) = &pattern
             && p.len() > 1024
         {
@@ -215,12 +220,16 @@ impl<S: Send + Sync> FromRequestParts<S> for DiscoveryParams {
         }
         Ok(Self {
             pattern,
-            kind: value(&pairs, "kind").map(parse_kind).transpose()?,
-            lifecycle: value(&pairs, "lifecycle_status")
+            kind: value(&pairs, field::KIND_FIELD)
+                .map(parse_kind)
+                .transpose()?,
+            lifecycle: value(&pairs, field::LIFECYCLE_STATUS_FIELD)
                 .map(parse_lifecycle)
                 .transpose()?
                 .unwrap_or_default(),
-            max_chain_depth: value(&pairs, "depth").map(parse_depth).transpose()?,
+            max_chain_depth: value(&pairs, field::DEPTH_FIELD)
+                .map(parse_depth)
+                .transpose()?,
             limit: query.limit,
             cursor,
             selection,

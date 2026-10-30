@@ -208,29 +208,29 @@ async def test_effective_documents_are_selected_independently(
 
 
 @pytest.mark.scenario("TR-READ-005")
-async def test_provenance_is_one_selected_group(
+async def test_provenance_is_a_type_schema_group(
     registry_http, registry_api_path, reading_fixture, given_registered
 ):
-    """Provenance arrives as one nested group, never as top-level fields."""
+    """A selected `false` stays in a schema's group; an Instance omits the group."""
     person_schema, person_instance, other_schema, other_instance = map(reading_fixture, PAIRS)
     await given_registered(person_schema, person_instance, other_schema, other_instance)
 
-    # `compat_forced` is a schema admission fact; an Instance has an explicit null.
-    for document, compat_forced in (
-        (person_schema, False),
-        (person_instance, None),
-        (other_schema, False),
-        (other_instance, None),
+    # Nothing was skipped: each schema reports `false`, not an absence. An Instance
+    # has no applicable provenance field, so the selected group is absent, not null.
+    for document, extra in (
+        (person_schema, {"provenance": provenance(False)}),
+        (person_instance, {}),
+        (other_schema, {"provenance": provenance(False)}),
+        (other_instance, {}),
     ):
         assert_exact(
             await get_entity(
-                registry_http, registry_api_path, document["gts_id"], select="provenance"
+                registry_http,
+                registry_api_path,
+                document["gts_id"],
+                select="provenance",
             ),
-            {
-                "status": 200,
-                "etag": "<etag>",
-                "body": {**mandatory(document), "provenance": provenance(compat_forced)},
-            },
+            {"status": 200, "etag": "<etag>", "body": {**mandatory(document), **extra}},
         )
 
 
@@ -429,7 +429,6 @@ async def test_a_batch_projection_equals_the_exact_read(
         person_instance["gts_id"]: {
             **mandatory(person_instance),
             "content": person_instance["content"],
-            "provenance": provenance(None),
         },
     }
 

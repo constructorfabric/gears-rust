@@ -32,6 +32,7 @@
 //! async fn main() -> anyhow::Result<()> {
 //!     let opts = OopRunOptions {
 //!         gear_name: "my_gear".to_string(),
+//!         config_gear_name: None,
 //!         instance_id: None,
 //!         directory_endpoint: "http://127.0.0.1:50051".to_string(),
 //!         config_path: None,
@@ -70,7 +71,31 @@ use cf_system_sdks::directory::{DirectoryClient, DirectoryGrpcClient};
 #[derive(Debug, Clone)]
 pub struct OopRunOptions {
     /// Logical gear name (e.g., "`file-parser`")
+    ///
+    /// **This is the directory registration name, and since roles it is not
+    /// always the gear's own id.** A role-split gear registers under its role's
+    /// directory name -- `event-broker-ingest` for the `cluster_ingest` mode --
+    /// while its configuration still lives under the gear id the
+    /// `#[toolkit::gear(name = ...)]` attribute declares, because that is the
+    /// key `GearCtx::config()` looks up. See [`Self::config_gear_name`].
     pub gear_name: String,
+
+    /// The `gears.<key>` section this process's configuration lives under.
+    ///
+    /// `None` means the same as [`Self::gear_name`], which is the answer for
+    /// every gear that runs in one undifferentiated shape -- so no existing
+    /// caller changes behaviour.
+    ///
+    /// **It exists because `gear_name` was doing two jobs that used to be one
+    /// string.** The registry names a gear by its attribute, and
+    /// `GearCtx::config()` reads `gears.<that name>.config`; a role changes the
+    /// name the instance *registers* under and not the name it *reads* under.
+    /// With the two conflated, a worker started as a role filed the master's
+    /// rendered blob under `gears["event-broker-ingest"]` while the gear read
+    /// `gears["event-broker"]`, so `TOOLKIT_MODULE_CONFIG` was inert under any
+    /// role and only the local `--config` file had any effect. Nothing failed;
+    /// the override simply did not arrive.
+    pub config_gear_name: Option<String>,
 
     /// Instance ID (defaults to a random UUID if None)
     pub instance_id: Option<Uuid>,
@@ -95,6 +120,18 @@ pub struct OopRunOptions {
     pub version: Option<String>,
 }
 
+impl OopRunOptions {
+    /// The `gears.<key>` section to read configuration from.
+    ///
+    /// [`Self::config_gear_name`] when set, and [`Self::gear_name`] otherwise --
+    /// so a caller that does not know about roles keeps exactly the behaviour it
+    /// had.
+    #[must_use]
+    pub fn config_gear_name(&self) -> &str {
+        self.config_gear_name.as_deref().unwrap_or(&self.gear_name)
+    }
+}
+
 impl Default for OopRunOptions {
     fn default() -> Self {
         // Check for config path in environment variable as fallback
@@ -107,6 +144,7 @@ impl Default for OopRunOptions {
 
         Self {
             gear_name: String::new(),
+            config_gear_name: None,
             instance_id: None,
             directory_endpoint,
             config_path,
@@ -385,6 +423,7 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 /// async fn main() -> anyhow::Result<()> {
 ///     let opts = OopRunOptions {
 ///         gear_name: "file-parser".to_string(),
+///         config_gear_name: None,
 ///         instance_id: None,
 ///         directory_endpoint: "http://127.0.0.1:50051".to_string(),
 ///         config_path: None,
@@ -464,7 +503,10 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     // 2. Local config file (override)
     // This also merges logging configuration for proper initialization
     let (final_config, merged_logging, db_options) =
-        build_oop_config_and_db(&config, &opts.gear_name, rendered_config.as_ref())?;
+        // The *config* key, not the registration name: a role changes what this
+        // process registers as and not what section it reads. Conflating them
+        // filed the master's rendered blob under a key the gear never looks up.
+        build_oop_config_and_db(&config, opts.config_gear_name(), rendered_config.as_ref())?;
 
     // Use OpenTelemetry config from rendered (master) config only.
     // OoP gears do not fall back to local config for telemetry — if the master
@@ -704,6 +746,7 @@ async fn build_oop_serve_options(
     // when the directory rejects the registration — the same late-failure the
     // label validation below avoids.
     validate_advertise_uri(&advertise_uri, cfg.allow_loopback_advertise)?;
+    log_auth_disabled_when_routable(cfg.auth_disabled, &advertise_uri);
 
     // Fail fast on a mis-configured label (bad charset, over-long, too many)
     // at start-up, using the same shared rules the directory enforces. Without
@@ -731,6 +774,7 @@ async fn build_oop_serve_options(
         directory,
         bearer_authenticator: None,
         internal_authenticator,
+        auth_disabled: cfg.auth_disabled,
         labels: cfg.labels.clone(),
     })
 }
@@ -948,13 +992,7 @@ fn validate_advertise_uri(uri: &str, allow_loopback: bool) -> Result<()> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("invalid oop_http.advertise_uri: must not contain userinfo: {uri}");
     }
-    let is_loopback = match parsed.host() {
-        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
-        Some(url::Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
-        None => false,
-    };
-    if !allow_loopback && is_loopback {
+    if !allow_loopback && is_loopback_host(&parsed) {
         anyhow::bail!(
             "invalid oop_http.advertise_uri: '{uri}' is a loopback/unspecified address, which is \
              unreachable by other gears in multi-host Profile 2 / Profile 3 (a registered-but-\
@@ -963,6 +1001,34 @@ fn validate_advertise_uri(uri: &str, allow_loopback: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether `uri`'s host is loopback / unspecified, i.e. unreachable from other hosts.
+fn is_loopback_host(uri: &url::Url) -> bool {
+    match uri.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Domain(d)) => d.trim_end_matches('.').eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+/// Log an `error!` when the development-only `auth_disabled` is set on a worker advertised
+/// at a routable address: other hosts reach it through the directory, and every tenant's
+/// request then runs as the default tenant.
+fn log_auth_disabled_when_routable(auth_disabled: bool, advertise_uri: &str) {
+    if !auth_disabled {
+        return;
+    }
+    let routable = url::Url::parse(advertise_uri).is_ok_and(|uri| !is_loopback_host(&uri));
+    if routable {
+        tracing::error!(
+            advertise_uri,
+            "oop_http.auth_disabled is set on a worker advertised at a routable address: every \
+             tenant request reaching it runs as the default tenant. Development only; unset it \
+             or advertise a loopback address."
+        );
+    }
 }
 
 #[allow(unknown_lints, de1301_no_print_macros)] // direct stdout config print before exit

@@ -1,13 +1,14 @@
 //! `ProvisioningService` — the transactional seller-provisioning seed. One
 //! sea-orm transaction runs the additive SELECT-then-INSERT of the chart of
-//! accounts, non-ISO currency scales, the fiscal-calendar config, and the
-//! initial OPEN fiscal period. The transaction is `SERIALIZABLE`, so the
-//! currency-scale lock check also excludes a first posting of the currency that
-//! has not committed yet (one side aborts as contention, returned as
-//! [`DomainError::ConcurrentModification`]). The fiscal-calendar fields are validated and
-//! the initial `period_id` derived BEFORE the transaction opens (pure
-//! `domain::provisioning::plan`), so a malformed calendar never takes a write
-//! lock.
+//! accounts, currency scales (non-ISO codes, or an ISO code at its own ISO scale),
+//! the fiscal-calendar config, and the initial OPEN fiscal period. The transaction
+//! is `SERIALIZABLE`, so the currency-scale lock check also excludes a first
+//! posting of the currency that has not committed yet (one side aborts as
+//! contention, returned as [`DomainError::ConcurrentModification`]). The
+//! fiscal-calendar fields and the currency-scale rows are validated and the
+//! initial `period_id` derived BEFORE the transaction opens (pure
+//! `domain::provisioning::plan`), so a malformed calendar or a scale row that
+//! overrides an ISO 4217 scale never takes a write lock.
 //!
 //! ## Error handling across the transaction boundary
 //!
@@ -57,12 +58,13 @@ impl ProvisioningService {
     }
 
     /// Provision a seller legal-entity in one transaction: additively seed the
-    /// chart of accounts, non-ISO currency scales, the fiscal-calendar config,
+    /// chart of accounts, currency scales, the fiscal-calendar config,
     /// and the initial OPEN fiscal period. Idempotent — existing rows are a
     /// no-op and reported as "existing".
     ///
     /// # Errors
-    /// [`DomainError::InvalidRequest`] on a malformed fiscal calendar;
+    /// [`DomainError::InvalidRequest`] on a malformed fiscal calendar, or on a scale
+    /// row that gives an ISO 4217 code another scale than its ISO scale;
     /// [`DomainError::CurrencyScaleLocked`] when a scale row is refused because the
     /// currency is already posted under another scale;
     /// [`DomainError::ConcurrentModification`] when a concurrent request registers
@@ -71,6 +73,7 @@ impl ProvisioningService {
     pub async fn provision(&self, req: ProvisionRequest) -> Result<ProvisionOutcome, DomainError> {
         // --- PRE-TRANSACTION (fail fast, no writes) ---
         plan::validate_calendar(&req.fiscal_calendar)?;
+        plan::validate_currency_scales(&req.currency_scales)?;
         let period_id = plan::initial_period_id(OffsetDateTime::now_utc());
 
         // --- TRANSACTION ---
@@ -152,7 +155,7 @@ impl ProvisioningService {
             }
         }
 
-        // Non-ISO currency scales.
+        // Currency scales (non-ISO codes; an ISO code only at its ISO scale).
         let mut scales_created: u32 = 0;
         let mut scales_existing: u32 = 0;
         for scale in req.currency_scales {

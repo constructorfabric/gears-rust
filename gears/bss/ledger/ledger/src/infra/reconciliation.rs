@@ -470,7 +470,7 @@ impl ReconciliationFramework {
                         .start(txn, &scope, tenant, run_id, &period_owned, CHECK_AR_DERIVED)
                         .await
                         .map_err(repo_to_db)?;
-                    // VHP-1843: prefer the incremental tie-out (baseline + fold of
+                    // Prefer the incremental tie-out (baseline + fold of
                     // the open period) over the all-time full fold; fall back to the
                     // full fold when there is no baseline yet (the tenant has never
                     // closed a period) or a period is transitional. The incremental

@@ -104,9 +104,9 @@ pub struct JobsConfig {
     /// tamper-evidence hash chain). Defaults to once per day.
     pub verify_tick_secs: u64,
     /// How often the daily tie-out runs the FULL all-time fold as a drift
-    /// backstop instead of the incremental (baseline + open-period) path
-    /// (VHP-1843): every `N`th tick folds full, the rest go incremental. `0` (or
-    /// `1`) means every tick folds full — the pre-VHP-1843 behaviour. The first
+    /// backstop instead of the incremental (baseline + open-period) path:
+    /// every `N`th tick folds full, the rest go incremental. `0` (or `1`) means
+    /// every tick folds full. The first
     /// tick after startup always folds full. Defaults to `7` (≈ weekly at the
     /// daily cadence) — closed periods are immutable, so the incremental path is
     /// authoritative and the full fold is paranoia against baseline drift.
@@ -224,7 +224,7 @@ impl JobsConfig {
 /// `ScheduleBuilder` enforces before materialization (decision 3 / E-8): a
 /// straight-line schedule whose derived segment count exceeds it is blocked
 /// (`DomainError::ScheduleTooLong`) rather than degraded — degrade (coarser /
-/// chunked auto-segmentation) and a per-tenant ceiling are deferred (VHP-1853).
+/// chunked auto-segmentation) and a per-tenant ceiling are deferred.
 /// `recognition_run_tick_secs` is the cadence of the Phase 2 `RecognitionRunJob`
 /// ticker (mirrors the `JobsConfig` `*_tick_secs` knobs).
 #[derive(Debug, Clone, Deserialize)]
@@ -286,7 +286,7 @@ impl RecognitionConfig {
 /// revaluation run, applied to a tenant WITHOUT an explicit `fx_revaluation_mode`
 /// row (off by default — fail-safe: a Mode-A tenant whose ERP revalues must NOT
 /// double-count). Per-tenant Mode A/B resolution is the `fx_revaluation_mode`
-/// config (VHP-1986); an explicit row OVERRIDES this flag. Staleness
+/// config; an explicit row OVERRIDES this flag. Staleness
 /// follows F3: G10 currencies stale past `stale_g10_hours` (24h), others past a
 /// tenant policy bounded by `stale_default_max_days` (≤ 7 days — a config above 7
 /// is REJECTED at `validate`, no silent clamp). `provider_order` is the

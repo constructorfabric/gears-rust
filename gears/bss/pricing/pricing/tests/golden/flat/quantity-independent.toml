@@ -13,18 +13,18 @@ provenance = ["AC#60 (backup)", "PRD 17.2 (backup)", "PRD 6.2 (backup)"]
 model_kind   = "flat"
 charge_kind  = "recurring"
 currency     = "USD"
-amount_minor = 9900
+amount       = "99"
 
 [[assert]]
 given  = { q = 0 }
-expect = { charge_minor = 9900 }
+expect = { charge = "99" }
 why    = "a flat charge is owed whether or not anything was consumed - this is the case that separates flat from per_unit, where q=0 bills nothing"
 
 [[assert]]
 given  = { q = 1 }
-expect = { charge_minor = 9900 }
+expect = { charge = "99" }
 
 [[assert]]
 given  = { q = 1000 }
-expect = { charge_minor = 9900 }
+expect = { charge = "99" }
 why    = "the quantity does not scale a flat row; an evaluator that multiplies here has silently turned it into per_unit"

@@ -12,6 +12,9 @@ WITHOUT the ``bss-ledger`` feature (or a plain ``cf-gears-example-server`` on
 ``PATH``) does not mount these routes, so the probe would 404 and the whole
 module skips rather than emitting red failures for endpoints that are simply not
 served by that binary. This mirrors the file-storage module's staging pattern.
+
+Only a missing gear skips. A failed seed (provisioning or the first journal entry) fails the
+test: the seed is part of what the suite proves.
 """
 
 import datetime
@@ -98,24 +101,45 @@ def _quarter(month: int) -> int:
     return (month - 1) // 3 + 1
 
 
-def _provision_seller(base_url: str, headers: dict, tenant_id: str) -> httpx.Response:
+def _money(amount: str, currency: str = "USD", scale: int = 2) -> dict:
+    """Money on the ledger wire: plain decimal text in major units, its currency and posting scale."""
+    return {"amount": amount, "currency": currency, "currency_scale": scale}
+
+
+def _provision_seller(
+    base_url: str,
+    headers: dict,
+    tenant_id: str,
+    currency_scales: list[dict] | None = None,
+    accounts: list[dict] | None = None,
+) -> httpx.Response:
     """Idempotently provision ``tenant_id``'s ledger (chart of accounts + calendar).
 
     Seeds the account classes an invoice-with-tax needs (AR / REVENUE /
     TAX_PAYABLE, plus SUSPENSE as the unmapped fallback) in USD, a monthly fiscal
-    calendar, and the current period. Provisioning is idempotent — re-provisioning
+    calendar, and the current period. An item with ``revenue_stream`` books to the REVENUE
+    account of that stream (the ``subscription`` stream is seeded too). Provisioning is idempotent — re-provisioning
     an already-seeded tenant returns 200 with ``accounts_existing`` — so this is
-    safe to call on every run.
+    safe to call on every run. Pass ``currency_scales`` to seed scale rows (a code with no
+    ISO 4217 scale, such as ``XTS``).
+    Pass ``accounts`` to seed other accounts than the USD ones.
     """
+    usd_accounts = [
+        {"account_class": "AR", "currency": "USD", "normal_side": "DR"},
+        {"account_class": "REVENUE", "currency": "USD", "normal_side": "CR"},
+        {"account_class": "TAX_PAYABLE", "currency": "USD", "normal_side": "CR"},
+        {"account_class": "SUSPENSE", "currency": "USD", "normal_side": "DR"},
+        {
+            "account_class": "REVENUE",
+            "currency": "USD",
+            "normal_side": "CR",
+            "revenue_stream": "subscription",
+        },
+    ]
     body = {
         "tenant_id": tenant_id,
-        "accounts": [
-            {"account_class": "AR", "currency": "USD", "normal_side": "DR"},
-            {"account_class": "REVENUE", "currency": "USD", "normal_side": "CR"},
-            {"account_class": "TAX_PAYABLE", "currency": "USD", "normal_side": "CR"},
-            {"account_class": "SUSPENSE", "currency": "USD", "normal_side": "DR"},
-        ],
-        "currency_scales": [],
+        "accounts": accounts or usd_accounts,
+        "currency_scales": currency_scales or [],
         "fiscal_calendar": {"timezone": "UTC", "granularity": "MONTH", "fy_start": 1},
     }
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
@@ -125,14 +149,19 @@ def _provision_seller(base_url: str, headers: dict, tenant_id: str) -> httpx.Res
 
 
 def _post_invoice(
-    base_url: str, headers: dict, tenant_id: str, payer_tenant_id: str
+    base_url: str,
+    headers: dict,
+    tenant_id: str,
+    payer_tenant_id: str,
+    item_amount: dict | None = None,
+    tax_amount: dict | None = None,
 ) -> httpx.Response:
     """Post one balanced invoice into ``tenant_id``'s ledger; return the response.
 
-    Dates and ``period_id`` are derived from the current UTC date so the entry
-    lands in the period provisioning just opened. A fresh ``invoice_id`` +
-    ``correlation_id`` per call sidesteps idempotent-replay ambiguity (a re-post
-    of the same invoice would return 200-replay, not a fresh 201).
+    Money is decimal text in major units with its currency and scale (default 10.00 USD ex tax
+    and 2.00 USD tax). Dates and ``period_id`` come from the current UTC date so the entry lands
+    in the period provisioning opened. A fresh ``invoice_id`` + ``correlation_id`` per call
+    avoids an idempotent replay.
     """
     today = datetime.datetime.now(datetime.timezone.utc).date()
     period_id = f"{today.year:04d}{today.month:02d}"
@@ -145,8 +174,7 @@ def _post_invoice(
         "period_id": period_id,
         "items": [
             {
-                "amount_minor_ex_tax": 1000,
-                "currency": "USD",
+                "amount_ex_tax": item_amount or _money("10.00"),
                 "revenue_stream": "subscription",
                 "catalog_class": "REVENUE",
                 "gl_code": "4000",
@@ -154,8 +182,7 @@ def _post_invoice(
         ],
         "tax": [
             {
-                "amount_minor": 200,
-                "currency": "USD",
+                "amount": tax_amount or _money("2.00"),
                 "tax_jurisdiction": "US-CA",
                 "tax_filing_period": f"{today.year}Q{_quarter(today.month)}",
             }
@@ -169,36 +196,35 @@ def _post_invoice(
 
 
 @pytest.fixture(scope="module")
-def seeded_entry():
-    """The id of a journal entry that genuinely exists in TENANT_A's ledger.
+def seller() -> tuple[str, dict]:
+    """TENANT_A provisioned as a ledger seller; returns ``(base_url, headers)``.
 
-    Provisions TENANT_A (idempotent) then posts one invoice as TENANT_A, returning
-    the created ``entry_id``. Reads base URL / token from the environment (like the
-    session-scoped probe) so it can stay module-scoped.
-
-    If the stack cannot seed — provisioning or the post is not accepted (e.g. AM is
-    not wired to mark TENANT_A a seller, or the current period is closed) — the
-    dependent cross-tenant test SKIPS rather than fails: a seeding gap is an infra
-    concern, not a BOLA regression.
+    Provisioning is idempotent, so every module may call it. A refusal is a failure, not a skip:
+    the e2e config makes TENANT_A's type a ledger owner (``seller_tenant_types``).
     """
     base_url = os.getenv("E2E_BASE_URL", "http://localhost:8086")
     headers = {
         "Authorization": f"Bearer {os.getenv('E2E_AUTH_TOKEN', 'e2e-token-tenant-a')}"
     }
-
     prov = _provision_seller(base_url, headers, TENANT_A_ID)
-    if prov.status_code not in (200, 201):
-        pytest.skip(
-            f"cannot seed: provisioning TENANT_A returned {prov.status_code}: {prov.text}"
-        )
+    assert prov.status_code in (200, 201), (
+        f"provisioning TENANT_A returned {prov.status_code}: {prov.text}"
+    )
+    return base_url, headers
 
+
+@pytest.fixture(scope="module")
+def seeded_entry(seller):
+    """The id of a journal entry that genuinely exists in TENANT_A's ledger.
+
+    Posts one invoice as TENANT_A and returns the created ``entry_id``. A post that is not
+    accepted fails the test: the seed is part of what the suite proves.
+    """
+    base_url, headers = seller
     posted = _post_invoice(base_url, headers, TENANT_A_ID, SEED_PAYER_ID)
-    if posted.status_code not in (200, 201):
-        pytest.skip(
-            f"cannot seed: posting a journal entry returned {posted.status_code}: {posted.text}"
-        )
-
+    assert posted.status_code == 201, (
+        f"posting a journal entry returned {posted.status_code}: {posted.text}"
+    )
     entry_id = posted.json().get("entry_id")
-    if not entry_id:
-        pytest.skip(f"cannot seed: post response carried no entry_id: {posted.text}")
+    assert entry_id, f"the post response carried no entry_id: {posted.text}"
     return entry_id

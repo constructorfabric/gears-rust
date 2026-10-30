@@ -267,9 +267,14 @@ Nothing else rounds. Sums, differences, caps and comparisons are exact
 multiple of the increment instead of rounding it.
 
 `CurrencySpec` validates the code's shape and supported scale, not registry membership.
-The posting service compares new input against the current authoritative currency
-registry. Restoring stored values and reversing postings use their stored metadata,
-including after the registry changes.
+An ISO 4217 code always has its ISO scale (`bss_money::iso_scale`); the registry never
+overrides it. The registry serves a code with no ISO 4217 minor-unit scale (`iso_scale` gives
+none), such as `XTS` or a code ISO does not list. A row for an ISO code with a scale can only
+repeat that scale: provisioning refuses another scale, and the resolver takes the ISO scale
+before it reads the registry. A non-ISO code must be provisioned with the same
+scale here and in pricing's `currency_scales` config (pricing D-530). The posting service
+compares new input against this authoritative scale. Restoring stored values and reversing postings
+use their stored metadata, including after the registry changes.
 
 Text storage (`infra/storage/money_text.rs`) preserves all accepted digits on both
 databases; a stored value that is not canonical text is reported as corrupt, never
@@ -291,8 +296,8 @@ On the wire every REST money field is
 output is canonical text. FX quotes are decimal strings (`rate`). The SDK traits are
 `LedgerClientV1`, `IssuedInvoiceManifestV1`, `PspSettlementFeedV1` and `RateProviderV1`,
 with the plugin type `RateProviderPluginSpecV1`; `ProvisionCurrencyScale { currency:
-CurrencySpec, source }` seeds a non-ISO scale (the REST body keeps `currency` and
-`currency_scale`). The decimal limit is the same for every
+CurrencySpec, source }` seeds a non-ISO scale, or an ISO code at its own ISO scale
+(the REST body keeps `currency` and `currency_scale`). The decimal limit is the same for every
 currency and scale.
 
 `PostingService::post` refuses `SourceDocType::Reversal`. Reversals go through

@@ -108,7 +108,7 @@ pub(crate) const LIFECYCLE_OPEN: &str = "OPEN";
 
 // --- Payer lifecycle (`ledger_payer_state.lifecycle_state`) ---
 
-/// Payer lifecycle state stamped on a payer-closure upsert (VHP-1852 Phase 2).
+/// Payer lifecycle state stamped on a payer-closure upsert.
 /// Absence of a row means OPEN; the only persisted lifecycle literal is the
 /// closed marker. A SEPARATE concept from the fiscal-period / account `OPEN`.
 pub(crate) const PAYER_LIFECYCLE_CLOSED: &str = "CLOSED";

@@ -1,4 +1,4 @@
-<!-- Updated: 2026-09-24 by Constructor Tech -->
+<!-- Updated: 2026-10-06 by Constructor Tech -->
 
 # OAGW e2e suite
 
@@ -49,7 +49,9 @@ change is tested as the decision specifies, and marked
 
 - Register every created upstream with the `cleanup` fixture
   (`cleanup.upstream(headers, await create_upstream(...))`). Deletion runs at
-  teardown, children before parents, even when the test fails.
+  teardown, children before parents, even when the test fails. Register a
+  route with `cleanup.route` only when deleting its upstream won't remove it,
+  e.g. a route on a registry-provisioned upstream.
 - Pin the identity of errors with `helpers.assert_problem` (status,
   problem+json, `x-oagw-error-source`, and optionally `type`/`reason`/
   `resource_type`/`detail`). `esrc=None` asserts that a layer in front of
@@ -67,6 +69,11 @@ From the repository root:
 ```sh
 make e2e-local SUITE=oagw
 
+# The sqlite profile: OAGW on SQLite, with one upstream and two routes
+# provisioned from types-registry `entities` (see e2e.yaml). Only this profile
+# runs the section 19 (configuration storage) tests; elsewhere they skip.
+make e2e-oagw-sqlite
+
 # Only the tests of one scenario (a stem or a stem prefix).
 .venv/bin/python tools/scripts/run_e2e.py --suite oagw -- --oagw-scenario positive-18.3
 
@@ -76,6 +83,18 @@ make e2e-local SUITE=oagw
 # The same map without a server; outcomes show "not run".
 .venv/bin/python -m pytest testing/e2e/suites/oagw --collect-only -q --oagw-scenario-map
 ```
+
+Both profiles run every other test. The default keeps OAGW in memory. The
+sqlite profile's database is `~/.cf-gears/oagw/oagw.db` and survives between
+local runs; tests use unique aliases, so leftover rows don't interfere. 19.1
+reads the registry rows from that file, at `OAGW_E2E_DB`; set it, and
+`OAGW_E2E_PROFILE=sqlite`, yourself when you run `ci.py` directly or move
+`home_dir`. The section 19 tests skip only when `OAGW_E2E_PROFILE` is unset
+and the server lacks the registry upstream; with the variable set, a missing
+upstream fails them.
+The launcher cannot restart the server, so restart survival is tested in the
+gear's `gear_tests.rs` and the boot reconcile of registry rows in
+`domain/services/registry_reconcile_tests.rs`.
 
 Against an already running server, set `E2E_OAGW_BASE_URL`. To run the mock
 separately, start it with `python -m suites.oagw.mock_upstream` from

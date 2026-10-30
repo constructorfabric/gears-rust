@@ -30,7 +30,7 @@ for (const vector of fixture.vectors) {
 }
 for (const test of fixture.semantic_projections) {
   let payload;
-  if (test.kind === 'money') payload = { currency: 'EUR', model: { kind: 'per_unit', unit_amount: decimal(test.input) }, minimum_fee: null };
+  if (test.kind === 'money') payload = { currency: 'EUR', currency_scale: '2', model: { kind: 'per_unit', unit_amount: decimal(test.input) }, minimum_fee: null };
   else if (test.kind === 'u64') {
     const value = BigInt(test.input);
     assert(value >= 0n && value <= 18446744073709551615n);

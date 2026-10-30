@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Declaration route registration.
 //!
 //! Every route is built through `OperationBuilder` rather than mounted on the
@@ -16,7 +15,7 @@ use toolkit_db::{DBProvider, DbError};
 
 use toolkit::api::canonical_prelude::StatusCode;
 
-use crate::api::rest::declaration_dto::{CreatedDeclarationDto, DeclarationDto};
+use crate::api::rest::declaration_dto::{CreatedDeclarationDto, DeclarationDto, RevivalReportDto};
 use crate::api::rest::declaration_handlers as handlers;
 use crate::domain::declaration::DeclarationService;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
@@ -64,12 +63,80 @@ fn etag_header() -> ResponseHeaderSpec {
     )
 }
 
+/// Register the revival report, the advisory companion of a revive.
+fn register_revival(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
+    OperationBuilder::post("/settings-service/v1/declarations/revival-preview")
+        .operation_id("settings_service.report_revival")
+        .summary("Report what reviving a retired declaration would do to its values")
+        .description(
+            "Advisory: takes the body of the create that would revive a retired \
+             declaration and reports the values it retained at the caller's tenant \
+             and its descendants, each re-validated as the revive would re-validate \
+             it, without changing anything. Nothing is stored, no step-up is asked, \
+             no audit record is written and no cache is touched, and a revive neither \
+             requires a report nor consults one. The coverage is the caller's own \
+             administration: the caller's tenant and its descendants under the \
+             subtree node budget, standalone descendants and their subtrees left out \
+             of the list and the counts; `complete` is `false` when the budget cut the \
+             walk, and the counts are then lower bounds. `values` lists the first \
+             `limit` (default 100, above 500 clamped, below 1 refused) in the walk's \
+             breadth-first order, `total` and `total_needs_review` count every value \
+             found. A value is masked by the strictest of its row's own classification, the \
+             declaration's and the one the body derives, and its detail is withheld \
+             whenever it is masked. A body the create's JSON extractor refuses is \
+             answered as the create answers it (`400`, `415`, `422`), once both \
+             decisions are made; the create's own refusals are answered in the \
+             create's order; a \
+             body that would not revive a retired declaration, or a retired \
+             declaration the caller may not read, is `404` with the code \
+             `nothing_to_revive`, the same answer either way. Reactivation is a \
+             separate request: `POST` of the same body to the declarations collection, \
+             which needs step-up, and values written in between are not in the report. A \
+             standalone tenant is a barrier: its subtree is administered from within, \
+             and an administrator above it neither sees nor is told of values stored \
+             there, though the revive re-validates them too.",
+        )
+        .tag(TAG)
+        .authenticated()
+        .no_license_required()
+        .query_param_typed("limit", false, "How many values to list", "integer")
+        .json_request::<crate::api::rest::declaration_dto::CreateDeclarationRequest>(
+            openapi,
+            "The declaration body a revive would be sent",
+        )
+        .handler(crate::api::rest::revival_handlers::revival_report)
+        .json_response_with_schema::<RevivalReportDto>(
+            openapi,
+            StatusCode::OK,
+            "The retained values a revive would re-validate",
+        )
+        .error_400(openapi)
+        .problem_response(
+            openapi,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "The body is not sent as `application/json`, as the create answers it",
+        )
+        .problem_response(
+            openapi,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "The body is JSON but not a declaration to create, as the create answers it",
+        )
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_404(openapi)
+        .error_409(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi)
+}
+
 /// Register the declaration read and authoring routes.
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
     service: Arc<DeclarationService<DeclarationRepo>>,
     admin: Arc<handlers::ConcreteDeclarationAdmin>,
+    resolver: Arc<crate::gear::ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
     enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
 ) -> Router {
@@ -96,10 +163,10 @@ pub fn register_routes(
         .query_param_typed("limit", false, "Page size", "integer")
         .query_param("cursor", false, "Cursor for pagination")
         .handler(handlers::list_declarations::<DeclarationRepo>)
-        .json_response_with_schema::<toolkit_odata::Page<DeclarationDto>>(
+        .json_response_with_schema::<crate::api::rest::page_dto::PageDto<DeclarationDto>>(
             openapi,
             StatusCode::OK,
-            "A page of declarations with its pagination cursors",
+            "A page of declarations with its pagination cursors and the total",
         )
         .with_odata_filter::<DeclarationFilterField>()
         .with_odata_orderby::<crate::domain::odata::DeclarationOrderField>()
@@ -190,6 +257,8 @@ pub fn register_routes(
         .error_500(openapi)
         .error_503(openapi)
         .register(router, openapi);
+
+    let router = register_revival(router, openapi);
 
     let router = OperationBuilder::patch("/settings-service/v1/declarations/{id}")
         .operation_id("settings_service.update_declaration")
@@ -286,6 +355,7 @@ pub fn register_routes(
     router
         .layer(axum::Extension(service))
         .layer(axum::Extension(admin))
+        .layer(axum::Extension(resolver))
         .layer(axum::Extension(db))
         .layer(axum::Extension(enforcer))
 }

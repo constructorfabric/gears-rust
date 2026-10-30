@@ -21,35 +21,44 @@ impl MigrationTrait for CreateProducerRegistrationSchema {
             match backend {
                 DatabaseBackend::Postgres => {
                     "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
-                        registration_key VARCHAR(1024) PRIMARY KEY,
+                        registration_key VARCHAR(255) NOT NULL,
+                        queue VARCHAR(255) NOT NULL,
+                        outbox_partition BIGINT NOT NULL,
                         producer_id UUID NOT NULL,
                         mode VARCHAR(32) NOT NULL,
                         client_agent VARCHAR(256) NOT NULL,
                         generation BIGINT NOT NULL,
                         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                        PRIMARY KEY (registration_key, queue, outbox_partition)
                     )"
                 }
                 DatabaseBackend::Sqlite => {
                     "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
-                        registration_key TEXT PRIMARY KEY,
+                        registration_key TEXT NOT NULL,
+                        queue TEXT NOT NULL,
+                        outbox_partition INTEGER NOT NULL,
                         producer_id TEXT NOT NULL,
                         mode TEXT NOT NULL,
                         client_agent TEXT NOT NULL,
                         generation INTEGER NOT NULL,
                         created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        PRIMARY KEY (registration_key, queue, outbox_partition)
                     )"
                 }
                 DatabaseBackend::MySql => {
                     "CREATE TABLE IF NOT EXISTS event_broker_producer_registrations (
-                        registration_key VARCHAR(1024) PRIMARY KEY,
+                        registration_key VARCHAR(255) NOT NULL,
+                        queue VARCHAR(255) NOT NULL,
+                        outbox_partition BIGINT NOT NULL,
                         producer_id CHAR(36) NOT NULL,
                         mode VARCHAR(32) NOT NULL,
                         client_agent VARCHAR(256) NOT NULL,
                         generation BIGINT NOT NULL,
                         created_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-                        updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
+                        updated_at TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+                        PRIMARY KEY (registration_key, queue, outbox_partition)
                     )"
                 }
                 other => {

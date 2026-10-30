@@ -7,6 +7,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use github_mirror::domain::repo::{SyncWatermarkRecord, SyncWatermarkRepository};
 use github_mirror::domain::sync::SweepWatermark;
+use github_mirror::domain::sync::mirror_worker::SweptEnd;
 use github_mirror::domain::sync::task::Family;
 use github_mirror::infra::storage::sea_orm_repo::SeaOrmSyncWatermarkRepository;
 use toolkit_db::{DBProvider, DbError};
@@ -50,6 +51,7 @@ impl Fixture {
                     family: FAMILY.to_owned(),
                     last_seen_updated_at: last_seen.map(ToOwned::to_owned),
                     page1_etag: etag.map(ToOwned::to_owned),
+                    stage_etags: std::collections::BTreeMap::new(),
                     last_head_sha: None,
                     sweep_in_progress: false,
                     candidate_high_water: None,
@@ -87,8 +89,10 @@ impl Fixture {
                 self.tenant,
                 REPO,
                 Family::Issues,
-                etag.map(ToOwned::to_owned),
-                None,
+                SweptEnd {
+                    page1_etag: etag.map(ToOwned::to_owned),
+                    ..SweptEnd::default()
+                },
             )
             .await
             .unwrap();

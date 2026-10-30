@@ -1,4 +1,3 @@
-// Created: 2026-08-25 by Virtuozzo International GmbH
 //! The `setting_declarations` table.
 
 use sea_orm::entity::prelude::*;
@@ -95,6 +94,9 @@ pub struct Model {
     /// `active` or `retired`. Retirement is a soft delete: the row and its
     /// overrides remain, excluded from resolution.
     pub status: String,
+
+    /// Optional human-readable label, 1..256 characters, never derived.
+    pub display_name: Option<String>,
 
     /// Optional long-form description.
     pub description: Option<String>,

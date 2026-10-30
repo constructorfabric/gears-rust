@@ -1,5 +1,5 @@
 //! Repository for the per-tenant invoice-posting policy
-//! (`ledger_tenant_posting_policy`, VHP-1853): resolve the version in effect
+//! (`ledger_tenant_posting_policy`): resolve the version in effect
 //! (latest `effective_from <= at`, highest `version` on a tie) and append a new
 //! effective-dated version. Mirrors `PaymentRepo::read_effective_policy`
 //! (precedence) + `ApprovalRepo::insert_policy_row` (dual-control). Tenant-scoped

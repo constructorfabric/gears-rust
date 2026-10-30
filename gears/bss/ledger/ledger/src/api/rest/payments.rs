@@ -1,6 +1,6 @@
 //! Axum handlers + router for the ledger's payment REST surface (architecture
 //! §6, money-in / money-out). Four operations under `/bss-ledger/v1`, all
-//! tenant-scoped WITHOUT a tenant in the path (the vhp-core convention, matching
+//! tenant-scoped WITHOUT a tenant in the path (the platform convention, matching
 //! the journal-entry / provisioning surfaces): writes carry `tenant_id` in the
 //! **body**, the unallocated read takes a `?tenant_id=` **query** param.
 //!

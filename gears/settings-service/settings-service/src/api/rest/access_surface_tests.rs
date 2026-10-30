@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The tenant-access surface driven as a client drives it.
 //!
 //! What a tenant may do with a setting is a sparse decision on a
@@ -331,6 +330,11 @@ async fn the_listing_carries_the_rows_recorded_for_the_setting() {
         "the listing is not paginated: {body}"
     );
     assert_eq!(body["page_info"]["limit"], json!(2), "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(2),
+        "the whole list, so the total is its length: {body}"
+    );
 }
 
 // ── What the surface refuses ─────────────────────────────────────────────────

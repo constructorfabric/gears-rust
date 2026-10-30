@@ -1,4 +1,4 @@
-//! Create the dual-control governance tables in schema `bss` (VHP-1852):
+//! Create the dual-control governance tables in schema `bss`:
 //! `ledger_approval` (one row per governed mutation that crossed a policy
 //! threshold — the `PENDING → APPROVED | REJECTED | NEEDS_REWORK | CANCELLED |
 //! EXPIRED` state machine + the deterministic `intent`), `ledger_dual_control_policy`

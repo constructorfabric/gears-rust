@@ -542,7 +542,7 @@ async fn legacy_published_usage_upgrades_without_inventing_policy_and_keeps_reso
         "INSERT INTO pricing_plan_item (id,tenant_id,revision_id,sku_id,price_book_entry_id,treatment,reservation_id,reference_state,version,created_by,created_at,updated_at) VALUES (?,?,?,?,?,'paid',?,'confirmed',1,?,?,?)",
         vec![Uuid::new_v4().into(),tenant.into(),revision.into(),sku.into(),entry.into(),Uuid::new_v4().into(),author.into(),now.into(),now.into()])).await.unwrap();
     raw.execute_raw(Statement::from_sql_and_values(DbBackend::Sqlite,
-        "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES (?,?,?,1,?,'all','2026-09-01','approved',?,1,?,?)",
+        "INSERT INTO pricing_price (id,tenant_id,price_book_entry_id,version_no,price_json,currency,currency_scale,eligibility,effective_from,state,created_by,version,created_at,updated_at) VALUES (?,?,?,1,?,'EUR',2,'all','2026-09-01','approved',?,1,?,?)",
         vec![price.into(),tenant.into(),entry.into(),json!({"rate":"1"}).to_string().into(),author.into(),now.into(),now.into()])).await.unwrap();
     run_migrations_for_testing(&db, BssPricingGear::default().migrations())
         .await

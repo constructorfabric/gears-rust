@@ -7,8 +7,8 @@ use crate::models::{LicenseCheckRequest, LicenseDecision};
 
 /// Plugin API trait for license resolver backends.
 ///
-/// Mirrors [`LicenseResolverClient`](crate::api::LicenseResolverClient) with
-/// the same single `is_licensed` method. Each plugin registers this trait as a
+/// Mirrors [`LicenseResolverApi`](crate::api::LicenseResolverApi) with the
+/// same single `is_licensed` method, in process only. Each plugin registers this trait as a
 /// scoped `ClientHub` entry keyed by its GTS instance id, and is discovered by
 /// the gateway via the [`LicenseResolverPluginSpecV1`](crate::gts::LicenseResolverPluginSpecV1)
 /// spec (vendor + priority). It tracks the public contract's major version.

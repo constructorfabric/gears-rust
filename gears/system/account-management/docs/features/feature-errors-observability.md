@@ -109,7 +109,7 @@ One generic flow models how a domain failure surfaces from any AM feature's code
 
 **Steps**:
 
-> This algorithm enumerates the canonical categories AM uses today. Any domain error not matched by steps 2–9 **MUST** fall through to `Internal` (HTTP 500) via step 10 to preserve public-contract stability; the unmatched diagnostic detail is preserved in the audit trail, not the public Problem body. The mapping is implemented by [`From<DomainError> for CanonicalError`](../../account-management/account-management/src/domain/error.rs).
+> This algorithm enumerates the canonical categories AM uses today. Any domain error not matched by steps 2–9 **MUST** fall through to `Internal` (HTTP 500) via step 10 to preserve public-contract stability; the unmatched diagnostic detail is preserved in the audit trail, not the public Problem body. The mapping is implemented by [`From<DomainError> for CanonicalError`](../../account-management/src/domain/error.rs).
 
 1. [ ] - `p1` - Identify the `DomainError` variant - `inst-algo-etp-identify-kind`
 2. [ ] - `p1` - **IF** variant is `Validation` / `InvalidTenantType` / `RootTenantCannotDelete` / `RootTenantCannotConvert` - `inst-algo-etp-invalid-argument`

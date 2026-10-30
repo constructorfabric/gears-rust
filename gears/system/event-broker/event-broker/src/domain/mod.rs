@@ -14,7 +14,6 @@ pub mod idempotency;
 pub mod ingest;
 pub mod local_broker;
 pub mod model;
-pub mod notify;
 pub mod outbox;
 pub mod projection;
 pub mod repo;

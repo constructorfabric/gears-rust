@@ -88,8 +88,9 @@ pub struct ImmutablePrice {
     /// Financial-content SHA-256, excluding identity and mutable closing metadata.
     pub money_digest: Digest,
 
-    /// Currency.
-    pub currency: String,
+    /// The price's currency and scale as stored with the price: the book's currency at the scale
+    /// the currency table gave it when the price was written. Never the current table's.
+    pub currency: bss_money::CurrencySpec,
 
     /// Model.
     pub model: PriceModel,

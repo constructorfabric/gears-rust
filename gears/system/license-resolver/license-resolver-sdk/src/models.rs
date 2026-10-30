@@ -11,6 +11,7 @@ use gts::GtsTypeId;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use toolkit_security::SecurityContext;
+use utoipa::ToSchema;
 use uuid::Uuid;
 
 /// The subject of a check — whom the license is checked for.
@@ -19,18 +20,21 @@ use uuid::Uuid;
 /// `gts.cf.core.lic.subj.v1~`). Polymorphic: a tenant, a user, or any future
 /// subject type — the resolver never assumes the subject is a tenant. Its wire
 /// shape is pinned by [`LicenseSubjectV1`](crate::gts::LicenseSubjectV1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = LicenseSubject)]
 #[serde(deny_unknown_fields)]
 pub struct Subject {
     /// The derived Subject contract type this object instantiates (e.g.
     /// `gts.cf.core.lic.subj.v1~cf.genai.llm_gateway.user.v1~`). Wire key
     /// `type`; the resolver resolves its schema to validate `metadata`.
     #[serde(rename = "type")]
+    #[schema(value_type = String)]
     pub gts_type: GtsTypeId,
     /// Optional instance id — a well-known name or a UUID (natural key);
     /// non-empty, at most 255 characters per the base schema.
     /// Absent for a type-level subject.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min_length = 1, max_length = 255)]
     pub id: Option<String>,
     /// Licensing-relevant properties conforming to the derived contract's
     /// metadata schema. Semantically opaque to the resolver; shape-validated
@@ -39,6 +43,7 @@ pub struct Subject {
     /// Required on the wire, so an omitted `metadata` is non-conforming and
     /// **must not** be defaulted to `{}` here. Pass an empty map when the
     /// contract declares no metadata.
+    #[schema(value_type = Object)]
     pub metadata: Map<String, Value>,
 }
 
@@ -48,7 +53,8 @@ pub struct Subject {
 /// `gts.cf.core.lic.res.v1~`). Without [`id`](Self::id) the check targets the
 /// whole resource type (e.g. gating a `POST`); with it, a specific instance. Its
 /// wire shape is pinned by [`LicenseResourceV1`](crate::gts::LicenseResourceV1).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[schema(as = LicenseResource)]
 #[serde(deny_unknown_fields)]
 pub struct Resource {
     /// The derived Resource contract type this object instantiates (e.g.
@@ -56,11 +62,13 @@ pub struct Resource {
     /// `type`; the resolver resolves its schema to validate `metadata` and read
     /// `admitted_subjects`.
     #[serde(rename = "type")]
+    #[schema(value_type = String)]
     pub gts_type: GtsTypeId,
     /// Optional instance id — a well-known name or a UUID (natural key);
     /// non-empty, at most 255 characters per the base schema.
     /// Absent = whole-type check; how that is answered is the backend's policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(min_length = 1, max_length = 255)]
     pub id: Option<String>,
     /// Licensing-relevant properties conforming to the derived contract's
     /// metadata schema. Semantically opaque to the resolver; shape-validated
@@ -69,6 +77,7 @@ pub struct Resource {
     /// Required on the wire, so an omitted `metadata` is non-conforming and
     /// **must not** be defaulted to `{}` here. Pass an empty map when the
     /// contract declares no metadata.
+    #[schema(value_type = Object)]
     pub metadata: Map<String, Value>,
 }
 
@@ -84,7 +93,7 @@ pub struct Resource {
 /// must not grant more than presence**. An input that cannot is a new version of
 /// the licensing contract, not an optional field (see "Envelope evolution" in
 /// the module's DESIGN doc).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
 pub struct LicenseCheckContext {
     /// The tenant the check is scoped to. No cross-tenant resolution.
@@ -172,7 +181,7 @@ impl LicenseCheckContextBuilder {
 ///
 /// Unknown fields are **ignored** here too, under the same rule as
 /// [`LicenseCheckContext`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
 pub struct LicenseCheckRequest {
     /// Whom the license is checked for.
@@ -207,7 +216,7 @@ impl LicenseCheckRequest {
 ///
 /// Unknown fields are **ignored**; adding one is non-breaking in both directions
 /// because [`granted`](Self::granted) is authoritative on its own.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[non_exhaustive]
 pub struct LicenseDecision {
     /// Whether the resource is licensed to the subject at the time of the call.
@@ -233,6 +242,14 @@ impl LicenseDecision {
         self.diagnostics.insert(key.into(), value.into());
         self
     }
+}
+
+// Tag traits required by `#[toolkit::rest_contract]` for the HTTP body types.
+mod _api_dto_markers {
+    use toolkit::api::api_dto::{RequestApiDto, ResponseApiDto};
+
+    impl RequestApiDto for super::LicenseCheckRequest {}
+    impl ResponseApiDto for super::LicenseDecision {}
 }
 
 #[cfg(test)]

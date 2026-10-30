@@ -89,8 +89,8 @@ pub enum OperationKind {
 
 /// `operation.plane` — 1 platform, 2 tenant.
 ///
-/// Every P0 operation is `Platform`. The plane is expressed by the contract and
-/// the data, not enforced by the transport (ceiling C8).
+/// Every P0 operation is `Platform`: only platform routes and the platform contract
+/// reach a mutation (D17). No listener separates the planes yet (ceiling C8).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]
 pub enum Plane {
@@ -151,8 +151,8 @@ pub enum OperationItemStatus {
 /// `dependency.kind` — 1 `schema_ref` (`$ref`), 2 derivation (immediate base),
 /// 3 `instance_of` (conforming Type Schema).
 ///
-/// `x-gts-ref` is not represented: it constrains an instance value without resolving
-/// or inlining a target. The numbering is append-only after the first release, and
+/// An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is not represented:
+/// it constrains an instance value without resolving or inlining a target. The numbering is append-only after the first release, and
 /// `ck_tr_dependency_kind` admits exactly these three values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, EnumIter, DeriveActiveEnum)]
 #[sea_orm(rs_type = "i16", db_type = "SmallInteger")]

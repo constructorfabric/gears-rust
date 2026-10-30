@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Tests for the declaration `OData` surface.
 //!
 //! Acceptance: FEATURE `setting-declarations.md` CDSL `inst-decl-read-5` — an
@@ -98,6 +97,7 @@ fn row(owner_module: Option<&str>) -> DeclarationModel {
         owner_module: owner_module.map(str::to_owned),
         licence_feature: None,
         status: "retired".to_owned(),
+        display_name: None,
         description: None,
         last_change_at: at,
         created_at: at,

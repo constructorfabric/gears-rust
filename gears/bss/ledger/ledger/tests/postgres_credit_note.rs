@@ -343,7 +343,7 @@ async fn total_deferred(
     .await
 }
 
-// TODO(VHP-1856 Slice 3 Phase 3): an `#[ignore]` integration test that posts a
+// TODO(Slice 3): an `#[ignore]` integration test that posts a
 // credit note carrying a multi-component `tax` breakdown and asserts the projected
 // `tax_subbalance` is disaggregated per `(jurisdiction, filing)` (and that the
 // `NegativeTaxSubbalance` alarm added in Group 2 is now reachable for notes). The

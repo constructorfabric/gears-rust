@@ -444,6 +444,33 @@ async fn every_route_denies_authorization_before_preconditions_or_disclosure() {
             "{method} {path}"
         );
     }
+    // D-537: the currency table is the one door that asks no permission. A PDP that denies
+    // everything is never asked, and a caller with no security context is still 401.
+    let (status, body, _) = request(
+        &f.denied,
+        &f.ctx,
+        "GET",
+        "/currencies",
+        json!({}),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(165), "{body}");
+    let response = f
+        .denied
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/bss-pricing/v1/currencies")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status().as_u16(), 401, "no context, no table");
 }
 
 use bss_pricing::infra::storage::{
@@ -498,6 +525,8 @@ fn price(p: &price_book_entry::Model) -> price::Model {
         version_no: 1,
         dim_value: None,
         price_json: serde_json::json!({"rate":"0.1"}),
+        currency: "EUR".into(),
+        currency_scale: 2,
         min_fee: Some("12.34".into()),
         eligibility: "all".into(),
         effective_from: at(9).date(),
@@ -709,6 +738,9 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
         ),
         ("GET", "/settings".into(), "config", "read"),
         ("PUT", "/settings".into(), "config", "settings"),
+        // D-537: the deployment's table, read by any authenticated caller; an empty label
+        // marks the one door that asks no permission.
+        ("GET", "/currencies".into(), "", ""),
         ("GET", "/dimension-keys".into(), "config", "read"),
         ("PUT", "/dimension-keys".into(), "config", "settings"),
         (
@@ -859,9 +891,10 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
             )
         })
         .collect();
-    // 60: run 9.7's batch checks read (D-482), run 9.8b's plans counts (D-485), the cancel and
-    // end doors (D-520, D-521), and the book's archive and unarchive (D-522).
-    assert_eq!(table.len(), 60);
+    // 61: run 9.7's batch checks read (D-482), run 9.8b's plans counts (D-485), the cancel and
+    // end doors (D-520, D-521), the book's archive and unarchive (D-522), and the currency table
+    // (D-537).
+    assert_eq!(table.len(), 61);
     assert_eq!(rows.len(), table.len(), "one row per route");
     assert_eq!(
         rows, f.registered,
@@ -884,21 +917,22 @@ async fn authorization_labels_actions_and_cross_tenant_reads_are_pinned() {
             403,
             "{method} {path}"
         );
-        assert_eq!(
-            request(
-                &f.app,
-                &context("wrong:wrong"),
-                method,
-                &path,
-                json!({}),
-                None,
-                None
-            )
-            .await
-            .0,
-            403,
-            "{method} {path}"
-        );
+        let wrong = request(
+            &f.app,
+            &context("wrong:wrong"),
+            method,
+            &path,
+            json!({}),
+            None,
+            None,
+        )
+        .await
+        .0;
+        if label.is_empty() {
+            assert_eq!(wrong, 200, "{method} {path}: no grant is asked");
+        } else {
+            assert_eq!(wrong, 403, "{method} {path}");
+        }
     }
     let stranger = SecurityContext::builder()
         .subject_id(Uuid::new_v4())
@@ -947,7 +981,7 @@ async fn a_nul_character_in_free_text_is_refused_before_any_write() {
         .call(
             "PUT",
             "/settings",
-            json!({"default_timing":"advance","default_rounding":"half\u{0}up","invoice_line_templates":{}}),
+            json!({"default_timing":"advance","default_gl":"gl\u{0}x","invoice_line_templates":{}}),
             Some(&tag),
             None,
         )

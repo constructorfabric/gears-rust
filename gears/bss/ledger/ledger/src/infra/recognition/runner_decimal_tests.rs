@@ -36,7 +36,10 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
     let publisher = Arc::new(LedgerEventPublisher::noop());
     let runner = RecognitionRunner::new(provider.clone(), publisher, Arc::new(NoopLedgerMetrics));
     let scope = AccessScope::allow_all();
-    for currency in ["EUR", "USD"] {
+    // Non-ISO codes: the registry row is the only source of their scale, so a test can
+    // change it and prove that a reversal keeps the stored scale (an ISO code always keeps
+    // its ISO scale).
+    for currency in ["TKA", "TKB"] {
         runner
             .reference
             .upsert_currency_scale(crate::domain::model::CurrencyScaleRow {
@@ -63,7 +66,7 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
                 tenant_id: tenant,
                 legal_entity_id: tenant,
                 account_class: class.as_str().into(),
-                currency: "EUR".into(),
+                currency: "TKA".into(),
                 revenue_stream: class.is_per_stream().then(|| "test".into()),
                 normal_side: normal.as_str().into(),
                 may_go_negative: false,
@@ -102,7 +105,7 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
                     po_allocation_group: None,
                     subscription_ref: None,
                     revenue_stream: "test".into(),
-                    total_deferred: money("1", "EUR", 2),
+                    total_deferred: money("1", "TKA", 2),
                     policy_ref: "straight-line".into(),
                     ssp_snapshot_ref: None,
                     vc_estimate_ref: None,
@@ -118,7 +121,7 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
                     schedule_id: "schedule".into(),
                     segment_no: 1,
                     period_id: "202610".into(),
-                    amount: money("1", "EUR", 2),
+                    amount: money("1", "TKA", 2),
                 }],
             )
             .await?;
@@ -131,14 +134,14 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
         schedule_id: "schedule".into(),
         segment_no: 1,
         period_id: "202610".into(),
-        amount: money("1", "EUR", 2),
+        amount: money("1", "TKA", 2),
         revenue_stream: "test".into(),
     };
     let mut header = posting_header(
         &SecurityContext::anonymous(),
         tenant,
         "202610",
-        "EUR",
+        "TKA",
         "fund".into(),
     );
     header.source_doc_type = SourceDocType::InvoicePost;
@@ -155,8 +158,8 @@ async fn seeded(db: Db, functional: bool) -> (Db, RecognitionRunner, Uuid, Relea
     ));
     liability.account_id = accounts[1];
     if functional {
-        cash.functional_money = Some(money("2", "USD", 2));
-        liability.functional_money = Some(money("2", "USD", 2));
+        cash.functional_money = Some(money("2", "TKB", 2));
+        liability.functional_money = Some(money("2", "TKB", 2));
     }
     runner
         .posting
@@ -202,7 +205,7 @@ async fn snapshot(db: &Db) -> String {
 #[tokio::test]
 async fn stale_due_money_refreshes_and_completed_replay_ignores_closed_mutable_gates() {
     let (db, runner, tenant, mut candidate) = fixture().await;
-    candidate.amount = money("999", "USD", 3);
+    candidate.amount = money("999", "TKB", 3);
     candidate.revenue_stream = "wrong".into();
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::allow_all();
@@ -220,7 +223,7 @@ async fn stale_due_money_refreshes_and_completed_replay_ignores_closed_mutable_g
         original
             .lines
             .iter()
-            .all(|l| l.money == money("1", "EUR", 2))
+            .all(|l| l.money == money("1", "TKA", 2))
     );
     let conn = db.conn().unwrap();
     crate::infra::storage::entity::fiscal_period::Entity::update_many()
@@ -320,7 +323,7 @@ async fn queue_then_predecessor_release_preserves_target_and_e2_actual_period_re
                     schedule_id: "schedule".into(),
                     segment_no: 2,
                     period_id: "202610".into(),
-                    amount: money("0.2", "EUR", 2),
+                    amount: money("0.2", "TKA", 2),
                 }],
             )
             .await?;
@@ -480,7 +483,7 @@ async fn postgres_actual_runner_release_replay_reversal() {
         treatment: "prospective".into(),
         new_segments: Some(vec![bss_ledger_sdk::ChangeSegment {
             period_id: "202610".into(),
-            money: money("1", "EUR", 2),
+            money: money("1", "TKA", 2),
         }]),
     };
     let (release, replacement) = tokio::join!(
@@ -495,11 +498,11 @@ async fn postgres_actual_runner_release_replay_reversal() {
         .unwrap()
         .unwrap();
     if release.is_ok() {
-        assert_eq!(original.recognized, money("1", "EUR", 2));
+        assert_eq!(original.recognized, money("1", "TKA", 2));
         assert!(replacement.is_err());
     } else {
         assert_eq!(original.status, "REPLACED");
-        assert_eq!(original.recognized, money("0", "EUR", 2));
+        assert_eq!(original.recognized, money("0", "TKA", 2));
         assert!(replacement.is_ok());
     }
 }
@@ -541,8 +544,8 @@ async fn historical_functional_release_reversal_restores_full_dimensions_despite
             &scope,
             &NewRateSnapshot {
                 tenant_id: tenant,
-                base_currency: money("1", "EUR", 2).currency().clone(),
-                quote_currency: money("2", "USD", 2).currency().clone(),
+                base_currency: money("1", "TKA", 2).currency().clone(),
+                quote_currency: money("2", "TKB", 2).currency().clone(),
                 rate: bss_ledger_sdk::parse_decimal("2").unwrap(),
                 as_of: OffsetDateTime::now_utc(),
                 provider: "test".into(),
@@ -576,9 +579,9 @@ async fn historical_functional_release_reversal_restores_full_dimensions_despite
             let mut lines: Vec<_> = bound.lines.into_iter().map(new_line).collect();
             for line in &mut lines {
                 line.account_id = chart
-                    .resolve(line.account_class, "EUR", Some("test"))
+                    .resolve(line.account_class, "TKA", Some("test"))
                     .unwrap();
-                line.functional_money = Some(money("2", "USD", 2));
+                line.functional_money = Some(money("2", "TKB", 2));
                 line.gl_code = Some("historical-gl".into());
                 line.invoice_item_ref = Some("historical-item".into());
                 line.price_id = Some("historical-price".into());
@@ -602,7 +605,7 @@ async fn historical_functional_release_reversal_restores_full_dimensions_despite
                 &SecurityContext::anonymous(),
                 tenant,
                 "202610",
-                "EUR",
+                "TKA",
                 "schedule:1".into(),
             );
             header.rate_snapshot_ref = Some(rate_id);
@@ -636,8 +639,8 @@ async fn historical_functional_release_reversal_restores_full_dimensions_despite
         .unwrap();
     fx.upsert_rate(&NewFxRate {
         tenant_id: tenant,
-        base_currency: "EUR".into(),
-        quote_currency: "USD".into(),
+        base_currency: "TKA".into(),
+        quote_currency: "TKB".into(),
         provider: "test".into(),
         rate: bss_ledger_sdk::parse_decimal("7").unwrap(),
         as_of: OffsetDateTime::now_utc(),
@@ -774,7 +777,7 @@ async fn stale_actual_discovery_refreshes_changed_segment_and_replaced_schedule_
         original
             .lines
             .iter()
-            .all(|l| l.money == money("0.6", "EUR", 2))
+            .all(|l| l.money == money("0.6", "TKA", 2))
     );
     let (db, runner, tenant, candidate) = fixture().await;
     let service = crate::infra::recognition::change_service::RecognitionChangeService::new(
@@ -793,7 +796,7 @@ async fn stale_actual_discovery_refreshes_changed_segment_and_replaced_schedule_
                 treatment: "prospective".into(),
                 new_segments: Some(vec![bss_ledger_sdk::ChangeSegment {
                     period_id: "202610".into(),
-                    money: money("1", "EUR", 2),
+                    money: money("1", "TKA", 2),
                 }]),
             },
         )
@@ -951,7 +954,7 @@ async fn terminal_schedule_negative_delta_succeeds_but_negative_result_rolls_bac
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(state.recognized, money("0", "EUR", 2));
+    assert_eq!(state.recognized, money("0", "TKA", 2));
     assert_eq!(state.status, "CANCELLED");
     assert_eq!(
         runner
@@ -1011,7 +1014,7 @@ async fn later_release_failure_keeps_prior_segment_committed() {
                     po_allocation_group: None,
                     subscription_ref: None,
                     revenue_stream: "test".into(),
-                    total_deferred: money("0.2", "EUR", 2),
+                    total_deferred: money("0.2", "TKA", 2),
                     policy_ref: "straight-line".into(),
                     ssp_snapshot_ref: None,
                     vc_estimate_ref: None,
@@ -1027,7 +1030,7 @@ async fn later_release_failure_keeps_prior_segment_committed() {
                     schedule_id: "z-second".into(),
                     segment_no: 1,
                     period_id: "202610".into(),
-                    amount: money("0.2", "EUR", 2),
+                    amount: money("0.2", "TKA", 2),
                 }],
             )
             .await?;
@@ -1066,9 +1069,9 @@ async fn later_release_failure_keeps_prior_segment_committed() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(first.recognized, money("1", "EUR", 2));
+    assert_eq!(first.recognized, money("1", "TKA", 2));
     assert_eq!(first.status, "COMPLETED");
-    assert_eq!(second.recognized, money("0", "EUR", 2));
+    assert_eq!(second.recognized, money("0", "TKA", 2));
     assert_eq!(
         runner
             .recognition
@@ -1101,7 +1104,7 @@ async fn later_release_failure_keeps_prior_segment_committed() {
 async fn historical_stored_spec_disagreement_is_internal_and_preserves_all_financial_state() {
     let ctx = SecurityContext::anonymous();
     let scope = AccessScope::allow_all();
-    for (code, scale) in [("USD", 2_i16), ("EUR", 3_i16)] {
+    for (code, scale) in [("TKB", 2_i16), ("TKA", 3_i16)] {
         let (db, runner, tenant, candidate) = fixture().await;
         runner
             .release_segment(&ctx, &scope, tenant, &candidate, Uuid::now_v7())
@@ -1109,7 +1112,7 @@ async fn historical_stored_spec_disagreement_is_internal_and_preserves_all_finan
             .unwrap();
         let conn = db.conn().unwrap();
         // Coherent schedule/segment metadata still decodes, but no longer
-        // agrees with the original complete journal's persisted EUR/scale2.
+        // agrees with the original complete journal's persisted TKA/scale2.
         recognition_schedule::Entity::update_many()
             .secure()
             .scope_with(&scope)

@@ -1,4 +1,3 @@
-// Created: 2026-08-26 by Virtuozzo International GmbH
 //! Declaration read handlers.
 //!
 //! Each obtains its `AccessScope` from the enforcement point before it touches
@@ -18,6 +17,7 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::declaration_dto::DeclarationDto;
+use crate::api::rest::page_dto::PageDto;
 use crate::domain::declaration::{DeclarationRepository, DeclarationService};
 use crate::domain::error::DomainError;
 
@@ -103,11 +103,7 @@ pub async fn list_declarations<R: DeclarationRepository>(
 
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
     let page = svc.list(&conn, &scope, &query).await?;
-    let items: Vec<DeclarationDto> = page.items.into_iter().map(DeclarationDto::from).collect();
-    Ok(Json(toolkit_odata::Page {
-        items,
-        page_info: page.page_info,
-    }))
+    Ok(Json(PageDto::counted(page, DeclarationDto::from)))
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-read:p1:inst-decl-read-9
 }
 

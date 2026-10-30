@@ -1,0 +1,227 @@
+name: Publish Images & Charts
+
+# Reusable Docker image + Helm chart publish for ONE component, driven by
+# deploy/components.yaml (adding a gear is one entry there, never a change here).
+#
+# Called by release-plz.yml once per released, publishable gear — so a release and
+# its images/charts share a single run — or run manually (workflow_dispatch) to
+# publish the platform umbrella or re-publish anything. The resolve job turns the
+# component/version inputs into the build spec; the image and chart jobs gate on
+# has_image / has_chart.
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: Component name from deploy/components.yaml
+        required: true
+        type: string
+      version:
+        description: SemVer version (with or without a leading v)
+        required: true
+        type: string
+      latest:
+        description: Also tag the image `:latest` (set by release-plz; off for manual re-publish)
+        required: false
+        default: false
+        type: boolean
+  workflow_dispatch:
+    inputs:
+      component:
+        description: Component name from deploy/components.yaml
+        required: true
+        type: string
+      version:
+        description: SemVer version (with or without a leading v)
+        required: true
+        type: string
+      latest:
+        description: Also tag the image `:latest`
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # One in-flight publish per component; different components run in parallel.
+  # queue: max queues extra same-component publishes instead of cancelling them
+  # (requires cancel-in-progress: false).
+  group: publish-${{ inputs.component }}
+  queue: max
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Resolve release
+    runs-on: ubuntu-latest
+    outputs:
+      component: ${{ steps.resolve.outputs.component }}
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      has_image: ${{ steps.resolve.outputs.has_image }}
+      dockerfile: ${{ steps.resolve.outputs.dockerfile }}
+      build_args: ${{ steps.resolve.outputs.build_args }}
+      has_chart: ${{ steps.resolve.outputs.has_chart }}
+      chart_path: ${{ steps.resolve.outputs.chart_path }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Resolve component
+        id: resolve
+        env:
+          INPUT_COMPONENT: ${{ inputs.component }}
+          INPUT_VERSION: ${{ inputs.version }}
+        run: python3 tools/scripts/resolve_release.py
+
+  image:
+    name: Image (${{ inputs.component }} ${{ inputs.version }})
+    needs: resolve
+    if: needs.resolve.outputs.has_image == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # keyless cosign signing via GitHub OIDC
+    env:
+      IMAGE: ghcr.io/constructorfabric/${{ needs.resolve.outputs.component }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Build from the gear's release tag, so a re-publish reproduces that
+          # version's source. Empty ref (platform umbrella) = default checkout.
+          ref: ${{ needs.resolve.outputs.ref }}
+          persist-credentials: false
+
+      - name: Docker metadata (tags + OCI labels)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=${{ needs.resolve.outputs.version }}
+            type=raw,value=latest,enable=${{ inputs.latest }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ${{ needs.resolve.outputs.dockerfile }}
+          # amd64-only for v1; buildx is set up so arm64 can be added here later.
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: ${{ needs.resolve.outputs.build_args }}
+          # SLSA provenance + SPDX SBOM, attached to the image as attestations.
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=${{ needs.resolve.outputs.component }}
+          cache-to: type=gha,mode=max,scope=${{ needs.resolve.outputs.component }}
+
+      - name: Sign image (keyless)
+        env:
+          REF: ${{ env.IMAGE }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$REF"
+          echo "Signed \`$REF\`" >> "$GITHUB_STEP_SUMMARY"
+
+  chart:
+    name: Chart (${{ inputs.component }} ${{ inputs.version }})
+    needs: [resolve, image]
+    # Image-bearing components publish the chart only after the image job
+    # succeeds; the chart-only toolkit-platform has no image job (skipped), so
+    # allow success or skipped but never a failed image build. The explicit
+    # status function is required so a skipped image doesn't auto-skip chart.
+    if: >-
+      !cancelled()
+      && needs.resolve.result == 'success'
+      && needs.resolve.outputs.has_chart == 'true'
+      && needs.image.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write   # keyless cosign signing via GitHub OIDC
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Same release-tag source as the image job (empty ref = default
+          # checkout, for the platform umbrella).
+          ref: ${{ needs.resolve.outputs.ref }}
+          persist-credentials: false
+
+      - name: Install Helm
+        env:
+          HELM_VERSION: "3.18.4"
+          HELM_SHA256: "f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1"
+        run: |
+          curl -fsSL -o /tmp/helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/helm.tgz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+          helm version
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # helm login for `helm push`; cosign login (writes ~/.docker/config.json)
+          # so `cosign sign` can push the signature artifact to the same repo.
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io --username "${{ github.actor }}" --password-stdin
+          echo "$GHCR_TOKEN" | cosign login ghcr.io --username "${{ github.actor }}" --password-stdin
+
+      - name: Resolve chart dependencies
+        run: bash tools/scripts/update-helm-deps.sh
+
+      - name: Package, push, and sign chart
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+          CHART_PATH: ${{ needs.resolve.outputs.chart_path }}
+          HAS_IMAGE: ${{ needs.resolve.outputs.has_image }}
+          REPO: ghcr.io/constructorfabric/charts/${{ needs.resolve.outputs.component }}
+        run: |
+          mkdir -p artifacts
+          # A gear's own chart deploys this release's image, so pin image.tag to the
+          # release version (the committed value is a 0.0.0 placeholder). The umbrella
+          # has no image of its own and keeps its committed pins. This edits the
+          # ephemeral checkout only — it is never committed.
+          if [[ "$HAS_IMAGE" == "true" ]]; then
+            yq -i ".image.tag = \"$VERSION\"" "$CHART_PATH/values.yaml"
+          fi
+          helm package "$CHART_PATH" --destination artifacts \
+            --version "$VERSION" --app-version "$VERSION"
+          # helm push reports the pushed manifest digest; sign that immutable ref.
+          # Keep only the last matching line's final token, so an extra line that
+          # happens to say "digest" can't turn $digest into two words.
+          digest=$(helm push artifacts/*.tgz oci://ghcr.io/constructorfabric/charts 2>&1 \
+            | awk '/[Dd]igest:/ { d = $NF } END { print d }')
+          if [[ -z "$digest" ]]; then
+            echo "::error::helm push did not report a digest" >&2
+            exit 1
+          fi
+          echo "pushed ${REPO}@${digest}"
+          cosign sign --yes "${REPO}@${digest}"
+          echo "Signed \`${REPO}@${digest}\`" >> "$GITHUB_STEP_SUMMARY"

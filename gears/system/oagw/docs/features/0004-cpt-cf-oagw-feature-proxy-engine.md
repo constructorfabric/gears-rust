@@ -16,7 +16,7 @@
   - [Plugin Chain Execution](#plugin-chain-execution)
   - [Header Transformation](#header-transformation)
   - [Body Validation](#body-validation)
-  - [Pingora In-Memory Bridge](#pingora-in-memory-bridge)
+  - [Upstream Forwarding](#upstream-forwarding)
   - [Error Source Classification](#error-source-classification)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
@@ -27,7 +27,7 @@
   - [Implement Header Transformation](#implement-header-transformation)
   - [Implement Body Validation](#implement-body-validation)
   - [Implement Error Source Distinction](#implement-error-source-distinction)
-  - [Implement Pingora Proxy Engine](#implement-pingora-proxy-engine)
+  - [Implement Upstream Proxy Engine](#implement-upstream-proxy-engine)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Additional Context](#7-additional-context)
   - [Performance Considerations](#performance-considerations)
@@ -45,7 +45,7 @@
 
 ### 1.1 Overview
 
-Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain, forward HTTP request via Pingora in-memory bridge, transform response, and return with error source distinction.
+Implement the Data Plane proxy execution flow: resolve upstream by alias, match route, execute plugin chain, forward HTTP request through the `toolkit-http-proxy` upstream engine, transform response, and return with error source distinction.
 
 ### 1.2 Purpose
 
@@ -92,8 +92,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 - Body validation fails (400 ValidationError or 413 PayloadTooLarge)
 - Upstream returns error response (502 DownstreamError passthrough)
 - Upstream connection or request times out (504 ConnectionTimeout / RequestTimeout)
-- WebSocket upgrade requested (501 ProtocolError — not supported by unidirectional bridge)
-- Pingora-level protocol error (502 ProtocolError — e.g. HTTP/2 downgrade failure)
+- Upstream rejects a WebSocket upgrade (502 ProtocolError — no `101 Switching Protocols`)
+- Upstream HTTP/2 protocol error (502 ProtocolError)
 - X-OAGW-Target-Host missing for multi-endpoint common-suffix upstream (400 MissingTargetHost)
 - X-OAGW-Target-Host format invalid (400 InvalidTargetHost)
 - X-OAGW-Target-Host does not match any configured endpoint (400 UnknownTargetHost)
@@ -135,17 +135,17 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 23. [x] - `p1` - **IF** `X-OAGW-Target-Host` present AND value does not match any configured endpoint host - `inst-proxy-23`
     1. [x] - `p1` - **RETURN** 400 UnknownTargetHost with `X-OAGW-Error-Source: gateway` - `inst-proxy-23a`
 24. [x] - `p1` - **IF** request contains `Upgrade: websocket` header - `inst-proxy-24`
-    1. [x] - `p1` - **RETURN** 501 ProtocolError with `X-OAGW-Error-Source: gateway` (WebSocket requires bidirectional tunnel; current bridge is unidirectional) - `inst-proxy-24a`
+    1. [x] - `p1` - Perform the handshake on a dedicated upstream connection via the engine's upgrade; tunnel only after the upstream answers `101`, otherwise **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-24a`
 25. [x] - `p1` - Build outbound HTTP request: set target URL (scheme + host + port + path), method, headers, body - `inst-proxy-25`
-26. [x] - `p1` - Serialize request into in-memory duplex stream and forward to Pingora `ProxyHttp` engine via `cpt-cf-oagw-algo-pingora-bridge` - `inst-proxy-26`
-27. [x] - `p1` - **IF** Pingora reports upstream connection failure (refused, DNS, TLS) via `fail_to_proxy` - `inst-proxy-27`
-    1. [x] - `p1` - Map Pingora `ErrorType` to `DomainError` and write RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
-    2. [x] - `p1` - **RETURN** 502 DownstreamError with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
-28. [x] - `p1` - **IF** connection or request timeout (Pingora `ConnectTimedout`, `ReadTimedout`, `WriteTimedout`) - `inst-proxy-28`
+26. [x] - `p1` - Forward the request through the upstream engine via `cpt-cf-oagw-algo-upstream-forwarding` - `inst-proxy-26`
+27. [x] - `p1` - **IF** the engine reports an upstream connection failure (refused, DNS, TLS) - `inst-proxy-27`
+    1. [x] - `p1` - Map the engine error kind to `DomainError`; the REST layer writes the RFC 9457 Problem response with `X-OAGW-Error-Source: gateway` - `inst-proxy-27a`
+    2. [x] - `p1` - **RETURN** 502 DownstreamError (503 LinkUnavailable for no route) with `X-OAGW-Error-Source: gateway` - `inst-proxy-27b`
+28. [x] - `p1` - **IF** connection or request timeout (connect timeout, response-head or body read timeout) - `inst-proxy-28`
     1. [x] - `p1` - **RETURN** 504 ConnectionTimeout or RequestTimeout via `cpt-cf-oagw-algo-error-source-classification` - `inst-proxy-28a`
-29. [x] - `p1` - **IF** Pingora reports HTTP/2 error (`H2Error`, `H2Downgrade`) - `inst-proxy-29`
+29. [x] - `p1` - **IF** the engine reports an HTTP/2 protocol error - `inst-proxy-29`
     1. [x] - `p1` - **RETURN** 502 ProtocolError with `X-OAGW-Error-Source: gateway` - `inst-proxy-29a`
-30. [x] - `p1` - Parse upstream response from duplex stream read half - `inst-proxy-30`
+30. [x] - `p1` - Receive the upstream response head; the body streams - `inst-proxy-30`
 31. [x] - `p1` - **IF** upstream returns error response - `inst-proxy-31`
     1. [x] - `p1` - Execute transform plugins: `on_error` phase - `inst-proxy-31a`
     2. [x] - `p1` - **RETURN** upstream response as-is with `X-OAGW-Error-Source: upstream` - `inst-proxy-31b`
@@ -158,45 +158,47 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-algo-alias-resolution`
 
-**Input**: Alias string, tenant_id from SecurityContext
+**Input**: Alias string, tenant chain (requesting tenant first, then ancestors to root)
 
 **Output**: Resolved `UpstreamConfig` or error
 
 **Steps**:
-1. [x] - `p1` - DB: SELECT upstream FROM oagw_upstream WHERE alias = :alias AND tenant_id = :tenant_id AND enabled = true - `inst-alias-1`
-2. [x] - `p1` - **IF** upstream found in current tenant - `inst-alias-2`
-   1. [x] - `p1` - **RETURN** resolved UpstreamConfig - `inst-alias-2a`
-3. [x] - `p1` - Walk tenant hierarchy from current tenant toward root (closest ancestor first) - `inst-alias-3`
-4. [x] - `p1` - **FOR EACH** ancestor tenant_id in hierarchy - `inst-alias-4`
-   1. [x] - `p1` - DB: SELECT upstream FROM oagw_upstream WHERE alias = :alias AND tenant_id = :ancestor_id AND sharing != 'private' - `inst-alias-4a`
-   2. [x] - `p1` - **IF** upstream found - `inst-alias-4b`
-      1. [x] - `p1` - **IF** upstream disabled (enabled = false) - `inst-alias-4b1`
-         1. [x] - `p1` - **RETURN** error: upstream disabled (503 LinkUnavailable) - `inst-alias-4b1a`
-      2. [x] - `p1` - **RETURN** resolved UpstreamConfig (closest match wins — shadowing) - `inst-alias-4b2`
-5. [x] - `p1` - **RETURN** error: upstream not found for alias (404 RouteNotFound) - `inst-alias-5`
+1. [x] - `p1` - Repo: `list_by_alias_for_tenants(alias, tenant_chain, Tags::Skip)` — one query `WHERE alias = :alias AND tenant_id IN (:chain)` with plugin rows joined in and no tags, replacing one lookup per tenant - `inst-alias-1`
+2. [x] - `p1` - Order the returned upstreams by their tenant's position in the chain (closest first) - `inst-alias-3`
+3. [x] - `p1` - **FOR EACH** upstream in chain order - `inst-alias-4`
+   1. [x] - `p1` - **IF** upstream belongs to an ancestor AND none of its sharing modes is visible (all `private`), skip it - `inst-alias-4a`
+   2. [x] - `p1` - **IF** upstream disabled (enabled = false), record the disabled alias and continue - `inst-alias-4b1`
+   3. [x] - `p1` - **ELSE** keep it as a visible enabled match - `inst-alias-4b`
+4. [x] - `p1` - **IF** at least one visible enabled match - `inst-alias-2`
+   1. [x] - `p1` - **RETURN** the closest one as resolved UpstreamConfig (shadowing); visible ancestors form the merge chain - `inst-alias-4b2`
+5. [x] - `p1` - **IF** a disabled match was recorded - `inst-alias-4b1-ret`
+   1. [x] - `p1` - **RETURN** error: upstream disabled (503 LinkUnavailable) - `inst-alias-4b1a`
+6. [x] - `p1` - **RETURN** error: upstream not found for alias (404 RouteNotFound) - `inst-alias-5`
 
 ### Route Matching
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-algo-route-matching`
 
-**Input**: upstream_id, HTTP method, request path
+**Input**: tenant chain, ordered upstream IDs (selected upstream first, then merge-chain ancestor upstreams closest-first), HTTP method, request path
 
 **Output**: Matched `RouteConfig` or error
 
 **Steps**:
-1. [x] - `p1` - DB: SELECT routes FROM oagw_route WHERE upstream_id = :upstream_id AND enabled = true - `inst-route-1`
-2. [x] - `p1` - Filter routes by match type for the request protocol - `inst-route-2`
-3. [x] - `p1` - **FOR EACH** route ordered by path prefix length (longest first), then priority (lowest number first) - `inst-route-3`
+1. [x] - `p1` - Repo: `find_matching_in_tenants(tenant_chain, upstream_ids, method, path, Tags::Skip)` with `upstream_ids` ordered selected upstream first, then ancestor upstreams closest-first — one candidate query `WHERE tenant_id IN (:chain) AND upstream_id IN (:upstream_ids) AND enabled = true AND match_type = 'http'` joined with `oagw_route_http_match` and `oagw_route_method` and filtered on the request method when a database is configured, replacing one `find_matching` call per tenant and per upstream - `inst-route-1`
+2. [x] - `p1` - Evaluate candidate routes by upstream preference (list order: selected upstream first, then ancestor upstreams closest-first), then by tenant chain position (closest first); the first upstream and tenant with a matching route wins, so routes on the selected upstream and descendant routes take priority - `inst-route-1b`
+3. [x] - `p1` - Within a tenant, filter routes by match type for the request protocol - `inst-route-2`
+4. [x] - `p1` - **FOR EACH** route ordered by path prefix length (longest first), then priority (higher number first, per `cpt-cf-oagw-adr-storage-schema`), then lowest route ID - `inst-route-3`
    1. [x] - `p1` - **IF** route.match_type = 'http' - `inst-route-3a`
-      1. [x] - `p1` - DB: Check method in oagw_route_method WHERE route_id = :route_id - `inst-route-3a1`
-      2. [x] - `p1` - DB: Check request path starts with path_prefix from oagw_route_http_match - `inst-route-3a2`
+      1. [x] - `p1` - Check request method is in the route's HTTP method list - `inst-route-3a1`
+      2. [x] - `p1` - Check request path starts with the route's path prefix - `inst-route-3a2`
       3. [x] - `p1` - **IF** method allowed AND path matches prefix - `inst-route-3a3`
-         1. [x] - `p1` - **RETURN** RouteConfig (first match wins — longest prefix + highest priority) - `inst-route-3a3a`
-   2. [x] - `p1` - **IF** route.match_type = 'grpc' - `inst-route-3b`
-      1. [x] - `p1` - DB: Check gRPC service and method from oagw_route_grpc_match - `inst-route-3b1`
-      2. [x] - `p1` - **IF** service and method match - `inst-route-3b2`
-         1. [x] - `p1` - **RETURN** RouteConfig - `inst-route-3b2a`
-4. [x] - `p1` - **RETURN** error: no matching route found (404 RouteNotFound) - `inst-route-4`
+         1. [x] - `p1` - **RETURN** RouteConfig (first match wins in the order defined by `inst-route-1b` and `inst-route-3`) - `inst-route-3a3a`
+   2. [ ] - `p1` - **IF** route.match_type = 'grpc' (planned; gRPC routes are stored but never matched today) - `inst-route-3b`
+      1. [ ] - `p1` - Check gRPC service and method against the route's gRPC match - `inst-route-3b1`
+      2. [ ] - `p1` - **IF** service and method match - `inst-route-3b2`
+         1. [ ] - `p1` - **RETURN** RouteConfig - `inst-route-3b2a`
+5. [x] - `p1` - Repo: load the winning route in full with its path, method and plugin binding rows (tag rows only for `Tags::Load`); **IF** the loaded route no longer matches the request (a concurrent write changed, removed or moved it), select once more from step 1, then fall through to step 6 - `inst-route-5`
+6. [x] - `p1` - **RETURN** error: no matching route found in any tenant (404 RouteNotFound) - `inst-route-4`
 
 ### Plugin Chain Execution
 
@@ -207,18 +209,18 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 **Output**: Processed request ready for forwarding, or rejection error
 
 **Steps**:
-1. [x] - `p1` - Load upstream plugin bindings ordered by position from oagw_upstream_plugin - `inst-chain-1`
-2. [x] - `p1` - Load route plugin bindings ordered by position from oagw_route_plugin - `inst-chain-2`
+1. [x] - `p1` - Load upstream plugin bindings ordered by position (`oagw_upstream_plugin` when a database is configured) - `inst-chain-1`
+2. [x] - `p1` - Load route plugin bindings ordered by position (`oagw_route_plugin` when a database is configured) - `inst-chain-2`
 3. [x] - `p1` - Compose ordered chain: `[upstream_plugins...] + [route_plugins...]` (upstream-before-route) - `inst-chain-3`
 4. [x] - `p1` - **FOR EACH** plugin_ref in composed chain - `inst-chain-4`
    1. [x] - `p1` - Parse GTS identifier: extract instance part (after `~`) - `inst-chain-4a`
    2. [x] - `p1` - **IF** instance parses as UUID - `inst-chain-4b`
-      1. [x] - `p1` - DB: SELECT plugin FROM oagw_plugin WHERE id = :uuid — must exist and match schema type - `inst-chain-4b1`
+      1. [ ] - `p1` - DB: SELECT plugin FROM oagw_plugin WHERE id = :uuid — must exist and match schema type (with custom plugin support; `oagw_plugin` is not created yet) - `inst-chain-4b1`
    3. [x] - `p1` - **ELSE** (named plugin) - `inst-chain-4c`
       1. [x] - `p1` - Resolve via in-process plugin registry - `inst-chain-4c1`
    4. [x] - `p1` - **IF** plugin not found - `inst-chain-4d`
       1. [x] - `p1` - **RETURN** 503 PluginNotFound with `X-OAGW-Error-Source: gateway` - `inst-chain-4d1`
-5. [x] - `p1` - Resolve upstream auth plugin from auth_plugin_ref / auth_plugin_uuid columns - `inst-chain-5`
+5. [x] - `p1` - Resolve upstream auth plugin from the upstream's auth configuration (`auth_plugin_ref` / `auth_plugin_uuid` when a database is configured) - `inst-chain-5`
 6. [x] - `p1` - Execute auth plugin: resolve credentials from `cred_store` via secret_ref, inject into request - `inst-chain-6`
 7. [x] - `p1` - **IF** secret not found or credential resolution fails - `inst-chain-7`
    1. [x] - `p1` - **RETURN** 401 AuthenticationFailed or 500 SecretNotFound - `inst-chain-7a`
@@ -268,28 +270,26 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
    1. [x] - `p1` - **RETURN** 413 PayloadTooLarge (abort read) - `inst-body-3a`
 4. [x] - `p1` - **RETURN** validation passed - `inst-body-4`
 
-### Pingora In-Memory Bridge
+### Upstream Forwarding
 
-- [x] `p1` - **ID**: `cpt-cf-oagw-algo-pingora-bridge`
+- [x] `p1` - **ID**: `cpt-cf-oagw-algo-upstream-forwarding`
 
-**Input**: Serialized HTTP/1.1 request (headers + body), selected endpoint
+**Input**: Outbound request (method, URL, headers, body), selected endpoint
 
-**Output**: Upstream HTTP response or Pingora error
+**Output**: Upstream HTTP response (head + streaming body) or engine error
 
 **Steps**:
-1. [x] - `p1` - Inject internal metadata headers (`x-oagw-internal-*`) for Pingora endpoint selection into outbound headers - `inst-bridge-1`
-2. [x] - `p1` - Create in-memory `tokio::io::duplex` stream pair (write half, read half) - `inst-bridge-2`
-3. [x] - `p1` - Serialize HTTP/1.1 request headers (including internal metadata) into write half - `inst-bridge-3`
-4. [x] - `p1` - **IF** request has body AND Content-Length known - `inst-bridge-4`
-   1. [x] - `p1` - Write full body with Content-Length framing - `inst-bridge-4a`
-5. [x] - `p1` - **ELSE IF** request has streaming body - `inst-bridge-5`
-   1. [x] - `p1` - Write headers only, then stream body chunks; body boundary is `Connection: close` (EOF on write-half shutdown) - `inst-bridge-5a`
-6. [x] - `p1` - Feed duplex read half to Pingora `http_proxy_service_with_name` as client session - `inst-bridge-6`
-7. [x] - `p1` - Pingora `ProxyHttp` implementation resolves `HttpPeer` from internal headers, connects to upstream, forwards request, streams response back into duplex write half - `inst-bridge-7`
-8. [x] - `p1` - **IF** Pingora encounters upstream error - `inst-bridge-8`
-   1. [x] - `p1` - `fail_to_proxy` converts `pingora_core::ErrorType` → `DomainError` → RFC 9457 `Problem` and writes directly to session - `inst-bridge-8a`
-9. [x] - `p1` - Parse HTTP/1.1 response from duplex read half (status, headers, body) - `inst-bridge-9`
-10. [x] - `p1` - **RETURN** parsed `http::Response<Body>` - `inst-bridge-10`
+1. [x] - `p1` - Build the engine target: the load balancer's pre-resolved address, or resolve the endpoint host (retries 100/500/2500 ms) and take the first address the SSRF policy allows - `inst-fwd-1`
+2. [x] - `p1` - Choose transport and protocol policy: TLS for `https`/`wss`/`wt`, HTTP/1.1 only for `wss`, cleartext HTTP/1.1 for `http` - `inst-fwd-2`
+3. [x] - `p1` - **IF** request body is buffered - `inst-fwd-3`
+   1. [x] - `p1` - Send it with `Content-Length` framing derived by the engine - `inst-fwd-3a`
+4. [x] - `p1` - **ELSE IF** request body is streaming - `inst-fwd-4`
+   1. [x] - `p1` - Forward chunks as they arrive, enforcing `max_body_size`; on breach or stream error abort the upstream request without completing its framing and **RETURN** 413 PayloadTooLarge or 502 DownstreamError - `inst-fwd-4a`
+5. [x] - `p1` - Engine reuses a pooled connection or connects (ALPN `h2`/`http/1.1` for TLS), rewrites framing and hop-by-hop headers, and sends the request; the engine sends it again at most once, on another connection, only in the cases of ADR-0019 (a request that never left, `REFUSED_STREAM`, `HTTP_1_1_REQUIRED`, and for idempotent methods a stale keep-alive connection or a graceful `GOAWAY`) - `inst-fwd-5`
+6. [x] - `p1` - **IF** the engine fails - `inst-fwd-6`
+   1. [x] - `p1` - Map the engine error kind to `DomainError` (see [ADR-0019](../ADR/0019-upstream-proxy-engine.md)) - `inst-fwd-6a`
+7. [x] - `p1` - Strip every `x-oagw-*` header from the upstream response head - `inst-fwd-7`
+8. [x] - `p1` - **RETURN** response head and streaming body - `inst-fwd-8`
 
 ### Error Source Classification
 
@@ -320,7 +320,7 @@ Not applicable. The proxy engine is a stateless request-response flow — each p
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-proxy-execution`
 
-The system **MUST** implement `DataPlaneService::proxy_request(...)` that orchestrates the full proxy flow: alias resolution, route matching, body validation, plugin chain execution, HTTP forwarding via the Pingora in-memory bridge, and response transformation. No upstream response caching per `cpt-cf-oagw-principle-no-cache`. Pingora's stale pooled-connection reconnect (re-establishing a connection that was closed server-side before request bytes are sent) is permitted; all other failures **MUST** be returned immediately without additional application-layer retries per `cpt-cf-oagw-principle-no-retry`.
+The system **MUST** implement `DataPlaneService::proxy_request(...)` that orchestrates the full proxy flow: alias resolution, route matching, body validation, plugin chain execution, HTTP forwarding through the upstream proxy engine, and response transformation. No upstream response caching per `cpt-cf-oagw-principle-no-cache`. The engine's single connection-level resend in the cases listed in ADR-0019 is permitted; all other failures **MUST** be returned immediately without additional application-layer retries per `cpt-cf-oagw-principle-no-retry`.
 
 **Implements**:
 - `cpt-cf-oagw-flow-proxy-request`
@@ -334,7 +334,7 @@ The system **MUST** implement `DataPlaneService::proxy_request(...)` that orches
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-alias-resolution`
 
-The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest match wins (shadowing). Disabled upstreams **MUST** return 503 LinkUnavailable. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants.
+The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest enabled match wins (shadowing); a disabled upstream is skipped, and when only disabled upstreams match the alias resolution **MUST** return 503 LinkUnavailable. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants. The upstreams for the whole tenant chain **MUST** be fetched with one `list_by_alias_for_tenants` call; the walk then runs in memory, so the number of queries does not grow with hierarchy depth.
 
 **Implements**:
 - `cpt-cf-oagw-algo-alias-resolution`
@@ -347,13 +347,13 @@ The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierar
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-route-matching`
 
-The system **MUST** match inbound requests to routes by HTTP method allowlist and longest path prefix, ordered by priority (lowest number wins). Only enabled routes are considered. gRPC routes match by `(service, method)` via `oagw_route_grpc_match`. No two enabled routes under the same upstream may share `(path_prefix, priority)` for the same method.
+The system **MUST** match inbound requests to routes by HTTP method allowlist and longest path prefix, ordered by priority (higher number wins, per `cpt-cf-oagw-adr-storage-schema`). Only enabled routes are considered. No two enabled routes under the same upstream may share `(path_prefix, priority)` for the same method. Matching runs in application code over the upstream's enabled routes, identically for in-memory and database storage. Candidate routes for the whole tenant chain **MUST** be fetched with one `find_matching_in_tenants` call that loads only the columns matching reads. The call takes the ordered upstream IDs (selected upstream first, then ancestor upstreams closest-first), so the fallback to routes on ancestor upstreams needs no extra call. Routes on the selected upstream take priority over routes on ancestor upstreams, and descendant routes take priority over ancestor routes. The lowest route ID breaks any remaining tie, and only the winning route is loaded in full, with its path, method and plugin rows (tag rows only for `Tags::Load`, which the proxy never passes). The loaded route **MUST** be re-checked against the request; a route that a concurrent write changed, removed or moved is selected once more, and a second miss is no match.
 
 **Implements**:
 - `cpt-cf-oagw-algo-route-matching`
 
 **Touches**:
-- DB: `oagw_route`, `oagw_route_http_match`, `oagw_route_grpc_match`, `oagw_route_method`
+- DB: `oagw_route`, `oagw_route_http_match`, `oagw_route_method`, `oagw_route_plugin` (when a database is configured)
 - Entities: `Route`
 
 ### Implement Plugin Chain Execution
@@ -366,7 +366,7 @@ The system **MUST** execute the plugin chain in deterministic order: Auth → Gu
 - `cpt-cf-oagw-algo-plugin-chain-execution`
 
 **Touches**:
-- DB: `oagw_upstream_plugin`, `oagw_route_plugin`, `oagw_plugin`
+- DB: `oagw_upstream_plugin`, `oagw_route_plugin`; `oagw_plugin` once custom plugins are supported
 - Entities: `Plugin`
 
 ### Implement Header Transformation
@@ -405,17 +405,19 @@ The system **MUST** set `X-OAGW-Error-Source: gateway` on all gateway-originated
 **Touches**:
 - API: `{METHOD} /api/oagw/v1/proxy/{alias}/{path}`
 
-### Implement Pingora Proxy Engine
+### Implement Upstream Proxy Engine
 
-- [x] `p1` - **ID**: `cpt-cf-oagw-dod-pingora-proxy`
+- [x] `p1` - **ID**: `cpt-cf-oagw-dod-upstream-proxy-engine`
 
-The system **MUST** use Pingora (`pingora-proxy`, `pingora-load-balancing`) as the upstream HTTP engine, connected via an in-memory `tokio::io::duplex` bridge (`cpt-cf-oagw-algo-pingora-bridge`). Pingora manages connection pooling, TLS termination, and health checks internally. Multi-endpoint upstreams **MUST** distribute requests via `LoadBalancer<RoundRobin>` with `TcpHealthCheck` (10s interval). When `X-OAGW-Target-Host` header is present, the system **MUST** select the matching endpoint explicitly (no round-robin). All endpoints in a pool **MUST** have identical protocol, scheme, and port. `X-OAGW-Target-Host` **MUST** be validated: required for multi-endpoint common-suffix upstreams (400 MissingTargetHost); format must be hostname or IP without port/path/special chars (400 InvalidTargetHost); value must match a configured endpoint (400 UnknownTargetHost). Non-timeout upstream connection failures (refused, DNS, TLS) **MUST** return 502 DownstreamError. WebSocket `Upgrade` requests **MUST** be rejected with 501 ProtocolError before reaching the bridge (the duplex bridge is unidirectional and cannot support the bidirectional tunnel WebSocket requires).
+The system **MUST** forward upstream traffic through the `toolkit-http-proxy` engine (`cpt-cf-oagw-algo-upstream-forwarding`, [ADR-0019](../ADR/0019-upstream-proxy-engine.md)). The engine manages connection pooling, ALPN, FIPS-hardened TLS and outbound framing. Multi-endpoint upstreams **MUST** distribute requests round-robin over healthy backends, with TCP health checks every 10 s and DNS refresh every 30 s; every resolved address **MUST** pass the SSRF policy. When `X-OAGW-Target-Host` header is present, the system **MUST** select the matching endpoint explicitly (no round-robin). All endpoints in a pool **MUST** have identical protocol, scheme, and port. `X-OAGW-Target-Host` **MUST** be validated: required for multi-endpoint common-suffix upstreams (400 MissingTargetHost); format must be hostname or IP without port/path/special chars (400 InvalidTargetHost); value must match a configured endpoint (400 UnknownTargetHost). Non-timeout upstream connection failures (refused, DNS, TLS) **MUST** return 502 DownstreamError. WebSocket upgrades **MUST** be tunnelled on a dedicated connection only after the upstream answered `101 Switching Protocols`; any other answer **MUST** return 502 ProtocolError.
 
-Pingora-level errors are handled by the `fail_to_proxy` callback, which **MUST** convert `pingora_core::ErrorType` variants into `DomainError`, then use the canonical `DomainError` → RFC 9457 `Problem` pipeline. The response **MUST** include `X-OAGW-Error-Source: gateway` and `Content-Type: application/problem+json`.
+The endpoint selector caches each upstream's backend pool by upstream ID. It **MUST** rebuild a cached pool whenever the endpoints passed for that upstream differ from the cached list, so a replica serves updated endpoints after another replica writes the change to the shared database. Explicit invalidation by the local management handlers and the SDK remains as a fast path; correctness **MUST NOT** depend on it. A pool not selected for 10 minutes **MUST** be dropped, so pools of upstreams deleted through other replicas do not keep their DNS and health-check task running; dropping a pool **MUST** stop that task.
+
+Engine errors **MUST** be converted into `DomainError` and returned through the canonical `DomainError` → RFC 9457 `Problem` pipeline. The response **MUST** include `X-OAGW-Error-Source: gateway` and `Content-Type: application/problem+json`. Upstream responses **MUST** lose every `x-oagw-*` header before error-source classification, so an upstream cannot claim to be the gateway.
 
 **Implements**:
 - `cpt-cf-oagw-flow-proxy-request`
-- `cpt-cf-oagw-algo-pingora-bridge`
+- `cpt-cf-oagw-algo-upstream-forwarding`
 
 **Touches**:
 - Entities: `ServerConfig`, `Endpoint`
@@ -427,7 +429,8 @@ Pingora-level errors are handled by the `fail_to_proxy` callback, which **MUST**
 - [x] Alias resolution walks tenant hierarchy from descendant to root and returns closest match (shadowing)
 - [x] Disabled upstreams return 503 LinkUnavailable with `X-OAGW-Error-Source: gateway`
 - [x] Private upstreams are not visible to descendant tenants during alias resolution
-- [x] Route matching selects the longest path prefix match ordered by priority (lowest number first)
+- [x] Route matching selects the longest path prefix match, then the higher priority number
+- [x] Route matching evaluates candidates by upstream preference (selected upstream first, then ancestor upstreams closest-first) and tenant chain position before path prefix, and breaks remaining ties by the lowest route ID
 - [x] Unmatched routes return 404 RouteNotFound with `X-OAGW-Error-Source: gateway`
 - [x] Plugin chain executes in deterministic order: Auth → Guards → Transform(on_request) → upstream → Transform(on_response/on_error)
 - [x] Upstream plugins execute before route plugins in the composed chain
@@ -445,22 +448,25 @@ Pingora-level errors are handled by the `fail_to_proxy` callback, which **MUST**
 - [x] `X-OAGW-Error-Source: upstream` is set on upstream passthrough responses (body passed as-is)
 - [x] Multi-endpoint upstreams distribute requests via round-robin
 - [x] `X-OAGW-Target-Host` selects specific endpoint in multi-endpoint upstreams
+- [x] Changing an upstream's endpoints rebuilds its cached pool on every replica without explicit invalidation
+- [x] A pool idle past its TTL is dropped and its background task stops, as on invalidation
+- [x] With a database configured, alias resolution and route matching issue the same number of queries for tenant hierarchies of depth 1 and depth 5
 - [x] HTTPS-only constraint is enforced for all upstream connections
 - [x] Multi-endpoint upstream with common-suffix alias returns 400 MissingTargetHost when `X-OAGW-Target-Host` is absent
 - [x] Invalid `X-OAGW-Target-Host` format (not hostname or IP) returns 400 InvalidTargetHost
 - [x] `X-OAGW-Target-Host` value not matching any configured endpoint returns 400 UnknownTargetHost
 - [x] Upstream connection failures (refused, DNS, TLS) return 502 DownstreamError with `X-OAGW-Error-Source: gateway`
 - [x] No credentials appear in logs, error messages, or API responses
-- [x] Application layer does not add retries; only Pingora's built-in connection-level retry (up to 1 retry on reusable connections) is permitted
-- [x] WebSocket upgrade requests (`Upgrade: websocket`) are rejected with 501 ProtocolError and `X-OAGW-Error-Source: gateway`
-- [x] Pingora `fail_to_proxy` errors produce RFC 9457 Problem Details body with GTS type identifiers and `X-OAGW-Error-Source: gateway`
-- [x] When `X-OAGW-Error-Source` is absent (normal upstream response after `upstream_response_filter` strips `x-oagw-*` headers), `ErrorSource` defaults to `Upstream`; Pingora-generated error responses (`fail_to_proxy`) always set `X-OAGW-Error-Source: gateway` explicitly
+- [x] Application layer does not add retries; only the engine's single connection-level resend (ADR-0019) is permitted
+- [x] WebSocket upgrade requests (`Upgrade: websocket`) are tunnelled only after the upstream answers `101`; a rejected upgrade returns 502 ProtocolError with `X-OAGW-Error-Source: gateway`
+- [x] Upstream engine errors produce RFC 9457 Problem Details body with GTS type identifiers and `X-OAGW-Error-Source: gateway`
+- [x] Upstream responses lose every `x-oagw-*` header, so `ErrorSource` defaults to `Upstream` for them; gateway-generated error responses always set `X-OAGW-Error-Source: gateway` explicitly
 
 ## 7. Additional Context
 
 ### Performance Considerations
 
-The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. Pingora manages upstream connection pooling and TLS session reuse internally, with `TcpHealthCheck` at 10s intervals to avoid routing to unhealthy backends. The in-memory duplex bridge (`tokio::io::duplex`) avoids network overhead between the application layer and Pingora — serialization/deserialization is the only cost. Body validation checks Content-Length before buffering to reject oversized payloads early. For streaming bodies (e.g. SSE uploads), `Connection: close` framing avoids buffering the full body; Pingora reads until the write half shuts down (EOF).
+The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. With a database configured, configuration lookup costs three queries per request whatever the tenant depth (the upstreams with their plugin rows, the candidate routes, and the winning route with its path, method and plugin rows; two more only for a request that raced a configuration write); there is no config cache yet (DESIGN §4.1). The upstream engine pools connections (HTTP/2 multiplexed, HTTP/1.1 keep-alive) and reuses TLS sessions, with TCP health checks at 10s intervals to avoid routing to unhealthy backends. Requests go straight from the pipeline to the engine — no serialization, pipe or spawned task per request. Body validation checks Content-Length before buffering to reject oversized payloads early. Streaming bodies (e.g. SSE uploads) are forwarded chunk by chunk without buffering the full body.
 
 ### Security Considerations
 
@@ -476,7 +482,7 @@ Credential isolation is enforced by resolving secrets from `cred_store` at reque
 - **States section**: Not applicable — proxy engine is a stateless request-response flow. Circuit breaker state management belongs to `cpt-cf-oagw-feature-rate-limiting`.
 - **Multi-tenant hierarchy merge**: Out of scope — hierarchical config override and sharing mode merge strategies belong to cpt-cf-oagw-feature-tenant-hierarchy.
 - **Rate limiting enforcement**: Out of scope — rate limiting and circuit breaker during proxy flow belong to `cpt-cf-oagw-feature-rate-limiting`.
-- **SSE/WebTransport streaming**: Out of scope — streaming protocol support belongs to `cpt-cf-oagw-feature-streaming`. **WebSocket upgrade requests are explicitly rejected** with 501 ProtocolError in this feature because the unidirectional duplex bridge cannot support the bidirectional tunnel WebSocket requires.
+- **SSE/WebTransport streaming**: Out of scope — streaming protocol support belongs to `cpt-cf-oagw-feature-streaming`. WebSocket upgrades are tunnelled through the engine's upgrade path (step `inst-proxy-24`); the WebSocket relay itself belongs to the streaming feature.
 - **Metrics and audit logging**: Out of scope — Prometheus metrics, structured logging, and CORS handling belong to `cpt-cf-oagw-feature-observability`.
 - **UX/Accessibility**: Not applicable — OAGW is a backend API gear with no user interface.
 - **Compliance/Privacy**: OAGW does not handle PII directly. Credential isolation via `cred_store` references covers data protection. No additional regulatory compliance beyond standard platform requirements.

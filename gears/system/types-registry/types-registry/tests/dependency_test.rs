@@ -4,6 +4,7 @@
 
 use std::sync::Arc;
 
+use gts::{X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -227,7 +228,7 @@ async fn one_admission_writes_a_row_per_edge_kind() {
                 "type": "object",
                 "properties": {
                     "shape": { "$ref": format!("gts://{SHAPE}") },
-                    "role": { "type": "string", "x-gts-ref": ROLE },
+                    "role": { "type": "string", X_GTS_INSTANCE_REF: ROLE },
                 },
             },
         ],
@@ -246,7 +247,7 @@ async fn one_admission_writes_a_row_per_edge_kind() {
         .into_iter()
         .collect::<Vec<_>>(),
         "the `$ref` to the base and the derivation from it are two relations, not one; \
-         the `x-gts-ref` to ROLE is neither",
+         the `x-gts-instance-ref` to ROLE is neither",
     );
 }
 
@@ -335,64 +336,75 @@ async fn a_revision_that_keeps_its_reference_keeps_the_edge() {
 }
 
 #[tokio::test]
-async fn an_x_gts_ref_writes_no_row_whether_its_target_exists_or_not() {
-    let db = test_db().await;
-    admit(&db, "role", ROLE, schema(ROLE), None).await;
+async fn an_entity_ref_writes_no_row_whether_its_target_exists_or_not() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        let db = test_db().await;
+        admit(&db, "role", ROLE, schema(ROLE), None).await;
 
-    for (key, id, target) in [("present", SHAPE, ROLE), ("absent", INVOICE, ABSENT)] {
-        admit(
-            &db,
-            key,
-            id,
-            schema_with(
+        for (key, id, target) in [("present", SHAPE, ROLE), ("absent", INVOICE, ABSENT)] {
+            admit(
+                &db,
+                key,
                 id,
-                &json!({ "role": { "type": "string", "x-gts-ref": target } }),
-            ),
-            None,
-        )
-        .await;
+                schema_with(
+                    id,
+                    &json!({ "role": { "type": "string", keyword: target } }),
+                ),
+                None,
+            )
+            .await;
+            assert!(
+                outgoing(&db, id).await.is_empty(),
+                "{id} constrains a value to name {target} via {keyword}; that is not a dependency",
+            );
+        }
+
+        // And the constrained target keeps no incoming row either, so a deletion of it has
+        // nothing to be blocked by: the point of the decision.
+        let provider = worker(&db);
+        let conn = provider.conn().expect("conn");
+        let rows = dependency::Entity::find()
+            .secure()
+            .scope_with(&allow_all())
+            .all(&conn)
+            .await
+            .expect("edges");
         assert!(
-            outgoing(&db, id).await.is_empty(),
-            "{id} constrains a value to name {target}; that is not a dependency",
+            rows.is_empty(),
+            "no edge of any kind was written for {keyword}: {rows:?}"
         );
     }
-
-    // And the constrained target keeps no incoming row either, so a deletion of it has nothing to
-    // be blocked by — the point of the decision.
-    let provider = worker(&db);
-    let conn = provider.conn().expect("conn");
-    let rows = dependency::Entity::find()
-        .secure()
-        .scope_with(&allow_all())
-        .all(&conn)
-        .await
-        .expect("edges");
-    assert!(rows.is_empty(), "no edge of any kind was written: {rows:?}");
 }
 
 #[tokio::test]
-async fn a_stable_schema_may_use_an_x_gts_ref_that_names_major_zero() {
-    let db = test_db().await;
-    for (key, id, pattern) in [
-        ("stable-x-gts-ref-v0-exact", INVOICE, UNSTABLE.to_owned()),
-        ("stable-x-gts-ref-v0-pattern", SHAPE, format!("{UNSTABLE}*")),
-    ] {
-        admit(
-            &db,
-            key,
-            id,
-            schema_with(
-                id,
-                &json!({ "role": { "type": "string", "x-gts-ref": pattern } }),
+async fn a_stable_schema_may_use_an_entity_ref_that_names_major_zero() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        let db = test_db().await;
+        for (key, id, pattern) in [
+            ("stable-entity-ref-v0-exact", INVOICE, UNSTABLE.to_owned()),
+            (
+                "stable-entity-ref-v0-pattern",
+                SHAPE,
+                format!("{UNSTABLE}*"),
             ),
-            None,
-        )
-        .await;
+        ] {
+            admit(
+                &db,
+                key,
+                id,
+                schema_with(
+                    id,
+                    &json!({ "role": { "type": "string", keyword: pattern } }),
+                ),
+                None,
+            )
+            .await;
 
-        assert!(
-            outgoing(&db, id).await.is_empty(),
-            "an x-gts-ref naming major zero is not a dependency",
-        );
+            assert!(
+                outgoing(&db, id).await.is_empty(),
+                "a {keyword} naming major zero is not a dependency",
+            );
+        }
     }
 }
 

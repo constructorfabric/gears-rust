@@ -340,6 +340,82 @@ async fn proxy_nonexistent_alias_returns_404() {
     }
 }
 
+// 6.5: Known alias, no matching route: 404 without calling the upstream.
+#[tokio::test]
+async fn proxy_known_alias_without_matching_route_returns_404() {
+    let mut guard = MockGuard::new();
+    guard.mock(
+        "POST",
+        "/v1/chat",
+        MockResponse {
+            status: 200,
+            headers: vec![],
+            body: MockBody::Json(json!({})),
+        },
+    );
+    let h = AppHarness::builder().build().await;
+    let ctx = h.security_context().clone();
+    let upstream = h
+        .facade()
+        .create_upstream(
+            ctx.clone(),
+            CreateUpstreamRequest::builder(
+                Server {
+                    endpoints: vec![Endpoint {
+                        scheme: Scheme::Http,
+                        host: "127.0.0.1".into(),
+                        port: h.mock_port(),
+                    }],
+                },
+                HTTP_PROTOCOL_ID,
+            )
+            .alias("no-route-test")
+            .build(),
+        )
+        .await
+        .unwrap();
+    h.facade()
+        .create_route(
+            ctx.clone(),
+            CreateRouteRequest::builder(
+                upstream.id,
+                MatchRules {
+                    http: Some(HttpMatch {
+                        methods: vec![HttpMethod::Post],
+                        path: guard.path("/v1/chat"),
+                        query_allowlist: vec![],
+                        path_suffix_mode: PathSuffixMode::Disabled,
+                    }),
+                    grpc: None,
+                },
+            )
+            .build(),
+        )
+        .await
+        .unwrap();
+
+    // Wrong method on the route's path, then the right method on another path.
+    for (method, path) in [
+        (Method::GET, guard.path("/v1/chat")),
+        (Method::POST, guard.path("/v2/other")),
+    ] {
+        let req = http::Request::builder()
+            .method(method.clone())
+            .uri(format!("/no-route-test{path}"))
+            .body(Body::Empty)
+            .unwrap();
+        match h.facade().proxy_request(ctx.clone(), req).await {
+            Err(err) => assert!(
+                matches!(err, CanonicalError::NotFound { .. })
+                    && err.resource_type() == Some(oagw_sdk::gts::ROUTE_SCHEMA),
+                "{method} {path}: expected a route 404, got {err:?}"
+            ),
+            Ok(resp) => panic!("{method} {path}: expected 404, got {}", resp.status()),
+        }
+    }
+    assert!(guard.recorded_requests().await.is_empty());
+}
+
 // 6.17: Pipeline abort — disabled upstream returns 503.
 #[tokio::test]
 async fn proxy_disabled_upstream_returns_503() {
@@ -1237,7 +1313,7 @@ async fn proxy_path_suffix_disabled_rejects_extra_path() {
 // Uses a single mock on 127.0.0.1 with two identical endpoint entries so the
 // test works on all platforms (macOS only has 127.0.0.1 on loopback by default).
 // Actual round-robin distribution across distinct backends is covered by unit
-// tests in pingora_proxy.rs (`select_round_robin_distribution`) and service.rs
+// tests in endpoint_selector_tests.rs (`select_round_robin_distribution`) and service.rs
 // (`select_endpoint_round_robin_fallback`).  This integration test verifies the
 // full proxy pipeline succeeds with a multi-endpoint upstream configuration.
 #[tokio::test]
@@ -1510,8 +1586,7 @@ async fn proxy_all_backends_unreachable() {
             "expected DownstreamError for unreachable backend, got: {err:?}"
         ),
         Ok(resp) => {
-            // Pingora may write the gateway response directly via
-            // fail_to_proxy. An unreachable backend maps to 502 (DownstreamError
+            // A gateway-generated error response. An unreachable backend maps to 502 (DownstreamError
             // — connection refused/closed), 503 (LinkUnavailable — no route),
             // or 504 (connect timeout), depending on how the connection fails.
             assert!(
@@ -2142,7 +2217,7 @@ async fn proxy_websocket_idle_timeout_closes_connection() {
     server_handle.abort();
 }
 
-// P4 #18: Pingora fail_to_proxy produces valid RFC 9457 Problem body with correct GTS type.
+// P4 #18: an unreachable upstream produces a valid RFC 9457 Problem body with correct GTS type.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
     let h = AppHarness::builder()
@@ -2212,7 +2287,7 @@ async fn proxy_unreachable_backend_returns_rfc9457_problem_body() {
             );
         }
         Ok(resp) => {
-            // Pingora wrote the response directly via fail_to_proxy. An
+            // A gateway-generated error response. An
             // unreachable backend maps to 502 (DownstreamError), 503
             // (LinkUnavailable), or 504 (connect timeout).
             let status = resp.status();
@@ -2342,7 +2417,7 @@ async fn proxy_streaming_body_exceeding_limit_returns_413() {
 }
 
 // Body::Stream POST must reach the upstream intact via chunked transfer
-// encoding on the internal Pingora bridge.
+// encoding through the upstream engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_streaming_body_post_arrives_intact() {
     let mut guard = MockGuard::new();
@@ -4609,7 +4684,7 @@ async fn proxy_websocket_binary_frame_opcode_preserved() {
 
 // 14.12: Sustained multi-message session with extended-length payloads.
 // Sends 60 frames of varying sizes (including 2-byte and 8-byte extended length
-// encodings) through the full Axum→Pingora→mock→relay→client stack, exercising
+// encodings) through the full Axum→engine→mock→relay→client stack, exercising
 // the relay loop's long-running behavior.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn proxy_websocket_sustained_multi_message_extended_lengths() {

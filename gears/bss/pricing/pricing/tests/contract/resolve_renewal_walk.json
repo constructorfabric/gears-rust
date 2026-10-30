@@ -14,8 +14,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-12-05",
         "items": [
           {
@@ -58,8 +56,10 @@
                   "price_id": "<price:12>",
                   "dim_used": null,
                   "pinned_from": "<price:10>",
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "amount": "12.00"
+                    "amount": "12"
                   },
                   "min_fee": null,
                   "eligibility": "all",
@@ -87,8 +87,6 @@
         "state": "published",
         "book_id": "<book:eur>",
         "currency": "EUR",
-        "currency_minor_digits": 2,
-        "rounding_policy": "half_even",
         "date": "2026-12-05",
         "items": [
           {
@@ -131,8 +129,10 @@
                   "price_id": "<price:15>",
                   "dim_used": null,
                   "pinned_from": null,
+                  "currency": "EUR",
+                  "currency_scale": 2,
                   "price": {
-                    "amount": "15.00"
+                    "amount": "15"
                   },
                   "min_fee": null,
                   "eligibility": "new",

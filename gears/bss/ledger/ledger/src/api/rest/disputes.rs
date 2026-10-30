@@ -1,7 +1,7 @@
 //! Axum handler + router for the ledger's chargeback (dispute) REST surface
 //! (architecture §4.5, the dispute state machine). One write operation + two
 //! read operations under `/bss-ledger/v1`, tenant-scoped WITHOUT a tenant in the
-//! path (the vhp-core convention, matching the payment surface): the write's
+//! path (the platform convention, matching the payment surface): the write's
 //! `tenant_id` is in the **body**, the by-id read takes the dispute id in the
 //! path + the owning seller `tenant_id` in the query.
 //!
@@ -69,7 +69,7 @@ const TAG: &str = "BSS Ledger Disputes";
 pub struct ApiState {
     /// In-process data-access client (the gear's own local impl).
     pub client: Arc<dyn LedgerClientV1>,
-    /// Dual-control lifecycle engine (VHP-1852): the loss gate routes a
+    /// Dual-control lifecycle engine: the loss gate routes a
     /// high-value chargeback-loss to the preparer→approver queue. `None` disables
     /// the gate (router unit tests without a governance DB).
     pub approval: Option<Arc<crate::infra::approval::service::ApprovalService>>,
@@ -260,7 +260,7 @@ async fn record_dispute_phase(
     .await
     .map_err(authz_error_to_canonical)?;
 
-    // Dual-control gate (VHP-1852): a chargeback-LOSS whose magnitude crosses the
+    // Dual-control gate: a chargeback-LOSS whose magnitude crosses the
     // D2 threshold routes to the preparer→approver queue (409); other phases, or a
     // below-threshold loss, post inline (unchanged).
     if body.phase.eq_ignore_ascii_case("lost")

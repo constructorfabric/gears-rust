@@ -648,11 +648,11 @@ Each subject projection **MUST** declare a required `scope` trait in the base's 
 `SecurityContext` accessor. QE **MUST** read the registry-validated effective trait and compare instance ids directly.
 Scope **MUST NOT** be inferred from the type-id name segment.
 
-Each projection **MUST** declare its admitted metrics through a typed
-`x-gts-traits` value whose entries are metric instance ids narrowed by `x-gts-ref`. `x-gts-ref` is pattern-level only: it
-validates that a value is a well-formed GTS id under the declared prefix. The system **MUST** therefore itself verify,
-at bootstrap per `cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is
-genuinely an instance of the metric base. A narrowed `x-gts-ref` is a prefix match, not an instance-of check. The request
+Each projection **MUST** declare its admitted metrics through a typed `x-gts-traits` value whose entries are metric
+instance ids narrowed by `x-gts-instance-ref`. `x-gts-instance-ref` is pattern-level only: it validates that a value is
+a well-formed GTS instance id under the declared prefix. The system **MUST** therefore itself verify, at bootstrap per
+`cpt-cf-quota-enforcement-fr-contract-validation`, that each referenced metric is registered and is genuinely an
+instance of the metric base. A narrowed `x-gts-instance-ref` is a prefix match, not an instance-of check. The request
 may also carry a resource projection for typed resource properties; resource does not enter the P1 counter key. Metric
 identity remains owned by `types-registry` and is not changed by this requirement.
 
@@ -1507,7 +1507,8 @@ in-flight leases and to bound row growth between sweeper runs.
 
 The system **MUST** provide a batch debit operation that submits multiple debit items targeting potentially different
 metrics in a single call. The batch **MUST** carry an envelope idempotency key; replay of the same envelope key returns
-the original outcome without modifying counters a second time. Each item **MUST** also carry its own idempotency key for
+the original outcome without modifying counters a second time, as long as the batch is within the current maximum
+batch size. Each item **MUST** also carry its own idempotency key for
 individual identification.
 
 Every batch item **MUST** carry a positive integer `amount > 0`. The batch **MUST** be rejected with an actionable

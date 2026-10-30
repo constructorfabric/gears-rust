@@ -1013,7 +1013,7 @@ fn security_matches_authenticated_routes() {
         let spec = spec_for(&registered, &key);
         assert_eq!(
             yaml_operation_authenticated(&doc, &key, &op),
-            spec.authenticated,
+            spec.auth != toolkit::api::RouteAuth::Anonymous,
             "{key}: the operation's effective `security` and the route's \
              `.authenticated()` posture disagree",
         );

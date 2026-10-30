@@ -17,7 +17,7 @@ It is the distributed counterpart to `cf-gears-example-server`, which links
 deliberately links *only* the control-plane gears, so every other gear can be
 deployed and scaled independently:
 
-- **Profile 2 (Host + Workers)** — flight-control runs the directory + edge; OoP
+- **Profile 2 (Self-Hosted)** — flight-control runs the directory + edge; OoP
   worker processes register with it over UDS (single-node) or TCP.
 - **Profile 3 (K8s Native)** — flight-control runs as the platform pod; each
   other gear runs as its own pod, fronted by an external gateway.

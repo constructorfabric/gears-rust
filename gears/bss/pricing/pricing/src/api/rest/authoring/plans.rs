@@ -191,17 +191,18 @@ async fn revision_read(
     let mut book_ids: Vec<Uuid> = entries.iter().map(|e| e.book_id).collect();
     book_ids.sort_unstable();
     book_ids.dedup();
-    let admitted: BTreeSet<Uuid> = match books {
+    // The admitted books, each with its currency, which every shown price must carry.
+    let admitted: BTreeMap<Uuid, String> = match books {
         Some(scope) => book_repo::find_many(tx, scope, tenant, &book_ids)
             .await?
             .into_iter()
-            .map(|b| b.id)
+            .map(|b| (b.id, b.currency))
             .collect(),
-        None => BTreeSet::new(),
+        None => BTreeMap::new(),
     };
-    let shown: Vec<&price_book_entry::Model> = entries
+    let shown: Vec<(&price_book_entry::Model, &str)> = entries
         .iter()
-        .filter(|e| admitted.contains(&e.book_id))
+        .filter_map(|e| admitted.get(&e.book_id).map(|c| (e, c.as_str())))
         .collect();
     let mut headlines = if shown.is_empty() {
         BTreeMap::new()
@@ -212,7 +213,7 @@ async fn revision_read(
         .into_iter()
         .map(|e| {
             let price = admitted
-                .contains(&e.book_id)
+                .contains_key(&e.book_id)
                 .then(|| headlines.remove(&e.id).and_then(|h| h.current))
                 .flatten();
             Ok(dto::PricingPlanEntrySummary::of(e, price)?)
@@ -300,7 +301,10 @@ async fn require_book_read(
     tenant: Uuid,
     book: Uuid,
 ) -> Result<(), DoorError> {
-    if super::price_book_entries::shows_money(tx, books, tenant, book).await? {
+    if super::price_book_entries::money_book(tx, books, tenant, book)
+        .await?
+        .is_some()
+    {
         Ok(())
     } else {
         Err(support::forbidden_because(
@@ -1411,7 +1415,6 @@ pub async fn stored_contexts(
     let settings = configuration::settings(tx, &children, tenant).await?;
     let defaults = plan::Defaults {
         gl: settings.default_gl,
-        rounding: settings.default_rounding,
         tax_category: settings.default_tax_category,
     };
     let loaded = Loaded {
@@ -1566,7 +1569,13 @@ fn rows_of(
                 Some(prices) => prices.as_slice(),
                 None => &[],
             };
-            entries.push(entry_of(entry, prices)?);
+            let book = loaded.books_by_id.get(&entry.book_id).ok_or_else(|| {
+                corrupt(format!(
+                    "entry {entry_id} names lost book {}",
+                    entry.book_id
+                ))
+            })?;
+            entries.push(entry_of(entry, prices, &book.book.currency)?);
         }
     }
     let books = revision_books
@@ -1594,9 +1603,12 @@ fn item_of(m: &plan_item::Model) -> Result<plan::Item, DoorError> {
         },
     })
 }
+/// An entry of a revision with its prices, each read against its book's currency
+/// (`book_currency`) as every read of a stored price reads it.
 fn entry_of(
     e: &price_book_entry::Model,
     stored: &[price::Model],
+    book_currency: &str,
 ) -> Result<plan::Entry, DoorError> {
     let bad = |what: &str| corrupt(format!("entry {} {what}", e.id));
     // A `cancel` or `end` is not a price: it never covers an item, pending or applied
@@ -1615,7 +1627,7 @@ fn entry_of(
     let model = price_book_entry_repo::model_of(e)?;
     let prices = stored
         .iter()
-        .map(|m| price_repo::to_domain(m, model))
+        .map(|m| price_repo::in_book(m, model, book_currency))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(plan::Entry {
         id: e.id,

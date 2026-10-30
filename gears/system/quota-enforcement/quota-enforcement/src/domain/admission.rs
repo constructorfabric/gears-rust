@@ -15,6 +15,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use authz_resolver_sdk::{EnforcerError, PolicyEnforcer};
 use quota_enforcement_sdk::TenantId;
+use serde_json::{Map, Value};
 use toolkit_macros::domain_model;
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
 use uuid::Uuid;
@@ -63,6 +64,21 @@ pub struct Admitted {
     pub access_scope: AccessScope,
 }
 
+/// Platform policy admission without a fabricated tenant identifier.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq)]
+pub struct OperatorAdmission {
+    access_scope: AccessScope,
+}
+
+impl OperatorAdmission {
+    /// Preserve the PDP-issued scope for the policy storage boundary.
+    #[must_use]
+    pub const fn access_scope(&self) -> &AccessScope {
+        &self.access_scope
+    }
+}
+
 /// The PEP boundary.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-gateway-admission:p1
 #[domain_model]
@@ -76,6 +92,44 @@ impl Admission {
     #[must_use]
     pub fn new(enforcer: PolicyEnforcer, metrics: Arc<dyn QeMetrics>) -> Self {
         Self { enforcer, metrics }
+    }
+
+    /// The metrics port the boundary records on; the ingress step shares it.
+    #[must_use]
+    pub fn metrics(&self) -> &dyn QeMetrics {
+        self.metrics.as_ref()
+    }
+
+    /// The same port as a handle, for a component that outlives the borrow.
+    #[must_use]
+    pub fn metrics_handle(&self) -> Arc<dyn QeMetrics> {
+        Arc::clone(&self.metrics)
+    }
+
+    /// Admit a platform policy operation through the PDP without row properties.
+    ///
+    /// # Errors
+    /// Returns PDP denial (including unsupported constraints) or unavailability.
+    pub async fn admit_operator(
+        &self,
+        ctx: &SecurityContext,
+        action: &str,
+    ) -> Result<OperatorAdmission, DomainError> {
+        let resource = &super::pep::resources::POLICY;
+        let site = LogSite {
+            principal: ctx.subject_id(),
+            resource: resource.name(),
+            action,
+        };
+        let request = AccessRequest::new().require_constraints(false);
+        let access_scope = self
+            .enforcer
+            .access_scope_with(ctx, resource, action, None, &request)
+            .await
+            .map_err(|err| {
+                self.deny(&site, denial_reason(&err), DomainError::from_enforcer(err))
+            })?;
+        Ok(OperatorAdmission { access_scope })
     }
 
     /// Admit `action` on `resource` for the explicit `target`.
@@ -95,12 +149,31 @@ impl Admission {
         action: &str,
         target: AdmissionTarget,
     ) -> Result<Admitted, DomainError> {
+        self.admit_with_properties(ctx, resource, action, target, Map::new())
+            .await
+    }
+
+    /// [`Self::admit`] with further resource properties the PDP evaluates:
+    /// the rest of a caller-supplied attribution tuple (metric, subjects,
+    /// resource). The explicit `target` tenant is authoritative: it is written
+    /// after `properties`, so a caller-supplied `owner_tenant_id` can never
+    /// replace it.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::admit`].
+    pub async fn admit_with_properties(
+        &self,
+        ctx: &SecurityContext,
+        resource: &ResourceType,
+        action: &str,
+        target: AdmissionTarget,
+        properties: Map<String, Value>,
+    ) -> Result<Admitted, DomainError> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-request
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-authn
-        // The request arrives from REST or from the in-process client through
-        // this one entry. `ctx` carries the service principal the platform
-        // `api-gateway` authenticated; `target` stays untrusted request data
-        // until the PDP authorizes it.
+        // Both transports enter here; `target` remains untrusted until the PDP
+        // authorizes it for the authenticated principal in `ctx`.
         let site = LogSite {
             principal: ctx.subject_id(),
             resource: resource.name(),
@@ -116,7 +189,12 @@ impl Admission {
         // @cpt-end:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-shape
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-pdp
-        let request = AccessRequest::new()
+        let mut request = AccessRequest::new();
+        for (key, value) in properties {
+            request = request.resource_property(key, value);
+        }
+        // Keep the authorized tenant as the explicit target.
+        let request = request
             .resource_property(pep_properties::OWNER_TENANT_ID, target.tenant_id.as_uuid())
             .require_constraints(true);
         let outcome = self
@@ -135,11 +213,8 @@ impl Admission {
 
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-scope
         // @cpt-begin:cpt-cf-quota-enforcement-flow-authorized-admission:p1:inst-adm-forward
-        // The PDP authorized the complete tuple, `target.tenant_id` included.
-        // The scope is not inspected here: `SecureConn` evaluates its filters
-        // at the storage boundary, and an in-memory membership check cannot
-        // evaluate an `InTenantSubtree` filter, so it would deny an authorized
-        // descendant tenant.
+        // Preserve hierarchy-aware filters for `SecureConn`; an in-memory
+        // membership check cannot evaluate `InTenantSubtree`.
         Ok(Admitted {
             tenant_id: target.tenant_id,
             access_scope,
@@ -189,6 +264,7 @@ fn validate_target_shape(target: AdmissionTarget) -> Result<(), DomainError> {
     Ok(())
 }
 
+/// The denial metric reason for a PEP error.
 const fn denial_reason(err: &EnforcerError) -> DenialReason {
     match err {
         EnforcerError::Denied { .. } | EnforcerError::CompileFailed(_) => {

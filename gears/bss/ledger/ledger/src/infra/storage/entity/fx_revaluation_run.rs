@@ -1,5 +1,5 @@
 //! `SeaORM` entity for `bss.ledger_fx_revaluation_run` — the Mode-B
-//! FX-revaluation completion marker (VHP-1859 review C3). One COMPLETE row per
+//! FX-revaluation completion marker. One COMPLETE row per
 //! `(tenant_id, period_id)`, written by the period-end revaluation job after a
 //! clean `run_period`; the close gate requires it when Mode-B is enabled, so a
 //! failed/lagged run BLOCKS close instead of leaving a forever-unpostable missing

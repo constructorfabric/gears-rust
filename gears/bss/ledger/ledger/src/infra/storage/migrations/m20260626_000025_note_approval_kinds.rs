@@ -1,5 +1,5 @@
 //! Forward-fix: add `CREDIT_NOTE` + `DEBIT_NOTE` to the dual-control
-//! `ledger_approval.kind` CHECK (Slice 3 Phase-1 dual-control follow-up, VHP-1856)
+//! `ledger_approval.kind` CHECK (Slice 3 dual-control follow-up)
 //! on clusters where `m20260624_000012` was ALREADY applied with its prior kind set.
 //!
 //! `m20260624_000012` was amended in place to add `CREDIT_NOTE` + `DEBIT_NOTE` to the

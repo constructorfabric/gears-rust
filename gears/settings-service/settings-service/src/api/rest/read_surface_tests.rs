@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The read surface driven as a client drives it: a request through the router
 //! the gear registers, and the status code the API promises.
 //!
@@ -15,6 +14,13 @@ use uuid::Uuid;
 use crate::domain::access::TenantAccess;
 use crate::domain::resolution::MASK_TOKEN;
 use crate::test_support::{BOOL, RestHarness, SECRET, TEXT};
+
+/// The review listing: the flagged overrides of the target's subtree.
+const REVIEW: &str = "/settings-service/v1/settings/review";
+
+/// The narrowed browse: the settings whose own override at the target is
+/// flagged.
+const NARROWED: &str = "/settings-service/v1/settings?$filter=needs_review%20eq%20true";
 
 /// The setting key as it travels in a path segment.
 fn encoded(h: &RestHarness, name: &str) -> String {
@@ -131,10 +137,12 @@ async fn a_page_is_cut_after_the_hidden_exclusion_so_it_comes_back_full() {
 }
 
 #[tokio::test]
-async fn a_subtree_past_the_budget_is_refused_by_search_and_the_needs_review_browse() {
-    // The corpus of overrides is the target's subtree. A subtree the budget
-    // cuts would make the answer silently incomplete, so the surface refuses
-    // and names the bound instead.
+async fn a_subtree_past_the_budget_is_refused_by_search_and_the_review_listing() {
+    // The corpus of a search and the rows of the review listing are the
+    // target's subtree. A subtree the budget cuts would make the answer
+    // silently incomplete, so those two refuse and name the bound instead.
+    // The browse, narrowed or not, reads the target's own rows only and never
+    // walks the subtree, so the budget is nothing it can trip over.
     let h = RestHarness::new().await;
     h.inner.declare("proxy", "cascading", json!(true)).await;
     h.inner
@@ -152,12 +160,7 @@ async fn a_subtree_past_the_budget_is_refused_by_search_and_the_needs_review_bro
         "{body}"
     );
 
-    let (status, body) = h
-        .get(
-            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
-            h.inner.tree.root,
-        )
-        .await;
+    let (status, body) = h.get(REVIEW, h.inner.tree.root).await;
     assert_eq!(status, 400, "{body}");
     assert_eq!(
         body["context"]["field_violations"][0]["reason"],
@@ -165,11 +168,15 @@ async fn a_subtree_past_the_budget_is_refused_by_search_and_the_needs_review_bro
         "{body}"
     );
 
-    // The plain browse never walks the subtree and is untouched.
-    let (status, _) = h
-        .get("/settings-service/v1/settings", h.inner.tree.root)
-        .await;
-    assert_eq!(status, 200);
+    // The plain browse never walks the subtree and is untouched, and neither
+    // is the narrowed one: it asks about the target's own overrides.
+    for uri in [
+        "/settings-service/v1/settings",
+        "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+    ] {
+        let (status, body) = h.get(uri, h.inner.tree.root).await;
+        assert_eq!(status, 200, "{uri}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -253,15 +260,19 @@ async fn search_takes_a_filter_and_refuses_orderby_and_select() {
     assert_eq!(status, 200, "{body}");
     for (filter, said) in [
         ("tenant%20eq%20%27x%27", "tenant"),
-        (
-            "needs_review%20eq%20false",
-            "`needs_review eq false` is not a listing; omit the filter to browse",
-        ),
+        // The refusal names the expression and is reported against `$filter`;
+        // the sentence around it is the handler's to word.
+        ("needs_review%20eq%20false", "needs_review eq false"),
     ] {
         let uri = format!("/settings-service/v1/search?q=proxy&$filter={filter}");
         let (status, body) = h.get(&uri, h.inner.tree.root).await;
         assert_eq!(status, 400, "{filter}: {body}");
         assert!(body.to_string().contains(said), "{filter}: {body}");
+        assert_eq!(
+            body["context"]["field_violations"][0]["field"],
+            json!("$filter"),
+            "{filter}: {body}"
+        );
         // The same expression, the same answer on browse.
         let (status, browse) = h
             .get(
@@ -271,6 +282,11 @@ async fn search_takes_a_filter_and_refuses_orderby_and_select() {
             .await;
         assert_eq!(status, 400, "{filter}: {browse}");
         assert!(browse.to_string().contains(said), "{filter}: {browse}");
+        assert_eq!(
+            browse["context"]["field_violations"][0]["field"],
+            json!("$filter"),
+            "{filter}: {browse}"
+        );
     }
 }
 
@@ -599,6 +615,7 @@ async fn a_target_outside_the_callers_subtree_is_refused_on_every_read() {
 
     for uri in [
         format!("/settings-service/v1/settings?tenant={outside}"),
+        format!("{REVIEW}?tenant={outside}"),
         format!("/settings-service/v1/search?q=proxy&tenant={outside}"),
         format!("/settings-service/v1/settings/{key}?tenant={outside}"),
         format!("/settings-service/v1/settings/{key}/history?tenant={outside}"),
@@ -614,9 +631,11 @@ async fn a_standalone_descendant_is_refused_from_above() {
     h.inner.declare("proxy", "cascading", json!(true)).await;
     // `s` is a descendant of `a`, marked standalone: inheritance flows in,
     // nothing of its own state is readable from above.
-    let uri = format!("/settings-service/v1/settings?tenant={}", h.inner.tree.s);
-    let (status, _) = h.get(&uri, h.inner.tree.a).await;
-    assert_eq!(status, 403);
+    for path in ["/settings-service/v1/settings", REVIEW] {
+        let uri = format!("{path}?tenant={}", h.inner.tree.s);
+        let (status, _) = h.get(&uri, h.inner.tree.a).await;
+        assert_eq!(status, 403, "{uri}");
+    }
 }
 
 #[tokio::test]
@@ -624,6 +643,7 @@ async fn a_malformed_tenant_is_refused_before_anything_else() {
     let h = RestHarness::new().await;
     for uri in [
         "/settings-service/v1/settings?tenant=not-a-uuid",
+        "/settings-service/v1/settings/review?tenant=not-a-uuid",
         "/settings-service/v1/search?q=proxy&tenant=not-a-uuid",
     ] {
         let (status, _) = h.get(uri, h.inner.tree.root).await;
@@ -641,6 +661,7 @@ async fn a_denied_caller_is_refused_on_every_read_and_learns_nothing() {
 
     for uri in [
         "/settings-service/v1/settings".to_owned(),
+        REVIEW.to_owned(),
         "/settings-service/v1/search?q=proxy".to_owned(),
         format!("/settings-service/v1/settings/{key}"),
         format!("/settings-service/v1/settings/{key}/history"),
@@ -789,44 +810,401 @@ async fn an_override_hit_names_the_scope_it_is_set_at() {
     assert_eq!(hit["scope"], json!(format!("/tenants/{}", h.inner.tree.a)));
 }
 
-// ── The review listing ───────────────────────────────────────────────────────
+// ── The needs-review narrowing of the browse ─────────────────────────────────
 
 #[tokio::test]
-async fn the_review_listing_returns_the_flagged_rows_of_the_subtree_not_resolved_values() {
-    // `needs_review eq true` is a different question from browsing: it asks
-    // which stored overrides stopped validating, so it answers rows — each at
-    // the scope that holds it — rather than one effective value per setting.
+async fn the_narrowed_browse_keeps_the_settings_flagged_at_the_target_in_the_resolved_shape() {
+    // `needs_review eq true` on the browse is a narrowing, not a second
+    // listing: the page is the ordinary one, cut to the settings whose own
+    // override at the target is flagged. The flagged value is never served —
+    // the item carries the fallthrough with the flag beside it — and a flag
+    // below the target does not mark the target's row.
     let h = RestHarness::new().await;
-    let flagged = h.inner.declare("flagged", "cascading", json!(true)).await;
-    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
-    h.inner
-        .set_flagged(flagged, h.inner.tree.a, json!(false))
+    let root = h.inner.tree.root;
+    let here = h
+        .inner
+        .declare_labelled(
+            "flagged_here",
+            "cascading",
+            json!(true),
+            "Minimum TLS version",
+        )
         .await;
-    h.inner.set(sound, h.inner.tree.a, json!(false)).await;
+    let below = h
+        .inner
+        .declare("flagged_below", "cascading", json!(true))
+        .await;
+    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
+    h.inner.set_flagged(here, root, json!(false)).await;
+    h.inner
+        .set_flagged(below, h.inner.tree.a, json!(false))
+        .await;
+    h.inner.set(sound, root, json!(false)).await;
 
-    let items = h
+    let items = h.items(NARROWED, root).await;
+    assert_eq!(
+        items.len(),
+        1,
+        "only the setting flagged at the target: {items:?}"
+    );
+    let item = &items[0];
+    assert_eq!(item["key"], json!(h.inner.key("flagged_here").to_string()));
+    assert_eq!(item["outcome"], json!("resolved"), "{item}");
+    assert!(
+        item.get("flagged").is_none(),
+        "the flagged-row item is retired from the page: {item}"
+    );
+    assert_eq!(item["mode"], json!("standard"), "{item}");
+    assert_eq!(item["display_name"], json!("Minimum TLS version"), "{item}");
+    let effective = &item["effective"];
+    assert_eq!(effective["needs_review"], json!(true), "{item}");
+    assert_eq!(
+        effective["needs_review_detail"],
+        json!("no longer validates"),
+        "{item}"
+    );
+    assert_eq!(
+        effective["value"],
+        json!(true),
+        "the fallthrough is served, never the flagged value: {item}"
+    );
+    assert_eq!(effective["fallback"], json!(true), "{item}");
+    assert!(effective["fallback_source"].is_string(), "{item}");
+    assert_eq!(
+        h.inner.hierarchy.subtree_calls(),
+        0,
+        "the narrowing reads the target's own rows and walks no subtree"
+    );
+
+    // The narrowing changes which settings are on the page, never the shape of
+    // an item: the same setting on the unfiltered page has the same keys.
+    let unfiltered = h.items("/settings-service/v1/settings", root).await;
+    let same = unfiltered
+        .iter()
+        .find(|i| i["key"] == item["key"])
+        .expect("the setting on the unfiltered page");
+    let shape = |v: &Value| -> Vec<String> {
+        let mut keys: Vec<String> = v.as_object().expect("an object").keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(shape(item), shape(same), "{item} against {same}");
+}
+
+#[tokio::test]
+async fn the_narrowed_browse_does_not_see_a_flag_that_sits_only_below_the_target() {
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner.set_flagged(id, h.inner.tree.b, json!(false)).await;
+
+    // `b` is below `a`: the setting is flagged in `a`'s subtree, not at `a`.
+    let from_above = h
         .items(
-            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            &format!(
+                "/settings-service/v1/settings?tenant={}&$filter=needs_review%20eq%20true",
+                h.inner.tree.a
+            ),
             h.inner.tree.root,
         )
         .await;
-    assert_eq!(items.len(), 1, "one flagged row: {items:?}");
-    let entry = &items[0];
-    assert_eq!(entry["outcome"], json!("needs_review"));
+    assert!(
+        from_above.is_empty(),
+        "a flag below the target is not the target's own: {from_above:?}"
+    );
+
+    let at_the_row = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings?tenant={}&$filter=needs_review%20eq%20true",
+                h.inner.tree.b
+            ),
+            h.inner.tree.root,
+        )
+        .await;
     assert_eq!(
-        entry["flagged"]["tenant_id"],
-        json!(h.inner.tree.a.to_string()),
-        "the row names the scope that holds it"
+        at_the_row.len(),
+        1,
+        "but the tenant holding it sees it: {at_the_row:?}"
     );
-    assert_eq!(entry["flagged"]["value"], json!(false));
-    assert!(
-        entry["flagged"]["etag"].is_string(),
-        "and carries the tag a correcting write must present: {entry}"
+}
+
+#[tokio::test]
+async fn the_narrowed_browse_refuses_needs_review_eq_false() {
+    let h = RestHarness::new().await;
+    h.inner.declare("alpha", "cascading", json!(true)).await;
+
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20false",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 400, "{body}");
+    assert_eq!(
+        body["context"]["field_violations"][0]["field"],
+        json!("$filter"),
+        "{body}"
     );
-    assert_eq!(entry["mode"], json!("standard"));
     assert!(
-        entry.get("effective").is_none(),
-        "a flagged row is not a resolved value: {entry}"
+        body.to_string().contains("needs_review eq false"),
+        "the refusal names the expression: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_narrowed_browse_pages_without_a_repeat_or_a_gap() {
+    // The narrowing is part of the page query, so every page is full of
+    // flagged settings and the cursor walks the narrowed set: a narrowing
+    // applied to the page after it was cut would return short pages and lose
+    // the flagged ones that sit past them.
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    let mut flagged = Vec::new();
+    for i in 0..5 {
+        let name = format!("flag_{i}");
+        let id = h.inner.declare(&name, "cascading", json!(true)).await;
+        h.inner.set_flagged(id, root, json!(false)).await;
+        flagged.push(h.inner.key(&name).to_string());
+        let name = format!("clean_{i}");
+        let id = h.inner.declare(&name, "cascading", json!(true)).await;
+        h.inner.set(id, root, json!(false)).await;
+    }
+
+    let (items, pages) = every_page(&h, &format!("{NARROWED}&limit=2")).await;
+    assert_eq!(pages, 3, "five flagged settings over pages of two");
+    let mut keys = keys_of(&items);
+    keys.sort();
+    flagged.sort();
+    assert_eq!(keys, flagged, "exactly the flagged set, no repeat, no gap");
+}
+
+#[tokio::test]
+async fn a_named_key_that_is_not_flagged_is_absent_from_the_narrowed_browse_not_not_found() {
+    // The narrowing asks which settings are flagged, so a visible key whose
+    // own override is sound is simply not an answer. A key that does not exist
+    // is a different matter: it keeps the entry every named key gets.
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    let flagged = h.inner.declare("flagged", "cascading", json!(true)).await;
+    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
+    h.inner.declare("untouched", "cascading", json!(true)).await;
+    h.inner.set_flagged(flagged, root, json!(false)).await;
+    h.inner.set(sound, root, json!(false)).await;
+
+    let filter = urlencoding(&format!(
+        "key in ('{}','{}','{}','{}') and needs_review eq true",
+        h.inner.key("flagged"),
+        h.inner.key("sound"),
+        h.inner.key("untouched"),
+        h.inner.key("never_declared")
+    ));
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            root,
+        )
+        .await;
+    let by_key = |needle: &str| {
+        items
+            .iter()
+            .find(|i| i["key"].as_str().is_some_and(|k| k.contains(needle)))
+    };
+    assert_eq!(
+        by_key("flagged.").map(|i| i["outcome"].clone()),
+        Some(json!("resolved")),
+        "{items:?}"
+    );
+    assert!(
+        by_key("sound.").is_none() && by_key("untouched.").is_none(),
+        "a visible key that is not flagged is absent, not reported not_found: {items:?}"
+    );
+    assert_eq!(
+        by_key("never_declared").map(|i| i["outcome"].clone()),
+        Some(json!("not_found")),
+        "a key that does not exist still gets its entry: {items:?}"
+    );
+    assert_eq!(items.len(), 2, "{items:?}");
+}
+
+#[tokio::test]
+async fn under_the_narrowing_a_named_key_hidden_from_the_caller_is_not_found() {
+    // The narrowing must not turn the per-key entry into an existence oracle:
+    // a key hidden from the caller is answered as one that does not exist,
+    // flagged or not, while a visible flagged one is served. (A key in another
+    // administrative domain is the same query predicate, pinned on the
+    // repository: this surface's resource declares no domain property, so no
+    // decision can carry one to it.)
+    let h = RestHarness::new().await;
+    let a = h.inner.tree.a;
+    let concealed = h.inner.declare("concealed", "cascading", json!(true)).await;
+    let open = h.inner.declare("open", "cascading", json!(true)).await;
+    h.restrict(concealed, a, TenantAccess::Hidden).await;
+    h.inner.set_flagged(concealed, a, json!(false)).await;
+    h.inner.set_flagged(open, a, json!(false)).await;
+
+    let filter = urlencoding(&format!(
+        "key in ('{}','{}') and needs_review eq true",
+        h.inner.key("concealed"),
+        h.inner.key("open"),
+    ));
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            a,
+        )
+        .await;
+    let outcome_of = |needle: &str| {
+        items
+            .iter()
+            .find(|i| i["key"].as_str().is_some_and(|k| k.contains(needle)))
+            .map(|i| i["outcome"].clone())
+    };
+    assert_eq!(
+        outcome_of("concealed."),
+        Some(json!("not_found")),
+        "hidden: {items:?}"
+    );
+    assert_eq!(
+        outcome_of("open."),
+        Some(json!("resolved")),
+        "visible and flagged: {items:?}"
+    );
+    assert_eq!(items.len(), 2, "{items:?}");
+}
+
+// ── The review listing ───────────────────────────────────────────────────────
+
+/// A tenant added below `parent` to the harness's tree.
+fn grow(h: &RestHarness, parent: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    h.inner.hierarchy.add_tenant(id, parent);
+    id
+}
+
+/// Five tenants a listing from the root reaches: the root, `a`, `b` below it,
+/// `c` and a fresh one below `c`. The standalone `s` is not one of them.
+fn five_tenants(h: &RestHarness) -> Vec<Uuid> {
+    let tree = &h.inner.tree;
+    let d = grow(h, tree.c);
+    vec![tree.root, tree.a, tree.b, tree.c, d]
+}
+
+fn tenants_of(items: &[Value]) -> Vec<Uuid> {
+    items
+        .iter()
+        .map(|i| {
+            i["tenant_id"]
+                .as_str()
+                .and_then(|t| t.parse().ok())
+                .expect("a tenant id")
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_review_listing_returns_one_row_per_flagged_override_of_the_subtree() {
+    // The listing answers rows — each at the scope that holds it, where it
+    // must be fixed — and not one effective value per setting. A standalone
+    // descendant's rows are its own administrators' and are not here.
+    let h = RestHarness::new().await;
+    let tree = &h.inner.tree;
+    let x = h.inner.declare("x", "cascading", json!(true)).await;
+    let y = h.inner.declare("y", "cascading", json!(true)).await;
+    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
+    for tenant in [tree.root, tree.a, tree.s] {
+        h.inner.set_flagged(x, tenant, json!(false)).await;
+    }
+    h.inner.set_flagged(y, tree.b, json!(false)).await;
+    h.inner.set(sound, tree.a, json!(false)).await;
+
+    let (status, body) = h.get(REVIEW, tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    let mut found: Vec<(String, Uuid)> = items
+        .iter()
+        .map(|i| {
+            (
+                i["key"].as_str().expect("key").to_owned(),
+                tenants_of(std::slice::from_ref(i))[0],
+            )
+        })
+        .collect();
+    found.sort();
+    let mut expected = vec![
+        (h.inner.key("x").to_string(), tree.root),
+        (h.inner.key("x").to_string(), tree.a),
+        (h.inner.key("y").to_string(), tree.b),
+    ];
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "flagged rows of the root and its non-standalone descendants, nothing else: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_review_item_carries_the_row_and_none_of_the_resolved_shape() {
+    let h = RestHarness::new().await;
+    let tree = &h.inner.tree;
+    let plain = h.inner.declare("plain", "cascading", json!(true)).await;
+    let labelled = h
+        .inner
+        .declare_labelled("labelled", "cascading", json!(true), "Minimum TLS version")
+        .await;
+    h.inner.set_flagged(plain, tree.a, json!(false)).await;
+    h.inner.set_flagged(labelled, tree.root, json!(false)).await;
+
+    let items = h.items(REVIEW, tree.root).await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    let own = |needle: &str| {
+        items
+            .iter()
+            .find(|i| i["key"].as_str().is_some_and(|k| k.contains(needle)))
+            .expect("an item for the setting")
+    };
+
+    let at_child = own("plain.");
+    assert_eq!(at_child["mode"], json!("standard"), "{at_child}");
+    assert_eq!(at_child["tenant_id"], json!(tree.a.to_string()));
+    assert_eq!(
+        at_child["scope"],
+        json!(format!("/tenants/{}", tree.a)),
+        "the scope path, in the form `source_scope` uses"
+    );
+    assert_eq!(
+        at_child["value"],
+        json!(false),
+        "the stored value, as stored"
+    );
+    assert_eq!(at_child["masked"], json!(false));
+    assert_eq!(
+        at_child["needs_review_detail"],
+        json!("no longer validates")
+    );
+    assert!(at_child["last_change_at"].is_string(), "{at_child}");
+    assert_eq!(at_child["set_by"], json!(format!("admin-of-{}", tree.a)));
+    assert!(at_child["etag"].is_string(), "{at_child}");
+    assert!(
+        at_child.get("display_name").is_none(),
+        "a setting with no display name omits it, never derives one: {at_child}"
+    );
+    for retired in ["outcome", "effective", "flagged", "fallback"] {
+        assert!(
+            at_child.get(retired).is_none(),
+            "a row is not a resolved value; `{retired}` has no place on it: {at_child}"
+        );
+    }
+
+    let at_root = own("labelled.");
+    assert_eq!(
+        at_root["scope"],
+        json!("/"),
+        "platform scope is `/`: {at_root}"
+    );
+    assert_eq!(
+        at_root["display_name"],
+        json!("Minimum TLS version"),
+        "{at_root}"
     );
 }
 
@@ -839,10 +1217,7 @@ async fn the_review_listing_stops_at_the_targets_own_subtree() {
 
     let from_the_sibling = h
         .items(
-            &format!(
-                "/settings-service/v1/settings?tenant={}&$filter=needs_review%20eq%20true",
-                h.inner.tree.a
-            ),
+            &format!("{REVIEW}?tenant={}", h.inner.tree.a),
             h.inner.tree.root,
         )
         .await;
@@ -851,12 +1226,7 @@ async fn the_review_listing_stops_at_the_targets_own_subtree() {
         "a sibling's flagged row is not on this page: {from_the_sibling:?}"
     );
 
-    let from_the_root = h
-        .items(
-            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
-            h.inner.tree.root,
-        )
-        .await;
+    let from_the_root = h.items(REVIEW, h.inner.tree.root).await;
     assert_eq!(
         from_the_root.len(),
         1,
@@ -865,29 +1235,384 @@ async fn the_review_listing_stops_at_the_targets_own_subtree() {
 }
 
 #[tokio::test]
-async fn the_review_listing_of_a_secret_shows_neither_the_value_nor_its_reference() {
-    // A secret override is a row holding a store reference. The listing exists
-    // so an administrator can find it and correct it, which needs the key and
-    // the scope — not the value, and not the handle to the value either.
+async fn one_setting_flagged_across_more_tenants_than_a_page_continues_on_the_next_page() {
+    // There is no row bound: a setting flagged at thousands of tenants spans
+    // pages. The page is cut over the rows, so the cursor walks one setting's
+    // rows and picks up exactly where the page ended.
     let h = RestHarness::new().await;
-    let id = h
+    let tenants = five_tenants(&h);
+    let id = h.inner.declare("spread", "cascading", json!(true)).await;
+    for tenant in &tenants {
+        h.inner.set_flagged(id, *tenant, json!(false)).await;
+    }
+
+    let (items, pages) = every_page(&h, &format!("{REVIEW}?limit=2")).await;
+    assert_eq!(pages, 3, "five rows over pages of two");
+    let found = tenants_of(&items);
+    let mut expected = tenants.clone();
+    expected.sort();
+    assert_eq!(
+        found, expected,
+        "all five rows, in tenant order, with no repeat and no gap"
+    );
+}
+
+#[tokio::test]
+async fn the_review_listing_is_ordered_by_declaration_then_tenant() {
+    // The order is fixed and total — `uq_value_scope` makes the pair unique
+    // for subject-less rows — which is what a keyset cursor needs.
+    let h = RestHarness::new().await;
+    let tenants = five_tenants(&h);
+    let first = h.inner.declare("first", "cascading", json!(true)).await;
+    let second = h.inner.declare("second", "cascading", json!(true)).await;
+    let mut expected = Vec::new();
+    for (declaration, rows) in [(first, 5), (second, 3)] {
+        for tenant in tenants.iter().take(rows) {
+            h.inner
+                .set_flagged(declaration, *tenant, json!(false))
+                .await;
+            expected.push((declaration, *tenant));
+        }
+    }
+    expected.sort();
+
+    let (items, pages) = every_page(&h, &format!("{REVIEW}?limit=3")).await;
+    assert_eq!(pages, 3, "eight rows over pages of three");
+    let declaration_of = |key: &str| {
+        if key.contains("first.") {
+            first
+        } else {
+            second
+        }
+    };
+    let found: Vec<(Uuid, Uuid)> = items
+        .iter()
+        .map(|i| {
+            (
+                declaration_of(i["key"].as_str().expect("key")),
+                tenants_of(std::slice::from_ref(i))[0],
+            )
+        })
+        .collect();
+    assert_eq!(
+        found, expected,
+        "rows sorted by (declaration id, tenant id)"
+    );
+}
+
+#[tokio::test]
+async fn the_review_listing_is_narrowed_by_category_and_by_key() {
+    let h = RestHarness::new().await;
+    let root = h.inner.tree.root;
+    let other = h.inner.add_category("other").await;
+    let here = h.inner.declare("here", "cascading", json!(true)).await;
+    let there = h
         .inner
-        .declare_typed("api_token", "cascading", json!(""), SECRET, "secret")
+        .declare_in(other, "there", "cascading", json!(true), TEXT, "public")
         .await;
-    h.inner
-        .set_flagged_secret(id, h.inner.tree.a, "credstore-ref-1")
-        .await;
+    let sound = h.inner.declare("sound", "cascading", json!(true)).await;
+    h.inner.set_flagged(here, root, json!(false)).await;
+    h.inner.set_flagged(there, root, json!("bad")).await;
+    h.inner.set(sound, root, json!(false)).await;
 
     let items = h
         .items(
-            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            &format!("{REVIEW}?$filter=category_id%20eq%20{other}"),
+            root,
+        )
+        .await;
+    assert_eq!(
+        keys_of(&items),
+        vec![h.inner.key("there").to_string()],
+        "the one category's rows"
+    );
+
+    // A named key with no flagged row is simply absent: no entry, no outcome.
+    let filter = urlencoding(&format!(
+        "key in ('{}','{}','{}')",
+        h.inner.key("here"),
+        h.inner.key("sound"),
+        h.inner.key("never_declared")
+    ));
+    let items = h.items(&format!("{REVIEW}?$filter={filter}"), root).await;
+    assert_eq!(
+        keys_of(&items),
+        vec![h.inner.key("here").to_string()],
+        "the unflagged and the undeclared key have no item: {items:?}"
+    );
+    assert!(items[0].get("outcome").is_none(), "{items:?}");
+}
+
+#[tokio::test]
+async fn the_review_listing_refuses_what_it_does_not_take() {
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner
+        .set_flagged(id, h.inner.tree.root, json!(false))
+        .await;
+
+    // `needs_review` is the listing itself, so naming it is refused; so is a
+    // field the filter does not map.
+    for filter in ["needs_review%20eq%20true", "tenant%20eq%20%27x%27"] {
+        let (status, body) = h
+            .get(&format!("{REVIEW}?$filter={filter}"), h.inner.tree.root)
+            .await;
+        assert_eq!(status, 400, "{filter}: {body}");
+        assert_eq!(
+            body["context"]["field_violations"][0]["field"],
+            json!("$filter"),
+            "{filter}: {body}"
+        );
+    }
+
+    // The order is fixed and a projection would vary the shape; both refused
+    // as unsupported options, not silently ignored.
+    for option in ["$orderby=key%20asc", "$select=key"] {
+        let (status, body) = h
+            .get(&format!("{REVIEW}?{option}"), h.inner.tree.root)
+            .await;
+        assert_eq!(status, 400, "{option}: {body}");
+        assert_eq!(
+            body["context"]["field_violations"][0]["reason"],
+            json!(crate::field::ODATA_UNSUPPORTED_OPTION),
+            "{option}: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_review_cursor_is_bound_to_its_filter_and_its_target() {
+    let h = RestHarness::new().await;
+    let tenants = five_tenants(&h);
+    let id = h.inner.declare("spread", "cascading", json!(true)).await;
+    for tenant in &tenants {
+        h.inner.set_flagged(id, *tenant, json!(false)).await;
+    }
+    let category = h.inner.category_id();
+    let other = h.inner.add_category("other").await;
+    let (status, first) = h
+        .get(
+            &format!("{REVIEW}?limit=2&$filter=category_id%20eq%20{category}"),
             h.inner.tree.root,
         )
         .await;
+    assert_eq!(status, 200, "{first}");
+    let cursor = first["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a second page")
+        .to_owned();
+
+    // The same filter and target continue it.
+    let (status, body) = h
+        .get(
+            &format!("{REVIEW}?limit=2&$filter=category_id%20eq%20{category}&cursor={cursor}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+
+    // Another filter, or none, is another listing; so is another target.
+    for (what, uri) in [
+        (
+            "another filter",
+            format!("{REVIEW}?limit=2&$filter=category_id%20eq%20{other}&cursor={cursor}"),
+        ),
+        ("no filter", format!("{REVIEW}?limit=2&cursor={cursor}")),
+        (
+            "another tenant",
+            format!(
+                "{REVIEW}?limit=2&tenant={}&$filter=category_id%20eq%20{category}&cursor={cursor}",
+                h.inner.tree.a
+            ),
+        ),
+    ] {
+        let (status, body) = h.get(&uri, h.inner.tree.root).await;
+        assert_eq!(
+            status, 400,
+            "{what} is refused before any row is read: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_hidden_setting_has_no_rows_on_the_review_listing() {
+    let h = RestHarness::new().await;
+    let tree = &h.inner.tree;
+    let visible = h.inner.declare("visible", "cascading", json!(true)).await;
+    let concealed = h.inner.declare("concealed", "cascading", json!(true)).await;
+    h.inner.set_flagged(visible, tree.b, json!(false)).await;
+    h.inner.set_flagged(concealed, tree.b, json!(false)).await;
+    h.restrict(concealed, tree.a, TenantAccess::Hidden).await;
+
+    let items = h.items(REVIEW, tree.a).await;
+    assert_eq!(
+        keys_of(&items),
+        vec![h.inner.key("visible").to_string()],
+        "a setting hidden from the caller leaves the listing silently: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_review_listing_refuses_a_target_the_caller_may_not_administer() {
+    let h = RestHarness::new().await;
+    let id = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner.set_flagged(id, h.inner.tree.c, json!(false)).await;
+    h.inner.set_flagged(id, h.inner.tree.s, json!(false)).await;
+
+    // `c` is the caller's sibling; `s` is a standalone descendant of `a`.
+    for target in [h.inner.tree.c, h.inner.tree.s] {
+        let (status, body) = h
+            .get(&format!("{REVIEW}?tenant={target}"), h.inner.tree.a)
+            .await;
+        assert_eq!(status, 403, "{target}: {body}");
+        assert!(
+            body.get("items").is_none(),
+            "a refusal carries no rows: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_review_listing_of_a_secret_shows_neither_the_value_nor_its_reference() {
+    // A secret override is a row holding a store reference. The listing exists
+    // so an administrator can find it and correct it, which needs the key and
+    // the scope — not the value, and not the handle to the value either; with
+    // the PII entitlement or without it, which is about `pii`, not `secret`.
+    for h in [
+        RestHarness::new().await,
+        RestHarness::without_pii_entitlement().await,
+    ] {
+        let id = h
+            .inner
+            .declare_typed("api_token", "cascading", json!(""), SECRET, "secret")
+            .await;
+        h.inner
+            .set_flagged_secret(id, h.inner.tree.a, "credstore-ref-1")
+            .await;
+
+        let items = h.items(REVIEW, h.inner.tree.root).await;
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["value"], json!(MASK_TOKEN));
+        assert_eq!(items[0]["masked"], json!(true), "{}", items[0]);
+        let wire = items[0].to_string();
+        assert!(!wire.contains("credstore-ref-1"), "{wire}");
+    }
+}
+
+#[tokio::test]
+async fn a_pii_row_is_masked_on_the_review_listing_without_the_entitlement_and_shown_with_it() {
+    // The value and the setter's identity are both personal data: masked for
+    // a reader who may not see `pii` unmasked, shown to one who may.
+    let entitled = RestHarness::new().await;
+    let masked = RestHarness::without_pii_entitlement().await;
+    for h in [&entitled, &masked] {
+        let id = h
+            .inner
+            .declare_typed("support_email", "cascading", json!("x"), TEXT, "pii")
+            .await;
+        h.inner
+            .set_flagged_classified(id, h.inner.tree.a, json!("ops@example.test"), "pii")
+            .await;
+    }
+
+    let items = entitled.items(REVIEW, entitled.inner.tree.root).await;
     assert_eq!(items.len(), 1, "{items:?}");
-    assert_eq!(items[0]["flagged"]["value"], json!(MASK_TOKEN));
-    let wire = items[0].to_string();
-    assert!(!wire.contains("credstore-ref-1"), "{wire}");
+    assert_eq!(items[0]["value"], json!("ops@example.test"), "{}", items[0]);
+    assert_eq!(items[0]["masked"], json!(false), "{}", items[0]);
+    assert_eq!(
+        items[0]["set_by"],
+        json!(format!("admin-of-{}", entitled.inner.tree.a)),
+        "{}",
+        items[0]
+    );
+
+    let items = masked.items(REVIEW, masked.inner.tree.root).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["value"], json!(MASK_TOKEN), "{}", items[0]);
+    assert_eq!(items[0]["masked"], json!(true), "{}", items[0]);
+    assert_eq!(items[0]["set_by"], json!(MASK_TOKEN), "{}", items[0]);
+}
+
+#[tokio::test]
+async fn a_search_hit_for_a_flagged_override_is_not_a_match_on_its_value() {
+    // A flagged override is not served — resolution falls through it — so the
+    // search does not match on what it holds either: a needle found only in
+    // the flagged value finds nothing, with the narrowing or without it.
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare("motto", "cascading", json!("nothing"))
+        .await;
+    h.inner
+        .set_flagged(id, h.inner.tree.root, json!("zzneedle"))
+        .await;
+
+    for filter in ["", "&$filter=needs_review%20eq%20true"] {
+        let items = h
+            .items(
+                &format!("/settings-service/v1/search?q=zzneedle{filter}"),
+                h.inner.tree.root,
+            )
+            .await;
+        assert!(
+            items.is_empty(),
+            "the value of a flagged row is not in the override match{filter}: {items:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_narrowed_search_keeps_the_settings_flagged_at_the_target_and_not_those_flagged_below() {
+    let h = RestHarness::new().await;
+    let tree = &h.inner.tree;
+    let here = h
+        .inner
+        .declare("proxy_here", "cascading", json!(true))
+        .await;
+    let below = h
+        .inner
+        .declare("proxy_below", "cascading", json!(true))
+        .await;
+    let sound = h
+        .inner
+        .declare("proxy_sound", "cascading", json!(true))
+        .await;
+    h.inner.set_flagged(here, tree.root, json!(false)).await;
+    h.inner.set_flagged(below, tree.a, json!(false)).await;
+    h.inner.set(sound, tree.root, json!(false)).await;
+
+    let slugs = |items: &[Value]| -> Vec<String> {
+        let mut slugs: Vec<String> = items
+            .iter()
+            .filter_map(|i| i["leaf_slug"].as_str().map(str::to_owned))
+            .collect();
+        slugs.sort();
+        slugs.dedup();
+        slugs
+    };
+    let items = h
+        .items(
+            "/settings-service/v1/search?q=proxy&$filter=needs_review%20eq%20true",
+            tree.root,
+        )
+        .await;
+    assert_eq!(
+        slugs(&items),
+        vec!["proxy_here"],
+        "only the setting whose own override at the target is flagged: {items:?}"
+    );
+
+    // From `a`, its own flagged override qualifies and the root's does not.
+    let items = h
+        .items(
+            &format!(
+                "/settings-service/v1/search?q=proxy&tenant={}&$filter=needs_review%20eq%20true",
+                tree.a
+            ),
+            tree.root,
+        )
+        .await;
+    assert_eq!(slugs(&items), vec!["proxy_below"], "{items:?}");
 }
 
 // ── Naming keys ──────────────────────────────────────────────────────────────
@@ -1416,7 +2141,7 @@ async fn the_search_corpus_follows_the_callers_entitlement_through_the_enforcer(
 }
 
 #[tokio::test]
-async fn the_tag_a_flagged_row_is_listed_with_is_the_one_a_correcting_write_presents() {
+async fn the_tag_a_review_row_is_listed_with_is_the_one_a_correcting_write_presents() {
     // The review listing exists so an administrator can fix what stopped
     // validating. The tag it hands out must be the value state tag the write
     // compares — the row's `last_change_at` — not its `updated_at`, which a
@@ -1451,13 +2176,9 @@ async fn the_tag_a_flagged_row_is_listed_with_is_the_one_a_correcting_write_pres
             .expect("flagged");
     }
 
-    let items = h
-        .items(
-            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
-            root,
-        )
-        .await;
-    let tag = items[0]["flagged"]["etag"]
+    let items = h.items(REVIEW, root).await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let tag = items[0]["etag"]
         .as_str()
         .expect("the listed tag")
         .to_owned();
@@ -1553,7 +2274,7 @@ async fn history_shows_the_settings_definition_records_beside_the_scopes_and_tel
 #[tokio::test]
 async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
     // Who set an ancestor's override is an administrator's identity: the trail
-    // and the flagged listing show it to a reader who may read unmasked and
+    // and the review listing show it to a reader who may read unmasked and
     // mask it for one who may not, as the audit history masks its actor.
     let entitled = RestHarness::new().await;
     let d = entitled
@@ -1573,7 +2294,7 @@ async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
         "/settings-service/v1/settings/{key}?tenant={}",
         entitled.inner.tree.a
     );
-    let flagged = "/settings-service/v1/settings?$filter=needs_review%20eq%20true";
+    let flagged = REVIEW;
 
     let (status, body) = entitled.get(&one, entitled.inner.tree.root).await;
     assert_eq!(status, 200, "{body}");
@@ -1613,15 +2334,422 @@ async fn setter_identity_is_masked_for_a_reader_without_the_pii_entitlement() {
             );
         }
     }
+    let (status, body) = entitled.get(flagged, entitled.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    let items = body["items"].as_array().expect("items");
+    assert!(!items.is_empty(), "{body}");
+    for item in items {
+        assert!(
+            item["set_by"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty() && s != MASK_TOKEN),
+            "an entitled reader sees who set the flagged row: {item}"
+        );
+    }
     let (status, body) = masked.get(flagged, masked.inner.tree.root).await;
     assert_eq!(status, 200, "{body}");
     let items = body["items"].as_array().expect("items");
     assert!(!items.is_empty(), "{body}");
     for item in items {
         assert_eq!(
-            item["flagged"]["set_by"],
+            item["set_by"],
             json!(MASK_TOKEN),
             "masked on the listing: {item}"
         );
     }
+}
+
+// ── The total beside the cursors ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn the_browse_total_counts_the_settings_after_the_hidden_exclusion() {
+    // The same four settings as the page-cut test, one hidden from `a`. The
+    // total is of what the walk holds for the caller — three for `a`, four
+    // for the root — counted under the filter and never under the cursor, so
+    // a short page and a later page report the same number.
+    let h = RestHarness::new().await;
+    for name in ["px_alpha", "px_gamma", "px_delta"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let concealed = h.inner.declare("px_beta", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let (status, body) = h
+        .get("/settings-service/v1/settings?limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+    let cursor = body["page_info"]["next_cursor"]
+        .as_str()
+        .expect("a third page")
+        .to_owned();
+    let (status, body) = h
+        .get(
+            &format!("/settings-service/v1/settings?limit=2&cursor={cursor}"),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "same walk, same total"
+    );
+
+    let (status, body) = h
+        .get("/settings-service/v1/settings?limit=2", h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(4),
+        "nothing hidden from the root"
+    );
+
+    // By category, the total is the category's count.
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings?$filter=category_id%20eq%20{}",
+                h.inner.category_id()
+            ),
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+}
+
+#[tokio::test]
+async fn the_narrowed_browse_counts_the_narrowed_set_and_the_review_listing_claims_no_total() {
+    // Under `needs_review eq true` the browse pages the settings whose own
+    // override at the target is flagged — narrowed in the page query — so its
+    // total is of that set. The review listing pages flagged rows across
+    // tenants, one setting to many rows, and claims no total rather than a
+    // wrong one.
+    let h = RestHarness::new().await;
+    let flagged = h.inner.declare("flagged", "cascading", json!(true)).await;
+    h.inner.declare("clean", "cascading", json!(true)).await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.a, json!(false))
+        .await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.b, json!(false))
+        .await;
+
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/settings?$filter=needs_review%20eq%20true",
+            h.inner.tree.a,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(1),
+        "the total is of the narrowed set: {body}"
+    );
+
+    let (status, body) = h
+        .get(
+            "/settings-service/v1/settings/review?limit=1",
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    assert!(
+        body["page_info"].get("total_count").is_none(),
+        "no total on the review listing: {body}"
+    );
+    assert!(body["page_info"]["limit"].is_number(), "{body}");
+}
+
+#[tokio::test]
+async fn search_reports_how_many_settings_match_beyond_the_page() {
+    let h = RestHarness::new().await;
+    for name in ["px_alpha", "px_gamma", "px_delta"] {
+        h.inner.declare(name, "cascading", json!(true)).await;
+    }
+    let concealed = h.inner.declare("px_beta", "cascading", json!(true)).await;
+    h.restrict(concealed, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let (status, body) = h
+        .get("/settings-service/v1/search?q=px_&limit=2", h.inner.tree.a)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(2));
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "the hidden setting matches nothing for this caller: {body}"
+    );
+}
+
+#[tokio::test]
+async fn history_reports_how_many_records_the_pair_holds() {
+    let h = RestHarness::new().await;
+    h.inner.declare("proxy", "cascading", json!(true)).await;
+    let value = format!(
+        "/settings-service/v1/settings/{}/value",
+        encoded(&h, "proxy")
+    );
+    let first = h
+        .send(
+            "PUT",
+            &value,
+            Some(json!({ "value": false })),
+            Some("absent"),
+            h.inner.tree.root,
+        )
+        .await;
+    let tag = first.body["etag"].as_str().expect("a tag").to_owned();
+    h.send(
+        "PUT",
+        &value,
+        Some(json!({ "value": true })),
+        Some(&tag),
+        h.inner.tree.root,
+    )
+    .await;
+
+    let (status, body) = h
+        .get(
+            &format!(
+                "/settings-service/v1/settings/{}/history?limit=1",
+                encoded(&h, "proxy")
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(body["page_info"]["total_count"], json!(2), "{body}");
+}
+
+// ── The display name ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_browse_item_carries_the_display_name_when_set_and_omits_it_otherwise() {
+    // The label rides beside `mode` on every browse item so a console renders
+    // one page without a second read; an unset one is absent, not derived.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("labelled", "cascading", json!(true), "Minimum TLS version")
+        .await;
+    h.inner.declare("bare", "cascading", json!(true)).await;
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    for item in &items {
+        let key = item["key"].as_str().expect("a key");
+        if key.contains(".labelled.") {
+            assert_eq!(item["display_name"], json!("Minimum TLS version"), "{item}");
+        } else {
+            assert!(
+                item.get("display_name").is_none(),
+                "an unset label is omitted, never derived from the slug: {item}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_single_effective_read_never_carries_the_display_name() {
+    // Value-only by design: a detail view composes the declaration read with
+    // this one, as it does for the description.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("labelled", "cascading", json!(true), "Minimum TLS version")
+        .await;
+
+    let uri = format!("/settings-service/v1/settings/{}", encoded(&h, "labelled"));
+    let (status, body) = h.get(&uri, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.get("display_name").is_none(),
+        "the effective value read carries no label: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_search_hit_carries_the_display_name_when_set_and_omits_it_otherwise() {
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("proxy_host", "cascading", json!("direct"), "Proxy host")
+        .await;
+    h.inner
+        .declare("proxy_port", "cascading", json!("direct"))
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=proxy", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 2, "{items:?}");
+    for hit in &items {
+        if hit["leaf_slug"] == json!("proxy_host") {
+            assert_eq!(hit["display_name"], json!("Proxy host"), "{hit}");
+        } else {
+            assert!(hit.get("display_name").is_none(), "{hit}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_hit_found_only_in_the_display_name_names_it_and_carries_no_scope() {
+    // What a person types is the label they see, not the key. The hit says the
+    // label matched, and since the label belongs to the declaration rather
+    // than to a tenant it carries no scope.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("relay", "cascading", json!("direct"), "Minimum TLS version")
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=tls", h.inner.tree.root)
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let hit = &items[0];
+    assert_eq!(hit["matched_field"], json!("display_name"), "{hit}");
+    assert_eq!(hit["display_name"], json!("Minimum TLS version"));
+    assert!(
+        hit.get("scope").is_none(),
+        "a declaration-level hit carries no scope: {hit}"
+    );
+}
+
+#[tokio::test]
+async fn an_override_hit_carries_the_display_name_of_its_declaration() {
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare_labelled("motto", "cascading", json!("nothing"), "Company motto")
+        .await;
+    h.inner.set(id, h.inner.tree.a, json!("alpha")).await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=alpha", h.inner.tree.a)
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    let hit = &items[0];
+    assert_eq!(hit["matched_field"], json!("value"));
+    assert_eq!(
+        hit["display_name"],
+        json!("Company motto"),
+        "an override hit names its declaration's label too: {hit}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_setting_is_not_found_through_its_display_name() {
+    // The label is ordinary declaration text under the same visibility filter
+    // as the key and the description: hiding a setting hides it from this path.
+    let h = RestHarness::new().await;
+    h.inner
+        .declare_labelled("visible", "cascading", json!(true), "Secretive label")
+        .await;
+    let hidden = h
+        .inner
+        .declare_labelled("concealed", "cascading", json!(true), "Secretive label")
+        .await;
+    h.restrict(hidden, h.inner.tree.a, TenantAccess::Hidden)
+        .await;
+
+    let items = h
+        .items("/settings-service/v1/search?q=secretive", h.inner.tree.a)
+        .await;
+    let slugs: Vec<&str> = items
+        .iter()
+        .filter_map(|i| i["leaf_slug"].as_str())
+        .collect();
+    assert_eq!(
+        slugs,
+        vec!["visible"],
+        "a hidden setting is not discoverable through its label either"
+    );
+}
+
+#[tokio::test]
+async fn the_narrowed_browse_item_and_the_review_item_carry_the_display_name() {
+    // A console renders the label of a flagged setting exactly as it does on
+    // the resolved page, whether it came through the narrowed browse or the
+    // review listing.
+    let h = RestHarness::new().await;
+    let flagged = h
+        .inner
+        .declare_labelled("flagged", "cascading", json!(true), "Minimum TLS version")
+        .await;
+    h.inner
+        .set_flagged(flagged, h.inner.tree.a, json!(false))
+        .await;
+
+    let narrowed = h
+        .items(
+            &format!(
+                "/settings-service/v1/settings?tenant={}&$filter=needs_review%20eq%20true",
+                h.inner.tree.a
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(narrowed.len(), 1, "{narrowed:?}");
+    assert_eq!(narrowed[0]["outcome"], json!("resolved"));
+    assert_eq!(
+        narrowed[0]["display_name"],
+        json!("Minimum TLS version"),
+        "{}",
+        narrowed[0]
+    );
+
+    let review = h.items(REVIEW, h.inner.tree.root).await;
+    assert_eq!(review.len(), 1, "{review:?}");
+    assert_eq!(
+        review[0]["display_name"],
+        json!("Minimum TLS version"),
+        "{}",
+        review[0]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_entry_carries_the_display_name_and_a_not_found_one_has_none() {
+    // A retired setting fails as its own entry yet still has a declaration to
+    // label it; a requested key with no declaration has nothing to report.
+    let h = RestHarness::new().await;
+    let retired = h
+        .inner
+        .declare_labelled("retired", "cascading", json!(true), "Old label")
+        .await;
+    h.inner.retire(retired).await;
+
+    let items = h
+        .items("/settings-service/v1/settings", h.inner.tree.root)
+        .await;
+    let gone = items
+        .iter()
+        .find(|i| i["key"].as_str().is_some_and(|k| k.contains("retired")))
+        .expect("the retired setting is listed");
+    assert_eq!(gone["outcome"], json!("retired"));
+    assert_eq!(gone["display_name"], json!("Old label"), "{gone}");
+
+    let filter = urlencoding(&format!("key in ('{}')", h.inner.key("never_declared")));
+    let items = h
+        .items(
+            &format!("/settings-service/v1/settings?$filter={filter}"),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(items.len(), 1, "{items:?}");
+    assert_eq!(items[0]["outcome"], json!("not_found"));
+    assert!(
+        items[0].get("display_name").is_none(),
+        "no declaration, no label: {}",
+        items[0]
+    );
 }

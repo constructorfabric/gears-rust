@@ -8,6 +8,7 @@ on:
       - 'apps/**/deploy/helm/**'
       - 'examples/**/deploy/helm/**'
       - 'gears/**/deploy/helm/**'
+      - 'tools/scripts/update-helm-deps.sh'
       - '.github/workflows/helm.yml'
   workflow_dispatch:
 
@@ -27,19 +28,24 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Helm
-        uses: taiki-e/install-action@4cef1412cce204788f482e778a0b9187f9626a29 # v2.87.21
-        with:
-          tool: helm
+        env:
+          HELM_VERSION: "3.18.4"
+          HELM_SHA256: "f8180838c23d7c7d797b208861fecb591d9ce1690d8704ed1e4cb8e2add966c1"
+        run: |
+          curl -fsSL -o /tmp/helm.tgz \
+            "https://get.helm.sh/helm-v${HELM_VERSION}-linux-amd64.tar.gz"
+          echo "${HELM_SHA256}  /tmp/helm.tgz" | sha256sum -c -
+          sudo tar -xzf /tmp/helm.tgz -C /usr/local/bin --strip-components=1 linux-amd64/helm
+          helm version
 
       - name: Resolve chart dependencies
-        run: bash deploy/helm/update-helm-deps.sh
+        run: bash tools/scripts/update-helm-deps.sh
 
       - name: Helm lint (library, umbrella, and all gear charts)
         run: |
-          gear_charts=$(grep -rlE --include=Chart.yaml \
-            '^[[:space:]]*-[[:space:]]*name:[[:space:]]*toolkit-common' \
-            apps examples gears | grep -v '/charts/' | xargs -r -n1 dirname)
-          helm lint deploy/helm/toolkit-common deploy/helm/toolkit-platform $gear_charts
+          chart_dirs=$(find apps examples gears deploy/helm -name Chart.yaml \
+            -not -path '*/charts/*' -exec dirname {} \;)
+          helm lint $chart_dirs
 
       - name: Helm template (umbrella presets)
         run: |

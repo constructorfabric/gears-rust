@@ -1,6 +1,6 @@
 //! Axum handler + router for the ledger's reusable-credit (wallet) REST surface
 //! (architecture §5.2). ONE operation under `/bss-ledger/v1`, tenant-scoped
-//! WITHOUT a tenant in the path (the vhp-core convention, matching the
+//! WITHOUT a tenant in the path (the platform convention, matching the
 //! payment / journal-entry / provisioning surfaces): the write carries
 //! `tenant_id` in the **body**.
 //!
@@ -43,7 +43,7 @@ const TAG: &str = "BSS Ledger Credit";
 pub struct ApiState {
     /// In-process data-access client (the gear's own local impl).
     pub client: Arc<dyn LedgerClientV1>,
-    /// Dual-control lifecycle engine (VHP-1852): the grant gate routes a
+    /// Dual-control lifecycle engine: the grant gate routes a
     /// high-value credit grant to the preparer→approver queue. `None` disables
     /// the gate (router unit tests without a governance DB).
     pub approval: Option<Arc<crate::infra::approval::service::ApprovalService>>,
@@ -133,7 +133,7 @@ async fn post_credit_application(
     // reaches the approval queue.
     let cmd = body.into_sdk()?;
 
-    // Dual-control gate (VHP-1852): a high-value credit GRANT routes to the
+    // Dual-control gate: a high-value credit GRANT routes to the
     // preparer→approver queue (409); an apply, or a below-threshold grant, posts
     // inline (unchanged).
     if let bss_ledger_sdk::CreditApplication::Grant(grant) = &cmd

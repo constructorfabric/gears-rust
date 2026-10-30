@@ -145,7 +145,7 @@ impl World {
         let mut price = entry_support::price(&entry);
         price.version_no = version_no;
         price.state = "approved".into();
-        price.price_json = json!({"rate": "1.00"});
+        price.price_json = json!({"rate": "1"});
         price.effective_from = date(from);
         tweak(&mut price);
         price_repo::insert(&conn, &scope, price).await.unwrap().id

@@ -6,7 +6,6 @@ use crate::{
     },
     authz::{self, OwnerTenant, ResourceRef, actions, resource_types},
     domain::{
-        book,
         money::{self, PriceData},
         price_book_entry::Model,
         resolve::Source,
@@ -29,7 +28,6 @@ use bss_pricing_sdk::{
     },
     terms::{BillingCycle, BillingTiming, InputSource, InvoiceInputs, Rounding},
 };
-use rust_decimal::Decimal;
 use std::sync::Arc;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::secure::AccessScope;
@@ -167,19 +165,12 @@ fn corrupt(detail: impl Into<String>) -> CanonicalError {
     tracing::error!(%detail, "corrupt stored pricing row");
     CanonicalError::internal(detail).create()
 }
-fn amount(price_id: Uuid, value: &str) -> Result<Decimal, CanonicalError> {
-    bss_money::parse_decimal(value)
-        .ok()
-        .filter(|v| *v >= Decimal::ZERO)
-        .ok_or_else(|| corrupt(format!("price {price_id}: invalid stored amount {value}")))
-}
+/// The contract's model of money already read as stored: each value within its field's limit.
 fn price_model(
     price_id: Uuid,
     model: Model,
-    value: serde_json::Value,
+    data: PriceData,
 ) -> Result<PriceModel, CanonicalError> {
-    let data = money::decode(model, value)
-        .map_err(|e| corrupt(format!("price {price_id}: {}", e.code)))?;
     if let Some(e) = money::validate(model, &data).first() {
         return Err(corrupt(format!("price {price_id}: {}", e.code)));
     }
@@ -209,22 +200,26 @@ fn price_model(
         }
     })
 }
+/// The price as the contract serves it, read as every other read reads a stored price
+/// (`price_repo::in_book`): money and fee in canonical text, and the currency spec stored on the
+/// row, whose code must be its book's (`book_currency`). Its scale is never the current table's.
 fn immutable(
     row: &crate::infra::storage::entity::price::Model,
     model: Model,
-    currency: &str,
+    book_currency: &str,
 ) -> Result<ImmutablePrice, CanonicalError> {
+    let price = crate::infra::storage::repo::price_repo::in_book(row, model, book_currency)
+        .map_err(|e| corrupt(e.to_string()))?;
+    let data = price
+        .price
+        .ok_or_else(|| corrupt(format!("price {}: no money", row.id)))?;
     let mut p = ImmutablePrice {
         price_id: row.id,
         price_book_entry_id: row.price_book_entry_id,
         money_digest: [0; 32],
-        currency: currency.into(),
-        model: price_model(row.id, model, row.price_json.clone())?,
-        minimum_fee: row
-            .min_fee
-            .as_deref()
-            .map(|value| amount(row.id, value))
-            .transpose()?,
+        currency: price.currency,
+        model: price_model(row.id, model, data)?,
+        minimum_fee: price.min_fee,
         effective_from: row.effective_from,
         ends_on: row
             .temporary_until
@@ -315,9 +310,6 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
                         Some("arrears") => BillingTiming::Arrears,
                         _ => return Err(incomplete("billing_timing")),
                     };
-                    if s.rounding != "half_even" {
-                        return Err(incomplete("rounding"));
-                    }
                     let kind = match entry.charge_kind {
                         crate::domain::price_book_entry::ChargeKind::Recurring => {
                             ChargeKind::Recurring
@@ -337,6 +329,7 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
                     let row = s.rows.get(&b.price.id).ok_or_else(|| {
                         corrupt(format!("price {}: bound price missing", b.price.id))
                     })?;
+                    // The invoice line posts at this price's stored scale, `price.currency`.
                     let price = immutable(row, entry.model, &s.currency)?;
                     if price.price_book_entry_id != entry.id {
                         return Err(corrupt(format!(
@@ -382,7 +375,6 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
                                 "tax_category",
                             )?,
                             timing,
-                            currency_scale: book::minor_digits(&s.currency),
                             rounding: Rounding::HalfEven,
                         },
                     })
@@ -397,7 +389,3 @@ pub(crate) fn project_resolution(s: &ReadSnapshot) -> Result<ResolvedBindings, C
         cells,
     })
 }
-
-#[cfg(test)]
-#[path = "pricing_read_amount_tests.rs"]
-mod amount_tests;

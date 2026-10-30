@@ -231,7 +231,7 @@ impl RateSource {
         }
 
         // Candidates exist but all are stale. v1 forbids the stale fallback.
-        // TODO(VHP-1853): per-tenant stale-allowed policy → on the configured
+        // TODO: per-tenant stale-allowed policy → on the configured
         // tenants, return the freshest stale candidate as
         // ResolvedRate { stale: true, .. } instead of erroring here.
         Err(DomainError::FxRateStaleNotAllowed(format!(

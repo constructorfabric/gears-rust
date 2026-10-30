@@ -474,7 +474,7 @@ impl TieOutJob {
     }
 
     /// Tie out one tenant for a daily tick: the incremental path (baseline + open
-    /// fold, VHP-1843) when `full` is false AND the tenant has a baseline, else
+    /// fold) when `full` is false AND the tenant has a baseline, else
     /// the full all-time fold. Both yield a [`TieOutReport`] so the alarm path is
     /// shared. The incremental report omits the full-only defect classes
     /// (imbalanced entries / negative grains / PENDING lines) — those ride the
@@ -721,7 +721,7 @@ impl TieOutJob {
     /// One tie-out tick over every tenant. `full` forces the all-time fold for
     /// every tenant (the periodic drift backstop); otherwise each tenant takes the
     /// incremental path (baseline + open fold) when it has a baseline, falling
-    /// back to the full fold when it does not (VHP-1843).
+    /// back to the full fold when it does not.
     ///
     /// # Errors
     /// Returns `Err` only if the up-front tenant *enumeration* fails (DB
@@ -1711,7 +1711,7 @@ fn negative_grains(balances: &[account_balance::Model]) -> Vec<NegativeGrain> {
 }
 
 // ────────────────────────────────────────────────────────────────────────────
-// VHP-1843 incremental tie-out: (grain, grain_key) string-space projection.
+// Incremental tie-out: (grain, grain_key) string-space projection.
 //
 // The full `tie_out_on` folds ALL of a tenant's lines (O(history)). The
 // incremental path verifies `baseline + fold(open periods) == cache` instead:
@@ -1977,7 +1977,7 @@ impl IncrementalReport {
 }
 
 impl TieOutJob {
-    /// Incremental tie-out (VHP-1843): verify `baseline + fold(open periods) ==
+    /// Incremental tie-out: verify `baseline + fold(open periods) ==
     /// cache`, bounding the daily/recon cost to the open period instead of
     /// folding all of history. Returns `Ok(None)` — signalling the caller to run
     /// the full [`tie_out_on`](Self::tie_out_on) — when the tenant has no stored

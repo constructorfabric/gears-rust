@@ -184,7 +184,7 @@ pub trait LedgerMetricsPort: Send + Sync + 'static {
     fn recognition_period_queue_depth(&self, depth: i64);
     /// Increment the dual-control pending-created counter, labelled by `kind`
     /// (`ledger_dual_control_pending_total{kind}`) — an over-threshold mutation
-    /// routed to the preparer→approver queue (VHP-1852).
+    /// routed to the preparer→approver queue.
     fn dual_control_pending(&self, kind: &str);
     /// Increment the dual-control decision counter, labelled by `kind` +
     /// `decision` (approved / rejected / `needs_rework` / cancelled / expired)

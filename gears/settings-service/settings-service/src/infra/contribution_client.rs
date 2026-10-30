@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-module-contributions-operations:p1
 //! The in-process `SettingsContributionClient`.
 //!

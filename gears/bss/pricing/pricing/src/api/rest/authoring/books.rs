@@ -12,8 +12,9 @@ use super::{
     support::{DoorError, audit, check_version, conflict, date, invalid, missing, response, value},
 };
 use crate::{
-    domain::book,
+    domain::{book, currency::CurrencyScales},
     infra::storage::{
+        RepoError,
         entity::price_book,
         repo::{
             book_repo, idempotency_repo as idem, plan_revision_repo, price_book_entry_repo,
@@ -36,11 +37,24 @@ pub async fn find(
         .await?
         .ok_or_else(|| missing().into())
 }
-fn validate(m: &price_book::Model) -> Result<(), CanonicalError> {
+/// A new book's content rules: its currency is one `scales` resolves.
+fn validate_new(m: &price_book::Model, scales: &CurrencyScales) -> Result<(), CanonicalError> {
+    checked(m, |content| book::validate(content, scales))
+}
+/// A patched book's content rules. A patch cannot change the currency, so the stored one is
+/// judged by its shape only, never against today's table.
+fn validate_patch(m: &price_book::Model) -> Result<(), CanonicalError> {
+    checked(m, book::validate_shape)
+}
+/// The code, then the content rules `rules` makes, then the description.
+fn checked(
+    m: &price_book::Model,
+    rules: impl FnOnce(&book::Book) -> Vec<crate::domain::RuleError>,
+) -> Result<(), CanonicalError> {
     if m.code.trim().is_empty() {
         return Err(invalid("code", "BOOK_CODE_REQUIRED"));
     }
-    let errors = book::validate(&book::Book {
+    let errors = rules(&book::Book {
         name: m.name.clone(),
         currency: m.currency.clone(),
         valid_from: m.valid_from,
@@ -51,6 +65,11 @@ fn validate(m: &price_book::Model) -> Result<(), CanonicalError> {
     }
     book::validate_description(m.description.as_deref()).map_err(|e| invalid("description", e.code))
 }
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the replay needs the key and digest beside the request, and the currency table is \
+              the one thing the door takes from the state; a parameter struct would only hide them"
+)]
 pub async fn create(
     tx: &impl DBRunner,
     scope: &AccessScope,
@@ -59,6 +78,7 @@ pub async fn create(
     key: &str,
     digest: &[u8],
     body: PriceBookCreate,
+    scales: &CurrencyScales,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let now = crate::infra::storage::stored_now();
@@ -98,7 +118,7 @@ pub async fn create(
         archived_at: None,
         archived_by: None,
     };
-    validate(&model)?;
+    validate_new(&model, scales)?;
     // D-438: a new book takes a currency the tenant offers (any, while it offers none).
     super::configuration::offer_currency(tx, tenant, &model.currency).await?;
     let model = book_repo::insert(tx, scope, model).await?;
@@ -146,7 +166,7 @@ pub async fn patch(
     if let Some(description) = body.description {
         m.description = description;
     }
-    validate(&m)?;
+    validate_patch(&m)?;
     m.updated_at = crate::infra::storage::stored_now();
     book_repo::update(tx, scope, m.clone()).await?;
     m.version += 1;
@@ -510,16 +530,19 @@ pub async fn export(
                 b.id,
             ))
         });
-        // Every price echoes its entry's model (D-427).
-        let model = p.model.clone();
+        // Every price echoes its entry's model (D-427) and carries its book's currency.
+        let model = price_book_entry_repo::model_of(&p)?;
         let policy = policies.remove(&p.id);
         let entry = super::dto::PricingPriceBookEntryDto::from_stored(p, policy)?;
         result.push(PricingExportEntry {
             entry,
             prices: prices
                 .into_iter()
-                .map(|m| PricingPriceDto::of(m, &model))
-                .collect::<Result<_, _>>()?,
+                .map(|m| {
+                    let price = price_repo::in_book(&m, model, &book.currency)?;
+                    PricingPriceDto::of(m, &price)
+                })
+                .collect::<Result<_, RepoError>>()?,
         });
     }
     Ok(PriceBookExport {

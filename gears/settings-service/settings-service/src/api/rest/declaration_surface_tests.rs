@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The declaration surface driven as a client drives it.
 //!
 //! Authoring a declaration is where the two gates meet: authorization first,
@@ -662,5 +661,445 @@ async fn a_default_that_does_not_survive_a_round_trip_is_refused_as_a_value_writ
         json!(crate::field::VALUE_NOT_CANONICAL),
         "{}",
         answer.body
+    );
+}
+
+#[tokio::test]
+async fn the_declaration_listing_reports_its_total_beside_the_page() {
+    let h = RestHarness::new().await;
+    for name in ["alpha", "beta", "gamma"] {
+        create(&h, name).await;
+    }
+
+    let (status, body) = h
+        .get(&format!("{DECLARATIONS}?limit=2"), h.inner.tree.root)
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(slugs(&body).len(), 2);
+    assert_eq!(body["page_info"]["total_count"], json!(3), "{body}");
+
+    // Under a filter, the total is of the filtered set: one more declaration
+    // in another category leaves the harness category's total at three.
+    let other = h.inner.add_category("other").await;
+    h.inner
+        .declare_in(other, "delta", "cascading", json!(true), BOOL, "public")
+        .await;
+    let (status, body) = h
+        .get(
+            &format!(
+                "{DECLARATIONS}?$filter=category_id%20eq%20{}",
+                h.inner.category_id()
+            ),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(3),
+        "under the filter: {body}"
+    );
+    let (status, body) = h.get(DECLARATIONS, h.inner.tree.root).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(
+        body["page_info"]["total_count"],
+        json!(4),
+        "unfiltered: {body}"
+    );
+}
+
+// ── The display name ─────────────────────────────────────────────────────────
+
+/// Author a declaration with the given extra body fields and answer with the
+/// whole response.
+async fn create_with(h: &RestHarness, name: &str, extra: Value) -> crate::test_support::Answer {
+    let mut body = create_body(h, name);
+    for (field, value) in extra.as_object().expect("an object") {
+        body[field] = value.clone();
+    }
+    h.send("POST", DECLARATIONS, Some(body), None, h.inner.tree.root)
+        .await
+}
+
+/// The field a 400 problem document names, from its first violation.
+fn violated_field(body: &Value) -> &Value {
+    &body["context"]["field_violations"][0]["field"]
+}
+
+#[tokio::test]
+async fn a_create_with_a_display_name_answers_201_with_it_and_every_read_carries_it() {
+    // The label is what a console shows; it has to survive the create and be
+    // served by the single read and the listing alike.
+    let h = RestHarness::new().await;
+    let answer = create_with(
+        &h,
+        "min_tls",
+        json!({ "display_name": "Minimum TLS version" }),
+    )
+    .await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert_eq!(answer.body["display_name"], json!("Minimum TLS version"));
+    let id = answer.body["id"].as_str().expect("an id").to_owned();
+
+    let read = h
+        .send(
+            "GET",
+            &format!("{DECLARATIONS}/{id}"),
+            None,
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(read.body["display_name"], json!("Minimum TLS version"));
+
+    let (_, listing) = h.get(DECLARATIONS, h.inner.tree.root).await;
+    assert_eq!(
+        listing["items"][0]["display_name"],
+        json!("Minimum TLS version"),
+        "{listing}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_without_a_display_name_has_no_such_key_anywhere() {
+    // Omitted, never `null` and never derived from the leaf slug: the client
+    // owns the fallback label.
+    let h = RestHarness::new().await;
+    let answer = create_with(&h, "min_tls", json!({})).await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert!(
+        answer.body.get("display_name").is_none(),
+        "the create body: {}",
+        answer.body
+    );
+    let id = answer.body["id"].as_str().expect("an id").to_owned();
+
+    let read = h
+        .send(
+            "GET",
+            &format!("{DECLARATIONS}/{id}"),
+            None,
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert!(read.body.get("display_name").is_none(), "{}", read.body);
+    let (_, listing) = h.get(DECLARATIONS, h.inner.tree.root).await;
+    assert!(
+        listing["items"][0].get("display_name").is_none(),
+        "{listing}"
+    );
+}
+
+#[tokio::test]
+async fn a_create_with_a_null_display_name_behaves_as_if_it_were_absent() {
+    let h = RestHarness::new().await;
+    let answer = create_with(&h, "min_tls", json!({ "display_name": null })).await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert!(answer.body.get("display_name").is_none(), "{}", answer.body);
+}
+
+#[tokio::test]
+async fn an_empty_blank_or_over_long_display_name_is_refused_400_naming_the_field() {
+    let h = RestHarness::new().await;
+    for (n, bad) in ["", "   ", &"x".repeat(257)].into_iter().enumerate() {
+        let answer = create_with(&h, &format!("refused_{n}"), json!({ "display_name": bad })).await;
+        assert_eq!(answer.status, 400, "{n}: {}", answer.body);
+        assert_eq!(
+            violated_field(&answer.body),
+            &json!("display_name"),
+            "{n}: {}",
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_length_bound_counts_characters_after_trimming_not_bytes() {
+    // 256 `ё` are 512 bytes but 256 characters, which is what `varchar(256)`
+    // counts; surrounding whitespace is not part of the bound and is not kept.
+    let h = RestHarness::new().await;
+    let multi_byte = "\u{451}".repeat(256);
+    let answer = create_with(&h, "multi_byte", json!({ "display_name": multi_byte })).await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert_eq!(answer.body["display_name"], json!("\u{451}".repeat(256)));
+
+    let core = "y".repeat(256);
+    let answer = create_with(
+        &h,
+        "padded",
+        json!({ "display_name": format!("  {core}\t ") }),
+    )
+    .await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert_eq!(
+        answer.body["display_name"],
+        json!(core),
+        "the trimmed value is what is stored and returned"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_sets_clears_and_leaves_the_display_name() {
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "min_tls").await;
+    let uri = format!("{DECLARATIONS}/{id}");
+
+    let set = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": "x" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(set.status, 200, "{}", set.body);
+    assert_eq!(set.body["display_name"], json!("x"));
+    let tag = set.etag.expect("a fresh tag");
+
+    let other = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "description": "unrelated" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(other.status, 200, "{}", other.body);
+    assert_eq!(
+        other.body["display_name"],
+        json!("x"),
+        "a patch without the field leaves it"
+    );
+    let tag = other.etag.expect("a fresh tag");
+
+    let cleared = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": null })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(cleared.status, 200, "{}", cleared.body);
+    assert!(
+        cleared.body.get("display_name").is_none(),
+        "an explicit null clears it and the key goes: {}",
+        cleared.body
+    );
+}
+
+#[tokio::test]
+async fn a_display_name_edit_moves_the_tag_and_not_last_change_at() {
+    // The label is descriptive: `last_change_at` is what value resolution is
+    // stamped with, and it must not move. A `description` edit is the existing
+    // behaviour this one is held to.
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "min_tls").await;
+    let uri = format!("{DECLARATIONS}/{id}");
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    let stamp = read.body["last_change_at"].clone();
+
+    let by_description = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "description": "d" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(by_description.body["last_change_at"], stamp);
+    let tag_after_description = by_description.etag.expect("a tag");
+    assert_ne!(tag_after_description, tag);
+
+    let by_label = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": "Label" })),
+            Some(&tag_after_description),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(by_label.status, 200, "{}", by_label.body);
+    assert_ne!(
+        by_label.etag.as_deref(),
+        Some(tag_after_description.as_str()),
+        "the tag moves with a label edit"
+    );
+    assert_eq!(
+        by_label.body["last_change_at"], stamp,
+        "and the resolution stamp does not"
+    );
+}
+
+#[tokio::test]
+async fn a_patch_with_an_empty_display_name_is_refused_400_naming_the_field() {
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "min_tls").await;
+    let answer = h
+        .send(
+            "PATCH",
+            &format!("{DECLARATIONS}/{id}"),
+            Some(json!({ "display_name": "" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(
+        violated_field(&answer.body),
+        &json!("display_name"),
+        "{}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn a_display_name_patch_on_a_contributed_declaration_is_a_409() {
+    // The owning gear is the only author of a contributed declaration's
+    // metadata; the label arrives with its re-registration.
+    let h = RestHarness::new().await;
+    let id = h
+        .inner
+        .declare_labelled("contributed", "cascading", json!(true), "Module label")
+        .await;
+    let uri = format!("{DECLARATIONS}/{id}");
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    assert_eq!(read.status, 200, "{}", read.body);
+    assert_eq!(read.body["display_name"], json!("Module label"));
+    let tag = read.etag.expect("a tag");
+
+    let answer = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": "mine now" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 409, "{}", answer.body);
+    assert!(
+        answer.body["detail"]
+            .as_str()
+            .is_some_and(|d| d.starts_with("contributed_declaration_immutable")),
+        "the conflict names its reason first: {}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn a_display_name_with_a_control_character_is_refused_400_on_create() {
+    // NUL and a line break are not text a console can show as a label.
+    let h = RestHarness::new().await;
+    for (n, bad) in ["a\u{0}b", "a\nb"].into_iter().enumerate() {
+        let answer = create_with(&h, &format!("control_{n}"), json!({ "display_name": bad })).await;
+        assert_eq!(answer.status, 400, "{n}: {}", answer.body);
+        assert_eq!(
+            violated_field(&answer.body),
+            &json!("display_name"),
+            "{n}: {}",
+            answer.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_patch_with_a_control_character_in_the_display_name_is_refused_400() {
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "min_tls").await;
+    let answer = h
+        .send(
+            "PATCH",
+            &format!("{DECLARATIONS}/{id}"),
+            Some(json!({ "display_name": "a\tb" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(answer.status, 400, "{}", answer.body);
+    assert_eq!(
+        violated_field(&answer.body),
+        &json!("display_name"),
+        "{}",
+        answer.body
+    );
+}
+
+#[tokio::test]
+async fn a_patch_accepts_the_boundary_display_name_and_stores_it_trimmed() {
+    // The create path already proves the bound; the same bound must hold on a
+    // PATCH, where the padding and the tab are trimmed before counting.
+    let h = RestHarness::new().await;
+    let (id, tag) = create(&h, "min_tls").await;
+    let uri = format!("{DECLARATIONS}/{id}");
+    let core = "\u{451}".repeat(256);
+
+    let padded = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": format!("  {core}\t ") })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(padded.status, 200, "{}", padded.body);
+    assert_eq!(
+        padded.body["display_name"],
+        json!(core),
+        "the response carries the trimmed value"
+    );
+    let read = h.send("GET", &uri, None, None, h.inner.tree.root).await;
+    assert_eq!(
+        read.body["display_name"],
+        json!(core),
+        "a following read carries it too"
+    );
+
+    let tag = padded.etag.expect("a fresh tag");
+    let one = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "display_name": "x" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(
+        one.status, 200,
+        "a one-character label is accepted: {}",
+        one.body
+    );
+    assert_eq!(one.body["display_name"], json!("x"));
+}
+
+#[tokio::test]
+async fn surrounding_whitespace_is_trimmed_before_the_control_check_and_a_format_character_stays() {
+    // Trimming runs first, so a trailing newline is dropped rather than
+    // refused; a zero-width space is a format character, not a control one,
+    // and stays: the rule is about what a console cannot render, not about
+    // what looks odd in it.
+    let h = RestHarness::new().await;
+    let answer = create_with(&h, "trailing_newline", json!({ "display_name": "Label\n" })).await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert_eq!(
+        answer.body["display_name"],
+        json!("Label"),
+        "the newline was trimmed, not refused"
+    );
+
+    let answer = create_with(&h, "zero_width", json!({ "display_name": "a\u{200B}b" })).await;
+    assert_eq!(answer.status, 201, "{}", answer.body);
+    assert_eq!(
+        answer.body["display_name"],
+        json!("a\u{200B}b"),
+        "a format character is not a control character"
     );
 }

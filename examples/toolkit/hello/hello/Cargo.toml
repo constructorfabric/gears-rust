@@ -1,11 +1,14 @@
 [package]
 name = "hello"
-version = "0.1.0"
+version = "0.1.1"
 publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 description = "Minimal self-contained REST OoP demo gear (Profile 2/3)"
+
+[lib]
+name = "hello"
 
 [lints]
 workspace = true

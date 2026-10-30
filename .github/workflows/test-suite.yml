@@ -1,0 +1,130 @@
+name: Test Suite
+
+# Runs the Rust unit tests (nextest) on one OS.
+# Called by ci.yml (Ubuntu) and macos-windows-tests.yml (macOS and Windows).
+#
+# Jobs show up as `<caller job> / nextest`. test-report.yml relies on these
+# names.
+on:
+  workflow_call:
+    inputs:
+      os:
+        description: Runner label, e.g. ubuntu-latest.
+        required: true
+        type: string
+    # A called workflow must declare these, even for environment secrets.
+    # Optional: without them the job uses the GitHub cache.
+    secrets:
+      S3_ACCESS_KEY_ID:
+        description: S3 access key id for the selected cache environment.
+        required: false
+      S3_SECRET_ACCESS_KEY:
+        description: S3 secret access key for the selected cache environment.
+        required: false
+
+# A called workflow does not get the caller's env, so set it here.
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: full
+  CARGO_INCREMENTAL: "0"
+  CI_PREINSTALLED_TOOLS: nextest
+
+jobs:
+  nextest:
+    name: nextest
+    runs-on: ${{ inputs.os }}
+    # sccache S3 keys: read-write on main, read-only elsewhere. See .github/actions/sccache.
+    # No environment until the S3_BUCKET variable is set, so the job runs without one.
+    environment:
+      name: ${{ vars.S3_BUCKET != '' && (github.ref == 'refs/heads/main' && 'ci-cache-write' || 'ci-cache-read') || '' }}
+      deployment: false
+    env:
+      # Windows: use lld-link. It comes with LLVM on the runner and links much
+      # faster than link.exe.
+      RUSTFLAGS: ${{ startsWith(inputs.os, 'windows') && '-C debuginfo=0 -C linker=lld-link' || '-C debuginfo=0' }}
+      # nextest writes JUnit under the `ci` profile, and the Makefile copies it
+      # to JUNIT_DIR. Keep it relative: make's sh breaks on Windows backslashes.
+      NEXTEST_PROFILE: ci
+      JUNIT_DIR: test-results
+    steps:
+      - name: Free disk space
+        if: runner.os == 'Linux'
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Force LF in working tree (w/a for Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install protoc
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: protoc@3.34.1
+
+      - name: Install Go (required for aws-lc-fips-sys FIPS build)
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.21.x'  # pinned - see docs/security/fips/TOOLCHAIN.md
+          cache: false
+
+      - name: Install Rust toolchain from rust-toolchain.toml
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup show
+
+      - name: Install nextest
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        with:
+          tool: nextest
+
+      # Caches the Cargo registry and git deps, not target/.
+      - name: Cache Cargo/target
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-bin: false
+          cache-targets: false
+          shared-key: pr-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      # Only main writes to the cache. See .github/actions/sccache.
+      - name: Set up sccache
+        id: sccache
+        uses: ./.github/actions/sccache
+        with:
+          s3-endpoint: ${{ vars.S3_ENDPOINT }}
+          s3-region: ${{ vars.S3_REGION }}
+          s3-bucket: ${{ vars.S3_BUCKET }}
+          s3-access-key-id: ${{ secrets.S3_ACCESS_KEY_ID }}
+          s3-secret-access-key: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+
+      - name: cargo test (no macros)
+        shell: bash
+        run: tools/scripts/with_rust_annotations.sh make test-no-macros
+
+      # test-report.yml turns this into GitHub checks, because this job cannot
+      # write checks on fork PRs. Runs on failure too, so failed tests show up.
+      - name: Upload Rust test results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rust-tests-${{ runner.os }}
+          path: test-results/*.xml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Save compilation metrics
+        if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
+        continue-on-error: true
+        uses: ./.github/actions/sccache-stats

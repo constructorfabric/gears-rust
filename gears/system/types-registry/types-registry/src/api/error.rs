@@ -1,0 +1,1292 @@
+//! Shared domain/service-to-`CanonicalError` ladder; re-exported at `api::rest::error` for
+//! compatibility.
+
+use toolkit_canonical_errors::{CanonicalError, resource_error};
+use types_registry_sdk::{field, precondition, reason};
+
+use crate::domain::admission::acceptance::{AcceptanceError, MAX_IDEMPOTENCY_KEY};
+use crate::domain::admission::worker::WorkerError;
+use crate::domain::error::DomainError;
+use crate::domain::error::LocalClientError;
+use crate::domain::registry_service::{MAX_BATCH_GET_KEYS, MAX_KEY_LEN, ServiceError};
+use crate::domain::selection::{EntityField, SelectionError};
+
+#[resource_error(gts_id!("cf.core.types_registry.entity.v1~"))]
+pub struct TypeRegistryError;
+
+/// Errors naming an admission operation rather than an entity: a missing
+/// operation, and the operation an `Idempotency-Key` is already bound to.
+/// `resource_name` is then an operation UUID, so the type says so.
+#[resource_error(gts_id!("cf.core.types_registry.operation.v1~"))]
+pub struct OperationError;
+
+/// A missing operation, from a read or from the worker: named by its id, under the
+/// operation resource type rather than the entity one.
+#[must_use]
+pub fn operation_not_found(operation_id: uuid::Uuid) -> CanonicalError {
+    OperationError::not_found(format!("No operation with id: {operation_id}"))
+        .with_resource(operation_id.to_string())
+        .create()
+}
+
+/// The local client's own refusals, in the shapes REST gives the same situations.
+impl From<LocalClientError> for CanonicalError {
+    fn from(e: LocalClientError) -> Self {
+        match e {
+            LocalClientError::ReadBackFailed { operation_id, why } => {
+                OperationError::aborted(format!(
+                    "operation {operation_id} was accepted, but {why}; retry with the same \
+                     idempotency key"
+                ))
+                .with_resource(operation_id.to_string())
+                .with_reason(reason::aborted::OPERATION_READ_FAILED)
+                .create()
+            }
+            LocalClientError::WrongKind { operation_id } => OperationError::unknown(format!(
+                "operation {operation_id} was accepted, but read back as an operation of an \
+                 unexpected kind"
+            ))
+            .with_resource(operation_id.to_string())
+            .create(),
+            LocalClientError::Unrepresentable { operation_id } => OperationError::unknown(format!(
+                "operation {operation_id} was accepted, but its record could not be represented"
+            ))
+            .with_resource(operation_id.to_string())
+            .create(),
+            LocalClientError::OperationNotFound { operation_id } => {
+                operation_not_found(operation_id)
+            }
+            LocalClientError::VersionOutOfRange { key, version } => invalid_version(
+                &key,
+                format!("{version} is not a resource version this registry issues"),
+            ),
+        }
+    }
+}
+
+impl From<DomainError> for CanonicalError {
+    fn from(e: DomainError) -> Self {
+        match e {
+            DomainError::InvalidGtsId(msg) => TypeRegistryError::invalid_argument()
+                .with_field_violation(field::GTS_ID_FIELD, msg, field::INVALID_GTS_ID)
+                .create(),
+            DomainError::NotFound { kind, target } => {
+                TypeRegistryError::not_found(format!("No entity with {kind}: {target}"))
+                    .with_resource(target)
+                    .create()
+            }
+            DomainError::AlreadyExists(id) => TypeRegistryError::already_exists(format!(
+                "Entity with GTS ID already exists: {id}"
+            ))
+            .with_resource(id)
+            .create(),
+            // Legacy parent refusal: dependent → resource, parent → violation subject.
+            DomainError::ParentTypeSchemaNotRegistered {
+                parent_type_id,
+                dependent_id,
+            } => {
+                let detail = format!(
+                    "Cannot register {dependent_id}: required type-schema {parent_type_id} is not registered"
+                );
+                TypeRegistryError::failed_precondition()
+                    .with_resource(dependent_id)
+                    .with_precondition_violation(
+                        parent_type_id,
+                        detail,
+                        precondition::PARENT_NOT_REGISTERED,
+                    )
+                    .create()
+            }
+            DomainError::InvalidQuery(msg) => TypeRegistryError::invalid_argument()
+                .with_field_violation(field::QUERY_FIELD, msg, field::INVALID_QUERY)
+                .create(),
+            DomainError::ValidationFailed(msg) => TypeRegistryError::invalid_argument()
+                .with_field_violation(field::ENTITY_FIELD, msg, field::VALIDATION_FAILED)
+                .create(),
+            DomainError::NotInReadyMode => CanonicalError::service_unavailable().create(),
+            DomainError::ReadyCommitFailed(errors) => {
+                // Unreachable from REST handlers — `switch_to_ready` runs in
+                // gear `post_init` only. Kept for `From` exhaustiveness.
+                // If it ever surfaces, we want an opaque internal response;
+                // the validation detail is logged server-side and preserved
+                // on the canonical error's diagnostic field.
+                for ve in &errors {
+                    tracing::error!(
+                        gts_id = %ve.gts_id,
+                        message = %ve.message,
+                        "types_registry ready commit validation failure"
+                    );
+                }
+                let summary = format!("ready commit failed with {} errors", errors.len());
+                CanonicalError::internal(summary).create()
+            }
+            DomainError::Internal(e) => {
+                tracing::error!(error = ?e, "Internal error in types_registry");
+                CanonicalError::internal(e.to_string()).create()
+            }
+        }
+    }
+}
+
+// Construct public error details from variant fields. Error `Display` messages
+// target operator logs and may contain internal configuration or database details.
+// Infrastructure failures are logged and returned with an opaque detail.
+
+/// What the caller is told when the failure is ours.
+const OPAQUE_INTERNAL: &str = "An internal error occurred. Please retry later.";
+
+/// Log the cause with its processing step and return [`OPAQUE_INTERNAL`].
+fn opaque_internal(cause: &dyn std::fmt::Display, at: &'static str) -> CanonicalError {
+    tracing::error!(error = %cause, at, "types_registry could not complete a request");
+    CanonicalError::internal(OPAQUE_INTERNAL).create()
+}
+
+/// A response body `serde_json` refused to encode: a defect of ours, and not a
+/// blocking-task failure, so it is logged under its own step.
+#[must_use]
+pub fn response_not_serialized(cause: &serde_json::Error) -> CanonicalError {
+    opaque_internal(cause, "response serialization")
+}
+
+impl From<ServiceError> for CanonicalError {
+    fn from(e: ServiceError) -> Self {
+        match e {
+            ServiceError::Acceptance(inner) => inner.into(),
+            ServiceError::Worker(inner) => inner.into(),
+            // Storage and database failures are not the caller's fault and carry
+            // nothing the caller can act on, so they stay opaque.
+            ServiceError::Storage(inner) => opaque_internal(&inner, "storage read"),
+            ServiceError::Blocking(inner) => opaque_internal(&inner, "blocking task"),
+            ServiceError::Db(inner) => opaque_internal(&inner, "database read"),
+            // A stored document that will not parse is corruption, not input, so
+            // the offending value goes to the operator log and not to the caller.
+            ServiceError::CorruptDocument(detail) => {
+                opaque_internal(&detail, "stored document parse")
+            }
+            // Report the request field and its bound without exposing configuration keys.
+            ServiceError::BatchReadOutOfRange { count } => invalid_field(
+                field::ITEMS_FIELD,
+                format!(
+                    "a batch read must name between 1 and {MAX_BATCH_GET_KEYS} keys; \
+                     this one named {count}"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            ServiceError::PageSizeOutOfRange { limit, max } => invalid_field(
+                field::LIMIT_FIELD,
+                format!("a page size must be between 1 and {max}; this request asked for {limit}"),
+                field::VALIDATION_FAILED,
+            ),
+            // `gts-rust`'s own message: it names the position and the token it
+            // refused, which is what a caller fixing a wildcard needs, and it
+            // describes the caller's input rather than anything of ours.
+            ServiceError::InvalidPattern { message } => invalid_field(
+                field::PATTERN_FIELD,
+                format!("the pattern is not a GTS identifier pattern: {message}"),
+                field::INVALID_QUERY,
+            ),
+            ServiceError::KeyTooLong { len } => key_too_long(len),
+            // Only a batch item reaches the domain bound; the header is bounded
+            // when it is parsed.
+            ServiceError::ValidatorTooLong { len } => {
+                validator_too_long(field::IF_NONE_MATCH_FIELD, len)
+            }
+            ServiceError::CursorTooLong { len } => cursor_too_long(len),
+            ServiceError::CursorNotUsable { detail } => cursor_not_usable(&detail),
+            // A defect of ours, logged where it happened; the detail names the step.
+            ServiceError::CursorUnencodable => {
+                CanonicalError::internal("the registry could not construct a page cursor").create()
+            }
+        }
+    }
+}
+
+impl From<WorkerError> for CanonicalError {
+    fn from(e: WorkerError) -> Self {
+        match e {
+            // A candidate refused on its merits never arrives here — that is an
+            // `ItemFailure` recorded on the operation item. Everything else in
+            // this type is an infrastructure failure, so all of it is opaque.
+            WorkerError::OperationNotFound { operation_id } => operation_not_found(operation_id),
+            WorkerError::MissingPayload { item_id } => opaque_internal(
+                &format!("operation item {item_id} carries no request payload"),
+                "admission",
+            ),
+            WorkerError::MissingItemWrite { item_id } => opaque_internal(
+                &format!(
+                    "the commit path for operation item {item_id} recorded no terminal item write"
+                ),
+                "admission",
+            ),
+            WorkerError::MissingPrediction { item_id } => opaque_internal(
+                &format!("the dry-run pass left operation item {item_id} without a prediction"),
+                "admission",
+            ),
+            // Corruption, not input: acceptance canonicalized this identifier
+            // before the row was written.
+            WorkerError::StoredIdentifierUnparsable {
+                item_id,
+                gts_id,
+                reason,
+            } => opaque_internal(
+                &format!(
+                    "operation item {item_id} holds an unparsable stored identifier '{gts_id}': {reason}"
+                ),
+                "admission",
+            ),
+            // Kept only for exhaustiveness: `run_operation` catches this one and
+            // reports the outcome the winning pass recorded, so it does not reach a
+            // handler. If it ever does, it is a worker bug and not a client's.
+            WorkerError::ItemAlreadyTerminal { item_id } => opaque_internal(
+                &format!("operation item {item_id} was terminalized by another pass"),
+                "admission",
+            ),
+            // The operation exists — it was just read — so this is a `500`, not the
+            // `404` the `OperationNotFound` arm above produces. That is what this
+            // path used to report, which named a live operation as missing and
+            // dropped the item id that says what actually vanished.
+            WorkerError::ItemOutcomeVanished { item_id } => opaque_internal(
+                &format!("operation item {item_id} lost the outcome a concurrent pass recorded"),
+                "admission",
+            ),
+            WorkerError::StoreBuild(inner) => opaque_internal(&inner, "transient store build"),
+            WorkerError::EvaluationTask(inner) => {
+                opaque_internal(&inner, "blocking evaluation task")
+            }
+            // Corruption, not input: an entity row without the current-state row its
+            // own admission transaction wrote. Nothing the caller can act on.
+            WorkerError::CurrentStateMissing { gts_id, entity_id } => opaque_internal(
+                &format!("entity '{gts_id}' (id {entity_id}) has no current-state row of its kind"),
+                "admission",
+            ),
+            // Its own arm, not folded into the one above: the entity row is gone,
+            // which points at a different table and a different cause.
+            WorkerError::EntityVanished { gts_id, entity_id } => opaque_internal(
+                &format!("entity '{gts_id}' (id {entity_id}) vanished mid-transaction"),
+                "admission",
+            ),
+            // Corruption of an immutable stored revision, so the document itself
+            // stays in the operator log and never reaches the caller.
+            WorkerError::BaselineUnparsable { gts_id, source } => opaque_internal(
+                &format!("the stored baseline document for '{gts_id}' is not valid JSON: {source}"),
+                "admission",
+            ),
+            // A target disappearing after evaluation violates the persisted-identity invariant.
+            WorkerError::DependencyTargetAbsent { gts_id } => opaque_internal(
+                &format!("dependency target '{gts_id}' vanished before its edge was committed"),
+                "admission",
+            ),
+            // Contention, not corruption: the request is correct and can be
+            // repeated after the short hint advertised by the response.
+            WorkerError::ResourceVersionExhausted { gts_id } => opaque_internal(
+                &format!("entity '{gts_id}' cannot advance resource_version after i64::MAX"),
+                "admission",
+            ),
+            WorkerError::RevisionNumberExhausted { gts_id } => opaque_internal(
+                &format!("entity '{gts_id}' cannot allocate a revision after i32::MAX"),
+                "admission",
+            ),
+            // Exhaustive only: `process_item` records this as a failed item.
+            WorkerError::RefusedAfterWrite(failure) => {
+                opaque_internal(&failure.to_string(), "admission")
+            }
+            // Exhaustive only: `process_item` retries or records revalidation exhaustion.
+            WorkerError::RevalidationRequired(drift) => {
+                opaque_internal(&drift.to_string(), "admission")
+            }
+            WorkerError::FailureUnencodable(inner) => {
+                opaque_internal(&inner, "failure payload encoding")
+            }
+            WorkerError::Storage(inner) => opaque_internal(&inner, "storage write"),
+            WorkerError::Db(inner) => opaque_internal(&inner, "database write"),
+        }
+    }
+}
+
+/// One invalid-argument problem keyed by a field, with no resource attached.
+fn invalid_field(field_name: &str, detail: String, code: &str) -> CanonicalError {
+    TypeRegistryError::invalid_argument()
+        .with_field_violation(field_name, detail, code)
+        .create()
+}
+
+/// The `Idempotency-Key` header carries bytes that are not UTF-8.
+///
+/// Its own refusal rather than [`AcceptanceError::MissingIdempotencyKey`], because
+/// the two are different mistakes and only the handler can tell them apart:
+/// `validate` receives a `String`, so by the time it runs an unusable header and an
+/// absent one look identical. Telling a caller that sent a key that a key is
+/// *required* sends them looking for the wrong bug.
+#[must_use]
+pub fn idempotency_key_not_utf8() -> CanonicalError {
+    invalid_field(
+        field::IDEMPOTENCY_KEY_HEADER,
+        "the Idempotency-Key header is not valid UTF-8".to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject `If-Match`: deletion uses `expected_resource_version`, checked
+/// asynchronously at admission, so it cannot provide HTTP `412` semantics (DESIGN §3.3).
+#[must_use]
+pub fn if_match_not_supported() -> CanonicalError {
+    invalid_field(
+        field::IF_MATCH_HEADER,
+        "If-Match is not supported on this route; name the precondition in \
+         expected_resource_version, whose failure is reported on the operation item"
+            .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject the `If-None-Match` **header** on a batch read.
+///
+/// Refused rather than ignored: validators and `unchanged` results are per key,
+/// one header cannot carry a batch of them, and a caller that sent one believes
+/// its request is conditional (DESIGN §3.3). The per-item slot is named in the
+/// message, so the fix is in the refusal.
+#[must_use]
+pub fn if_none_match_not_supported() -> CanonicalError {
+    invalid_field(
+        field::IF_NONE_MATCH_HEADER,
+        "If-None-Match is not supported on a batch read; carry each key's validator \
+         in that item's if_none_match, because one header cannot represent a batch"
+            .to_owned(),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Caller input echoed into a problem document, cut to a bounded length.
+fn shown(raw: &str) -> String {
+    raw.chars().take(64).collect()
+}
+
+/// One refusal for every malformed `depth`, whichever layer spotted it.
+#[must_use]
+pub fn depth_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        field::DEPTH_FIELD,
+        format!("depth must be an integer from 1 to 255, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn kind_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        field::KIND_FIELD,
+        format!("kind must be `type_schema` or `instance`, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn lifecycle_status_not_recognized(raw: &str) -> CanonicalError {
+    let shown = shown(raw);
+    invalid_field(
+        field::LIFECYCLE_STATUS_FIELD,
+        format!("lifecycle_status must be `active`, `deleted` or `all`, not `{shown}`"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// `0` is refused under the spelling the caller used, before `ToolKit` reports
+/// it as `$top`.
+#[must_use]
+pub fn page_size_zero(name: &str) -> CanonicalError {
+    invalid_field(
+        name,
+        format!("{name} must be a positive page size"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn select_refused(error: &SelectionError) -> CanonicalError {
+    let detail = match error {
+        SelectionError::Empty => "$select must name at least one field".to_owned(),
+        SelectionError::EmptySegment => {
+            "$select must not contain an empty field name between commas".to_owned()
+        }
+        SelectionError::Duplicate(name) => format!("duplicate field in $select: {name}"),
+        SelectionError::Unknown(name) => format!(
+            "'{name}' is not a selectable field; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Unavailable(name) => format!(
+            "'{name}' is not available at this version; select from {}",
+            selectable_fields()
+        ),
+        SelectionError::Nested(name) => {
+            format!("'{name}' names a path inside a field; $select takes whole top-level fields")
+        }
+    };
+    invalid_field(field::SELECT_FIELD, detail, field::INVALID_SELECT)
+}
+
+/// One violation per key, with `ToolKit`'s reason code for the `$` namespace.
+#[must_use]
+pub fn unsupported_query_params(keys: &[&str], allowed: &[&str]) -> CanonicalError {
+    let accepted = if allowed.is_empty() {
+        "this route accepts no query parameters".to_owned()
+    } else {
+        format!("this route accepts only {}", allowed.join(", "))
+    };
+    let violation = |key: &str| {
+        let key = shown(key);
+        let detail = format!("unsupported query parameter `{key}`; {accepted}");
+        (key, detail, field::UNSUPPORTED_QUERY_PARAM)
+    };
+    let Some((first, rest)) = keys.split_first() else {
+        return query_params_unreadable("no parameter to refuse");
+    };
+    let (key, detail, reason) = violation(first);
+    let mut error = TypeRegistryError::invalid_argument().with_field_violation(key, detail, reason);
+    for key in rest {
+        let (key, detail, reason) = violation(key);
+        error = error.with_field_violation(key, detail, reason);
+    }
+    error.create()
+}
+
+#[must_use]
+pub fn too_many_query_params(count: usize, max: usize) -> CanonicalError {
+    invalid_field(
+        field::QUERY_FIELD,
+        format!("at most {max} query parameters are accepted; this request has {count}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn duplicate_query_param(key: &str) -> CanonicalError {
+    invalid_field(
+        key,
+        format!("query parameter `{key}` is given more than once"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+#[must_use]
+pub fn query_params_unreadable(detail: &str) -> CanonicalError {
+    invalid_field(
+        field::QUERY_FIELD,
+        format!("the query string could not be read: {detail}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+fn selectable_fields() -> String {
+    EntityField::ALL.map(EntityField::name).join(", ")
+}
+
+/// Reject a read or deletion key over [`MAX_KEY_LEN`] bytes, whichever layer
+/// spotted it.
+#[must_use]
+pub fn key_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        field::ENTITY_KEY_FIELD,
+        format!("a key must be at most {MAX_KEY_LEN} bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject an entity-tag longer than a key may be, under the field that carried
+/// it: the `If-None-Match` header or a batch item's `if_none_match`.
+#[must_use]
+pub fn validator_too_long(field_name: &'static str, len: usize) -> CanonicalError {
+    invalid_field(
+        field_name,
+        format!(
+            "each {field_name} entity-tag must be at most {MAX_KEY_LEN} bytes; this one is {len}"
+        ),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a conditional value that cannot be read, rather than read unconditionally.
+#[must_use]
+pub fn malformed_condition(field_name: &'static str, detail: &str) -> CanonicalError {
+    invalid_field(
+        field_name,
+        format!("{field_name} cannot be read: {detail}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a `pattern` query parameter that exceeds the GTS identifier ceiling
+/// (1 024 bytes).
+#[must_use]
+pub fn pattern_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        field::PATTERN_FIELD,
+        format!("pattern must be at most 1024 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a `cursor` query parameter that exceeds the cursor size ceiling
+/// (4 096 bytes).
+#[must_use]
+pub fn cursor_too_long(len: usize) -> CanonicalError {
+    invalid_field(
+        field::CURSOR_FIELD,
+        format!("cursor must be at most 4096 bytes; this one is {len}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// Reject a cursor this build cannot use: unreadable, of an unknown version, or
+/// issued for a different query.
+///
+/// Splicing two traversals would return a page that is neither complete for the
+/// old query nor for the new one, so a mismatch is refused rather than reinterpreted.
+/// `detail` comes from `toolkit-odata`, which distinguishes the cases.
+#[must_use]
+pub fn cursor_not_usable(detail: &str) -> CanonicalError {
+    invalid_field(
+        field::CURSOR_FIELD,
+        format!("the cursor cannot be used for this request: {detail}"),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// One invalid-argument problem naming the offending candidate as the resource.
+fn invalid_candidate(gts_id: &str, field_name: &str, detail: String, code: &str) -> CanonicalError {
+    TypeRegistryError::invalid_argument()
+        .with_resource(gts_id.to_owned())
+        .with_field_violation(field_name, detail, code)
+        .create()
+}
+
+/// A refused `skip_compatibility_check`, naming the candidate as the resource; `detail`
+/// follows the field name.
+fn invalid_skip(gts_id: &str, detail: &str) -> CanonicalError {
+    invalid_candidate(
+        gts_id,
+        field::SKIP_COMPATIBILITY_CHECK_FIELD,
+        format!("{} {detail}", field::SKIP_COMPATIBILITY_CHECK_FIELD),
+        field::VALIDATION_FAILED,
+    )
+}
+
+/// A refused `expected_resource_version`, naming the candidate as the resource.
+fn invalid_version(gts_id: &str, detail: String) -> CanonicalError {
+    invalid_candidate(
+        gts_id,
+        field::EXPECTED_RESOURCE_VERSION_FIELD,
+        detail,
+        field::VALIDATION_FAILED,
+    )
+}
+
+impl From<AcceptanceError> for CanonicalError {
+    fn from(e: AcceptanceError) -> Self {
+        match &e {
+            // --- the envelope -------------------------------------------------
+            AcceptanceError::MissingIdempotencyKey => invalid_field(
+                field::IDEMPOTENCY_KEY_HEADER,
+                "an Idempotency-Key header is required".to_owned(),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::IdempotencyKeyTooLong { length } => invalid_field(
+                field::IDEMPOTENCY_KEY_HEADER,
+                format!(
+                    "an Idempotency-Key may be at most {MAX_IDEMPOTENCY_KEY} characters; \
+                     this one is {length}"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::EmptyBatch => invalid_field(
+                field::ITEMS_FIELD,
+                "a request must carry at least one entity".to_owned(),
+                field::VALIDATION_FAILED,
+            ),
+            // The limit is a deployment setting, so the number is given rather
+            // than the config key that holds it.
+            AcceptanceError::BatchTooLarge { count, limit } => invalid_field(
+                field::ITEMS_FIELD,
+                format!("{count} entities exceeds the limit of {limit} per request"),
+                field::VALIDATION_FAILED,
+            ),
+
+            // --- the candidate identifier -------------------------------------
+            AcceptanceError::KeyTooLong { length } => key_too_long(*length),
+            // The code a longer identifier got before the bound: it is not one.
+            AcceptanceError::IdentifierTooLong { length } => invalid_field(
+                field::GTS_ID_FIELD,
+                format!(
+                    "a GTS identifier must be at most {MAX_KEY_LEN} bytes; this one is {length}"
+                ),
+                field::INVALID_GTS_ID,
+            ),
+            AcceptanceError::InvalidIdentifier { gts_id, reason } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' is not a canonical GTS identifier: {reason}"),
+                field::INVALID_GTS_ID,
+            ),
+            AcceptanceError::DuplicateCandidate { gts_id } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' appears twice in one request"),
+                field::INVALID_GTS_ID,
+            ),
+            // Positions, not keys: the two may be different kinds of key for one
+            // entity, and neither string need repeat.
+            AcceptanceError::DuplicateTarget {
+                first_index,
+                second_index,
+            } => invalid_field(
+                field::ENTITY_KEY_FIELD,
+                format!("items[{first_index}] and items[{second_index}] name the same entity"),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::ExplicitUuidTail { gts_id } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' carries an explicit UUID tail, which is not registrable"),
+                field::INVALID_GTS_ID,
+            ),
+            AcceptanceError::InstanceVersionProfile { gts_id, reason } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("registered Instance '{gts_id}' must name a stable version: {reason}"),
+                field::INVALID_GTS_ID,
+            ),
+
+            // --- the candidate document ---------------------------------------
+            AcceptanceError::MissingSchemaId { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares no string top-level $id; \
+                     it must be 'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            // The declared value is not echoed: it is unbounded caller input.
+            AcceptanceError::SchemaIdMismatch { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "Type Schema '{gts_id}' declares a top-level $id other than \
+                     'gts://{gts_id}'"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::MissingDialect { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!("'{gts_id}' declares no top-level $schema"),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::UnsupportedDialect { gts_id, found } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!(
+                    "'{gts_id}' declares dialect '{found}', which is not the Draft-07 \
+                     spelling set"
+                ),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::ConflictingDialect { gts_id, path } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!("'{gts_id}' declares a differing $schema at '{path}'"),
+                field::VALIDATION_FAILED,
+            ),
+            AcceptanceError::MissingContent { gts_id } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!("'{gts_id}' carries no document, which a registration requires"),
+                field::VALIDATION_FAILED,
+            ),
+            // Named on the precondition field rather than on the entity: what is
+            // missing is the version, and "delete if present" is not the fallback.
+            AcceptanceError::DeletionRequiresVersion { gts_id } => invalid_version(
+                gts_id,
+                format!(
+                    "deleting '{gts_id}' requires a positive expected_resource_version; \
+                     an absent one is not a request to delete whatever is there"
+                ),
+            ),
+            AcceptanceError::AuthoredDocumentTooLarge {
+                gts_id,
+                size,
+                limit,
+            } => invalid_candidate(
+                gts_id,
+                field::ENTITY_FIELD,
+                format!("'{gts_id}' is {size} bytes, over the limit of {limit}"),
+                field::VALIDATION_FAILED,
+            ),
+
+            // --- the candidate's flags ----------------------------------------
+            // `allow_compatibility_force` is the operator's switch, so the caller
+            // is told the outcome rather than the setting to go and change.
+            AcceptanceError::ForceNotPermitted { gts_id } => invalid_skip(
+                gts_id,
+                &format!("is not permitted on '{gts_id}' in this deployment"),
+            ),
+            AcceptanceError::ForceHasNothingToWaive { gts_id } => invalid_skip(
+                gts_id,
+                &format!("on '{gts_id}' has no cross-minor compatibility check to skip"),
+            ),
+            // The identifier is at fault, not the flag, so the violation points at
+            // the identifier field rather than at `skip_compatibility_check`.
+            AcceptanceError::UnreadableVersion { gts_id } => invalid_candidate(
+                gts_id,
+                field::GTS_ID_FIELD,
+                format!("'{gts_id}' names no readable major in its last segment"),
+                field::INVALID_GTS_ID,
+            ),
+            AcceptanceError::MinorTypeSchemaRevision { gts_id } => invalid_version(
+                gts_id,
+                format!(
+                    "minor-bearing Type Schema '{gts_id}' is immutable; register a new minor instead"
+                ),
+            ),
+            AcceptanceError::ZeroPrecondition { gts_id } => invalid_version(
+                gts_id,
+                format!(
+                    "expected_resource_version 0 on '{gts_id}' is refused: omit the field \
+                     to require absence"
+                ),
+            ),
+            AcceptanceError::DeletionZeroPrecondition { gts_id } => invalid_version(
+                gts_id,
+                format!(
+                    "expected_resource_version 0 on '{gts_id}' is refused: deleting requires \
+                     the positive version being deleted"
+                ),
+            ),
+            AcceptanceError::NegativePrecondition { gts_id, version } => invalid_version(
+                gts_id,
+                format!("expected_resource_version {version} on '{gts_id}' is negative"),
+            ),
+
+            // --- policy -------------------------------------------------------
+            // `failed_precondition`, not `permission_denied`. A closed region is a
+            // statement about *what* may be registered, not about who is asking,
+            // and the deployment's own configuration is the precondition that
+            // failed. It is also the only shape that keeps the detail: the
+            // `permission_denied` constructor locks the wire `detail`, so the
+            // region and the parameter — the two things an operator has to edit —
+            // would not survive the mapping.
+            AcceptanceError::PolicyRefused(refusal) => TypeRegistryError::failed_precondition()
+                .with_resource(refusal.0.gts_id.clone())
+                .with_precondition_violation(
+                    refusal
+                        .0
+                        .region
+                        .clone()
+                        .unwrap_or_else(|| precondition::DEFAULT_REGION.to_owned()),
+                    refusal.to_string(),
+                    format!(
+                        "{}{}",
+                        precondition::REGISTRATION_POLICY_PREFIX,
+                        refusal.0.parameter.to_uppercase()
+                    ),
+                )
+                .create(),
+
+            // --- idempotency --------------------------------------------------
+            // The operation id is given in both the detail and the resource: the
+            // caller needs it to read what its key is already bound to.
+            AcceptanceError::FingerprintConflict { operation_id } => {
+                OperationError::already_exists(format!(
+                    "this Idempotency-Key is already bound to operation {operation_id} \
+                     with a different request"
+                ))
+                .with_resource(operation_id.to_string())
+                .create()
+            }
+
+            // --- infrastructure ------------------------------------------------
+            AcceptanceError::Dispatch(inner) => opaque_internal(inner, "operation dispatch"),
+            AcceptanceError::Storage(inner) => opaque_internal(inner, "acceptance storage"),
+            AcceptanceError::Db(inner) => opaque_internal(inner, "acceptance database"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::admission::AdmissionFailureReason;
+    use crate::domain::admission::acceptance::PolicyRefusalError;
+    use crate::domain::admission::vector::{VectorDrift, VectorRole};
+    use crate::domain::admission::worker::ItemFailure;
+    use crate::domain::gts_store::StoreBuildError;
+    use crate::domain::policy::PolicyRefusal;
+    use toolkit_canonical_errors::Problem;
+    use toolkit_db::DbError;
+    use toolkit_db::secure::ScopeError;
+    use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+
+    fn problem_from(err: DomainError) -> Problem {
+        // Construct the wire `Problem` the same way the canonical error
+        // middleware does — minus the post-response `instance` / `trace_id`
+        // injection, which has no request context at the unit-test level.
+        Problem::from(CanonicalError::from(err))
+    }
+
+    fn acceptance_problem(err: AcceptanceError) -> Problem {
+        Problem::from(CanonicalError::from(err))
+    }
+
+    fn worker_problem(err: WorkerError) -> Problem {
+        Problem::from(CanonicalError::from(err))
+    }
+
+    fn assert_field_violation(problem: &Problem, expected_field: &str, expected_reason: &str) {
+        assert_eq!(problem.status, Some(400));
+        let violation = problem
+            .context
+            .get("field_violations")
+            .and_then(|value| value.get(0))
+            .expect("an invalid argument must carry a field violation");
+        assert_eq!(
+            violation.get("field").and_then(serde_json::Value::as_str),
+            Some(expected_field),
+        );
+        assert_eq!(
+            violation.get("reason").and_then(serde_json::Value::as_str),
+            Some(expected_reason),
+        );
+    }
+
+    #[test]
+    fn every_client_acceptance_refusal_has_the_expected_field_and_reason() {
+        let id = gts_id!("cf.core.events.test.v1~").to_owned();
+        let cases = vec![
+            (
+                AcceptanceError::MissingIdempotencyKey,
+                field::IDEMPOTENCY_KEY_HEADER,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::IdempotencyKeyTooLong { length: 300 },
+                field::IDEMPOTENCY_KEY_HEADER,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::EmptyBatch,
+                field::ITEMS_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::BatchTooLarge { count: 2, limit: 1 },
+                field::ITEMS_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::KeyTooLong { length: 1025 },
+                field::ENTITY_KEY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::IdentifierTooLong { length: 1025 },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::InvalidIdentifier {
+                    gts_id: id.clone(),
+                    reason: "bad id".to_owned(),
+                },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::DuplicateCandidate { gts_id: id.clone() },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::DuplicateTarget {
+                    first_index: 0,
+                    second_index: 1,
+                },
+                field::ENTITY_KEY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::DeletionZeroPrecondition { gts_id: id.clone() },
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::ExplicitUuidTail { gts_id: id.clone() },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::InstanceVersionProfile {
+                    gts_id: id.clone(),
+                    reason: "unstable".to_owned(),
+                },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::MissingSchemaId { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::SchemaIdMismatch { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::MissingDialect { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::UnsupportedDialect {
+                    gts_id: id.clone(),
+                    found: "draft-next".to_owned(),
+                },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::ConflictingDialect {
+                    gts_id: id.clone(),
+                    path: "$.child".to_owned(),
+                },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::MissingContent { gts_id: id.clone() },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::AuthoredDocumentTooLarge {
+                    gts_id: id.clone(),
+                    size: 2,
+                    limit: 1,
+                },
+                field::ENTITY_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::ForceNotPermitted { gts_id: id.clone() },
+                field::SKIP_COMPATIBILITY_CHECK_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::ForceHasNothingToWaive { gts_id: id.clone() },
+                field::SKIP_COMPATIBILITY_CHECK_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::UnreadableVersion { gts_id: id.clone() },
+                field::GTS_ID_FIELD,
+                field::INVALID_GTS_ID,
+            ),
+            (
+                AcceptanceError::MinorTypeSchemaRevision { gts_id: id.clone() },
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::ZeroPrecondition { gts_id: id.clone() },
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+            (
+                AcceptanceError::NegativePrecondition {
+                    gts_id: id,
+                    version: -1,
+                },
+                field::EXPECTED_RESOURCE_VERSION_FIELD,
+                field::VALIDATION_FAILED,
+            ),
+        ];
+
+        for (error, expected_field, expected_reason) in cases {
+            assert_field_violation(&acceptance_problem(error), expected_field, expected_reason);
+        }
+    }
+
+    #[test]
+    fn policy_and_fingerprint_refusals_keep_their_distinct_problem_shapes() {
+        let policy = acceptance_problem(AcceptanceError::PolicyRefused(PolicyRefusalError(
+            PolicyRefusal {
+                gts_id: "acme.crm.customer.type.v1~".to_owned(),
+                parameter: "allowed_vendors",
+                region: Some("acme.crm.*".to_owned()),
+                detail: "vendor is closed".to_owned(),
+            },
+        )));
+        assert_eq!(policy.status, Some(400));
+        let violation = policy
+            .context
+            .get("violations")
+            .and_then(|value| value.get(0))
+            .expect("policy refusal must carry a precondition violation");
+        assert_eq!(
+            violation.get("type").and_then(serde_json::Value::as_str),
+            Some(precondition::REGISTRATION_POLICY_ALLOWED_VENDORS),
+        );
+
+        let operation_id = uuid::Uuid::nil();
+        let conflict = acceptance_problem(AcceptanceError::FingerprintConflict { operation_id });
+        assert_eq!(conflict.status, Some(409));
+        assert!(conflict.detail.contains(&operation_id.to_string()));
+        assert_operation_resource(&conflict, operation_id);
+    }
+
+    /// An operation error names the operation, so its `resource_type` is the
+    /// operation type the SDK publishes, never the entity type.
+    fn assert_operation_resource(problem: &Problem, operation_id: uuid::Uuid) {
+        assert_eq!(
+            problem
+                .context
+                .get("resource_type")
+                .and_then(serde_json::Value::as_str),
+            Some(types_registry_sdk::gts::OPERATION_RESOURCE_TYPE),
+        );
+        assert_eq!(
+            problem
+                .context
+                .get("resource_name")
+                .and_then(serde_json::Value::as_str),
+            Some(operation_id.to_string().as_str()),
+        );
+    }
+
+    #[test]
+    fn acceptance_infrastructure_errors_are_opaque() {
+        let cases = [
+            acceptance_problem(AcceptanceError::Dispatch(anyhow::anyhow!(
+                "dispatch-secret"
+            ))),
+            acceptance_problem(AcceptanceError::Storage(ScopeError::Invalid(
+                "storage-secret",
+            ))),
+            acceptance_problem(AcceptanceError::Db(DbError::InvalidConfig(
+                "database-secret".to_owned(),
+            ))),
+        ];
+        for problem in cases {
+            assert_eq!(problem.status, Some(500));
+            assert_eq!(problem.detail, OPAQUE_INTERNAL);
+            assert!(!problem.detail.contains("secret"));
+        }
+    }
+
+    /// The entity marker's literal is not the SDK constant callers dispatch on, so
+    /// only this pins the two together.
+    #[test]
+    fn entity_problems_carry_the_sdk_entity_resource_type() {
+        let id = gts_id!("cf.core.events.test.v1~");
+        for problem in [
+            problem_from(DomainError::not_found_by_id(id)),
+            problem_from(DomainError::AlreadyExists(id.to_owned())),
+        ] {
+            assert_eq!(
+                problem
+                    .context
+                    .get("resource_type")
+                    .and_then(serde_json::Value::as_str),
+                Some(types_registry_sdk::gts::TYPE_RESOURCE_TYPE),
+                "{problem:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn worker_variants_have_stable_status_and_opaque_internal_details() {
+        let missing = worker_problem(WorkerError::OperationNotFound {
+            operation_id: uuid::Uuid::nil(),
+        });
+        assert_eq!(missing.status, Some(404));
+        assert_operation_resource(&missing, uuid::Uuid::nil());
+
+        let cases = [
+            worker_problem(WorkerError::MissingPayload { item_id: 42 }),
+            worker_problem(WorkerError::ItemAlreadyTerminal { item_id: 42 }),
+            worker_problem(WorkerError::StoreBuild(StoreBuildError::Storage(
+                ScopeError::Invalid("store-secret"),
+            ))),
+            worker_problem(WorkerError::CurrentStateMissing {
+                gts_id: "state-secret".to_owned(),
+                entity_id: 7,
+            }),
+            worker_problem(WorkerError::EntityVanished {
+                gts_id: "entity-secret".to_owned(),
+                entity_id: 7,
+            }),
+            worker_problem(WorkerError::RevisionNumberExhausted {
+                gts_id: "revision-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::DependencyTargetAbsent {
+                gts_id: "dependency-secret".to_owned(),
+            }),
+            worker_problem(WorkerError::ResourceVersionExhausted {
+                gts_id: "version-secret".to_owned(),
+            }),
+            // Cover the variants whose `Display` includes caller-visible content.
+            worker_problem(WorkerError::RefusedAfterWrite(ItemFailure::new(
+                AdmissionFailureReason::Unknown("reason-secret".to_owned()),
+                "message-secret".to_owned(),
+            ))),
+            worker_problem(WorkerError::RevalidationRequired(VectorDrift::Moved {
+                gts_id: "drift-secret".to_owned(),
+                role: VectorRole::Dependent,
+                recorded: 1,
+                found: 2,
+            })),
+            // The `source` is a real serde error, since the variant interpolates both
+            // it and the identifier into its `Display`.
+            worker_problem(WorkerError::BaselineUnparsable {
+                gts_id: "baseline-secret".to_owned(),
+                source: serde_json::from_str::<serde_json::Value>("{not-secret-json")
+                    .expect_err("the fixture must not parse"),
+            }),
+            worker_problem(WorkerError::Storage(ScopeError::Invalid("storage-secret"))),
+            worker_problem(WorkerError::Db(DbError::InvalidConfig(
+                "database-secret".to_owned(),
+            ))),
+        ];
+        for problem in cases {
+            assert_eq!(problem.status, Some(500));
+            assert_eq!(problem.detail, OPAQUE_INTERNAL);
+            assert!(!problem.detail.contains("secret"));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_blocking_task_is_also_opaque() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        task.abort();
+        let join_error = match task.await {
+            Ok(()) => panic!("the task must be cancelled"),
+            Err(error) => error,
+        };
+        let problem = worker_problem(WorkerError::EvaluationTask(join_error));
+        assert_eq!(problem.status, Some(500));
+        assert_eq!(problem.detail, OPAQUE_INTERNAL);
+        assert!(!problem.detail.contains("cancelled"));
+    }
+
+    #[test]
+    fn every_service_error_arm_delegates_or_stays_opaque() {
+        assert_eq!(
+            Problem::from(CanonicalError::from(ServiceError::Acceptance(
+                AcceptanceError::MissingIdempotencyKey,
+            )))
+            .status,
+            Some(400),
+        );
+        assert_eq!(
+            Problem::from(CanonicalError::from(ServiceError::Worker(
+                WorkerError::MissingPayload { item_id: 1 },
+            )))
+            .detail,
+            OPAQUE_INTERNAL,
+        );
+        let opaque = [
+            ServiceError::Storage(ScopeError::Invalid("storage-secret")),
+            ServiceError::Db(DbError::InvalidConfig("database-secret".to_owned())),
+            ServiceError::CorruptDocument("document-secret".to_owned()),
+        ];
+        for error in opaque {
+            let problem = Problem::from(CanonicalError::from(error));
+            assert_eq!(problem.status, Some(500));
+            assert_eq!(problem.detail, OPAQUE_INTERNAL);
+            assert!(!problem.detail.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_not_found_by_id() {
+        let problem = problem_from(DomainError::not_found_by_id(gts_id!(
+            "cf.core.events.test.v1~"
+        )));
+        assert_eq!(problem.status, Some(404));
+        // `instance` is filled by the canonical error middleware on the way
+        // out — at the unit-test level no middleware is in scope.
+        assert!(problem.instance.is_none());
+        assert!(
+            problem
+                .detail
+                .contains(&format!("GTS ID: {}", gts_id!("cf.core.events.test.v1~"))),
+            "expected GTS-id-keyed detail, got {:?}",
+            problem.detail,
+        );
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_not_found_by_uuid() {
+        let problem = problem_from(DomainError::not_found_by_uuid(uuid::Uuid::nil()));
+        assert_eq!(problem.status, Some(404));
+        assert!(
+            problem
+                .detail
+                .contains("UUID: 00000000-0000-0000-0000-000000000000"),
+            "expected UUID-keyed detail, got {:?}",
+            problem.detail,
+        );
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_already_exists() {
+        let problem = problem_from(DomainError::already_exists(gts_id!(
+            "cf.core.events.test.v1~"
+        )));
+        assert_eq!(problem.status, Some(409));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_invalid_gts_id() {
+        let problem = problem_from(DomainError::invalid_gts_id("bad format"));
+        assert_eq!(problem.status, Some(400));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_validation_failed() {
+        let problem = problem_from(DomainError::validation_failed("schema invalid"));
+        assert_eq!(problem.status, Some(400));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_not_in_ready_mode() {
+        let problem = problem_from(DomainError::NotInReadyMode);
+        assert_eq!(problem.status, Some(503));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_ready_commit_failed() {
+        use crate::domain::error::ValidationError;
+        let problem = problem_from(DomainError::ReadyCommitFailed(vec![
+            ValidationError::new(format!("{GTS_ID_PREFIX}test1~"), "error1"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test2~"), "error2"),
+            ValidationError::new(format!("{GTS_ID_PREFIX}test3~"), "error3"),
+        ]));
+        // ReadyCommitFailed is only produced by post_init lifecycle and
+        // never reaches a REST response; map opaquely to internal.
+        assert_eq!(problem.status, Some(500));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_internal() {
+        let problem = problem_from(DomainError::Internal(anyhow::anyhow!("test error")));
+        assert_eq!(problem.status, Some(500));
+    }
+
+    #[test]
+    fn test_domain_error_to_problem_invalid_query() {
+        let problem = problem_from(DomainError::invalid_query("bad pattern"));
+        assert_eq!(problem.status, Some(400));
+    }
+}

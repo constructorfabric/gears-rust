@@ -6,7 +6,7 @@
 mod plan_support;
 use bss_pricing::infra::storage::{
     entity::{plan_revision, price},
-    repo::{plan_revision_repo, price_book_entry_repo, price_repo},
+    repo::{book_repo, plan_revision_repo, price_book_entry_repo, price_repo},
 };
 use bss_products_sdk::models::SkuType;
 use plan_support::{
@@ -41,7 +41,13 @@ async fn price_at(
         .await
         .unwrap()
         .unwrap();
+    let book = book_repo::find(&conn, &scope(f), f.ctx.subject_tenant_id(), e.book_id)
+        .await
+        .unwrap()
+        .unwrap();
     let mut p = entry_support::price(&e);
+    // The price carries its book's currency, as every read checks.
+    p.currency = book.currency;
     p.version_no = version_no;
     p.state = state.into();
     p.dim_value = dim.map(str::to_owned);
@@ -147,7 +153,7 @@ async fn a_skus_entries_are_listed_across_books_with_their_usage_and_the_price_i
         None,
         t - day * 30,
         Some(t - day * 10),
-        "0.10",
+        "0.1",
     )
     .await;
     let current = price_at(
@@ -158,10 +164,10 @@ async fn a_skus_entries_are_listed_across_books_with_their_usage_and_the_price_i
         None,
         t - day * 10,
         Some(t + day * 10),
-        "0.20",
+        "0.2",
     )
     .await;
-    price_at(&f, e_eur, 3, "approved", None, t + day * 10, None, "0.30").await;
+    price_at(&f, e_eur, 3, "approved", None, t + day * 10, None, "0.3").await;
     price_at(
         &f,
         e_eur,
@@ -173,8 +179,8 @@ async fn a_skus_entries_are_listed_across_books_with_their_usage_and_the_price_i
         "0.25",
     )
     .await;
-    price_at(&f, e_eur, 5, "pending", None, t + day * 20, None, "0.40").await;
-    price_at(&f, e_eur, 6, "rejected", None, t + day * 21, None, "0.50").await;
+    price_at(&f, e_eur, 5, "pending", None, t + day * 20, None, "0.4").await;
+    price_at(&f, e_eur, 6, "rejected", None, t + day * 21, None, "0.5").await;
     // e_usd: only a value chain and a draft — nothing of the default chain in force.
     price_at(
         &f,
@@ -217,10 +223,7 @@ async fn a_skus_entries_are_listed_across_books_with_their_usage_and_the_price_i
     assert_eq!(second["currency"], "EUR");
     assert_eq!(second["usage"], usage((1, 2, 1), 1, 0, 1, 0));
     assert_eq!(second["current_price"]["id"], current.id.to_string());
-    assert_eq!(
-        second["current_price"]["price_json"],
-        json!({"rate":"0.20"})
-    );
+    assert_eq!(second["current_price"]["price_json"], json!({"rate":"0.2"}));
     assert_eq!(second["current_price"]["status"], "active");
     assert_eq!(second["current_price"]["model"], "per_unit");
     assert!(second["current_price"]["dim_value"].is_null());
@@ -257,7 +260,7 @@ async fn the_price_in_force_is_shown_only_to_a_holder_of_price_book_read() {
         None,
         today() - time::Duration::days(1),
         None,
-        "0.10",
+        "0.1",
     )
     .await;
     // The user holds every grant: the money is there.
@@ -606,7 +609,7 @@ async fn seeded_sku(f: &Fixture, catalog: &Catalog, tag: &str, n: usize) -> Uuid
             None,
             today() - time::Duration::days(1),
             None,
-            "0.10",
+            "0.1",
         )
         .await;
         let (_, revision) = plan(f, &format!("{tag}-plan-{i:03}"), own).await;
@@ -963,11 +966,11 @@ async fn sku_entries_status_comes_from_todays_counts() {
     let ended = entry(&f, ended_book, sku, "usage", None).await;
     // A value chain in force prices the entry and is not its current_price (D-434).
     price_at(&f, value, 1, "approved", Some("eu"), t - day, None, "0.25").await;
-    price_at(&f, later, 1, "approved", None, t + day, None, "0.30").await;
-    price_at(&f, live, 1, "approved", None, t - day, None, "0.20").await;
-    price_at(&f, live, 2, "draft", None, t + day, None, "0.40").await;
-    price_at(&f, pending, 1, "pending", None, t, None, "0.50").await;
-    price_at(&f, rejected, 1, "rejected", None, t - day, None, "0.60").await;
+    price_at(&f, later, 1, "approved", None, t + day, None, "0.3").await;
+    price_at(&f, live, 1, "approved", None, t - day, None, "0.2").await;
+    price_at(&f, live, 2, "draft", None, t + day, None, "0.4").await;
+    price_at(&f, pending, 1, "pending", None, t, None, "0.5").await;
+    price_at(&f, rejected, 1, "rejected", None, t - day, None, "0.6").await;
     price_at(
         &f,
         ended,
@@ -976,7 +979,7 @@ async fn sku_entries_status_comes_from_todays_counts() {
         None,
         t - day * 30,
         Some(t - day),
-        "0.10",
+        "0.1",
     )
     .await;
 
@@ -1042,7 +1045,7 @@ async fn sku_entries_narrow_by_the_plain_keys() {
         None,
         t - time::Duration::days(1),
         None,
-        "0.20",
+        "0.2",
     )
     .await;
     price_at(
@@ -1053,7 +1056,7 @@ async fn sku_entries_narrow_by_the_plain_keys() {
         None,
         t + time::Duration::days(1),
         None,
-        "0.30",
+        "0.3",
     )
     .await;
     price_at(
@@ -1064,7 +1067,7 @@ async fn sku_entries_narrow_by_the_plain_keys() {
         None,
         t - time::Duration::days(1),
         None,
-        "0.40",
+        "0.4",
     )
     .await;
     price_at(
@@ -1168,7 +1171,7 @@ async fn sku_entries_order_by_book_name_and_status_both_ways() {
         None,
         t - time::Duration::days(1),
         None,
-        "0.20",
+        "0.2",
     )
     .await;
     let by_name = vec![priced.to_string(), other.to_string(), z.to_string()];

@@ -324,9 +324,10 @@ def _patch_file_storage_config(config_text: str, env) -> str:
     sidecar_url = f"http://localhost:{sidecar_port}"
 
     # Replace storage_root (any current value).
+    root = Path(storage_root).as_posix()
     config_text = re.sub(
         r"(storage_root\s*:\s*).*",
-        rf'\1"{storage_root}"',
+        lambda m: f'{m.group(1)}"{root}"',
         config_text,
         count=1,
     )
@@ -377,7 +378,7 @@ def _require_e2e_binary():
     AND the sidecar binary.  We gate on a DEDICATED env var (``FS_E2E_BINARY``)
     rather than the shared ``E2E_BINARY`` so that enabling this suite does not
     accidentally un-skip other gears (e.g. mini-chat) that gate on ``E2E_BINARY``
-    and expect their own scoped invocation (``make e2e-mini-chat``).
+    and expect their own scoped invocation (``make e2e-local SUITE=mini-chat``).
     """
     if not os.environ.get("FS_E2E_BINARY"):
         pytest.skip(

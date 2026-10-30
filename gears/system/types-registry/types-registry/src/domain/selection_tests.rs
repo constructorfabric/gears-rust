@@ -99,11 +99,33 @@ fn unknown_unavailable_and_nested_names_are_told_apart() {
     for name in [
         "content.title",
         "effective/resolved_schema",
-        "provenance.owning_gear",
+        "origin.resource_version",
+        "provenance.compatibility_check_skipped",
+        "provenance/compatibility_check_skipped",
     ] {
         assert_eq!(
             parse(&[name]),
             Err(SelectionError::Nested(name.to_owned())),
+            "{name}",
+        );
+    }
+}
+
+/// An unknown name in any case, a `provenance` member on its own, and the internal
+/// revision audit columns are not read fields.
+#[test]
+fn unsupported_read_fields_are_not_selectable() {
+    for name in [
+        "unknown_field",
+        "UNKNOWN_FIELD",
+        "compatibility_check_skipped",
+        "compat_forced",
+        "gts_spec_version",
+        "gts_impl_version",
+    ] {
+        assert_eq!(
+            parse(&[name]),
+            Err(SelectionError::Unknown(name.to_lowercase())),
             "{name}",
         );
     }

@@ -105,8 +105,8 @@ SKU chain guard uses immutable Products history captured before the transaction.
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-pricing-algo-prices-windows-dimension-model-and-floor`
 
-1. [ ] - `p1` - Derive permitted models from charge kind for the entry's model, chosen at its create (D-427); validate each price's money against its entry's model, nonnegative prices and coherent model parameters. - `inst-prices-windows-dimension-model-and-floor-1`
-2. [ ] - `p1` - Evaluate per_unit, graduated, volume and package with decimal arithmetic and half-open tier bands; recurring/one_time allow flat or per_unit. - `inst-prices-windows-dimension-model-and-floor-2`
+1. [ ] - `p1` - Derive permitted models from charge kind for the entry's model, chosen at its create (D-427); validate each price's money against its entry's model, nonnegative prices, coherent model parameters and the numeric contract: exact decimal text, at most 12 fractional places for a rate and 28 for a quantity or threshold, a minimum fee on the price's currency increment (D-527, D-528). - `inst-prices-windows-dimension-model-and-floor-1`
+2. [ ] - `p1` - Evaluate per_unit, graduated, volume and package with exact decimal arithmetic that never rounds (a package count is a whole number) and half-open tier bands; recurring/one_time allow flat or per_unit. - `inst-prices-windows-dimension-model-and-floor-2`
 3. [ ] - `p1` - Preserve usage package size and SKU (unit, usage_type_ref) read as of each price's start across successors, a start before the SKU's first version reading that first version (D-402); CHAIN_MODEL_CHANGED fails submit and is rechecked at apply. The model cannot change on a chain: it is the entry's (D-427). - `inst-prices-windows-dimension-model-and-floor-3`
 4. [ ] - `p1` - Aggregate rated amounts by price/subscription/period across every bound value and slice (no plan carries an included quantity since D-467); apply the prorated price floor, then promotions; not built in pricing, Rating applies the floor and pricing stores and validates min_fee (D-415). - `inst-prices-windows-dimension-model-and-floor-4`
 
@@ -137,7 +137,7 @@ Every DoD below is required for this feature's delivery phase. Constraints: `cpt
 
 - [x] `p1` - **ID**: `cpt-cf-bss-pricing-dod-price-models`
 
-The entry's model is one of the model families its charge kind allows, and a draft's money must have that model's shape (D-427). Approved money remains immutable while controlled chain metadata can normalize on successors (spec §5).
+The entry's model is one of the model families its charge kind allows, and a draft's money must have that model's shape (D-427). Every decimal is exact text within the numeric contract and is stored as canonical text; each refusal names its code and cause, and writes nothing (D-527, D-528). Each price stores its currency spec, and every read uses it, never today's currency table (D-531). `tests/numeric_boundaries.rs` and its PostgreSQL twin walk every boundary through the production router. Approved money remains immutable while controlled chain metadata can normalize on successors (spec §5).
 
 Requirement: `cpt-cf-bss-pricing-fr-price`; PRD AC #4.
 
@@ -246,8 +246,9 @@ Verification uses domain tests, scoped repository tests on both backends and RES
 apply reject missing/mismatched meter evidence and hourly minimum fees (including zero). New-sale
 support is recurring/one-time Flat or PerUnit and usage PerUnit, Volume or Graduated; Package, allowances,
 FX and promotions remain outside the supported sale profile. BillingCycle floors require subscription-line
-scope; CalendarHour uses UTC, SUM and actual partial quantities with full thresholds. Stable money digest
-projection normalizes equivalent decimal spellings. A successor never replaces a receipt's original
+scope; CalendarHour uses UTC, SUM and actual partial quantities with full thresholds. The money digest
+hashes canonical decimal text and the price's currency scale: equivalent spellings hash alike, and the same
+value at another scale hashes differently (D-532). A successor never replaces a receipt's original
 price/policy; an explicit close raced with acceptance is refused. Current retirement/close checks remain
 necessary for fresh fulfilment. Tests run identical behavior on SQLite and PostgreSQL.
 

@@ -28,7 +28,7 @@ charge_kind         = "usage"
 currency            = "USD"
 meter               = "api.calls"
 billing_granularity = "whole_unit"
-amount_minor        = 40
+rate                = "0.4"
 
 [successor]
 model_kind          = "per_unit"
@@ -36,7 +36,7 @@ charge_kind         = "usage"
 currency            = "USD"
 meter               = "api.calls"
 billing_granularity = "whole_unit"
-amount_minor        = 55
+rate                = "0.55"
 
 [[assert]]
 expect = { publish = "accepted" }

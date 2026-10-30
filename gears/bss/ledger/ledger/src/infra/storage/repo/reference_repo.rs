@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::domain::model::{
     AccountRow, CurrencyScaleRow, FiscalCalendarRow, FiscalPeriodRow, RepoError,
 };
+use crate::domain::money::check_iso_scale;
 use crate::infra::storage::entity::{
     currency_scale_registry, fiscal_calendar, fiscal_period, journal_line, tenant_account,
     tenant_posting_lock,
@@ -50,18 +51,23 @@ impl ReferenceRepo {
 
     /// Insert or update a currency-scale registry row keyed by
     /// `(tenant_id, currency)`. Rejects an unsupported scale at
-    /// registration (`ScaleOutOfRange`) and a changed scale once postings
-    /// exist for the currency (`CurrencyScaleLocked`, architecture I-1);
-    /// the same scale is an idempotent no-op.
+    /// registration (`ScaleOutOfRange`), an ISO 4217 code at another scale
+    /// than its ISO scale (`InvalidRequest`: the registry never overrides an
+    /// ISO scale), and a changed scale once postings exist for the currency
+    /// (`CurrencyScaleLocked`, architecture I-1); the same scale is an
+    /// idempotent no-op.
     ///
     /// # Errors
-    /// [`RepoError::ScaleOutOfRange`] / [`RepoError::CurrencyScaleLocked`]
-    /// per the guards above, or [`RepoError::Db`] on a storage failure.
+    /// [`RepoError::ScaleOutOfRange`] / [`RepoError::InvalidRequest`] /
+    /// [`RepoError::CurrencyScaleLocked`] per the guards above, or
+    /// [`RepoError::Db`] on a storage failure.
     pub async fn upsert_currency_scale(&self, row: CurrencyScaleRow) -> Result<(), RepoError> {
         if row.currency_scale > 28 {
             return Err(RepoError::ScaleOutOfRange(row.currency));
         }
         CurrencySpec::try_new(row.currency.clone(), row.currency_scale)?;
+        check_iso_scale(&row.currency, row.currency_scale)
+            .map_err(|conflict| RepoError::InvalidRequest(conflict.to_string()))?;
         // ONE `SERIALIZABLE` transaction so the scale-immutability check-then-act
         // is atomic: the `posted?` probe and a concurrent first posting for the
         // currency form a read-write conflict under Postgres SSI, so a post that
@@ -520,15 +526,17 @@ impl ReferenceRepo {
     /// posted history fails rather than re-scaling it.
     ///
     /// The check and the insert take no lock. At the default READ COMMITTED
-    /// isolation they guard committed history only: a posting that resolved the
-    /// ISO default scale and has not committed yet is not seen, so both can
-    /// commit. A caller that must also exclude that in-flight posting runs `txn`
-    /// SERIALIZABLE, as [`Self::upsert_currency_scale`], provisioning and the
-    /// posting path do, so the registry-read / journal-write cycle aborts one side.
+    /// isolation they guard committed history only: a posting that has not
+    /// committed yet is not seen, so both can commit. A caller that must also
+    /// exclude that in-flight posting runs `txn` SERIALIZABLE, as
+    /// [`Self::upsert_currency_scale`], provisioning and the posting path do, so
+    /// the registry-read / journal-write cycle aborts one side.
     ///
     /// # Errors
     /// [`RepoError::ScaleOutOfRange`] when the scale exceeds 28;
     /// [`RepoError::Money`] when the currency code is malformed;
+    /// [`RepoError::InvalidRequest`] when the currency is an ISO 4217 code and
+    /// the scale is not its ISO scale (the registry never overrides it);
     /// [`RepoError::CurrencyScaleLocked`] when posted lines carry the currency under
     /// another scale; [`RepoError::Conflict`] on a concurrent first registration or
     /// classified database contention; [`RepoError::Db`] on any other storage failure.
@@ -541,6 +549,8 @@ impl ReferenceRepo {
             return Err(RepoError::ScaleOutOfRange(row.currency));
         }
         CurrencySpec::try_new(row.currency.clone(), row.currency_scale)?;
+        check_iso_scale(&row.currency, row.currency_scale)
+            .map_err(|conflict| RepoError::InvalidRequest(conflict.to_string()))?;
         let scope = AccessScope::for_tenant(row.tenant_id);
         let existing = currency_scale_registry::Entity::find()
             .secure()

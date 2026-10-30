@@ -8,3 +8,7 @@ pub fn date(s: &str) -> Date {
 pub fn dec(s: &str) -> Decimal {
     Decimal::from_str(s).unwrap()
 }
+/// The currency spec of `code` at `scale`.
+pub fn spec(code: &str, scale: u8) -> bss_money::CurrencySpec {
+    bss_money::CurrencySpec::try_new(code.to_owned(), scale).unwrap()
+}

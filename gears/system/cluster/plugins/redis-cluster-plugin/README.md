@@ -8,7 +8,7 @@ lock deployments, paired with a linearizable backend (K8s Lease) for leader elec
 **Status: feature-complete.** Both primitives and both providers are implemented and
 registered, so `provider: redis` under either `cache` or `lock` resolves in any build
 of the cluster gear. Unit, conformance and integration tests all run under
-`make test-cluster-redis`; [`docs/TESTING.md`](./docs/TESTING.md) §7 is the register of
+`make test-integration LANE=cluster-redis`; [`docs/TESTING.md`](./docs/TESTING.md) §7 is the register of
 what that covers. Both the Sentinel and the 3-node Cluster fixture are
 built and run on every PR; there is no fault-injection layer, and
 [`docs/TESTING.md`](./docs/TESTING.md) §8 registers what that leaves unverified.

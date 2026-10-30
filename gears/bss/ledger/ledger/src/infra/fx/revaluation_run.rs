@@ -214,7 +214,7 @@ impl UnrealizedRevaluationRun {
         enabled: bool,
     ) -> Result<ScopeStatus, DomainError> {
         // H4 — Mode gate: a Mode-A (or unset) tenant must not revalue. `enabled` is
-        // the caller's resolved per-tenant Mode-B decision (VHP-1986).
+        // the caller's resolved per-tenant Mode-B decision.
         if !enabled {
             return Ok(ScopeStatus::Disabled);
         }

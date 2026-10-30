@@ -8,6 +8,7 @@
 #![deny(rust_2018_idioms)]
 
 mod backend;
+mod budget;
 mod catalog;
 mod rego;
 
@@ -15,8 +16,10 @@ pub use backend::{
     CompileError, CompiledDocument, ContextError, CostBound, EVALUATED_AT_KEY, EVALUATED_AT_NS_KEY,
     EvaluationBackend, EvaluationContext, EvaluationError,
 };
+pub use budget::{BoolEvaluationError, EvaluationBudget};
 pub use catalog::BackendCatalog;
 pub use rego::{
     MAX_AST_DEPTH, MAX_BRACKET_NESTING, MAX_EVALUATION_DEPTH, MAX_RULE_DEPENDENCY_DEPTH,
-    REGO_BACKEND_ID, REGO_DENYLIST, REGO_RESOURCE_DENYLIST, RegoBackend, screen_denylist,
+    REGO_BACKEND_ID, REGO_DENYLIST, REGO_RESOURCE_DENYLIST, RegoBackend, ScreenedCompileError,
+    compile_screened, screen_denylist,
 };

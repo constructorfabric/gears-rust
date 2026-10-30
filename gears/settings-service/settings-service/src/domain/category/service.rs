@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! Category operations.
 //!
 //! Generic over the repository rather than holding a trait object: the
@@ -11,7 +10,7 @@ use toolkit_db::secure::DBRunner;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
 
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
@@ -92,6 +91,7 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
             key.as_str(),
             None,
             actor.ctx.subject_id().to_string(),
+            ActorTenant::of(actor.ctx.subject_tenant_id()),
             operation,
             actor.request_id,
         );
@@ -170,7 +170,7 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         conn: &C,
         scope: &AccessScope,
         query: &toolkit_odata::ODataQuery,
-    ) -> Result<toolkit_odata::Page<Category>, DomainError> {
+    ) -> Result<crate::domain::odata::Listing<Category>, DomainError> {
         crate::domain::odata::reject_unsupported_options(query, "categories")?;
         crate::domain::odata::reject_unsortable::<crate::domain::odata::CategoryOrderField>(
             query,

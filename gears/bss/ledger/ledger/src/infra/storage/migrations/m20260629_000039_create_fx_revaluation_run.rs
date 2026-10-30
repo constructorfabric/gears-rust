@@ -1,5 +1,5 @@
 //! Create the Mode-B FX-revaluation completion-marker table in schema `bss`:
-//! `ledger_fx_revaluation_run` (VHP-1859 review C3). One COMPLETE marker per
+//! `ledger_fx_revaluation_run`. One COMPLETE marker per
 //! `(tenant_id, period_id)`, upserted by the revaluation job after a period-end
 //! `run_period` finishes ALL scopes without error. The period-close gate, when
 //! Mode-B is enabled (`fx.revaluation_enabled`), REQUIRES this marker for the

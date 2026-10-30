@@ -11,6 +11,7 @@ pub(crate) mod ports;
 pub(crate) mod rate_limit;
 /// Repository traits for upstream and route persistence.
 pub(crate) mod repo;
+pub(crate) mod route_matching;
 /// Control-plane and data-plane service traits and their implementations.
 pub(crate) mod services;
 /// SSRF guard that filters outbound IP addresses.

@@ -1,0 +1,40 @@
+family     = "per-unit"
+id         = "sub-minor-rate"
+kind       = "evaluation"
+provenance = []
+
+# A rate finer than the currency's minor unit: 0.047 is 4.7 cents. Amounts are major-unit
+# decimal text, so the rate is written as it is priced, and the evaluation is exact. Rounding
+# to the posting scale of a currency is a later step with one owner; it never happens here.
+
+[snapshot]
+model_kind      = "per_unit"
+charge_kind     = "recurring"
+currency        = "USD"
+rate            = "0.047"
+quantity_source = "subscription_seat_count"
+
+[[assert]]
+given  = { q = 0 }
+expect = { charge = "0" }
+why    = "no quantity bills nothing"
+
+[[assert]]
+given  = { q = 1 }
+expect = { charge = "0.047" }
+why    = "a rate with places finer than the cent: 0.047 is not a multiple of the minor unit, and the amount keeps all three places"
+
+[[assert]]
+given  = { q = 3 }
+expect = { charge = "0.141" }
+why    = "the product stays exact: 3 x 0.047, not 3 x a rounded rate"
+
+[[assert]]
+given  = { q = 100 }
+expect = { charge = "4.7" }
+why    = "100 x 0.047 is 4.7, which happens to be a whole number of cents"
+
+[[assert]]
+given  = { q = 1000 }
+expect = { charge = "47" }
+why    = "1000 x 0.047 is a whole number of major units"

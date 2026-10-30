@@ -10,7 +10,7 @@ The `cf-gears-license-resolver` gear provides:
 - **Plugin discovery** — Finds license-resolver plugins via GTS types-registry
 - **Vendor-based selection** — Selects a plugin by vendor and priority, memoized after the first resolution
 - **Fail-closed semantics** — A non-conforming request, a missing plugin and an unreachable backend all yield an error; none of them can produce a granted decision
-- **ClientHub integration** — Registers `LicenseResolverClient` for inter-gear use
+- **ClientHub and REST** — Registers `LicenseResolverApi` in ClientHub and hosts it at `POST /license-resolver/v1/is-licensed` (internal, not exposed by the api-gateway)
 
 This is a **main gear** — it holds no grant store and decides no licensing question. It validates *shape and compatibility* and routes; what the contract properties mean, and whether the pair is licensed, belong to the plugin.
 
@@ -20,7 +20,7 @@ This is a **main gear** — it holds no grant store and decides no licensing que
 Consumer Gear
     │  projects its domain objects into registered contract types
     ▼
-LicenseResolverClient  (SDK trait, registered in ClientHub)
+LicenseResolverApi  (SDK contract: ClientHub in process, REST from another process)
     │
     ▼
 license-resolver gateway  (this crate — validates, then routes)
@@ -36,9 +36,10 @@ Plugin implementation  (holds the grant facts)
 ## Usage
 
 ```rust
-use license_resolver_sdk::{LicenseCheckContext, LicenseCheckRequest, LicenseResolverClient};
+use license_resolver_sdk::{LicenseCheckContext, LicenseCheckRequest, LicenseResolverApi};
+use toolkit_security::PlatformSecurityContext;
 
-let resolver = hub.get::<dyn LicenseResolverClient>()?;
+let resolver = hub.get::<dyn LicenseResolverApi>()?;
 
 let request = LicenseCheckRequest::new(
     subject,   // instance of your derived `gts.cf.core.lic.subj.v1~…` contract
@@ -46,16 +47,19 @@ let request = LicenseCheckRequest::new(
     LicenseCheckContext::from_security_context(&ctx),
 );
 
-if resolver.is_licensed(request).await?.granted {
+if resolver
+    .is_licensed(PlatformSecurityContext::outbound_marker(), request)
+    .await?
+    .granted {
     // allow
 }
 ```
 
-A not-granted answer is `LicenseDecision { granted: false }`, not an error. Every error variant is a cannot-determine condition the caller must treat as not-granted — see `LicenseResolverError` in the SDK.
+A not-granted answer is `LicenseDecision { granted: false }`, not an error. Every error is a cannot-determine condition the caller must treat as not-granted — see the `LicenseResolverError` to `CanonicalError` mapping in the SDK.
 
 ## Validation
 
-Each check resolves both contract types and reports **every** violation it finds, as `LicenseResolverError::InvalidRequest { violations }`. The `reason` codes are published in `license_resolver_sdk::field`:
+Each check resolves both contract types and reports **every** violation it finds, as `InvalidArgument` with one field violation each. The `reason` codes are published in `license_resolver_sdk::field`:
 
 | `reason` | Rejected because |
 |---|---|
