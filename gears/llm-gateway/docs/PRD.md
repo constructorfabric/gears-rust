@@ -274,7 +274,7 @@ Gateway acts as a processor — consumers own request/response data; Gateway own
 - Image and file input as base64 data or external URLs
 - Reasoning configuration and reasoning output, including multi-turn reasoning continuity without server-side state
 - Tool/function calling pass-through (consumer executes tools), including tools defined by GTS reference or inline GTS schema
-- Gateway web search tool (`cf:web_search`), forwarded to providers that support it natively
+- Gateway web search tool (`cf_gears:web_search`), forwarded to providers that support it natively
 - Provider-specific tools, namespaced by provider (e.g. `openai:shell`)
 - Structured output with schema validation
 - Generic generation parameters (max tokens, temperature, top_p, seed, …), generic cache-control parameters, and forwarding of provider-specific parameters
@@ -295,7 +295,7 @@ Gateway acts as a processor — consumers own request/response data; Gateway own
 
 - Conversation state storage — consumers provide full context per request
 - Provider-side conversation state: `previous_response_id`, `store=true`
-- Tool execution — Gateway returns tool calls for consumer to execute. This includes web search: Gateway does not run searches itself; `cf:web_search` is executed by providers that support it
+- Tool execution — Gateway returns tool calls for consumer to execute. This includes web search: Gateway does not run searches itself; `cf_gears:web_search` is executed by providers that support it
 - Gateway-side content caching or response deduplication (provider-side prompt caching controls are in scope)
 
 ## 5. Functional Requirements
@@ -369,9 +369,9 @@ The system **MUST** support models with a custom `base_url` (self-hosted or Open
 
 When model info contains a secret reference, the system **MUST** fetch the provider API key from CredStore and pass it to the provider plugin for the provider call. The key is optional: models without a secret reference (auth handled by OAGW, local provider) **MUST** be callable without a key. The system **MUST NOT** persist or log provider API keys.
 
-A provider API key **MUST** only be sent to an approved destination. Before fetching the key, the system **MUST** verify that the model's `base_url` is an OAGW destination approved for the tenant; if it is not, the system **MUST** reject the request with an `unapproved_destination` error, without fetching or sending the key. The check applies equally when a plain HTTP client replaces the OAGW implementation (§ 3.1); approved destinations then come from deployment configuration.
+A provider API key **MUST** only be sent to an approved destination. A model's destination is its OAGW upstream alias from model info, and the provider plugin sends the key only in requests to that alias, through OAGW. If the alias does not resolve to an upstream enabled for the tenant, OAGW forwards nothing and the system **MUST** return an `unapproved_destination` error; the key is never sent. The key may already have been fetched at that point, because the check happens when OAGW resolves the alias; it is then dropped unused. The same applies when a plain HTTP client replaces the OAGW implementation (§ 3.1): it resolves aliases from deployment configuration and forwards nothing for an alias it does not know.
 
-Requests carrying a provider API key **MUST** use HTTPS. If the model has a secret reference and its `base_url` does not use HTTPS, the system **MUST** reject the request with an `unapproved_destination` error before fetching the key. This applies to OAGW and to a plain HTTP client substitute alike. Models without a secret reference are not affected.
+Requests carrying a provider API key **MUST** use HTTPS: the system **MUST NOT** send a key over a connection that is not HTTPS, through OAGW or a plain HTTP client substitute alike. Models without a secret reference are not affected.
 
 **Actors**: `cpt-cf-llm-gateway-actor-credstore`, `cpt-cf-llm-gateway-actor-provider-plugin`, `cpt-cf-llm-gateway-actor-oagw`
 
@@ -418,7 +418,7 @@ A `tool_choice` that names a function not defined in the request **MUST** be rej
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-fr-web-search-v1`
 
-The system **MUST** support a provider-agnostic web search tool (`cf:web_search`). The provider plugin **MUST** map it to the provider's native web search tool when the provider supports one; otherwise the request is rejected by the capability check. The Gateway does not run searches itself. Web search results and citations **MUST** be returned in a normalized format.
+The system **MUST** support a provider-agnostic web search tool (`cf_gears:web_search`). The provider plugin **MUST** map it to the provider's native web search tool when the provider supports one; otherwise the request is rejected by the capability check. The Gateway does not run searches itself. Web search results and citations **MUST** be returned in a normalized format.
 
 **Actors**: `cpt-cf-llm-gateway-actor-consumer`, `cpt-cf-llm-gateway-actor-provider-plugin`
 
@@ -434,7 +434,7 @@ The system **MUST** accept provider-specific tools namespaced with the provider 
 
 - [ ] `p1` - **ID**: `cpt-cf-llm-gateway-fr-structured-output-v1`
 
-The system **MUST** accept a JSON schema with the request and validate the provider response against it, returning either the validated response or a validation error with details.
+The system **MUST** accept a JSON schema with the request and validate the provider response against it, returning either the validated response or an `output_validation_error` with details. This code is distinct from request validation errors (`validation_error`): the request was valid and the provider was called, so retrying the same request may succeed.
 
 Providers accept different subsets of JSON Schema (e.g. Google requires `$ref` to be inlined and does not accept `additionalProperties`). The provider plugin **MUST** adapt the schema to the provider's subset when this can be done without loosening the final result — for example, inlining `$ref` or removing keywords the provider does not accept. Removed constraints remain enforced, because the system validates the response against the original schema, not the adapted one. If the schema cannot be expressed in the provider's subset (e.g. recursive `$ref` for a provider that requires inlining), the system **MUST** reject the request with an `unsupported_schema` error naming the construct, before calling the provider.
 
@@ -446,7 +446,7 @@ Providers accept different subsets of JSON Schema (e.g. Google requires `$ref` t
 
 The system **MUST** accept generic generation parameters (max output tokens, temperature, top_p, seed, penalties, etc.) and generic cache-control parameters, and map them to the provider's equivalents. The system **MUST** support forwarding provider-specific parameters that have no generic equivalent; which parameters may be forwarded is governed by the model configuration in Model Registry.
 
-The provider plugin **MUST** report which generic parameters the resolved model supports (support can differ between models of the same provider, e.g. reasoning models that reject `temperature`). When a request contains a generic generation parameter the model does not support, the system **MUST**, before calling the provider:
+The system **MUST** determine which generic parameters the resolved model supports (support can differ between models of the same provider, e.g. reasoning models that reject `temperature`). This knowledge is kept by the Gateway per provider and model; provider plugins do not report it. When a request contains a generic generation parameter the model does not support, the system **MUST**, before calling the provider:
 
 - by default, reject the request with an `unsupported_parameter` error that names the parameter;
 - if the request sets `drop_unsupported_params`, drop the parameter and proceed.
@@ -748,7 +748,7 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 - **Invalid model**: Gateway returns model-not-found error if model is unavailable for tenant.
 - **No plugin for provider**: Gateway returns provider-not-supported error.
 - **Credentials unavailable**: Gateway returns credentials-unavailable error if the key cannot be fetched from CredStore.
-- **Unapproved destination**: Gateway returns unapproved_destination error if the model has a secret reference and its `base_url` is not an approved destination for the tenant or does not use HTTPS; the key is not fetched (`cpt-cf-llm-gateway-fr-provider-credentials-v1`).
+- **Unapproved destination**: Gateway returns unapproved_destination error if the model's OAGW upstream alias does not resolve to an upstream enabled for the tenant; OAGW forwards nothing and the key is never sent (`cpt-cf-llm-gateway-fr-provider-credentials-v1`).
 - **Quota exhausted**: Gateway returns quota-exceeded error without calling the provider.
 - **Quota check unavailable**: Gateway returns quota-check-unavailable error if Quota Enforcement is unavailable; the quota check is never bypassed.
 - **Model not capable**: Gateway returns capability_not_supported error if model does not support a capability required by the request (e.g., tool calling, image input, web search, reasoning, structured output).
@@ -960,7 +960,7 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 
 **Acceptance criteria**:
 - Tool definitions supported: reference, inline GTS, unified format (OpenAI-like)
-- Gateway web search (`cf:web_search`) and provider-specific tools (`<provider>:<tool>`) can be combined with function tools in one request (see UC-020)
+- Gateway web search (`cf_gears:web_search`) and provider-specific tools (`<provider>:<tool>`) can be combined with function tools in one request (see UC-020)
 - Tool calls returned in unified format
 - `tool_choice` (`none`, `auto`, `required`, specific function) and `parallel_tool_calls` mapped to provider equivalents
 - Response in normalized format
@@ -979,12 +979,12 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 3. Plugin adapts the schema to the JSON Schema subset the provider accepts, maps it to the provider's native structured output, and calls the provider via OAGW
 4. Plugin converts the provider response to the normalized format and computes cost in AI credits
 5. Gateway validates the response against the original schema
-6. Gateway reports usage and returns the validated response with usage (or validation_error if invalid)
+6. Gateway reports usage and returns the validated response with usage (or output_validation_error if invalid)
 
 **Postconditions**: Valid JSON returned, usage reported.
 
 **Alternative Flows**:
-- **Schema validation failure**: Gateway returns validation_error with details if response does not match schema.
+- **Schema validation failure**: Gateway returns output_validation_error with details if response does not match schema; usage is still reported.
 - **Unsupported schema**: Gateway returns unsupported_schema error naming the construct if the schema cannot be expressed in the provider's JSON Schema subset; the provider is not called.
 - **Model not capable**: Gateway returns capability_not_supported error if the model does not support schema-constrained output.
 - **Common failures**: invalid model, no plugin for provider, credentials unavailable, unapproved destination, quota exhausted or unavailable, model not capable, and provider error are handled as in UC-001.
@@ -992,7 +992,7 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 **Acceptance criteria**:
 - Response validated against the original schema, including constraints removed during schema adaptation
 - Schemas adapted to the provider's JSON Schema subset where possible; otherwise rejected with unsupported_schema before calling the provider
-- Returns validation_error with details if schema validation fails
+- Returns output_validation_error with details if schema validation fails, distinct from request validation_error
 - Response in normalized format
 - Usage included: cost in AI credits, generic token usage, provider raw usage
 
@@ -1161,9 +1161,9 @@ LLM Gateway exposes a REST API (documented in DESIGN.md) and the `llm-gateway-sd
 **Preconditions**: Model available for tenant; the provider supports the requested tool.
 
 **Flow**:
-1. Consumer sends create_response with `cf:web_search` and/or a provider-specific tool (e.g. `openai:shell`)
+1. Consumer sends create_response with `cf_gears:web_search` and/or a provider-specific tool (e.g. `openai:shell`)
 2. Gateway resolves model info via Model Registry, validates capabilities, checks the quota, selects the provider plugin, fetches the provider API key, and calls the plugin (as in UC-001, steps 2–7)
-3. Plugin maps `cf:web_search` to the provider's native web search tool, forwards provider-specific tools as-is, and calls the provider via OAGW
+3. Plugin maps `cf_gears:web_search` to the provider's native web search tool, forwards provider-specific tools as-is, and calls the provider via OAGW
 4. Provider executes the tools and returns the answer
 5. Plugin converts the answer, citations, web search results, and provider tool call outputs to the normalized format and computes cost in AI credits
 6. Gateway reports usage and returns the answer with normalized citations, web search results, and provider tool call outputs

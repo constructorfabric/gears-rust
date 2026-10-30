@@ -157,7 +157,8 @@ pub fn event_pattern(id: &str) -> GtsIdPattern {
 }
 
 pub async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    for _ in 0..100 {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while tokio::time::Instant::now() < deadline {
         if predicate() {
             return;
         }

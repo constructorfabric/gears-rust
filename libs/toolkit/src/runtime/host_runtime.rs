@@ -7,7 +7,8 @@
 //! - `pre_init` (system gears only)
 //! - DB migrations (gears with DB capability)
 //! - `init` (all gears)
-//! - proxy-wiring (`#[toolkit::consumes]` clients; feature-gated)
+//! - proxy-wiring (`#[toolkit::consumes]` clients; always runs, after `init`,
+//!   before `post_init`)
 //! - `post_init` (system gears only; runs after *all* `init` complete)
 //! - REST wiring (gears with REST capability; requires a single REST host)
 //! - gRPC registration (gears with gRPC capability; requires a single gRPC hub)
@@ -20,6 +21,27 @@
 //! during its own `start` has to find the client in the `ClientHub` regardless
 //! of profile. The `OoP` path additionally has no REST-wiring, directory-register
 //! or spawn phases (`oop_serve` owns those concerns).
+//!
+//! # `deps` vs `#[toolkit::consumes]` — two different relationships
+//!
+//! These are often confused; they do different jobs (cf. systemd `After=` vs
+//! `Requires=`/`Wants=`):
+//!
+//! - **`deps = [...]`** controls **`init` ordering within one process**, and
+//!   requires the named gears to be *linked into this binary* (an unknown dep is a
+//!   build-time error). It is therefore an **in-process** concern only: in `OoP`
+//!   mode a `dep` can only name a gear in the same process. Use it solely when one
+//!   gear's `init` must run after another's in the same binary.
+//! - **`#[toolkit::consumes(contract, from)]`** declares a **runtime dependency**
+//!   that may be satisfied **locally or remotely**. It adds **no ordering** edge;
+//!   it is wired in the proxy-wiring phase (local impl wins, else a
+//!   directory-resolving proxy) and gates `/readyz` until the provider resolves.
+//!   This is the parity-safe way to depend on another gear — it behaves
+//!   identically in- and out-of-process.
+//!
+//! Rule of thumb: reach for `#[toolkit::consumes]`; use `deps` only for genuine
+//! same-process `init` ordering, never as an inter-gear-call or cross-profile
+//! guarantee.
 
 use axum::Router;
 use std::collections::HashSet;
@@ -469,14 +491,26 @@ impl HostRuntime {
         // Every dep is registered as a readiness gate; local ones are marked
         // resolved immediately, and only remote ones gate readiness + get the
         // background directory-resolve loop (ADR-0007: startup-gating + sticky).
-        // `owner_gear` is derived by `#[toolkit::consumes]` from the struct
-        // ident, while `#[toolkit::gear(name = ...)]` sets the registry name
-        // independently. When they diverge, wiring still works (the loop below
-        // does not filter on owner) but the static-override config key silently
-        // resolves to nothing. Say so rather than leaving the operator to wonder
-        // why `consumer_wiring` is ignored.
+        // `owner_gear` is set by `#[toolkit::consumes]` to the gear's declared
+        // `#[toolkit::gear(name = ...)]`, falling back to the kebab-case of the
+        // struct ident when that attribute is absent. It is used as the config key
+        // `gears.<owner_gear>.config.consumer_wiring.<dep>`. If it does not match
+        // any registered gear name, wiring still works (the loop below does not
+        // filter on owner) but that static-override config key silently resolves to
+        // nothing, so warn.
         let known_gears: std::collections::HashSet<&str> =
             self.registry.gears().iter().map(GearEntry::name).collect();
+        // In-process gears with no REST API to advertise: a `Remote` outcome for
+        // one of these is a self-pointing dead proxy (see the hard error below).
+        // REST providers are excluded (their `Remote` resolves once advertised);
+        // cross-process deps are excluded by `known_gears`.
+        let rest_providers: std::collections::HashSet<&str> =
+            self.rest_provider_gears().into_iter().collect();
+        let unreachable_in_process: std::collections::HashSet<&str> = known_gears
+            .iter()
+            .copied()
+            .filter(|g| !rest_providers.contains(g))
+            .collect();
         for reg in regs {
             if !known_gears.contains(reg.owner_gear) {
                 tracing::warn!(
@@ -484,7 +518,7 @@ impl HostRuntime {
                     dep = reg.dep_gear,
                     "proxy-wiring: consumer's owner gear name does not match any registered gear; \
                      the `gears.{}.config.consumer_wiring.{}` static override will never resolve. \
-                     Rename the gear to the kebab-case of its struct ident.",
+                     Ensure the consumer's `#[toolkit::gear(name = ...)]` matches its registered name.",
                     reg.owner_gear,
                     reg.dep_gear,
                 );
@@ -553,6 +587,27 @@ impl HostRuntime {
                 // Static override → fixed endpoint, always resolvable — no probe.
                 crate::discovery::WireOutcome::Remote if is_static => {
                     self.dep_checker.mark_resolved(reg.dep_gear);
+                }
+                // A registered consumer depends on an in-process dep with no local
+                // impl and no REST API: wiring fell to a self-pointing proxy that
+                // would gate `/readyz` forever. Gated on the owner being registered
+                // too, so a stray/unused consumer (owner not in this process) falls
+                // through to the normal remote path below instead of aborting.
+                crate::discovery::WireOutcome::Remote
+                    if known_gears.contains(reg.owner_gear)
+                        && unreachable_in_process.contains(reg.dep_gear) =>
+                {
+                    return Err(RegistryError::ProxyWiring {
+                        gear: reg.owner_gear,
+                        source: anyhow::anyhow!(
+                            "consumer '{}' depends on in-process gear '{}', which registered no \
+                             local impl and serves no REST API; the provider must register its \
+                             client in init() (#[toolkit::provides] wire_* or ClientHub::register) \
+                             or serve the contract over REST.",
+                            reg.owner_gear,
+                            reg.dep_gear,
+                        ),
+                    });
                 }
                 // Directory-resolved remote → gate readiness + background probe.
                 crate::discovery::WireOutcome::Remote => remote_deps.push(reg.dep_gear.to_owned()),
@@ -2051,6 +2106,48 @@ mod tests {
         // resolved immediately rather than left gating /readyz.
         assert!(runtime.dep_checker.all_resolved());
         assert!(runtime.dep_checker.unresolved_deps().is_empty());
+    }
+
+    /// An in-process provider that forgot to register its local impl must fail
+    /// startup rather than silently wiring a self-pointing proxy: here both the
+    /// consumer `orders` and provider `billing` are registered gears, but the
+    /// consumer's wiring reports `Remote`.
+    #[tokio::test]
+    async fn proxy_wiring_in_process_provider_wired_remote_is_a_hard_error() {
+        // Register the consumer `orders` and the provider `billing`, where billing
+        // never provides its client (no local impl, no REST).
+        let mut b = crate::registry::RegistryBuilder::default();
+        b.register_core_with_meta("orders", &[], Arc::new(DummyCore));
+        b.register_core_with_meta("billing", &[], Arc::new(DummyCore));
+        let registry = b.build_topo_sorted().unwrap();
+
+        let runtime = HostRuntime::new(
+            registry,
+            Arc::new(MapCfg(std::collections::HashMap::new())),
+            DbOptions::None,
+            Arc::new(ClientHub::new()),
+            CancellationToken::new(),
+            Uuid::new_v4(),
+            None,
+        );
+
+        // `test_registration()` is owner=orders, dep=billing, and `record_wire`
+        // reports `Remote` without registering a local impl — the bug scenario.
+        let reg = test_registration();
+        let err = runtime
+            .wire_consumer_registrations(&[&reg])
+            .expect_err("an in-process provider wired Remote must fail startup");
+        let msg = err.to_string();
+        assert!(
+            matches!(err, RegistryError::ProxyWiring { gear, .. } if gear == "orders"),
+            "expected a ProxyWiring error for the consumer gear, got: {msg}"
+        );
+        // Display must surface the source, so both the consumer and provider gear
+        // names appear in the rendered message.
+        assert!(
+            msg.contains("orders") && msg.contains("billing"),
+            "displayed error must name both consumer and provider, got: {msg}"
+        );
     }
 
     /// Tuning-only entry (no `endpoint`, the production shape): keeps the shared

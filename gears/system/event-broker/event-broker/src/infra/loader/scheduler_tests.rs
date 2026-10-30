@@ -270,7 +270,7 @@ async fn the_pool_bounds_how_many_fetches_run_at_once() {
     drop(readers);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn an_event_not_yet_visible_is_found_by_a_later_poll() {
     // The notification outruns the backend: the event is appended but cannot be
     // read for another 30ms.

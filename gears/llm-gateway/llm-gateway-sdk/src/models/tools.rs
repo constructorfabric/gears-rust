@@ -28,12 +28,67 @@ pub enum Tool {
     /// An inline GTS schema definition.
     #[serde(rename = "inline_gts")]
     InlineGts(ToolInlineGts),
+    /// The provider-agnostic Gateway web search tool. The provider plugin maps
+    /// it to the provider's native web search; the Gateway never runs searches
+    /// itself (`cpt-cf-llm-gateway-fr-web-search-v1`). Named under the
+    /// Gateway-owned `cf_gears:` prefix (ADR 0001).
+    #[serde(rename = "cf_gears:web_search")]
+    WebSearch(WebSearchTool),
     /// The built-in image-generation tool (Gears extension).
     #[serde(rename = "cf_gears:image_generation")]
     ImageGeneration(ImageGenerationTool),
-    /// A tool `type` the core does not own, preserved verbatim.
+    /// A tool `type` the core does not own, preserved verbatim. Provider-specific
+    /// tools are namespaced by provider (`<provider>:<tool>`, e.g.
+    /// `openai:shell`) and forwarded to the matching plugin
+    /// (`cpt-cf-llm-gateway-fr-provider-tools-v1`).
     #[serde(untagged)]
     Other(Extension),
+}
+
+/// Gateway web search tool (`cf_gears:web_search`). Results and citations come
+/// back as `cf_gears:web_search_call` output items and `url_citation`
+/// annotations.
+///
+/// The generic option is [`WebSearchTool::allowed_domains`]. Any other fields
+/// (e.g. `search_context_size`) are kept in [`WebSearchTool::options`] and
+/// handed to the plugin, which maps those its provider supports. Accepting them
+/// here keeps the tool a `WebSearch` value: if they made decoding fail, the
+/// tool would fall through to [`Tool::Other`] and skip the web search
+/// capability check.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize, schemars::JsonSchema,
+)]
+#[non_exhaustive]
+pub struct WebSearchTool {
+    /// Domains the search is restricted to (e.g. `example.com`, which also
+    /// covers its subdomains). `None` means no restriction.
+    ///
+    /// This narrows what the model can read, so it is never dropped: when the
+    /// provider cannot restrict search by domain, the request is rejected with
+    /// `unsupported_parameter`, even when `drop_unsupported_params` is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+
+    /// Tool options other than `type` and `allowed_domains`, preserved
+    /// verbatim.
+    #[serde(flatten)]
+    pub options: serde_json::Map<String, serde_json::Value>,
+}
+
+impl WebSearchTool {
+    /// Restrict the search to these domains.
+    #[must_use]
+    pub fn with_allowed_domains(mut self, domains: Vec<String>) -> Self {
+        self.allowed_domains = Some(domains);
+        self
+    }
+
+    /// Add a provider-specific option, forwarded to the plugin verbatim.
+    #[must_use]
+    pub fn with_option(mut self, key: impl Into<String>, value: serde_json::Value) -> Self {
+        self.options.insert(key.into(), value);
+        self
+    }
 }
 
 /// Function tool.
@@ -169,4 +224,66 @@ pub enum ImageOutputFormat {
 pub enum ImageResponseFormat {
     Base64,
     Url,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Extra fields must not push the Gateway tool into `Other`, where it would
+    // bypass the web search capability check.
+    #[test]
+    fn web_search_tool_with_options_stays_web_search() {
+        let wire = serde_json::json!({
+            "type": "cf_gears:web_search",
+            "search_context_size": "high"
+        });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        let Tool::WebSearch(web_search) = &tool else {
+            panic!("expected WebSearch, got {tool:?}");
+        };
+        assert_eq!(
+            web_search.options.get("search_context_size"),
+            Some(&serde_json::json!("high"))
+        );
+        assert_eq!(serde_json::to_value(&tool).unwrap(), wire);
+    }
+
+    #[test]
+    fn web_search_tool_allowed_domains_is_typed() {
+        let wire = serde_json::json!({
+            "type": "cf_gears:web_search",
+            "allowed_domains": ["docs.rs", "serde.rs"],
+            "search_context_size": "low"
+        });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        let Tool::WebSearch(web_search) = &tool else {
+            panic!("expected WebSearch, got {tool:?}");
+        };
+        assert_eq!(
+            web_search.allowed_domains.as_deref(),
+            Some(&["docs.rs".to_owned(), "serde.rs".to_owned()][..])
+        );
+        assert!(!web_search.options.contains_key("allowed_domains"));
+        assert_eq!(
+            web_search.options.get("search_context_size"),
+            Some(&serde_json::json!("low"))
+        );
+        assert_eq!(serde_json::to_value(&tool).unwrap(), wire);
+    }
+
+    #[test]
+    fn provider_tool_is_preserved_verbatim() {
+        let wire = serde_json::json!({ "type": "openai:shell", "env": "default" });
+        let tool: Tool = serde_json::from_value(wire.clone()).unwrap();
+        let Tool::Other(ext) = &tool else {
+            panic!("expected Other");
+        };
+        assert_eq!(ext.kind(), Some("openai:shell"));
+        assert_eq!(serde_json::to_value(&tool).unwrap(), wire);
+    }
 }

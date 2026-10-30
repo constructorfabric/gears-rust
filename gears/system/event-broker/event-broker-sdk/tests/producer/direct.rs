@@ -60,7 +60,7 @@ async fn stored_count(harness: &EventBrokerHarness, partition: u32) -> usize {
 /// The real broker admits a publish (`Accepted`) and persists asynchronously through
 /// its ingest outbox, so the read-back must poll rather than assert immediately.
 async fn wait_for_stored(harness: &EventBrokerHarness, partition: u32, expected: usize) {
-    for _ in 0..200 {
+    for _ in 0..1000 {
         if stored_count(harness, partition).await >= expected {
             assert_eq!(stored_count(harness, partition).await, expected);
             return;

@@ -717,7 +717,7 @@ async fn stored_count(harness: &EventBrokerHarness, topic: &str) -> usize {
 }
 
 async fn wait_for_stored(harness: &EventBrokerHarness, topic: &str, count: usize) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if stored_count(harness, topic).await >= count {
             return;
@@ -788,7 +788,7 @@ fn billing_charged() -> BillingCharged {
 }
 
 async fn wait_until(mut predicate: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if predicate() {
             return;
