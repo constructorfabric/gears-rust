@@ -1,4 +1,4 @@
-//! The authorized read service (early S6-01 draft subset with S6-04 access logging): the one
+//! The authorized draft/submitted read service with S6-04 access logging: the one
 //! common read wrapper REST and the local SDK share (08 §3.6 OL-66/67).
 //!
 //! Every read runs the same sequence: boundary validation (page size, filters, cursor) with no
@@ -26,9 +26,10 @@
 //! [`RESTARTS`]; past it the read is refused `authorization-context-changed`, logged, nothing
 //! disclosed.
 //!
-//! Only the draft subset composes: an order outside `draft` carries committed versions whose
-//! pins, totals and fulfillment projection are later packages (S3/S5/S6-01 completion), so such
-//! a read fails closed as unavailable after authorization and discloses nothing.
+//! Drafts compose from their working set. Submitted orders compose exclusively from their
+//! immutable current version, validated commercial pins and persisted producer totals. Later
+//! lifecycle states remain unavailable until their fulfillment projections are delivered.
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use arc_swap::ArcSwapOption;
@@ -38,6 +39,7 @@ use bss_orders_sdk::authoring::{
     SelectedItem, VersionSummary,
 };
 use bss_orders_sdk::catalog::{OrderState, Reason};
+use bss_orders_sdk::commercial::OrderPin;
 use bss_orders_sdk::models::{DraftRevision, OrderVersion};
 use bss_orders_sdk::reads::{
     Cursor, LineList, LinePage, ListOrders, OrderPage, OrderSummary, PageInfo, PageSize,
@@ -51,6 +53,9 @@ use uuid::Uuid;
 
 use crate::authz::{Action, AuthzFailure, Caller, Pep, Prefetch};
 use crate::domain::audit::{ActorIdentities, AuditActor};
+use crate::domain::gate::answers::EvaluationChargeKind;
+use crate::domain::gate::commercial::digest_hex;
+use crate::domain::gate::totals::TotalScope;
 use crate::domain::read::ProofDenial;
 use crate::domain::read::{
     self, AccessOutcome, Collection, CursorBinding, GET_OPERATION, Position, ReadRuleError,
@@ -58,7 +63,9 @@ use crate::domain::read::{
 };
 use crate::infra::diagnostics::serde_category;
 use crate::infra::engine::errors::not_delivered;
-use crate::infra::storage::entity::{draft_content, order, order_line_identity, read_access_log};
+use crate::infra::storage::entity::{
+    draft_content, order, order_line, order_line_identity, read_access_log, resolved_total,
+};
 use crate::infra::storage::repo::{self, children, private};
 use crate::infra::storage::scoped::{self, AuthorizedRead, PrivateScope};
 use crate::infra::storage::term::{self, StoredShapeError};
@@ -174,6 +181,8 @@ struct Snapshot {
     version: Option<crate::infra::storage::entity::order_version::Model>,
     identities: Vec<order_line_identity::Model>,
     drafts: Vec<draft_content::Model>,
+    committed: Vec<order_line::Model>,
+    totals: Vec<resolved_total::Model>,
 }
 
 /// Outcome of one authorized snapshot attempt.
@@ -198,20 +207,42 @@ fn integration(what: &'static str) -> OrdersError {
     OrdersError::Integration
 }
 
-/// A stored working line that does not compose: the row identity, the column and, for a serde
-/// failure, its category; never the serde message or the stored content (D-44, D-218).
+/// A stored line whose authored columns do not compose: the row identity, the column and, for a
+/// serde failure, its category; never the serde message or the stored content (D-44, D-218).
 fn line_integration(
-    row: &draft_content::Model,
+    order_id: Uuid,
+    line_id: Uuid,
     column: &'static str,
     category: Option<&'static str>,
 ) -> OrdersError {
     tracing::error!(
         target: "orders.read.integration",
-        order_id = %row.order_id,
-        line_id = %row.line_id,
+        order_id = %order_id,
+        line_id = %line_id,
         column,
         category,
         "stored line cannot be composed"
+    );
+    OrdersError::Integration
+}
+
+/// A committed row (line or total) that fails a named integrity check: the row identity, the
+/// first failing check and, where there is one, a static or codec cause; never the stored
+/// content (D-44, D-218). The shape of [`line_integration`] and of the gate's
+/// `submit_integration`.
+fn committed_integration(
+    order_id: Uuid,
+    line_id: Uuid,
+    check: &'static str,
+    cause: Option<&dyn std::fmt::Display>,
+) -> OrdersError {
+    tracing::error!(
+        target: "orders.read.integration",
+        order_id = %order_id,
+        line_id = %line_id,
+        check,
+        cause = cause.map(tracing::field::display),
+        "committed row fails its integrity check"
     );
     OrdersError::Integration
 }
@@ -252,6 +283,33 @@ impl ReadService {
         self.served_point(&parts, caller, GET_OPERATION, &snapshot.row)
             .await?;
         Ok(view)
+    }
+
+    /// The authorized draft read of an existing-order write (submit): [`Self::get`]'s decision,
+    /// snapshot and served log, but `Ok(None)` when the authorized order is no longer a draft, so
+    /// the engine settles the state table's refusal (`not-admissible`) instead of the read
+    /// answering the undelivered committed composition. Nothing is disclosed and no served log is
+    /// written for `None`; a refusal is the read's own answer and logged as [`Self::get`]'s.
+    ///
+    /// # Errors
+    /// As [`Self::get`].
+    pub async fn get_draft(
+        &self,
+        caller: &Caller,
+        order_id: Uuid,
+    ) -> Result<Option<OrderView>, OrdersError> {
+        Self::check_proof(caller)?;
+        let parts = self.parts()?;
+        let snapshot = self
+            .targeted(&parts, caller, GET_OPERATION, order_id, &Load::Detail)
+            .await?;
+        if !is_draft(&snapshot.row) {
+            return Ok(None);
+        }
+        let view = compose_view(&snapshot)?;
+        self.served_point(&parts, caller, GET_OPERATION, &snapshot.row)
+            .await?;
+        Ok(Some(view))
     }
 
     /// *List Orders* (08 §3.6 paginated list): an untargeted `order × read`, the PDP scope,
@@ -336,7 +394,7 @@ impl ReadService {
     }
 
     /// The per-order line page through the current scoped parent: identity order
-    /// `(created_at, line_id)` joined to the draft working membership.
+    /// `(created_at, line_id)` joined to working or committed-version membership.
     ///
     /// # Errors
     /// As [`Self::get`], plus `cursor-invalid` before the access decision.
@@ -356,7 +414,13 @@ impl ReadService {
             subject_tenant_id: caller.ctx().subject_tenant_id(),
             filters_hash: &hash,
         };
-        let after = decode(request.cursor.as_ref(), binding)?;
+        let decoded = request
+            .cursor
+            .as_ref()
+            .map(|token| read::decode_cursor_bound(token, binding))
+            .transpose()
+            .map_err(|_| OrdersError::Refused(Reason::CursorInvalid))?;
+        let after = decoded.map(|d| d.position);
         let parts = self.parts()?;
         let operation = Collection::Lines.operation();
         let load = Load::Lines {
@@ -366,16 +430,38 @@ impl ReadService {
         let snapshot = self
             .targeted(&parts, caller, operation, order_id, &load)
             .await?;
-        if !is_draft(&snapshot.row) {
-            return Err(not_delivered("committed-version line composition").into());
+        ensure_readable(&snapshot.row)?;
+        // A line continuation is bound to the version it was issued at; one at another version
+        // is refused (D-64: `current_version` is set from creation). A token `main` issued
+        // carries no binding and was issued at the creation version (D-246).
+        if let Some(decoded) = decoded
+            && decoded.line_version() != snapshot.row.current_version
+        {
+            return Err(OrdersError::Refused(Reason::CursorInvalid));
         }
         let (identities, more) = read::split_page(snapshot.identities, page_size);
-        let next_cursor = next_cursor(
-            more,
-            identities.last().map(|row| (row.created_at, row.line_id)),
-            binding,
-        )?;
-        let lines = compose_lines(&identities, &snapshot.drafts)?;
+        let next_cursor = if more {
+            identities
+                .last()
+                .map(|row| {
+                    let position = Position::of(row.created_at, row.line_id)
+                        .map_err(|_| integration("line cursor position"))?;
+                    read::encode_cursor_version(
+                        binding,
+                        position,
+                        Some(snapshot.row.current_version),
+                    )
+                    .map_err(|_| integration("line cursor encoding"))
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        let lines = if is_draft(&snapshot.row) {
+            compose_lines(&identities, &snapshot.drafts)?
+        } else {
+            compose_committed_lines(&snapshot.row, &identities, &snapshot.committed)?
+        };
         let page = LinePage {
             items: lines,
             page_info: PageInfo::forward(next_cursor, page_size),
@@ -473,22 +559,49 @@ impl ReadService {
                     } else {
                         None
                     };
-                    let identities =
-                        repo::read::draft_line_page(tx, scope, row.order_id, after, limit).await?;
-                    // A line page loads the content of its own lines only; the detail view
-                    // composes every line, so it loads the order's whole draft content.
-                    let drafts = if load.is_some() {
-                        let line_ids = identities.iter().map(|i| i.line_id).collect::<Vec<_>>();
-                        children::draft_content_for_lines(tx, scope, row.order_id, &line_ids)
-                            .await?
+                    let (identities, drafts, committed, totals) = if is_draft(&row) {
+                        let identities =
+                            repo::read::draft_line_page(tx, scope, row.order_id, after, limit)
+                                .await?;
+                        let ids = identities.iter().map(|i| i.line_id).collect::<Vec<_>>();
+                        let drafts =
+                            children::draft_content_for_lines(tx, scope, row.order_id, &ids)
+                                .await?;
+                        (identities, drafts, Vec::new(), Vec::new())
                     } else {
-                        children::draft_content_for_order(tx, scope, row.order_id).await?
+                        let identities = repo::read::committed_line_page(
+                            tx,
+                            scope,
+                            row.order_id,
+                            row.current_version,
+                            after,
+                            limit,
+                        )
+                        .await?;
+                        let ids = identities.iter().map(|i| i.line_id).collect::<Vec<_>>();
+                        let committed = children::committed_content_for_lines(
+                            tx,
+                            scope,
+                            row.order_id,
+                            row.current_version,
+                            &ids,
+                        )
+                        .await?;
+                        let totals = if load.is_none() {
+                            children::committed_totals(tx, scope, row.order_id, row.current_version)
+                                .await?
+                        } else {
+                            Vec::new()
+                        };
+                        (identities, Vec::new(), committed, totals)
                     };
                     Ok(Attempt::Loaded(Box::new(Snapshot {
                         row,
                         version,
                         identities,
                         drafts,
+                        committed,
+                        totals,
                     })))
                 })
             })
@@ -729,26 +842,41 @@ fn summary(row: &order::Model) -> Result<OrderSummary, OrdersError> {
     })
 }
 
-/// The composed draft view. Committed-version content (pins, totals, fulfillment projection,
-/// acceptance, administrative values) belongs to later packages: an order outside `draft` is
-/// refused unavailable after authorization and discloses nothing.
+/// Compose the authorized current draft or submitted commercial snapshot.
 fn compose_view(snapshot: &Snapshot) -> Result<OrderView, OrdersError> {
     let row = &snapshot.row;
-    if !is_draft(row) {
-        return Err(not_delivered("committed-version composition").into());
-    }
+    ensure_readable(row)?;
     let version = snapshot
         .version
         .as_ref()
         .ok_or_else(|| integration("current version row"))?;
+    let lines = if is_draft(row) {
+        compose_lines(&snapshot.identities, &snapshot.drafts)?
+    } else {
+        compose_committed_lines(row, &snapshot.identities, &snapshot.committed)?
+    };
+    if !is_draft(row) {
+        validate_totals(&lines, &snapshot.totals)?;
+    }
     Ok(OrderView {
+        resolved_totals: if is_draft(row) {
+            None
+        } else {
+            Some(
+                snapshot
+                    .totals
+                    .iter()
+                    .map(committed_total)
+                    .collect::<Result<_, _>>()?,
+            )
+        },
         order: header(row)?,
         version: VersionSummary {
             version: version_of(version.version)?,
             supersedes_version: version.supersedes_version.map(version_of).transpose()?,
             created_at: version.created_at,
         },
-        lines: compose_lines(&snapshot.identities, &snapshot.drafts)?,
+        lines,
         draft_revision: draft_revision(row)?,
     })
 }
@@ -766,41 +894,93 @@ fn compose_lines(
                 .iter()
                 .find(|row| row.line_id == identity.line_id)
                 .ok_or_else(|| integration("draft membership"))
-                .and_then(draft_line)
+                .and_then(|row| draft_line(row.into()))
         })
         .collect()
 }
 
-fn draft_line(row: &draft_content::Model) -> Result<DraftLine, OrdersError> {
-    let selected_items = Vec::<SelectedItem>::deserialize(&row.selected_items)
-        .map_err(|error| line_integration(row, "selected_items", Some(serde_category(&error))))?;
+/// The authored columns a working row and an immutable committed row share, borrowed from
+/// either table so one decoder composes both and neither path builds the other's entity.
+#[derive(Clone, Copy)]
+struct AuthoredColumns<'a> {
+    order_id: Uuid,
+    line_id: Uuid,
+    plan_id: Uuid,
+    plan_revision_id: Uuid,
+    selected_items: &'a serde_json::Value,
+    currency: &'a str,
+    contract_effective_date: Option<time::Date>,
+    service_activation_date: Option<time::Date>,
+    acceptance_due_date: Option<time::Date>,
+    term_kind: &'a str,
+    authored_term: &'a serde_json::Value,
+    billing_cycle: Option<&'a str>,
+}
+
+impl<'a> From<&'a draft_content::Model> for AuthoredColumns<'a> {
+    fn from(row: &'a draft_content::Model) -> Self {
+        Self {
+            order_id: row.order_id,
+            line_id: row.line_id,
+            plan_id: row.plan_id,
+            plan_revision_id: row.plan_revision_id,
+            selected_items: &row.selected_items,
+            currency: &row.currency,
+            contract_effective_date: row.contract_effective_date,
+            service_activation_date: row.service_activation_date,
+            acceptance_due_date: row.acceptance_due_date,
+            term_kind: &row.term_kind,
+            authored_term: &row.authored_term,
+            billing_cycle: row.billing_cycle.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a order_line::Model> for AuthoredColumns<'a> {
+    fn from(row: &'a order_line::Model) -> Self {
+        Self {
+            order_id: row.order_id,
+            line_id: row.line_id,
+            plan_id: row.plan_id,
+            plan_revision_id: row.plan_revision_id,
+            selected_items: &row.selected_items,
+            currency: &row.currency,
+            contract_effective_date: Some(row.contract_effective_date),
+            service_activation_date: row.service_activation_date,
+            acceptance_due_date: row.acceptance_due_date,
+            term_kind: &row.term_kind,
+            authored_term: &row.authored_term,
+            billing_cycle: Some(&row.billing_cycle),
+        }
+    }
+}
+
+fn draft_line(cols: AuthoredColumns<'_>) -> Result<DraftLine, OrdersError> {
+    let fail = |column, category| line_integration(cols.order_id, cols.line_id, column, category);
+    let selected_items = Vec::<SelectedItem>::deserialize(cols.selected_items)
+        .map_err(|error| fail("selected_items", Some(serde_category(&error))))?;
     let term_duration =
-        term::stored_term(&row.term_kind, &row.authored_term).map_err(|error| match error {
-            StoredShapeError::Undecodable { category, .. } => {
-                line_integration(row, "authored_term", Some(category))
-            }
+        term::stored_term(cols.term_kind, cols.authored_term).map_err(|error| match error {
+            StoredShapeError::Undecodable { category, .. } => fail("authored_term", Some(category)),
             StoredShapeError::UnknownKind | StoredShapeError::Unrepresentable => {
-                line_integration(row, "term_kind", None)
+                fail("term_kind", None)
             }
         })?;
-    let billing_cycle = row
+    let billing_cycle = cols
         .billing_cycle
-        .as_deref()
-        .map(|token| {
-            BillingCycle::from_token(token)
-                .ok_or_else(|| line_integration(row, "billing_cycle", None))
-        })
+        .map(|token| BillingCycle::from_token(token).ok_or_else(|| fail("billing_cycle", None)))
         .transpose()?;
     Ok(DraftLine {
-        line_id: row.line_id,
-        plan_id: row.plan_id,
-        plan_revision_id: row.plan_revision_id,
+        committed: None,
+        line_id: cols.line_id,
+        plan_id: cols.plan_id,
+        plan_revision_id: cols.plan_revision_id,
         selected_items,
-        currency: Currency::try_from(row.currency.clone())
-            .map_err(|_| line_integration(row, "currency", None))?,
-        contract_effective_date: row.contract_effective_date.map(CalendarDate),
-        service_activation_date: row.service_activation_date.map(CalendarDate),
-        acceptance_due_date: row.acceptance_due_date.map(CalendarDate),
+        currency: Currency::try_from(cols.currency.to_owned())
+            .map_err(|_| fail("currency", None))?,
+        contract_effective_date: cols.contract_effective_date.map(CalendarDate),
+        service_activation_date: cols.service_activation_date.map(CalendarDate),
+        acceptance_due_date: cols.acceptance_due_date.map(CalendarDate),
         term_duration,
         billing_cycle,
     })
@@ -816,3 +996,218 @@ pub fn page_size(value: Option<u64>) -> Result<Option<PageSize>, OrdersError> {
         .transpose()
         .map_err(|_| OrdersError::Refused(Reason::PageSizeExceeded))
 }
+
+/// Only the delivered submitted representation is served outside draft.
+fn ensure_readable(row: &order::Model) -> Result<(), OrdersError> {
+    if is_draft(row) || row.state == OrderState::Submitted.token() {
+        Ok(())
+    } else {
+        Err(not_delivered("committed state composition").into())
+    }
+}
+
+fn compose_committed_lines(
+    parent: &order::Model,
+    identities: &[order_line_identity::Model],
+    rows: &[order_line::Model],
+) -> Result<Vec<DraftLine>, OrdersError> {
+    identities
+        .iter()
+        .map(|identity| {
+            let row = rows
+                .iter()
+                .find(|row| row.line_id == identity.line_id)
+                .ok_or_else(|| integration("committed membership"))?;
+            committed_line(parent, row)
+        })
+        .collect()
+}
+
+fn committed_line(
+    parent: &order::Model,
+    row: &order_line::Model,
+) -> Result<DraftLine, OrdersError> {
+    let fail = |check, cause: Option<&dyn std::fmt::Display>| {
+        committed_integration(row.order_id, row.line_id, check, cause)
+    };
+    let value = row.order_pin.as_ref().ok_or_else(|| fail("pin", None))?;
+    let bytes = serde_json::to_vec(value).map_err(|_| fail("pin", Some(&"re-encoding")))?;
+    let pin = OrderPin::decode(&bytes).map_err(|error| fail("pin", Some(&error)))?;
+    let receipt = pin.receipt();
+    let query = &receipt.query;
+    let axes = &query.tenant_axes;
+    let request_digest = digest_hex(&receipt.request_digest);
+    let terms_digest = digest_hex(&receipt.terms_digest);
+    // Validate the independent row selection, not merely a self-consistent receipt; the first
+    // failing check is the one logged.
+    let checks = [
+        (axes.seller_tenant_id == parent.seller_tenant_id, "seller"),
+        (axes.payer_tenant_id == parent.payer_tenant_id, "payer"),
+        (
+            axes.resource_tenant_id == parent.resource_tenant_id,
+            "resource",
+        ),
+        (query.order_id == row.order_id, "order"),
+        (query.line_id == row.line_id, "line"),
+        (
+            i64::try_from(query.order_version).ok() == Some(i64::from(row.version)),
+            "version",
+        ),
+        (query.plan_id == row.plan_id, "plan"),
+        (query.plan_revision_id == row.plan_revision_id, "revision"),
+        (
+            row.pricing_acceptance_id == Some(receipt.acceptance_id),
+            "acceptance",
+        ),
+        (
+            row.pricing_request_digest.as_deref() == Some(request_digest.as_str()),
+            "request_digest",
+        ),
+        (
+            row.pricing_terms_digest.as_deref() == Some(terms_digest.as_str()),
+            "terms_digest",
+        ),
+    ];
+    if let Some(&(_, check)) = checks.iter().find(|(holds, _)| !holds) {
+        return Err(fail(check, None));
+    }
+    let mut line = draft_line(row.into())?;
+    let selected = crate::infra::gate::preview::gate_line(
+        row.line_id,
+        row.plan_id,
+        row.plan_revision_id,
+        &line.selected_items,
+        &row.currency,
+    );
+    let version = u64::try_from(row.version).map_err(|_| fail("version", None))?;
+    if !crate::domain::gate::commercial::verify_commit_line(query, row.order_id, version, &selected)
+    {
+        return Err(fail("authored selection", None));
+    }
+    line.committed = Some(bss_orders_sdk::reads::CommittedLine {
+        commercial_attempt_id: row
+            .commercial_attempt_id
+            .ok_or_else(|| fail("attempt", None))?,
+        order_pin: pin,
+    });
+    Ok(line)
+}
+
+fn committed_total(
+    row: &resolved_total::Model,
+) -> Result<bss_orders_sdk::reads::CommittedTotal, OrdersError> {
+    // The entity keeps the Postgres `integer`; the DB CHECK (0..28) means this never fires.
+    let currency_scale = u8::try_from(row.currency_scale).map_err(|e| {
+        committed_integration(row.order_id, row.line_id, "currency_scale", Some(&e))
+    })?;
+    Ok(bss_orders_sdk::reads::CommittedTotal {
+        scope: row.scope.clone(),
+        line_id: row.line_id,
+        currency: row.currency.clone(),
+        assessment_id: row.assessment_id,
+        currency_scale,
+        exclusions: row.exclusions.clone(),
+        item_breakdown: row.item_breakdown.clone(),
+        recurring_by_cycle: row.recurring_by_cycle.clone(),
+        amount_status: row.amount_status.clone(),
+        amount_basis: row.amount_basis.clone(),
+        period_evidence: row.period_evidence.clone(),
+        gross_exact: row.gross_exact.clone(),
+        gross_display: row.gross_display.clone(),
+        net_exact: row.net_exact.clone(),
+        net_display: row.net_display.clone(),
+        discount_status: row.discount_status.clone(),
+        discount_exact: row.discount_exact.clone(),
+        discount_display: row.discount_display.clone(),
+        promotion_ref: row.promotion_ref.clone(),
+        charge_kind: row.charge_kind.clone(),
+        tcv_exact: row.tcv_exact.clone(),
+        tcv_display: row.tcv_display.clone(),
+        tcv_basis: row.tcv_basis.clone(),
+        tcv_evidence: row.tcv_evidence.clone(),
+    })
+}
+
+/// A stored total's scope and charge kind as the domain enums, or the named check it fails.
+fn total_tokens(
+    total: &resolved_total::Model,
+) -> Result<(TotalScope, EvaluationChargeKind), OrdersError> {
+    let fail = |check| committed_integration(total.order_id, total.line_id, check, None);
+    let scope = TotalScope::from_token(&total.scope).ok_or_else(|| fail("total scope"))?;
+    let kind =
+        EvaluationChargeKind::from_token(&total.charge_kind).ok_or_else(|| fail("charge kind"))?;
+    if scope == TotalScope::Order && !total.line_id.is_nil() {
+        return Err(fail("total scope"));
+    }
+    Ok((scope, kind))
+}
+
+/// Check membership and assessment provenance without recomputing producer amounts.
+fn validate_totals(
+    lines: &[DraftLine],
+    totals: &[resolved_total::Model],
+) -> Result<(), OrdersError> {
+    let first = lines
+        .first()
+        .and_then(|line| line.committed.as_ref())
+        .ok_or_else(|| integration("missing committed lines"))?;
+    let assessment = first.order_pin.assessment_id();
+    let totals = totals
+        .iter()
+        .map(|total| total_tokens(total).map(|(scope, kind)| (scope, kind, total)))
+        .collect::<Result<Vec<_>, _>>()?;
+    for line in lines {
+        let evidence = line
+            .committed
+            .as_ref()
+            .ok_or_else(|| integration("missing committed pin"))?;
+        if evidence.order_pin.assessment_id() != assessment {
+            return Err(integration("inconsistent committed assessments"));
+        }
+        if !totals
+            .iter()
+            .any(|(scope, _, total)| *scope == TotalScope::Line && total.line_id == line.line_id)
+        {
+            return Err(integration("missing committed line totals"));
+        }
+    }
+    let mut line_kinds = BTreeSet::new();
+    let mut order_kinds = BTreeSet::new();
+    for &(scope, kind, _) in &totals {
+        match scope {
+            TotalScope::Line => line_kinds.insert(kind),
+            TotalScope::Order => order_kinds.insert(kind),
+        };
+    }
+    // Rating components are producer declarations, not inferred from Pricing binding kinds.
+    // Every committed order also has the recurring TCV carrier, including usage-only orders.
+    line_kinds.insert(EvaluationChargeKind::Recurring);
+    if line_kinds != order_kinds {
+        return Err(integration("incomplete committed totals"));
+    }
+    for (scope, _, total) in totals {
+        let currency = match scope {
+            TotalScope::Order => &first.order_pin.receipt().query.market.currency,
+            TotalScope::Line => {
+                &lines
+                    .iter()
+                    .find(|line| line.line_id == total.line_id)
+                    .and_then(|line| line.committed.as_ref())
+                    .ok_or_else(|| integration("total membership"))?
+                    .order_pin
+                    .receipt()
+                    .query
+                    .market
+                    .currency
+            }
+        };
+        if total.assessment_id != assessment || &total.currency != currency {
+            return Err(integration("committed total provenance"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "read_tests.rs"]
+mod tests;

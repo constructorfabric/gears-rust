@@ -24,7 +24,7 @@ use bss_orders_sdk::catalog::{OrderState, Trigger};
 use event_broker::test_support::{
     DeliveredOutcome, DeliveredPublish, EventBrokerHarness, FaultInjectingBroker, TransientFault,
 };
-use event_broker_sdk::backend::{Backend, Partition, TopicPartition, Wait};
+use event_broker_sdk::backend::{Partition, TopicPartition, Wait};
 use event_broker_sdk::{EventBrokerApi, GtsInstanceId, Sequence};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};

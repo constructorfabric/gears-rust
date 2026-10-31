@@ -13,7 +13,7 @@
     reason = "a broken corpus must fail loudly; `allow`, not `expect`, because not every \
               test in the file unwraps or expects"
 )]
-use bss_orders::api::rest::capture;
+use bss_orders::api::rest::{capture, gate};
 use bss_orders_sdk::OrdersError;
 use bss_orders_sdk::authoring::{AddLine, Category, CreateOrder, HeaderPatch, LinePatch};
 use bss_orders_sdk::catalog::Reason;
@@ -543,4 +543,35 @@ fn patch_presence_rules_hold_on_the_new_path() {
     assert_eq!(revision, None);
     assert_eq!(cleared.contract_id, Some(None));
     assert_eq!(cleared.named_fields(), ["contract_id"]);
+}
+
+/// The development-delivery submit body (M3b, D-238): exactly the independent draft revision.
+/// A missing revision and any extra member are `request-invalid`, as on every Orders write.
+#[test]
+fn submit_body_requires_the_draft_revision_and_refuses_unknown_members() {
+    for body in [
+        json!({}),
+        json!({"expected_draft_revision": 0, "x": 1}),
+        json!({"expected_draft_revision": -1}),
+        json!({"expected_draft_revision": "3"}),
+    ] {
+        assert!(
+            matches!(
+                gate::submit_body(&serde_json::to_vec(&body).unwrap()),
+                Err(OrdersError::Refused(Reason::RequestInvalid))
+            ),
+            "{body}"
+        );
+    }
+    for raw in [&b""[..], b"[]", b"{"] {
+        assert!(matches!(
+            gate::submit_body(raw),
+            Err(OrdersError::Refused(Reason::RequestInvalid))
+        ));
+    }
+    let body = gate::submit_body(br#"{"expected_draft_revision": 3}"#).unwrap();
+    assert_eq!(
+        body.expected_draft_revision,
+        DraftRevision::try_from(3).unwrap()
+    );
 }

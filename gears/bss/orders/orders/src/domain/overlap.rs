@@ -25,9 +25,6 @@ pub enum ClaimRuleError {
     /// The overlap key is empty or contains NUL.
     #[error("overlap scope key must be non-empty owner text without NUL")]
     InvalidKey,
-    /// An acquiring transition offered no resolved overlap key.
-    #[error("an acquiring transition must offer at least one resolved overlap key")]
-    EmptyProposal,
     /// A transition into a terminal state carried resolved overlap keys.
     #[error("a terminal transition carries no resolved overlap keys")]
     TerminalWithKeys,
@@ -106,12 +103,10 @@ pub struct ProposedClaims {
     tuples: BTreeSet<ClaimTuple>,
 }
 impl ProposedClaims {
-    /// # Errors
-    /// [`ClaimRuleError::EmptyProposal`] when no key was offered.
-    pub fn new(
-        parties: ClaimParties,
-        keys: impl IntoIterator<Item = OverlapScopeKey>,
-    ) -> Result<Self, ClaimRuleError> {
+    /// An empty proposal is valid for a basket without paid recurring SKUs. On amendment
+    /// it replaces (and releases) any formerly held claims, rather than retaining them.
+    #[must_use]
+    pub fn new(parties: ClaimParties, keys: impl IntoIterator<Item = OverlapScopeKey>) -> Self {
         let ClaimParties {
             payer_tenant_id,
             resource_tenant_id,
@@ -124,14 +119,11 @@ impl ProposedClaims {
                 overlap_scope_key,
             })
             .collect();
-        if tuples.is_empty() {
-            return Err(ClaimRuleError::EmptyProposal);
-        }
-        Ok(Self {
+        Self {
             payer_tenant_id,
             resource_tenant_id,
             tuples,
-        })
+        }
     }
     /// Returns the proposed version's payer tenant.
     #[must_use]

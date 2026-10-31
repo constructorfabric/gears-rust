@@ -27,7 +27,7 @@ pub struct Model {
     pub prepared_draft_revision: Option<i64>,
     /// Complete proposed tenant arrangement captured at reservation.
     pub proposed_arrangement: Json,
-    /// Fingerprint of the authorization facts the request was decided on.
+    /// Fingerprint of the authorization facts the request was decided on; recorded evidence, never compared (the request fingerprint covers the axes).
     pub authorization_fact_fingerprint: String,
     /// Original business principal that requested the operation.
     pub original_principal: Json,

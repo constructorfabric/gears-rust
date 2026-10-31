@@ -42,6 +42,7 @@
 //! `impl From<OrdersError> for OwnError`. A consumer that holds a [`CanonicalError`] from
 //! another Orders-adjacent call projects it with `OrdersError::from(canonical)`.
 use crate::catalog::{OrderState, Reason, Trigger};
+use crate::gate_report::GateReport;
 use crate::models::{DraftRevision, OrderVersion};
 use serde::{Deserialize, Serialize};
 use toolkit_canonical_errors::CanonicalError;
@@ -142,9 +143,18 @@ pub struct RefusalDiagnostics {
     /// to approve (D-182).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_audit_id: Option<Uuid>,
-    /// `overlap-collision`: the blocked overlap tuples (D-179).
+    /// `order-in-flight-for-key` (the engine's step-17.5 claim refusal, the only reason that
+    /// populates it today) and `overlap-collision`: the blocked overlap tuples (D-179).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked: Option<Vec<BlockedOverlap>>,
+    /// Every composite-gate refusal of a submit or amendment (the gate's catalog, axis, contract,
+    /// overlap, date and pin reasons) and the step-17.5 `order-in-flight-for-key` claim refusal:
+    /// the complete authorized gate report, whose primary blocking result is this refusal itself
+    /// (DESIGN L5093, D-233 as amended by D-240 item 4). Absent from an Orders that predates
+    /// D-233 (or, for `order-in-flight-for-key`, D-240 item 4) and from every non-gate refusal.
+    /// Boxed so the report does not grow every [`OrdersError`] (clippy `result_large_err`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment: Option<Box<GateReport>>,
 }
 
 /// One blocked overlap tuple of an `overlap-collision` refusal.

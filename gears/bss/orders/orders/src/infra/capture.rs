@@ -62,7 +62,8 @@ pub enum SettledOutcome {
     Refused(Option<Reason>),
 }
 impl Settled {
-    fn from_outcome(outcome: EngineOutcome) -> Self {
+    /// The caller's view of an engine outcome: committed, refused, or a replay of either.
+    pub(crate) fn from_outcome(outcome: EngineOutcome) -> Self {
         let (settled, order_id, replayed) = match outcome.kind {
             OutcomeKind::Committed { order_id, .. } => {
                 (SettledOutcome::Committed, Some(order_id), false)
@@ -409,7 +410,12 @@ fn document_of<const N: usize>(members: [(&str, Value); N]) -> Value {
     )
 }
 
-fn fingerprint_document(value: &impl serde::Serialize) -> Result<Value, OrdersError> {
+/// The fingerprint contribution of an authored value: its wire encoding with every JSON number
+/// as its exact decimal string (the S1-06 request profile); shared with submit (S3-12).
+///
+/// # Errors
+/// `request-invalid` for a value without a wire encoding.
+pub fn fingerprint_document(value: &impl serde::Serialize) -> Result<Value, OrdersError> {
     fn exact(value: Value) -> Value {
         match value {
             Value::Number(n) => Value::String(n.to_string()),

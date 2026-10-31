@@ -49,6 +49,304 @@ pub struct OrdersConfig {
     /// `rl_orders_caller_write` / `rl_orders_workflow_write` zones), not an Orders setting.
     #[serde(default)]
     pub throttling: ThrottlingConfig,
+    /// Gate port budgets and the per-seller commercial identities (S3-09). Absent means the
+    /// F03 §3.3 baselines and no configured identity.
+    #[serde(default)]
+    #[expand_vars]
+    pub gate: GateConfig,
+}
+
+/// The accepted gate deadline, in milliseconds; the bound of `dependency_timeout_ms` (D-244,
+/// unratified like D-231 item 5).
+const GATE_DEADLINE_MS_RANGE: std::ops::RangeInclusive<u32> = 1..=60_000;
+
+/// Gate port budgets (F03 §3.3 baselines, D-231 item 5; unratified). Missing = baseline.
+#[derive(Debug, Clone, Deserialize, ExpandVars)]
+#[serde(deny_unknown_fields)]
+pub struct GateConfig {
+    /// Per-port deadline overrides in milliseconds, keyed by `GatePort` token
+    /// (`current-revision`, `resolve`, `sku-read`, …).
+    #[serde(default)]
+    pub deadline_ms: std::collections::BTreeMap<crate::domain::gate::ports::GatePort, u32>,
+    /// The deadline of the one `AuthN` client-credentials exchange per catalog read, in
+    /// milliseconds (D-194). Absent = 250, the gate port baseline (F03 §3.3; unratified, D-231
+    /// item 5).
+    #[serde(default)]
+    pub authority_exchange_deadline_ms: Option<u32>,
+    /// The deadline of one Pricing acceptance command (`SellabilityV1` `check`, submit phase B,
+    /// M2-6), in milliseconds: one per line command, not a gate port (`GatePort::ALL` is
+    /// unchanged). Absent = 500.
+    #[serde(default)]
+    pub acceptance_deadline_ms: Option<u32>,
+    /// Per-seller commercial identities for the D-194 service principal (Task 8; Q13).
+    #[serde(default)]
+    #[expand_vars]
+    pub commercial_identities: Vec<CommercialIdentityConfig>,
+    /// Bind development stubs of the undelivered gate providers (Task 8b). Requires the
+    /// `gate-dev-stubs` cargo feature and `dev_stub_fixture`; never set in production.
+    #[serde(default)]
+    pub dev_stubs: bool,
+    /// The JSON fixture the development stubs answer from; read at init when `dev_stubs` is set.
+    #[serde(default)]
+    pub dev_stub_fixture: Option<std::path::PathBuf>,
+    /// Preview requests per minute per authenticated subject (F03 §4.6 "a rate limit", D-52):
+    /// the gear-local [`PerCallerLimiter`](crate::infra::throttle::PerCallerLimiter) in the
+    /// Preview service. `1..=600`; absent = 60.
+    #[serde(default = "gate_baseline::preview_per_caller_per_minute")]
+    pub preview_per_caller_per_minute: u32,
+    /// Submit requests per minute per authenticated subject (M2-5). `1..=600`; absent = 10.
+    #[serde(default = "gate_baseline::submit_per_caller_per_minute")]
+    pub submit_per_caller_per_minute: u32,
+    /// The per-port circuit breaker (F03 §3.3, D-237): one per port, shared by every run in
+    /// the gear. Absent = enabled at the baselines below.
+    #[serde(default)]
+    pub breaker: BreakerConfig,
+}
+
+/// The gear-local per-port circuit breaker (F03 §3.3 "0.5 failures over 30 s, open 10 s";
+/// D-237, unratified). A deadline or a transient failure counts as a failure, a success or a
+/// permanent answer as a success; an open port answers `Unavailable::Outage` without a call.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BreakerConfig {
+    /// Whether the breaker judges the ports. Absent = true; false admits every call.
+    #[serde(default = "gate_baseline::breaker_enabled")]
+    pub enabled: bool,
+    /// Failures / outcomes in the window at or above which a closed breaker opens; `(0, 1]`, and at least one basis point (0.0001) once rounded.
+    /// Absent = 0.5.
+    #[serde(default = "gate_baseline::breaker_failure_rate")]
+    pub failure_rate: f32,
+    /// The sliding window, in seconds; at least 1. Absent = 30.
+    #[serde(default = "gate_baseline::breaker_window_seconds")]
+    pub window_seconds: u32,
+    /// How long an open breaker rejects before one probe call, in seconds; at least 1.
+    /// Absent = 10.
+    #[serde(default = "gate_baseline::breaker_open_seconds")]
+    pub open_seconds: u32,
+    /// Outcomes the window must hold before the rate is judged; at least 1. Absent = 10
+    /// (unratified, D-237).
+    #[serde(default = "gate_baseline::breaker_min_calls")]
+    pub min_calls: u32,
+}
+
+impl Default for BreakerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: gate_baseline::breaker_enabled(),
+            failure_rate: gate_baseline::breaker_failure_rate(),
+            window_seconds: gate_baseline::breaker_window_seconds(),
+            open_seconds: gate_baseline::breaker_open_seconds(),
+            min_calls: gate_baseline::breaker_min_calls(),
+        }
+    }
+}
+
+impl BreakerConfig {
+    /// The breaker policy these settings describe; [`GateConfig::validate`] checks it.
+    #[must_use]
+    pub fn policy(&self) -> crate::domain::gate::breaker::BreakerPolicy {
+        crate::domain::gate::breaker::BreakerPolicy {
+            failure_rate: self.failure_rate,
+            window: std::time::Duration::from_secs(u64::from(self.window_seconds)),
+            open_for: std::time::Duration::from_secs(u64::from(self.open_seconds)),
+            min_calls: self.min_calls,
+        }
+    }
+}
+
+mod gate_baseline {
+    use crate::domain::gate::breaker::BreakerPolicy;
+
+    pub const fn preview_per_caller_per_minute() -> u32 {
+        60
+    }
+    pub const fn submit_per_caller_per_minute() -> u32 {
+        10
+    }
+    pub const fn breaker_enabled() -> bool {
+        true
+    }
+    pub const fn breaker_failure_rate() -> f32 {
+        BreakerPolicy::BASELINE.failure_rate
+    }
+    pub fn breaker_window_seconds() -> u32 {
+        u32::try_from(BreakerPolicy::BASELINE.window.as_secs()).unwrap_or(u32::MAX)
+    }
+    pub fn breaker_open_seconds() -> u32 {
+        u32::try_from(BreakerPolicy::BASELINE.open_for.as_secs()).unwrap_or(u32::MAX)
+    }
+    pub const fn breaker_min_calls() -> u32 {
+        BreakerPolicy::BASELINE.min_calls
+    }
+}
+
+/// The accepted range of a gate per-caller limit.
+const PER_CALLER_PER_MINUTE_RANGE: std::ops::RangeInclusive<u32> = 1..=600;
+
+impl Default for GateConfig {
+    fn default() -> Self {
+        Self {
+            deadline_ms: std::collections::BTreeMap::new(),
+            authority_exchange_deadline_ms: None,
+            acceptance_deadline_ms: None,
+            commercial_identities: Vec::new(),
+            dev_stubs: false,
+            dev_stub_fixture: None,
+            preview_per_caller_per_minute: gate_baseline::preview_per_caller_per_minute(),
+            submit_per_caller_per_minute: gate_baseline::submit_per_caller_per_minute(),
+            breaker: BreakerConfig::default(),
+        }
+    }
+}
+
+/// One seller's commercial identity: client credentials the gate presents as the D-194 service
+/// principal. `client_secret` is a secret reference (`"${VAR}"`) resolved at load time; `Debug`
+/// redacts it.
+#[derive(Debug, Clone, Deserialize, ExpandVars)]
+#[serde(deny_unknown_fields)]
+pub struct CommercialIdentityConfig {
+    /// The seller tenant this identity acts for; unique across the list.
+    pub seller_tenant_id: uuid::Uuid,
+    /// The client identifier.
+    pub client_id: String,
+    /// The client secret reference.
+    #[expand_vars]
+    pub client_secret: SecretString,
+    /// Requested scopes.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+impl GateConfig {
+    /// Reject a deadline (port, authority exchange or acceptance) outside `1..=60000` ms, a
+    /// duplicated seller identity, an empty or unresolved (`${`) `client_secret`, a blank
+    /// `client_id` or scope, a per-caller limit outside `1..=600`, an out-of-range `gate.breaker`
+    /// value, and
+    /// `dev_stubs` without the `gate-dev-stubs` feature or without a fixture path.
+    ///
+    /// # Errors
+    /// A sanitized operator error naming the offending key or tenant (never a secret).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (port, ms) in &self.deadline_ms {
+            anyhow::ensure!(
+                GATE_DEADLINE_MS_RANGE.contains(ms),
+                "bss-orders: gate.deadline_ms.{} must be 1..=60000",
+                port.token()
+            );
+        }
+        for (key, value) in [
+            (
+                "authority_exchange_deadline_ms",
+                self.authority_exchange_deadline_ms,
+            ),
+            ("acceptance_deadline_ms", self.acceptance_deadline_ms),
+        ] {
+            anyhow::ensure!(
+                value.is_none_or(|ms| GATE_DEADLINE_MS_RANGE.contains(&ms)),
+                "bss-orders: gate.{key} must be 1..=60000"
+            );
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for identity in &self.commercial_identities {
+            anyhow::ensure!(
+                seen.insert(identity.seller_tenant_id),
+                "bss-orders: gate.commercial_identities: duplicate seller_tenant_id {}",
+                identity.seller_tenant_id
+            );
+            let secret = identity.client_secret.expose_secret();
+            anyhow::ensure!(
+                !secret.is_empty() && !secret.contains("${"),
+                "bss-orders: gate.commercial_identities[{}]: client_secret is empty or an unresolved secret reference",
+                identity.seller_tenant_id
+            );
+            anyhow::ensure!(
+                !identity.client_id.trim().is_empty(),
+                "bss-orders: gate.commercial_identities[{}]: client_id must not be blank",
+                identity.seller_tenant_id
+            );
+            anyhow::ensure!(
+                identity.scopes.iter().all(|s| !s.trim().is_empty()),
+                "bss-orders: gate.commercial_identities[{}]: a scope is blank",
+                identity.seller_tenant_id
+            );
+        }
+        for (key, value) in [
+            (
+                "preview_per_caller_per_minute",
+                self.preview_per_caller_per_minute,
+            ),
+            (
+                "submit_per_caller_per_minute",
+                self.submit_per_caller_per_minute,
+            ),
+        ] {
+            anyhow::ensure!(
+                PER_CALLER_PER_MINUTE_RANGE.contains(&value),
+                "bss-orders: gate.{key} must be 1..=600"
+            );
+        }
+        // The domain error names the key (`gate.breaker.failure_rate`, …).
+        self.breaker
+            .policy()
+            .validate()
+            .map_err(|e| anyhow::anyhow!("bss-orders: {e}"))?;
+        #[cfg(not(feature = "gate-dev-stubs"))]
+        anyhow::ensure!(
+            !self.dev_stubs,
+            "bss-orders: gate.dev_stubs requires the gate-dev-stubs feature"
+        );
+        #[cfg(feature = "gate-dev-stubs")]
+        anyhow::ensure!(
+            !self.dev_stubs || self.dev_stub_fixture.is_some(),
+            "bss-orders: gate.dev_stubs requires gate.dev_stub_fixture"
+        );
+        Ok(())
+    }
+
+    /// The one development-delivery value: the fixture the stubs answer from, present only when
+    /// the `gate-dev-stubs` feature, `dev_stubs = true` and `dev_stub_fixture` all hold (the
+    /// documented double opt-in). `validate` is the only place that refuses the partial states.
+    #[must_use]
+    pub fn dev_delivery_fixture(&self) -> Option<&std::path::Path> {
+        (cfg!(feature = "gate-dev-stubs") && self.dev_stubs)
+            .then_some(self.dev_stub_fixture.as_deref())
+            .flatten()
+    }
+
+    /// The Preview limiter's settings (validated by [`Self::validate`]).
+    ///
+    /// # Errors
+    /// A limit outside `1..=600`.
+    pub fn preview_limit(&self) -> anyhow::Result<crate::infra::throttle::CallerLimitSettings> {
+        caller_limit(
+            "preview_per_caller_per_minute",
+            self.preview_per_caller_per_minute,
+        )
+    }
+
+    /// The submit limiter's settings (M2-5; validated by [`Self::validate`]).
+    ///
+    /// # Errors
+    /// A limit outside `1..=600`.
+    pub fn submit_limit(&self) -> anyhow::Result<crate::infra::throttle::CallerLimitSettings> {
+        caller_limit(
+            "submit_per_caller_per_minute",
+            self.submit_per_caller_per_minute,
+        )
+    }
+}
+
+fn caller_limit(
+    key: &str,
+    per_minute: u32,
+) -> anyhow::Result<crate::infra::throttle::CallerLimitSettings> {
+    let positive = std::num::NonZeroU32::new(per_minute)
+        .filter(|n| PER_CALLER_PER_MINUTE_RANGE.contains(&n.get()))
+        .ok_or_else(|| anyhow::anyhow!("bss-orders: gate.{key} must be 1..=600"))?;
+    Ok(crate::infra::throttle::CallerLimitSettings {
+        per_minute: positive,
+        max_keys: crate::infra::throttle::PER_CALLER_MAX_KEYS_BASELINE,
+    })
 }
 
 /// The per-(caller, order) request limit: 20 per minute is the declared baseline and the
@@ -64,10 +362,10 @@ pub struct ThrottlingConfig {
 }
 mod throttling_baseline {
     pub const fn per_order_per_minute() -> u32 {
-        crate::api::rest::throttle::PER_ORDER_PER_MINUTE_BASELINE
+        crate::infra::throttle::PER_ORDER_PER_MINUTE_BASELINE
     }
     pub const fn per_order_max_keys() -> u64 {
-        crate::api::rest::throttle::PER_ORDER_MAX_KEYS_BASELINE
+        crate::infra::throttle::PER_ORDER_MAX_KEYS_BASELINE
     }
 }
 impl Default for ThrottlingConfig {
@@ -338,6 +636,13 @@ impl OrdersConfig {
                 !maintenance.tasks.is_empty(),
                 "bss-orders: maintenance requires at least one allowlisted task"
             );
+            // F01 retention purge: refusals are always audited, so scheduling workers without
+            // the purge would let refused audit rows grow unbounded. No maintenance block at
+            // all stays the finding-185 warning (no worker scheduled).
+            anyhow::ensure!(
+                maintenance.tasks.contains(&MaintenanceTask::RetentionPurge),
+                "bss-orders: maintenance tasks must include retention_purge (refusals are always audited)"
+            );
             self.maintenance_connections()?;
             self.worker_settings()?;
         }
@@ -347,6 +652,7 @@ impl OrdersConfig {
         self.capture_settings()?;
         self.date_policy_plan()?;
         self.throttle_settings()?;
+        self.gate.validate()?;
         Ok(())
     }
 
@@ -357,8 +663,8 @@ impl OrdersConfig {
     /// the maximum, D-221).
     pub(crate) fn throttle_settings(
         &self,
-    ) -> anyhow::Result<crate::api::rest::throttle::ThrottleSettings> {
-        use crate::api::rest::throttle::{
+    ) -> anyhow::Result<crate::infra::throttle::ThrottleSettings> {
+        use crate::infra::throttle::{
             PER_ORDER_MAX_KEYS_BASELINE, PER_ORDER_PER_MINUTE_BASELINE, ThrottleSettings,
         };
         let per_minute = self.throttling.per_order_per_minute;

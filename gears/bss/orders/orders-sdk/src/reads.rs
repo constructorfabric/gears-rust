@@ -1,5 +1,5 @@
 //! Read contracts (08 §3.3; S1-02 catalog `get`, `list`, `list_lines`; `models.json`
-//! `ListOrders`, `OrderPage`, `LineList`, `LinePage`). Early S6-01 draft subset with S6-04
+//! `ListOrders`, `OrderPage`, `LineList`, `LinePage`). Draft and submitted reads with S6-04
 //! access logging.
 //!
 //! Every collection is paged (08 §2.2) in the shared list format (DNA REST `PAGINATION.md`,
@@ -207,4 +207,70 @@ pub struct LinePage {
     pub current_version: OrderVersion,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_revision: Option<DraftRevision>,
+}
+
+/// Immutable commercial evidence selected by the committed version, never a live quotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedLine {
+    pub commercial_attempt_id: Uuid,
+    pub order_pin: crate::commercial::OrderPin,
+}
+
+/// Producer-resolved amounts copied from the committed version. Decimal amounts retain their
+/// exact producer spelling; evidence documents are the producer's versioned JSON contracts.
+///
+/// The token fields (`scope`, `amount_status`, `amount_basis`, `discount_status`, `charge_kind`,
+/// `tcv_basis`) are open strings by design, never enums: a stored body written by a newer build
+/// may carry a token this build does not know, and replay must still decode it (D-233 item 3).
+/// Consumers match the tokens they know and treat any other as unrecognized.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommittedTotal {
+    /// Which roll-up the row is: `line` (one line's total) or `order` (the order roll-up).
+    pub scope: String,
+    /// The line the row prices; the nil UUID for the `order` roll-up.
+    pub line_id: Uuid,
+    /// The evaluation currency code.
+    pub currency: String,
+    /// The pricing assessment the row was resolved under.
+    pub assessment_id: Uuid,
+    /// The evaluation currency's minor-unit scale (0..=28).
+    pub currency_scale: u8,
+    /// Producer exclusions, verbatim JSON.
+    pub exclusions: serde_json::Value,
+    /// Producer item breakdown, verbatim JSON.
+    pub item_breakdown: serde_json::Value,
+    /// Producer recurring amounts labelled by cycle, verbatim JSON.
+    pub recurring_by_cycle: serde_json::Value,
+    /// `committed`, or `uncommitted_usage` for a usage row that has no committed amount.
+    pub amount_status: String,
+    /// The producer-declared monetary horizon of the amounts.
+    pub amount_basis: String,
+    /// The producer's line, term and cycle evidence, verbatim JSON.
+    pub period_evidence: serde_json::Value,
+    /// The gross amount as an exact decimal string; absent exactly for a usage row.
+    pub gross_exact: Option<String>,
+    /// The gross amount's display text.
+    pub gross_display: Option<String>,
+    /// The net amount as an exact decimal string; absent exactly for a usage row.
+    pub net_exact: Option<String>,
+    /// The net amount's display text.
+    pub net_display: Option<String>,
+    /// `available` when the producer stated a discount, else `unavailable`.
+    pub discount_status: String,
+    /// The discount as an exact decimal string, when available.
+    pub discount_exact: Option<String>,
+    /// The discount's display text, when available.
+    pub discount_display: Option<String>,
+    /// The promotion the discount came from, when the producer named one.
+    pub promotion_ref: Option<String>,
+    /// `recurring`, `one_time` or `usage`.
+    pub charge_kind: String,
+    /// The total contract value as an exact decimal string (order roll-up of recurring charges).
+    pub tcv_exact: Option<String>,
+    /// The total contract value's display text.
+    pub tcv_display: Option<String>,
+    /// The valuation horizon the TCV declares (`finite_term`, `rolling_annualized`, `mixed`).
+    pub tcv_basis: Option<String>,
+    /// The producer's per-line TCV basis and policy version, verbatim JSON.
+    pub tcv_evidence: Option<serde_json::Value>,
 }

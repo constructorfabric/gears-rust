@@ -167,6 +167,7 @@ fn malformed_tokens_are_cursor_invalid() {
         f: hash.clone(),
         o: Collection::Orders.sort().to_owned(),
         k: position(),
+        r: None,
     };
     let mut json = serde_json::to_value(&valid).unwrap();
     let encode = |v: &serde_json::Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
@@ -387,4 +388,54 @@ mod cursor_properties {
             }
         }
     }
+}
+
+#[test]
+fn line_cursor_version_comes_from_the_validated_decode() {
+    let hash = no_filters_hash();
+    let lines = CursorBinding {
+        collection: Collection::Lines,
+        parent: Some(u(9)),
+        ..binding(&hash)
+    };
+    let token = encode_cursor_version(lines, position(), Some(4)).unwrap();
+    let decoded = decode_cursor_bound(&token, lines).unwrap();
+    assert_eq!(decoded.position, position());
+    assert_eq!(decoded.version, Some(4));
+    // `decode_cursor` is the same decode without the version.
+    assert_eq!(decode_cursor(&token, lines), Ok(position()));
+    // A version-bound token presented for another binding yields no version at all.
+    let other = CursorBinding {
+        parent: Some(u(99)),
+        ..lines
+    };
+    assert_eq!(
+        decode_cursor_bound(&token, other).unwrap_err(),
+        ReadRuleError::CursorInvalid
+    );
+    // An unbound token decodes with `version: None`.
+    let plain = encode_cursor(lines, position()).unwrap();
+    assert_eq!(decode_cursor_bound(&plain, lines).unwrap().version, None);
+}
+
+/// D-246: `main` issued line tokens without the version member, and `main` never committed a
+/// version, so such a token is bound to the creation version; a bound token keeps its own.
+#[test]
+fn a_version_less_line_token_is_bound_to_the_creation_version() {
+    let hash = no_filters_hash();
+    let lines = CursorBinding {
+        collection: Collection::Lines,
+        parent: Some(u(9)),
+        ..binding(&hash)
+    };
+    let main = decode_cursor_bound(&encode_cursor(lines, position()).unwrap(), lines).unwrap();
+    assert_eq!(main.version, None);
+    assert_eq!(main.line_version(), 1);
+    assert_eq!(main.line_version(), MAIN_LINE_CURSOR_VERSION);
+    let bound = decode_cursor_bound(
+        &encode_cursor_version(lines, position(), Some(4)).unwrap(),
+        lines,
+    )
+    .unwrap();
+    assert_eq!(bound.line_version(), 4);
 }

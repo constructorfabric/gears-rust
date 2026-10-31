@@ -708,6 +708,18 @@
           "type": "jsonb",
           "nullable": false,
           "extra": ""
+        },
+        {
+          "name": "catalog_subscription_product_key",
+          "type": "text",
+          "nullable": true,
+          "extra": ""
+        },
+        {
+          "name": "overlap_item_keys",
+          "type": "jsonb",
+          "nullable": true,
+          "extra": ""
         }
       ],
       "pk": [
@@ -719,14 +731,15 @@
         "pk_bss_orders__order_line": "PRIMARY KEY (order_id,version,line_id)",
         "ck_bss_orders__order_line__0": "CHECK (billing_cycle IN ('month','year'))",
         "ck_bss_orders__order_line__1": "CHECK (currency ~ '^[A-Z]{3}$')",
-        "ck_bss_orders__order_line__2": "CHECK ((commercial_attempt_id IS NULL AND pricing_acceptance_id IS NULL AND pricing_request_digest IS NULL AND pricing_terms_digest IS NULL AND order_pin IS NULL) OR (commercial_attempt_id IS NOT NULL AND pricing_acceptance_id IS NOT NULL AND pricing_request_digest IS NOT NULL AND pricing_terms_digest IS NOT NULL AND order_pin IS NOT NULL AND overlap_scope_key IS NOT NULL))",
         "ck_bss_orders__order_line__3": "CHECK (term_duration > interval '0')",
         "fk_bss_orders__order_line__0": "FOREIGN KEY (order_id) REFERENCES bss_orders__order(order_id)",
         "fk_bss_orders__order_line__1": "FOREIGN KEY (order_id,version) REFERENCES bss_orders__order_version(order_id,version)",
         "fk_bss_orders__order_line__2": "FOREIGN KEY (order_id,line_id) REFERENCES bss_orders__order_line_identity(order_id,line_id)",
         "fk_bss_orders__order_line__3": "FOREIGN KEY (commercial_attempt_id,order_id,version) REFERENCES bss_orders__commercial_attempt(attempt_id,order_id,candidate_version)",
         "ck_bss_orders__order_line__term_intent": "CHECK (bss_orders__term_valid(term_kind,term_duration,authored_term,billing_cycle))",
-        "ck_bss_orders__order_line__dates": "CHECK ( service_activation_date IS NOT NULL AND acceptance_due_date IS NOT NULL AND bss_orders__date_snapshot_valid(date_policy_switch_state))"
+        "ck_bss_orders__order_line__dates": "CHECK ( service_activation_date IS NOT NULL AND acceptance_due_date IS NOT NULL AND bss_orders__date_snapshot_valid(date_policy_switch_state))",
+        "ck_bss_orders__order_line__2": "CHECK (commercial_attempt_id IS NOT NULL AND pricing_acceptance_id IS NOT NULL AND pricing_request_digest IS NOT NULL AND pricing_terms_digest IS NOT NULL AND order_pin IS NOT NULL)",
+        "ck_bss_orders__order_line__item_keys": "CHECK ( overlap_item_keys IS NULL OR ( jsonb_typeof(overlap_item_keys) = 'array' AND overlap_scope_key IS NULL AND catalog_subscription_product_key IS NULL ) )"
       },
       "indexes": {},
       "triggers": [

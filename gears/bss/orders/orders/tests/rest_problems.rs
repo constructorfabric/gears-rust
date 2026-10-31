@@ -5,9 +5,16 @@
 //! `fixtures/rest-problem-golden.json` holds the exact Problem bytes the pre-D-219 SDK encoder
 //! (`OrdersError::into_problem`, `ReasonMapping::http_status`) produced at 53091e0d5 for every
 //! registered reason, every settled diagnostic shape and every infrastructure error. These tests
-//! prove the wire unchanged and every reason round-trips: boundary refusals and infrastructure
-//! errors byte for byte; settled refusals as JSON, because their body is rendered from a
-//! `serde_json::Value` whose key order depends on the build's `serde_json` features.
+//! prove the wire unchanged byte for byte and every reason round-trips. A reason registered after
+//! the capture (D-232 `payer-relationship-unconfirmed`) gains its entries written from its catalog
+//! row in the shape of the captured entries of the same category and status; D-233 adds one
+//! settled entry carrying the optional `assessment` gate report member the same way.
+//!
+//! Settled bodies are stored as JSON values and replayed through `sort_all_objects`
+//! (`src/api/rest/capture.rs`), because JSONB may reorder keys and host feature unification may
+//! enable `serde_json/preserve_order`; so the settled comparisons normalize the same way before
+//! comparing bytes. Boundary bodies are serialized straight from the `Problem` struct, never
+//! through a `Value`, so they are compared as emitted.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -73,7 +80,7 @@ fn boundary_and_infrastructure_problems_are_byte_identical_to_the_pre_d219_wire(
 /// the contract-error decode and not the HTTP status. Re-encoding the decoded error yields the
 /// same bytes again.
 #[test]
-fn every_settled_refusal_is_identical_json_and_round_trips_through_the_sdk_error() {
+fn every_settled_refusal_is_byte_identical_and_round_trips_through_the_sdk_error() {
     let golden = golden();
     let mut reasons = BTreeSet::new();
     for entry in golden["settled_refusals"].as_array().unwrap() {
@@ -83,17 +90,18 @@ fn every_settled_refusal_is_identical_json_and_round_trips_through_the_sdk_error
         let problem = rest::error::settled_refusal_problem(reason, data.clone());
         // The engine stores `json_value(&problem)` with `wire::reason_status` as the status.
         let stored = serde_json::to_value(&problem).unwrap();
+        let mut canon = stored.clone();
+        canon.sort_all_objects();
         assert_eq!(
             u64::from(wire::reason_status(reason)),
             entry["status"].as_u64().unwrap()
         );
         assert_eq!(problem.status, Some(wire::reason_status(reason)));
-        // The stored body is rendered from a `serde_json::Value`, whose key order follows the
-        // build's serde_json features (`preserve_order` is on in workspace builds, off in a
-        // single-crate one), so the body is compared as JSON, not as bytes.
-        let golden_body: serde_json::Value =
-            serde_json::from_str(entry["body"].as_str().unwrap()).unwrap();
-        assert_eq!(stored, golden_body, "{reason:?}");
+        assert_eq!(
+            serde_json::to_string(&canon).unwrap(),
+            entry["body"].as_str().unwrap(),
+            "{reason:?}"
+        );
         // Decode: stored body → Problem → (error_domain, error_code) + context.data.
         let decoded: Problem = serde_json::from_value(stored).unwrap();
         let envelope = RefusalEnvelope::try_from(decoded).unwrap();
@@ -103,10 +111,12 @@ fn every_settled_refusal_is_identical_json_and_round_trips_through_the_sdk_error
         assert_eq!(serde_json::to_value(&envelope.diagnostics).unwrap(), data);
         let error = OrdersError::from(envelope);
         assert_eq!(error.reason(), Some(reason));
-        // Encode the SDK error again: the same body the engine stored.
+        // Encode the SDK error again: the same bytes the engine stored.
+        let mut reencoded = serde_json::to_value(rest::problem(error)).unwrap();
+        reencoded.sort_all_objects();
         assert_eq!(
-            serde_json::to_value(rest::problem(error)).unwrap(),
-            golden_body,
+            serde_json::to_string(&reencoded).unwrap(),
+            entry["body"].as_str().unwrap(),
             "{reason:?}"
         );
     }
@@ -168,9 +178,15 @@ fn the_canonical_round_trip_cannot_carry_an_orders_refusal() {
             }
         }
     }
-    // Measured: 70 of the 90 reasons are rejected; the 20 not_found, already_exists and
-    // service_unavailable reasons convert without their code and diagnostics.
-    assert_eq!((rejected, Reason::ALL.len()), (70, 90));
+    // Measured: 72 of the 92 reasons are rejected; the 20 not_found, already_exists and
+    // service_unavailable reasons convert without their code and diagnostics. D-232 added
+    // `payer-relationship-unconfirmed` (FailedPrecondition), one more rejected reason.
+    assert_eq!((rejected, Reason::ALL.len()), (72, 92));
+    assert_eq!(
+        Reason::from_token("payer-relationship-unconfirmed")
+            .map(|r| (r.mapping().code, wire::reason_status(r))),
+        Some(("PAYER_RELATIONSHIP_UNCONFIRMED", 400))
+    );
 }
 
 /// The gear-side wire bindings match the reviewed catalog: every reason's registered status

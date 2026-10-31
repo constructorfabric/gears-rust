@@ -75,6 +75,8 @@ magika = ["file_parser/magika"]
 bss-products = ["dep:bss_products"]
 # Orders requires the Event Broker gear (D-200) and the plugins its standalone deployment
 # resolves: the standalone cluster cache and the SQLite event-log backend.
+# Orders E2E/development hosts only; ordinary bss-orders builds do not enable this.
+bss-orders-test-authz = ["bss-orders", "dep:bss-orders-test-authz-plugin"]
 bss-orders = [
     "dep:bss_orders",
     "dep:event_broker",
@@ -165,6 +167,7 @@ cluster = { package = "cf-gears-cluster", path = "../../gears/system/cluster/clu
 bss_pricing = { package = "cf-gears-bss-pricing", path = "../../gears/bss/pricing/pricing", optional = true }
 bss_products = { package = "cf-gears-bss-products", path = "../../gears/bss/products/products", optional = true }
 bss_orders = { package = "cf-gears-bss-orders", path = "../../gears/bss/orders/orders", optional = true }
+bss-orders-test-authz-plugin = { package = "cf-gears-bss-orders-test-authz-plugin", path = "../../gears/bss/orders/test-authz-plugin", optional = true }
 event_broker = { package = "cf-gears-event-broker", path = "../../gears/system/event-broker/event-broker", optional = true }
 standalone-cluster-plugin = { package = "cf-gears-standalone-cluster-plugin", path = "../../gears/system/cluster/plugins/standalone-cluster-plugin", optional = true }
 sqlite-event-broker-plugin = { package = "cf-gears-sqlite-event-broker-plugin", path = "../../gears/system/event-broker/plugins/sqlite-event-broker-plugin", optional = true }

@@ -15,6 +15,7 @@ use uuid::Uuid;
 
 use super::private::RegistryKeyColumns;
 use super::{LockedOrder, TransactionRunner, mutable, private};
+use crate::domain::gate::commercial::ORDER_MEMBER;
 use crate::domain::idempotency::{
     ExecutionOwner, Fingerprint, GateDecision, LeaseDuration, RecordView, RegistryKey,
     RegistryRuleError, Settlement, StoredResponse, classify, next_fence,
@@ -43,6 +44,8 @@ pub enum RegistryError {
     StaleOwner,
     #[error("an operational first result cannot be rewritten")]
     FirstResultConflict,
+    #[error("a receipt for a line the attempt did not freeze")]
+    UnfrozenLine,
     #[error("commercial version allocation exhausted")]
     CandidateExhausted,
     #[error("a fulfillment control is already pending")]
@@ -729,7 +732,12 @@ pub enum Probe {
     /// Matching unresolved D-188/D-198 execution: resume from its frozen inputs, never from a
     /// fresh assessment.
     Existing(Frozen),
-    /// Anything else, including mismatch and live leases: the authoritative gate decides.
+    /// A live (unexpired or unresolved) record of this key and order under another request
+    /// fingerprint: the authoritative gate answers `idempotency-mismatch`, so a caller that
+    /// would assess first (submit, amendment) goes to the gate without assessing.
+    Mismatch,
+    /// Anything else, including live leases and another order's record: the authoritative gate
+    /// decides.
     Miss,
 }
 
@@ -759,16 +767,16 @@ pub async fn probe(
         return Ok(Probe::Miss);
     };
     let now = db_now(runner, s, k).await?;
-    if row.request_fingerprint != fingerprint.as_str()
-        || order.is_some_and(|(id, _)| row.order_id != Some(id))
+    // An expired settled record is never replayed or matched, even before the sweep removes it.
+    if order.is_some_and(|(id, _)| row.order_id != Some(id))
+        || (row.status == SETTLED && row.expires_at <= now)
     {
         return Ok(Probe::Miss);
     }
+    if row.request_fingerprint != fingerprint.as_str() {
+        return Ok(Probe::Mismatch);
+    }
     if row.status == SETTLED {
-        // An expired record is never replayed, even before the sweep removes it.
-        if row.expires_at <= now {
-            return Ok(Probe::Miss);
-        }
         return Ok(Probe::Replay(Replay::from_row(&row)?));
     }
     let Some((order_id, order_scope)) = order else {
@@ -838,17 +846,26 @@ fn require_new_durable<T: TransactionRunner>(
 /// exact per-line request snapshots, insert the attempt and link it to the claimed marker.
 /// The caller commits this short transaction before the first remote command.
 ///
+/// `line_requests` is fallible like the engine's own snapshot: its error aborts the call before
+/// the attempt is built, so no row is inserted, and the caller's rollback releases the candidate.
+///
 /// # Errors
-/// Not a fresh durable claim of this aggregate, candidate exhaustion or store failure.
-pub async fn begin_commercial_attempt<'a, T: TransactionRunner>(
+/// Not a fresh durable claim of this aggregate, candidate exhaustion, store failure, or the
+/// snapshot's own error.
+pub async fn begin_commercial_attempt<'a, T, E>(
     owned: Owned<'a, T>,
     locked: &mut LockedOrder<'a, T>,
     inputs: AttemptInputs,
-    line_requests: impl FnOnce(i32) -> serde_json::Value,
-) -> Result<(DurableExecution, commercial_attempt::Model), RegistryError> {
+    line_requests: impl FnOnce(i32) -> Result<serde_json::Value, E>,
+) -> Result<(DurableExecution, commercial_attempt::Model), E>
+where
+    T: TransactionRunner,
+    E: From<RegistryError>,
+{
     let claim_owner = require_new_durable(&owned, locked)?;
     let previous = locked.row.current_version;
     let candidate = locked.allocate_candidate_version().await?;
+    let line_requests = line_requests(candidate)?;
     let attempt = commercial_attempt::Model {
         attempt_id: Uuid::new_v4(),
         order_id: locked.row.order_id,
@@ -863,7 +880,7 @@ pub async fn begin_commercial_attempt<'a, T: TransactionRunner>(
         authorization_fact_fingerprint: inputs.authorization_fact_fingerprint,
         original_principal: inputs.original_principal,
         proof_reference: inputs.proof_reference,
-        line_requests: line_requests(candidate),
+        line_requests,
         date_policy_basis: inputs.date_policy_basis,
         commercial_subject_id: inputs.commercial_subject_id,
         commercial_subject_type: inputs.commercial_subject_type,
@@ -876,10 +893,15 @@ pub async fn begin_commercial_attempt<'a, T: TransactionRunner>(
         created_at: owned.now,
         terminal_at: None,
     };
-    let attempt = locked.insert_commercial_attempt(attempt).await?;
+    let attempt = locked
+        .insert_commercial_attempt(attempt)
+        .await
+        .map_err(RegistryError::from)?;
     let mut marker = owned.row.clone();
     marker.attempt_id = Some(attempt.attempt_id);
-    mutable::replace_idempotency(owned.tx, &owned.scope, &owned.row, marker.clone()).await?;
+    mutable::replace_idempotency(owned.tx, &owned.scope, &owned.row, marker.clone())
+        .await
+        .map_err(RegistryError::from)?;
     let frozen = Frozen::Commercial(attempt.clone());
     Ok((DurableExecution::from_parts(&marker, &frozen)?, attempt))
 }
@@ -997,25 +1019,33 @@ pub enum Recorded {
 }
 
 /// D-188 step 3: record one returned per-line receipt under the current fence. Immutable
-/// first results: an identical repeat is accepted, a different value is refused.
+/// first results: an identical repeat is accepted, a different value is refused. `line_key`
+/// must be one of the attempt's frozen lines. A new result also renews the owner's lease on the
+/// marker and the attempt to `now + lease` ([`renew_lease`]); an identical repeat writes nothing.
 ///
 /// # Errors
-/// Stale owner, conflicting first result or store failure.
+/// Stale owner, a line the attempt did not freeze, conflicting first result or store failure.
 pub async fn record_receipt<T: TransactionRunner>(
     locked: &LockedOrder<'_, T>,
     execution: &DurableExecution,
     line_key: &str,
     result: serde_json::Value,
+    lease: LeaseDuration,
 ) -> Result<Recorded, RegistryError> {
-    let (_, frozen) = verify_owner(locked, execution).await?;
+    let (marker, frozen) = verify_owner(locked, execution).await?;
     let Frozen::Commercial(attempt) = frozen else {
         return Err(RegistryError::StaleOwner);
     };
+    // Only a line the attempt froze has a result (its `line_requests` member, never "order").
+    if line_key == ORDER_MEMBER || attempt.line_requests.get(line_key).is_none() {
+        return Err(RegistryError::UnfrozenLine);
+    }
     match attempt.receipt_results.get(line_key) {
         Some(existing) if *existing == result => return Ok(Recorded::AlreadyRecorded),
         Some(_) => return Err(RegistryError::FirstResultConflict),
         None => {}
     }
+    let lease_until = renew_lease(locked, &marker, execution, lease).await?;
     let mut next = attempt.clone();
     let results = next
         .receipt_results
@@ -1025,8 +1055,32 @@ pub async fn record_receipt<T: TransactionRunner>(
         ))?;
     results.insert(line_key.to_owned(), result);
     AttemptStatus::Running.token().clone_into(&mut next.status);
+    next.lease_until = Some(lease_until);
     locked.replace_commercial_attempt(&attempt, next).await?;
     Ok(Recorded::New)
+}
+
+/// Extend the live owner's lease on the marker to `now + lease` (database time) and return the
+/// new deadline for its linked execution. Owner token and fence are unchanged: renewal is not a
+/// reclaim. Phase B renews after each recorded receipt, so a long basket is not reclaimed from a
+/// live owner between two lines (D-188 step 3).
+async fn renew_lease<T: TransactionRunner>(
+    locked: &LockedOrder<'_, T>,
+    marker: &idempotency::Model,
+    execution: &DurableExecution,
+    lease: LeaseDuration,
+) -> Result<OffsetDateTime, RegistryError> {
+    let scope = PrivateScope::for_principal(&execution.principal_scope);
+    let key = RegistryKeyColumns {
+        operation: &execution.operation,
+        principal_scope: &execution.principal_scope,
+        idempotency_key: &execution.idempotency_key,
+    };
+    let lease_until = db_now(locked.tx, scope.access_scope(), key).await? + lease.duration();
+    let mut proposed = marker.clone();
+    proposed.lease_expires_at = Some(lease_until);
+    mutable::replace_idempotency(locked.tx, scope.access_scope(), marker, proposed).await?;
+    Ok(lease_until)
 }
 
 /// D-198 step 2-4 progress: append receiver commands/evidence under the current fence and

@@ -1,5 +1,8 @@
 # Feature: Sellability Gate, Price Pin and Preview
 
+> **D-242 protected-capacity amendment (2026-10-27):** [Proposed Orders / Subscriptions contract](../SUBSCRIPTIONS_CONTRACT.md) adopts PR5516's three-count full-tuple semantics, confirmation-before-capture reservation, protected own conversion/resume and lower-limit preservation. It supersedes active-only/release-on-leaving-active and activation-intent-only reservation wording below for the target contract. Historical/local active-only behavior remains legacy development behavior. Item mapping and versioned observation DTOs now have an Orders-local implementation (`a81090675`, `cd82261cf`) of the proposed contract. Real owner SDKs, atomic reservation/financial protocols, Workflow integration and bilateral conformance remain open. No provider checkbox is closed.
+
+
 
 <!-- toc -->
 
@@ -154,7 +157,7 @@ Evaluate the adopted catalog predicates of [DESIGN §4.1](../DESIGN.md#contract-
 
 | Orders predicate | Check and refusal behavior |
 |------------------|----------------------------|
-| 1. Axis validity | All three tenants resolve; `axis-invalid` or owning input unavailability |
+| 1. Axis validity | All three tenants resolve; `axis-invalid` or owning input unavailability; an unconfirmed payer ↔ seller or payer ↔ resource-tenant relationship is `payer-relationship-unconfirmed` (D-215, D-232) |
 | 2. Contract | Only if referenced: active and payer party-eligible through Contracts; `contract-not-active`, `contract-party-ineligible` or `contract-resolution-unavailable` |
 | 3. Quantity | Owning per-item quantity floors and selection bounds; `quantity-below-floor`; no local monetary arithmetic |
 | 4. Market | Book currency and explicit producer market applicability match payer market; `market-inconsistent`; missing price scope is unevaluable |
@@ -196,7 +199,7 @@ Evaluate every independent predicate even after a failure; a single failure bloc
 | Price evaluation | 500 ms |
 | Indicative tax, Preview only | 250 ms |
 
-Use one logical batched port operation per run; bounded adapter splitting follows DESIGN §4.3. Identity precedes market use; revision facts precede assessment/composition; exact bindings precede Rating; authoritative keys precede occupancy. Retry transient failures at most two attempts inside the deadline, never retry a deadline. Use the design baseline breaker (0.5 failure ratio/30 seconds, open 10 seconds), bulkhead (32 concurrent calls/port), and caller limits (submit 10/minute, Preview 60/minute) through shared platform facilities. Unavailable required shared breaker capability remains a prerequisite.
+Use one logical batched port operation per run; bounded adapter splitting follows DESIGN §4.3. Identity precedes market use; revision facts precede assessment/composition; exact bindings precede Rating; authoritative keys precede occupancy. Retry transient failures at most two attempts inside the deadline, never retry a deadline. Use the design baseline breaker (0.5 failure ratio/30 seconds, open 10 seconds), bulkhead (32 concurrent calls/port), and caller limits (submit 10/minute, Preview 60/minute) through shared platform facilities. The gate's breaker is gear-local until the platform ships one (D-237; `cpt-cf-bss-orders-upreq-shared-circuit-breaker`).
 
 The conservative resolution ceilings are 2.25 seconds for submit and 2.5 seconds for Preview. These are external-resolution baselines, separate from commit latency and PRD durable-write-plus-publication latency; none proves an end-to-end subsecond submit. Keep unratified budgets and latency reconciliation open.
 
@@ -211,7 +214,7 @@ The conservative resolution ceilings are 2.25 seconds for submit and 2.5 seconds
 1. Retain every evaluated result, including passed outcomes, identified by run, line, predicate, resolve `item_id`, selection-presence flag and raw nullable `dim_value` (D-195; selected NULL differs from literal text `default`). Preserve distinct item/slot results without expanding order lines; reject duplicate identities or incomplete coverage.
 2. Order by declared predicate order, then binary line ID, binary item ID, selection presence (`false` first) and raw dimension UTF-8 bytes, with NULL first at nullable levels. Persist trusted run metadata atomically with the complete vector.
 3. For submit/amendment, use the engine transaction and bind `assessmentId=run_id` to its immutable settled response. Engine-only/state/version/date-basis refusals discard provisional stale results and carry no assessment ID.
-4. Within the **blocking** result set, choose the first unavailable result as primary Problem; otherwise choose the first failed result, preserving the complete authorized report. D-195 excludes only approved D-189/D-193 optional-context TCV unevaluability and D-191 optional forecast absence from this set, preserving successful Preview/`tcvWithheld`; required sellability checks and actual business failures retain their blocking behavior. Canonical reason/domain/code mapping remains Foundation's contract.
+4. Within the **blocking** result set, choose the first failed definitive local refusal as primary Problem (D-234: axis validity, including `payer-relationship-unconfirmed` and the withheld payer-dependent rows carrying predicate 1's reason, reference resolution, single currency, quantity floor and dates); otherwise the first unavailable result; otherwise the first failed result, preserving the complete authorized report. D-195 excludes only approved D-189/D-193 optional-context TCV unevaluability and D-191 optional forecast absence from this set, preserving successful Preview/`tcvWithheld`; required sellability checks and actual business failures retain their blocking behavior. Canonical reason/domain/code mapping remains Foundation's contract.
 5. Preview commits a standalone diagnostic transaction; repeated calls create new runs. Operational lookup requires current diagnostic grants scoped by subject tenant; possession of an assessment ID is never authority. No public diagnostic endpoint is added.
 
 ## 4. States (CDSL)
@@ -274,7 +277,7 @@ The implementation MUST expose the [design §3.8](../DESIGN.md#contract-03-3-8) 
 ## 6. Acceptance Criteria
 
 - [ ] A fully evaluable authorized basket admits one version with a resolvable pin per line and verbatim totals; a failed/unevaluable line prevents all commercial admission.
-- [ ] Mixed failed/unevaluable predicates return all independent failures, persisted passed results and pin outcomes. An unresolvable reference creates no duplicate pin failure; primary Problem follows unavailable-first ordering within the blocking set; optional-context TCV-only unevaluability remains diagnostic and preserves successful `tcvWithheld`.
+- [ ] Mixed failed/unevaluable predicates return all independent failures, persisted passed results and pin outcomes. An unresolvable reference creates no duplicate pin failure; primary Problem follows D-234 ordering within the blocking set (a definitive local refusal first, then unavailable-first, then failed); optional-context TCV-only unevaluability remains diagnostic and preserves successful `tcvWithheld`.
 - [ ] Revision absence/outage, overlap-key absence/outage, composition timeout and incomplete bundle component/key coverage produce distinct declared diagnostics and no pin/version admission.
 - [ ] Partner callers use seller/revision inputs for every catalog-facing operation; denied catalog access yields unavailable diagnostics, never a buyer-facing 403. Revision or price publication mid-run does not mix the assessed bindings and totals.
 - [ ] A 200-line basket invokes each basket-dependent port once per run; validate deadline, bounded retry, breaker, bulkhead and caller-rate behavior through shared facilities.
@@ -432,7 +435,7 @@ Missing upstream SDK operations remain release gates; do not import gear interna
 Input: order_id, current_version, authenticated Workflow SecurityContext
 Output: exactly one of `proceed` | `reject` (per-line reasons) | `not-dispatchable` (state or version) | `defer` (port reason) — [`../DECISIONS.md`](../DECISIONS.md) D-127
 
-1. [ ] - `p1` - Read the PDP-authorized current order and its current version through the composed read of [08-read-and-authz — What a read exposes (normative)](../DESIGN.md#contract-08-4-2), which carries the fulfillment inputs steps 5 and 6 use — each line's stored `overlap_scope_key`, the version's `market_currency`, `market_region` and `payer_tenant_id` ([`../DECISIONS.md`](../DECISIONS.md) D-144) - `inst-rc-read-order`
+1. [ ] - `p1` - Read the PDP-authorized current order and its current version through the composed read of [08-read-and-authz — What a read exposes (normative)](../DESIGN.md#contract-08-4-2), which carries the fulfillment inputs steps 5 and 6 use — each line's stored overlap keys (the `item_keys_v1` collection `orders_order_line.overlap_item_keys`, or the legacy scalar `overlap_scope_key` on a row without one) and its `activation_deadline`, the version's `market_currency`, `market_region` and `payer_tenant_id` ([`../DECISIONS.md`](../DECISIONS.md) D-144) - `inst-rc-read-order`
 2. [ ] - `p1` - **IF** the order is `on_hold`, is terminal, or its current version differs from `current_version` (superseded): - `inst-rc-if-not-dispatchable`
    1. [ ] - `p1` - **RETURN** `not-dispatchable` carrying the observed state or current version - `inst-rc-return-not-dispatchable`
 3. [ ] - `p1` - Re-derive the order market from the payer's **current** commercial profile through the identity port under its §2.2 deadline - `inst-rc-rederive-market`
@@ -440,7 +443,7 @@ Output: exactly one of `proceed` | `reject` (per-line reasons) | `not-dispatchab
    1. [ ] - `p1` - **RETURN** `defer` carrying `identity-party-unavailable`; never fabricate a divergence - `inst-rc-return-defer-identity`
 5. [ ] - `p1` - **IF** it diverges from the market frozen at submit: - `inst-rc-if-market-diverged`
    1. [ ] - `p1` - **RETURN** `reject` with market-divergence for the affected lines - `inst-rc-return-market-divergence`
-6. [ ] - `p1` - Re-read overlap **occupancy** `(activeCount, maxConcurrentActive, provenance)` in one batched call for each line's overlap key **as stored on `orders_order_line.overlap_scope_key`** with the order's payer at submit/amendment and its resource tenant; do not re-resolve the product key from the registry, so the re-check tests the same key the claim holds - `inst-rc-reread-overlap`
+6. [ ] - `p1` - Re-read overlap **occupancy** `(activeCount, maxConcurrentActive, provenance)` in one batched call for each distinct overlap key **as stored on the line**: the `overlap_scope_key` values of `orders_order_line.overlap_item_keys`, or, for a legacy row whose collection is NULL, its scalar `overlap_scope_key`; mixed or malformed stored evidence defers `overlap-presence-unevaluable` (`StoredLine::from_stored`) with the order's payer at submit/amendment and its resource tenant; do not re-resolve the product key from the registry, so the re-check tests the same key the claim holds - `inst-rc-reread-overlap`
 7. [ ] - `p1` - **IF** the occupancy port is unavailable, its deadline elapsed, or an answer lacks `activeCount` or `maxConcurrentActive`: - `inst-rc-if-occupancy-unavailable`
    1. [ ] - `p1` - **RETURN** `defer` carrying `overlap-presence-unevaluable`; never default the limit to one and never fabricate a collision - `inst-rc-return-defer-occupancy`
 8. [ ] - `p1` - **IF** for any key `activeCount + pending > maxConcurrentActive`, where `pending` is the number of this order's lines carrying the key that are not yet activated (all of them, before the first activation): - `inst-rc-if-overlap-collision`
@@ -509,9 +512,9 @@ Nine predicates are this gear's own. Each **MUST** carry its own machine-readabl
    `(payer_tenant_id, resource_tenant_id, overlap_scope_key)` the batched owning Subscriptions contract returns
    `(activeCount, maxConcurrentActive, provenance)`, the limit resolved using its Catalog/Contract
    policy. The tuple matches predicate 9's claim (D-179). Until Subscriptions enforces the resource
-   dimension it answers on the tuple it enforces and says so in `provenance`; this predicate applies
+   dimension it answers on the tuple it enforces and declares its count scope separately from limit `provenance`; this predicate applies
    that answer as given and never re-buckets a per-payer count locally. For each key, `proposed` is
-   the number of basket lines carrying it **plus**, while `provenance` states an answer coarser than
+   the number of basket lines carrying it **plus**, while the explicit count scope states an answer coarser than
    the claim tuple (per payer), the lines carrying the same key on the current version of every
    **other** in-flight order of this payer holding a live `orders_inflight_overlap_claim` on
    `(payer_tenant_id, overlap_scope_key)` under a different resource tenant (D-180). The addend is
@@ -699,3 +702,12 @@ The [Rating-owned exact-binding contract](../DESIGN.md#contract-03-rating-purcha
 
 
 **D-198 capacity alignment:** the selected target scope includes payer, resource tenant and registry product key. Until the producer adopts it, apply its legacy scope/provenance unchanged. Occupancy includes explicit admitted-pending capacity without double-counting already-reserved proposed lines. Submit/recheck remain advisory; only Subscriptions receiver slot admission and generation fencing authorize effects. [Normative receiver protocol](../DESIGN.md#contract-06-activation-admission).
+
+**Residual Task 10 development binding:** the proposed occupancy mirror requires
+`count_scope: per_payer | full_tuple`, independent of limit `provenance`. Missing or
+unknown scope is malformed and cannot silently select either counting rule. Predicate 7's
+D-180 other-resource addend applies only to `per_payer`; `full_tuple` uses active count
+plus the proposed basket. Predicate 9's same-tuple live-claim check is unchanged. The
+activation recheck uses only this order's pending lines for either explicit scope. Producer
+agreement and Workflow adoption of the required field and updated fixtures are outstanding;
+this mirror does not implement the D-198 receiver capacity protocol.

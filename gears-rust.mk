@@ -647,15 +647,15 @@ lane_args_products-pg = -p cf-gears-bss-products --run-ignored ignored-only -E '
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not test(grain_fold_timing)' --no-fail-fast
 
-## bss-orders' Postgres tier (Docker required; testcontainers).
+## bss-orders' Postgres tier (Docker required; testcontainers) and its gated tests.
 ##
-## Same `--run-ignored ignored-only` shape as ledger and products: every Orders test that starts a
-## PostgreSQL container is `#[ignore]` with the Docker reason — the lib's `infra::storage::tests`
-## modules and the gear-boot tests in `gear::tests` — and the attribute marks nothing else, so
-## there is no binary or name filter. The unit tier keeps the config, codec and REST-surface tests
-## that need no container (D-224).
+## `--run-ignored all` runs the crate's ignored Docker/PG tests (the lib's `infra::storage::tests`
+## modules and the gear-boot tests in `gear::tests`) together with every non-ignored test. Orders
+## has no `postgres_*` test binary. `--features gate-dev-stubs` compiles in and runs the gated
+## tests: `infra/storage/tests/submit.rs` and the `infra::gate::tests::{faults,orchestrate,preview}`
+## lib tests. The unit tier (`make test`) keeps the tests that need neither.
 ## `--no-fail-fast` for the reason the pricing lane gives.
-lane_args_orders-pg = -p cf-gears-bss-orders --run-ignored ignored-only --no-fail-fast
+lane_args_orders-pg = -p cf-gears-bss-orders --features gate-dev-stubs --run-ignored all --no-fail-fast
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))
@@ -1054,6 +1054,12 @@ e2e-usage-collector: py-env
 	$(call print_target_banner)
 	$(if $(filter-out $(UC_E2E_BACKENDS),$(BACKEND)),$(error Unknown BACKEND '$(BACKEND)'. Use one of: $(UC_E2E_BACKENDS)))
 	$(foreach b,$(or $(BACKEND),$(UC_E2E_BACKENDS)),cargo build --bin cf-gears-example-server --features=$(UC_E2E_FEATURES),$(b)-usage-collector$(newline)E2E_BINARY=target/debug/cf-gears-example-server UC_E2E_BACKEND=$(b) $(PYTHON) -m pytest testing/e2e/suites/usage_collector/ -vv $(E2E_TARGET)$(newline))
+
+## Run the Orders development Preview/submit E2E suite (self-managed PostgreSQL; Docker required)
+.PHONY: e2e-orders
+e2e-orders: py-env
+	$(call print_target_banner)
+	$(PYTHON) tools/scripts/run_e2e.py --suite bss-orders -- $(E2E_TARGET)
 
 ## Run event-broker E2E tests (its own standalone binary, not a cf-gears-example-server feature)
 e2e-event-broker: py-env
