@@ -552,6 +552,70 @@ impl WorkerAction for StableAction {
     }
 }
 
+// `WorkerAction::execute` is `fn -> impl Future`, not `async fn`, so an
+// implementor may panic before it returns a future at all. This action
+// panics in that synchronous part, which no `async fn` impl can express.
+
+struct SyncPanicAction {
+    panic_on_call: u32,
+    call_count: Arc<AtomicU32>,
+}
+
+impl WorkerAction for SyncPanicAction {
+    type Payload = ();
+    type Error = String;
+
+    fn execute(
+        &mut self,
+        _cancel: &CancellationToken,
+    ) -> impl std::future::Future<Output = Result<Directive, String>> + Send {
+        let n = self.call_count.fetch_add(1, Ordering::SeqCst);
+        assert!(
+            n != self.panic_on_call,
+            "segfault before future construction"
+        );
+        std::future::ready(Ok(Directive::idle()))
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sync_panic_before_future_is_caught_and_worker_keeps_running() {
+    // Same scenario as `panicking_worker_recovers_and_keeps_running`, but
+    // the panic happens before the returned future exists rather than
+    // while it is polled.
+
+    let cancel = CancellationToken::new();
+    let notify = Arc::new(Notify::new());
+    let bad_count = Arc::new(AtomicU32::new(0));
+
+    let bad_action = SyncPanicAction {
+        panic_on_call: 0, // panic on first execute
+        call_count: bad_count.clone(),
+    };
+
+    let (poker_notify, _poker_handle) = poker(Duration::from_secs(1), cancel.clone());
+
+    let bad_worker = WorkerBuilder::new("sync-panic", cancel.clone())
+        .notifier(notify.clone())
+        .notifier(poker_notify)
+        .pacing(PacingConfig::default())
+        .on_panic(PanicPolicy::CatchAndRetry)
+        .build(bad_action);
+
+    let handle = tokio::spawn(bad_worker.run());
+
+    // Let it run — first call panics, subsequent calls succeed.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    cancel.cancel();
+    handle.await.unwrap();
+
+    let calls = bad_count.load(Ordering::SeqCst);
+    assert!(
+        calls > 1,
+        "worker should have recovered from a pre-future panic and kept running, got {calls} calls",
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn panicking_worker_recovers_and_keeps_running() {
     // The "bad" worker panics on call 0, but the worker loop catches
