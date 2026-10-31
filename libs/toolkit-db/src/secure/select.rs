@@ -6,7 +6,9 @@ use std::sync::Arc;
 
 use crate::secure::cond::build_scope_condition;
 use crate::secure::error::ScopeError;
-use crate::secure::{AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, SeaOrmRunner};
+use crate::secure::{
+    AccessScope, DBRunner, DBRunnerInternal, ScopableEntity, ScopeProperties, SeaOrmRunner,
+};
 
 /// Typestate marker: query has not yet been scoped.
 /// Cannot execute queries in this state.

@@ -46,27 +46,15 @@ mod node {
 }
 
 impl ScopableEntity for node::Entity {
-    fn tenant_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(node::Column::TenantId)
-    }
-    fn resource_col() -> Option<<Self as EntityTrait>::Column> {
-        Some(node::Column::Id)
-    }
-    fn owner_col() -> Option<<Self as EntityTrait>::Column> {
-        None
-    }
+    const SCOPE_PROPERTIES: &'static [(&'static str, Self::Column)] = &[
+        (pep_properties::OWNER_TENANT_ID, node::Column::TenantId),
+        (pep_properties::RESOURCE_ID, node::Column::Id),
+    ];
+
+    const UNSCOPED_DIMENSIONS: &'static [&'static str] = &[pep_properties::OWNER_ID];
+
     fn type_col() -> Option<<Self as EntityTrait>::Column> {
         None
-    }
-    fn resolve_property(property: &str) -> Option<<Self as EntityTrait>::Column> {
-        match property {
-            p if p == pep_properties::OWNER_TENANT_ID => Self::tenant_col(),
-            p if p == pep_properties::RESOURCE_ID => Self::resource_col(),
-            _ => None,
-        }
-    }
-    fn scope_columns() -> Vec<<Self as EntityTrait>::Column> {
-        vec![node::Column::TenantId, node::Column::Id]
     }
 }
 
