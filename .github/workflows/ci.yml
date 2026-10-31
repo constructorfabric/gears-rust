@@ -1120,6 +1120,12 @@ jobs:
             { date -u +%T; df -BG --output=used,avail / | tail -1
               du -sx -BG "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE/llvm-cov-target" "$GITHUB_WORKSPACE/llvm-cov-build" "${SCCACHE_DIR:-$HOME/.cache/sccache}" "$HOME/.cargo" "$RUNNER_TEMP" /tmp 2>/dev/null
               sudo du -sx -BG /var/lib/docker /var/lib/containerd 2>/dev/null; } >> "$RUNNER_TEMP/disk.log"
+            avail=$(df -BG --output=avail / | tail -1 | tr -dc 0-9)
+            if [ "$avail" -lt 8 ]; then
+              echo "STOPPED the build at ${avail}G free" >> "$RUNNER_TEMP/disk.log"
+              sudo du -xh -d3 / 2>/dev/null | sort -h | tail -40 >> "$RUNNER_TEMP/disk.log"
+              pkill -f cargo-llvm-cov; pkill -f nextest; pkill -x cargo; exit 0
+            fi
             sleep 30; done' >/dev/null 2>&1 &
 
       - name: Install protoc
