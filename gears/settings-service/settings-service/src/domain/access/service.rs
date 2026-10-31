@@ -77,6 +77,22 @@ pub struct AccessListing {
     pub root: Uuid,
 }
 
+/// Request-local hierarchy facts resolved before entering the settings transaction.
+///
+/// Private fields bind the authenticated actor to the authorized target. Only
+/// hierarchy facts are captured: declaration visibility, stored restrictions,
+/// preconditions and audit writes still use the transaction's database runner.
+/// This does not lock Account Management's hierarchy; concurrent hierarchy
+/// changes have the same preflight consistency model as setting value writes.
+#[domain_model]
+pub struct PreparedAccessMutation {
+    actor: AccessActor,
+    target: Uuid,
+    caller_chain: Vec<Uuid>,
+    target_chain: Vec<Uuid>,
+    root: Uuid,
+}
+
 /// The service.
 #[domain_model]
 pub struct AccessService<D, A, S> {
@@ -160,6 +176,18 @@ where
         actor: &AccessActor,
         key: &SettingKey,
     ) -> Result<Declaration, DomainError> {
+        let (_, chain) = self.root_and_chain(actor.ctx.subject_tenant_id()).await?;
+        self.visible_declaration_on_chain(conn, actor, key, &chain)
+            .await
+    }
+
+    async fn visible_declaration_on_chain<C: DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        chain: &[Uuid],
+    ) -> Result<Declaration, DomainError> {
         let declaration = self
             .declarations
             .find_by_key(conn, &AccessScope::allow_all(), key.as_str())
@@ -169,7 +197,7 @@ where
             return Err(absent());
         }
         if self
-            .effective_for(conn, declaration.id, actor.ctx.subject_tenant_id())
+            .effective_on_chain(conn, declaration.id, chain)
             .await?
             .is_hidden()
         {
@@ -178,7 +206,7 @@ where
         Ok(declaration)
     }
 
-    /// The root tenant and one tenant's chain from it, root first.
+    /// Resolve cross-gear hierarchy data without a settings transaction open.
     async fn root_and_chain(&self, tenant: Uuid) -> Result<(Uuid, Vec<Uuid>), DomainError> {
         let root = self.platform.root_tenant().await?;
         let chain = if tenant == root {
@@ -189,8 +217,36 @@ where
         Ok((root, chain))
     }
 
-    /// Effective access over a chain already obtained.
-    async fn effective_over<C: DBRunner>(
+    /// Authorize the target and gather every hierarchy fact the mutation needs.
+    /// Call this before opening a transaction: the tenant resolver opens its
+    /// own database connection, which the task-local transaction guard forbids
+    /// from inside another gear's transaction.
+    ///
+    /// # Errors
+    /// Unauthorized unless the target is a reachable strict descendant;
+    /// propagates failures resolving the hierarchy or platform root.
+    pub async fn prepare_mutation(
+        &self,
+        actor: &AccessActor,
+        target: Uuid,
+    ) -> Result<PreparedAccessMutation, DomainError> {
+        let caller = actor.ctx.subject_tenant_id();
+        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
+            return Err(denied());
+        }
+        let (_, caller_chain) = self.root_and_chain(caller).await?;
+        let (root, target_chain) = self.root_and_chain(target).await?;
+        Ok(PreparedAccessMutation {
+            actor: actor.clone(),
+            target,
+            caller_chain,
+            target_chain,
+            root,
+        })
+    }
+
+    /// Query current restrictions using a previously resolved hierarchy chain.
+    async fn effective_on_chain<C: DBRunner>(
         &self,
         conn: &C,
         declaration_id: Uuid,
@@ -201,17 +257,6 @@ where
             .find_in_tenants(conn, &AccessScope::allow_all(), declaration_id, chain)
             .await?;
         Ok(strictest(&rows))
-    }
-
-    /// Effective access of one tenant for one declaration.
-    async fn effective_for<C: DBRunner>(
-        &self,
-        conn: &C,
-        declaration_id: Uuid,
-        tenant: Uuid,
-    ) -> Result<EffectiveAccess, DomainError> {
-        let (_, chain) = self.root_and_chain(tenant).await?;
-        self.effective_over(conn, declaration_id, &chain).await
     }
 
     /// The target of a read: the caller's own tenant or a descendant that is
@@ -232,14 +277,24 @@ where
         declaration: Declaration,
         tenant_id: Uuid,
     ) -> Result<AccessReadout, DomainError> {
+        let (root, chain) = self.root_and_chain(tenant_id).await?;
+        self.readout_on_chain(conn, declaration, tenant_id, root, &chain)
+            .await
+    }
+
+    async fn readout_on_chain<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration: Declaration,
+        tenant_id: Uuid,
+        root: Uuid,
+        chain: &[Uuid],
+    ) -> Result<AccessReadout, DomainError> {
         let stored = self
             .access
             .find_one(conn, &AccessScope::allow_all(), declaration.id, tenant_id)
             .await?;
-        // The target's chain is what the upward disclosure boundary reads the
-        // path from the reader tenant down to the target off.
-        let (root, chain) = self.root_and_chain(tenant_id).await?;
-        let effective = self.effective_over(conn, declaration.id, &chain).await?;
+        let effective = self.effective_on_chain(conn, declaration.id, chain).await?;
         let etag = restriction_tag(stored.as_ref());
         Ok(AccessReadout {
             declaration,
@@ -247,7 +302,7 @@ where
             stored,
             effective,
             etag,
-            chain,
+            chain: chain.to_vec(),
             root,
         })
     }
@@ -280,16 +335,12 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-5
     }
 
-    /// Store `read_only` or `hidden` for a strict descendant, inside the
-    /// caller's transaction.
+    /// Prepare and store a restriction using a non-transactional runner.
+    /// For atomic mutation and audit writes, resolve [`Self::prepare_mutation`]
+    /// before opening a transaction, then call [`Self::set_prepared`] inside it.
     ///
     /// # Errors
-    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
-    /// descendant; [`DomainError::Validation`] for `overridable`;
-    /// [`DomainError::NotFound`] for a declaration absent or hidden;
-    /// [`DomainError::Retired`] for a retired one;
-    /// [`DomainError::PreconditionRequired`] and
-    /// [`DomainError::PreconditionFailed`] on the tag.
+    /// As [`Self::prepare_mutation`] and [`Self::set_prepared`].
     pub async fn set<C: DBRunner>(
         &self,
         conn: &C,
@@ -299,11 +350,51 @@ where
         access: TenantAccess,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let caller = actor.ctx.subject_tenant_id();
+        let prepared = self.prepare_mutation(actor, target).await?;
+        self.set_prepared(conn, &prepared, key, access, if_match)
+            .await
+    }
+
+    /// Prepare and clear a restriction using a non-transactional runner.
+    /// For atomic mutation and audit writes, resolve [`Self::prepare_mutation`]
+    /// before opening a transaction, then call [`Self::clear_prepared`] inside it.
+    ///
+    /// # Errors
+    /// As [`Self::prepare_mutation`] and [`Self::clear_prepared`].
+    pub async fn clear<C: DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        target: Uuid,
+        if_match: Option<&str>,
+    ) -> Result<AccessReadout, DomainError> {
+        let prepared = self.prepare_mutation(actor, target).await?;
+        self.clear_prepared(conn, &prepared, key, if_match).await
+    }
+
+    /// Store `read_only` or `hidden` for a strict descendant, inside the
+    /// caller's transaction, using hierarchy facts from [`Self::prepare_mutation`].
+    ///
+    /// # Errors
+    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
+    /// descendant; [`DomainError::Validation`] for `overridable`;
+    /// [`DomainError::NotFound`] for a declaration absent or hidden;
+    /// [`DomainError::Retired`] for a retired one;
+    /// [`DomainError::PreconditionRequired`] and
+    /// [`DomainError::PreconditionFailed`] on the tag.
+    pub async fn set_prepared<C: DBRunner>(
+        &self,
+        conn: &C,
+        prepared: &PreparedAccessMutation,
+        key: &SettingKey,
+        access: TenantAccess,
+        if_match: Option<&str>,
+    ) -> Result<AccessReadout, DomainError> {
+        let actor = &prepared.actor;
+        let target = prepared.target;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
-        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
-            return Err(denied());
-        }
+        // Target authorization was completed by `prepare_mutation`.
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         if access == TenantAccess::Overridable {
@@ -315,7 +406,9 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
-        let declaration = self.visible_declaration(conn, actor, key).await?;
+        let declaration = self
+            .visible_declaration_on_chain(conn, actor, key, &prepared.caller_chain)
+            .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-14
         refuse_retired(&declaration)?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-14
@@ -381,7 +474,14 @@ where
             .append(conn, &AccessScope::allow_all(), record)
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-11
-        self.readout(conn, declaration, target).await
+        self.readout_on_chain(
+            conn,
+            declaration,
+            target,
+            prepared.root,
+            &prepared.target_chain,
+        )
+        .await
     }
 
     /// Delete a strict descendant's row, inside the caller's transaction.
@@ -390,22 +490,22 @@ where
     ///
     /// # Errors
     /// As [`Self::set`], without the access validation.
-    pub async fn clear<C: DBRunner>(
+    pub async fn clear_prepared<C: DBRunner>(
         &self,
         conn: &C,
-        actor: &AccessActor,
+        prepared: &PreparedAccessMutation,
         key: &SettingKey,
-        target: Uuid,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let caller = actor.ctx.subject_tenant_id();
+        let actor = &prepared.actor;
+        let target = prepared.target;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
-        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
-            return Err(denied());
-        }
+        // Target authorization was completed by `prepare_mutation`.
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
-        let declaration = self.visible_declaration(conn, actor, key).await?;
+        let declaration = self
+            .visible_declaration_on_chain(conn, actor, key, &prepared.caller_chain)
+            .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-10
         refuse_retired(&declaration)?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-10
@@ -449,7 +549,14 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-7
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-6
-        self.readout(conn, declaration, target).await
+        self.readout_on_chain(
+            conn,
+            declaration,
+            target,
+            prepared.root,
+            &prepared.target_chain,
+        )
+        .await
     }
 
     /// Evict the target and its descendants after an access change; called
