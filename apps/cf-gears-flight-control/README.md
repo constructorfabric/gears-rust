@@ -17,9 +17,12 @@ It is the distributed counterpart to `cf-gears-example-server`, which links
 deliberately links *only* the control-plane gears, so every other gear can be
 deployed and scaled independently:
 
-- **Profile 2 (Self-Hosted)** — flight-control runs the directory + edge; OoP
-  worker processes register with it over UDS (single-node) or TCP.
-- **Profile 3 (K8s Native)** — flight-control runs as the platform pod; each
+- **Profile 2 (Self-hosted)** — `flight-control` is the minimal `HostRuntime`
+  host: it links only the control-plane gears and can spawn gears marked
+  `runtime.type: oop` in its config as OoP worker processes (see
+  `config/oop-self-hosted.yaml`). Workers may also be started manually by an
+  operator. Workers register with `flight-control`'s DirectoryService.
+- **Profile 3 (K8s Native)** — `flight-control` runs as the control-plane; each
   other gear runs as its own pod, fronted by an external gateway.
 
 The authoritative model lives in `docs/arch/toolkit-oop/`: ADR-0001 (deployment

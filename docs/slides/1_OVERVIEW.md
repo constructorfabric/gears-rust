@@ -335,10 +335,9 @@ A Gear:
 The **logical model stays identical** regardless of the physical boundary.
 
 - **In-process (default)** — gears share one runtime; communicate via typed `ClientHub` clients; wired by Tookit
-- **Out-of-process** — gears as separate processes over **gRPC**
-  - `HostRuntime` OoP orchestration hooks
-  - `toolkit-transport-grpc` transport library
-  - `examples/oop-gears/` demonstrates the pattern
+- **Out-of-process** — gears as separate processes over **REST** (gRPC opt-in)
+  - `HostRuntime` OoP orchestration hooks (`runtime.type: oop` spawns workers)
+  - `config/oop-self-hosted.yaml` + `examples/toolkit/hello/` demonstrate the pattern
 
 > Switch modes with a YAML field (`runtime.type`) — **no code changes**.
 

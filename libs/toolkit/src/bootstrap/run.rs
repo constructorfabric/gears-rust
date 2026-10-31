@@ -80,8 +80,9 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
     // OoP gears are spawned after the start phase (once grpc-hub has bound its port).
     //
-    // No `internal_token_provider` is set here on purpose: this is the
-    // in-process (Profile 1) host. Gear-to-gear calls resolve to LOCAL trait
+    // No `internal_token_provider` is set here on purpose: `run_server` hosts
+    // gears in-process (Profile 1, or a Profile 2 host composition). Gear-to-gear
+    // calls resolve to LOCAL trait
     // objects through the `ClientHub` — there is no transport, so no
     // `X-ToolKit-Internal-Token` header/metadata is ever emitted and no outbound
     // platform credential is needed. The provider is only consulted inside the

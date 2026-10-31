@@ -1,10 +1,11 @@
 # Out-of-process (loopback) E2E suite — self-managed.
 #
-# This suite verifies the Profile 2 (Host + Workers) OoP wiring on loopback: it
-# boots flight-control (edge + DirectoryService) and three OoP gear processes on
-# loopback, discovered via the directory and fronted by the built-in edge — the
-# same OoP software path a Profile 3 (Kubernetes) deployment shares, minus pods
-# and an external gateway. It then asserts the cross-process seams that no unit
+# This suite verifies the OoP runtime wiring on loopback: it boots
+# flight-control (edge + DirectoryService) and three manually launched OoP gear
+# processes on loopback, discovered via the directory and fronted by the
+# built-in edge — the same OoP software path a Profile 3 (Kubernetes)
+# deployment shares, minus pods and an external gateway. It asserts the
+# cross-process seams that no unit
 # test or in-process E2E can reach, organized one concern per file:
 #   - test_edge_routing.py: directory-synced routing + tenant-plane gating of
 #       gear routes — anonymous cross-process proxy (hello), missing-bearer 401,
@@ -26,6 +27,10 @@
 #         reports /readyz 503 (unresolved_deps), then flips to 200 once resolved
 #       * contract-call resilience (ADR-0005): with its provider down, a consumer
 #         charge degrades to a clean 503 (problem+json) and recovers after restart
+#
+# The host-spawn (Profile 2) side of the machinery — `runtime.type: oop` driving
+# process spawn and host shutdown stopping the child — is covered by the sibling
+# suite `testing/e2e/suites/oop_self_hosted`; run separately via `make e2e-oop-self-hosted`.
 #
 # It owns its own lifecycle (multiple distinct binaries), so it is NOT run by the
 # shared `make e2e-local`. Run it directly:
