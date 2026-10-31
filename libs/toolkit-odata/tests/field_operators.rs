@@ -5,7 +5,8 @@
 //! `OperationBuilder::with_odata_filter` writes `x-odata-filter.allowedFields`
 //! from `FieldKind::allows`, and the parser refuses anything outside it, so a
 //! caller reading the contract and a caller probing the endpoint get the same
-//! answer.
+//! answer. A field that serves fewer operators narrows both through
+//! `FilterField::published_ops`; see `published_ops.rs`.
 
 use toolkit_odata::filter::{FieldKind, FilterField, FilterOp, parse_odata_filter};
 
