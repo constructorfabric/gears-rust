@@ -1663,7 +1663,7 @@ pub async fn soft_delete(
                             )
                             .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
                             .project_all(tx, |query| {
-                                edge_ends_columns(query).into_model::<EdgeEnds>()
+                                edge_state_columns(query).into_model::<EdgeState>()
                             })
                             .await
                             .map_err(map_scope_err)?;
@@ -1701,11 +1701,15 @@ pub async fn soft_delete(
                         (removed, edges)
                     }
                     DeleteRequest::Edge(key) => {
-                        let live = edge::Entity::find()
+                        // One read decides whether there is anything to
+                        // delete. A second read of the key, under read
+                        // committed, can see an upsert that revived the edge
+                        // after the first one, and a revived edge is the same
+                        // row, not a key taken by another.
+                        let row = edge::Entity::find()
                             .secure()
                             .scope_with(&scope)
                             .filter(Condition::all().add(edge::Column::EdgeKey.eq(key.clone())))
-                            .filter(Condition::all().add(edge::Column::DeletedAt.is_null()))
                             .limit(1)
                             .project_all(tx, |query| {
                                 edge_ends_columns(query).into_model::<EdgeEnds>()
@@ -1714,8 +1718,15 @@ pub async fn soft_delete(
                             .map_err(map_scope_err)?
                             .into_iter()
                             .next();
-                        let Some(model) = live else {
-                            return already_tombstoned_edge(&scope, tx, &key, epoch).await;
+                        let model = match row {
+                            None => {
+                                return settle_no_op(&scope, tx, None, "edge", &key, epoch).await;
+                            }
+                            Some(row) if row.deleted_at.is_some() => {
+                                return settle_no_op(&scope, tx, Some(true), "edge", &key, epoch)
+                                    .await;
+                            }
+                            Some(row) => row,
                         };
                         // An edge is a statement about two nodes: tombstoning
                         // it needs both endpoints visible under the caller's
@@ -1759,7 +1770,7 @@ pub async fn soft_delete(
                             .rows_affected;
                         // Same rule as the node above.
                         if removed == 0 {
-                            return already_tombstoned_edge(&scope, tx, &key, epoch).await;
+                            return lost_edge_delete(&scope, tx, &key, model.id, epoch).await;
                         }
                         (0u64, removed)
                     }
@@ -1818,23 +1829,48 @@ async fn already_tombstoned_node(
     settle_no_op(scope, tx, found, "node", key, epoch).await
 }
 
-async fn already_tombstoned_edge(
+/// Settle an edge delete that lost its compare-and-set on the row it read.
+async fn lost_edge_delete(
     scope: &AccessScope,
     tx: &impl DBRunner,
     key: &str,
+    read_id: i64,
     epoch: i64,
 ) -> Result<DeleteOutcome, TxStoreError> {
-    let found = edge_tombstoned(scope, tx, key).await?;
-    settle_no_op(scope, tx, found, "edge", key, epoch).await
+    let found = edge_state(scope, tx, key).await?;
+    settle_no_op(
+        scope,
+        tx,
+        lost_edge_verdict(read_id, found),
+        "edge",
+        key,
+        epoch,
+    )
+    .await
 }
 
-/// Whether the edge under `key` is tombstoned now: `None` when no row holds
-/// the key, `Some(false)` while it is live.
-async fn edge_tombstoned(
+/// What a lost edge delete finds under the key, as `settle_no_op` reads it.
+///
+/// An edge, unlike a node, is revived by the next upsert. So a live row
+/// under the key is the row the delete read when its id matches: another
+/// delete tombstoned it and an upsert revived it between the read and the
+/// compare-and-set, and this delete settles as the no-op that ordered before
+/// the revive. Only a live row with another id is a key taken again. Pure,
+/// so each arm is pinned by a unit case rather than by the race.
+fn lost_edge_verdict(read_id: i64, found: Option<(i64, bool)>) -> Option<bool> {
+    match found {
+        Some((id, false)) if id == read_id => Some(true),
+        other => other.map(|(_, tombstoned)| tombstoned),
+    }
+}
+
+/// The row under `key` now and whether it is tombstoned: `None` when no row
+/// holds the key.
+async fn edge_state(
     scope: &AccessScope,
     tx: &impl DBRunner,
     key: &str,
-) -> Result<Option<bool>, TxStoreError> {
+) -> Result<Option<(i64, bool)>, TxStoreError> {
     Ok(edge::Entity::find()
         .secure()
         .scope_with(scope)
@@ -1847,7 +1883,7 @@ async fn edge_tombstoned(
         .map_err(map_scope_err)?
         .into_iter()
         .next()
-        .map(|row| row.deleted_at.is_some()))
+        .map(|row| (row.id, row.deleted_at.is_some())))
 }
 
 /// Settle an edge delete whose endpoint is not visible, although the edge
@@ -1872,7 +1908,9 @@ async fn endpoint_hidden(
     key: &str,
     epoch: i64,
 ) -> Result<DeleteOutcome, TxStoreError> {
-    let tombstoned = edge_tombstoned(scope, tx, key).await?;
+    let tombstoned = edge_state(scope, tx, key)
+        .await?
+        .map(|(_, tombstoned)| tombstoned);
     hidden_endpoint_verdict(tombstoned)?;
     let revision = current_revision(scope, tx).await?;
     Ok(DeleteOutcome {
@@ -2348,5 +2386,32 @@ mod no_op_verdict_tests {
                 "a live {what} under the key must be a conflict, got {verdict:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lost_edge_verdict_tests {
+    use super::lost_edge_verdict;
+
+    /// The row the delete read, live again: tombstoned and revived after the
+    /// read. The delete ordered before the revive, so it is a no-op.
+    #[test]
+    fn the_same_row_live_again_settles_as_a_no_op() {
+        assert_eq!(lost_edge_verdict(7, Some((7, false))), Some(true));
+    }
+
+    /// Another row live under the key: the one the delete read was purged
+    /// and the key taken again, which stays a conflict.
+    #[test]
+    fn another_live_row_under_the_key_stays_a_conflict() {
+        assert_eq!(lost_edge_verdict(7, Some((8, false))), Some(false));
+    }
+
+    /// A tombstone settles and no row is absent, whatever row was read.
+    #[test]
+    fn a_tombstone_settles_and_no_row_is_absent() {
+        assert_eq!(lost_edge_verdict(7, Some((7, true))), Some(true));
+        assert_eq!(lost_edge_verdict(7, Some((8, true))), Some(true));
+        assert_eq!(lost_edge_verdict(7, None), None);
     }
 }
