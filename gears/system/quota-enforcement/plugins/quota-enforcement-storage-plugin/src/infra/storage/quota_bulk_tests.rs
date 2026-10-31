@@ -1,29 +1,33 @@
 #![allow(clippy::expect_used)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use quota_enforcement_sdk::engine::{EvaluationContext, EvaluationLimits, EvaluationOutcome};
 use quota_enforcement_sdk::{
     ApplicableQuotas, AttributionDigest, BulkCreateEntry, BulkCreateEnvelope, BulkDeactivateEntry,
     BulkDeactivateEnvelope, BulkUpdateEntry, BulkUpdateEnvelope, CapPatch, Decision,
-    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, OperationType,
-    PageRequest, PayloadHash, PolicyDraft, PolicyScope, Quota, QuotaDebitPlan, QuotaFilter,
-    QuotaId, QuotaPatch, QuotaStatus, TransitionOutcome,
+    EvaluatedMutation, IdempotencyScope, IdempotencySubjectKey, IdempotencyWrite, MetricId,
+    OperationType, PageRequest, PayloadHash, PolicyDraft, PolicyScope, Quota, QuotaDebitPlan,
+    QuotaFilter, QuotaId, QuotaPatch, QuotaStatus, TransitionOutcome,
 };
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use time::OffsetDateTime;
+use time::macros::datetime;
 use toolkit_db::Db;
 use toolkit_db::outbox::OutboxHandle;
 use toolkit_db::secure::SecureEntityExt;
 use toolkit_security::{AccessScope, SecurityContext};
 
 use crate::domain::ports::{LeaseStore, QuotaStore, StoreError};
-use crate::infra::storage::entity::{idempotency_record, lease, operation_log, quota};
+use crate::infra::storage::entity::{
+    idempotency_record, idempotency_retention_config, lease, operation_log, quota,
+};
 use crate::infra::storage::repo::lease_repo::STATE_RESOLVED_BY_DEACTIVATION;
 use crate::infra::storage::{SqlConsumptionStore, SqlPolicyStore, SqlQuotaStore};
 use crate::test_support::{
-    METRIC_TOKENS, actor, bound_outbox, count_rows, draft, enqueued_messages, other_tenant,
-    quota_changed, scope_for, tenant, test_db, user,
+    METRIC_REQUESTS, METRIC_TOKENS, actor, bound_outbox, count_rows, draft, enqueued_messages,
+    other_tenant, quota_changed, scope_for, tenant, test_db, user,
 };
 
 fn ctx() -> SecurityContext {
@@ -104,6 +108,7 @@ struct Harness {
     quotas: SqlQuotaStore,
     leases: SqlConsumptionStore,
     outbox: OutboxHandle,
+    clock: Arc<Mutex<OffsetDateTime>>,
 }
 
 impl Harness {
@@ -127,18 +132,29 @@ impl Harness {
             )
             .await
             .expect("seed the global policy");
-        let quotas = SqlQuotaStore::new(db.clone(), Arc::clone(&enqueuer) as _);
+        let clock = Arc::new(Mutex::new(OffsetDateTime::now_utc()));
+        let reader = Arc::clone(&clock);
+        let quotas = SqlQuotaStore::with_clock(
+            db.clone(),
+            Arc::clone(&enqueuer) as _,
+            Arc::new(move || *reader.lock().expect("clock")),
+        );
         let leases = SqlConsumptionStore::new(db.clone(), enqueuer);
         Self {
             db,
             quotas,
             leases,
             outbox,
+            clock,
         }
     }
 
     async fn down(self) {
         self.outbox.stop().await;
+    }
+
+    fn set_now(&self, now: OffsetDateTime) {
+        *self.clock.lock().expect("clock") = now;
     }
 
     async fn quota(&self, subject: &str, cap: Option<u64>) -> QuotaId {
@@ -483,5 +499,57 @@ async fn a_bulk_deactivate_resolves_a_shared_lease_under_the_earlier_item() {
             .count(),
         1
     );
+    h.down().await;
+}
+
+#[tokio::test]
+async fn a_bulk_record_lives_for_its_longest_metric_retention_then_a_replay_is_new() {
+    use sea_orm::ActiveValue::Set;
+    let h = Harness::up().await;
+    let start = datetime!(2026-03-17 10:00:00 UTC);
+    let week = 7 * 24 * 3600;
+    toolkit_db::secure::secure_insert::<idempotency_retention_config::Entity>(
+        idempotency_retention_config::ActiveModel {
+            tenant_key: Set(tenant().as_uuid().to_string()),
+            metric_key: Set(METRIC_REQUESTS.to_owned()),
+            retention_seconds: Set(week),
+            updated_at: Set(start),
+        },
+        &AccessScope::allow_all(),
+        &h.db.conn().expect("conn"),
+    )
+    .await
+    .expect("configure retention");
+    h.set_now(start);
+    let mut requests = create_entry("u2");
+    requests.draft.metric = MetricId::parse(METRIC_REQUESTS).expect("metric");
+    let envelope = BulkCreateEnvelope {
+        tenant_id: tenant(),
+        idempotency: envelope_write(OperationType::BulkCreateQuotas, "pack", 1),
+        items: vec![create_entry("u1"), requests],
+    };
+    let created = h
+        .quotas
+        .bulk_create_quotas(&actor(), &envelope)
+        .await
+        .expect("bulk create")
+        .into_inner();
+
+    let deadline = start + time::Duration::seconds(week);
+    h.set_now(deadline - time::Duration::seconds(1));
+    assert_eq!(
+        h.quotas.bulk_create_quotas(&actor(), &envelope).await,
+        Ok(TransitionOutcome::NoOp(created)),
+        "the requests metric keeps the record past the tokens default"
+    );
+
+    h.set_now(deadline);
+    let fresh = h
+        .quotas
+        .bulk_create_quotas(&actor(), &envelope)
+        .await
+        .expect("a new request");
+    assert!(fresh.is_applied(), "an expired record is not replayed");
+    assert_eq!(count_rows::<quota::Entity>(&h.db).await, 4);
     h.down().await;
 }

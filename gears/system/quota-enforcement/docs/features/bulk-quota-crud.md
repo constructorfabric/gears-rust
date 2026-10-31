@@ -306,7 +306,8 @@ lexicographic `quota_id` ordering (`cpt-cf-quota-enforcement-adr-acquisition-ord
 committed envelope key **MUST** return the original outcome without re-applying, with the envelope idempotency record
 persisted in the same transaction as the batch; a divergent payload under the same envelope scope **MUST** return
 `IDEMPOTENCY_PAYLOAD_MISMATCH`, and the replay machinery is the one established by the consumption-operations feature,
-consumed unchanged.
+consumed unchanged. The envelope record is kept for the longest idempotency retention among its items' metrics (PRD
+§5.8, default 24 h); a replay after it expires is a new request.
 
 **Implements**:
 - `cpt-cf-quota-enforcement-algo-bulk-envelope`
