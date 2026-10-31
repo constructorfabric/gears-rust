@@ -37,6 +37,24 @@ cf-gears-resource-group  (this crate — services, repos, REST handlers)
 - `rest` — REST API for types, groups, and memberships (OpenAPI-described)
 - Gear dependencies: `authz-resolver`, `types-registry`
 
+## Configuration
+
+```yaml
+gears:
+  resource-group:
+    config:
+      # GTS type-path prefixes that make an RG type a tenant type
+      # (`tenant_id = group.id`, tenant-root uniqueness). A type is a tenant
+      # type when its code starts with ANY of the entries.
+      # Default: [TENANT_RG_TYPE_PATH] = ["gts.cf.core.rg.type.v1~cf.core._.tenant.v1~"]
+      tenant_type_paths:
+        - "gts.cf.core.rg.type.v1~acme.core._.tenant.v1~"
+```
+
+Entries must be canonical (trimmed, lowercase). `rg-tr-plugin`'s `tenant_types`
+takes exact type paths, not prefixes: list there every concrete tenant type
+that falls under these prefixes.
+
 ## Usage (in-process)
 
 Consumers use the SDK trait from `cf-gears-resource-group-sdk`:

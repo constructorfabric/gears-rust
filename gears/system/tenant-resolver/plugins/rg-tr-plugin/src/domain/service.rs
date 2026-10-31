@@ -4,13 +4,13 @@
 //! Domain service for the RG tenant resolver plugin.
 //!
 //! Maps Resource Group hierarchy data to tenant resolver models.
-//! Groups whose type code equals `TENANT_RG_TYPE_PATH` are treated as tenants;
-//! all other groups are invisible to this plugin.
+//! Groups whose type code is one of the configured tenant types (default:
+//! `TENANT_RG_TYPE_PATH`) are treated as tenants; all other groups are
+//! invisible to this plugin.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
-use resource_group_sdk::TENANT_RG_TYPE_PATH;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
 use resource_group_sdk::error::ResourceGroupError;
 use resource_group_sdk::models::{ResourceGroup, ResourceGroupWithDepth};
@@ -38,65 +38,66 @@ fn hierarchy_eq(field: HierarchyFilterField, value: Value) -> Expr {
     )
 }
 
-/// `type eq '<TENANT_RG_TYPE_PATH>'` — restrict the hierarchy walk to
+/// `<field> in ('<type1>', '<type2>', …)` — restrict a query to
 /// tenant-typed groups only.
-fn tenant_type_filter() -> Expr {
-    hierarchy_eq(
-        HierarchyFilterField::Type,
-        Value::String(TENANT_RG_TYPE_PATH.to_owned()),
+///
+/// Takes the field name so the same helper serves both
+/// `HierarchyFilterField::Type` (hierarchy walks) and
+/// `GroupFilterField::Type` (`list_groups`); both resolve to the public
+/// name `"type"`, but each call site names the typed enum it queries.
+fn tenant_type_filter(field_name: &str, tenant_types: &[String]) -> Expr {
+    Expr::In(
+        Box::new(Expr::Identifier(field_name.to_owned())),
+        tenant_types
+            .iter()
+            .map(|t| Expr::Value(Value::String(t.clone())))
+            .collect(),
     )
 }
-
-/// `type eq '<TENANT_RG_TYPE_PATH>'` expressed via the groups-filter field
-/// enum. Both `HierarchyFilterField::Type` and `GroupFilterField::Type`
-/// resolve to the public name `"type"`; this variant is used with
-/// `list_groups` (the flat listing endpoint) where `GroupFilterField` is
-/// the correct type-safe source of identifiers.
-fn tenant_type_filter_for_groups() -> Expr {
-    Expr::Compare(
-        Box::new(Expr::Identifier(GroupFilterField::Type.name().to_owned())),
-        CompareOperator::Eq,
-        Box::new(Expr::Value(Value::String(TENANT_RG_TYPE_PATH.to_owned()))),
-    )
-}
-
-/// Precomputed `type eq '<TENANT_RG_TYPE_PATH>'` query used for multi-row
-/// ancestor / descendant walks.
-///
-/// Built once via the AST constructors instead of re-parsing the constant
-/// string on every lookup. The `Box<Expr>` clone that eventually lands in
-/// `ODataQuery` happens once per `drain_hierarchy_pages` invocation, not
-/// per page.
-static TENANT_TYPE_FILTER_QUERY: LazyLock<ODataQuery> =
-    LazyLock::new(|| ODataQuery::default().with_filter(tenant_type_filter()));
-
-/// Precomputed `type eq '<TENANT_RG_TYPE_PATH>' and hierarchy/depth eq 0`
-/// query used by `resolve_tenant` for single-node lookup.
-///
-/// The hierarchy API treats the reference group as `depth = 0`; adding the
-/// depth predicate bounds the result to that single row so we don't drag
-/// the entire ancestor chain back from RG just to read the node's metadata.
-static TENANT_SELF_QUERY: LazyLock<ODataQuery> = LazyLock::new(|| {
-    let depth_eq_zero = hierarchy_eq(
-        HierarchyFilterField::HierarchyDepth,
-        Value::Number(0i64.into()),
-    );
-    ODataQuery::default().with_filter(tenant_type_filter().and(depth_eq_zero))
-});
 
 /// RG-based tenant resolver service.
 ///
 /// Resolves tenant data from Resource Group hierarchy. Only groups whose
-/// type code equals [`TENANT_RG_TYPE_PATH`] are treated as tenants — the
-/// prefix is the single source of truth and lives in `resource-group-sdk`.
+/// type code is one of the configured tenant types are treated as tenants
+/// (default: `resource_group_sdk::TENANT_RG_TYPE_PATH`).
 #[domain_model]
 pub struct Service {
     rg: Arc<dyn ResourceGroupReadHierarchy>,
+    /// Configured tenant RG type paths, used for the `list_groups` filter.
+    tenant_types: Vec<String>,
+    /// Precomputed `type in (<tenant types>)` query used for multi-row
+    /// ancestor / descendant walks.
+    ///
+    /// Built once via the AST constructors instead of re-parsing a filter
+    /// string on every lookup. The `Box<Expr>` clone that eventually lands
+    /// in `ODataQuery` happens once per `drain_hierarchy_pages` invocation,
+    /// not per page.
+    tenant_type_query: ODataQuery,
+    /// Precomputed `type in (<tenant types>) and hierarchy/depth eq 0` query
+    /// used by `resolve_tenant` for single-node lookup.
+    ///
+    /// The hierarchy API treats the reference group as `depth = 0`; adding
+    /// the depth predicate bounds the result to that single row so we don't
+    /// drag the entire ancestor chain back from RG just to read the node's
+    /// metadata.
+    tenant_self_query: ODataQuery,
 }
 
 impl Service {
-    pub fn new(rg: Arc<dyn ResourceGroupReadHierarchy>) -> Self {
-        Self { rg }
+    pub fn new(rg: Arc<dyn ResourceGroupReadHierarchy>, tenant_types: Vec<String>) -> Self {
+        let type_filter = tenant_type_filter(HierarchyFilterField::Type.name(), &tenant_types);
+        let depth_eq_zero = hierarchy_eq(
+            HierarchyFilterField::HierarchyDepth,
+            Value::Number(0i64.into()),
+        );
+        let tenant_type_query = ODataQuery::default().with_filter(type_filter.clone());
+        let tenant_self_query = ODataQuery::default().with_filter(type_filter.and(depth_eq_zero));
+        Self {
+            rg,
+            tenant_types,
+            tenant_type_query,
+            tenant_self_query,
+        }
     }
 
     // -- Public query methods (called from client.rs) --
@@ -113,7 +114,7 @@ impl Service {
         id: TenantId,
     ) -> Result<TenantInfo, TenantResolverError> {
         let items = self
-            .drain_hierarchy_pages(ctx, id.0, &TENANT_SELF_QUERY, Direction::Ancestors)
+            .drain_hierarchy_pages(ctx, id.0, &self.tenant_self_query, Direction::Ancestors)
             .await?;
 
         items
@@ -126,7 +127,7 @@ impl Service {
     /// Get multiple tenants by IDs in a single RG round-trip.
     ///
     /// Issues one `list_groups` call with an `OData` filter
-    /// `type eq '<TENANT_RG_TYPE_PATH>' and id in (id1, id2, …)`, then drains
+    /// `type in (<tenant types>) and id in (id1, id2, …)`, then drains
     /// pagination if the result spans multiple pages. This replaces the
     /// previous per-id sequential hierarchy lookups used by
     /// `TenantResolverPluginClient::get_tenants`.
@@ -169,7 +170,8 @@ impl Service {
             id_values,
         );
 
-        let filter = tenant_type_filter_for_groups().and(id_in_filter);
+        let filter =
+            tenant_type_filter(GroupFilterField::Type.name(), &self.tenant_types).and(id_in_filter);
         let base_query = ODataQuery::default().with_filter(filter);
 
         let items = self.drain_list_groups_pages(ctx, base_query).await?;
@@ -188,7 +190,7 @@ impl Service {
         barrier_mode: BarrierMode,
     ) -> Result<(TenantRef, Vec<TenantRef>), TenantResolverError> {
         let items = self
-            .drain_hierarchy_pages(ctx, id.0, &TENANT_TYPE_FILTER_QUERY, Direction::Ancestors)
+            .drain_hierarchy_pages(ctx, id.0, &self.tenant_type_query, Direction::Ancestors)
             .await?;
 
         // Split: depth=0 is the tenant, depth<0 are ancestors
@@ -226,7 +228,7 @@ impl Service {
         max_depth: Option<u32>,
     ) -> Result<(TenantRef, Vec<TenantRef>), TenantResolverError> {
         let items = self
-            .drain_hierarchy_pages(ctx, id.0, &TENANT_TYPE_FILTER_QUERY, Direction::Descendants)
+            .drain_hierarchy_pages(ctx, id.0, &self.tenant_type_query, Direction::Descendants)
             .await?;
 
         // Split: depth=0 is the tenant, depth>0 are descendants
@@ -310,7 +312,11 @@ impl Service {
                 other => TenantResolverError::Internal(other.to_string()),
             })?;
 
-            all_items.extend(page.items);
+            all_items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|g| self.is_tenant_type(&g.code)),
+            );
 
             match page.page_info.next_cursor {
                 Some(cursor_str) => {
@@ -324,6 +330,15 @@ impl Service {
         }
 
         Ok(all_items)
+    }
+
+    /// Whether `code` is one of the configured tenant types.
+    ///
+    /// Applied to every row RG returns, on top of the `type in (...)`
+    /// filter: an RG build whose hierarchy reads ignore that predicate would
+    /// otherwise leak non-tenant groups into tenant results.
+    fn is_tenant_type(&self, code: &str) -> bool {
+        self.tenant_types.iter().any(|t| t == code)
     }
 
     /// Drain all pages from `list_groups` for the given query. Mirrors
@@ -345,7 +360,11 @@ impl Service {
                 .await
                 .map_err(|e| TenantResolverError::Internal(e.to_string()))?;
 
-            all_items.extend(page.items);
+            all_items.extend(
+                page.items
+                    .into_iter()
+                    .filter(|g| self.is_tenant_type(&g.code)),
+            );
 
             match page.page_info.next_cursor {
                 Some(cursor_str) => {
