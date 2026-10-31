@@ -1,12 +1,12 @@
 ---
-status: accepted
+status: superseded by ADR-0020
 date: 2026-02-09
 decision-makers: Constructor Fabric Steering Committee
 ---
 
 # Control Plane Caching — Multi-Layer L1/L2 Strategy
 
-> **Implementation status:** not implemented. OAGW has no configuration cache: every proxied request reads the repositories (with a database, three queries; see [ADR: Optional Persistence](./0018-optional-persistence.md)). No configuration is cached. Endpoint connection pools are; with a shared database, how they follow writes made on other replicas is in [Endpoint Pool Freshness Across Replicas](./0018-optional-persistence.md#endpoint-pool-freshness-across-replicas). OAuth2 tokens and the negotiated HTTP version per host are cached with a TTL, keyed by content, not by upstream.
+> **Superseded by [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md)** (status `proposed` until its benchmark). The multi-layer L1/L2 design below was never implemented. With a database, OAGW keeps a per-replica in-memory cache of the proxy configuration, kept fresh through a cluster change log with a TTL backstop; no configuration is stored in Redis. Without a database there is no configuration cache. Endpoint connection pools are cached; with a shared database, how they follow writes made on other replicas is in [Endpoint Pool Freshness Across Replicas](./0018-optional-persistence.md#endpoint-pool-freshness-across-replicas). OAuth2 tokens and the negotiated HTTP version per host are cached with a TTL, keyed by content, not by upstream.
 
 
 <!-- toc -->

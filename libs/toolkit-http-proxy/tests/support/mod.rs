@@ -31,25 +31,13 @@ pub type RespBody = BoxBody<Bytes, Infallible>;
 /// per-platform choice as `toolkit-http`: Apple corecrypto on macOS, CNG on
 /// Windows (empty unless the host is in FIPS mode), AWS-LC FIPS elsewhere.
 pub fn install_provider() {
-    #[cfg(feature = "fips")]
-    {
-        #[cfg(target_os = "macos")]
-        let _ = rustls_corecrypto_provider::default_provider().install_default();
-        #[cfg(target_os = "windows")]
-        {
-            let provider = rustls_cng_crypto::fips_provider();
-            assert!(
-                !provider.cipher_suites.is_empty(),
-                "Windows is not in FIPS mode (FipsAlgorithmPolicy != 1); \
-                 fips tests need system-wide FIPS mode"
-            );
-            let _ = provider.install_default();
-        }
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        let _ = rustls::crypto::default_fips_provider().install_default();
-    }
-    #[cfg(not(feature = "fips"))]
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let provider = toolkit_security::tls::configured_provider();
+    #[cfg(all(feature = "fips", target_os = "windows"))]
+    assert!(
+        !provider.cipher_suites.is_empty(),
+        "fips tests need Windows FIPS policy enabled"
+    );
+    drop(provider.install_default());
 }
 
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {

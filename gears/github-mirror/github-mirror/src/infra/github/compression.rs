@@ -11,7 +11,7 @@
 
 use std::io::{Read as _, Write as _};
 
-use aws_lc_rs::digest::{self, SHA256};
+use toolkit_security::crypto::hash::Sha256;
 
 use crate::domain::error::DomainError;
 
@@ -114,7 +114,7 @@ impl Compression {
 /// Hex SHA-256 of the **uncompressed** body, for integrity checks.
 #[must_use]
 pub fn content_hash(body: &[u8]) -> String {
-    hex::encode(digest::digest(&SHA256, body).as_ref())
+    hex::encode(Sha256::digest(body).as_ref())
 }
 
 #[cfg(test)]

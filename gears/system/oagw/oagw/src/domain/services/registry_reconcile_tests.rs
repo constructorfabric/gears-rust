@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use credstore_sdk::CredStoreClientV1;
 use tenant_resolver_sdk::{TenantId, TenantResolverClient};
 use tokio_util::sync::CancellationToken;
+use toolkit_db::test_support::{QueryKind, QueryRecorder};
 use toolkit_db::{DBProvider, Db};
 use tracing_test::traced_test;
 use uuid::Uuid;
@@ -24,7 +25,7 @@ use crate::domain::model::{
 use crate::domain::ports::metric_labels::provisioning_reason as why;
 use crate::domain::repo::{
     RegistryRowRepository, RegistryState, RegistryStateStore, RepositoryError, RouteRepository,
-    UpstreamRepository,
+    Tags, UpstreamRepository,
 };
 use crate::domain::services::registry_state::{
     Gate, LEASE_POLL, LEASE_TTL, RunOutcome, content_hash, gated_reconcile,
@@ -37,7 +38,13 @@ use crate::domain::test_support::{
     ErroringCredStore, MockCredStoreClient, MockTenantResolverClient, ProvisioningMetrics,
     UnauthorizedTenantResolver, UnavailableStorage, allow_all_enforcer,
 };
+use crate::infra::proxy_cache::testing::CacheMetrics;
+use crate::infra::proxy_cache::{
+    CachedProxyConfigReader, FlushingRegistryRowRepo, FlushingRouteRepo, FlushingUpstreamRepo,
+    ProxyConfigCache, WriteHook,
+};
 use crate::infra::storage::registry_state_in_memory::InMemoryRegistryStateStore;
+use crate::infra::storage::testing::recorded_sqlite;
 use crate::infra::storage::{
     DbRegistryRowRepo, DbRegistryStateStore, DbRouteRepo, DbUpstreamRepo, InMemoryRegistryRowRepo,
     InMemoryRouteRepo, InMemoryUpstreamRepo,
@@ -228,9 +235,189 @@ fn planes_guarded(
         allow_all_enforcer(),
         credstore,
         Arc::new(ssrf),
+        None,
     ));
     let provisioner = Arc::new(RegistryProvisionerImpl::new(cp.clone(), stores.rows));
     (cp, provisioner)
+}
+
+/// One proxy lookup: the tenant, the alias, and the method and path to
+/// match, if any.
+pub(crate) type Lookup<'a> = (Uuid, &'a str, Option<(&'a str, &'a str)>);
+
+/// What a lookup resolves to, as a comparable value: the effective upstream
+/// and route, or the error.
+pub(crate) type Resolved = Result<(Upstream, Option<Route>), Failed>;
+
+/// A lookup's error, kept typed so a test can match its variant.
+/// `DomainError` has no `PartialEq`; two are equal when their debug forms,
+/// which spell out every field, are.
+#[derive(Debug, Clone)]
+pub(crate) struct Failed(pub(crate) crate::domain::error::DomainError);
+
+impl PartialEq for Failed {
+    fn eq(&self, other: &Self) -> bool {
+        format!("{:?}", self.0) == format!("{:?}", other.0)
+    }
+}
+
+/// Whether `answer` is "not found": no upstream with the alias, or no route.
+pub(crate) fn is_not_found(answer: &Resolved) -> bool {
+    matches!(
+        answer,
+        Err(Failed(crate::domain::error::DomainError::NotFound { .. }))
+    )
+}
+
+/// Whether `answer` is "disabled": the visible upstreams are all disabled.
+pub(crate) fn is_disabled(answer: &Resolved) -> bool {
+    matches!(
+        answer,
+        Err(Failed(
+            crate::domain::error::DomainError::UpstreamDisabled { .. }
+        ))
+    )
+}
+
+/// A Control Plane and its registry write path wired as the gear wires them
+/// on a database (ADR-0020): proxy resolution reads through a proxy
+/// configuration cache, and every write evicts from it. `uncached` reads
+/// the same store directly; the store's statements are recorded.
+pub(crate) struct CachedPlanes {
+    pub(crate) cp: Arc<ControlPlaneServiceImpl>,
+    pub(crate) provisioner: Arc<RegistryProvisionerImpl>,
+    pub(crate) uncached: Arc<ControlPlaneServiceImpl>,
+    /// The hook its writes go through (holding the cache), to connect them
+    /// to a cluster change log.
+    #[cfg(feature = "cluster")]
+    pub(crate) hook: WriteHook,
+    /// What its cache records.
+    #[cfg(feature = "cluster")]
+    pub(crate) metrics: Arc<CacheMetrics>,
+    recorder: QueryRecorder,
+}
+
+impl CachedPlanes {
+    /// On a fresh recorded `SQLite` database, over the tenants `tenants`.
+    pub(crate) async fn new(tenants: Arc<dyn TenantResolverClient>) -> Self {
+        let (db, recorder) = recorded_sqlite().await;
+        Self::over(Stores::new(Backend::Db(db)), recorder, tenants)
+    }
+
+    /// Over `stores`, whose statements `recorder` records.
+    pub(crate) fn over(
+        stores: Stores,
+        recorder: QueryRecorder,
+        tenants: Arc<dyn TenantResolverClient>,
+    ) -> Self {
+        Self::with_ttl(stores, recorder, tenants, Duration::from_secs(60))
+    }
+
+    /// [`over`](Self::over), with cache entries living for `ttl`.
+    pub(crate) fn with_ttl(
+        stores: Stores,
+        recorder: QueryRecorder,
+        tenants: Arc<dyn TenantResolverClient>,
+        ttl: Duration,
+    ) -> Self {
+        let credstore: Arc<dyn CredStoreClientV1> = Arc::new(MockCredStoreClient::empty());
+        let metrics = Arc::new(CacheMetrics::default());
+        let cache = Arc::new(ProxyConfigCache::new(ttl, 100, metrics.clone()));
+        let reader = CachedProxyConfigReader::new(
+            Arc::clone(&cache),
+            stores.upstreams.clone(),
+            stores.routes.clone(),
+        );
+        let hook = WriteHook::new(cache);
+        let cp = Arc::new(ControlPlaneServiceImpl::new(
+            Arc::new(FlushingUpstreamRepo::new(
+                stores.upstreams.clone(),
+                hook.clone(),
+            )),
+            Arc::new(FlushingRouteRepo::new(stores.routes.clone(), hook.clone())),
+            tenants.clone(),
+            allow_all_enforcer(),
+            credstore.clone(),
+            Arc::new(SsrfGuard::disabled()),
+            Some(Arc::new(reader)),
+        ));
+        let provisioner = Arc::new(RegistryProvisionerImpl::new(
+            cp.clone(),
+            Arc::new(FlushingRegistryRowRepo::new(
+                stores.rows.clone(),
+                hook.clone(),
+            )),
+        ));
+        let (uncached, _) = planes_over(stores, tenants, credstore);
+        Self {
+            cp,
+            provisioner,
+            uncached,
+            #[cfg(feature = "cluster")]
+            hook,
+            #[cfg(feature = "cluster")]
+            metrics,
+            recorder,
+        }
+    }
+
+    /// `SELECT`s the store has run so far.
+    pub(crate) fn selects(&self) -> usize {
+        self.recorder
+            .events()
+            .iter()
+            .filter(|e| e.kind == QueryKind::Select)
+            .count()
+    }
+
+    /// Resolve `lookup` through the cache, and check that the answer is
+    /// cached: a second lookup answers the same and runs no `SELECT`.
+    pub(crate) async fn cached(&self, lookup: Lookup<'_>) -> Resolved {
+        let first = resolve(&self.cp, lookup).await;
+        let selects = self.selects();
+        let second = resolve(&self.cp, lookup).await;
+        assert_eq!(self.selects(), selects, "{lookup:?} is cached");
+        assert_eq!(second, first, "{lookup:?}");
+        second
+    }
+
+    /// Run `write` and check that the next lookups through the cache see
+    /// it: before `write` each lookup's answer is cached; after it, each
+    /// answers as without the cache, and differently from before.
+    pub(crate) async fn assert_sees<T>(
+        &self,
+        name: &str,
+        lookups: &[Lookup<'_>],
+        write: impl AsyncFnOnce() -> T,
+    ) -> T {
+        let mut before = Vec::with_capacity(lookups.len());
+        for &lookup in lookups {
+            before.push(self.cached(lookup).await);
+        }
+        let written = write().await;
+        for (&lookup, before) in lookups.iter().zip(before) {
+            let after = resolve(&self.cp, lookup).await;
+            assert_eq!(
+                after,
+                resolve(&self.uncached, lookup).await,
+                "{name}: {lookup:?} through the cache"
+            );
+            assert_ne!(after, before, "{name} changes {lookup:?}");
+        }
+        written
+    }
+}
+
+/// What `cp` resolves `lookup` to, without tags.
+pub(crate) async fn resolve(
+    cp: &ControlPlaneServiceImpl,
+    (tenant, alias, target): Lookup<'_>,
+) -> Resolved {
+    let ctx = provisioning_ctx(tenant).expect("security context");
+    let chain = cp.build_tenant_chain(&ctx).await.map_err(Failed)?;
+    cp.resolve_alias(&ctx, &chain, alias, target, Tags::Skip)
+        .await
+        .map_err(Failed)
 }
 
 /// A Control Plane and its registry write path in memory, one tenant.
@@ -2538,6 +2725,12 @@ impl RouteRepository for FailingRoutes {
             .find_matching_in_tenants(tenant_chain, upstream_ids, method, path, tags)
             .await
     }
+    async fn list_proxy_routes(
+        &self,
+        upstreams: &[crate::domain::repo::RowKey],
+    ) -> Result<Vec<(crate::domain::repo::RowKey, Vec<Route>)>, RepositoryError> {
+        self.0.list_proxy_routes(upstreams).await
+    }
     async fn update(&self, route: Route) -> Result<Route, RepositoryError> {
         self.0.update(route).await
     }
@@ -2690,4 +2883,72 @@ async fn a_hung_write_aborts_the_run_after_the_call_timeout() {
         f.upstream(root, id(&upstreams[0])).await.is_some(),
         "phase 4 ran before the hang"
     );
+}
+
+// ---------------------------------------------------------------------------
+// The proxy configuration cache (ADR-0020)
+// ---------------------------------------------------------------------------
+
+/// Every reconcile write is seen by the next lookup through the cache:
+/// creates, upstream and route updates, a route move, and the removal,
+/// whose upstreams go through `delete_upstream_if_unused` (a route delete
+/// evicts no alias entry, so the alias lookups see only that).
+///
+/// ADR-0020: CACHE-FRESH-002.
+#[tokio::test]
+async fn reconcile_writes_are_seen_through_the_proxy_cache() {
+    let root = Uuid::new_v4();
+    let f = CachedPlanes::new(Arc::new(MockTenantResolverClient::single_tenant())).await;
+    let metrics = ProvisioningMetrics::default();
+    let run = async |upstreams: &[ProvisionedUpstream], routes: &[ProvisionedRoute]| {
+        let counts = reconcile_registry(
+            &*f.provisioner,
+            &metrics,
+            &Unattended,
+            upstreams,
+            routes,
+            root,
+        )
+        .await
+        .unwrap();
+        assert!(counts.is_clean(), "{counts:?}");
+    };
+    let (mut upstreams, mut routes) = registry_instances(root);
+    let other = upstream_at(root, "other.example.com");
+    upstreams.push(other.clone());
+    let (v1, v2) = (Some(("POST", "/v1")), Some(("POST", "/v2")));
+    let api = |target| (root, "api.example.com", target);
+    let moved_to = |target| (root, "other.example.com", target);
+
+    f.assert_sees(
+        "create",
+        &[api(None), api(v1), moved_to(None)],
+        async || run(&upstreams, &routes).await,
+    )
+    .await;
+
+    upstreams[0].request.enabled = false;
+    f.assert_sees("upstream update", &[api(None), api(v1)], async || {
+        run(&upstreams, &routes).await;
+    })
+    .await;
+    upstreams[0].request.enabled = true;
+    run(&upstreams, &routes).await;
+
+    set_path(&mut routes[0], "/v2");
+    f.assert_sees("route update", &[api(v1), api(v2)], async || {
+        run(&upstreams, &routes).await;
+    })
+    .await;
+
+    routes[0].request.upstream_id = id(&other);
+    f.assert_sees("route move", &[api(v2), moved_to(v2)], async || {
+        run(&upstreams, &routes).await;
+    })
+    .await;
+
+    f.assert_sees("removal", &[api(None), moved_to(None)], async || {
+        run(&[], &[]).await;
+    })
+    .await;
 }

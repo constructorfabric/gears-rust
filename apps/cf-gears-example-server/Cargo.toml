@@ -22,6 +22,10 @@ nodes-registry = ["dep:nodes_registry"]
 resource-group = ["dep:resource_group"]
 grpc-hub = ["dep:grpc_hub"]
 oagw = ["dep:api_egress"]
+# OAGW with the cluster gear in the same process (plus grpc-hub, which cluster
+# requires), needed on a database for the proxy configuration cache (ADR-0020);
+# `oagw` alone runs OAGW in memory only.
+oagw-embedded = ["oagw", "api_egress/cluster", "dep:cluster", "grpc-hub"]
 credstore = ["dep:credstore"]
 graph-storage = ["dep:graph-storage"]
 settings-service = ["dep:settings_service", "credstore"]

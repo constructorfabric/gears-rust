@@ -10,8 +10,11 @@
 //! path, methods and plugins (its tags only when requested): 2 queries (3 with
 //! tags) at any hierarchy depth. The loaded winner is re-checked against the
 //! request; a request that raced a write selects once more (2 more queries).
+//! `list_proxy_routes` loads every enabled HTTP route of several upstreams in
+//! full with that same join, without the winner filter: 1 query.
 //! `get_by_id` and `list` read in one read-only snapshot transaction;
-//! `find_matching_in_tenants` runs in none (ADR-0018 *Transactions*).
+//! `find_matching_in_tenants` and `list_proxy_routes` run in none (ADR-0018
+//! *Transactions*).
 //! Creates and updates run in one READ COMMITTED transaction, retried on
 //! contention, and replace child rows by delete-then-insert. An enabled HTTP
 //! route first locks its upstream row (`upstream_lock`) and runs the overlap
@@ -19,13 +22,13 @@
 //! serialize and the second sees the first. Deletes are one statement.
 //! The registry reconcile's cross-tenant read lives in `registry_row_db_repo`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use async_trait::async_trait;
 use sea_orm::ActiveValue::NotSet;
 use sea_orm::{
     ColumnTrait, DbBackend, EntityTrait, FromQueryResult, IdenStatic, Iterable, JoinType, Order,
-    QueryFilter, QuerySelect, RelationTrait,
+    QueryFilter, QuerySelect, RelationTrait, Select,
 };
 use time::OffsetDateTime;
 use toolkit_db::secure::{
@@ -39,7 +42,7 @@ use super::entity::{
     route, route_grpc_match, route_http_match, route_method, route_plugin, route_tag,
 };
 use super::error::{internal, invalid_stored, not_found, route_create, route_update};
-use super::load::{Parent, by_parent, children, snapshot, update_one};
+use super::load::{Parent, by_parent, children, max_in_list, snapshot, update_one};
 use super::mapper::{
     CandidateRow, MATCH_TYPE_HTTP, RouteChildRows, RouteChildren, http_candidate, method_text,
     parse_managed_by, parse_stored_method, route_from_rows, route_rows, sorted_tags,
@@ -48,18 +51,18 @@ use super::mapper::{
 use super::upstream_lock::{Hold, HoldBeforeCommit};
 use super::upstream_lock::{lock_upstream, read_committed_for};
 use crate::domain::model::{HttpMethod, ListQuery, Route};
-use crate::domain::repo::{RepositoryError, RouteOverlap, RouteRepository, Tags};
+use crate::domain::repo::{RepositoryError, RouteOverlap, RouteRepository, RowKey, Tags};
 use crate::domain::route_matching::{parse_method, select_route};
 
 const ENTITY: &str = "route";
 
-/// Column prefix of the plugin binding in [`WinnerRow`].
+/// Column prefix of the plugin binding in [`FullRouteRow`].
 const PLUGIN_PREFIX: &str = "plugin_";
 
-/// The winning route joined with its path, one of its methods and one of its
-/// plugin bindings (`None`: no bindings).
+/// A route joined with its path, one of its methods and one of its plugin
+/// bindings (`None`: no bindings).
 #[derive(FromQueryResult)]
-struct WinnerRow {
+struct FullRouteRow {
     #[sea_orm(nested)]
     route: route::Model,
     path_prefix: String,
@@ -344,17 +347,35 @@ async fn select_and_load(
     };
     let (winner_id, winner_tenant) = (winner.id, winner.tenant_id);
 
-    // The winner in full: one row per (method, plugin binding), joined on
-    // the composite foreign keys like the candidates. Its path and upstream
-    // are read here, not taken from the candidate query, so the caller
-    // checks the route as stored now.
-    let rows: Vec<WinnerRow> = route::Entity::find()
-        .filter(route::Column::Id.eq(winner_id))
-        .filter(route::Column::UpstreamId.is_in(upstream_ids.iter().copied()))
+    // The winner in full. Its path and upstream are read here, not taken
+    // from the candidate query, so the caller checks the route as stored now.
+    let winner = full_http_routes(
+        conn,
+        route::Entity::find()
+            .filter(route::Column::Id.eq(winner_id))
+            .filter(route::Column::UpstreamId.is_in(upstream_ids.iter().copied())),
+        AccessScope::for_tenant(winner_tenant),
+    )
+    .await?
+    .pop();
+    Ok(Attempt::Winner(winner.map(Box::new)))
+}
+
+/// The enabled HTTP routes `select` filters, in full with their path,
+/// methods and plugins but without tags, in ID order: one query of one row
+/// per (route, method, plugin binding), inner-joined to the HTTP match and
+/// the methods and left-joined to the plugins on the composite foreign keys,
+/// whose tenant keeps every child in its scoped route's tenant.
+async fn full_http_routes(
+    conn: &impl DBRunner,
+    select: Select<route::Entity>,
+    scope: AccessScope,
+) -> Result<Vec<Route>, RepositoryError> {
+    let rows: Vec<FullRouteRow> = select
         .filter(route::Column::Enabled.eq(true))
         .filter(route::Column::MatchType.eq(MATCH_TYPE_HTTP))
         .secure()
-        .scope_with(&AccessScope::for_tenant(winner_tenant))
+        .scope_with(&scope)
         .project_all(conn, |q| {
             route_plugin::Column::iter()
                 .fold(
@@ -365,52 +386,83 @@ async fn select_and_load(
                         .join_rev(JoinType::LeftJoin, route_plugin::Relation::Route.def()),
                     |q, col| q.column_as(col, format!("{PLUGIN_PREFIX}{}", col.as_str())),
                 )
-                .into_model::<WinnerRow>()
+                .into_model::<FullRouteRow>()
         })
         .await
         .map_err(internal)?;
-    let mut row = None;
-    let mut methods: Vec<route_method::Model> = Vec::new();
-    let mut plugins: BTreeMap<i32, route_plugin::Model> = BTreeMap::new();
-    for WinnerRow {
+
+    /// One route's rows, folded.
+    struct Parts {
+        row: route::Model,
+        path_prefix: String,
+        methods: Vec<route_method::Model>,
+        plugins: BTreeMap<i32, route_plugin::Model>,
+    }
+    let mut routes: BTreeMap<Uuid, Parts> = BTreeMap::new();
+    for FullRouteRow {
         route,
         path_prefix,
         method,
         plugin,
     } in rows
     {
-        if !methods.iter().any(|m| m.method == method) {
-            methods.push(route_method::Model {
-                route_id: route.id,
-                tenant_id: route.tenant_id,
+        let parts = routes.entry(route.id).or_insert_with(|| Parts {
+            row: route,
+            path_prefix,
+            methods: Vec::new(),
+            plugins: BTreeMap::new(),
+        });
+        if !parts.methods.iter().any(|m| m.method == method) {
+            parts.methods.push(route_method::Model {
+                route_id: parts.row.id,
+                tenant_id: parts.row.tenant_id,
                 method,
             });
         }
         if let Some(plugin) = plugin {
-            plugins.entry(plugin.position).or_insert(plugin);
+            parts.plugins.entry(plugin.position).or_insert(plugin);
         }
-        row.get_or_insert((route, path_prefix));
     }
-    let plugins: Vec<route_plugin::Model> = plugins.into_values().collect();
-    let Some((row, path_prefix)) = row else {
-        return Ok(Attempt::Winner(None));
-    };
-    let http_match = route_http_match::Model {
-        route_id: row.id,
-        tenant_id: row.tenant_id,
-        path_prefix,
-    };
-    let route = route_from_rows(
-        row,
-        RouteChildren {
-            http_match: Some(http_match),
-            methods,
-            grpc_match: None,
-            tags: Vec::new(),
-            plugins,
-        },
-    )?;
-    Ok(Attempt::Winner(Some(Box::new(route))))
+    routes
+        .into_values()
+        .map(|parts| {
+            let http_match = route_http_match::Model {
+                route_id: parts.row.id,
+                tenant_id: parts.row.tenant_id,
+                path_prefix: parts.path_prefix,
+            };
+            route_from_rows(
+                parts.row,
+                RouteChildren {
+                    http_match: Some(http_match),
+                    methods: parts.methods,
+                    grpc_match: None,
+                    tags: Vec::new(),
+                    plugins: parts.plugins.into_values().collect(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// `routes` (in ID order) under the key of their upstream: one entry per
+/// distinct key, in the order the keys first appear. Tenant and upstream are
+/// filtered separately, so a route whose `(tenant, upstream)` pair is not
+/// one of the keys is dropped here.
+fn group_by_upstream(keys: &[RowKey], routes: Vec<Route>) -> Vec<(RowKey, Vec<Route>)> {
+    let mut grouped: HashMap<RowKey, Vec<Route>> = HashMap::new();
+    for route in routes {
+        let key = RowKey {
+            tenant_id: route.tenant_id,
+            id: route.upstream_id,
+        };
+        grouped.entry(key).or_default().push(route);
+    }
+    let mut seen = HashSet::new();
+    keys.iter()
+        .filter(|key| seen.insert(**key))
+        .map(|key| (*key, grouped.remove(key).unwrap_or_default()))
+        .collect()
 }
 
 /// One row per (stored route, shared method) of the overlap rule (see
@@ -607,6 +659,32 @@ impl RouteRepository for DbRouteRepo {
             Tags::Skip => Vec::new(),
         };
         Ok(Route { tags, ..route })
+    }
+
+    async fn list_proxy_routes(
+        &self,
+        upstreams: &[RowKey],
+    ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError> {
+        if upstreams.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.db.conn()?;
+        let mut routes = Vec::new();
+        // Each chunk binds at most one tenant per key plus the upstream IDs;
+        // only keys past the backend's bind limit take a second query.
+        for chunk in upstreams.chunks(max_in_list(&conn, 2).div_euclid(2).max(1)) {
+            let tenants: BTreeSet<Uuid> = chunk.iter().map(|k| k.tenant_id).collect();
+            routes.extend(
+                full_http_routes(
+                    &conn,
+                    route::Entity::find()
+                        .filter(route::Column::UpstreamId.is_in(chunk.iter().map(|k| k.id))),
+                    AccessScope::for_tenants(tenants.into_iter().collect()),
+                )
+                .await?,
+            );
+        }
+        Ok(group_by_upstream(upstreams, routes))
     }
 
     async fn update(&self, route: Route) -> Result<Route, RepositoryError> {

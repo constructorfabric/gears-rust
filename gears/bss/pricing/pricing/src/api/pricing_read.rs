@@ -92,7 +92,7 @@ impl PricingReadV1 for PricingReadProvider {
                 query.price_id,
             )
             .await?;
-        let snapshot = support::transaction_door(&self.state.db.db(), move |tx| {
+        let snapshot = support::transaction_door_read(&self.state.db.db(), move |tx| {
             let scope = scope.clone();
             Box::pin(async move {
                 pricing_reads::load_price(tx, &scope, query.catalog.tenant_id, query.price_id).await

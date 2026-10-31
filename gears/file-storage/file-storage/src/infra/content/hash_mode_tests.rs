@@ -1,13 +1,13 @@
 //! Wire-format tests for `Manifest` (ADR-0006): the grammar must be byte-for-byte unambiguous.
 
-use sha2::{Digest, Sha256};
+use toolkit_security::crypto::hash::Sha256;
 
 use super::*;
 
 fn digest_of(bytes: &[u8]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().into()
+    hasher.finalize()
 }
 
 fn sample_entries() -> Vec<ManifestEntry> {
@@ -76,7 +76,7 @@ fn root_matches_independently_computed_reference_sha256() {
     let reference_root: [u8; 32] = {
         let mut hasher = Sha256::new();
         hasher.update(wire.as_bytes());
-        hasher.finalize().into()
+        hasher.finalize()
     };
 
     assert_eq!(manifest.root(), reference_root);

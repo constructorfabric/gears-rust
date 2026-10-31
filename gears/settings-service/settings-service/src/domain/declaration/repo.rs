@@ -354,6 +354,22 @@ pub trait DeclarationRepository: Send + Sync {
         id: Uuid,
     ) -> Result<(), DomainError>;
 
+    /// Hard-delete a declaration at the version the caller compared its tag
+    /// against. The only path that hard-deletes a declaration; its
+    /// `setting_values`, `tenant_permissions` and `pending_secrets` go by
+    /// `ON DELETE CASCADE`.
+    ///
+    /// # Errors
+    /// [`DomainError::PreconditionFailed`] when no row is at `expected` any
+    /// more.
+    async fn delete<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError>;
+
     /// Adopt a re-declaration's Schema Default — the definition arm of the
     /// effective recency — stamping `last_change_at` and `updated_at`.
     ///

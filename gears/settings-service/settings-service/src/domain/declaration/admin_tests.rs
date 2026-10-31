@@ -17,25 +17,36 @@ use crate::domain::declaration::{
     Declaration, DeclarationDraft, DeclarationRepository, DeclarationStatus,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecretManager as _;
+use crate::domain::ports::StepUpOperation;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::domain::writes::WriteActor;
 use crate::infra::storage::category_repo::CategoryRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
+use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, ResolutionHarness, SECRET, TEXT,
-    resolution_catalogue,
+    BOOL, FixedStepUp, RecordingAudit, RecordingMetrics, RecordingRegistrar, RecordingSecrets,
+    ResolutionHarness, SECRET, TEXT, resolution_catalogue,
 };
 
-type Admin = DeclarationAdmin<DeclarationRepo, CategoryRepo, ValueRepo, Arc<RecordingAudit>>;
+type Admin = DeclarationAdmin<
+    DeclarationRepo,
+    CategoryRepo,
+    ValueRepo,
+    Arc<RecordingAudit>,
+    PendingSecretRepo,
+>;
 
 struct Harness {
     base: ResolutionHarness,
     admin: Admin,
     audit: Arc<RecordingAudit>,
     registrar: Arc<RecordingRegistrar>,
+    secrets: Arc<RecordingSecrets>,
+    metrics: Arc<RecordingMetrics>,
 }
 
 impl Harness {
@@ -55,6 +66,8 @@ impl Harness {
         let base = ResolutionHarness::new().await;
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(RecordingRegistrar::default());
+        let secrets = Arc::new(RecordingSecrets::default());
+        let metrics = Arc::new(RecordingMetrics::default());
         let admin = DeclarationAdmin::new(
             DeclarationRepo,
             CategoryRepo,
@@ -64,12 +77,17 @@ impl Harness {
             step_up,
             Arc::clone(&audit),
             Arc::clone(&base.cache),
+            PendingSecretRepo,
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            Arc::clone(&metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
         );
         Self {
             base,
             admin,
             audit,
             registrar,
+            secrets,
+            metrics,
         }
     }
 
@@ -127,6 +145,44 @@ impl Harness {
         self.admin
             .retire(&conn, &AccessScope::allow_all(), id, if_match, actor)
             .await
+    }
+
+    async fn purge(
+        &self,
+        id: Uuid,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+    ) -> Result<super::PurgedDeclaration, DomainError> {
+        let conn = self.base.db.conn().expect("connection");
+        self.admin
+            .purge(&conn, &AccessScope::allow_all(), id, if_match, actor)
+            .await
+    }
+
+    /// An admin-authored declaration, retired; answers its id and current tag.
+    async fn retired(&self, name: &str) -> (Uuid, String) {
+        let created = self
+            .create(self.request(name), &admin_actor())
+            .await
+            .expect("created");
+        let id = created.declaration.id;
+        let tag = etag_of(&created.declaration);
+        self.retire(id, Some(tag.as_str()), &admin_actor())
+            .await
+            .expect("retired");
+        let tag = etag_of(&self.load(id).await);
+        (id, tag.as_str().to_owned())
+    }
+
+    /// How many declarations the setting has had, whatever their status.
+    async fn versions_of(&self, key: &str) -> usize {
+        let conn = self.base.db.conn().expect("connection");
+        let prefix = key.strip_suffix("1~").expect("a v1 key");
+        DeclarationRepo
+            .find_by_key_prefix(&conn, &AccessScope::allow_all(), prefix)
+            .await
+            .expect("lookup")
+            .len()
     }
 
     async fn load(&self, id: Uuid) -> Declaration {
@@ -2009,6 +2065,9 @@ async fn a_validator_that_goes_down_at_the_row_re_validation_fails_the_report_un
         Arc::new(FixedStepUp::verified()),
         Arc::clone(&h.audit),
         Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
     );
     let conn = h.base.db.conn().expect("connection");
     let scope = AccessScope::allow_all();
@@ -2199,6 +2258,9 @@ async fn rows_holding_the_same_value_are_judged_once_and_each_gets_its_own_verdi
         Arc::new(FixedStepUp::verified()),
         Arc::clone(&h.audit),
         Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
     );
     let conn = h.base.db.conn().expect("connection");
     let scope = AccessScope::allow_all();
@@ -2456,6 +2518,25 @@ impl ValueRepository for BatchRecordingValues {
             .delete(conn, scope, declaration_id, tenant_id, expected)
             .await
     }
+
+    async fn secret_refs<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DomainError> {
+        ValueRepo.secret_refs(conn, declaration_id).await
+    }
+
+    async fn references_held_by_others<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<std::collections::HashSet<String>, DomainError> {
+        ValueRepo
+            .references_held_by_others(conn, declaration_id, refs)
+            .await
+    }
 }
 
 /// A retired `retry_policy` declaration, its report asked of an admin whose
@@ -2475,6 +2556,9 @@ async fn report_over(
         Arc::new(FixedStepUp::verified()),
         Arc::clone(&h.audit),
         Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
     );
     let conn = h.base.db.conn().expect("connection");
     let scope = AccessScope::allow_all();
@@ -2581,4 +2665,944 @@ async fn the_listing_stops_after_the_first_tenant_batch_that_fills_the_limit() {
     assert!(report.rows.is_empty());
     assert_eq!(report.total, 6);
     assert!(batches.is_empty());
+}
+// ── Purge ────────────────────────────────────────────────────────────────────
+
+fn conflict_detail(err: DomainError) -> String {
+    match err {
+        DomainError::Conflict { detail } => detail,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_purge_refuses_an_active_and_a_contributed_declaration_and_wants_a_current_tag() {
+    let h = Harness::verified().await;
+
+    // Active: refused as not retired, and still there.
+    let created = h
+        .create(h.request("live"), &admin_actor())
+        .await
+        .expect("created");
+    let live = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    let err = h
+        .purge(live, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("active");
+    assert!(
+        conflict_detail(err).starts_with(super::conflict::NOT_RETIRED),
+        "the status refusal"
+    );
+    assert_eq!(h.load(live).await.status, DeclarationStatus::Active);
+
+    // Contributed, active or retired: the kind is judged before the status.
+    let contributed = h
+        .base
+        .declare(
+            "owned",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let tag = etag_of(&h.load(contributed).await);
+    let err = h
+        .purge(contributed, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("contributed");
+    assert!(conflict_detail(err).starts_with(super::conflict::CONTRIBUTED_IMMUTABLE));
+    h.base.retire(contributed).await;
+    let tag = etag_of(&h.load(contributed).await);
+    let err = h
+        .purge(contributed, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("contributed, retired");
+    assert!(conflict_detail(err).starts_with(super::conflict::CONTRIBUTED_IMMUTABLE));
+
+    // Retired: the tag is required, and a stale one is refused.
+    let (id, tag) = h.retired("gone").await;
+    let err = h.purge(id, None, &admin_actor()).await.expect_err("no tag");
+    assert!(
+        matches!(err, DomainError::PreconditionRequired { .. }),
+        "{err:?}"
+    );
+    let err = h
+        .purge(id, Some("\"stale\""), &admin_actor())
+        .await
+        .expect_err("stale tag");
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "nothing was removed"
+    );
+
+    // And a current one purges.
+    h.purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+}
+
+#[tokio::test]
+async fn a_purge_collects_every_reference_held_at_any_scope_and_subject_and_records_a_remove() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("tokens").await;
+    let key = h.load(id).await.key;
+    let t = &h.base.tree;
+    h.base.set(id, t.root, json!(true)).await;
+    h.base.set_secret(id, t.a, "value-a").await;
+    h.base.set_secret(id, t.b, "value-b").await;
+    h.base.set_subject_secret(id, t.c, "value-subject").await;
+    h.base.stage_secret(id, t.s, "staged-s").await;
+    // The same entry named twice is released once.
+    h.base.stage_secret(id, t.a, "value-a").await;
+
+    let purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    assert_eq!(purged.key, key);
+    let mut refs: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| (e.tenant, e.secret_ref.as_str()))
+        .collect();
+    refs.sort();
+    let mut expected = vec![
+        (t.a, "value-a"),
+        (t.b, "value-b"),
+        (t.c, "value-subject"),
+        (t.s, "staged-s"),
+    ];
+    expected.sort();
+    assert_eq!(refs, expected);
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_all(&conn, &AccessScope::allow_all(), id)
+            .await
+            .expect("rows")
+            .is_empty()
+    );
+    let records = h.audit.records();
+    let last = records.last().expect("a record");
+    assert_eq!(last.operation, AuditOperation::Remove);
+    assert!(last.pre_image.is_some() && last.post_image.is_none());
+    assert_eq!(last.declaration_key, key);
+}
+
+#[tokio::test]
+async fn every_declaration_action_counts_its_step_up_under_its_own_operation() {
+    let h = Harness::verified().await;
+
+    // update: loosening a gate needs step-up.
+    let created = h
+        .create(h.request("tuned"), &admin_actor())
+        .await
+        .expect("created");
+    let tag = etag_of(&created.declaration);
+    h.update(
+        created.declaration.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &admin_actor(),
+    )
+    .await
+    .expect("updated");
+
+    // evolve: a changed default on the active declaration.
+    let mut evolved = h.request("tuned");
+    evolved.default_value = json!(true);
+    let evolved = h.create(evolved, &admin_actor()).await.expect("evolved");
+    assert!(evolved.evolved);
+
+    // retire, reactivate, purge on another one.
+    let (id, _) = h.retired("cycled").await;
+    let revived = h
+        .create(h.request("cycled"), &admin_actor())
+        .await
+        .expect("revived");
+    assert!(revived.reactivated);
+    let tag = etag_of(&revived.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired again");
+    let tag = etag_of(&h.load(id).await);
+    h.purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Update),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Evolve),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Reactivate),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Retire),
+        vec!["verified"; 2]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["verified"]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_step_up_is_counted_by_its_code_and_a_service_principal_as_its_own_result() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Stale))).await;
+    // Judged before anything is read: no row at this id, still the challenge.
+    let err = h
+        .purge(Uuid::new_v4(), Some("\"any\""), &admin_actor())
+        .await
+        .expect_err("challenge");
+    assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
+    assert_eq!(h.metrics.step_ups_of(StepUpOperation::Purge), vec!["stale"]);
+
+    let err = h
+        .purge(Uuid::new_v4(), Some("\"any\""), &service_actor())
+        .await
+        .expect_err("machine");
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["stale", "service_principal"]
+    );
+
+    // An outage of the verifier is counted too, and is no challenge.
+    let down = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Unavailable(
+        "authn down".to_owned(),
+    ))))
+    .await;
+    let err = down
+        .purge(Uuid::new_v4(), Some("\"any\""), &admin_actor())
+        .await
+        .expect_err("unavailable");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+    assert_eq!(
+        down.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["unavailable"]
+    );
+}
+
+// ── The release ──────────────────────────────────────────────────────────────
+
+fn held(n: usize) -> super::PurgedDeclaration {
+    super::PurgedDeclaration {
+        id: Uuid::new_v4(),
+        key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.x.v1~".to_owned(),
+        secrets: (0..n)
+            .map(|i| super::HeldSecret {
+                tenant: Uuid::new_v4(),
+                secret_ref: format!("ref-{i}"),
+            })
+            .collect(),
+        kept_secrets: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn the_release_counts_ok_for_every_entry_and_failed_when_the_store_refuses() {
+    let h = Harness::verified().await;
+    let purged = held(3);
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext");
+    }
+
+    let summary = h.admin.release_purged(purged.clone(), "req-1").await;
+
+    assert_eq!((summary.released, summary.failed), (3, 0));
+    assert!(h.secrets.held().is_empty());
+    assert_eq!(
+        *h.metrics.purge_releases.lock().expect("lock"),
+        vec!["ok"; 3]
+    );
+
+    h.secrets.go_down();
+    let summary = h.admin.release_purged(purged, "req-2").await;
+    assert_eq!((summary.released, summary.failed), (0, 3));
+    assert_eq!(
+        h.metrics
+            .purge_releases
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|r| **r == "failed")
+            .count(),
+        3
+    );
+}
+
+/// A store that answers every release after a pause and remembers how many
+/// were in flight at once; optionally holds each one at a gate.
+struct SlowStore {
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    started: std::sync::atomic::AtomicUsize,
+    released: std::sync::atomic::AtomicUsize,
+    gate: Option<tokio::sync::Semaphore>,
+}
+
+impl SlowStore {
+    fn new(gated: bool) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: 0.into(),
+            peak: 0.into(),
+            started: 0.into(),
+            released: 0.into(),
+            gate: gated.then(|| tokio::sync::Semaphore::new(0)),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::domain::ports::SecretManager for SlowStore {
+    fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
+        unreachable!("a release mints nothing")
+    }
+    async fn store_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+        _plaintext: &Value,
+    ) -> Result<(), DomainError> {
+        unreachable!("a release stores nothing")
+    }
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<SecretString, DomainError> {
+        unreachable!("a release reads nothing")
+    }
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.started.fetch_add(1, SeqCst);
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.peak.fetch_max(now, SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.expect("open gate").forget();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.in_flight.fetch_sub(1, SeqCst);
+        self.released.fetch_add(1, SeqCst);
+        Ok(())
+    }
+}
+
+/// The admin of a harness, over a Secret Manager of the test's choosing.
+fn admin_over(h: &Harness, secrets: Arc<dyn crate::domain::ports::SecretManager>) -> Admin {
+    DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        secrets,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
+    )
+}
+
+#[tokio::test]
+async fn the_release_runs_at_most_four_at_a_time() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let h = Harness::verified().await;
+    let store = SlowStore::new(false);
+    let admin = admin_over(
+        &h,
+        Arc::clone(&store) as Arc<dyn crate::domain::ports::SecretManager>,
+    );
+
+    let summary = admin.release_purged(held(10), "req").await;
+
+    assert_eq!((summary.released, summary.failed), (10, 0));
+    assert_eq!(store.released.load(SeqCst), 10);
+    let peak = store.peak.load(SeqCst);
+    assert!(peak <= 4, "never more than four in flight: {peak}");
+    assert!(peak > 1, "and the releases do overlap: {peak}");
+}
+
+#[tokio::test]
+async fn the_release_finishes_when_the_caller_that_started_it_is_dropped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let h = Harness::verified().await;
+    let store = SlowStore::new(true);
+    let admin = admin_over(
+        &h,
+        Arc::clone(&store) as Arc<dyn crate::domain::ports::SecretManager>,
+    );
+
+    {
+        let release = admin.release_purged(held(6), "req");
+        tokio::pin!(release);
+        // Run the caller until the first release has begun, then drop it.
+        let begun = async {
+            while store.started.load(SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            _ = &mut release => panic!("the gate is shut; nothing can have finished"),
+            () = begun => {}
+        }
+    }
+    store.gate.as_ref().expect("gated").add_permits(6);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store.released.load(SeqCst) < 6 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every entry is released although the caller is gone");
+}
+
+// ── What an evolution shares, and what a purge must not take ────────────────
+
+/// The references still named by a value or staged row of `id`.
+async fn refs_held_by(h: &Harness, id: Uuid) -> Vec<String> {
+    let conn = h.base.db.conn().expect("connection");
+    let mut refs: Vec<String> = ValueRepo
+        .secret_refs(&conn, id)
+        .await
+        .expect("refs")
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    refs.sort();
+    refs
+}
+
+#[tokio::test]
+async fn a_purge_releases_none_of_the_entries_another_declaration_still_holds() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("old").await;
+    let successor = h
+        .base
+        .declare(
+            "new",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let t = &h.base.tree;
+    // What an evolution's copy leaves: the successor's row names the same
+    // reference as the retired predecessor's.
+    h.base.set_secret(id, t.a, "shared-value").await;
+    h.base.set_secret(successor, t.a, "shared-value").await;
+    // A reference another declaration holds only as a staged row.
+    h.base.set_secret(id, t.b, "shared-staged").await;
+    h.base.stage_secret(successor, t.b, "shared-staged").await;
+    // And the ones nobody else holds.
+    h.base.set_secret(id, t.c, "own-value").await;
+    h.base.stage_secret(id, t.s, "own-staged").await;
+    for reference in ["shared-value", "shared-staged", "own-value", "own-staged"] {
+        h.secrets.seed(reference, "plaintext");
+    }
+
+    let purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    let mut released: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| e.secret_ref.as_str())
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released, vec!["own-staged", "own-value"]);
+    assert_eq!(
+        purged.kept_secrets.len(),
+        2,
+        "both shared references are counted"
+    );
+    let summary = h.admin.release_purged(purged, "req").await;
+    assert_eq!((summary.released, summary.failed), (2, 0));
+    assert_eq!(
+        h.secrets.held(),
+        vec!["shared-staged".to_owned(), "shared-value".to_owned()],
+        "the entries the successor still holds are in the store"
+    );
+    assert_eq!(
+        refs_held_by(&h, successor).await,
+        vec!["shared-value".to_owned()],
+        "and its row still names its own"
+    );
+}
+
+#[tokio::test]
+async fn after_an_evolution_of_a_secret_setting_a_purge_of_its_predecessor_keeps_the_successors_entries()
+ {
+    let h = Harness::verified().await;
+    let mut first = h.request("api_token");
+    first.value_type_id = SECRET.to_owned();
+    first.default_value = json!("");
+    let first = h.create(first, &admin_actor()).await.expect("created");
+    let old = first.declaration.id;
+    let t = &h.base.tree;
+    h.base.set_secret(old, t.a, "tenant-a-entry").await;
+    h.base.set_secret(old, t.b, "tenant-b-entry").await;
+    h.secrets.seed("tenant-a-entry", "plaintext-a");
+    h.secrets.seed("tenant-b-entry", "plaintext-b");
+
+    // Evolve: a changed scope class on the active declaration.
+    let mut next = h.request("api_token");
+    next.value_type_id = SECRET.to_owned();
+    next.default_value = json!("");
+    next.scope_class = "local".to_owned();
+    let evolved = h.create(next, &admin_actor()).await.expect("evolved");
+    assert!(evolved.evolved);
+    let successor = evolved.declaration.id;
+    assert_eq!(
+        refs_held_by(&h, successor).await,
+        vec!["tenant-a-entry".to_owned(), "tenant-b-entry".to_owned()],
+        "the evolution copied the references"
+    );
+
+    let tag = etag_of(&h.load(old).await);
+    let purged = h
+        .purge(old, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+    assert_eq!(purged.secrets, Vec::<super::HeldSecret>::new());
+    assert_eq!(purged.kept_secrets.len(), 2);
+    let summary = h.admin.release_purged(purged, "req").await;
+
+    assert_eq!((summary.released, summary.failed), (0, 0));
+    assert_eq!(
+        h.secrets.held(),
+        vec!["tenant-a-entry".to_owned(), "tenant-b-entry".to_owned()],
+        "the live successor keeps its secrets"
+    );
+    assert!(h.secrets.deleted.lock().expect("lock").is_empty());
+    let key = h.load(successor).await.key;
+    for (tenant, reference, plaintext) in [
+        (t.a, "tenant-a-entry", "plaintext-a"),
+        (t.b, "tenant-b-entry", "plaintext-b"),
+    ] {
+        let resolved = h
+            .secrets
+            .resolve_plaintext(&key, tenant, reference)
+            .await
+            .expect("the successor's secret still resolves");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&resolved), plaintext);
+    }
+}
+
+#[tokio::test]
+async fn a_purge_outside_the_callers_administrative_domain_is_not_found_and_removes_nothing() {
+    let h = Harness::verified().await;
+    let mut request = h.request("domained");
+    request.domain_affinity = Some("infra".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let tag = etag_of(&h.load(id).await);
+    h.base
+        .set_secret(id, h.base.tree.a, "inside-the-domain")
+        .await;
+    h.secrets.seed("inside-the-domain", "plaintext");
+    let billing = AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::In(toolkit_security::InScopeFilter::new(
+            crate::domain::category::visibility::DOMAIN_PROPERTY,
+            vec!["billing".into()],
+        )),
+    ]));
+    let mut actor = admin_actor();
+    actor.visibility = crate::domain::category::domain_visibility(&billing);
+    let conn = h.base.db.conn().expect("connection");
+
+    let err = h
+        .admin
+        .purge(&conn, &billing, id, Some(tag.as_str()), &actor)
+        .await
+        .expect_err("outside the caller's domain");
+
+    assert!(
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "declaration"
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "the row stays"
+    );
+    assert_eq!(
+        refs_held_by(&h, id).await,
+        vec!["inside-the-domain".to_owned()]
+    );
+    assert_eq!(h.secrets.held(), vec!["inside-the-domain".to_owned()]);
+    assert!(
+        h.secrets.deleted.lock().expect("lock").is_empty(),
+        "nothing is released"
+    );
+}
+
+/// What a purge keeps for another declaration, checked again after the commit.
+#[tokio::test]
+async fn the_kept_references_of_a_purge_are_released_once_the_other_declaration_is_gone() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("old").await;
+    let other = h
+        .base
+        .declare(
+            "new",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let t = &h.base.tree;
+    h.base.set_secret(id, t.a, "shared-value").await;
+    h.base.set_secret(other, t.a, "shared-value").await;
+    h.base.stage_secret(id, t.b, "own-staged").await;
+    h.secrets.seed("shared-value", "plaintext");
+    h.secrets.seed("own-staged", "plaintext");
+    let mut purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+    assert_eq!(purged.id, id);
+    assert_eq!(purged.kept_secrets.len(), 1);
+    let conn = h.base.db.conn().expect("connection");
+
+    // The other declaration still holds it: nothing moves.
+    h.admin.reclaim_kept(&conn, &mut purged).await;
+    assert_eq!(purged.kept_secrets.len(), 1, "still held, still kept");
+    assert_eq!(purged.secrets.len(), 1);
+
+    // Its own purge commits meanwhile: the rows are gone.
+    let current = h.load(other).await;
+    DeclarationRepo
+        .delete(&conn, &AccessScope::allow_all(), other, current.updated_at)
+        .await
+        .expect("the other declaration is deleted");
+    h.admin.reclaim_kept(&conn, &mut purged).await;
+    assert_eq!(purged.kept_secrets, Vec::<super::HeldSecret>::new());
+    let mut released: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| e.secret_ref.as_str())
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released, vec!["own-staged", "shared-value"]);
+    let summary = h.admin.release_purged(purged, "req").await;
+    assert_eq!((summary.released, summary.failed), (2, 0));
+    assert_eq!(h.secrets.held(), Vec::<String>::new());
+}
+
+/// A declaration outside the caller's administrative domain is not found by a
+/// revive or an evolution either, whatever was read about it before the lock:
+/// both read it again by id under the lock, with the caller's visibility.
+#[tokio::test]
+async fn a_revive_and_an_evolution_outside_the_callers_domain_are_not_found_and_change_nothing() {
+    let h = Harness::verified().await;
+    let billing = AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::In(toolkit_security::InScopeFilter::new(
+            crate::domain::category::visibility::DOMAIN_PROPERTY,
+            vec!["billing".into()],
+        )),
+    ]));
+    let mut actor = admin_actor();
+    actor.visibility = crate::domain::category::domain_visibility(&billing);
+    let conn = h.base.db.conn().expect("connection");
+    let not_found = |err: DomainError| {
+        assert!(
+            matches!(
+                err,
+                DomainError::NotFound {
+                    resource: "declaration"
+                }
+            ),
+            "{err:?}"
+        );
+    };
+    let derived = || super::DerivedClassification {
+        has_secret_trait: false,
+        data_classification: crate::domain::declaration::DataClassification::Public,
+    };
+    let metadata = || crate::domain::declaration::DeclarationMetadata {
+        mode: "standard".to_owned(),
+        display_name: None,
+        description: None,
+        domain_affinity: Some("infra".to_owned()),
+        licence_feature: None,
+        data_classification: "public".to_owned(),
+        requires_step_up: true,
+        anonymous_exposable: false,
+    };
+
+    // An evolution of an active declaration.
+    let mut request = h.request("domained");
+    request.domain_affinity = Some("infra".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+    let key = SettingKey::parse(&created.declaration.key).expect("a key");
+    let mut evolving = h.request("domained");
+    evolving.scope_class = "local".to_owned();
+    let err = h
+        .admin
+        .evolve(
+            &conn,
+            &billing,
+            &key,
+            h.load(id).await,
+            &[],
+            &evolving,
+            derived(),
+            metadata(),
+            &actor,
+        )
+        .await
+        .expect_err("outside the caller's domain");
+    not_found(err);
+    let after = h.load(id).await;
+    assert_eq!(after.status, DeclarationStatus::Active);
+    assert_eq!(after.scope_class, "cascading");
+    assert_eq!(h.versions_of(&after.key).await, 1, "no successor");
+
+    // A revive of a retired one.
+    let tag = etag_of(&after);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let err = h
+        .admin
+        .revive(
+            &conn,
+            &billing,
+            &key,
+            h.load(id).await,
+            &h.request("domained"),
+            derived(),
+            metadata(),
+            &actor,
+        )
+        .await
+        .expect_err("outside the caller's domain");
+    not_found(err);
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "still retired"
+    );
+}
+
+// ── The release's log lines ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn the_refused_release_logs_an_error_with_the_key_the_tenant_and_the_error_never_the_secret()
+{
+    let h = Harness::verified().await;
+    let purged = held(2);
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext-of-the-entry");
+    }
+    h.secrets.go_down();
+    let key = purged.key.clone();
+    let tenants: Vec<String> = purged
+        .secrets
+        .iter()
+        .map(|e| e.tenant.to_string())
+        .collect();
+
+    let summary = h.admin.release_purged(purged, "req-error").await;
+    assert_eq!((summary.released, summary.failed), (0, 2));
+
+    logs_assert(|lines: &[&str]| {
+        let errors: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("a credential store entry was not released"))
+            .collect();
+        if errors.len() != 2 {
+            return Err(format!("one error line per refused entry: {lines:?}"));
+        }
+        for tenant in &tenants {
+            let line = errors
+                .iter()
+                .find(|l| l.contains(tenant.as_str()))
+                .ok_or_else(|| format!("a line carries tenant {tenant}"))?;
+            if !line.contains("ERROR") || !line.contains(&key) {
+                return Err(format!("level and key on the line: {line}"));
+            }
+            if !line.contains("the fake store is down") {
+                return Err(format!("the error's log-safe text on the line: {line}"));
+            }
+        }
+        for line in lines {
+            for secret in ["plaintext-of-the-entry", "ref-0", "ref-1"] {
+                if line.contains(secret) {
+                    return Err(format!("the secret or its reference leaked: {line}"));
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn the_release_logs_one_info_line_when_it_starts_and_one_when_it_ends_with_the_request_id() {
+    let h = Harness::verified().await;
+    let mut purged = held(3);
+    purged.kept_secrets = (0..2)
+        .map(|i| super::HeldSecret {
+            tenant: Uuid::new_v4(),
+            secret_ref: format!("kept-{i}"),
+        })
+        .collect();
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext");
+    }
+
+    let summary = h.admin.release_purged(purged, "req-info-42").await;
+    assert_eq!((summary.released, summary.failed), (3, 0));
+
+    logs_assert(|lines: &[&str]| {
+        let start: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("declaration purge: releasing credential store entries"))
+            .collect();
+        let end: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("declaration purge: credential store release finished"))
+            .collect();
+        if start.len() != 1 || end.len() != 1 {
+            return Err(format!("one start and one end line: {lines:?}"));
+        }
+        for line in [start[0], end[0]] {
+            if !line.contains("INFO") || !line.contains("request_id=req-info-42") {
+                return Err(format!("info level and the request id: {line}"));
+            }
+        }
+        if !start[0].contains("entries=3") || !start[0].contains("kept=2") {
+            return Err(format!(
+                "the start line counts entries and kept: {}",
+                start[0]
+            ));
+        }
+        if !end[0].contains("released=3") || !end[0].contains("failed=0") {
+            return Err(format!("the end line counts the outcome: {}", end[0]));
+        }
+        Ok(())
+    });
+}
+
+// ── A release that does not finish ───────────────────────────────────────────
+
+/// A store that panics on its second release.
+struct PanicsOnTheSecond {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::ports::SecretManager for PanicsOnTheSecond {
+    fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
+        unreachable!("a release mints nothing")
+    }
+    async fn store_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+        _plaintext: &Value,
+    ) -> Result<(), DomainError> {
+        unreachable!("a release stores nothing")
+    }
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<SecretString, DomainError> {
+        unreachable!("a release reads nothing")
+    }
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(call != 2, "the store blew up on its second release");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_release_task_that_panics_counts_every_entry_it_did_not_report_as_failed() {
+    let h = Harness::verified().await;
+    let admin = admin_over(&h, Arc::new(PanicsOnTheSecond { calls: 0.into() }));
+
+    let summary = admin.release_purged(held(5), "req-panic").await;
+
+    assert_eq!(
+        summary.released + summary.failed,
+        5,
+        "every entry is accounted for: {summary:?}"
+    );
+    assert_eq!(summary.released, 1, "only the first was reported");
+    assert_eq!(summary.failed, 4, "the unreached remainder is failed");
+    let counts = h.metrics.purge_releases.lock().expect("lock").clone();
+    assert_eq!(
+        counts.iter().filter(|r| **r == "ok").count(),
+        1,
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.iter().filter(|r| **r == "failed").count(),
+        4,
+        "{counts:?}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let errors: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("the release task did not finish"))
+            .collect();
+        match errors.as_slice() {
+            [line]
+                if line.contains("ERROR")
+                    && line.contains("request_id=req-panic")
+                    && line.contains("entries=5")
+                    && line.contains("key=gts.cf.core.settings.setting_type.v1~acme") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "one error line with the key, id and count: {other:?}"
+            )),
+        }
+    });
 }

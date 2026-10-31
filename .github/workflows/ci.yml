@@ -84,6 +84,8 @@ jobs:
               - 'gears-rust.mk'
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - 'tools/scripts/check_crypto_facade.py'
+              - 'tools/scripts/tests/test_crypto_facade.py'
               # Input to `make check-release-config` in the repo-checks job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
@@ -99,6 +101,8 @@ jobs:
               # silently never runs on exactly the diff it exists to catch.
               - 'testing/e2e/lib/sidecars.py'
             fips:
+              - 'libs/toolkit-security/**'
+              - 'libs/toolkit-auth/**'
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
               - 'libs/toolkit-http-proxy/**'
@@ -218,6 +222,11 @@ jobs:
       # step in this job.
       - name: No unpinned database container images
         run: cargo xtask check-test-container-pins
+
+      - name: Application crypto stays behind the facade
+        run: |
+          python3 tools/scripts/check_crypto_facade.py
+          python3 -m unittest discover -s tools/scripts/tests -p test_crypto_facade.py
 
       # The wrapper turns compiler/lint errors into annotations titled by
       # their code (E0308, DE0904, clippy::...) when the command fails.
@@ -485,6 +494,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
 
+      - name: Test oagw (cluster feature)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-cluster
+
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
       # failing run still ships its report; a missing report (build failure)
@@ -594,18 +607,33 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+          cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
           cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
-      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
-      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
-      - name: FIPS build check (Windows / CNG)
+      # Windows: execute native CNG operations through internal test injection.
+      # This does not establish a FIPS witness on the hosted runner (ADR 0003).
+      - name: CNG operations and FIPS build check (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          cargo test --locked -p cf-gears-toolkit-security --features fips,jwt --lib crypto::windows_tests::native_cng_operations
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-security --all-targets --features fips,jwt,internal-auth-cache
           cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
           cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
+
+      - name: Check FIPS sidecar configuration
+        shell: bash
+        run: cargo check --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+
+      - name: Test native FIPS consumers
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked -p cf-gears-file-storage --features toolkit/fips --lib --bin sidecar
+          cargo test --locked -p cf-gears-credstore --features toolkit-security/fips --lib domain::secret::fence
 
       - name: Save compilation metrics
         if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
@@ -1090,7 +1118,10 @@ jobs:
       #   5. The toolkit-durable-execution PostgreSQL suites behind the integration
       #      feature, including subprocess recovery. A single test binary
       #      shares the workspace-pinned PostgreSQL container.
-      #   6. The quota-enforcement storage plugin's PostgreSQL suites. These
+      #   6. OAGW with its `cluster` feature, which pass 1 lacks: the proxy
+      #      cache's change log, publisher and watcher. Keep in sync with
+      #      the `oagw-cluster` lane of `make test-integration`.
+      #   7. The quota-enforcement storage plugin's PostgreSQL suites. These
       #      live behind `#![cfg(feature = "postgres")]`. Keep in sync with
       #      the `quota-enforcement-pg` lane of `make test-integration`.
       #
@@ -1134,7 +1165,10 @@ jobs:
           # (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-durable-execution-pg
-          # Pass 6: quota-enforcement storage plugin PostgreSQL suites (real
+          # Pass 6: OAGW with the `cluster` feature.
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
+          # Pass 7: quota-enforcement storage plugin PostgreSQL suites (real
           # Postgres via testcontainers).
           fresh_report
           "$W" cargo llvm-cov nextest --no-report -p cf-gears-quota-enforcement-storage-plugin --features postgres
@@ -1225,4 +1259,4 @@ jobs:
           git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
-        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh make dylint

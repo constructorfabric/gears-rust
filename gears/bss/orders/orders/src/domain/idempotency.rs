@@ -308,8 +308,8 @@ impl FingerprintInput<'_> {
     /// See [`Self::preimage`].
     pub fn fingerprint(&self) -> Result<Fingerprint, RegistryRuleError> {
         use std::fmt::Write;
-        // FIPS-validated provider (DE0708), as the Types Registry admission fingerprint.
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &self.preimage()?);
+        // toolkit-security facade, as the Types Registry admission fingerprint.
+        let digest = toolkit_security::crypto::hash::Sha256::digest(&self.preimage()?);
         let mut hex = String::with_capacity(FINGERPRINT_PREFIX.len() + 64);
         hex.push_str(FINGERPRINT_PREFIX);
         for byte in digest.as_ref() {

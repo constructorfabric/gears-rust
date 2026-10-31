@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-graph-storage-sdk"
-version = "0.2.0"
+version = "0.2.1"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -30,7 +30,6 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 # The embedding-space identity hash is derived here rather than per provider:
 # every plugin must arrive at the same name for the same space (ADR-0005).
-aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 time = { workspace = true }
 tokio-util = { workspace = true }

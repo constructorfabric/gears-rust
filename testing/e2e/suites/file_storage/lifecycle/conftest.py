@@ -14,7 +14,7 @@ Prerequisites
   If absent the conftest resolves ``target/debug/sidecar`` relative to the repo
   root (same strategy as the orchestrator's server binary fallback).
 * The ``cryptography`` Python package is required (listed in requirements.txt)
-  to derive the sidecar public key from the fixed seed at runtime and to mint
+  to derive the sidecar public key from the fixed PKCS#8 key at runtime and to mint
   signed download tokens directly against the sidecar for the download step.
 """
 
@@ -35,10 +35,9 @@ import pytest
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
-# 32-byte all-zeros seed, base64url-encoded (no padding).
-# This FIXED seed is written into the patched e2e config so the control plane
-# and the sidecar share a stable keypair; it is meaningless outside tests.
-_SIGNING_KEY_SEED_B64 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+# Public test-only P-256 PKCS#8 DER key, base64url without padding.
+# Shared by local config and lifecycle fixtures. Never use in production.
+_SIGNING_KEY_PKCS8_B64 = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgvyXv0q8GjreoBuf_PpNaMtOTjopTQiDanrRzE0yTGY2hRANCAAQZ2L6QZ1TYiDoNOYAetCY5SuDm9FiW2tOcy3DSKnbz8Wy9bwdzDx6plcpgtLoifYSjTnIR3X14G1M5Rrg1sj5D"
 
 # Repo root (resolved from this file's location:
 #   lifecycle/ -> file_storage/ -> gears/ -> e2e/ -> testing/ -> repo root).
@@ -64,24 +63,17 @@ def _encode_b64url(b: bytes) -> str:
     return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
 
 
-def _derive_sidecar_public_key_b64(seed_b64: str) -> str:
-    """Derive the Ed25519 public key from a base64url-encoded 32-byte seed.
-
-    Requires the ``cryptography`` package (pinned in requirements.txt).
-    Returns the public key as a base64url-encoded string (no padding).
-    The control plane uses the same key pair: seed → private key → public key.
-    The sidecar is configured with the PUBLIC key only (``FS_SIDECAR_PUBLIC_KEY``).
-    """
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    seed_bytes = _decode_b64url(seed_b64)
-    private_key = Ed25519PrivateKey.from_private_bytes(seed_bytes)
-    pub_bytes = private_key.public_key().public_bytes_raw()
+def _derive_sidecar_public_key_b64(key_b64: str) -> str:
+    """Export the P-256 public point from the shared test-only PKCS#8 key."""
+    from cryptography.hazmat.primitives import serialization
+    private_key = serialization.load_der_private_key(_decode_b64url(key_b64), password=None)
+    pub_bytes = private_key.public_key().public_bytes(
+        serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
     return _encode_b64url(pub_bytes)
 
 
 def _mint_token(
-    seed_b64: str,
+    key_b64: str,
     op: str,
     file_id: str,
     version_id: str,
@@ -89,23 +81,13 @@ def _mint_token(
     backend_id: str = "local-fs",
     ttl_secs: int = 300,
 ) -> str:
-    """Mint a signed URL token in the same format the control plane uses.
+    """Mint the private signed-URL codec with an independent ECDSA implementation.
 
-    Token format (from ``infra/signed_url/mod.rs``):
-        base64url(json_payload) + "." + base64url(ed25519_signature)
-
-    ``payload`` is JSON-encoded ``Claims`` with the given fields.
-    The signature is Ed25519 over the raw JSON bytes (the control plane uses
-    ``ring``; we use ``cryptography`` — both implement Ed25519 PKCS8 / raw).
-
-    The token is validated by the sidecar using ``Verifier::verify()`` which
-    calls ``ring::signature::UnparsedPublicKey::verify``.  Both libraries use
-    the same Ed25519 algorithm so the tokens are interoperable.
+    The signature is ASN.1 DER ECDSA P-256/SHA-256 over the original JSON bytes.
     """
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
-    seed_bytes = _decode_b64url(seed_b64)
-    private_key = Ed25519PrivateKey.from_private_bytes(seed_bytes)
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    private_key = serialization.load_der_private_key(_decode_b64url(key_b64), password=None)
 
     exp = int(time.time()) + ttl_secs
     claims: dict = {
@@ -117,7 +99,7 @@ def _mint_token(
         "exp": exp,
     }
     payload_bytes = json.dumps(claims, separators=(",", ":")).encode()
-    signature = private_key.sign(payload_bytes)
+    signature = private_key.sign(payload_bytes, ec.ECDSA(hashes.SHA256()))
 
     return _encode_b64url(payload_bytes) + "." + _encode_b64url(signature)
 
@@ -170,7 +152,7 @@ class FileStorageSidecar:
 
     Configuration (matches ``sidecar.rs`` env vars):
       * ``FS_SIDECAR_ADDR``         bind address (0.0.0.0:<port>)
-      * ``FS_SIDECAR_PUBLIC_KEY``   base64url Ed25519 public key (no padding)
+      * ``FS_SIDECAR_PUBLIC_KEY``   base64url uncompressed SEC1 P-256 public key (no padding)
       * ``FS_SIDECAR_BACKEND_ROOT`` local-fs root dir
       * ``FS_SIDECAR_CONTROL_URL``  control-plane base URL for finalize callback
       * ``FS_SIDECAR_INTERNAL_TOKEN`` mandatory x-fs-internal-token secret (dev value)
@@ -304,7 +286,7 @@ def _patch_file_storage_config(config_text: str, env) -> str:
     Finds the file-storage gear block and replaces:
       * ``storage_root``     → the session temp dir
       * ``sidecar_base_url`` → the launched sidecar's URL
-      * ``signing_key_seed`` → the fixed test seed
+      * ``signing_key_pkcs8`` → the fixed test PKCS#8 key
       * ``bind_addr``        → the lifecycle server port (avoids CI collision)
 
     Uses the same regex-on-YAML-text technique as the mini-chat conftest so we
@@ -338,10 +320,10 @@ def _patch_file_storage_config(config_text: str, env) -> str:
         config_text,
         count=1,
     )
-    # Replace signing_key_seed (any current value).
+    # Replace signing_key_pkcs8 (any current value).
     config_text = re.sub(
-        r"(signing_key_seed\s*:\s*).*",
-        rf'\1"{_SIGNING_KEY_SEED_B64}"',
+        r"(signing_key_pkcs8\s*:\s*).*",
+        rf'\1"{_SIGNING_KEY_PKCS8_B64}"',
         config_text,
         count=1,
     )
@@ -409,13 +391,13 @@ def fs_storage_root() -> str:
 
 
 @pytest.fixture(scope="session")
-def fs_signing_seed() -> str:
-    """The fixed Ed25519 seed used by both the control plane and the sidecar."""
-    return _SIGNING_KEY_SEED_B64
+def fs_signing_key() -> str:
+    """The public test-only ECDSA P-256 PKCS#8 key used by both the control plane and the sidecar."""
+    return _SIGNING_KEY_PKCS8_B64
 
 
 @pytest.fixture(scope="session")
-def _lifecycle_test_env(fs_storage_root, fs_signing_seed):
+def _lifecycle_test_env(fs_storage_root, fs_signing_key):
     """Private, lifecycle-scoped server+sidecar orchestration.
 
     This fixture is intentionally named with a leading underscore and does NOT
@@ -428,7 +410,7 @@ def _lifecycle_test_env(fs_storage_root, fs_signing_seed):
     the lifecycle suite is fully self-contained:
 
     1. Start the sidecar (so its port is known).
-    2. Patch the config (inject sidecar URL, storage root, signing seed, port).
+    2. Patch the config (inject sidecar URL, storage root, signing key, port).
     3. Resolve the server binary (FS_E2E_BINARY env var — dedicated to this
        suite so it does not un-skip other gears gated on E2E_BINARY).
     4. Start the server.
@@ -438,7 +420,7 @@ def _lifecycle_test_env(fs_storage_root, fs_signing_seed):
     """
     from lib.orchestrator import GearTestEnv, RunningTestEnv, _log_path, _wait_healthy
 
-    pub_key_b64 = _derive_sidecar_public_key_b64(fs_signing_seed)
+    pub_key_b64 = _derive_sidecar_public_key_b64(fs_signing_key)
     print(f"[file-storage lifecycle] sidecar public key: {pub_key_b64}")
 
     control_base_url = f"http://localhost:{_SERVER_PORT}"
@@ -549,8 +531,8 @@ def lifecycle_auth_headers() -> dict:
 
 
 @pytest.fixture(scope="session")
-def fs_token_minter(fs_signing_seed):
-    """Factory that mints signed sidecar tokens from the fixed test seed.
+def fs_token_minter(fs_signing_key):
+    """Factory that mints signed sidecar tokens from the fixed test PKCS#8 key.
 
     Returns a callable ``mint(op, file_id, version_id, backend_path, **kwargs)``
     that produces a token in the same format the control plane issues.
@@ -569,7 +551,7 @@ def fs_token_minter(fs_signing_seed):
         ttl_secs: int = 300,
     ) -> str:
         return _mint_token(
-            seed_b64=fs_signing_seed,
+            key_b64=fs_signing_key,
             op=op,
             file_id=file_id,
             version_id=version_id,

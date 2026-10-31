@@ -7,10 +7,12 @@
 # Fast two-pass clippy used in PR CI (target: <5 min with sccache).
 # Pass 1 covers the 80+ "leaf" crates (gears, plugins, SDKs): they use `dep:`
 # guards only, so --all-features is sufficient — no --each-feature needed.
-# Pass 2 runs cargo-hack --each-feature on the three crates with real
-# #[cfg(feature = "...")] guards (mutually-exclusive DB backends, otel, fips, db).
-# These account for >95% of all cfg-gated lines in the repo. See GH issue #1574.
-CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http
+# Pass 2 runs cargo-hack --each-feature on the crates with real
+# #[cfg(feature = "...")] guards (mutually-exclusive DB backends, otel, fips, db;
+# OAGW's in-memory-only build without `cluster`). These account for >95% of all
+# cfg-gated lines in the repo. See GH issue #1574.
+CLIPPY_HACK_CRATES := -p cf-gears-toolkit -p cf-gears-toolkit-db -p cf-gears-toolkit-http \
+	-p cf-gears-oagw
 # `_any-backend` is toolkit-db's internal "some backend is on" marker (see its
 # [features] block); enabling it *alone* asserts a driver exists while none does,
 # which the outbox benchmarks reject with a compile_error!. Not a configuration
@@ -127,6 +129,17 @@ setup: .setup-stamp py-env
 
 # -------- Repository checks --------
 
+.PHONY: dylint-oagw-cluster
+
+# `make dylint` also lints OAGW's proxy cache change log, which needs its
+# `cluster` feature: default features leave it unlinted, and `--all-features`
+# fails workspace-wide.
+dylint: dylint-oagw-cluster
+dylint-oagw-cluster:
+	$(call print_target_banner)
+	$(call check_tool,cargo-gears)
+	cargo gears lint --dylint -P cf-gears-oagw -F cluster
+
 .PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-release-config check-release-resolver
 
 ## Verify git submodules (e.g. guidelines/DNA) are initialized; fails otherwise.
@@ -240,8 +253,9 @@ E2E_SIDECAR_ENV := $(if $(GEAR),$(if $(filter file-storage,$(GEAR)),FS_SIDECAR_B
 GEAR_E2E_KEY := $(subst -,_,$(GEAR))
 GEAR_E2E_TARGET ?= testing/e2e/suites/$(GEAR_E2E_KEY)
 GEAR_E2E_SCOPE := $(if $(GEAR),$(GEAR_E2E_TARGET) $(E2E_TARGET),$(E2E_TARGET))
-# Coverage: pass the first resolved package + e2e target path to coverage.py.
-GEAR_COVERAGE_ARGS = $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) --e2e-target $(GEAR_E2E_TARGET),)
+# Coverage: pass the first resolved package + e2e target path to coverage.py,
+# and GEAR_FEATURES for its unit tests (e.g. GEAR=oagw GEAR_FEATURES=cluster).
+GEAR_COVERAGE_ARGS = $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) --e2e-target $(GEAR_E2E_TARGET) $(GEAR_FEATURE_ARGS),)
 
 # --- Server feature selection for run / openapi ---
 # Base features always enabled when running a focused server.
@@ -444,7 +458,7 @@ test-eb-kafka: install-tools
 
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
-	types-registry-db oagw-db cluster-pg cluster-redis rg-pg settings-service-pg \
+	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
 	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
@@ -493,13 +507,19 @@ lane_args_types-registry-db = -p cf-gears-types-registry --features integration 
 lane_args_eb-gear-db = -p cf-gears-event-broker --features integration -E 'binary(/_backends_test$$/)'
 lane_env_eb-gear-db = EB_TEST_REQUIRE_DOCKER=1
 
-## OAGW's database tier: the repository conformance suite and the
-## migration tests on PostgreSQL and MySQL (Docker required; no skip without
-## it; images pinned in test-containers).
+## OAGW's database tier: the repository conformance suite, the
+## migration tests and the proxy cache tests on PostgreSQL and MySQL, and the
+## proxy cache across replicas over a Redis cluster profile (Docker required;
+## no skip without it; images pinned in test-containers, Redis in the test).
 ## The in-memory and SQLite runs of the same suites are part of `make test`,
 ## except the SQLite lock races, which need the `integration` test hooks and
 ## run here (no Docker needed for them).
-lane_args_oagw-db = -p cf-gears-oagw --features integration -E 'test(/postgres|mysql|races_on_sqlite/)'
+lane_args_oagw-db = -p cf-gears-oagw --features integration -E 'test(/postgres|mysql|redis|races_on_sqlite/)'
+
+## OAGW's tests with its `cluster` feature: the proxy cache's change log,
+## publisher and watcher, and the gear on a database (ADR-0020). `make test`
+## runs OAGW in memory only. No Docker needed.
+lane_args_oagw-cluster = -p cf-gears-oagw --features cluster
 
 ## The Postgres cluster plugin's conformance (Layer 2) and Layer 3
 ## integration suites (Docker required;
@@ -539,13 +559,14 @@ lane_args_cluster-redis = -p cf-redis-cluster-plugin --features integration --re
 ## gears/system/resource-group/resource-group/tests/pg_smoke_test.rs)
 lane_args_rg-pg = -p cf-gears-resource-group --features integration
 
-## The settings-service gear's PostgreSQL migration suite (Docker required;
+## The settings-service gear's PostgreSQL suites: the migration chain, the
+## refused category delete and the declaration purge (Docker required; each
 ## spins up its own postgres container via testcontainers -- see
-## gears/settings-service/settings-service/tests/pg_migrations_test.rs). The
+## gears/settings-service/settings-service/tests/pg_*_test.rs). The
 ## suites beside the gear's migrations run on SQLite, where a statement
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
-lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test
+lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_category_delete_test --test pg_declaration_purge_test
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).
@@ -770,6 +791,8 @@ coverage-durable-execution-pg:
 ## compiles once.
 test-fips: install-tools
 	$(call print_target_banner)
+	cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+	cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
 	cargo nextest run -p cf-gears-toolkit -p cf-gears-toolkit-http -p cf-gears-toolkit-http-proxy -p cf-gears-oagw -p cf-gears-clickhouse-usage-collector-plugin \
 		--features cf-gears-toolkit/bootstrap,cf-gears-toolkit/fips,cf-gears-toolkit-http/fips,cf-gears-toolkit-http-proxy/fips,cf-gears-oagw/fips
 
@@ -1115,7 +1138,7 @@ coverage: py-env
 coverage-unit: py-env
 	$(call print_target_banner)
 	$(call check_tool,cargo-llvm-cov)
-	$(PYTHON) tools/scripts/coverage.py unit $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))),)
+	$(PYTHON) tools/scripts/coverage.py unit $(if $(GEAR),--package $(firstword $(subst -p ,,$(GEAR_PKGS))) $(GEAR_FEATURE_ARGS),)
 
 ## Ensure needed packages and programs installed for local e2e testing
 check-prereq-e2e-local: py-env
@@ -1412,7 +1435,8 @@ all: check test-integration e2e-local openapi
 
 # Integration lanes that `make all` and `make ci` run (target-specific LANE, see tests.mk).
 all: LANE = toolkit-db-sqlite
-ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db
+ci: LANE = users-info-pg usage-collector-pg usage-collector-ch types-registry-db oagw-db \
+	oagw-cluster
 
 # Re-run setup when a make file changes.
 .setup-stamp: Makefile gears-rust.mk .gears-dna/gears.mk

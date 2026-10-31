@@ -66,8 +66,8 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-rate-limiting` — Token bucket algorithm with hierarchical merge
 - `cpt-cf-oagw-adr-circuit-breaker` — State machine with configurable thresholds and fallback
 - `cpt-cf-oagw-adr-cors` — Built-in CORS handler with per-upstream/route config
-- `cpt-cf-oagw-adr-data-plane-caching` — Control plane caching strategies
-- `cpt-cf-oagw-adr-state-management` — CP/DP state structures with cache invalidation
+- `cpt-cf-oagw-adr-data-plane-caching` — Control plane caching strategies (superseded by `cpt-cf-oagw-adr-proxy-config-cache`)
+- `cpt-cf-oagw-adr-state-management` — CP/DP state structures; its Data Plane L1 cache is replaced by `cpt-cf-oagw-adr-proxy-config-cache`, its rate-limiter ownership stays
 - `cpt-cf-oagw-adr-storage-schema` — Cross-database relational schema with JSON config blobs
 - `cpt-cf-oagw-adr-resource-identification` — Layered resource model with alias resolution
 - `cpt-cf-oagw-adr-concurrency-control` — Per-scope in-flight request limits
@@ -79,6 +79,7 @@ This design satisfies the requirements for centralized outbound traffic manageme
 - `cpt-cf-oagw-adr-required-headers-guard-plugin` — Stateless builtin `GuardPlugin` enforcing required request/response headers, fail-open when unconfigured
 - `cpt-cf-oagw-adr-optional-persistence` — Opt-in database persistence with in-memory fallback, using the storage schema from the start
 - `cpt-cf-oagw-adr-upstream-proxy-engine` — Upstream forwarding through the in-house `toolkit-http-proxy` engine instead of the Pingora bridge
+- `cpt-cf-oagw-adr-proxy-config-cache` — Per-replica cache of the proxy lookup with a database; each write evicts only the entries it affects, on every replica through a cluster change log, with a TTL backstop (proposed until its benchmark)
 
 ### 1.3 Architecture Layers
 
@@ -104,6 +105,7 @@ The gear follows DDD-Light layering: domain layer has no infrastructure dependen
 | `toolkit-auth` | Bearer token authentication & authorization |
 | `cred_store` | Secret material retrieval by URI reference |
 | `types_registry` | GTS schema/instance registration |
+| `cluster-sdk` | With a database: the cluster change log that keeps each replica's proxy configuration cache fresh ([ADR: Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md)) |
 
 ### 1.4 High-Level Architecture Diagram
 
@@ -822,11 +824,15 @@ sequenceDiagram
     API-->>C: HTTP response + X-OAGW-Error-Source
 ```
 
+With a database, `resolve_proxy_target` reads the upstream candidates and routes through the per-replica proxy configuration cache; a hit runs no query (§4.1).
+
 #### Management Operation Flow
 
 ```text
 Client → API Handler (auth, validate DTO) → ControlPlaneService (validate, write DB) → Response
 ```
+
+With a database, each write also evicts the proxy configuration cache entries it affects and appends the change to the cluster change log, so every replica evicts them too (§4.1).
 
 ### 3.6 Database Schemas & Tables
 
@@ -845,6 +851,8 @@ Upstream and route storage sits behind the domain repository traits (`UpstreamRe
 | Present but unusable | None — gear startup fails | — |
 
 `database: null` counts as absent. OAGW compiles the SQLite and PostgreSQL backends; MySQL is supported when built with the `mysql` feature (see [ADR: Optional Persistence](./ADR/0018-optional-persistence.md)).
+
+With a database and the proxy configuration cache enabled (the default), OAGW also needs the cluster gear and an `oagw` cluster profile whose cache supports watches, through which the proxy configuration cache tells the other replicas about each write ([ADR: Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md#cluster-setup)). With `proxy_cache.enabled: false` neither is needed and every request reads the database. Without a database neither is needed, and OAGW supports one replica only, since each replica's in-memory configuration is its own; the same holds for the cluster's standalone backend.
 
 Both implementations satisfy one repository contract and pass one conformance test suite, so Management API and proxy behavior do not depend on the backend.
 
@@ -901,7 +909,11 @@ See [ADR: Resource Identification](./ADR/0010-resource-identification.md) for th
 
 OAGW does not cache upstream responses. Caching is client/upstream responsibility.
 
-Config caching (in-memory caching of effective upstream/route configuration to avoid DB reads on every proxy request) is not implemented. With a configured database, each proxy request issues three queries regardless of tenant hierarchy depth: the upstreams with the alias across the whole tenant chain joined with their plugin rows, the enabled HTTP routes of the selected upstream and its ancestor upstreams that allow the request method, with only the columns matching reads, and the winning route in full with its path, method and plugin rows (re-checked against the request; a request that raced a configuration write selects once more, two more queries). The proxy never reads tags and does not load them; the SDK's `resolve_proxy_target` does, with two more queries. [ADR: Control Plane Caching](./ADR/0007-data-plane-caching.md) and [ADR: State Management](./ADR/0008-state-management.md) define the caching to add on top of [ADR: Optional Persistence](./ADR/0018-optional-persistence.md).
+With a database, OAGW caches the configuration the proxy reads ([ADR: Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md), proposed until its benchmark). Each replica keeps two in-memory sections: the upstreams with an alias across a tenant chain (key: alias and chain; disabled ones included; empty for "not found"), and the enabled HTTP routes of each upstream, in full (key: the upstream's tenant and ID). Both hold raw repository answers, so upstream selection, the SSRF check, `select_route` and the merge still run on every request. A hit runs no query; a miss runs one query per section that missed. Errors are not cached; concurrent misses on one key share one load. Entries expire after `proxy_cache.ttl` (default 60 s); each section holds at most `proxy_cache.max_entries` (default 10,000) and evicts the least recently used entry when full.
+
+Every write evicts only the entries it can affect (those holding the written upstream or route, those for an upstream's alias whose chain holds its tenant, and the route entry of a route's upstream), and detaches the loads in flight in the sections it touches, so a load that read pre-write rows is not stored. The cache wraps the repositories, so every write path evicts: the Management API, the SDK and the registry reconcile. The writer then appends the change to a short change log in the cluster gear (key `oagw/proxy-config-changes`, the last 128 changes and 32 KiB) and waits at most 2 s for the append (a registry reconcile run waits once, at its end); every other replica watches the log and evicts the same entries. A write whose future is dropped mid-call publishes its change once more 30 s later, in case its statement commits late. A replica that cannot know what it missed (a gap, a new or unreadable log, a watch that fell behind or reconnected) empties its whole cache; the TTL corrects a lost change. Cache loads (30 s), change log appends (1 s per attempt, 5 attempts) and log reads (5 s) are bounded, so a hung database or cluster call cannot stall the cache. During a rolling upgrade an older build skips its appends to a newer-format log. A cluster outage leaves OAGW `Degraded`, not unready; proxying continues and the TTL bounds staleness.
+
+With the cache off (`proxy_cache.enabled: false`), and for the SDK's `resolve_proxy_target`, each lookup issues three queries regardless of tenant hierarchy depth: the upstreams with the alias across the tenant chain joined with their plugin rows; the enabled HTTP routes of the selected and ancestor upstreams that allow the request method, with only the columns matching reads; and the winning route in full with its path, method and plugin rows (re-checked against the request; a request that raced a configuration write selects once more, two more queries). The proxy never loads tags; `resolve_proxy_target` does, with two more queries. With the cache off there is no change log: writes append nothing, and no cluster is needed.
 
 The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint pool and rebuilds it whenever the upstream's configured endpoints differ from the cached list. This keeps every replica current when several replicas share one database, without cross-instance invalidation.
 
@@ -910,7 +922,7 @@ The endpoint selector (`PoolEndpointSelector`) caches each upstream's endpoint p
 Prometheus metrics at `/metrics` (admin-only):
 
 - `oagw_requests_total{host, http.request.method, http.route, http.response.status_code}` — counter (label keys follow OTel HTTP semantic conventions; numeric status; method normalized to a standard verb or `_OTHER`; aligned with the inbound API Gateway)
-- `oagw_request_duration_seconds{host, http.route, phase}` — histogram
+- `oagw_request_duration_seconds{host, http.route, phase}` — histogram (`phase`: `total` for the whole request, `resolve` for the upstream and route lookup, `auth` for the auth plugin; a request that does not resolve records `resolve` with `host` and `http.route` set to `unknown`)
 - `oagw_requests_in_flight{host}` — gauge
 - `oagw_errors_total{host, http.route, error_type}` — counter
 - `oagw_circuit_breaker_state{host}` — gauge
@@ -935,6 +947,17 @@ Prometheus metrics at `/metrics` (admin-only):
 **Upstream Health Metrics**:
 - `oagw_upstream_available{host, endpoint}` — gauge (0=down, 1=up)
 - `oagw_upstream_connections{host, state}` — gauge (state: `idle`, `active`, `max`)
+
+**Proxy Configuration Cache Metrics** ([ADR: Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md#health-and-metrics); with a database):
+- `oagw_proxy_cache_lookups_total{map, result}` — counter (`map`: `alias`, `route`; `result`: `hit`, `miss`, `joined`)
+- `oagw_proxy_cache_entries{map}` — gauge
+- `oagw_proxy_cache_evictions_total{map, reason}` — counter (`reason`: `change`, `ttl`, `capacity`)
+- `oagw_proxy_cache_changes_total{source}` — counter (`source`: `local`, `remote`)
+- `oagw_proxy_cache_flushes_total{cause}` — counter (the whole cache emptied; `cause`: `watch_reset`, `log_gap`, `log_reset`, `log_unreadable`, `watch_closed`)
+- `oagw_proxy_cache_loads_discarded_total{map}` — counter (loads not stored because a change detached them)
+- `oagw_proxy_cache_publish_failures_total{reason}` — counter (each change not appended to the cluster change log, once; `reason`: `append_failed`, `newer_log`, `publisher_stopped`; a write's 2 s wait timing out is not counted)
+
+The gear's health check reports `Degraded` with `proxy_cache_watch_connecting` while the change log watch connects or reconnects, `proxy_cache_watch_down` once it is closed for good or stopped, and `proxy_cache_newer_log` while appends skip a newer-format log. It includes the cluster SDK's readiness: `cluster-starting` and `cluster-profile-degraded` report `Degraded`, `cluster-misconfigured` `Unhealthy`; a check that does not answer within 250 ms leaves the last result for up to 10 s, then `Degraded` with `cluster_readiness_slow`. On a tie the cache's code shows before registry provisioning's.
 
 Cardinality management: no tenant labels; `http.route` is the normalized route match pattern, not the raw request path; `http.request.method` is normalized to a standard verb or `_OTHER`; `http.response.status_code` is the numeric upstream status (OTel HTTP semconv). Status-class queries (`5xx` rate, etc.) are expressed at query time via regex on the numeric code. Label-key vocabulary matches the inbound API Gateway so both gateways share dashboards. `host` remains as an OAGW-specific label carrying the upstream alias.
 
@@ -1020,7 +1043,7 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 | [0004 Rate Limiting](./ADR/0004-rate-limiting.md) | `cpt-cf-oagw-component-model` |
 | [0005 Circuit Breaker](./ADR/0005-circuit-breaker.md) | `cpt-cf-oagw-interface-api` |
 | [0006 CORS](./ADR/0006-cors.md) | `cpt-cf-oagw-component-model` |
-| [0007 Control Plane Caching](./ADR/0007-data-plane-caching.md) | `cpt-cf-oagw-tech-dependencies` |
+| [0007 Control Plane Caching](./ADR/0007-data-plane-caching.md) (superseded by 0019) | `cpt-cf-oagw-tech-dependencies` |
 | [0008 State Management](./ADR/0008-state-management.md) | `cpt-cf-oagw-component-model` |
 | [0009 Storage Schema](./ADR/0009-storage-schema.md) | `cpt-cf-oagw-db-schema` |
 | [0010 Resource Identification](./ADR/0010-resource-identification.md) | `cpt-cf-oagw-design-domain-model` |
@@ -1031,3 +1054,4 @@ Structured JSON logs to stdout, ingested by centralized logging system (e.g., EL
 | [0015 Rust ABI Client Library](./ADR/0015-rust-abi-client-library.md) | `cpt-cf-oagw-tech-dependencies` |
 | [0018 Optional Persistence](./ADR/0018-optional-persistence.md) | `cpt-cf-oagw-db-schema` |
 | [0019 Upstream Proxy Engine](./ADR/0019-upstream-proxy-engine.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |
+| [0020 Proxy Configuration Cache](./ADR/0020-proxy-config-cache.md) | `cpt-cf-oagw-tech-dependencies`, `cpt-cf-oagw-seq-proxy-flow` |

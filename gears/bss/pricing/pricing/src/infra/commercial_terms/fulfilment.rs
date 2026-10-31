@@ -128,7 +128,7 @@ impl CommercialTermsService {
             let capture = Arc::new(self.capture(ctx, &r).await?);
             let r = r.clone();
             let clock = self.clock.clone();
-            support::unit_transaction_observed_with_events(&db, &self.state.outbox, move |tx, _| {
+            support::unit_transaction_observed_read(&db, &self.state.outbox, move |tx, _| {
                 let r = r.clone();
                 let capture = capture.clone();
                 let clock = clock.clone();

@@ -166,8 +166,10 @@ async fn database(
         "sqlite://{}?mode=rwc",
         dir.path().join("db.sqlite3").display()
     );
+    // The gears' database config sets `transaction_mode=immediate`; sqlx refuses it, so only the
+    // toolkit pool gets it.
     let db = toolkit_db::connect_db(
-        &dsn,
+        &format!("{dsn}&transaction_mode=immediate"),
         toolkit_db::ConnectOpts {
             max_conns: Some(4),
             min_conns: Some(1),

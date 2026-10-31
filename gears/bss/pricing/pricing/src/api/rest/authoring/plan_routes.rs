@@ -3,7 +3,10 @@ use super::{
     AuthoringState,
     caps::Capped,
     dto, plan_items, plans,
-    support::{authz_failure, etag, header, invalid_because, require_authenticated, transaction},
+    support::{
+        authz_failure, etag, header, invalid_because, require_authenticated, transaction,
+        transaction_read,
+    },
 };
 use crate::{
     api::rest::{correlation, preconditions},
@@ -297,7 +300,7 @@ async fn get_plan(
     .await
     .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    let (body, version) = transaction(&state.db.db(), move |tx| {
+    let (body, version) = transaction_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move { plans::get(tx, &scope, tenant, id).await })
     })
@@ -422,7 +425,7 @@ async fn get_revision(
     // D-440: the sale-date price is money, judged after plan read and before the revision's 404.
     let books = super::money_scope(&enforcer, &ctx).await?;
     let tenant = ctx.subject_tenant_id();
-    let (body, version) = transaction(&state.db.db(), move |tx| {
+    let (body, version) = transaction_read(&state.db.db(), move |tx| {
         let (scope, books) = (scope.clone(), books.clone());
         Box::pin(async move { plans::get_revision(tx, &scope, books.as_ref(), tenant, id).await })
     })
@@ -446,7 +449,7 @@ async fn get_reservations(
     )
     .await
     .map_err(authz_failure)?;
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx) = (scope.clone(), ctx.clone());
         Box::pin(async move { plans::reservations(tx, &scope, ctx.subject_tenant_id(), id).await })
     })
@@ -742,7 +745,7 @@ async fn get_item(
     .await
     .map_err(authz_failure)?;
     let tenant = ctx.subject_tenant_id();
-    let (body, version) = transaction(&state.db.db(), move |tx| {
+    let (body, version) = transaction_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move { plan_items::get(tx, &scope, tenant, id).await })
     })

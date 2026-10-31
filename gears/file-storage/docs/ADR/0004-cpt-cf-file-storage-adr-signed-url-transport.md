@@ -41,7 +41,7 @@ Two decisions, previously conflated and re-litigated during review:
 2. **Transport / envelope** — **URL query string** **vs.** **HTTP header**.
 
 Earlier drafts chose discrete fields. After team review we **reverse to an opaque token**. The decisive premise:
-**FileStorage is deliberately not S3-wire-compatible** — our own host, parameter names, semantics, and crypto (Ed25519,
+**FileStorage is deliberately not S3-wire-compatible** — our own host, parameter names, semantics, and crypto (ECDSA P-256/SHA-256,
 not HMAC) mean no S3 client, CDN, or tool can ever generate or consume our credential (see *More Information*).
 Therefore the *only* parties that ever need to read the claims are the **control plane** (which mints) and the
 **sidecar** (which verifies). With no external reader to serve, discrete-field readability is not an asset — it is a
@@ -60,7 +60,7 @@ liability that would couple intermediaries to a layout we want free to change.
   public key
 * **Two access intents** — an embeddable **bare URL** (browser, `<img>`/`<video>`, `curl`, media `Range`) and a
   **programmatic / batch** path, both must work
-* **A safe, standard token** — avoid JWT's algorithm-agility footguns (`alg` confusion / downgrade)
+* **A fixed signature scheme** — no caller-controlled algorithm negotiation
 
 ## Considered Options
 
@@ -71,13 +71,9 @@ liability that would couple intermediaries to a layout we want free to change.
 ## Decision Outcome
 
 * **Encoding = one opaque, atomically-signed token.**
-* **Token format = PASETO `v4.public`** (Ed25519, asymmetric; **not** JWT). It carries the full claim-set — `op`,
-  resource (`file_id`, `content_id`/`version_id`), `exp` (required, capped at `max_url_ttl`, recommended 7 days), the
-  constraints (`ip`, token-claim predicates, upload `max_size`/`exact_size`/`expected_hash`; P2 `max_rate`/`max_conns`),
-  and the baked response-header set — with **one signature over the whole set**. The PASETO **footer** carries a key id
-  (`kid`) for rotation. **Implemented as a codec-equivalent bespoke format, not literal PASETO** — no footer, no
-  `kid`; key rotation is instead solved by the sidecar verifying against a small ordered set of public keys — see
-  [Implementation note](#implementation-note-p2-2026-07) below.
+* **Token format = private ECDSA P-256/SHA-256 compact token**, not JWT or PASETO.
+  `base64url(json(claims)).base64url(ASN.1-DER-signature)` signs the original JSON bytes.
+  The claim set and transport remain unchanged. There is no algorithm negotiation or `kid`.
 * **Transport = both query and header**, chosen by access intent; the **token bytes are identical** either way:
   * **query** — `?fs-token=<token>` — for bare, embeddable URLs (browser, `<img>`/`<video>`, `curl`, media `Range`; the caller
     cannot set headers). Because a query token can leak via server/proxy logs, browser history, and the `Referer`
@@ -100,57 +96,31 @@ liability that would couple intermediaries to a layout we want free to change.
   field layout. The token is **atomic** (signed/verified/rotated as one unit) and **opaque**, which is what makes the
   format **freely evolvable** (see the Token Opacity Contract).
 
-This supersedes the earlier "discrete fields" outcome. It adopts the PASETO proposal raised in PR review while keeping
-the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint property.
+The private token replaces the earlier discrete fields while preserving both query and header transport.
+Only the control plane can sign; the sidecar holds the public key.
 
 ### Consequences
 
 * `cpt-cf-file-storage-design-signed-urls` (DESIGN §4.5), api.md, and the worked examples (§4.6/§4.7) change: the
   discrete `X-FS-*` parameters are replaced by a **single token** carried as `?fs-token=<token>` (query) or an
   `X-FS-Token` header. SigV4-style canonical-string signing is replaced by **asymmetric mint (control) / verify
-  (sidecar) — the bespoke codec-equivalent token specified under [Implementation note](#implementation-note-p2-2026-07),
+  (sidecar) — the private compact token specified under [Implementation note](#implementation-note-p2-2026-07),
   not a literal PASETO library**; all claims live inside the token.
-* **No PASETO token-library dependency (bespoke codec):** the shipped token is
-  `base64url(json(claims)).base64url(ed25519_signature)` built on the already-present `base64` and `ring`/Ed25519
-  primitives through the in-house `SignatureProvider`/`SignatureVerifier` abstraction — **no `kid` footer** (the
-  sidecar instead verifies against a small ordered set of public keys, primary + previously-active, giving a
-  rotation crossover window without needing to select a key by id — see the Implementation note below), and no new
-  third-party token format crate. Ed25519
-  keys as before (private → control, public → sidecar). Literal PASETO `v4.public` is not adopted in P1; it remains a
-  possible future wrapper over the same `SignatureProvider` seam (the format is opaque and codec-evolvable per the
-  Token Opacity Contract).
-* **FIPS posture (binding constraint on the dependency, not a deferred fallback).** The token signs with **Ed25519**,
-  which *is* approved under **FIPS 186-5**, but approval requires the signing/verifying primitive to run inside a
-  **FIPS-validated cryptographic module** — a generic Ed25519 crate (PASETO or otherwise) is not automatically
-  compliant. The binding rule for implementation is therefore about *which crate we pull in*:
-  * **MUST NOT** introduce any new crate that hard-wires a **non-FIPS algorithm or a self-contained crypto
-    implementation we cannot swap out.** No dependency may bake the signing primitive in such a way that the algorithm
-    or its backing module is fixed at the crate boundary.
-  * The token signer/verifier **MUST sit behind a thin in-house crypto-provider abstraction** (a `SignatureProvider`
-    trait: `sign(claims) -> token` on control, `verify(token) -> claims` on the sidecar). The token codec (the bespoke
-    codec-equivalent format in P1) calls that abstraction; the abstraction is what binds to the concrete algorithm + module.
-  * In FIPS deployments the provider **MUST** be backed by a FIPS-validated module (the platform already ships
-    `rustls-corecrypto-provider`); the Ed25519 token path must route through it. If no validated Ed25519 module is
-    available for a target, the provider is swapped for a FIPS-approved alternative (e.g. ECDSA P-256 / a JWS profile
-    over the validated module) — **without touching the token codec, claim-set, or the rest of this design**, because
-    the token is **opaque and the codec is freely evolvable** (Token Opacity Contract).
-  * Concretely this means we evaluate any candidate crypto/token crate for this property **before** adding it (a literal
-    PASETO wrapper, if ever adopted, included): prefer one that
-    accepts an external signer/key backend (so the algorithm is replaceable), and reject any that statically links a
-    non-replaceable non-FIPS implementation.
-
-  This preserves the control-signs / sidecar-verifies / sidecar-cannot-mint property regardless of which module backs
-  the provider. The concrete crate + provider choice (and the non-FIPS default) is settled at implementation time, but
-  the **replaceability requirement above is not deferrable** — it gates dependency selection.
+* **Crypto boundary.** The token codec calls `SignatureProvider` / `SignatureVerifier`;
+  `EcdsaP256Provider` delegates cryptographic operations to `toolkit_security::crypto`.
+  The codec does not depend directly on a primitive crate or backend.
+* **FIPS posture.** Key generation, signing and verification use AWS-LC FIPS on Linux,
+  Apple corecrypto on macOS, and CNG on Windows. Missing backend witnesses fail startup;
+  ordinary-mode fallback is forbidden. Deployment claims still depend on the module's
+  operational environment and security policy.
 * **Observability/debuggability** is **sanitized server-side structured logging** by control/sidecar (tenant/file ids,
   outcome; never the token or raw claims). It is **not** done by decoding the token at the edge.
 * **Embeddable vs. leak vs. cache:** query envelope (token in URL, short `exp`) for embeddable; header envelope (token
   out of URL, stable cacheable URL) for programmatic.
-* Resolves the `CHANGES_REQUESTED` review (adopts PASETO); the discrete-field debate and its pros/cons are removed.
 
 ### Confirmation
 
-* Code review confirming the control plane mints the signed token (Ed25519, the bespoke codec-equivalent-to-PASETO
+* Code review confirming the control plane mints the signed token (ECDSA P-256/SHA-256, the bespoke codec-equivalent-to-PASETO
   format described in the Implementation note below) and the sidecar verifies it with the public key, and that
   **no component other than control and sidecar parses the token**.
 * Integration tests: the token authorizes via **query** (bare URL, `Range` works) and via **header** (no signing
@@ -159,32 +129,16 @@ the dual-envelope (query + header) and the asymmetric, sidecar-cannot-mint prope
 
 ### Implementation note (P2, 2026-07)
 
-**Implemented as** a bespoke, codec-equivalent format rather than literal PASETO `v4.public`:
-`base64url(json(claims)).base64url(ed25519_signature)` — the JSON claim-set and
-an Ed25519 signature over its serialized bytes, each base64url-encoded and joined with a `.`. There is **no `kid`
-field** anywhere in the token (no footer, no key-id claim); instead, the sidecar's `Verifier` checks a token's
-signature against a small **ordered** set of public keys — the primary (`FS_SIDECAR_PUBLIC_KEY`) plus, optionally,
-a short list of previously-active keys retained during a rotation (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — trying each
-in turn until one matches. This is what gives a `signing_key_seed` rotation a zero-outage crossover window without
-needing a `kid` claim to select a key at all: see `docs/operations.md`'s `signing_key_seed` → **Rotation** section
-for the operational procedure.
+The codec is `base64url(json(claims)).base64url(ecdsa_der_signature)`.
+The control plane holds a PKCS#8 DER P-256 private key. The sidecar receives only
+its uncompressed SEC1 public point (`0x04 || X || Y`, 65 bytes). Signatures use
+SHA-256 and ASN.1 DER. Tokens are opaque to clients and intermediaries.
 
-This is an accepted interim measure, not a silent deviation: every property this ADR actually cares about holds —
-the token is opaque per the Token Opacity Contract below (only control and sidecar parse it), signed with Ed25519
-through the in-house `SignatureProvider`/`SignatureVerifier` abstraction (`Ed25519Provider`) exactly as the FIPS
-posture above requires (not a hard-wired crate call, so it satisfies the *replaceability* requirement), and the
-control plane remains the sole minter with the sidecar verify-only. What differs is only the concrete codec (bespoke
-vs. the PASETO `v4.public` wire format) and the absence of `kid`-based key *selection* — and the FIPS posture is
-otherwise unchanged: Ed25519 approval under FIPS 186-5 still requires the signing/verifying primitive to run inside a
-**FIPS-validated cryptographic module**, and the current `Ed25519Provider` is a generic (non-validated)
-implementation, so this codec **MUST NOT** be used in any FIPS-constrained deployment until the provider behind it is
-swapped for a FIPS-validated module (or a FIPS-approved alternative such as ECDSA P-256 over a validated module) —
-which, because the codec is opaque and evolvable, requires no change to the token format or claim-set, only to the
-provider implementation. Key rotation itself is no longer deferred: it is solved operationally by the sidecar's
-ordered multi-key `Verifier` described above, with the full zero-outage procedure in `docs/operations.md`'s
-`signing_key_seed` → **Rotation** section. Migrating the codec to a literal PASETO `v4.public` library and adding
-`kid`-based key *selection* (an optimization once the key set stops being small enough to try linearly, not a
-correctness gap) remain deferred — tracked as a "Deferred item" in `DECOMPOSITION.md`.
+The original implementation used Ed25519. It now uses P-256 so the same algorithm
+is available across all three selected native FIPS providers. This is a breaking
+key and token change: deploy a new `signing_key_pkcs8` and matching
+`FS_SIDECAR_PUBLIC_KEY` together. Old Ed25519 seeds/public keys/tokens are rejected.
+See [migration procedure](../operations.md#ed25519-to-p-256-migration).
 
 ### Claim-set evolution (P2 1.11, 2026-07)
 
@@ -233,12 +187,10 @@ This is a hard interface boundary, not a nicety:
 * Good, because the format is **private to control+sidecar and therefore freely evolvable** — claim-set and crypto can
   change with zero coordination with intermediaries (the core driver)
 * Good, because no intermediary couples to our field layout; the credential is just bytes everywhere else
-* Good, because PASETO `v4.public` is a **safe, fixed-crypto** standard (Ed25519, no `alg` agility / JWT confusion),
-  asymmetric so the sidecar cannot mint
+* Good, because the codec fixes P-256/SHA-256 without algorithm negotiation; the sidecar cannot mint
 * Bad, because it is not human-readable on the wire — **by design**; debugging is server-side, not by eyeballing a URL
 * Bad, because the edge cannot read claims — **by design**; this is the encapsulation we want
-* Bad, because it adds a PASETO v4 dependency on control and sidecar
-* Bad, because `v4.public` is signed-not-encrypted (payload decodable) — addressed by the Opacity Contract, not relied on for secrecy
+* Bad, because the token is signed rather than encrypted (payload decodable) — addressed by the Opacity Contract, not relied on for secrecy
 
 **Discrete fields — rejected:**
 
@@ -260,14 +212,12 @@ Both are adopted; the caller (or SDK) picks by intent — query for embedding, h
 
 ## More Information
 
-**PASETO `v4.public`** is a self-contained token: `v4.public.<base64url(payload)>.<base64url(footer)>` where the payload
-is the claim-set and the signature is Ed25519 over the canonical PASETO pre-auth encoding; verification uses the public
-key only. Unlike JWT it has **no algorithm field** — the version pins exactly one scheme, eliminating `alg`-confusion
-and downgrade attacks. We use the footer for the `kid`.
+The codec uses toolkit-security's ECDSA API directly. It does not implement PASETO
+framing or pre-authentication encoding and must not be advertised as PASETO.
 
 **Why not mimic S3's discrete-field shape:** S3 SigV4 (and its many re-implementations) deliberately uses readable
 discrete params because S3 *is* an open, multi-client wire contract. We are the opposite: a closed credential between
-two components we control. Our crypto (Ed25519 vs HMAC-SHA256), param semantics, and resource addressing (the URL points
+two components we control. Our crypto (ECDSA P-256/SHA-256 vs HMAC-SHA256), param semantics, and resource addressing (the URL points
 at our sidecar, not a backend) already make S3 compatibility impossible — so we gain nothing by imitating its shape, and
 an opaque, evolvable token serves our actual two-party, evolvable contract far better.
 
@@ -294,6 +244,6 @@ an opaque, evolvable token serves our actual two-party, evolvable contract far b
 This decision directly addresses the following requirements or design elements:
 
 * `cpt-cf-file-storage-fr-signed-urls` — the credential is a PASETO `v4.public` token carried in the query or a header
-* `cpt-cf-file-storage-design-signed-urls` — claims move inside the token; PASETO mint/verify replaces canonical-string signing
+* `cpt-cf-file-storage-design-signed-urls` — claims move inside the token; private-token mint/verify replaces canonical-string signing
 * `cpt-cf-file-storage-principle-signed-urls` — control-minted (private key), sidecar-verified (public key); the sidecar cannot mint
 * `cpt-cf-file-storage-nfr-bandwidth` — the header envelope gives programmatic callers a stable, cache-friendly URL

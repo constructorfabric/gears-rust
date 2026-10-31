@@ -220,6 +220,25 @@ impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
     fn record_registry_provisioning_run(&self, outcome: &str) {
         self.runs.lock().unwrap().push(outcome.to_owned());
     }
+    fn record_proxy_cache_lookup(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheLookup,
+    ) {
+    }
+    fn record_proxy_cache_entries(&self, _: crate::domain::ports::metric_labels::CacheMap, _: u64) {
+    }
+    fn record_proxy_cache_evictions(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheEviction,
+        _: u64,
+    ) {
+    }
+    fn record_proxy_cache_change(&self, _: &str) {}
+    fn record_proxy_cache_flush(&self, _: &str) {}
+    fn record_proxy_cache_load_discarded(&self, _: crate::domain::ports::metric_labels::CacheMap) {}
+    fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
 }
 
 #[cfg(test)]
@@ -641,6 +660,7 @@ impl TestCpBuilder {
             allow_all_enforcer(),
             credstore,
             Arc::new(SsrfGuard::disabled()),
+            None,
         ));
 
         cp
@@ -913,7 +933,7 @@ mod unavailable {
 
     use crate::domain::model::{ListQuery, Route, Upstream};
     use crate::domain::repo::{
-        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, Tags,
+        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, RowKey, Tags,
         UpstreamRepository,
     };
 
@@ -992,6 +1012,12 @@ mod unavailable {
             _: &str,
             _: Tags,
         ) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_proxy_routes(
+            &self,
+            _: &[RowKey],
+        ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError> {
             Err(unavailable())
         }
         async fn update(&self, _: Route) -> Result<Route, RepositoryError> {

@@ -73,56 +73,56 @@ fn removed_background_sweep_keys_are_rejected() {
 }
 
 #[test]
-fn validate_rejects_missing_signing_key_seed_when_required_flag_set() {
+fn validate_rejects_missing_signing_key_pkcs8_when_required_flag_set() {
     let cfg = FileStorageConfig {
-        signing_key_seed: None,
-        require_signing_key_seed: true,
+        signing_key_pkcs8: None,
+        require_signing_key: true,
         ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_err(),
-        "a missing signing_key_seed must be rejected when require_signing_key_seed is true"
+        "a missing signing_key_pkcs8 must be rejected when require_signing_key is true"
     );
 }
 
 #[test]
-fn validate_allows_missing_signing_key_seed_when_required_flag_unset() {
+fn validate_allows_missing_signing_key_pkcs8_when_required_flag_unset() {
     let cfg = FileStorageConfig {
-        signing_key_seed: None,
-        require_signing_key_seed: false,
+        signing_key_pkcs8: None,
+        require_signing_key: false,
         ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
-        "a missing signing_key_seed must be allowed when require_signing_key_seed is false"
+        "a missing signing_key_pkcs8 must be allowed when require_signing_key is false"
     );
 }
 
 #[test]
-fn validate_allows_present_signing_key_seed_when_required_flag_set() {
+fn validate_allows_present_signing_key_pkcs8_when_required_flag_set() {
     const SEED: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
     let cfg = FileStorageConfig {
-        signing_key_seed: Some(SecretString::new(SEED)),
-        require_signing_key_seed: true,
+        signing_key_pkcs8: Some(SecretString::new(SEED)),
+        require_signing_key: true,
         ..cfg_with_secret()
     };
     assert!(
         cfg.validate().is_ok(),
-        "a present signing_key_seed must pass validation even when required"
+        "a present signing_key_pkcs8 must pass validation even when required"
     );
 
     let cfg_debug = format!("{cfg:?}");
     assert!(
         !cfg_debug.contains(SEED),
-        "FileStorageConfig's Debug output must never contain the raw signing_key_seed: {cfg_debug}"
+        "FileStorageConfig's Debug output must never contain the raw signing_key_pkcs8: {cfg_debug}"
     );
 }
 
 #[test]
-fn default_require_signing_key_seed_is_true() {
+fn default_require_signing_key_is_true() {
     assert!(
-        FileStorageConfig::default().require_signing_key_seed,
-        "require_signing_key_seed must default to true (secure-by-default)"
+        FileStorageConfig::default().require_signing_key,
+        "require_signing_key must default to true (secure-by-default)"
     );
 }
 
@@ -131,7 +131,7 @@ fn missing_finalize_internal_secret_fails_validate() {
     // The s2s finalize/report-part callbacks require the internal credential;
     // finalize trusts the size/hash the sidecar reports on them.
     let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: None,
         ..FileStorageConfig::default()
     };
@@ -153,7 +153,7 @@ fn missing_finalize_internal_secret_fails_validate() {
 fn present_finalize_internal_secret_passes_validate_and_is_redacted() {
     const SECRET: &str = "interim-shared-secret";
     let cfg = FileStorageConfig {
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new(SECRET)),
         ..FileStorageConfig::default()
     };
@@ -270,7 +270,7 @@ fn validate_rejects_default_page_size_exceeding_max_page_size() {
     let cfg = FileStorageConfig {
         default_page_size: 150,
         max_page_size: 100,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
@@ -289,7 +289,7 @@ fn validate_accepts_default_page_size_equal_to_max_page_size() {
     let cfg = FileStorageConfig {
         default_page_size: 100,
         max_page_size: 100,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
@@ -304,7 +304,7 @@ fn validate_accepts_max_page_size_at_ceiling() {
     let cfg = FileStorageConfig {
         default_page_size: MAX_PAGE_SIZE_CEILING,
         max_page_size: MAX_PAGE_SIZE_CEILING,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
@@ -319,7 +319,7 @@ fn validate_rejects_max_page_size_above_ceiling() {
     let cfg = FileStorageConfig {
         default_page_size: MAX_PAGE_SIZE_CEILING,
         max_page_size: MAX_PAGE_SIZE_CEILING + 1,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
@@ -338,7 +338,7 @@ fn validate_rejects_zero_default_page_size() {
     let cfg = FileStorageConfig {
         default_page_size: 0,
         max_page_size: 100,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
@@ -356,7 +356,7 @@ fn validate_rejects_zero_max_page_size() {
     let cfg = FileStorageConfig {
         default_page_size: 25,
         max_page_size: 0,
-        require_signing_key_seed: false,
+        require_signing_key: false,
         finalize_internal_secret: Some(SecretString::new("test-internal-secret")),
         ..FileStorageConfig::default()
     };
