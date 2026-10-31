@@ -317,6 +317,43 @@ mod tests {
         );
     }
 
+    /// ADR-0009 §3: a generic client's builder captures its handler, so every
+    /// endpoint rebuild wraps the same handler state around a fresh transport.
+    #[tokio::test]
+    async fn rebuild_keeps_the_captured_handler() {
+        struct Handler;
+        struct HandlerClient {
+            base_url: String,
+            handler: Arc<Handler>,
+        }
+        let handler = Arc::new(Handler);
+        let captured = Arc::clone(&handler);
+        let c = DirectoryResolvingClient::new(
+            Arc::new(ScriptResolver {
+                steps: vec![
+                    Step::Found("http://a:8080".into()),
+                    Step::Found("http://b:9090".into()),
+                ],
+                idx: AtomicUsize::new(0),
+            }),
+            "billing",
+            ClientTuning::default(),
+            move |cfg| {
+                Ok(HandlerClient {
+                    base_url: cfg.base_url,
+                    handler: Arc::clone(&captured),
+                })
+            },
+        );
+
+        let first = c.resolved().await.unwrap();
+        let second = c.resolved().await.unwrap();
+        assert_eq!(first.base_url, "http://a:8080");
+        assert_eq!(second.base_url, "http://b:9090");
+        assert!(Arc::ptr_eq(&first.handler, &handler));
+        assert!(Arc::ptr_eq(&second.handler, &handler));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_resolves_build_client_only_once() {
         // Real OS-thread concurrency (not single-threaded cooperative

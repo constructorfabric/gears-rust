@@ -19,7 +19,10 @@ mod retry;
 mod user_agent;
 
 #[cfg(feature = "otel")]
-pub use metrics::{ClassifyFn, MetricsLayer, MetricsService, default_classify};
+pub use metrics::{
+    ClassifyFn, MetricsLayer, MetricsService, RequestDurationRecorder, RequestLabels,
+    RequestOutcome, default_classify,
+};
 pub use otel::{OtelLayer, OtelService};
 pub use redirect::SecureRedirectPolicy;
 pub use retry::{RETRY_ATTEMPT_HEADER, RetryLayer, RetryService};

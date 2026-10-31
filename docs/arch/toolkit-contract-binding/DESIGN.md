@@ -580,18 +580,53 @@ Perspective: **plugin author**. Point: the plugin implements the base trait like
 
 **Manual implementation is always allowed.** The macro generates a default client for the common case (POST + JSON, SSE streaming, exponential-backoff retry). When a gear needs behavior the macro does not express — complex path templates, query parameter composition, custom authentication, connection pooling with per-tenant routing, bespoke retry strategies, request signing — the author can write a hand-crafted client that implements the same base trait directly. The consumer still gets `Arc<dyn NotificationBackend>`; the generated client and the hand-written client are indistinguishable from the consumer's perspective. The macro is a convenience for the common case, not a lock-in. Hand-written clients can coexist with macro-generated ones in the same codebase.
 
-**Proposed per-method composition.**
-[ADR-0009](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md) proposes
-`#[client_manual]` on individual REST projection methods, a generated public,
-sealed handler trait and constructor injection through a generic `H`
-stored as `Arc<H>`. Only the SDK implements the handler trait; applications
-configure and inject SDK-provided concrete or `dyn` handlers via `with_manual`.
-One generated base-trait implementation would dispatch ordinary methods itself
-and delegate manual methods to that handler. A projection may name a default
-handler (`manual_handler`); `H` then defaults to it, and `new`, `with_http_client`
-and the generated wiring keep their signatures. Existing unannotated clients keep
-their constructors and behavior. This is not implemented; the current escape
-hatch still replaces the whole client.
+**Per-method composition.**
+[ADR-0009](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md) adds
+`#[client_manual]` on individual REST projection methods. For a projection with
+such methods the macro generates a public, sealed `{Projection}Manual` trait with
+exactly those methods, each taking a `ManualCallContext` after `&self`, and makes
+`{Projection}Client<H: ?Sized>` and `{Projection}ResolvingClient<H: ?Sized>`
+generic over the handler, stored as `Arc<H>`. One generated base-trait
+implementation dispatches ordinary methods itself and delegates manual methods
+to the handler. Only the SDK implements the handler trait (the sealing module is
+`{projection_snake}_manual_sealed`); applications inject SDK-provided concrete or
+`dyn` handlers with `with_manual` / `with_http_client_and_manual`. A projection
+may name a default handler (`manual_handler = path::Type`, `Type: Default`); `H`
+then defaults to it, and `new`, `with_http_client` and the `provides`/`consumes`
+expansions keep their signatures. Without `manual_handler` there is no `new`.
+Projections without manual methods expand as before. `#[retryable]` is rejected
+on a manual method.
+
+`ManualCallContext` (`toolkit_contract::runtime::manual`) gives the handler the
+current endpoint, configuration, binding and the method's captured credential,
+plus `url`, `request` and `send_json` helpers that reuse the generated client's
+URL building, credential attachment and `send_unary`.
+
+`#[passthrough("/prefix/{*rest}", methods = [..])]` replaces the verb for an
+opaque request method; it requires `#[client_manual]` and `#[server_manual]`.
+The binding IR records it honestly as `HttpMethod::Passthrough` with an
+`HttpFieldBinding::Passthrough { field, param, methods }`, and
+`validate_http_binding` checks the method set and the trailing wildcard.
+`ManualCallContext::send_raw` (feature `raw-http`) forwards such a request on the
+`toolkit-http-proxy` engine: destination pinned to the configured endpoint,
+caller `Host`/`Authorization`/`X-ToolKit-Internal-Token` replaced, trace context
+injected, streaming bodies with response trailers (request trailers over HTTP/2
+only: the engine never forwards a request `Trailer` declaration), no
+decompression, redirects or replay
+(`ProxyClientConfig::resend_idempotent = false`), and
+`http.client.request.duration` recorded under `otel`. It takes its transport
+settings from `ClientConfig`, like `build_default_http_client`: `require_tls`,
+`tls_roots` and `tls` (minimum version, mutual-TLS identity). Clients built with
+`new`/`with_manual` share one `max_concurrent_requests` budget
+(`toolkit_http::ConcurrencyLimiter`) between generated and raw calls; with a
+caller-supplied `HttpClient`, raw calls get a budget of their own. Name
+resolution, each TCP connect and each TLS handshake are bounded by `timeout`; the
+response head and each body frame by `stream_idle_timeout`, so a long upload is
+not cut by `timeout`; resolved addresses are reused until they age out
+(`pool_idle_timeout`) or none accepts a connect, and `ProxyClient::send_any`
+moves to the next address after a refused connect. Upgrade and `CONNECT`
+requests, methods outside the set and dot segments are refused with
+`TransportError::InvalidRequest`; WebSocket stays out of scope.
 
 The handler trait follows the projection's contract major version without an
 independent version. Required method additions to the sealed trait can be
@@ -600,14 +635,9 @@ safety remain breaking changes to the SDK's Rust API. Stateful factory integrati
 is deferred: `consumes` factories run after all `init` calls, while `provides`
 factories run inside the provider's `init` and require already initialized,
 declared dependencies. Missing required dependencies are startup wiring errors.
-
-The ADR also defines the required wiring/discovery integration, opaque binding
-metadata and shared raw HTTP runtime behavior. OAGW-specific error interpretation
-stays in its SDK adapter. A raw transport must not inherit typed SSE parsing,
-decompression, redirects or replay; adding only a generator annotation would not
-satisfy those requirements. WebSocket upgrades are out of scope; the raw helper
-rejects upgrade requests. See the ADR's dependency and verification table before
-changing codegen, public IR structs or transport construction.
+OAGW SDK adoption is the next step; OAGW-specific error interpretation stays in
+its SDK adapter. The fixture SDK `libs/toolkit-contract-manual-fixture` exercises
+all of the above.
 
 ### D4: ContractError Derive
 
@@ -1018,6 +1048,6 @@ bodies — these fall to a manual `impl Base for MyClient` (ADR-0002 escape hatc
 - **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
 - **ADR-0007** — contract versioning (additive + parallel traits): [`./ADR/0007-cpt-cf-binding-adr-contract-versioning.md`](./ADR/0007-cpt-cf-binding-adr-contract-versioning.md)
 - **ADR-0008** — gRPC transport projection: [`./ADR/0008-cpt-cf-binding-adr-grpc-projection.md`](./ADR/0008-cpt-cf-binding-adr-grpc-projection.md)
-- **ADR-0009** — typed manual client methods and raw HTTP runtime (proposed): [`./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md`](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md)
+- **ADR-0009** — typed manual client methods and raw HTTP runtime: [`./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md`](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
 - **Gear/plugin declaration and resolution**: [PR #1380](https://github.com/constructorfabric/gears-rust/pull/1380)

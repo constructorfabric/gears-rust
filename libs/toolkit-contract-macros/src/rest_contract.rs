@@ -17,6 +17,10 @@ use crate::projection::{
     streaming_return_type, strip_method_attrs,
 };
 use crate::rest_contract_parse::{HttpVerb, RestContractModel, RestMethodModel, RestParam};
+use crate::rest_manual::{
+    ClientGenerics, generate_manual_client_method, generate_manual_trait,
+    generate_mixed_client_struct,
+};
 use crate::support::contract_support_path;
 
 const HTTP_ATTRS: &[&str] = &[
@@ -28,6 +32,8 @@ const HTTP_ATTRS: &[&str] = &[
     "retryable",
     "streaming",
     "server_manual",
+    "client_manual",
+    "passthrough",
     "exposed",
     "internal",
     "anonymous",
@@ -53,7 +59,12 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     let support = contract_support_path();
     let cleaned_trait = generate_cleaned_trait(model);
     let binding_fn = generate_binding_fn(model, &support);
-    let client_struct = generate_client_struct(model, &support);
+    let manual_trait = generate_manual_trait(model, &support);
+    let client_struct = if model.has_client_manual() {
+        generate_mixed_client_struct(model, &support)
+    } else {
+        generate_client_struct(model, &support)
+    };
     let client_impl = generate_client_impl(model, &support);
     let resolving_struct = generate_resolving_client_struct(model, &support);
     let resolving_impl = generate_resolving_client_impl(model, &support);
@@ -64,6 +75,7 @@ pub fn generate(model: &RestContractModel) -> TokenStream {
     quote! {
         #cleaned_trait
         #binding_fn
+        #manual_trait
         #client_struct
         #client_impl
         #resolving_struct
@@ -93,9 +105,10 @@ fn check_path_placeholders(model: &RestContractModel) -> Option<TokenStream> {
             .map(|(param, _)| param.ident.to_string())
             .collect();
 
+        // A `{*name}` wildcard is filled by a passthrough request, not a parameter.
         let orphans: Vec<String> = extract_path_param_names(&method.path_template)
             .into_iter()
-            .filter(|p| !declared.contains(p))
+            .filter(|p| !p.starts_with('*') && !declared.contains(p))
             .map(|p| format!("`{{{p}}}`"))
             .collect();
 
@@ -127,7 +140,13 @@ fn check_path_placeholders(model: &RestContractModel) -> Option<TokenStream> {
 ///
 /// Returns the `compile_error!` tokens for the first offending method.
 fn check_query_params(model: &RestContractModel) -> Option<TokenStream> {
-    for method in &model.methods {
+    // Neither side of a fully manual method is generated, so neither encodes
+    // nor decodes its query.
+    for method in model
+        .methods
+        .iter()
+        .filter(|m| !(m.client_manual && m.server_manual))
+    {
         let query_params: Vec<&RestParam> = classify_params(method)
             .into_iter()
             .filter(|(_, class)| *class == FieldClass::Query)
@@ -239,11 +258,23 @@ fn generate_full_coverage_check(model: &RestContractModel, support: &TokenStream
 }
 
 fn generate_projection_impl(model: &RestContractModel) -> TokenStream {
-    generate_projection_impl_for_client(
-        &model.trait_ident,
-        &client_struct_ident(&model.trait_ident),
-        "rest-client",
-    )
+    if !model.has_client_manual() {
+        return generate_projection_impl_for_client(
+            &model.trait_ident,
+            &client_struct_ident(&model.trait_ident),
+            "rest-client",
+        );
+    }
+    let projection = &model.trait_ident;
+    let client = client_struct_ident(projection);
+    let ClientGenerics {
+        impl_generics, ty, ..
+    } = ClientGenerics::of(model);
+    quote! {
+        #[cfg(feature = "rest-client")]
+        #[::async_trait::async_trait]
+        impl #impl_generics #projection for #client #ty {}
+    }
 }
 
 fn generate_cleaned_trait(model: &RestContractModel) -> TokenStream {
@@ -341,7 +372,20 @@ fn build_method_binding(method: &RestMethodModel, support: &TokenStream) -> Toke
     let stream_framing = stream_framing_tokens(method.stream_framing, support);
     let optional = method.optional;
 
-    let field_bindings = build_field_bindings(method, support);
+    let field_bindings = if let Some(spec) = &method.passthrough {
+        let field = spec.field.to_string();
+        let param = &spec.param;
+        let methods = spec.methods.iter().map(|m| http_method_tokens(*m, support));
+        vec![quote! {
+            #support::ir::binding::HttpFieldBinding::Passthrough {
+                field: #field.to_owned(),
+                param: #param.to_owned(),
+                methods: vec![ #(#methods),* ],
+            }
+        }]
+    } else {
+        build_field_bindings(method, support)
+    };
 
     quote! {
         #support::ir::binding::HttpMethodBindingIr {
@@ -388,8 +432,12 @@ enum FieldClass {
 /// otherwise the first remaining param on a body-carrying verb (POST/PUT) is the
 /// `Body`; all others are `Query`.
 fn classify_params(method: &RestMethodModel) -> Vec<(&RestParam, FieldClass)> {
-    let path_params = extract_path_param_names(&method.path_template);
     let mut out = Vec::new();
+    // A passthrough request is one opaque field, bound by `build_method_binding`.
+    if method.passthrough.is_some() {
+        return out;
+    }
+    let path_params = extract_path_param_names(&method.path_template);
     let mut body_assigned = false;
     for param in &method.params {
         if param.ident == "self" || is_security_context_type(&param.ty) {
@@ -532,16 +580,22 @@ fn generate_client_struct(model: &RestContractModel, support: &TokenStream) -> T
 fn generate_client_impl(model: &RestContractModel, support: &TokenStream) -> TokenStream {
     let client_ident = client_struct_ident(&model.trait_ident);
     let trait_path = &model.base_trait;
+    let ClientGenerics {
+        impl_generics, ty, ..
+    } = ClientGenerics::of(model);
 
-    let methods = model
-        .methods
-        .iter()
-        .map(|m| generate_client_method(m, &model.trait_ident, support));
+    let methods = model.methods.iter().map(|m| {
+        if m.client_manual {
+            generate_manual_client_method(m, model, support)
+        } else {
+            generate_client_method(m, &model.trait_ident, support)
+        }
+    });
 
     quote! {
         #[cfg(feature = "rest-client")]
         #[::async_trait::async_trait]
-        impl #trait_path for #client_ident {
+        impl #impl_generics #trait_path for #client_ident #ty {
             #(#methods)*
         }
     }
@@ -558,6 +612,9 @@ fn generate_resolving_client_struct(
     model: &RestContractModel,
     support: &TokenStream,
 ) -> TokenStream {
+    if model.has_client_manual() {
+        return crate::rest_manual::generate_mixed_resolving_struct(model, support);
+    }
     let resolving_ident = resolving_struct_ident(&model.trait_ident);
     let client_ident = client_struct_ident(&model.trait_ident);
     let doc = format!(
@@ -613,16 +670,20 @@ fn generate_resolving_client_impl(model: &RestContractModel, support: &TokenStre
     let resolving_ident = resolving_struct_ident(&model.trait_ident);
     let client_ident = client_struct_ident(&model.trait_ident);
     let trait_path = &model.base_trait;
+    let ClientGenerics {
+        impl_static, ty, ..
+    } = ClientGenerics::of(model);
+    let client_ty = quote! { #client_ident #ty };
 
     let methods = model
         .methods
         .iter()
-        .map(|m| generate_resolving_method(m, &client_ident, trait_path, support));
+        .map(|m| generate_resolving_method(m, &client_ty, trait_path, support));
 
     quote! {
         #[cfg(feature = "rest-client")]
         #[::async_trait::async_trait]
-        impl #trait_path for #resolving_ident {
+        impl #impl_static #trait_path for #resolving_ident #ty {
             #(#methods)*
         }
     }
@@ -631,7 +692,7 @@ fn generate_resolving_client_impl(model: &RestContractModel, support: &TokenStre
 /// One delegating method body for the resolving wrapper.
 fn generate_resolving_method(
     method: &RestMethodModel,
-    client_ident: &syn::Ident,
+    client_ty: &TokenStream,
     trait_path: &syn::Path,
     support: &TokenStream,
 ) -> TokenStream {
@@ -660,7 +721,7 @@ fn generate_resolving_method(
                             + ::std::marker::Send + 'static,
                     >> = match __inner.resolved().await {
                         ::std::result::Result::Ok(__c) => {
-                            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*)
+                            <#client_ty as #trait_path>::#method_ident(&*__c, #(#arg_idents),*)
                         }
                         ::std::result::Result::Err(__e) => ::std::boxed::Box::pin(
                             ::futures_util::stream::once(async move {
@@ -686,12 +747,13 @@ fn generate_resolving_method(
     quote! {
         async fn #method_ident #sig {
             let __c = self.__inner.resolved().await.map_err(#convert_err)?;
-            <#client_ident as #trait_path>::#method_ident(&*__c, #(#arg_idents),*).await
+            <#client_ty as #trait_path>::#method_ident(&*__c, #(#arg_idents),*).await
         }
     }
 }
 
-fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
+/// `{Projection}ResolvingClient`: the directory-resolving client's name.
+pub fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
     format_ident!("{}ResolvingClient", trait_ident)
 }
 
@@ -703,14 +765,20 @@ fn resolving_struct_ident(trait_ident: &syn::Ident) -> syn::Ident {
 ///
 /// Routed through `#support::__tracing` (a `toolkit-contract` re-export) so SDK
 /// crates need no direct `tracing` dependency.
-fn client_span_ctor(
+pub fn client_span_ctor(
     service: &str,
     method_name: &str,
     method: &RestMethodModel,
     support: &TokenStream,
 ) -> TokenStream {
     let span_name = format!("{service}.{method_name}");
-    let http_method_str = method.http_method.ir_variant().to_uppercase();
+    // A passthrough method's verb is only known per request; `send_raw`
+    // records it then.
+    let http_method_str = if matches!(method.http_method, HttpVerb::Passthrough) {
+        "_OTHER".to_owned()
+    } else {
+        method.http_method.ir_variant().to_uppercase()
+    };
     let route_str = method.path_template.clone();
     quote! {
         #support::__tracing::info_span!(
@@ -1173,25 +1241,36 @@ fn generate_awaited_streaming_body(parts: &StreamingBody<'_>) -> TokenStream {
     }
 }
 
-fn render_method_signature(method: &RestMethodModel) -> TokenStream {
-    let params = method.params.iter().map(|p| {
-        let ident = &p.ident;
-        let ty = &p.ty;
-        if ident == "self" {
-            return quote! { &self };
-        }
-        quote! { #ident: #ty }
-    });
+/// `( &self, params.. ) -> Ret` of a projection method as the client implements it.
+pub fn render_method_signature(method: &RestMethodModel) -> TokenStream {
+    let params = render_method_params(method);
+    let return_ty = render_method_return(method);
+    quote! {
+        ( &self, #(#params),* ) #return_ty
+    }
+}
 
-    let return_ty = match &method.result_types {
+/// `name: Type` for every parameter after the receiver.
+pub fn render_method_params(method: &RestMethodModel) -> Vec<TokenStream> {
+    method
+        .params
+        .iter()
+        .filter(|p| p.ident != "self")
+        .map(|p| {
+            let ident = &p.ident;
+            let ty = &p.ty;
+            quote! { #ident: #ty }
+        })
+        .collect()
+}
+
+/// The method's return type, with a streaming method's stream rewrite.
+pub fn render_method_return(method: &RestMethodModel) -> TokenStream {
+    match &method.result_types {
         Some((ok, err)) if !method.shape.is_streaming() => {
             quote! { -> ::std::result::Result<#ok, #err> }
         }
         _ => streaming_signature_return(method),
-    };
-
-    quote! {
-        ( &self, #(#params),* ) #return_ty
     }
 }
 
@@ -1223,7 +1302,8 @@ fn response_type(method: &RestMethodModel) -> TokenStream {
     quote! { () }
 }
 
-fn error_type(method: &RestMethodModel) -> TokenStream {
+/// The `E` of the method's `Result<_, E>`.
+pub fn error_type(method: &RestMethodModel) -> TokenStream {
     if let Some((_, err)) = &method.result_types {
         return quote! { #err };
     }
@@ -1237,6 +1317,11 @@ fn http_verb_call(verb: HttpVerb) -> syn::Ident {
         HttpVerb::Put => format_ident!("put"),
         HttpVerb::Patch => format_ident!("patch"),
         HttpVerb::Delete => format_ident!("delete"),
+        HttpVerb::Head => format_ident!("head"),
+        HttpVerb::Options => format_ident!("options"),
+        HttpVerb::Passthrough => {
+            unreachable!("a passthrough method is #[client_manual]; no generated dispatch")
+        }
     }
 }
 
@@ -1343,7 +1428,7 @@ fn build_query_string(method: &RestMethodModel, support: &TokenStream) -> TokenS
 ///   (`InternalCredential::None`) nothing is attached — the requirement is
 ///   enforced server-side.
 /// - No context parameter → both `None`.
-fn capture_auth_credentials(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
+pub fn capture_auth_credentials(method: &RestMethodModel, support: &TokenStream) -> TokenStream {
     let secctx = method
         .params
         .iter()
@@ -1503,6 +1588,11 @@ fn generate_method_route(method: &RestMethodModel, model: &RestContractModel) ->
         HttpVerb::Put => quote! { put },
         HttpVerb::Patch => quote! { patch },
         HttpVerb::Delete => quote! { delete },
+        HttpVerb::Head => quote! { head },
+        HttpVerb::Options => quote! { options },
+        HttpVerb::Passthrough => {
+            unreachable!("a passthrough method is #[server_manual]; no generated route")
+        }
     };
 
     // Placeholder/parameter agreement is checked up front in
@@ -1854,7 +1944,7 @@ fn generate_unary_handler(method: &RestMethodModel, support: &TokenStream) -> To
 /// names (e.g. `HttpGatewayApi` → `http_gateway_api`, not `h_t_t_p_...`). A
 /// hand-rolled converter here previously diverged on such names and broke the
 /// `provides`↔REST wiring with an `E0425 cannot find function`.
-fn to_snake_case(s: &str) -> String {
+pub fn to_snake_case(s: &str) -> String {
     use heck::ToSnakeCase as _;
     s.to_snake_case()
 }

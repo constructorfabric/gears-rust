@@ -89,6 +89,7 @@ members = [
     "libs/toolkit-contract",
     "libs/toolkit-contract-macros",
     "libs/toolkit-contract-macros-tests",
+    "libs/toolkit-contract-manual-fixture",
     "libs/toolkit-contract-protogen",
     "libs/system-sdks",
     "libs/system-sdks/sdks/directory",

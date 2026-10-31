@@ -69,6 +69,12 @@ impl From<TransportError> for CanonicalError {
             TransportError::UrlBuild(msg) => {
                 CanonicalError::internal(format!("URL build error: {msg}")).create()
             }
+            // The SDK adapter handed the client a request it refuses to forward
+            // (upgrade, CONNECT, method outside the binding's set): a local
+            // fault, like `UrlBuild`.
+            TransportError::InvalidRequest(msg) => {
+                CanonicalError::internal(format!("invalid request: {msg}")).create()
+            }
         }
     }
 }

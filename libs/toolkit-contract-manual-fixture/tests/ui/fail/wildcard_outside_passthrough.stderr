@@ -1,0 +1,5 @@
+error: malformed path template `/files/{*rest}`: `{*name}` wildcards are only valid in `#[passthrough]` templates
+  --> tests/ui/fail/wildcard_outside_passthrough.rs:13:5
+   |
+13 |     #[get("/files/{*rest}")]
+   |     ^

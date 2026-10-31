@@ -210,6 +210,13 @@ pub struct ClientConfig {
     /// which is **not** transient, so a saturated client fails fast rather than
     /// retrying into its own overload.
     pub max_concurrent_requests: Option<usize>,
+    /// Trust anchors for provider certificates. Transport-construction field:
+    /// applied by `build_default_http_client` and by the raw transport of
+    /// `#[client_manual]` passthrough methods. Defaults to Mozilla's roots.
+    pub tls_roots: toolkit_http::TlsRootConfig,
+    /// Minimum TLS version and optional mutual-TLS client identity.
+    /// Transport-construction field, applied like [`tls_roots`](Self::tls_roots).
+    pub tls: toolkit_http::TlsConfig,
     /// Source of the platform-plane internal credential attached to methods
     /// whose plane marker is `PlatformSecurityContext` (carried as
     /// `X-ToolKit-Internal-Token`). `None` (the default) attaches nothing —
@@ -237,6 +244,8 @@ impl ClientConfig {
             pool_max_idle_per_host: 128,
             pool_idle_timeout: Some(Duration::from_secs(90)),
             max_concurrent_requests: Some(128),
+            tls_roots: toolkit_http::TlsRootConfig::default(),
+            tls: toolkit_http::TlsConfig::default(),
             internal_token_provider: None,
         }
     }
@@ -302,6 +311,22 @@ impl ClientConfig {
     #[must_use]
     pub fn with_max_concurrent_requests(mut self, max: Option<usize>) -> Self {
         self.max_concurrent_requests = max;
+        self
+    }
+
+    /// Override the trust anchors for provider certificates. See
+    /// [`Self::tls_roots`].
+    #[must_use]
+    pub fn with_tls_roots(mut self, roots: toolkit_http::TlsRootConfig) -> Self {
+        self.tls_roots = roots;
+        self
+    }
+
+    /// Override the minimum TLS version and mutual-TLS identity. See
+    /// [`Self::tls`].
+    #[must_use]
+    pub fn with_tls(mut self, tls: toolkit_http::TlsConfig) -> Self {
+        self.tls = tls;
         self
     }
 
