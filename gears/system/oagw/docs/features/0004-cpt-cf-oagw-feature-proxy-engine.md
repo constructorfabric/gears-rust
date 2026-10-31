@@ -68,6 +68,7 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
 - **Sequence**: `cpt-cf-oagw-seq-proxy-flow`
+- **ADR**: [ADR/0020-proxy-config-cache.md](../ADR/0020-proxy-config-cache.md) — proxy configuration cache with a database
 - **Dependencies**: `cpt-cf-oagw-feature-management-api`, `cpt-cf-oagw-feature-plugin-system`
 
 ## 2. Actor Flows (CDSL)
@@ -162,6 +163,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 
 **Output**: Resolved `UpstreamConfig` or error
 
+**With the proxy configuration cache** (a database and `proxy_cache.enabled: true`; `cpt-cf-oagw-algo-obs-proxy-config-cache`): step 1 reads the alias section, keyed by the alias and the tenant chain. A hit runs no query; a miss runs step 1's query and stores its rows as they are (disabled and not-visible upstreams included), or an empty list. Steps 2–6 run on every request, unchanged. An alias that fails validation answers *not found* without a read and without a cache entry.
+
 **Steps**:
 1. [x] - `p1` - Repo: `list_by_alias_for_tenants(alias, tenant_chain, Tags::Skip)` — one query `WHERE alias = :alias AND tenant_id IN (:chain)` with plugin rows joined in and no tags, replacing one lookup per tenant - `inst-alias-1`
 2. [x] - `p1` - Order the returned upstreams by their tenant's position in the chain (closest first) - `inst-alias-3`
@@ -182,6 +185,8 @@ Design constraints enforced: `cpt-cf-oagw-constraint-body-limit`, `cpt-cf-oagw-c
 **Input**: tenant chain, ordered upstream IDs (selected upstream first, then merge-chain ancestor upstreams closest-first), HTTP method, request path
 
 **Output**: Matched `RouteConfig` or error
+
+**With the proxy configuration cache** (a database and `proxy_cache.enabled: true`): steps 1 and 5 are replaced by a read of the route section, which holds each upstream's enabled HTTP routes in full, for each upstream in `upstream_ids`. Hits run no query; the upstreams that miss are loaded with one `list_proxy_routes` query. Steps 2–4 (`select_route`) run on every request. No re-check is needed: every route was loaded in full by one query.
 
 **Steps**:
 1. [x] - `p1` - Repo: `find_matching_in_tenants(tenant_chain, upstream_ids, method, path, Tags::Skip)` with `upstream_ids` ordered selected upstream first, then ancestor upstreams closest-first — one candidate query `WHERE tenant_id IN (:chain) AND upstream_id IN (:upstream_ids) AND enabled = true AND match_type = 'http'` joined with `oagw_route_http_match` and `oagw_route_method` and filtered on the request method when a database is configured, replacing one `find_matching` call per tenant and per upstream - `inst-route-1`
@@ -334,7 +339,7 @@ The system **MUST** implement `DataPlaneService::proxy_request(...)` that orches
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-alias-resolution`
 
-The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest enabled match wins (shadowing); a disabled upstream is skipped, and when only disabled upstreams match the alias resolution **MUST** return 503 LinkUnavailable. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants. The upstreams for the whole tenant chain **MUST** be fetched with one `list_by_alias_for_tenants` call; the walk then runs in memory, so the number of queries does not grow with hierarchy depth.
+The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierarchy walk from descendant to root. The closest enabled match wins (shadowing); a disabled upstream is skipped, and when only disabled upstreams match the alias resolution **MUST** return 503 LinkUnavailable. Private upstreams (sharing = `private`) **MUST NOT** be visible to descendant tenants. The upstreams for the whole tenant chain **MUST** be fetched with one `list_by_alias_for_tenants` call; the walk then runs in memory, so the number of queries does not grow with hierarchy depth. With the proxy configuration cache, that call's result is cached per alias and tenant chain and the walk still runs on every request, so a cached lookup returns what an uncached one does.
 
 **Implements**:
 - `cpt-cf-oagw-algo-alias-resolution`
@@ -347,7 +352,7 @@ The system **MUST** resolve upstreams by `(tenant_id, alias)` with tenant hierar
 
 - [x] `p1` - **ID**: `cpt-cf-oagw-dod-route-matching`
 
-The system **MUST** match inbound requests to routes by HTTP method allowlist and longest path prefix, ordered by priority (higher number wins, per `cpt-cf-oagw-adr-storage-schema`). Only enabled routes are considered. No two enabled routes under the same upstream may share `(path_prefix, priority)` for the same method. Matching runs in application code over the upstream's enabled routes, identically for in-memory and database storage. Candidate routes for the whole tenant chain **MUST** be fetched with one `find_matching_in_tenants` call that loads only the columns matching reads. The call takes the ordered upstream IDs (selected upstream first, then ancestor upstreams closest-first), so the fallback to routes on ancestor upstreams needs no extra call. Routes on the selected upstream take priority over routes on ancestor upstreams, and descendant routes take priority over ancestor routes. The lowest route ID breaks any remaining tie, and only the winning route is loaded in full, with its path, method and plugin rows (tag rows only for `Tags::Load`, which the proxy never passes). The loaded route **MUST** be re-checked against the request; a route that a concurrent write changed, removed or moved is selected once more, and a second miss is no match.
+The system **MUST** match inbound requests to routes by HTTP method allowlist and longest path prefix, ordered by priority (higher number wins, per `cpt-cf-oagw-adr-storage-schema`). Only enabled routes are considered. No two enabled routes under the same upstream may share `(path_prefix, priority)` for the same method. Matching runs in application code over the upstream's enabled routes, identically for in-memory and database storage. Candidate routes for the whole tenant chain **MUST** be fetched with one `find_matching_in_tenants` call that loads only the columns matching reads. The call takes the ordered upstream IDs (selected upstream first, then ancestor upstreams closest-first), so the fallback to routes on ancestor upstreams needs no extra call. Routes on the selected upstream take priority over routes on ancestor upstreams, and descendant routes take priority over ancestor routes. The lowest route ID breaks any remaining tie, and only the winning route is loaded in full, with its path, method and plugin rows (tag rows only for `Tags::Load`, which the proxy never passes). The loaded route **MUST** be re-checked against the request; a route that a concurrent write changed, removed or moved is selected once more, and a second miss is no match. With the proxy configuration cache, each upstream's enabled HTTP routes are cached in full, the upstreams that miss are loaded with one `list_proxy_routes` query, and matching runs over them with the same code and no re-check.
 
 **Implements**:
 - `cpt-cf-oagw-algo-route-matching`
@@ -451,6 +456,9 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 - [x] Changing an upstream's endpoints rebuilds its cached pool on every replica without explicit invalidation
 - [x] A pool idle past its TTL is dropped and its background task stops, as on invalidation
 - [x] With a database configured, alias resolution and route matching issue the same number of queries for tenant hierarchies of depth 1 and depth 5
+- [x] With a database and the proxy configuration cache enabled, a repeated lookup runs no query, a lookup that misses both sections runs two, and the result equals an uncached lookup's (`cpt-cf-oagw-adr-proxy-config-cache`)
+- [x] With the cache, each configuration write is visible to the next lookup on the same replica, and on other replicas once the change is delivered through the cluster change log; a lost change shows within `proxy_cache.ttl`
+- [x] The SSRF check runs on every request, so a cached upstream whose host is later denied is rejected on the next lookup
 - [x] HTTPS-only constraint is enforced for all upstream connections
 - [x] Multi-endpoint upstream with common-suffix alias returns 400 MissingTargetHost when `X-OAGW-Target-Host` is absent
 - [x] Invalid `X-OAGW-Target-Host` format (not hostname or IP) returns 400 InvalidTargetHost
@@ -466,7 +474,7 @@ Engine errors **MUST** be converted into `DomainError` and returned through the 
 
 ### Performance Considerations
 
-The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. With a database configured, configuration lookup costs three queries per request whatever the tenant depth (the upstreams with their plugin rows, the candidate routes, and the winning route with its path, method and plugin rows; two more only for a request that raced a configuration write); there is no config cache yet (DESIGN §4.1). The upstream engine pools connections (HTTP/2 multiplexed, HTTP/1.1 keep-alive) and reuses TLS sessions, with TCP health checks at 10s intervals to avoid routing to unhealthy backends. Requests go straight from the pipeline to the engine — no serialization, pipe or spawned task per request. Body validation checks Content-Length before buffering to reject oversized payloads early. Streaming bodies (e.g. SSE uploads) are forwarded chunk by chunk without buffering the full body.
+The proxy engine is on the critical path for every outbound API call — less than 10ms added latency at p95 per `cpt-cf-oagw-nfr-low-latency`. Plugin chain execution and header transformation are in-memory operations. With a database configured, configuration lookup costs three queries per request whatever the tenant depth (the upstreams with their plugin rows, the candidate routes, and the winning route with its path, method and plugin rows; two more only for a request that raced a configuration write); with the proxy configuration cache (on by default with a database; DESIGN §4.1), a hit runs no query and a miss one per section that missed. The upstream engine pools connections (HTTP/2 multiplexed, HTTP/1.1 keep-alive) and reuses TLS sessions, with TCP health checks at 10s intervals to avoid routing to unhealthy backends. Requests go straight from the pipeline to the engine — no serialization, pipe or spawned task per request. Body validation checks Content-Length before buffering to reject oversized payloads early. Streaming bodies (e.g. SSE uploads) are forwarded chunk by chunk without buffering the full body.
 
 ### Security Considerations
 

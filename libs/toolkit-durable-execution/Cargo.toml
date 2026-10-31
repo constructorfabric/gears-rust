@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-durable-execution"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -37,7 +37,6 @@ async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-aws-lc-rs.workspace = true
 hex.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "time", "rt", "sync"] }

@@ -1,5 +1,5 @@
 <!-- Created: 2026-09-06 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-15 by Virtuozzo International GmbH -->
 
 # Feature: Audit Store and History
 
@@ -20,6 +20,7 @@
   - [Transactional Append](#transactional-append)
   - [Canonical Audit Resource Id](#canonical-audit-resource-id)
   - [Retention Horizon](#retention-horizon)
+  - [Resolve Actor Names](#resolve-actor-names)
 - [4. States (CDSL)](#4-states-cdsl)
 - [5. Definitions of Done](#5-definitions-of-done)
   - [Audit Records Table](#audit-records-table)
@@ -28,6 +29,7 @@
   - [Masking and Actor Classification](#masking-and-actor-classification)
   - [History Read](#history-read)
   - [Retention](#retention)
+  - [Actor Names on History](#actor-names-on-history)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
 <!-- /toc -->
@@ -36,7 +38,7 @@
 
 ### 1.1 Overview
 
-Replaces the tracing stand-in behind the Audit Emitter with the R1 audit sink the design specifies: an append-only `audit_records` table written inside the mutation's own transaction through the `AuditSink` port, and the per-(setting, scope) history read served from that table on the canonical audit resource id.
+Replaces the tracing stand-in behind the Audit Emitter with the R1 audit sink the design specifies: an append-only `audit_records` table written inside the mutation's own transaction through the `AuditSink` port, and the per-(setting, scope) history read served from that table on the canonical audit resource id. Each history record also carries a display name of its actor, `actor_name`, resolved server-side at read time and never stored.
 
 ### 1.2 Purpose
 
@@ -44,7 +46,7 @@ Audit is a show-stopper here, not a deferrable: a mutation that cannot record it
 
 The sink is a port with two bindings. R1 binds this table, the system of record for the online retention window. R2 adds shipping through the transactional outbox to the platform Audit Subsystem behind the same port — an addition, not a replacement, and one that can never affect a mutation, because by then the record is already committed.
 
-Two things about the record itself are fixed before it is written. Masking happens before the record is built, so a `secret`-classified value is never written in plaintext anywhere. And the actor identity is itself classified, because an administrator identity is PII: the record carries the classification, and the read side honours it.
+Two things about the record itself are fixed before it is written. Masking happens before the record is built, so a `secret`-classified value is never written in plaintext anywhere. And the actor identity is itself classified, because an administrator identity is PII: the record carries the classification, and the read side honours it. A compliance reviewer reading who changed what needs that actor as a display name rather than a bare identifier, which is why each history record also carries a server-resolved `actor_name` that is never stored.
 
 **Requirements**: `cpt-cf-settings-service-fr-audit-mutations`, `cpt-cf-settings-service-nfr-scale-growth`
 
@@ -60,9 +62,10 @@ Two things about the record itself are fixed before it is written. Masking happe
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md) — §5.7 Security, Secrets & Audit; §6.1 Scale & Growth
-- **Design**: [DESIGN.md](../DESIGN.md) — §4.2 (Component: Audit Emitter — *Canonical audit resource id*, *Fail-closed audit*, *The sink is a port with two bindings*), §4.3 (REST API — Search, History & Preferences; *History reads the gear's own audit store*), §4.7 (Table `audit_records`), §4.8 (The Data Path)
+- **PRD**: [PRD.md](../PRD.md) — §5.7 Security, Secrets & Audit; §6.1 Scale & Growth (`cpt-cf-settings-service-nfr-scale-growth`). The display name on the history read and the optional Account Management dependency are required there too: §5.7 (`cpt-cf-settings-service-fr-audit-mutations`) and §2.2 (`cpt-cf-settings-service-actor-account-management`).
+- **Design**: [DESIGN.md](../DESIGN.md) — §4.2 (Component: Audit Emitter — *Canonical audit resource id*, *Fail-closed audit*, *The sink is a port with two bindings*), §4.3 (REST API — Search, History & Preferences; *History reads the gear's own audit store*), §4.7 (Table `audit_records`), §4.8 (The Data Path); §3.2 constraint `cpt-cf-settings-service-constraint-account-management-optional`; §4.2 Component: Actor Name Resolver, `cpt-cf-settings-service-component-actor-name-resolver`; §4.6 sequence `cpt-cf-settings-service-seq-history-actor-names`
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.6
+- **Soft dependency**: Account Management (AM), reached only to put a display name on a history record's actor, through `AccountManagementClient` (`account-management-sdk`) looked up in `ClientHub` at each lookup; a deployment without AM reads every `actor_name` as `null`.
 - **Dependencies**: entry 2.1 for the Audit Emitter and the `AuditSink` port it declares; entry 2.3, since history is keyed by a setting key and the table denormalizes `declaration_key`; entry 2.7 for the tenant access rule that hides a setting's history along with the setting — until it lands, absence of restriction rows means every setting is visible.
 - **Not applicable**: Shipping records to the platform Audit Subsystem through the transactional outbox is R2. The global audit view across all settings is the platform audit surface's, not an endpoint here. Secret-use records are written by the Secret Manager of entry 2.9 through the same sink. The mutations themselves stay the business of the features that perform them; this feature is the sink they all write to and the one read over it. A pruning schedule is not specified: the design fixes that `retain_until` is carried and that deletes outside pruning are forbidden, not when pruning runs.
 
@@ -79,6 +82,7 @@ Two things about the record itself are fixed before it is written. Masking happe
 **Success Scenarios**:
 - The mutation history of one setting at one scope, newest first, paginated, with values as recorded and the actor masked when the caller may not see PII
 - An empty page when nothing has happened, distinguishable from a failure
+- Every unmasked administrator actor the caller may see in AM carries a display name; a name that cannot be resolved reads `null` and never fails the page
 
 **Error Scenarios**:
 - The caller is not authorized to read the setting
@@ -143,6 +147,35 @@ Two things about the record itself are fixed before it is written. Masking happe
 2. [x] - `p1` - **ELSE** its horizon is `occurred_at` plus the configured default, which **MUST NOT** be shorter than twelve months - `inst-as-ret-2`
 3. [x] - `p1` - Pruning, run by the gear's managed lifecycle at start and once a day, deletes only records past their horizon, located through the partial `idx_audit_retention` for an explicit hold and the partial `idx_audit_default_horizon` for the default; it works in bounded batches — each selects its ids through those indexes, then deletes them by primary key, two short statements whose cost does not grow with the table — each batch its own commit, until a batch comes back short, a per-tick cap is reached or the lifecycle stops, leaving the rest to the next tick; no other `DELETE` and no `UPDATE` is ever issued against the table - `inst-as-ret-3`
 4. [x] - `p1` - **RETURN** the horizon; R2 shipping copies a record onward but changes nothing about its online window here - `inst-as-ret-4`
+
+### Resolve Actor Names
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-algo-audit-store-actor-names`
+
+**Input**: The page of history records after masking and the caller's `SecurityContext`
+
+**Output**: `actor_name` on every record of the page, and one lookup result, `ok`, `degraded` or `skipped`
+
+**Steps**:
+1. [x] - `p2` - Collect the user-id actors of the page whose actor is unmasked, each with the tenant its record says the actor acted from (`actor_tenant_id`), and deduplicate them; a masked actor, a module-name actor, the nil id and an actor whose record carries no actor tenant are never looked up, and the nil id reads `"System"` when unmasked - `inst-as-names-1`
+2. [x] - `p2` - **IF** no user-id actor remains → no lookup is made, the pass counts as `skipped`, and continue with the fill step - `inst-as-names-17`
+3. [x] - `p2` - **IF** the context has no real subject → no lookup is made and nothing is cached: every user-id actor reads `null`, the pass counts as `skipped`, and continue with the fill step - `inst-as-names-2`
+4. [x] - `p2` - **IF** no `AccountManagementClient` is found in `ClientHub` → every user-id actor reads `null`, the pass counts as `skipped`, and continue with the fill step - `inst-as-names-3`
+5. [x] - `p2` - Take cache hits first: the key is the caller's tenant, the caller's subject and the actor, a name lives 5 minutes, and the cache holds at most 10,000 names; a full cache drops its expired names, then all - `inst-as-names-4`
+6. [x] - `p2` - **IF** at least one actor was collected and every one was a cache hit → the pass counts as `ok` with no AM call, and continue with the fill step - `inst-as-names-5`
+7. [x] - `p2` - Start one budget of 1 s for the page's lookups, counted by the resolver from here - `inst-as-names-6`
+8. [x] - `p2` - Group the collected ids the cache did not answer by the actor's tenant and run the lookup - `inst-as-names-7`
+   1. [x] - `p2` - Split each tenant group into chunks of 200 (`IdpUserPagination::MAX_TOP`) and run at most 4 chunks at once - `inst-as-names-9`
+      1. [x] - `p2` - API: `AccountManagementClient::list_users` with an id-set filter for the chunk in the group's tenant, always with the caller's own `SecurityContext`; AM decides visibility, and no privileged context is used - `inst-as-names-10`
+      2. [x] - `p2` - **IF** the chunk is answered → fill the names it returned and keep each in the cache for this caller; the name is the display name, then first and last name, then the username, blank values skipped - `inst-as-names-11`
+      3. [x] - `p2` - **IF** an actor is refused by the answer or not in it → it stays unresolved, is not cached, and nothing is logged; a refused answer, including a whole chunk AM refuses, is AM's own answer: it counts as `ok` for the pass and logs nothing - `inst-as-names-12`
+      4. [x] - `p2` - **IF** the chunk fails, times out, hits a paging or query failure or the budget → its actors stay unresolved, the pass is `degraded`, and one warn line is logged with the reason kind and the id count only, with no id, no profile and no error text - `inst-as-names-13`
+9. [x] - `p2` - Every actor the lookup did not answer reads `null`, final; no other tenant is asked - `inst-as-names-19`
+10. [x] - `p2` - **FOR EACH** record → set `actor_name` to `null` when `actor_masked` is true, `null` for a module actor, `"System"` for the nil id when unmasked, and otherwise the resolved name or `null` - `inst-as-names-16`
+11. [x] - `p2` - Count the pass once in `settings_actor_name_lookups_total` and record its duration in `settings_actor_name_lookup_duration_seconds`, both by `result` on every path: `ok` when every chunk answered — a refused or not-found answer is an answer — an all-cache-hit pass included, `degraded` when any chunk failed, timed out or hit the budget, `skipped` when no lookup was made - `inst-as-names-14`
+12. [x] - `p2` - **RETURN** the page with `actor_name` on every record and the pass result - `inst-as-names-15`
+
+The visibility boundary holds in both directions. An ancestor reading a descendant scope gets the name of each actor AM lets the caller list in the actor's own tenant — the descendant's administrators in the descendant's tenant, an ancestor administrator who wrote there in the ancestor's — and `null` otherwise. A descendant reading a record an ancestor administrator wrote reads `null`, because the actor is withheld by the upward disclosure boundary (`inst-as-hist-10`), masked and never looked up, so an ancestor's display name is never shown to a subordinate tenant. A record written before the actor tenant was recorded reads `null`: the resolver asks no tenant the record does not name. This relies on AM allowing an ancestor administrator to list a descendant tenant's users; where it does not, names read `null` and nothing leaks.
 
 ## 4. States (CDSL)
 
@@ -214,7 +247,7 @@ A `secret`-classified value **MUST** be masked before the record is built and **
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-audit-store-history-read`
 
-The system **MUST** serve `GET /settings-service/v1/settings/{key}/history` from the gear's own `audit_records` table, newest first and cursor-paginated, authorized by `read` on the setting's key, confined to the caller's own tenant or a descendant that is not standalone, and reporting a hidden setting as absent rather than forbidden. The query **MUST** be an index lookup on `(declaration_key, tenant_id)`, and an empty history **MUST** be an empty page rather than an error. An actor **MUST** be shown only when its recorded `actor_tenant_id` lies on the path from the reader tenant down to the record's tenant, else the mask token with `actor_withheld: true`; a definition record's actor, a machine act's actor and a record written before the column existed are withheld from every tenant reader, and a platform administrator sees every actor.
+The system **MUST** serve `GET /settings-service/v1/settings/{key}/history` from the gear's own `audit_records` table, newest first and cursor-paginated, authorized by `read` on the setting's key, confined to the caller's own tenant or a descendant that is not standalone, and reporting a hidden setting as absent rather than forbidden. The query **MUST** be an index lookup on `(declaration_key, tenant_id)`, and an empty history **MUST** be an empty page rather than an error. An actor **MUST** be shown only when its recorded `actor_tenant_id` lies on the path from the reader tenant down to the record's tenant, else the mask token with `actor_withheld: true`; a definition record's actor, a machine act's actor and a record written before the column existed are withheld from every tenant reader, and a platform administrator sees every actor. The `actor_name` field of each record is owned by `cpt-cf-settings-service-dod-audit-store-actor-names`.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-audit-store-history`
@@ -236,6 +269,33 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 
 **Touches**:
 - DB Table: `audit_records`
+
+### Actor Names on History
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-audit-store-actor-names`
+
+The system **MUST** return `actor_name: string | null` beside `actor` on every history record: `null` when the actor is masked or a module name, `"System"` for the nil id when unmasked, and otherwise the display name resolved from Account Management or `null` when it cannot be had. It **MUST** resolve names once per page, inside a budget of 1 s the resolver keeps itself, so AM never fails the page or delays it by more than that. It **MUST** keep AM optional: with no `AccountManagementClient` in `ClientHub` every name reads `null`. It **MUST** call AM only with the caller's own `SecurityContext`, **MUST** cache names per caller only, and **MUST NOT** persist a name or log an id, a profile or an error text. The field is additive and nullable: removing the resolver returns `null` everywhere and leaves the record and the table unchanged.
+
+**Security**: a masked actor is never looked up; AM, not this gear, decides what the caller may see, with no privileged context and no added permission; the cache key includes the caller's tenant and subject, and a name is never persisted. Names are transient PII and fall under the platform retention and privacy policy of the actor identity. A cached name may outlive a visibility narrowing or an erasure in AM by up to 5 minutes, the accepted staleness bound (DESIGN §5.2 "Account Management for actor names").
+
+**Reliability**: a failed, refused, late or absent AM yields `null` names on a `200`; there is deliberately no circuit breaker and no negative cache, so a recovered AM is used again on the next read. The AM call is single-shot with no retry, and the cap of 4 chunks at once is per page, deliberately with no process-wide bound.
+
+**Observability**: `settings_actor_name_lookups_total` and `settings_actor_name_lookup_duration_seconds` by `result` (`ok`, `degraded`, `skipped`), carrying no actor identifier, and one warn line per degraded chunk with the reason kind and the id count only.
+
+**Test layering**: unit tests cover the name fallback order, the cache bound and the per-caller key; API and integration tests use a mock `AccountManagementClient` that answers per tenant and records its queries, covering the per-tenant queries, the chunking, the budget and the absent client; a load test that times the history page with a healthy and a slow AM is planned after the first release; until it runs, the p95 criterion in §6 stays unchecked.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-audit-store-history`
+- `cpt-cf-settings-service-algo-audit-store-actor-names`
+
+**Constraints**: `cpt-cf-settings-service-constraint-account-management-optional`, `cpt-cf-settings-service-constraint-rbac-policy-enforcer`
+
+**Touches**:
+- API: `GET /settings-service/v1/settings/{key}/history` (field `actor_name`)
+- Entities: Actor Name Resolver (`cpt-cf-settings-service-component-actor-name-resolver`)
+- Sequence: `cpt-cf-settings-service-seq-history-actor-names`
+- ClientHub: `AccountManagementClient`
+- Metrics: `settings_actor_name_lookups_total`, `settings_actor_name_lookup_duration_seconds`
 
 ## 6. Acceptance Criteria
 
@@ -261,3 +321,25 @@ Every record **MUST** carry `retain_until` or fall under the store's configured 
 - [x] A platform administrator sees every actor in the history
 - [x] A record written before `actor_tenant_id` existed carries `NULL` and its actor is withheld from a tenant reader
 - [x] An actor re-parented off the path from the reader tenant to the record's tenant is withheld
+- [ ] A history page of records by several users, one of them repeated, makes one lookup pass: one id-set query per (tenant, chunk) over the deduplicated ids, and each record carries the user's name in `actor_name`
+- [ ] A masked actor reads `actor_masked` true and `actor_name` `null`, and no lookup is made for it
+- [ ] A record written by a contributing module reads `actor_name` `null`, and no lookup is made
+- [ ] A record whose actor is the nil id reads `actor_name` `"System"` for an unmasked caller, with no lookup
+- [ ] With no `AccountManagementClient` in `ClientHub`, with a client that errors, or with one that outlasts the budget, the history read answers `200` with every user-id actor's `actor_name` `null`, within the budget; a nil-id record still reads `"System"` when unmasked
+- [ ] An ancestor reading a descendant scope's history gets the descendant administrators' names, asked in the descendant's tenant, and for a record it wrote in that scope its own name, asked in its own tenant; a lookup that asks the record's tenant for that record fails the scenario
+- [ ] A descendant administrator reading a record an ancestor administrator wrote reads `actor_name` `null`: the actor is withheld (`actor_withheld: true`, `actor_masked` true), so no lookup is made for it
+- [ ] More than 200 distinct actors on one page are read in chunks of 200, at most 4 at once
+- [ ] An all-cache-hit pass records `result=ok` and one histogram sample, with no AM call
+- [ ] A pass with a failed chunk records `result=degraded`
+- [ ] An actor AM does not list in the tenant it acted from reads `null` and is asked in no other tenant, and a chunk that failed is not retried
+- [ ] A page whose actors are all masked or module names records `result=skipped` with no AM call
+- [ ] A client slower than the 1 s budget leaves the resolved names set and the rest `null`
+- [ ] The name cache holds at most 10,000 names, and a full cache drops its expired names, then all
+- [ ] A name is cached per caller: a second read by the same caller makes no lookup, and another subject reads AM itself
+- [ ] A refused or absent actor is not cached, so the next read looks up again and shows the name once it becomes visible
+- [ ] A context without a real subject makes no AM call, caches nothing, reads every name `null` and counts `result=skipped`
+- [ ] The name is the display name, then first and last name, then the username, blank values skipped, and `null` when all are blank
+- [ ] A record without a recorded actor tenant — written before the column existed — reads `actor_name` `null`, with no lookup made for it
+- [ ] A degraded chunk logs one warn line with the reason kind and the id count only, with no id and no profile text
+- [ ] An actor AM refuses or does not list, including a whole chunk AM refuses, reads `null`, records `result=ok` and writes no warn line
+- [ ] History p95 is at most 2 s with a healthy AM and with a slow AM whose mock client outlasts the budget; names degrade to `null` and the lookup stays within its budget (`cpt-cf-settings-service-nfr-scale-growth`)

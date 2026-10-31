@@ -1,5 +1,7 @@
 //! Adapters to the outside world.
 
+pub mod actor_name_metrics;
+pub mod actor_names;
 pub mod contribution_client;
 pub mod lifecycle_metrics;
 pub mod platform_scope;

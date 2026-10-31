@@ -574,11 +574,29 @@ impl DataPlaneService for DataPlaneServiceImpl {
 
             let max_body = self.max_body_size;
 
-            // 1. Resolve upstream + route in one pass (single hierarchy walk).
-            let (upstream, route) = self
+            // 1. Resolve upstream + route in one pass (single hierarchy walk),
+            //    timed: phase="resolve".
+            //
+            // Recorded on the error path too, under the unknown labels: a
+            // request that did not resolve has no upstream or route to name.
+            let resolve_start = Instant::now();
+            let resolved = self
                 .cp
                 .resolve_proxy_target(&ctx, &alias, method.as_ref(), &path_suffix, Tags::Skip)
-                .await?;
+                .await;
+            let resolve_seconds = resolve_start.elapsed().as_secs_f64();
+            let (upstream, route) = match resolved {
+                Ok(target) => target,
+                Err(e) => {
+                    self.metrics.record_request_duration_seconds(
+                        metric_labels::UNKNOWN,
+                        metric_labels::UNKNOWN,
+                        phase::RESOLVE,
+                        resolve_seconds,
+                    );
+                    return Err(e);
+                }
+            };
 
             // Capture metric labels now that upstream + route are known, and
             // begin tracking this request in the in-flight gauge via the
@@ -591,6 +609,12 @@ impl DataPlaneService for DataPlaneServiceImpl {
                 .map_or("/", |h| h.path.as_str())
                 .to_owned();
             guard.mark_resolved(host_label.clone(), path_label.clone());
+            self.metrics.record_request_duration_seconds(
+                &host_label,
+                &path_label,
+                phase::RESOLVE,
+                resolve_seconds,
+            );
 
         // 2. CORS origin enforcement for actual cross-origin requests.
         // Preflight is handled permissively at the handler level (no upstream resolution).
@@ -1901,6 +1925,16 @@ mod tests {
         selector: Arc<dyn EndpointSelector>,
         metrics: Arc<dyn OagwMetricsPort>,
     ) -> DataPlaneServiceImpl {
+        build_svc_resolving(selector, metrics, None)
+    }
+
+    /// Like [`build_svc_with_metrics`], with a CP whose `resolve_proxy_target`
+    /// returns `resolved`, or "not found" when it is `None`.
+    fn build_svc_resolving(
+        selector: Arc<dyn EndpointSelector>,
+        metrics: Arc<dyn OagwMetricsPort>,
+        resolved: Option<(Upstream, crate::domain::model::Route)>,
+    ) -> DataPlaneServiceImpl {
         use authz_resolver_sdk::{
             AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
             PolicyEnforcer,
@@ -1931,12 +1965,12 @@ mod tests {
             Arc::new(credstore_sdk::test_util::MockCredStoreClient::empty());
         let policy_enforcer = PolicyEnforcer::new(Arc::new(AllowAllAuthZ));
 
-        // Minimal CP — never called by select_endpoint().
+        // Minimal CP — only the proxy lookup is implemented.
         use crate::domain::error::DomainError;
         use crate::domain::model::*;
         use crate::domain::services::ControlPlaneService;
 
-        struct NoopCp;
+        struct NoopCp(Option<(Upstream, Route)>);
         #[async_trait]
         impl ControlPlaneService for NoopCp {
             async fn create_upstream(
@@ -2012,11 +2046,13 @@ mod tests {
                 _: &str,
                 _: Tags,
             ) -> Result<(Upstream, Route), DomainError> {
-                unimplemented!()
+                self.0
+                    .clone()
+                    .ok_or_else(|| DomainError::not_found("upstream", Uuid::nil()))
             }
         }
 
-        let cp: Arc<dyn ControlPlaneService> = Arc::new(NoopCp);
+        let cp: Arc<dyn ControlPlaneService> = Arc::new(NoopCp(resolved));
         crate::domain::test_support::ensure_crypto_provider();
         let engine = Arc::new(
             crate::infra::proxy::engine::ProxyEngine::new(
@@ -2319,6 +2355,159 @@ mod tests {
             .unwrap();
     }
 
+    /// Keeps only the request-duration observations.
+    #[derive(Default)]
+    struct DurationRecorder(std::sync::Mutex<Vec<(String, String, String)>>);
+
+    impl DurationRecorder {
+        fn phases(&self, phase: &str) -> Vec<(String, String)> {
+            self.0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, _, p)| p == phase)
+                .map(|(host, path, _)| (host.clone(), path.clone()))
+                .collect()
+        }
+    }
+
+    impl OagwMetricsPort for DurationRecorder {
+        fn record_request(&self, _: &str, _: &str, _: &str, _: u16) {}
+        fn record_error(&self, _: &str, _: &str, _: &str) {}
+        fn record_request_duration_seconds(&self, host: &str, path: &str, phase: &str, _: f64) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((host.to_owned(), path.to_owned(), phase.to_owned()));
+        }
+        fn increment_in_flight(&self, _: &str) {}
+        fn decrement_in_flight(&self, _: &str) {}
+        fn record_rate_limit_exceeded(&self, _: &str, _: &str) {}
+        fn record_rate_limit_usage_ratio(&self, _: &str, _: &str, _: f64) {}
+        fn increment_active_websocket_sessions(&self, _: &str) {}
+        fn decrement_active_websocket_sessions(&self, _: &str) {}
+        fn record_websocket_session_duration_seconds(&self, _: &str, _: f64) {}
+        fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
+        fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
+        fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_proxy_cache_lookup(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheLookup,
+        ) {
+        }
+        fn record_proxy_cache_entries(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_evictions(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheEviction,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_change(&self, _: &str) {}
+        fn record_proxy_cache_flush(&self, _: &str) {}
+        fn record_proxy_cache_load_discarded(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
+    }
+
+    fn test_ctx() -> SecurityContext {
+        SecurityContext::builder()
+            .subject_tenant_id(Uuid::new_v4())
+            .subject_id(Uuid::new_v4())
+            .build()
+            .expect("test security context")
+    }
+
+    fn proxy_get(uri: &str) -> http::Request<Body> {
+        http::Request::builder()
+            .method(http::Method::GET)
+            .uri(uri)
+            .body(Body::Empty)
+            .unwrap()
+    }
+
+    /// A resolved request records the `resolve` phase once, under the
+    /// upstream's alias and the route's path.
+    #[tokio::test]
+    async fn resolve_phase_recorded_with_resolved_labels() {
+        use crate::domain::model::{HttpMatch, HttpMethod, MatchRules, Route};
+
+        let upstream = upstream_with(vec![Endpoint {
+            scheme: Scheme::Https,
+            host: "127.0.0.1".into(),
+            port: 1,
+        }]);
+        let route = Route {
+            id: Uuid::new_v4(),
+            tenant_id: upstream.tenant_id,
+            upstream_id: upstream.id,
+            match_rules: MatchRules {
+                http: Some(HttpMatch {
+                    methods: vec![HttpMethod::Get],
+                    path: "/v1".into(),
+                    query_allowlist: vec![],
+                    path_suffix_mode: PathSuffixMode::Append,
+                }),
+                grpc: None,
+            },
+            plugins: None,
+            rate_limit: None,
+            cors: None,
+            tags: vec![],
+            priority: 0,
+            enabled: true,
+            managed_by: ManagedBy::Api,
+        };
+        let metrics = Arc::new(DurationRecorder::default());
+        let svc = build_svc_resolving(
+            Arc::new(MockSelector::new()),
+            metrics.clone(),
+            Some((upstream, route)),
+        );
+
+        // The query parameter is not allowlisted: the request fails right
+        // after resolution, before any network call.
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/test/v1/chat?x=1"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+
+        assert_eq!(
+            metrics.phases(phase::RESOLVE),
+            vec![("test".to_owned(), "/v1".to_owned())]
+        );
+    }
+
+    /// A request that does not resolve still records the `resolve` phase,
+    /// under the unknown labels.
+    #[tokio::test]
+    async fn resolve_phase_recorded_when_resolution_fails() {
+        let metrics = Arc::new(DurationRecorder::default());
+        let svc = build_svc_resolving(Arc::new(MockSelector::new()), metrics.clone(), None);
+
+        let err = svc
+            .proxy_request(test_ctx(), proxy_get("/missing/v1/chat"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::NotFound { .. }), "{err:?}");
+
+        let unknown = metric_labels::UNKNOWN.to_owned();
+        assert_eq!(
+            metrics.phases(phase::RESOLVE),
+            vec![(unknown.clone(), unknown)]
+        );
+    }
+
     /// Keeps only what the sweep reports.
     #[derive(Default)]
     struct SweepRecorder(std::sync::Mutex<Vec<(u64, u64)>>);
@@ -2339,6 +2528,33 @@ mod tests {
         }
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_proxy_cache_lookup(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheLookup,
+        ) {
+        }
+        fn record_proxy_cache_entries(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_evictions(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheEviction,
+            _: u64,
+        ) {
+        }
+        fn record_proxy_cache_change(&self, _: &str) {}
+        fn record_proxy_cache_flush(&self, _: &str) {}
+        fn record_proxy_cache_load_discarded(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
     }
 
     /// The sweeper the gear spawns ticks every interval, reports evicted and

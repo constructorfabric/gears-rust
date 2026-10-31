@@ -89,7 +89,7 @@ Client → API Handler (auth, rate limit) → Data Plane (orchestrate)
 * Good, because Data Plane remains focused on proxy logic
 * Good, because Control Plane can optimize cache invalidation during writes
 * Bad, because Data Plane depends on Control Plane for every proxy request (cache misses)
-* Neutral, to be mitigated by a Data Plane L1 cache for hot configs (planned, ADR-0007)
+* Neutral, mitigated with a database by the per-replica proxy configuration cache (ADR-0020, proposed), which serves hot configs without a database query
 
 ### Confirmation
 
@@ -242,7 +242,7 @@ Structured JSON logs sent to stdout, ingested by centralized logging system (e.g
 ## More Information
 
 - [ADR: Component Architecture](./0001-component-architecture.md) — Defines CP/DP trait separation
-- [ADR: Control Plane Caching](./0007-data-plane-caching.md) — planned L1 cache to mitigate the DP→CP dependency
+- [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md) — per-replica cache of the proxy lookup that mitigates the DP→CP dependency; supersedes [ADR: Control Plane Caching](./0007-data-plane-caching.md)
 - [ADR: State Management](./0008-state-management.md) — Cache and rate limiter ownership
 
 ## Traceability

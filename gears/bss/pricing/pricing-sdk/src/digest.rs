@@ -11,10 +11,10 @@ use crate::{
         UsageRatingPolicyInput,
     },
 };
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use rust_decimal::Decimal;
 use std::collections::{BTreeMap, BTreeSet};
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::crypto::hash::Sha256;
 
 #[toolkit_canonical_errors::resource_error(gts_id!("cf.bss.pricing.plan.v1~"))]
 struct BindingResource;
@@ -125,7 +125,7 @@ pub(crate) fn canonical_json_bytes(value: &V) -> Vec<u8> {
 /// SHA-256 over the canonical `{domain, payload}` envelope, domain-separating digests.
 pub(crate) fn hash_document(domain: &str, payload: V) -> Digest {
     let bytes = canonical_json_bytes(&object([("domain", text(domain)), ("payload", payload)]));
-    let hashed = sha256(&SHA256, &bytes);
+    let hashed = Sha256::digest(&bytes);
     let mut out = [0u8; 32];
     out.copy_from_slice(hashed.as_ref());
     out

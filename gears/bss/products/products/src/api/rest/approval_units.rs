@@ -11,7 +11,7 @@ use super::{
         ProductsApprovalUnitStateCounts, UnitCountsQuery, UnitDto, UnitList, UnitListQuery,
         VoteReceipt, VoteRequest,
     },
-    governance as g, json_body, replay, require_authenticated, tx_to_canonical,
+    governance as g, json_body, read_tx_config, replay, require_authenticated, tx_to_canonical,
     unit_tx_to_canonical,
 };
 use crate::{
@@ -411,7 +411,7 @@ async fn page_of(
     state
         .db
         .db()
-        .transaction_with_retry(category_tx_config(state), contention_db_err, move |tx| {
+        .transaction_with_retry(read_tx_config(state), contention_db_err, move |tx| {
             let (scope, filter, page) = (scope.clone(), filter.clone(), page.clone());
             let (approve_scope, submit_scope) = (approve_scope.clone(), submit_scope.clone());
             Box::pin(async move {
@@ -1245,7 +1245,7 @@ async fn review_content(
     events::transaction(
         &state.db.db(),
         &state.sink,
-        category_tx_config(state),
+        read_tx_config(state),
         contention_db_err,
         move |tx, outbox| {
             let scope = scope.clone();

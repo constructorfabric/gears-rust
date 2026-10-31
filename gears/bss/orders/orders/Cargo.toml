@@ -23,7 +23,6 @@ opentelemetry = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-aws-lc-rs = { workspace = true }
 # Opaque continuation tokens (08 §2.2, D-139), following the Approvals cursor precedent.
 base64 = { workspace = true }
 # Read query-string decoding at the REST boundary (`$filter`, limit, cursor).

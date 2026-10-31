@@ -3,8 +3,8 @@ use std::sync::{Arc, OnceLock};
 
 use dashmap::DashMap;
 use sea_orm::{
-    ConnectionTrait, DatabaseConnection, DatabaseExecutor, DbBackend, FromQueryResult,
-    IsolationLevel, Statement, TransactionTrait,
+    ConnectionTrait, DatabaseConnection, DatabaseExecutor, DbBackend, FromQueryResult, Statement,
+    TransactionTrait,
 };
 use tokio::sync::{Notify, RwLock};
 
@@ -18,7 +18,7 @@ use super::trace::{TraceOutcome, TraceState};
 use super::types::{OutboxConfig, OutboxError, OutboxMessageId};
 use super::wake::Wake;
 use crate::Db;
-use crate::secure::SeaOrmRunner;
+use crate::secure::{SeaOrmRunner, TxConfig, TxIsolationLevel};
 
 /// Per-partition notify map shared between sequencer and processors.
 type PartitionNotifyMap = Arc<HashMap<i64, Arc<Notify>>>;
@@ -312,12 +312,16 @@ impl Outbox {
         num_partitions: u16,
     ) -> Result<(), OutboxError> {
         super::validation::validate_queue_name(queue)?;
-        let conn = db.sea_internal();
         // Queue metadata must observe commits from active processors and other
         // registrants, regardless of the server connection's default isolation.
         let isolation = matches!(db.backend(), DbBackend::Postgres | DbBackend::MySql)
-            .then_some(IsolationLevel::ReadCommitted);
-        let txn = conn.begin_with_config(isolation, None).await?;
+            .then_some(TxIsolationLevel::ReadCommitted);
+        let txn = db
+            .begin_tx_with_config(TxConfig {
+                isolation,
+                access_mode: None,
+            })
+            .await?;
         let store = OutboxStore::new(self.statements());
 
         let ids = Self::ensure_partition_rows(&txn, &store, queue, num_partitions).await?;

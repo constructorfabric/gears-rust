@@ -17,9 +17,9 @@
 //! artifacts and has no exact-comparison fallback, so it uses SHA-256. Authored
 //! content has no digest: `unchanged` compares the canonical bytes (ADR-0012).
 
-use aws_lc_rs::digest::{Context, SHA256};
 use gts::ResolvedType;
 use toolkit_macros::domain_model;
+use toolkit_security::crypto::hash::Sha256;
 
 use crate::domain::admission::fingerprint::canonical_text;
 
@@ -61,17 +61,17 @@ pub fn resolution_fingerprint(
     effective_traits: &str,
     effective_traits_schema: &str,
 ) -> Vec<u8> {
-    let mut hasher = Context::new(&SHA256);
+    let mut hasher = Sha256::new();
     for field in [
         b"tr-resolution-v1".as_slice(),
         resolved_schema.as_bytes(),
         effective_traits.as_bytes(),
         effective_traits_schema.as_bytes(),
     ] {
-        hasher.update(&u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
         hasher.update(field);
     }
-    hasher.finish().as_ref().to_vec()
+    hasher.finalize().as_ref().to_vec()
 }
 
 #[cfg(test)]

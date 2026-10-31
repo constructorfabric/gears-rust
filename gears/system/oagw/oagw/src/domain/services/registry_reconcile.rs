@@ -36,7 +36,7 @@ use crate::domain::model::{
 };
 use crate::domain::ports::OagwMetricsPort;
 use crate::domain::ports::metric_labels::{provisioning_kind as kind, provisioning_reason};
-use crate::domain::repo::{DeleteOutcome, RowKey};
+use crate::domain::repo::{DeleteOutcome, RowKey, one_wait_at_the_end};
 use crate::domain::type_provisioning::{ProvisionedRoute, ProvisionedUpstream};
 
 /// What [`reconcile_registry`] did to one kind of row.
@@ -164,7 +164,33 @@ impl RunControl for Unattended {}
 /// is kept, never cascaded); phases 4 and 5 write upstreams, then routes, in
 /// passes. Row IDs are the GTS instance UUIDs. Only an infrastructure error
 /// returns `Err`.
+///
+/// No client waits to see the run's writes on another replica, so the writes
+/// do not each wait for their change to be published; the run waits once,
+/// at its end (ADR-0020 *Keeping the Cache Fresh*).
 pub(crate) async fn reconcile_registry(
+    cp: &dyn RegistryProvisioner,
+    metrics: &dyn OagwMetricsPort,
+    control: &dyn RunControl,
+    upstreams: &[ProvisionedUpstream],
+    routes: &[ProvisionedRoute],
+    root_tenant_id: Uuid,
+) -> anyhow::Result<ProvisioningCounts> {
+    // Boxed: the run's future is large, and the scope would otherwise move
+    // it on the stack.
+    one_wait_at_the_end(Box::pin(reconcile(
+        cp,
+        metrics,
+        control,
+        upstreams,
+        routes,
+        root_tenant_id,
+    )))
+    .await
+}
+
+/// [`reconcile_registry`], with each write's wait left to the caller.
+async fn reconcile(
     cp: &dyn RegistryProvisioner,
     metrics: &dyn OagwMetricsPort,
     control: &dyn RunControl,

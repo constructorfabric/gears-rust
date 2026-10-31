@@ -128,7 +128,7 @@ requirements per vector.
 | File                | Binary content stored in FileStorage with associated metadata                                                                                                                                                                                                                           |
 | Control Plane       | The FileStorage API/SDK. Owns metadata, authorization, versioning, and conditional-request semantics; issues signed URLs. Its REST surface never carries file content                                                                                                                    |
 | Sidecar (Data Plane)| The only component that moves user bytes. Has its own domain/URL, is connected to the storage backends, and verifies signed-URL signatures — it has no DB connection of its own and makes no platform-JWT call of any kind. Reports back to the control plane (finalize, per-part hash) over token-authenticated HTTP within a documented trusted network boundary, or over TLS/equivalent authenticated encryption when the callback crosses an untrusted or shared network, never an SDK call. Serves content only through signed URLs |
-| Signed URL          | A short-lived, control-minted **codec-equivalent Ed25519-signed token** (bespoke `base64url(json).base64url(ed25519_signature)` in P1 -- opaque and codec-evolvable per ADR-0004's Implementation note, not a literal PASETO library) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
+| Signed URL          | A short-lived, control-minted **private-codec ECDSA P-256/SHA-256-signed token** (bespoke `base64url(json).base64url(ecdsa_der_signature)` in P1 -- opaque and codec-evolvable per ADR-0004's Implementation note, not a literal PASETO library) pointing at the sidecar that authorizes one content operation (`GET`/`PUT`/part) on a specific object, subject to AND-combined claims (`exp`, optional `ip`, optional token-claim predicates, upload size/hash). Carried in the query (`?fs-token=`) or a header; **opaque** to all but control+sidecar (`cpt-cf-file-storage-fr-signed-urls`) |
 | File ID             | The immutable uuid identity of a logical file. The current content is reached by resolving the file's content pointer (`content_id`)                                                                                                                                                     |
 | Version ID          | A uuid assigned by FileStorage (control plane) identifying one immutable content blob; the backend object lives at `/{file_id}/{version_id}` and is never mutated in place                                                                                                                |
 | Content Pointer (`content_id`) | The `version_id` currently bound as a file's live content; changing content is a pointer swap, not an in-place mutation. The content-only ETag derives from `(file_id, content_id)`                                                                                            |
@@ -1016,8 +1016,8 @@ what allows the data plane (sidecar) to scale independently (ADR-0003).
 The control plane **MUST** issue short-lived **signed URLs** that authorize a single content operation
 (`GET`/`PUT`/part) against the **sidecar** for a specific object. Signed URLs **MUST**:
 
-- be a **stateless, opaque, asymmetric Ed25519-signed token** (the bespoke codec-equivalent format per ADR-0004's
-  Implementation note — `base64url(json).base64url(ed25519_signature)`, not a literal PASETO library), verifiable by the
+- be a **stateless, opaque, asymmetric ECDSA P-256/SHA-256-signed token** (the bespoke codec-equivalent format per ADR-0004's
+  Implementation note — `base64url(json).base64url(ecdsa_der_signature)`, not a literal PASETO library), verifiable by the
   sidecar without a database lookup, for which the control plane holds the private key (**sole minter**) and the sidecar
   holds only the public key;
 - be carried either in the `fs-token` URL query parameter (`?fs-token=<token>`, for bare embeddable URLs) or in the
@@ -1043,12 +1043,10 @@ The control plane **MUST** issue short-lived **signed URLs** that authorize a si
 - optionally carry a set of response headers the sidecar **MUST** echo verbatim on the served response (e.g.
   `Content-Disposition`, `Content-Type` override, `Cache-Control`), so the sidecar needs no control-plane round-trip.
 
-The control plane signs with a single active keypair at a time (the bespoke format carries no `kid`, in P1 or later);
-the sidecar verifies against a small ordered set of public keys — the active one plus, during a rotation window,
-previously-active ones (`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) — which lets a `signing_key_seed` rotation happen without
-an outage or invalidating already-issued signed URLs, with no `kid` needed to select among them (see
-`docs/operations.md`'s `signing_key_seed` → Rotation section for the procedure). There is no per-token revocation;
-emergency access revocation is the platform auth module's token revocation. Enforcement
+The control plane and sidecar use one active P-256 keypair. Previous-key overlap
+is not implemented; rotate through the coordinated procedure in operations.md.
+Outstanding URLs must be drained or deliberately invalidated during replacement.
+Enforcement
 of the `max_rate` / `max_conns` constraints is deferred to P2 (it additionally requires coordinating the
 multi-instance sidecar fleet on a shared backend).
 
@@ -1441,7 +1439,7 @@ signed-URL issuance. It does **not** carry file content — content moves over s
 **Type**: HTTP (signed-URL authorized)
 **Stability**: unstable
 **Description**: The sidecar's content surface (`GET`/`PUT`/part), addressed only via control-plane-issued signed
-URLs and served from its own domain. Verifies the bespoke codec-equivalent Ed25519 token and its claims per ADR-0004's
+URLs and served from its own domain. Verifies the bespoke private-codec ECDSA P-256/SHA-256 token and its claims per ADR-0004's
 Implementation note (base64url-encoded JSON plus a base64url-encoded signature; not a literal PASETO library), validates
 the platform token
 when a token-claim predicate is present, serves `Range` and conditional requests, and echoes the response headers
@@ -1725,7 +1723,7 @@ code; see `cpt-cf-file-storage-fr-owner-deletion`.
 - [x] Policies enforce file type and size restrictions on upload (most restrictive wins across tenant and user levels)
 - [x] All content traffic flows through the **sidecar** via signed URLs; no backend-addressable URL is returned to any client
 - [x] Content upload and download are each a two-step exchange (control request → signed URL → byte transfer to/from the sidecar); the control REST surface never carries content
-- [x] The credential is an opaque, asymmetric Ed25519-signed token (the bespoke codec-equivalent format per ADR-0004's Implementation note — not a literal PASETO library), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
+- [x] The credential is an opaque, asymmetric ECDSA P-256/SHA-256-signed token (the bespoke codec-equivalent format per ADR-0004's Implementation note — not a literal PASETO library), carried in the query (`?fs-token=`) or a header, stateless, enforcing AND-combined claims (expiry, optional ip, optional token-claim predicates, upload size/hash); altering any claim invalidates the signature; only control+sidecar parse it
 - [x] file_not_found error returned for non-existent files
 - [x] access_denied error returned for unauthorized operations
 - [x] Metadata-only queries complete without transferring file content

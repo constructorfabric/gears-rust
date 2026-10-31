@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode_header};
 use serde::Deserialize;
 use tokio::sync::{Mutex, RwLock};
 use toolkit_http::HttpClient;
@@ -116,6 +116,8 @@ pub enum Refusal {
     /// Google's keys could not be fetched. Not the caller's fault, and not
     /// something to answer 401 to.
     KeysUnavailable(String),
+    /// The local crypto backend cannot verify tokens.
+    CryptoUnavailable(String),
 }
 
 /// One allowlisted account. A token is admitted only when its uid and its
@@ -289,8 +291,14 @@ impl FirebaseVerifier {
             .map(|c| (*c).to_owned())
             .collect();
 
-        let data = decode::<Claims>(token, key, &validation)
-            .map_err(|e| Refusal::NotAValidToken(e.to_string()))?;
+        let data = toolkit_security::jwt::decode::<Claims>(token, key, &validation).map_err(
+            |e| match e.kind() {
+                jsonwebtoken::errors::ErrorKind::Provider(cause) => {
+                    Refusal::CryptoUnavailable(cause.clone())
+                }
+                _ => Refusal::NotAValidToken(e.to_string()),
+            },
+        )?;
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -364,3 +364,47 @@ async fn concurrent_authenticate_calls_all_succeed() {
         );
     }
 }
+
+#[tokio::test]
+async fn es256_token_authenticates_with_ec_jwk() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use toolkit_security::crypto::signature::EcdsaP256KeyPair;
+    let bytes = EcdsaP256KeyPair::generate_pkcs8().unwrap();
+    let pair = EcdsaP256KeyPair::from_pkcs8(&bytes).unwrap();
+    let point = pair.public_key();
+    let jwks: JwkSet = serde_json::from_value(serde_json::json!({"keys": [{
+        "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": TEST_KID,
+        "x": URL_SAFE_NO_PAD.encode(&point[1..33]), "y": URL_SAFE_NO_PAD.encode(&point[33..]),
+    }]}))
+    .unwrap();
+    let (plugin, _) = jwt_plugin_with_jwks_provider(StaticJwksProvider {
+        jwks: Some(Arc::new(jwks)),
+    });
+    let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+    header.kid = Some(TEST_KID.to_owned());
+    let claims = serde_json::json!({
+        "sub": "550e8400-e29b-41d4-a716-446655440000", "iss": TEST_ISSUER,
+        "exp": future_exp(), "tenant_id": "550e8400-e29b-41d4-a716-446655440111",
+    });
+    // Independent AWS-LC JWT signing oracle; production verification uses the facade.
+    let token = jsonwebtoken::encode(
+        &header,
+        &claims,
+        &jsonwebtoken::EncodingKey::from_ec_der(&bytes),
+    )
+    .unwrap();
+    assert!(
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &token)
+            .await
+            .is_ok()
+    );
+    let (message, signature) = token.rsplit_once('.').unwrap();
+    let mut signature = URL_SAFE_NO_PAD.decode(signature).unwrap();
+    signature[0] ^= 1;
+    let tampered = format!("{message}.{}", URL_SAFE_NO_PAD.encode(signature));
+    assert!(
+        <OidcAuthNPlugin as AuthNResolverPluginClient>::authenticate(&plugin, &tampered)
+            .await
+            .is_err()
+    );
+}

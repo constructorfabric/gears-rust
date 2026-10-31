@@ -90,11 +90,7 @@ impl FinalizeAuth {
             .get("x-fs-internal-token")
             .and_then(|v| v.to_str().ok());
         let matches = provided.is_some_and(|provided| {
-            // Constant-time comparator; only available via a deprecated re-export in
-            // ring 0.17, suppressed here rather than adding a crate for one call.
-            #[allow(deprecated)]
-            ring::constant_time::verify_slices_are_equal(expected.as_bytes(), provided.as_bytes())
-                .is_ok()
+            toolkit_security::crypto::constant_time_eq(expected.as_bytes(), provided.as_bytes())
         });
         if matches {
             Ok(())

@@ -9,6 +9,807 @@ release-plz updates this file in the Release PR.
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/constructorfabric/gears-rust/compare/cf-gears-model-registry-sdk-v0.1.12...cf-gears-model-registry-sdk-v0.1.13) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-noop-usage-collector-plugin-v0.2.1...cf-gears-noop-usage-collector-plugin-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-usage-collector-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-firebase-authn-plugin-v0.1.1...cf-gears-firebase-authn-plugin-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-authn-resolver-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-construct-v0.1.1...cf-gears-construct-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-types-registry, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-authz-resolver, cf-gears-settings-service-sdk, cf-gears-construct-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-construct-sdk-v0.1.1...cf-gears-construct-sdk-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-keycloak-idp-plugin-v0.2.1...cf-gears-keycloak-idp-plugin-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-account-management-sdk, cf-gears-types-registry-sdk, cf-gears-credstore-sdk, cf-gears-credstore
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-flight-control-v0.1.1...cf-gears-flight-control-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-api-gateway, cf-gears-authn-resolver, cf-gears-grpc-hub, cf-gears-static-authn-plugin, cf-gears-service-discovery, cf-gears-oidc-authn-plugin
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oidc-authn-plugin-v0.3.1...cf-gears-oidc-authn-plugin-v0.3.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-authn-resolver
+
+## [0.3.11](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-conformance-v0.3.10...cf-gears-cluster-conformance-v0.3.11) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-cluster-sdk
+
+## [0.1.24](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tr-authz-plugin-v0.1.23...cf-gears-tr-authz-plugin-v0.1.24) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-tenant-resolver
+
+## [0.3.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-timescaledb-usage-collector-plugin-v0.3.2...cf-gears-timescaledb-usage-collector-plugin-v0.3.3) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-usage-collector-sdk
+
+## [0.1.42](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-tr-plugin-v0.1.41...cf-gears-static-tr-plugin-v0.1.42) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.1.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-license-plugin-v0.1.7...cf-gears-static-license-plugin-v0.1.8) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-license-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.1.21](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-idp-plugin-v0.1.20...cf-gears-static-idp-plugin-v0.1.21) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-account-management-sdk, cf-gears-types-registry-sdk
+
+## [0.2.18](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-credstore-plugin-v0.2.17...cf-gears-static-credstore-plugin-v0.2.18) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-credstore-sdk
+
+## [0.1.43](https://github.com/constructorfabric/gears-rust/compare/cf-gears-single-tenant-tr-plugin-v0.1.42...cf-gears-single-tenant-tr-plugin-v0.1.43) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-v0.3.1...cf-gears-simple-user-settings-v0.3.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-authz-resolver, cf-gears-simple-user-settings-sdk
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-simple-user-settings-sdk-v0.2.1...cf-gears-simple-user-settings-sdk-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-sdk-v0.2.0...cf-gears-settings-service-sdk-v0.2.1) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-service-discovery-v0.3.1...cf-gears-service-discovery-v0.3.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.1.24](https://github.com/constructorfabric/gears-rust/compare/cf-gears-rg-tr-plugin-v0.1.23...cf-gears-rg-tr-plugin-v0.1.24) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-resource-group, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-resource-group-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-engine-most-restrictive-v0.1.1...cf-gears-quota-enforcement-engine-most-restrictive-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-quota-enforcement-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-engine-cel-v0.1.1...cf-gears-quota-enforcement-engine-cel-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-quota-enforcement-sdk
+
+## [0.1.46](https://github.com/constructorfabric/gears-rust/compare/cf-gears-nodes-registry-v0.1.45...cf-gears-nodes-registry-v0.1.46) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-v0.5.1...cf-gears-mini-chat-v0.5.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-types-registry, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-authz-resolver, cf-gears-oagw, cf-gears-authn-resolver-sdk, cf-gears-authn-resolver, cf-gears-mini-chat-sdk
+
+## [0.10.29](https://github.com/constructorfabric/gears-rust/compare/cf-gears-mini-chat-sdk-v0.10.28...cf-gears-mini-chat-sdk-v0.10.29) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.1.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-v0.1.7...cf-gears-license-resolver-v0.1.8) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-license-resolver-sdk, cf-gears-toolkit-contract, cf-gears-types-registry-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-remote-embedding-plugin-v0.1.1...cf-gears-graph-storage-remote-embedding-plugin-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-graph-storage-sdk
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-onnx-embedding-plugin-v0.1.1...cf-gears-graph-storage-onnx-embedding-plugin-v0.1.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-graph-storage-sdk
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-sdk-v0.2.0...cf-gears-graph-storage-sdk-v0.2.1) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-github-mirror-sdk-v0.2.1...cf-gears-github-mirror-sdk-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit
+
+## [0.4.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-storage-v0.4.0...cf-gears-file-storage-v0.4.1) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-authz-resolver
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-file-parser-v0.2.1...cf-gears-file-parser-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.1.3](https://github.com/constructorfabric/gears-rust/compare/cf-gears-clickhouse-usage-collector-plugin-v0.1.2...cf-gears-clickhouse-usage-collector-plugin-v0.1.3) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-usage-collector-sdk
+
+## [0.3.11](https://github.com/constructorfabric/gears-rust/compare/cf-chat-engine-v0.3.10...cf-chat-engine-v0.3.11) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-authz-resolver-sdk, cf-gears-authz-resolver
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-http-json-plugin-v0.2.1...cf-gears-bss-rate-provider-http-json-plugin-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-types-registry, cf-gears-bss-ledger-sdk, cf-gears-bss-rate-provider-sdk
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-ecb-plugin-v0.2.1...cf-gears-bss-rate-provider-ecb-plugin-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-types-registry, cf-gears-bss-ledger-sdk, cf-gears-bss-rate-provider-sdk
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-v0.2.1...cf-gears-bss-rate-provider-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-bss-ledger-sdk, cf-gears-bss-rate-provider-sdk
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-rate-provider-sdk-v0.2.1...cf-gears-bss-rate-provider-sdk-v0.2.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-bss-money, cf-gears-types-registry-sdk, cf-gears-bss-ledger-sdk
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-v0.5.1...cf-gears-usage-collector-v0.5.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-types-registry, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-authz-resolver, cf-gears-usage-collector-sdk
+
+## [0.3.17](https://github.com/constructorfabric/gears-rust/compare/cf-gears-usage-collector-sdk-v0.3.16...cf-gears-usage-collector-sdk-v0.3.17) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit
+
+## [0.1.41](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authz-plugin-v0.1.40...cf-gears-static-authz-plugin-v0.1.41) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.3.21](https://github.com/constructorfabric/gears-rust/compare/cf-gears-static-authn-plugin-v0.3.20...cf-gears-static-authn-plugin-v0.3.21) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-authn-resolver-sdk
+
+## [0.2.11](https://github.com/constructorfabric/gears-rust/compare/cf-gears-standalone-cluster-plugin-v0.2.10...cf-gears-standalone-cluster-plugin-v0.2.11) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-cluster-sdk
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-sdk-v0.3.1...cf-gears-cluster-sdk-v0.3.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-toolkit-contract
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-ledger-sdk-v0.2.0...cf-gears-bss-ledger-sdk-v0.2.1) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-bss-money
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-grpc-hub-v0.4.1...cf-gears-grpc-hub-v0.4.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.2.40](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-v0.2.39...cf-gears-authn-resolver-v0.2.40) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-types-registry-sdk, cf-gears-authn-resolver-sdk
+
+## [0.3.40](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authn-resolver-sdk-v0.3.39...cf-gears-authn-resolver-sdk-v0.3.40) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-oagw-v0.6.1...cf-gears-oagw-v0.6.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-tenant-resolver, cf-gears-credstore-sdk, cf-gears-credstore, cf-gears-toolkit-auth, cf-gears-toolkit-http-proxy
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-v0.6.1...cf-gears-credstore-v0.6.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-db, cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk, cf-gears-tenant-resolver, cf-gears-credstore-sdk
+
+## [0.2.20](https://github.com/constructorfabric/gears-rust/compare/cf-gears-credstore-sdk-v0.2.19...cf-gears-credstore-sdk-v0.2.20) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.1.44](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-v0.1.43...cf-gears-tenant-resolver-v0.1.44) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-tenant-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.3.7](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-sdk-v0.3.6...cf-gears-resource-group-sdk-v0.3.7) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-v0.3.1...cf-gears-authz-resolver-v0.3.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit, cf-gears-types-registry, cf-gears-toolkit-contract, cf-gears-authz-resolver-sdk, cf-gears-types-registry-sdk
+
+## [0.4.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-sdk-v0.4.1...cf-gears-types-registry-sdk-v0.4.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-toolkit-contract
+
+## [0.6.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-authz-resolver-sdk-v0.6.1...cf-gears-authz-resolver-sdk-v0.6.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-http, cf-gears-toolkit, cf-gears-toolkit-contract, cf-gears-tenant-resolver-sdk
+
+## [0.8.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-sdk-v0.8.1...cf-gears-account-management-sdk-v0.8.2) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit-odata, cf-gears-toolkit, cf-gears-tenant-resolver-sdk
+
+## [0.4.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-tenant-resolver-sdk-v0.4.7...cf-gears-tenant-resolver-sdk-v0.4.8) - 2026-10-30
+
+### Other
+
+- updated the following local packages: cf-gears-toolkit
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-license-enforcement-sdk-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(license-enforcement)* remove unnecessary deny_unknown_fields attribute (by @nonameffh)
+- *(license-enforcement)* specify canonical error mapping for admission conflict errors (by @nonameffh)
+- *(license-enforcement)* implement SDK (by @nonameffh)
+
+### Fixed
+
+- *(license-enforcement)* resolve code review findings (by @nonameffh)
+- *(license-enforcement)* fix lint (by @nonameffh)
+- *(license-enforcement)* fix SDK and evidence fields (by @nonameffh)
+
+### Contributors
+
+* @nonameffh
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.1.13...cf-gears-llm-gateway-sdk-v0.2.0) - 2026-10-30
+
+### Added
+
+- *(llm-gateway)* add allowed_domains to the web search tool (by @Ritmix3300)
+- *(llm-gateway)* add a cancellation token to the provider call context (by @Ritmix3300)
+- *(llm-gateway)* [**breaking**] align llm-gateway-sdk with the PRD (by @Ritmix3300)
+
+### Fixed
+
+- *(llm-gateway)* [**breaking**] make new public SDK types non_exhaustive with constructors (by @Ritmix3300)
+- *(llm-gateway)* make ProviderErrorCategory non_exhaustive (by @Ritmix3300)
+- *(llm-gateway)* truncate provider text in wire errors (by @Ritmix3300)
+- *(llm-gateway)* [**breaking**] drop stream from the SDK request body (by @Ritmix3300)
+- *(llm-gateway)* make the media_not_found message fixed text (by @Ritmix3300)
+- *(llm-gateway)* drop the P2 timeout error from the SDK (by @Ritmix3300)
+- *(llm-gateway)* add permission_denied and gateway_unavailable errors (by @Ritmix3300)
+- *(llm-gateway)* restore output_validation_error as a distinct code (by @Ritmix3300)
+- *(llm-gateway)* keep web search tool options instead of falling through to Other (by @Ritmix3300)
+- *(llm-gateway)* use cf_gears: prefix for web search types (by @Ritmix3300)
+
+### Other
+
+- *(llm-gateway)* drop stale PRD deviation notes from the SDK (by @Ritmix3300)
+- *(llm-gateway)* describe the key destination as the OAGW upstream alias (by @Ritmix3300)
+- *(llm-gateway)* describe unapproved_destination as an unresolved OAGW alias (by @Ritmix3300)
+- *(llm-gateway)* drop the serde-only web search roundtrip test (by @Ritmix3300)
+- *(llm-gateway)* cover ResponseResource gateway extensions (by @Ritmix3300)
+- *(llm-gateway)* list all sources of ignored_parameters (by @Ritmix3300)
+- *(llm-gateway)* clarify where unsupported_schema is checked (by @Ritmix3300)
+- *(llm-gateway)* [**breaking**] drop model_support from the plugin SDK (by @Ritmix3300)
+
+### Contributors
+
+* @Ritmix3300
+
+## [0.1.10](https://github.com/constructorfabric/gears-rust/compare/cf-gears-settings-service-v0.1.8...cf-gears-settings-service-v0.1.10) - 2026-10-30
+
+### Added
+
+- *(settings-service)* purge a retired declaration (by @shaneemberton)
+- *(settings-service)* show the actor's display name in a setting's history (by @shaneemberton)
+- *(settings-service)* [**breaking**] stop disclosing who acts above the reader's tenant (by @shaneemberton)
+- *(settings-service)* narrow the settings browse by a text (by @shaneemberton)
+
+### Fixed
+
+- *(settings-service)* read no tenant chain for a platform history reader (by @shaneemberton)
+- *(settings-service)* retired settings block category deletion, and the refusal counts them (by @shaneemberton)
+
+### Other
+
+- Merge pull request #5370 from shaneemberton/feat/settings-service-browse-q-disclosure-boundary (by @entropyshift) - #5370
+- *(settings-service)* share the text match without an import cycle (by @shaneemberton)
+
+### Contributors
+
+* @shaneemberton
+* @entropyshift
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-storage-plugin-v0.2.0...cf-gears-quota-enforcement-storage-plugin-v0.3.0) - 2026-10-30
+
+### Added
+
+- *(quota-enforcement-storage-plugin)* notification outbox and leased dispatch handler (by @vgprod)
+- *(quota-enforcement-storage-plugin)* snapshot store and paginated bulk read (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* keep snapshot reads write-free (by @vgprod)
+- *(qe)* poll notification partitions so another replica's lease can't stall delivery (by @vgprod)
+
+### Other
+
+- *(quota-enforcement)* share PG evaluation helpers (by @vgprod)
+- *(quota-enforcement)* settle outbox wakes in an async fn (by @vgprod)
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge pull request #5314 from vgprod/feat/quota-enforcement-snapshot-reads (by @nonameffh) - #5314
+- *(quota-enforcement)* read a snapshot page in three statements (by @vgprod)
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- *(quota-enforcement)* outlast the outbox reconciler in the two-pipeline test (by @vgprod)
+- *(quota-enforcement)* force record-key races; fix a dead-letter read race (by @vgprod)
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- *(quota-enforcement)* GTS ids under the cf.core.qe package (by @vgprod)
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+
+### Contributors
+
+* @vgprod
+* @nonameffh
+
+## [0.3.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-v0.2.0...cf-gears-quota-enforcement-v0.3.0) - 2026-10-30
+
+### Added
+
+- *(quota-enforcement)* notification dispatcher and sink fan-out (by @vgprod)
+- *(quota-enforcement)* snapshot read operation and snapshot API (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* stop leader tasks and delivery together on shutdown (by @vgprod)
+- *(quota-enforcement)* keep snapshot reads write-free (by @vgprod)
+
+### Other
+
+- *(quota-enforcement)* describe max_attempts by the recorded attempts count (by @vgprod)
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge pull request #5314 from vgprod/feat/quota-enforcement-snapshot-reads (by @nonameffh) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- *(quota-enforcement)* a snapshot subject kind is a full scope id (by @vgprod)
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+
+### Contributors
+
+* @vgprod
+* @nonameffh
+
+## [0.4.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-quota-enforcement-sdk-v0.3.0...cf-gears-quota-enforcement-sdk-v0.4.0) - 2026-10-30
+
+### Added
+
+- *(quota-enforcement-sdk)* notification sink contract and delivery callback (by @vgprod)
+- *(quota-enforcement-sdk)* snapshot read contract and subject filters (by @vgprod)
+
+### Fixed
+
+- *(quota-enforcement)* keep snapshot reads write-free (by @vgprod)
+
+### Other
+
+- Merge remote-tracking branch 'upstream/main' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge pull request #5314 from vgprod/feat/quota-enforcement-snapshot-reads (by @nonameffh) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch feat/quota-enforcement-snapshot-reads into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch feat/quota-enforcement-batch-debit into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- *(quota-enforcement)* a snapshot subject kind is a full scope id (by @vgprod)
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+- Merge branch 'feat/quota-enforcement-snapshot-reads' into feat/quota-enforcement-notifications (by @vgprod) - #5315
+- Merge branch 'feat/quota-enforcement-batch-debit' into feat/quota-enforcement-snapshot-reads (by @vgprod) - #5314
+
+### Contributors
+
+* @vgprod
+* @nonameffh
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-license-resolver-sdk-v0.2.1...cf-gears-license-resolver-sdk-v0.2.2) - 2026-10-30
+
+### Added
+
+- *(license-enforcement)* implement SDK (by @nonameffh)
+
+### Contributors
+
+* @nonameffh
+
+## [0.2.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-graph-storage-v0.2.1...cf-gears-graph-storage-v0.2.2) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-github-mirror-v0.1.1...cf-gears-github-mirror-v0.1.2) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.4.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-v0.3.1...cf-gears-event-broker-v0.4.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Fixed
+
+- *(event-broker)* stop event-broker tests racing the async ingest drain (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-sqlite-event-broker-plugin-v0.1.1...cf-gears-sqlite-event-broker-plugin-v0.2.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-postgres-event-broker-plugin-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-mysql-event-broker-plugin-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-memory-event-broker-plugin-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.1.0](https://github.com/constructorfabric/gears-rust/releases/tag/cf-gears-kafka-event-broker-plugin-v0.1.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.3.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-cluster-v0.3.1...cf-gears-cluster-v0.3.2) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.2.0](https://github.com/constructorfabric/gears-rust/compare/cf-redis-cluster-plugin-v0.1.7...cf-redis-cluster-plugin-v0.2.0) - 2026-10-30
+
+### Fixed
+
+- *(cluster)* stop the redis subscriber lagging under lock-release traffic (by @asmith987)
+
+### Other
+
+- Merge pull request #5414 from asmith987/fix/cluster-redis-subscriber-lag (by @MikeFalcon77) - #5414
+
+### Contributors
+
+* @MikeFalcon77
+* @asmith987
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-postgres-cluster-plugin-v0.5.1...cf-postgres-cluster-plugin-v0.5.2) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.1.5](https://github.com/constructorfabric/gears-rust/compare/cf-k8s-cluster-plugin-v0.1.4...cf-k8s-cluster-plugin-v0.1.5) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.2.1](https://github.com/constructorfabric/gears-rust/compare/cf-gears-bss-money-v0.2.0...cf-gears-bss-money-v0.2.1) - 2026-10-30
+
+### Added
+
+- *(bss-money)* add exact-fraction API (by @macrocheese1)
+
+### Other
+
+- Merge pull request #5527 from macrocheese1/feat/bss-money-exact-api (by @entropyshift) - #5527
+
+### Contributors
+
+* @entropyshift
+* @macrocheese1
+
+## [0.7.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-api-gateway-v0.6.1...cf-gears-api-gateway-v0.7.0) - 2026-10-30
+
+### Added
+
+- *(toolkit)* propagate x-request-id across contract-client hops (by @mattgarmon)
+
+### Fixed
+
+- *(toolkit)* a listener never serves a plane it cannot check (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #5456 from constructorfabric/gearbox/auth-hardening (by @Artifizer) - #5456
+- *(telemetry)* [**breaking**] drop never-read propagation/http tracing config keys (by @mattgarmon)
+
+### Contributors
+
+* @Artifizer
+* @MikeFalcon77
+* @mattgarmon
+
+## [0.4.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-event-broker-sdk-v0.3.1...cf-gears-event-broker-sdk-v0.4.0) - 2026-10-30
+
+### Added
+
+- *(event-broker)* backend registry, provisioning, storage plugins (by @striped-zebra-dev)
+
+### Fixed
+
+- *(event-broker)* stop event-broker tests racing the async ingest drain (by @striped-zebra-dev)
+
+### Contributors
+
+* @striped-zebra-dev
+
+## [0.11.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-account-management-v0.11.1...cf-gears-account-management-v0.11.2) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.4.8](https://github.com/constructorfabric/gears-rust/compare/cf-gears-resource-group-v0.4.7...cf-gears-resource-group-v0.4.8) - 2026-10-30
+
+### Other
+
+- update Cargo.toml dependencies
+
+## [0.5.2](https://github.com/constructorfabric/gears-rust/compare/cf-gears-types-registry-v0.5.1...cf-gears-types-registry-v0.5.2) - 2026-10-30
+
+### Fixed
+
+- *(toolkit)* address the review of #5456 (by @MikeFalcon77)
+
+### Contributors
+
+* @MikeFalcon77
+
+## [0.12.0](https://github.com/constructorfabric/gears-rust/compare/cf-gears-toolkit-v0.11.1...cf-gears-toolkit-v0.12.0) - 2026-10-30
+
+### Added
+
+- *(toolkit)* propagate x-request-id across contract-client hops (by @mattgarmon)
+
+### Fixed
+
+- *(toolkit)* stop in-process providers silently wiring to remote proxies (by @mattgarmon)
+- *(toolkit)* address the review of #5456 (by @MikeFalcon77)
+- *(toolkit)* a listener never serves a plane it cannot check (by @MikeFalcon77)
+
+### Other
+
+- Merge pull request #5456 from constructorfabric/gearbox/auth-hardening (by @Artifizer) - #5456
+- *(telemetry)* [**breaking**] drop never-read propagation/http tracing config keys (by @mattgarmon)
+
+### Contributors
+
+* @mattgarmon
+* @Artifizer
+* @MikeFalcon77
+
 ## [0.1.13](https://github.com/constructorfabric/gears-rust/compare/cf-gears-llm-gateway-sdk-v0.1.12...cf-gears-llm-gateway-sdk-v0.1.13) - 2026-10-28
 
 ### Other

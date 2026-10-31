@@ -1,12 +1,12 @@
 //! `FileStorage` data-plane sidecar: the only component that moves user bytes.
 //!
-//! It verifies the control-minted Ed25519 signed-URL token, enforces the token's upload
+//! It verifies the control-minted ECDSA P-256 signed-URL token, enforces the token's upload
 //! constraints (size / hash) and streams content to/from a storage backend. Clients never
 //! address a backend directly.
 //!
 //! Configuration (env):
 //!   - `FS_SIDECAR_ADDR` - bind address (default `0.0.0.0:8087`)
-//!   - `FS_SIDECAR_PUBLIC_KEY` - base64url Ed25519 public key (from control)
+//!   - `FS_SIDECAR_PUBLIC_KEY` - base64url uncompressed SEC1 P-256 public key (65 bytes, from control)
 //!   - `FS_SIDECAR_BACKEND_ROOT` - local-fs backend root (default `./.file-storage-data`)
 //!   - `FS_SIDECAR_CONTROL_URL` - control-plane base URL for the finalize/report-part
 //!     callbacks (default `http://localhost:8080`); empty disables them (dev/test only)
@@ -101,6 +101,10 @@ const DEFAULT_MAX_BODY_BYTES: usize = 5_368_709_120;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    toolkit_security::crypto::initialize().map_err(|e| anyhow::anyhow!("crypto backend: {e}"))?;
+    toolkit_security::tls::configured_provider()
+        .install_default()
+        .map_err(|_| anyhow::anyhow!("a conflicting TLS provider was already installed"))?;
     let addr: SocketAddr = std::env::var("FS_SIDECAR_ADDR")
         .unwrap_or_else(|_| "0.0.0.0:8087".to_owned())
         .parse()?;
@@ -111,6 +115,11 @@ async fn main() -> anyhow::Result<()> {
     let public_key = URL_SAFE_NO_PAD
         .decode(public_key_b64.trim())
         .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?;
+
+    let verifier = Arc::new(
+        Verifier::from_public_key(&public_key)
+            .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?,
+    );
 
     let control_base_url = std::env::var("FS_SIDECAR_CONTROL_URL")
         .unwrap_or_else(|_| "http://localhost:8080".to_owned());
@@ -192,10 +201,7 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let state = SidecarState {
-        verifier: Arc::new(
-            Verifier::from_public_key(public_key)
-                .map_err(|e| anyhow::anyhow!("invalid FS_SIDECAR_PUBLIC_KEY: {e}"))?,
-        ),
+        verifier,
         backends,
         control_base_url,
         internal_token,

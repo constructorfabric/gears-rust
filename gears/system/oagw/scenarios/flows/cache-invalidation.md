@@ -1,53 +1,93 @@
 # Cache Invalidation Flow
 
+<!-- toc -->
+
+- [Overview](#overview)
+- [Cache Architecture](#cache-architecture)
+  - [Sections](#sections)
+  - [What a Write Evicts](#what-a-write-evicts)
+- [Invalidation Trigger: Config Write](#invalidation-trigger-config-write)
+- [Scenario 1: Update Upstream Config](#scenario-1-update-upstream-config)
+  - [Initial State](#initial-state)
+  - [Management Request](#management-request)
+  - [Invalidation Flow](#invalidation-flow)
+  - [Post-Invalidation State](#post-invalidation-state)
+  - [Next Proxy Request](#next-proxy-request)
+- [Scenario 2: Create New Route](#scenario-2-create-new-route)
+- [Scenario 3: Delete Upstream (with cascade)](#scenario-3-delete-upstream-with-cascade)
+- [Scenario 4: Upstream Created in an Ancestor Tenant](#scenario-4-upstream-created-in-an-ancestor-tenant)
+- [Scenario 5: Multi-Instance Environment](#scenario-5-multi-instance-environment)
+  - [Setup](#setup)
+  - [Update Flow](#update-flow)
+  - [Next Request to the Other Instance](#next-request-to-the-other-instance)
+- [Scenario 6: Changes Missed](#scenario-6-changes-missed)
+- [Invalidation Timing](#invalidation-timing)
+- [Consistency Guarantees](#consistency-guarantees)
+- [Failure Scenarios](#failure-scenarios)
+  - [Change Log Append Fails](#change-log-append-fails)
+  - [Change Log Watch Down](#change-log-watch-down)
+  - [Database Write Fails](#database-write-fails)
+  - [Read Races a Write](#read-races-a-write)
+- [Monitoring](#monitoring)
+- [Related ADRs](#related-adrs)
+
+<!-- /toc -->
+
 ## Overview
 
-Cache invalidation ensures consistency across Control Plane and Data Plane caches when configuration changes. Writes trigger immediate invalidation in DP L1/L2, followed by CP L1
-notification.
+With a database, each OAGW instance keeps a per-instance cache of the configuration the proxy reads ([ADR: Proxy Configuration Cache](../../docs/ADR/0020-proxy-config-cache.md)). A configuration write evicts only the entries it can affect: on the writing instance before the write answers, and on every other instance through a short change log in the cluster gear. Every entry also expires after a TTL (default 60 s), which bounds staleness when a change is lost. When an instance cannot know what it missed, it empties its whole cache.
+
+Without a database there is no configuration cache: the proxy reads the in-memory repositories directly, and OAGW supports one instance only.
 
 ## Cache Architecture
 
-### Control Plane Caches
+### Sections
 
-- **L1 (In-Memory)**: LRU cache, 10k entries, <1μs access
-- **L2 (Redis, Optional)**: Shared across DP instances, ~1-2ms access
-- **Database**: Source of truth, ~5-10ms access
+| Section | Key | Value |
+|---|---|---|
+| Alias | normalized alias + tenant chain (requesting tenant first, then ancestors) | Every upstream with the alias owned by a tenant in the chain, disabled and not-visible ones included; empty when there is none ("not found") |
+| Route | the upstream's tenant and ID | The upstream's enabled HTTP routes, in full (path, methods, plugins, priority, rate limit, CORS) |
 
-### Data Plane Cache
+- Both sections hold raw repository answers. Upstream selection, the SSRF check, route selection and the merge run on every request, so a hit returns what an uncached lookup returns.
+- Each section indexes its entries by the IDs they hold (upstream IDs in the alias section, route IDs in the route section), and the alias section also by alias. A write finds the entries it affects through these indexes.
+- Each entry expires after `proxy_cache.ttl`. Each section holds at most `proxy_cache.max_entries` (default 10,000); when full, the least recently used entry goes.
+- The database is the only source of truth. The cluster gear holds only the change log, never configuration.
 
-- **L1 (In-Memory)**: LRU cache, 1000 entries, <1μs access
-- **No L2**: CP depends on DP for config resolution
+### What a Write Evicts
+
+| Write | Alias section evicts | Route section evicts |
+|---|---|---|
+| Upstream `U` in tenant `T` created or updated, with alias `a` | entries holding `U`; entries for `a` whose chain contains `T` | — |
+| Upstream `U` in `T` deleted | entries holding `U` | `U`'s entry |
+| Route `R` on upstream `U` created or updated | — | `U`'s entry; entries holding `R` |
+| Route `R` deleted | — | entries holding `R` |
+| The routes of upstream `U` deleted | — | `U`'s entry |
+
+A write also detaches the loads in flight in each section it touches, so a load that read rows from before the write is not stored.
 
 ## Invalidation Trigger: Config Write
 
-When a management operation modifies configuration (upstream, route, plugin), invalidation flows through multiple layers.
+The cache wraps the database repositories, so every upstream and route create, update and delete evicts, whether from the Management API, the SDK or the registry reconcile. The eviction runs after the call ends, succeeded, failed or cancelled mid-call. A write cancelled mid-call evicts and publishes its change once more 30 s later, since its statement can still commit after the cancel. A Management API or SDK write answers after its change is appended (at most 2 s); a registry reconcile run waits once, at its end.
 
 ## Scenario 1: Update Upstream Config
 
 ### Initial State
 
-**CP L1 cache**:
+Tenant `T` (child of partner `P`, child of root `R`) has proxied requests to `api.openai.com`. Instance A's cache:
 
-```
-upstream:{tenant_id}:openai → {...config...} (cached 5 minutes ago)
-```
-
-**DP L1 cache**:
-
-```
-upstream:{tenant_id}:openai → {...config...} (cached 10 minutes ago)
-```
-
-**DP L2 cache (Redis)**:
-
-```
-upstream:{tenant_id}:openai → {...config...} (TTL: 3 minutes remaining)
+```text
+alias section:
+  (api.openai.com, [T, P, R]) → [upstream U1 (tenant T), upstream U0 (tenant R)]   holds U1, U0
+  (api.openai.com, [T2, P, R]) → [upstream U0 (tenant R)]                          holds U0
+route section:
+  (T, U1) → [route R1, route R2]
+  (R, U0) → [route R9]
 ```
 
 ### Management Request
 
 ```http
-PUT /api/oagw/v1/upstreams/gts.cf.core.oagw.upstream.v1~7c9e6679... HTTP/1.1
+PUT /api/oagw/v1/upstreams/gts.cf.core.oagw.upstream.v1~<U1> HTTP/1.1
 Host: oagw.example.com
 Authorization: Bearer <tenant-token>
 Content-Type: application/json
@@ -59,380 +99,249 @@ Content-Type: application/json
     ]
   },
   "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
-  "alias": "openai",
-  "rate_limit": {
-    "sustained": { "rate": 50, "window": "minute" }
-  }
+  "enabled": false
 }
 ```
 
 ### Invalidation Flow
 
-```
-Client → API Handler
-  ↓
-API Handler → Control Plane
-  ↓
-┌─────────────────────────────────────┐
-│ Control Plane Processing               │
-├─────────────────────────────────────┤
-│ 1. Validate request                 │
-│ 2. Write to database                │
-│    UPDATE oagw_upstream             │
-│    SET config = ...                 │
-│    WHERE id = ...                   │
-│                                     │
-│ 3. Invalidate DP L1 cache           │
-│    DELETE upstream:{tenant}:openai  │
-│                                     │
-│ 4. Invalidate DP L2 cache (Redis)  │
-│    DEL upstream:{tenant}:openai     │
-│                                     │
-│ 5. Return success                   │
-└─────────────────────────────────────┘
-  ↓
-API Handler receives success
-  ↓
-API Handler → Data Plane (notification)
-  ↓
-┌─────────────────────────────────────┐
-│ Data Plane Processing            │
-├─────────────────────────────────────┤
-│ 1. Receive invalidation message     │
-│    {                                │
-│      "cache_key": "upstream:...",   │
-│      "tenant_id": "...",            │
-│      "upstream_id": "..."           │
-│    }                                │
-│                                     │
-│ 2. Invalidate CP L1 cache           │
-│    DELETE upstream:{tenant}:openai  │
-│                                     │
-│ 3. Acknowledge                      │
-└─────────────────────────────────────┘
-  ↓
-API Handler → Client (200 OK)
+```text
+Instance A
+┌──────────────────────────────────────────────┐
+│ 1. Build the change from the call:           │
+│    Upstream { tenant: T, id: U1,             │
+│               alias: api.openai.com }        │
+│ 2. Repository update commits                 │
+│ 3. Evict locally:                            │
+│    - entries holding U1                      │
+│    - entries for api.openai.com whose chain  │
+│      contains T                              │
+│    → (api.openai.com, [T, P, R]) evicted     │
+│    detach in-flight alias loads              │
+│ 4. Append the change to the cluster log      │
+│    oagw/proxy-config-changes (≤ 2 s wait)    │
+│ 5. Return 200 OK                             │
+└──────────────────────────────────────────────┘
 ```
 
 ### Post-Invalidation State
 
-**CP L1 cache**:
-
-```
-(empty - invalidated)
-```
-
-**DP L1 cache**:
-
-```
-(empty - invalidated)
-```
-
-**DP L2 cache (Redis)**:
-
-```
-(empty - invalidated)
-```
-
-**Database**:
-
-```
-upstream config = updated value (source of truth)
+```text
+alias section:
+  (api.openai.com, [T2, P, R]) → [upstream U0]     kept: T2's chain does not contain T
+route section:
+  (T, U1) → [route R1, route R2]                   kept: an upstream write does not touch routes
+  (R, U0) → [route R9]                             kept
 ```
 
 ### Next Proxy Request
 
+```text
+Tenant T: POST /api/oagw/v1/proxy/api.openai.com/v1/chat/completions
+  → alias section (api.openai.com, [T, P, R]): MISS
+  → SELECT the upstreams with the alias across [T, P, R]; store [U1 (disabled), U0]
+  → selection: U1 is disabled, U0 is visible and enabled → U0 (if it is shared to T)
+  → route section (R, U0): HIT
+  → select_route, merge, proxy
+Tenant T2: same alias
+  → alias section (api.openai.com, [T2, P, R]): HIT, no SQL
 ```
-Client → API Handler → Data Plane
-  ↓
-CP checks L1 cache: MISS
-  ↓
-CP calls DP.resolve_upstream("openai")
-  ↓
-DP checks L1 cache: MISS
-  ↓
-DP checks L2 cache: MISS
-  ↓
-DP queries database: HIT (fresh config)
-  ↓
-DP populates L1 and L2 with fresh config
-  ↓
-DP returns to CP
-  ↓
-CP populates L1 with fresh config
-  ↓
-CP uses fresh config for request
-```
-
-**Result**: Next request uses updated rate limit (50/min instead of 100/min).
 
 ## Scenario 2: Create New Route
 
-### Management Request
-
 ```http
 POST /api/oagw/v1/routes HTTP/1.1
-Host: oagw.example.com
-Authorization: Bearer <tenant-token>
 Content-Type: application/json
 
-{
-  "upstream_id": "gts.cf.core.oagw.upstream.v1~7c9e6679...",
-  "match": {
-    "http": {
-      "methods": ["POST"],
-      "path": "/v1/completions"
-    }
-  }
-}
+{ "upstream_id": "gts.cf.core.oagw.upstream.v1~<U1>", "match": { "http": { "methods": ["POST"], "path": "/v1/embeddings" } } }
 ```
 
-### Invalidation Flow
-
-```
-Control Plane:
-  1. Insert into oagw_route table
-  2. No cache to invalidate (new resource)
-  3. Return 201 Created
-
-No CP notification needed (route not cached yet)
+```text
+1. Change: Route { tenant: T, id: R3, upstream: U1 }
+2. Commit
+3. Evict (T, U1) from the route section, and entries holding R3 (none: it is new);
+   detach in-flight route loads. The alias section is untouched.
+4. Append to the change log, return 201
+Next request: alias HIT, route section (T, U1) MISS → one SELECT for U1's routes
 ```
 
-**Result**: Next request matching this route will query DP, get fresh route, cache it.
+A route moved to another upstream evicts both upstreams' route entries: the new upstream's by key, the old one's because it holds the route.
 
 ## Scenario 3: Delete Upstream (with cascade)
 
-### Management Request
-
 ```http
-DELETE /api/oagw/v1/upstreams/gts.cf.core.oagw.upstream.v1~7c9e6679...?cascade=true HTTP/1.1
-Host: oagw.example.com
-Authorization: Bearer <tenant-token>
+DELETE /api/oagw/v1/upstreams/gts.cf.core.oagw.upstream.v1~<U1> HTTP/1.1
 ```
 
-### Invalidation Flow
-
-```
-Control Plane:
-  1. Find all routes for upstream
-     SELECT id FROM oagw_route WHERE upstream_id = ...
-     Result: [route1, route2, route3]
-
-  2. Delete routes (cascade)
-     DELETE FROM oagw_route WHERE upstream_id = ...
-
-  3. Delete upstream
-     DELETE FROM oagw_upstream WHERE id = ...
-
-  4. Invalidate all affected cache keys:
-     DP L1/L2:
-       - upstream:{tenant}:openai
-       - route:{upstream_id}:POST:/v1/chat/completions
-       - route:{upstream_id}:POST:/v1/completions
-       - route:{upstream_id}:GET:/v1/models
-
-  5. Return 204 No Content
-
-API Handler:
-  Notify CP to invalidate all affected keys
+```text
+1. The database deletes U1; the foreign-key cascade deletes its routes and their rows
+2. Evict: alias entries holding U1, and the route entry (T, U1)
+3. Append to the change log, return 204
+Next request from T: alias MISS → SELECT returns [U0] (or [] → 404 "not found", cached)
 ```
 
-**Result**: All cached config for this upstream and its routes invalidated.
+The registry reconcile's `delete_upstream_if_unused` evicts the same entries.
 
-## Scenario 4: Multi-Instance Environment
+## Scenario 4: Upstream Created in an Ancestor Tenant
+
+Partner `P` creates an upstream with alias `api.example.com`, shared to its descendants. Tenants `T` and `T3` under `P` had cached "not found" for that alias; tenant `X` under another partner had too.
+
+```text
+Change: Upstream { tenant: P, id: U5, alias: api.example.com }
+Evict: entries for api.example.com whose chain contains P
+  → (api.example.com, [T, P, R])   evicted ("not found" entry)
+  → (api.example.com, [T3, P, R])  evicted
+  → (api.example.com, [X, Q, R])   kept: P is not in X's chain
+```
+
+The next request from `T` or `T3` loads the alias again and finds `U5`. A tenant that moves under another parent gets a new chain, so its next request uses a new key; no eviction is needed.
+
+## Scenario 5: Multi-Instance Environment
 
 ### Setup
 
-3 Control Plane instances behind load balancer, shared Redis L2 cache.
-2 Data Plane instances.
+```text
+Instance A ─┐                ┌─ PostgreSQL (configuration, source of truth)
+Instance B ─┼── both read ───┤
+            │                └─ cluster gear, profile oagw (Redis, PostgreSQL or k8s)
+            └── both append to and watch oagw/proxy-config-changes
+```
+
+Each instance has its own cache. The standalone cluster backend cannot be shared between processes, so several instances need a shared backend.
 
 ### Update Flow
 
-```
-Client → API Handler → DP Instance 1
-  ↓
-DP1:
-  1. Write to database (shared)
-  2. Flush DP1 L1 cache (local)
-  3. Flush Redis L2 cache (shared)
-  4. Return success
-  ↓
-API Handler → Broadcast to all CP instances
-  ↓
-CP1: Flush L1 cache (local)
-CP2: Flush L1 cache (local)
+```text
+Instance A                                   Cluster                         Instance B
+1. commit, evict locally
+2. read log {log: L, seq: 41}
+3. compare-and-swap with change seq 42  ──→  log {log: L, seq: 42, ...}
+4. return 200                                watch event: Changed  ──────→  5. read the log
+                                                                            6. baseline (L, 41):
+                                                                               apply seq 42 (origin A ≠ B)
+                                                                               evict the same entries
+                                                                            7. baseline (L, 42)
 ```
 
-### Next Request to Different Instance
+- A burst of writes on one instance, such as a registry reconcile run, becomes one append. Two instances appending at once conflict on the compare-and-swap; the loser retries (up to 5 attempts, each at most 1 s), so both changes land.
+- An instance skips its own changes in the log: it already applied them.
 
-```
-Client → API Handler → CP2
-  ↓
-CP2 L1: MISS (just flushed)
-  ↓
-CP2 → DP Instance 2 (load balanced)
-  ↓
-DP2 L1: MISS (different instance)
-  ↓
-DP2 L2 (Redis): MISS (shared, was flushed)
-  ↓
-DP2 Database: HIT (shared, has fresh data)
-  ↓
-DP2 populates L1 and L2
-  ↓
-DP2 → CP2
-  ↓
-CP2 populates L1
-  ↓
-Fresh config used
+### Next Request to the Other Instance
+
+```text
+Instance B: tenant T requests api.openai.com
+  → alias section MISS (evicted at step 6) → SELECT → fresh result
 ```
 
-**Result**: Invalidation works across multiple instances via shared L2 and DB.
+## Scenario 6: Changes Missed
+
+An instance that cannot know what it missed empties its whole cache. After a reconnect, a lag, a gap or a new log ID it follows the log from its current end. After an unreadable log (including a failed read) or a deleted or expired one it has no baseline: the next log it reads empties the cache once more and becomes the baseline.
+
+| Event | Why |
+|---|---|
+| The watch starts, reconnects (`Reset`) or fell behind (`Lagged`) | Changes may have been made while it was not listening. The instance reads the log first, then empties the cache, so no later load misses a change up to the baseline. |
+| The oldest change in the log is after the baseline + 1 | The log keeps the last 128 changes and 32 KiB; older ones were dropped before this instance read them. |
+| The log has a new ID | The log was created again (deleted, or replaced because it was malformed or of an older format). |
+| The log cannot be read, or is a newer format | During a rolling upgrade, an old instance empties its cache on every change until upgraded, and skips its own appends (`reason="newer_log"`, healthcheck code `proxy_cache_newer_log`), so the others see its writes within the TTL. A `get` that fails or takes longer than 5 s counts as unreadable (`cause="log_unreadable"`); a slow one also reconnects the watch. |
+| The log is deleted or expired | Nothing to follow until the next append. |
 
 ## Invalidation Timing
 
-| Event               | Latency         |
-|---------------------|-----------------|
-| DP L1 flush         | <1ms (local)    |
-| DP L2 flush (Redis) | 1-2ms (network) |
-| CP notification     | 10-50ms (async) |
-| CP L1 flush         | <1ms (local)    |
-
-**Total window**: ~50-100ms from write to all caches invalidated.
-
-**Staleness window**: Worst case 100ms for CP to receive notification and flush.
+| Step | Typical latency |
+|---|---|
+| Local eviction | < 1 ms (in memory, under the section lock) |
+| Change log append | one cluster round trip (embedded: in process; remote: + one gRPC hop); a Management API or SDK write waits for it for at most 2 s, a registry reconcile run once at its end |
+| Other instances evict | append + watch event + one cluster read: a few milliseconds |
+| Lost change corrected | at most `proxy_cache.ttl` (default 60 s) |
 
 ## Consistency Guarantees
 
-### Strong Consistency in DP
-
-- L1 flush before returning success
-- L2 flush before returning success
-- Next DP read sees fresh data
-
-### Eventual Consistency in CP
-
-- Notification is asynchronous
-- CP may serve stale data for ~50-100ms
-- Acceptable for MVP (config changes are rare)
-
-### Future: Immediate Consistency
-
-For strict consistency requirements:
-
-1. CP waits for DP write + invalidation to complete
-2. CP synchronously flushes its L1 before proxy call
-3. Adds latency, only enable if needed
-
-## Cache Key Patterns
-
-### Upstream
-
-```
-upstream:{tenant_id}:{alias}
-```
-
-Invalidated on:
-
-- `PUT /upstreams/{id}`
-- `DELETE /upstreams/{id}`
-
-### Route
-
-```
-route:{upstream_id}:{method}:{path}
-```
-
-Invalidated on:
-
-- `PUT /routes/{id}`
-- `DELETE /routes/{id}`
-- `DELETE /upstreams/{id}` (cascade)
-
-### Plugin
-
-```
-plugin:{plugin_id}
-```
-
-Invalidated on:
-
-- `PUT /plugins/{id}` (immutable, rare)
-- `DELETE /plugins/{id}`
+- **Own writes**: an instance sees its own write on the next lookup. The eviction happens before the write answers.
+- **Other instances' writes**: seen once the change is delivered, usually within milliseconds. The write waits for its append, so a client that then calls another instance only races the watch delivery.
+- **Lost changes**: bounded by the TTL. On an eventually consistent backend (Redis beyond a single node) two concurrent appends can both succeed and lose one change.
+- **Results**: a hit returns the same upstream, route and errors as an uncached lookup. The SSRF check runs on every request, so a host denied after caching is rejected at once.
 
 ## Failure Scenarios
 
-### Redis Unavailable During Invalidation
+### Change Log Append Fails
 
-```
-DP writes to database
+```text
+Instance A commits and evicts locally
   ↓
-DP flushes L1: SUCCESS
+Append fails after 5 attempts (each at most 1 s), or does not finish in 2 s
   ↓
-DP tries to flush L2 (Redis): FAILURE
+WARN logged; a change whose append fails for good counts once in
+oagw_proxy_cache_publish_failures_total{reason="append_failed"}
+(a timed-out wait alone is not counted)
   ↓
-DP logs error, continues
-  ↓
-Returns success (L1 flushed, DB updated)
-```
-
-**Impact**:
-
-- DP instance L1 is fresh
-- Other DP instances L2 cache may be stale (until TTL expires)
-- Max staleness: 5 minutes (L2 TTL)
-
-**Mitigation**: L2 TTL prevents unbounded staleness.
-
-### CP Notification Failure
-
-```
-DP completes write and flush
-  ↓
-API Handler sends CP notification: FAILURE
-  ↓
-API Handler logs error, continues
-  ↓
-Returns success to client
+Returns success to client (the database is the source of truth)
 ```
 
-**Impact**:
+**Impact**: other instances serve the old entries until they expire (at most the TTL).
 
-- CP L1 cache may be stale until TTL or eviction
-- CP cache is small (1000 entries), likely to be evicted soon
+The same counter also counts `reason="newer_log"` (an older build skipping its appends during a rolling upgrade) and `reason="publisher_stopped"` (changes still queued at the stop deadline).
 
-**Mitigation**:
+### Change Log Watch Down
 
-- CP cache has implicit TTL via LRU eviction
-- Config changes are rare, brief staleness acceptable for MVP
+```text
+Watch breaks (retryable), the stream ends, or a log read takes longer than 5 s
+  ↓
+Health: Degraded, code proxy_cache_watch_connecting; proxying continues
+  ↓
+Reconnect with backoff (1 s doubling to 30 s, kept across quick reconnects), read the log, empty the cache
+  ↓
+Health recovers
+```
+
+A watch that closes with an error that cannot be retried empties the cache once and stays down (code `proxy_cache_watch_down`); freshness then relies on the TTL.
+
+The health check includes the cluster SDK's readiness: `cluster-starting` and `cluster-profile-degraded` report `Degraded` and proxying continues; only `cluster-misconfigured` reports `Unhealthy`.
 
 ### Database Write Fails
 
-```
-DP writes to database: FAILURE
+```text
+Repository write: FAILURE
   ↓
-DP does not flush caches (transaction failed)
+The change is still evicted and appended (the write may have committed before it failed)
   ↓
-Returns error to client
+Returns the error to the client
 ```
 
-**Impact**: None (caches remain consistent with database).
+**Impact**: at most some extra reloads; caches never keep data the database no longer has.
+
+### Read Races a Write
+
+```text
+Request 1: alias MISS → load starts, reads rows from before the write
+Write:     commit → evict → detach the alias section's in-flight loads
+Request 1: load returns → answers request 1 (it arrived before the write) → NOT stored
+Request 2: MISS → new load → reads the committed rows → stored
+```
 
 ## Monitoring
 
-Key metrics for cache invalidation:
+Key metrics ([DESIGN §4.2](../../docs/DESIGN.md#42-metrics-and-observability)):
 
-- `oagw_cache_invalidation_total{layer="l1|l2|cp"}` - count
-- `oagw_cache_invalidation_duration_seconds{layer}` - histogram
-- `oagw_cache_invalidation_errors_total{layer, error_type}` - count
+- `oagw_proxy_cache_lookups_total{map, result}` — `result`: `hit`, `miss`, `joined`
+- `oagw_proxy_cache_evictions_total{map, reason}` — `reason`: `change`, `ttl`, `capacity`
+- `oagw_proxy_cache_changes_total{source}` — `local`, `remote`
+- `oagw_proxy_cache_flushes_total{cause}` — `watch_reset`, `log_gap`, `log_reset`, `log_unreadable`, `watch_closed`
+- `oagw_proxy_cache_loads_discarded_total{map}`
+- `oagw_proxy_cache_publish_failures_total{reason}` — `append_failed`, `newer_log`, `publisher_stopped`
+- `oagw_proxy_cache_entries{map}`
 
 Alert on:
 
-- High invalidation error rate (>1% for L2, >5% for CP notification)
-- Slow invalidation (>100ms for L2 flush)
+- Any `oagw_proxy_cache_publish_failures_total` increase
+- Repeated `log_gap` flushes (an instance keeps falling behind the log)
+- The healthcheck code `proxy_cache_watch_connecting` or `proxy_cache_watch_down` for longer than a few minutes (the cache's codes show before registry provisioning's when both are Degraded)
+- The healthcheck code `proxy_cache_newer_log` after a rollback: delete the cluster key `oagw/proxy-config-changes` (ADR-0020 *Rolling upgrades*)
+- The healthcheck code `cluster_readiness_slow` (the cluster readiness check has not answered for 10 s)
 
 ## Related ADRs
 
-- [ADR: Control Plane Caching](../../docs/ADR/0007-data-plane-caching.md)
-- [ADR: State Management](../../docs/ADR/0008-state-management.md)
+- [ADR: Proxy Configuration Cache](../../docs/ADR/0020-proxy-config-cache.md)
+- [ADR: Optional Persistence](../../docs/ADR/0018-optional-persistence.md)
+- [ADR: Control Plane Caching](../../docs/ADR/0007-data-plane-caching.md) (superseded by ADR-0020)
+- [ADR: State Management](../../docs/ADR/0008-state-management.md) (its Data Plane L1 cache is replaced by ADR-0020)
 - [ADR: Component Architecture](../../docs/ADR/0001-component-architecture.md)

@@ -1,6 +1,6 @@
 [package]
 name = "cf-k8s-cluster-plugin"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -36,6 +36,7 @@ workspace = true
 integration = ["dep:testcontainers", "dep:testcontainers-modules"]
 
 [dependencies]
+toolkit-security = { workspace = true }
 # `otel` pulls in the SDK's OpenTelemetry-backed `ClusterMetrics` adapter so the
 # cache signal set is emitted for free via `InstrumentedCache` (DESIGN §9); the
 # leader/lock signals are emitted natively via `ClusterMetrics::lock_op` /
@@ -62,7 +63,6 @@ dashmap = { workspace = true }
 rand = { workspace = true }
 # SHA-256 for the injective object-name mapping (DESIGN §2.2). Already a workspace
 # dep at 0.10 (used by file-storage, rustls-corecrypto-provider).
-sha2 = { workspace = true }
 # base64 encode/decode for the `ClusterCacheEntry.spec.value` byte field (DESIGN
 # §2.7): the CRD declares `format: byte` and the Rust spec holds the base64 text.
 base64 = { workspace = true }

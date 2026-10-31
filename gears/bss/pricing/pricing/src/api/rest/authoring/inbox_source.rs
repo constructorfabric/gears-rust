@@ -33,7 +33,7 @@ use toolkit_security::SecurityContext;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use super::support::{self, authz_failure, require_authenticated, transaction};
+use super::support::{self, authz_failure, require_authenticated, transaction_read};
 use super::{AuthoringState, approvals};
 use crate::authz::{self, actions, resource_types};
 use crate::infra::approval_kinds::Kind;
@@ -207,7 +207,7 @@ impl ApprovalSourceV1 for PricingApprovalSource {
             approve_scope,
             submit_scope,
         };
-        let listed = transaction(&self.state.db.db(), move |tx| {
+        let listed = transaction_read(&self.state.db.db(), move |tx| {
             let (scope, ctx, request) = (scope.clone(), ctx.clone(), request.clone());
             Box::pin(async move { approvals::read_unit_page(tx, &scope, &ctx, &request).await })
         })

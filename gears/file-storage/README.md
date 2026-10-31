@@ -57,8 +57,7 @@ FileStorage's control plane and data-plane sidecar are implemented and tested. H
   versions, storages) — JSON only; content never transits the control plane.
 - Immutable-blob + content-pointer model with optimistic-CAS bind, FileStorage-level versioning, tenant isolation,
   Authorization-Service per-type checks, conditional requests (ETag / `If-Match` / `If-None-Match`).
-- Pluggable backends (trait + `local-fs` + `in-memory`); Ed25519 signed URLs (codec-equivalent to, but not literal,
-  PASETO `v4.public` — see [ADR-0004](docs/ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md)'s
+- Pluggable backends (trait + `local-fs` + `in-memory`); ECDSA P-256/SHA-256 signed URLs (private compact codec, not JWT or PASETO — see [ADR-0004](docs/ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md)'s
   Implementation note); SHA-256 + magic-byte content-type validation; HTTP `Range`. Data-plane **sidecar** binary
   verifies tokens and streams bytes, then calls a token-authenticated `finalize` callback back to the control plane
   (`pending → available`); binding a version as the file's live content (`content_id`) is a separate client-issued
@@ -135,12 +134,13 @@ by the ADR-0005 external-dependency security review before merge or release use.
 
 ```bash
 cargo build -p cf-gears-file-storage                 # control-plane gear (lib)
-cargo build -p cf-gears-file-storage --bin sidecar   # data-plane sidecar
+cargo build -p cf-gears-file-storage --bin sidecar   # ordinary data-plane sidecar
+cargo build -p cf-gears-file-storage --bin sidecar --features toolkit/fips # native FIPS policy
 cargo test  -p cf-gears-file-storage -p cf-gears-file-storage-sdk
 
 # Sidecar env (4 of 12 — see docs/operations.md for the rest): FS_SIDECAR_ADDR,
-# FS_SIDECAR_PUBLIC_KEY (primary, base64url Ed25519 -- FS_SIDECAR_PREVIOUS_PUBLIC_KEYS
-# adds a rotation-window set of additional keys), FS_SIDECAR_BACKEND_ROOT,
+# FS_SIDECAR_PUBLIC_KEY (base64url 65-byte uncompressed SEC1 P-256 point),
+# FS_SIDECAR_BACKEND_ROOT,
 # FS_SIDECAR_CONTROL_URL (control-plane base URL for the finalize/report-part
 # callbacks -- without it, uploads default to http://localhost:8080 and stay
 # `pending` forever against any other control-plane address), and the REQUIRED

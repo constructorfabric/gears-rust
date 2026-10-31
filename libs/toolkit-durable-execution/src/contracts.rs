@@ -7,7 +7,6 @@
 use crate::authoring::{CompensationPolicy, FanOutOptions};
 use crate::runtime::{ActivityInput, ErasedActivity, ErasedCompensationBinding};
 use crate::{ActivityError, ActivityId, DefinitionError, DefinitionErrorKind, RetryPolicy};
-use aws_lc_rs::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -15,6 +14,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use toolkit_security::crypto::hash::Sha256;
 
 /// Largest accepted activity or compensation timeout.
 pub const MAX_TIMEOUT: Duration = Duration::from_hours(24);
@@ -277,7 +277,7 @@ impl ExecutionContract {
         self.validate()?;
         let bytes = serde_json::to_vec(&("durable-contract-v3", self))
             .map_err(|_| DefinitionError::new(DefinitionErrorKind::Encoding))?;
-        Ok(hex::encode(digest(&SHA256, &bytes).as_ref()))
+        Ok(hex::encode(Sha256::digest(&bytes).as_ref()))
     }
 
     /// Activity IDs grouped by stage, in execution order.

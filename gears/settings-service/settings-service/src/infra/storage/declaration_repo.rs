@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, ExprTrait, QueryFilter, QuerySelect};
 use toolkit_db::odata::{LimitCfg, ODataFieldMapping, encode_cursor_value, paginate_odata};
-use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_odata::{CursorV1, ODataOrderBy, ODataQuery, Page, SortDir};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
@@ -404,6 +404,30 @@ impl DeclarationRepository for DeclarationRepo {
             .ok_or(DomainError::NotFound {
                 resource: "declaration",
             })?;
+        Ok(())
+    }
+
+    async fn delete<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        // `delete_many` for the scoping, as the category delete is; filtered to
+        // the version so the row removed is the one the tag was compared
+        // against. The dependent rows follow by the foreign keys' cascade.
+        let outcome = DeclarationEntity::delete_many()
+            .filter(declaration::Column::Id.eq(id))
+            .filter(declaration::Column::UpdatedAt.eq(expected))
+            .secure()
+            .scope_with(scope)
+            .exec(conn)
+            .await
+            .map_err(db_error)?;
+        if outcome.rows_affected == 0 {
+            return Err(precondition::stale());
+        }
         Ok(())
     }
 

@@ -252,6 +252,7 @@ The OAGW design is decomposed into eight features organized along functional bou
   - RFC 9457 Problem Details for all gateway errors
   - Upstream proxy engine (`toolkit-http-proxy`) with connection pooling, ALPN and load balancing
   - Proxy endpoint: `{METHOD} /api/oagw/v1/proxy/{alias}[/{path}][?{query}]`
+  - Proxy lookup through the proxy configuration cache with a database (`cpt-cf-oagw-adr-proxy-config-cache`): alias resolution and route matching read the cache; selection, the SSRF check and the merge run on every request. The cache itself (`infra/proxy_cache/`) is specified in Feature 8
 
 - **Out of scope**:
   - Multi-tenant hierarchy merge (Feature 5)
@@ -465,12 +466,12 @@ The OAGW design is decomposed into eight features organized along functional bou
 
 - [ ] `p2` - **ID**: `cpt-cf-oagw-feature-observability`
 
-- **Purpose**: Implement Prometheus metrics, structured audit logging, CORS handling, SSRF protection, and multi-layer caching for operational visibility and security hardening.
+- **Purpose**: Implement Prometheus metrics, structured audit logging, CORS handling, SSRF protection, and, with a database, the proxy configuration cache for operational visibility and security hardening.
 
 - **Depends On**: `cpt-cf-oagw-feature-proxy-engine`
 
 - **Scope**:
-  - Prometheus metrics: `oagw_requests_total`, `oagw_request_duration_seconds`, `oagw_requests_in_flight`, `oagw_errors_total`, `oagw_circuit_breaker_state`, `oagw_rate_limit_exceeded_total`, `oagw_circuit_breaker_transitions_total`, `oagw_rate_limit_usage_ratio`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_upstream_available`, `oagw_upstream_connections`
+  - Prometheus metrics: `oagw_requests_total`, `oagw_request_duration_seconds` (phases `total`, `resolve`, `auth`), `oagw_requests_in_flight`, `oagw_errors_total`, `oagw_circuit_breaker_state`, `oagw_rate_limit_exceeded_total`, `oagw_circuit_breaker_transitions_total`, `oagw_rate_limit_usage_ratio`, `oagw_routing_target_host_used`, `oagw_routing_endpoint_selected`, `oagw_upstream_available`, `oagw_upstream_connections`; with a database, the proxy configuration cache's `oagw_proxy_cache_*` metrics and its `proxy_cache_watch_connecting` and `proxy_cache_watch_down` health codes (`cpt-cf-oagw-adr-proxy-config-cache`)
   - Histogram buckets: `[0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]`
   - Cardinality management: no tenant labels; normalized `http.route` from route config; `http.request.method` normalized to standard verbs or `_OTHER`; numeric `http.response.status_code` (OTel HTTP semconv) — status-class queries are expressed at query time over the numeric code
   - Structured JSON audit logging to stdout: request ID, tenant, host, path, method, status, duration, sizes
@@ -479,7 +480,7 @@ The OAGW design is decomposed into eight features organized along functional bou
   - CORS built-in handler: per-upstream/route configuration, preflight OPTIONS (no upstream round-trip)
   - SSRF protection: IP pinning rules, scheme allowlist (HTTPS-only), header stripping
   - HTTP smuggling prevention: strict header parsing, CR/LF rejection, CL/TE validation
-  - Multi-layer caching: DP L1 (1,000 entries, <1μs), CP L1 (10,000 entries, <1μs), CP L2 Redis (optional, ~1-2ms), DB (source of truth)
+  - Proxy configuration cache with a database (`cpt-cf-oagw-adr-proxy-config-cache`, `infra/proxy_cache/`): per-replica upstream candidates by alias and tenant chain, and routes by upstream; each write evicts only the entries it affects, on every replica through the cluster change log (OAGW's `cluster` feature; without it, or with `proxy_cache.enabled: false`, OAGW caches nothing and needs no cluster); TTL backstop. The proxy engine (Feature 4) reads through it
 
 - **Out of scope**:
   - TLS certificate pinning (future work)

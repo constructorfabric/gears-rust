@@ -35,6 +35,7 @@ pub fn register_routes(
     resolver: Arc<ConcreteResolver>,
     db: Arc<DBProvider<DbError>>,
     enforcer: Arc<authz_resolver_sdk::PolicyEnforcer>,
+    names: Arc<crate::infra::actor_names::ActorNameResolver>,
 ) -> Router {
     let router = OperationBuilder::get("/settings-service/v1/settings")
         .operation_id("settings_service.browse_settings")
@@ -229,4 +230,5 @@ pub fn register_routes(
         .layer(axum::Extension(resolver))
         .layer(axum::Extension(db))
         .layer(axum::Extension(enforcer))
+        .layer(axum::Extension(names))
 }

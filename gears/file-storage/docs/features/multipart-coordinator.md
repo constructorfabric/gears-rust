@@ -83,7 +83,7 @@ All part bytes flow exclusively through sidecar signed URLs (ADR-0004); there is
 - **ADR**: [ADR-0002](../ADR/0002-cpt-cf-file-storage-adr-content-hash-selection.md) -- Content hash selection; its `hash_policy` vision is superseded by ADR-0006
 - **ADR**: [ADR-0006](../ADR/0006-cpt-cf-file-storage-adr-content-hash-modes.md) -- Content-hash modes (whole-object + multipart offset-manifest composite, SHA-256-only)
 - **ADR**: [ADR-0003](../ADR/0003-cpt-cf-file-storage-adr-sidecar-data-plane.md) -- Sidecar data plane (no bytes through control plane)
-- **ADR**: [ADR-0004](../ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) -- Signed-URL transport, implemented as a codec-equivalent bespoke Ed25519 token, not literal PASETO v4.public -- no `kid` -- see that ADR's "Implementation note"
+- **ADR**: [ADR-0004](../ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) -- Signed-URL transport, implemented as a codec-equivalent bespoke ECDSA P-256/SHA-256 token, not literal PASETO v4.public -- no `kid` -- see that ADR's "Implementation note"
 - **Dependencies**: Signed-URL transport (ADR-0004), sidecar data plane (ADR-0003)
 
 ## 2. Actor Flows (CDSL)
@@ -123,7 +123,7 @@ User-facing interactions that start with an actor (human or external system) and
 6. [x] - `p1` - DB: INSERT pending version row into file_versions (version_id, file_id, status=pending) - `inst-init-db-version`
 7. [x] - `p1` - Backend: initiate_multipart(backend_path) -- obtain the backend's multipart upload handle - `inst-init-backend-initiate`
 8. [x] - `p1` - DB: INSERT into multipart_uploads (upload_id, file_id, version_id, backend_upload_handle, declared_size, part_size, state=in_progress, expires_at); on failure, best-effort compensate (abort the backend upload and the pending version) - `inst-init-db-session`
-9. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
+9. [x] - `p1` - FOR EACH part in the plan: mint a signed URL (ECDSA P-256/SHA-256, private compact codec -- ADR-0004's Implementation note) with claims {upload_id, file_id, version_id, part_number, offset, size, op="multipart_part", exp} - `inst-init-sign-urls`
 10. [x] - `p1` - RETURN 200 {upload_id, version_id, part_hash_algorithm, part_size, parts: [{part_number, offset, size, upload_url}], expires_at} - `inst-init-return`
 
 ### Upload a Part
@@ -156,7 +156,7 @@ User-facing interactions that start with an actor (human or external system) and
 
 **Steps**:
 1. [x] - `p1` - Client: PUT <signed_part_url> with raw body of exactly `size` bytes - `inst-part-request`
-2. [x] - `p1` - Sidecar: verify the signed token (asymmetric Ed25519; sidecar cannot mint tokens -- ADR-0004; **not
+2. [x] - `p1` - Sidecar: verify the signed token (asymmetric ECDSA P-256/SHA-256; sidecar cannot mint tokens -- ADR-0004; **not
    literal PASETO -- see that ADR's Implementation note**) - `inst-part-verify-token`
 3. [x] - `p1` - **IF** token invalid or expired **RETURN** 403 Forbidden - `inst-part-token-reject`
 4. [x] - `p1` - Algorithm: enforce per-part size claim using `cpt-cf-file-storage-algo-enforce-part-size` -- RETURN 413/PAYLOAD_TOO_LARGE before/after writing if mismatch - `inst-part-size-enforce`
@@ -422,7 +422,7 @@ regardless of lease state.
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-initiate`
 
-The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (Ed25519, codec-equivalent to PASETO v4.public -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
+The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` on the control plane. The endpoint validates declared_mime, declared_size, and storage quota; calls `cpt-cf-file-storage-algo-compute-parts-plan`; pre-registers a pending version; persists the multipart session with declared_size and part_size; mints one signed URL per part (ECDSA P-256/SHA-256, private compact codec -- ADR-0004) (claims: upload_id, file_id, version_id, part_number, offset, size, op, exp); and returns the full parts plan. The parts plan enforces a hard ceiling of 10,000 parts (`MAX_PART_COUNT`), widening the part size (up to `MAX_PART_SIZE`, 5 GiB) before rejecting a `declared_size` that cannot fit even at the maximum part size.
 
 **Implements**:
 - `cpt-cf-file-storage-flow-multipart-initiate`
@@ -437,7 +437,7 @@ The system **MUST** implement `POST /api/file-storage/v1/files/{id}/multipart` o
 
 - [x] `p1` - **ID**: `cpt-cf-file-storage-dod-multipart-sidecar-enforcement`
 
-The sidecar part-upload handler verifies the signed token (Ed25519, codec-equivalent to but not literal
+The sidecar part-upload handler verifies the signed token (ECDSA P-256/SHA-256, private codec rather than
 PASETO -- ADR-0004's Implementation note); calls `cpt-cf-file-storage-algo-enforce-part-size` to reject with HTTP 413
 if the body length does not match the size claim — neither write path buffers a whole part: on `multipart_native`
 paths a sidecar-side streaming counter (`part_size_guard`) enforces the ceiling ahead of the backend write, and the

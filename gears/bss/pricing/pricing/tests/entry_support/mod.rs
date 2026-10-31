@@ -11,7 +11,7 @@ use tower::ServiceExt;
 use uuid::Uuid;
 #[path = "../storage_support/mod.rs"]
 mod storage_support;
-pub use storage_support::TestDsn;
+pub use storage_support::{TestDsn, toolkit_dsn};
 /// A migrated file-backed database: provider, tenant scope, tenant and its [`TestDsn`], which the
 /// caller holds for the test's life.
 pub async fn test_db() -> (
@@ -225,6 +225,19 @@ impl Fixture {
         );
         Self::on_named(db, tenant, dsn, registry, Some(names)).await
     }
+    /// [`Fixture::with_directory`] whose doors read `clock`.
+    pub async fn with_directory_at(
+        registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
+        directory: Arc<dyn bss_rest::actor_names::ActorDirectory>,
+        clock: Arc<dyn bss_pricing::infra::reference_work::Clock>,
+    ) -> Self {
+        let (db, _, tenant, dsn) = storage_support::test_db().await;
+        let names = bss_rest::actor_names::ActorNames::with_directory(
+            directory,
+            &bss_pricing::api::rest::authoring::SYSTEM_ACTORS,
+        );
+        Self::build(db, tenant, dsn, registry, Some(names), None, Some(clock)).await
+    }
     /// [`Fixture::new`] over a currency table that adds the non-ISO codes of `scales` (code to
     /// scale) to the ISO one.
     pub async fn with_currency_scales(
@@ -250,7 +263,7 @@ impl Fixture {
                 .collect(),
         )
         .unwrap();
-        Self::build(db, tenant, dsn, registry, None, Some(scales)).await
+        Self::build(db, tenant, dsn, registry, None, Some(scales), None).await
     }
     /// [`Fixture::on`] with the actor names `names`, or the hub's when `None`.
     pub async fn on_named(
@@ -260,10 +273,10 @@ impl Fixture {
         registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
         names: Option<bss_rest::actor_names::ActorNames>,
     ) -> Self {
-        Self::build(db, tenant, dsn, registry, names, None).await
+        Self::build(db, tenant, dsn, registry, names, None, None).await
     }
-    /// The fixture over a state with the actor names `names` and the currency table `scales`,
-    /// or the hub's names and the ISO table when `None`.
+    /// The fixture over a state with the actor names `names`, the currency table `scales` and
+    /// doors that read `clock`, or the hub's names, the ISO table and the wall clock when `None`.
     async fn build(
         db: toolkit_db::DBProvider<toolkit_db::DbError>,
         tenant: Uuid,
@@ -271,6 +284,7 @@ impl Fixture {
         registry: Arc<dyn bss_products_sdk::ReferenceRegistryV1>,
         names: Option<bss_rest::actor_names::ActorNames>,
         scales: Option<bss_pricing::domain::currency::CurrencyScales>,
+        clock: Option<Arc<dyn bss_pricing::infra::reference_work::Clock>>,
     ) -> Self {
         let hub = Arc::new(toolkit::ClientHub::default());
         hub.register::<dyn bss_pricing_sdk::meter_semantics::UsageMeterSemanticsV1>(Arc::new(
@@ -284,6 +298,10 @@ impl Fixture {
             .unwrap();
         let state = match names {
             Some(names) => state.with_actor_names(names),
+            None => state,
+        };
+        let state = match clock {
+            Some(clock) => state.with_clock(clock),
             None => state,
         };
         let state = Arc::new(match scales {
@@ -353,7 +371,7 @@ impl Fixture {
     /// A second router over its own connection to the same database file.
     pub async fn second_app(&self) -> Router {
         let db = toolkit_db::connect_db(
-            &self.dsn,
+            &toolkit_dsn(&self.dsn),
             toolkit_db::ConnectOpts {
                 max_conns: Some(1),
                 min_conns: Some(1),

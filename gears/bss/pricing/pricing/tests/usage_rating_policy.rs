@@ -495,9 +495,12 @@ async fn legacy_published_usage_upgrades_without_inventing_policy_and_keeps_reso
     use toolkit::contracts::DatabaseCapability;
     use toolkit_db::migration_runner::run_migrations_for_testing;
     let dsn = TestDsn::new("pricing-legacy-policy-");
-    let db = toolkit_db::connect_db(&dsn, toolkit_db::ConnectOpts::default())
-        .await
-        .unwrap();
+    let db = toolkit_db::connect_db(
+        &plan_support::entry_support::toolkit_dsn(&dsn),
+        toolkit_db::ConnectOpts::default(),
+    )
+    .await
+    .unwrap();
     let prior = BssPricingGear::default()
         .migrations()
         .into_iter()

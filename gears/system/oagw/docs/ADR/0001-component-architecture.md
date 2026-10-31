@@ -184,7 +184,8 @@ Related architectural patterns:
 ## Related ADRs
 
 - [ADR: Request Routing](./0002-request-routing.md) - How requests flow through handlers to services
-- [ADR: Control Plane Caching](./0007-data-plane-caching.md) - Multi-layer cache strategy
+- [ADR: Control Plane Caching](./0007-data-plane-caching.md) - Multi-layer cache strategy (superseded by ADR-0020)
+- [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md) - Per-replica cache of the proxy lookup with a cluster change log
 - [ADR: State Management](./0008-state-management.md) - State distribution patterns
 
 ## References

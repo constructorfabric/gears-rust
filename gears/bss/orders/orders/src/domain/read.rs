@@ -7,7 +7,6 @@
 //! access-log row; a served log is required before any cross-tenant or proof-bearing
 //! disclosure; a refused log is required on every access refusal.
 use crate::gts::permissions::properties;
-use aws_lc_rs::digest::{SHA256, digest};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bss_orders_sdk::catalog::Reason;
@@ -15,6 +14,7 @@ use bss_orders_sdk::reads::{Cursor, OrderFilters, PageSize};
 use serde::{Deserialize, Serialize};
 use toolkit_macros::domain_model;
 use toolkit_security::access_scope::{AccessScope, ScopeFilter, ScopeValue};
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 /// The current token version; a token of any other version is `cursor-invalid`.
@@ -145,7 +145,7 @@ pub fn filters_hash(filters: &OrderFilters) -> String {
         contract_id: filters.contract_id,
     };
     let canonical = serde_json::to_vec(&normalized).unwrap_or_default();
-    hex(digest(&SHA256, &canonical).as_ref())
+    hex(Sha256::digest(&canonical).as_ref())
 }
 
 /// The empty-filter hash of the per-order collections, which take no filters.

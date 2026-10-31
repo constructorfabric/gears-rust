@@ -80,6 +80,10 @@ impl FirebaseService {
 /// learns 401 or 503, never how close the token came.
 fn refusal_to_error(refusal: &Refusal) -> AuthNResolverError {
     match refusal {
+        Refusal::CryptoUnavailable(cause) => {
+            warn!(%cause, "Firebase crypto backend unavailable; answering 503");
+            AuthNResolverError::ServiceUnavailable("crypto backend unavailable".to_owned())
+        }
         Refusal::KeysUnavailable(cause) => {
             warn!(%cause, "Firebase signing keys unavailable; answering 503");
             AuthNResolverError::ServiceUnavailable("Firebase signing keys unavailable".to_owned())
@@ -98,7 +102,7 @@ fn log_token_refusal(refusal: &Refusal) {
         Refusal::IdentityNotAllowed { uid, .. } => {
             debug!(%uid, "Firebase identity not on the allowlist");
         }
-        Refusal::KeysUnavailable(_) => {}
+        Refusal::KeysUnavailable(_) | Refusal::CryptoUnavailable(_) => {}
     }
 }
 
@@ -145,6 +149,15 @@ impl AuthNResolverPluginClient for FirebaseService {
 mod tests {
     use super::*;
     use crate::config::IdentityMapping;
+    #[test]
+    fn local_crypto_failure_returns_service_unavailable() {
+        let refusal = Refusal::CryptoUnavailable("backend failed".to_owned());
+        assert!(matches!(
+            refusal_to_error(&refusal),
+            AuthNResolverError::ServiceUnavailable(_)
+        ));
+    }
+
     #[tokio::test]
     async fn signed_identity_gets_only_its_configured_tenant_and_scopes() {
         let config = FirebaseAuthnPluginConfig {

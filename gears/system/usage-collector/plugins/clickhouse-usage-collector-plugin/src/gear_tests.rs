@@ -38,7 +38,7 @@ impl ConfigProvider for StaticConfig {
 /// `OnceLock`, so a second call returns `Err` and is deliberately dropped.
 /// `drop` rather than `let _ =` satisfies `clippy::let_underscore_must_use`.
 fn install_test_crypto_provider() {
-    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+    drop(toolkit_security::tls::configured_provider().install_default());
 }
 
 #[tokio::test]

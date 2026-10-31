@@ -162,9 +162,9 @@ The no-orphan rule protects the invariant that no declaration is ever left point
 6. [x] - `p1` - Evaluate the `If-Match` precondition using the shared precondition helper - `inst-cat-delete-6`
 7. [x] - `p1` - **IF** `If-Match` is absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-cat-delete-7`
 8. [x] - `p1` - Invoke the no-orphan deletion guard for this category - `inst-cat-delete-8`
-9. [x] - `p1` - **IF** the guard reports referencing declarations → **RETURN** `409 CategoryNotEmpty` - `inst-cat-delete-9`
+9. [x] - `p1` - **IF** the guard reports referencing declarations → **RETURN** `409 CategoryNotEmpty` whose detail carries the referencing declaration count, retired ones included - `inst-cat-delete-9`
 10. [x] - `p1` - DB: DELETE FROM categories WHERE id = {id} AND updated_at = {the version the tag was compared against}; **IF** no row matched → **RETURN** `412` - `inst-cat-delete-10`
-11. [x] - `p1` - **IF** the declaration foreign key `ON DELETE RESTRICT` rejects the delete → **RETURN** `409 CategoryNotEmpty`, covering a declaration inserted between the guard and the delete - `inst-cat-delete-11`
+11. [x] - `p1` - **IF** the declaration foreign key `ON DELETE RESTRICT` rejects the delete → **RETURN** `409 CategoryNotEmpty`; after the transaction has rolled back, count the referencing declarations again on a fresh connection and let the detail carry that count when the count answers, keeping the plain refusal when it does not, covering a declaration inserted between the guard and the delete - `inst-cat-delete-11`
 12. [x] - `p1` - Emit a category-deleted audit record carrying the pre-image - `inst-cat-delete-12`
 13. [x] - `p1` - **RETURN** `204` - `inst-cat-delete-13`
 
@@ -307,7 +307,7 @@ The system **MUST** expose create, get, list, update, and delete over categories
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-category-management-no-orphan`
 
-The system **MUST** refuse to delete a category while any setting declaration references it, returning `409 CategoryNotEmpty`, and **MUST** apply that refusal regardless of the referencing declaration's `status`, including `retired`. The declaration-to-category foreign key **MUST** be declared `ON DELETE RESTRICT` so the database enforces the rule independently, and the handler **MUST** translate that database rejection into the same `409` so a declaration inserted between the guard and the delete cannot produce a `500`.
+The system **MUST** refuse to delete a category while any setting declaration references it, returning `409 CategoryNotEmpty`, and **MUST** apply that refusal regardless of the referencing declaration's `status`, including `retired`. The declaration-to-category foreign key **MUST** be declared `ON DELETE RESTRICT` so the database enforces the rule independently, and the handler **MUST** translate that database rejection into the same `409` so a declaration inserted between the guard and the delete cannot produce a `500`. The refusal **MUST** report how many declarations still reference the category, retired ones included, as the total regardless of the caller's visibility, on the pre-check path and on the foreign-key path alike.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-category-management-delete`
@@ -414,12 +414,13 @@ Every category the list and the single read return **MUST** carry `setting_count
 - [ ] A `PATCH` without `If-Match` returns `428` and modifies no row
 - [ ] A `PATCH` with a stale `If-Match` returns `412` and modifies no row
 - [ ] A `PATCH` with a current `If-Match` returns `200` and an ETag different from the one the request carried
-- [ ] A `DELETE` without `If-Match` returns `428`, and with a stale `If-Match` returns `412`
-- [ ] Deleting an empty category returns `204` and the row is gone
-- [ ] Deleting a category holding an `active` declaration returns `409 CategoryNotEmpty` and the row remains
-- [ ] Deleting a category whose only declaration is `retired` returns `409 CategoryNotEmpty` and the row remains
-- [ ] A declaration inserted between the guard check and the delete produces `409 CategoryNotEmpty` rather than `500`
-- [ ] A database-level delete of a category holding any declaration is rejected by the foreign key `ON DELETE RESTRICT`, independently of the application pre-check
+- [x] A `DELETE` without `If-Match` returns `428`, and with a stale `If-Match` returns `412`
+- [x] Deleting an empty category returns `204` and the row is gone
+- [x] Deleting a category holding an `active` declaration returns `409 CategoryNotEmpty` and the row remains
+- [x] Deleting a category whose only declaration is `retired` returns `409 CategoryNotEmpty` and the row remains
+- [x] A declaration inserted between the guard check and the delete produces `409 CategoryNotEmpty` rather than `500`
+- [x] The `409 CategoryNotEmpty` detail names how many declarations still reference the category, retired ones included, on the guard path and on the foreign-key path alike
+- [x] A database-level delete of a category holding any declaration is rejected by the foreign key `ON DELETE RESTRICT`, independently of the application pre-check
 - [ ] Getting a category outside the caller's permitted domain returns `404` rather than `403`
 - [ ] A category with null `domain_affinity` is visible to a caller whose `AccessScope` restricts domains
 - [ ] A domain constraint whose values cannot be read as domain names restricts the caller to undomained categories rather than lifting the restriction

@@ -113,6 +113,7 @@ pub type ConcreteDeclarationAdmin = crate::domain::declaration::DeclarationAdmin
     crate::infra::storage::category_repo::CategoryRepo,
     crate::infra::storage::value_repo::ValueRepo,
     crate::infra::storage::audit_store::AuditStore,
+    crate::infra::storage::pending_secret_repo::PendingSecretRepo,
 >;
 
 /// The action a create is authorized as.
@@ -341,4 +342,106 @@ pub async fn retire_declaration(
         Json(dto),
     )
         .into_response())
+}
+
+/// `POST /settings-service/v1/declarations/{id}/purge`
+///
+/// Purge a retired declaration. The gates come first — `delete`
+/// authorization, then step-up inside the service — before any row is read.
+/// Once the transaction commits, the Credential Store entries it held are
+/// released and the answer waits for that to end.
+///
+/// # Errors
+/// `403` without `delete` authorization, `401` with a challenge without a
+/// fresh step-up, `404` when the declaration is absent or outside the caller's
+/// domain, `409` for a contributed declaration or one that is not retired,
+/// `428` / `412` on the tag.
+// Axum extractors, one per dependency; bundling them would hide what the
+// handler needs.
+pub async fn purge_declaration(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(admin): Extension<Arc<ConcreteDeclarationAdmin>>,
+    Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
+    Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-1
+    // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-2
+    // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-3
+    let scope =
+        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, DELETE, Some(id)).await?;
+    // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-3
+    // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-2
+    let actor = crate::api::rest::value_handlers::actor(
+        &ctx,
+        &headers,
+        crate::domain::category::domain_visibility(&scope),
+    );
+    let if_match = crate::api::rest::if_match(&headers).map(str::to_owned);
+    // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-1
+    let request_id = actor.request_id.clone();
+    // The whole hand-off — transaction, eviction, release — is one detached
+    // task, and the handler only awaits its handle: a client that disconnects
+    // while the commit is in flight drops the handler, never the task, so the
+    // references collected under the lock are not lost with it.
+    let task = tokio::spawn(async move {
+        let admin_for_tx = Arc::clone(&admin);
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-16
+        let outcome = db
+            .db()
+            .transaction_ref_mapped::<_, crate::domain::declaration::PurgedDeclaration, DomainError>(
+                move |tx| {
+                    Box::pin(async move {
+                        admin_for_tx
+                            .purge(tx, &scope, id, if_match.as_deref(), &actor)
+                            .await
+                    })
+                },
+            )
+            .await;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-16
+        let mut purged = match outcome {
+            Ok(purged) => purged,
+            // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-6
+            Err(err @ DomainError::StepUpRequired { .. }) => {
+                return Ok(crate::api::rest::value_handlers::step_up_challenge(err));
+            }
+            // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-6
+            Err(err) => return Err(err),
+        };
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-17
+        // Evicted again now the delete is durable: a reader between the
+        // in-transaction eviction and the commit could have re-populated the
+        // entry.
+        admin.evict(&purged.key);
+        // The references kept for another declaration are checked again on a
+        // fresh connection: a purge of that one, committed meanwhile, leaves
+        // nobody else to release them. A check that cannot run keeps them.
+        match db.conn() {
+            Ok(conn) => admin.reclaim_kept(&conn, &mut purged).await,
+            Err(err) => tracing::warn!(
+                key = %purged.key,
+                kept = purged.kept_secrets.len(),
+                err = %err,
+                "declaration purge: no connection to check the kept references again; they stay kept"
+            ),
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-17
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-23
+        // The purge stands whatever the release does, so its summary is not an
+        // answer; the wait is what keeps the `204` behind the end of the
+        // release.
+        admin.release_purged(purged, &request_id).await;
+        Ok(StatusCode::NO_CONTENT.into_response())
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-23
+    });
+    match task.await {
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(err)) => Err(err.into()),
+        Err(join) => Err(DomainError::Internal {
+            diagnostic: format!("the purge task did not finish: {join}"),
+        }
+        .into()),
+    }
 }

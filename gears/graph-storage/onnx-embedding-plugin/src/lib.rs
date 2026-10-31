@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use graph_storage_sdk::models::EmbeddingSpaceId;
 use graph_storage_sdk::plugin_api::{
     EmbedRequest, EmbedResponse, EmbeddingProviderError, EmbeddingProviderV1,
@@ -38,6 +37,7 @@ use toolkit_onnx_runtime::ort;
 use toolkit_onnx_runtime::ort::session::Session;
 use toolkit_onnx_runtime::ort::value::Tensor;
 use toolkit_onnx_runtime::{OnnxSession, OpenError, SessionOptions};
+use toolkit_security::crypto::hash::Sha256;
 use tracing::warn;
 
 /// How the model turns a sequence of token vectors into one sentence vector.
@@ -232,7 +232,7 @@ fn file_digest(what: &'static str, path: &Path) -> Result<String, OnnxLoadError>
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(hex::encode(sha256(&SHA256, &bytes)))
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 /// Open the session through the toolkit, keeping this crate's error type.

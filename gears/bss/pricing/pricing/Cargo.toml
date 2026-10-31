@@ -37,7 +37,6 @@ event-broker-sdk = { workspace = true, features = ["db", "outbox"] }
 coord = { workspace = true }
 anyhow = { workspace = true }
 async-trait = { workspace = true }
-aws-lc-rs = { workspace = true }
 time = { workspace = true, features = ["serde-well-known"] }
 serde = { workspace = true }
 serde_json = { workspace = true }

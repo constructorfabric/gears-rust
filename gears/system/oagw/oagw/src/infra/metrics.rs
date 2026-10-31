@@ -2,13 +2,17 @@
 //!
 //! Holds the active P0 instruments listed on the domain port. Deferred
 //! instruments from feature 0008 (circuit breaker, multi-endpoint routing,
-//! upstream availability, cache layers) are NOT declared here yet — they
-//! are introduced when their owning feature lands.
+//! upstream availability) are NOT declared here yet — they are introduced
+//! when their owning feature lands. The proxy configuration cache's
+//! `oagw_proxy_cache_*` instruments follow ADR-0020 (feature 0008, *Proxy
+//! Configuration Cache*).
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 
 use crate::domain::ports::OagwMetricsPort;
-use crate::domain::ports::metric_labels::{METHOD_OTHER, key};
+use crate::domain::ports::metric_labels::{
+    CacheEviction, CacheLookup, CacheMap, METHOD_OTHER, key,
+};
 
 /// Map an HTTP method to a low-cardinality `http.request.method` label value.
 ///
@@ -62,6 +66,24 @@ pub struct OagwMetricsMeter {
     websocket_session_duration_seconds: Histogram<f64>,
     registry_provisioning_failures: Counter<u64>,
     registry_provisioning_runs: Counter<u64>,
+    proxy_cache_lookups: Counter<u64>,
+    proxy_cache_entries: Gauge<u64>,
+    proxy_cache_evictions: Counter<u64>,
+    proxy_cache_changes: Counter<u64>,
+    #[cfg_attr(
+        all(not(feature = "cluster"), not(test)),
+        expect(dead_code, reason = "recorded by the change log watcher")
+    )]
+    proxy_cache_flushes: Counter<u64>,
+    proxy_cache_loads_discarded: Counter<u64>,
+    #[cfg_attr(
+        all(not(feature = "cluster"), not(test)),
+        expect(
+            dead_code,
+            reason = "recorded by the change log publisher and the write hook's publishing"
+        )
+    )]
+    proxy_cache_publish_failures: Counter<u64>,
 }
 
 impl OagwMetricsMeter {
@@ -123,6 +145,36 @@ impl OagwMetricsMeter {
             registry_provisioning_runs: meter
                 .u64_counter(format!("{prefix}_registry_provisioning_runs"))
                 .with_description("Registry reconcile runs by outcome")
+                .build(),
+            proxy_cache_lookups: meter
+                .u64_counter(format!("{prefix}_proxy_cache_lookups"))
+                .with_description("Proxy configuration cache lookups by section and result")
+                .build(),
+            proxy_cache_entries: meter
+                .u64_gauge(format!("{prefix}_proxy_cache_entries"))
+                .with_description("Entries held by each proxy configuration cache section")
+                .build(),
+            proxy_cache_evictions: meter
+                .u64_counter(format!("{prefix}_proxy_cache_evictions"))
+                .with_description("Proxy configuration cache entries evicted, by reason")
+                .build(),
+            proxy_cache_changes: meter
+                .u64_counter(format!("{prefix}_proxy_cache_changes"))
+                .with_description("Configuration changes applied to the proxy configuration cache")
+                .build(),
+            proxy_cache_flushes: meter
+                .u64_counter(format!("{prefix}_proxy_cache_flushes"))
+                .with_description("Times the whole proxy configuration cache was emptied, by cause")
+                .build(),
+            proxy_cache_loads_discarded: meter
+                .u64_counter(format!("{prefix}_proxy_cache_loads_discarded"))
+                .with_description("Proxy configuration cache loads not stored after a change")
+                .build(),
+            proxy_cache_publish_failures: meter
+                .u64_counter(format!("{prefix}_proxy_cache_publish_failures"))
+                .with_description(
+                    "Proxy configuration changes not appended to the cluster change log",
+                )
                 .build(),
         }
     }
@@ -227,6 +279,52 @@ impl OagwMetricsPort for OagwMetricsMeter {
     fn record_registry_provisioning_run(&self, outcome: &str) {
         self.registry_provisioning_runs
             .add(1, &[KeyValue::new(key::OUTCOME, outcome.to_owned())]);
+    }
+
+    // The cache's labels are static: no allocation per lookup.
+    fn record_proxy_cache_lookup(&self, map: CacheMap, result: CacheLookup) {
+        self.proxy_cache_lookups.add(
+            1,
+            &[
+                KeyValue::new(key::MAP, map.as_str()),
+                KeyValue::new(key::RESULT, result.as_str()),
+            ],
+        );
+    }
+
+    fn record_proxy_cache_entries(&self, map: CacheMap, entries: u64) {
+        self.proxy_cache_entries
+            .record(entries, &[KeyValue::new(key::MAP, map.as_str())]);
+    }
+
+    fn record_proxy_cache_evictions(&self, map: CacheMap, reason: CacheEviction, count: u64) {
+        self.proxy_cache_evictions.add(
+            count,
+            &[
+                KeyValue::new(key::MAP, map.as_str()),
+                KeyValue::new(key::REASON, reason.as_str()),
+            ],
+        );
+    }
+
+    fn record_proxy_cache_change(&self, source: &'static str) {
+        self.proxy_cache_changes
+            .add(1, &[KeyValue::new(key::SOURCE, source)]);
+    }
+
+    fn record_proxy_cache_flush(&self, cause: &'static str) {
+        self.proxy_cache_flushes
+            .add(1, &[KeyValue::new(key::CAUSE, cause)]);
+    }
+
+    fn record_proxy_cache_load_discarded(&self, map: CacheMap) {
+        self.proxy_cache_loads_discarded
+            .add(1, &[KeyValue::new(key::MAP, map.as_str())]);
+    }
+
+    fn record_proxy_cache_publish_failures(&self, reason: &'static str, count: u64) {
+        self.proxy_cache_publish_failures
+            .add(count, &[KeyValue::new(key::REASON, reason)]);
     }
 }
 

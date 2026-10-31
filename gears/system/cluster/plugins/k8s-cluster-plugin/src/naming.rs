@@ -10,7 +10,7 @@
 //! processes and restarts — it hashes the name string and nothing else.
 
 use cluster_sdk::ClusterError;
-use sha2::{Digest, Sha256};
+use toolkit_security::crypto::hash::Sha256;
 
 /// Label: one selector finds everything this plugin owns, in any namespace.
 pub const LABEL_MANAGED_BY: &str = "cluster.cf-gears.io/managed-by";

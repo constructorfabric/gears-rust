@@ -97,44 +97,14 @@ pub fn get_crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
     rustls::crypto::CryptoProvider::get_default()
         .cloned()
         .unwrap_or_else(|| {
-            // Provider selection mirrors `toolkit::bootstrap::init_crypto_provider`:
-            //   - fips + macOS    → Apple corecrypto, TLS 1.3-only (via the
-            //                       corecrypto-provider's own `fips` feature
-            //                       forwarded by toolkit-http's `fips`).
-            //                       `default_provider()` under `feature = "fips"`
-            //                       is aliased to `fips_provider()` semantics by
-            //                       the corecrypto crate itself — same single-
-            //                       entry-point pattern as `rustls-cng-crypto`.
-            //   - fips + Windows  → Windows CNG (FIPS-Approved set).
-            //                       No `fips::enabled()` re-check here: that
-            //                       gate is owned by `init_crypto_provider`
-            //                       and runs once at startup.
-            //   - fips + other    → AWS-LC FIPS.
-            //   - non-fips        → AWS-LC default.
-            #[cfg(all(feature = "fips", target_os = "macos"))]
-            {
-                Arc::new(rustls_corecrypto_provider::default_provider())
-            }
+            let provider = toolkit_security::tls::configured_provider();
             #[cfg(all(feature = "fips", target_os = "windows"))]
-            {
-                let provider = rustls_cng_crypto::fips_provider();
-                assert!(
-                    !provider.cipher_suites.is_empty(),
-                    "Windows is not in FIPS mode (FipsAlgorithmPolicy != 1). \
-                     Enable system-wide FIPS via Group Policy and reboot, \
-                     or call toolkit::bootstrap::init_crypto_provider() first \
-                     for the canonical fail-closed path."
-                );
-                Arc::new(provider)
-            }
-            #[cfg(all(feature = "fips", not(any(target_os = "macos", target_os = "windows"))))]
-            {
-                Arc::new(rustls::crypto::default_fips_provider())
-            }
-            #[cfg(not(feature = "fips"))]
-            {
-                Arc::new(rustls::crypto::aws_lc_rs::default_provider())
-            }
+            assert!(
+                !provider.cipher_suites.is_empty(),
+                "Windows is not in FIPS mode (FipsAlgorithmPolicy != 1). \
+                 Enable system-wide FIPS via Group Policy and reboot."
+            );
+            Arc::new(provider)
         })
 }
 
@@ -198,12 +168,7 @@ mod fips_test_provider {
         // `install_default()` returns `Err` if a provider is already installed
         // (benign here); drop the result. `drop` rather than `let _ =`
         // satisfies clippy::let_underscore_must_use.
-        #[cfg(target_os = "macos")]
-        drop(rustls_corecrypto_provider::default_provider().install_default());
-        #[cfg(target_os = "windows")]
-        drop(rustls_cng_crypto::fips_provider().install_default());
-        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-        drop(rustls::crypto::default_fips_provider().install_default());
+        drop(toolkit_security::tls::configured_provider().install_default());
     });
 }
 

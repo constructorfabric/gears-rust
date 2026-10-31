@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit-http"
-version = "0.7.1"
+version = "0.8.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,32 +18,10 @@ name = "toolkit_http"
 [lints]
 workspace = true
 
-# Pulled in only to trigger Cargo feature unification (rustls/hyper-rustls
-# `fips`); never referenced in code by design.
-[package.metadata.cargo-shear]
-ignored = ["rustls-fips-shim"]
-
 [features]
 default = []
-# FIPS-140-3: the `cf-gears-rustls-fips-shim` crate pulls `rustls/fips` and
-# `hyper-rustls/fips` ONLY on targets where AWS-LC FIPS is the intended
-# backend (its transitive deps are target-gated to non-macOS, non-Windows).
-# On macOS the corecrypto provider replaces the AWS-LC FIPS backend; on
-# Windows the CNG provider does. In both cases `rustls/fips` is
-# intentionally NOT activated — that is what keeps the aws-lc-fips dylib
-# out of macOS+fips and Windows+fips builds.
-fips = [
-    "dep:rustls-fips-shim",
-    "dep:rustls-corecrypto-provider",
-    # Forward to corecrypto-provider's own `fips` feature so its
-    # `default_provider()` becomes TLS-1.3-only on macOS. See
-    # toolkit::Cargo.toml for the same pattern and rustls-cng-crypto for the
-    # upstream reference.
-    "rustls-corecrypto-provider/fips",
-    # Windows CNG provider — target-conditional dep (see below), so this
-    # activator is a no-op on non-Windows hosts.
-    "dep:rustls-cng-crypto",
-]
+# Use the facade's per-OS policy for TLS and application primitives.
+fips = ["toolkit-security/fips"]
 # OpenTelemetry integration for distributed tracing
 otel = ["dep:opentelemetry", "toolkit-trace-context/otel"]
 
@@ -93,24 +71,6 @@ rand = { workspace = true }
 
 # OpenTelemetry (optional, for distributed tracing)
 opentelemetry = { workspace = true, optional = true }
-
-# Apple corecrypto-backed rustls CryptoProvider. The crate's `lib.rs` is gated
-# on `cfg(target_os = "macos")` so on Linux/Windows it is an empty lib with no
-# transitive deps — safe to list unconditionally. Activated by the `fips`
-# feature; consumed by `tls.rs::get_crypto_provider` only on macOS.
-rustls-corecrypto-provider = { workspace = true, optional = true }
-
-# Workspace-feature-unification shim that activates `rustls/fips` +
-# `hyper-rustls/fips` only on targets where AWS-LC FIPS is the intended
-# backend (i.e. not macOS, not Windows; see crate Cargo.toml for the
-# rationale). Empty lib on every target.
-rustls-fips-shim = { workspace = true, optional = true }
-
-# Windows CNG-backed rustls CryptoProvider. Activated by the `fips` feature;
-# consumed by `tls.rs::get_crypto_provider` only on Windows. Listed
-# target-conditionally because the crate links against Windows CNG.
-[target.'cfg(target_os = "windows")'.dependencies]
-rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }

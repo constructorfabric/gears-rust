@@ -20,7 +20,9 @@ use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
 use crate::domain::declaration::DeclarationStatus;
 use crate::domain::error::DomainError;
-use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
+use crate::domain::ports::{
+    NoMetrics, NoSecretManager, SecretManager, StepUpOperation, ValueEvent,
+};
 use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
@@ -211,7 +213,7 @@ impl WriteHarness {
                 &self.base.key(name),
                 target,
                 StepUpPolicy::Verify,
-                "set",
+                StepUpOperation::Set,
             )
             .await
     }
@@ -1232,7 +1234,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
             &base.key("strict"),
             None,
             StepUpPolicy::Verify,
-            "set",
+            StepUpOperation::Set,
         )
         .await
         .expect("gated");

@@ -56,12 +56,23 @@ impl From<&TestDsn> for String {
         dsn.dsn.clone()
     }
 }
+/// `dsn` as the gear's pool opens it: a `SQLite` one with `transaction_mode=immediate`, as the
+/// gear's database config sets it, so its writers wait for the write lock instead of failing at
+/// once. Raw connections keep the plain DSN, since sqlx refuses toolkit-db's option.
+pub fn toolkit_dsn(dsn: &str) -> String {
+    if dsn.starts_with("sqlite:") {
+        let separator = if dsn.contains('?') { '&' } else { '?' };
+        format!("{dsn}{separator}transaction_mode=immediate")
+    } else {
+        dsn.to_owned()
+    }
+}
 /// A migrated file-backed database: provider, tenant scope, tenant and its [`TestDsn`], which the
 /// caller holds for the test's life.
 pub async fn test_db() -> (DBProvider<DbError>, AccessScope, Uuid, TestDsn) {
     let dsn = TestDsn::new("pricing-repos-");
     let db = toolkit_db::connect_db(
-        &dsn,
+        &toolkit_dsn(&dsn),
         ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),

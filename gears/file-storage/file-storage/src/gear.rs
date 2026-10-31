@@ -95,19 +95,22 @@ impl Gear for FileStorageGear {
         let backends =
             build_backend_registry(&cfg).map_err(|e| anyhow::anyhow!("backend registry: {e}"))?;
 
-        // A configured seed keeps the keypair stable across restarts; otherwise the key
+        // A configured PKCS#8 key stays stable across restarts; otherwise the key
         // is ephemeral (local dev).
         let max_ttl = i64::try_from(cfg.max_url_ttl_secs).unwrap_or(i64::MAX);
-        let issuer = Arc::new(if let Some(seed_b64) = &cfg.signing_key_seed {
-            let seed = URL_SAFE_NO_PAD
-                .decode(seed_b64.expose().trim())
-                .map_err(|e| anyhow::anyhow!("invalid file-storage signing_key_seed: {e}"))?;
-            Issuer::from_seed(&seed, max_ttl).map_err(|e| anyhow::anyhow!("signing key: {e}"))?
+        let issuer = Arc::new(if let Some(key_b64) = &cfg.signing_key_pkcs8 {
+            let key_der = zeroize::Zeroizing::new(
+                URL_SAFE_NO_PAD
+                    .decode(key_b64.expose().trim())
+                    .map_err(|e| anyhow::anyhow!("invalid file-storage signing_key_pkcs8: {e}"))?,
+            );
+            Issuer::from_pkcs8(&key_der, max_ttl)
+                .map_err(|e| anyhow::anyhow!("signing key: {e}"))?
         } else {
             info!(
-                "file-storage: no signing_key_seed configured - generating an EPHEMERAL \
+                "file-storage: no signing_key_pkcs8 configured - generating an EPHEMERAL \
                  URL-signing key. Signed URLs will not survive a restart and the sidecar must \
-                 be reconfigured with the matching public key. Set signing_key_seed for \
+                 be reconfigured with the matching public key. Set signing_key_pkcs8 for \
                  production."
             );
             Issuer::generate(max_ttl).map_err(|e| anyhow::anyhow!("signing key: {e}"))?

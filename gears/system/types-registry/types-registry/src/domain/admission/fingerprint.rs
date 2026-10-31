@@ -24,7 +24,7 @@
 //! `("a", "bc")`, so a candidate identifier ending in a digit could otherwise
 //! collide with a different split of identifier and body.
 //!
-//! # Why SHA-256, and why `aws-lc-rs` rather than `sha2`
+//! # Why SHA-256, and why the toolkit-security facade
 //!
 //! Both digests here cover **client-controlled input** and their equality decides a
 //! replay, so both need collision resistance against a chosen input:
@@ -44,13 +44,12 @@
 //! do it: only the 1-byte `force` field follows the 8 arbitrary bytes of
 //! `expected_resource_version`.
 //!
-//! The hasher is `aws-lc-rs` — the FIPS-validated provider the platform already
-//! installs at bootstrap — and not `sha2`, which DE0708 bans outside an allow-list
-//! (`SECURITY.md §9`), as in `bss/ledger`'s `payload_hash`.
+//! The toolkit-security facade selects the platform/FIPS implementation,
+//! shared with `bss/ledger`'s `payload_hash`.
 
-use aws_lc_rs::digest::{Context, SHA256};
 use serde_json::{Map, Value};
 use toolkit_macros::domain_model;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 use super::Precondition;
@@ -159,7 +158,7 @@ pub struct FingerprintInput<'a> {
 /// preconditions and each `force` flag.
 #[must_use]
 pub fn request_fingerprint(input: &FingerprintInput<'_>) -> RequestFingerprint {
-    let mut hasher = Context::new(&SHA256);
+    let mut hasher = Sha256::new();
     // A version tag, so a future change to what the fingerprint covers cannot
     // read as a matching replay of a request accepted under the old rules.
     write_header(
@@ -216,7 +215,7 @@ pub fn deletion_fingerprint(
     scope: RequestScope,
     targets: &[DeletionFingerprintTarget],
 ) -> RequestFingerprint {
-    let mut hasher = Context::new(&SHA256);
+    let mut hasher = Sha256::new();
     write_header(&mut hasher, b"tr-deletion-fingerprint-v1", scope);
     write_field(&mut hasher, &field_len(targets.len()));
     for target in targets {
@@ -229,7 +228,7 @@ pub fn deletion_fingerprint(
     finish(hasher)
 }
 
-fn write_header(hasher: &mut Context, tag: &[u8], scope: RequestScope) {
+fn write_header(hasher: &mut Sha256, tag: &[u8], scope: RequestScope) {
     write_field(hasher, tag);
     write_field(hasher, &[kind_tag(scope.kind)]);
     write_field(hasher, &[u8::from(scope.dry_run)]);
@@ -242,8 +241,8 @@ fn write_header(hasher: &mut Context, tag: &[u8], scope: RequestScope) {
     write_field(hasher, scope.principal_id.as_bytes());
 }
 
-fn finish(hasher: Context) -> RequestFingerprint {
-    let digest = hasher.finish();
+fn finish(hasher: Sha256) -> RequestFingerprint {
+    let digest = hasher.finalize();
     let mut bytes = [0; 32];
     bytes.copy_from_slice(digest.as_ref());
     RequestFingerprint(bytes)
@@ -261,7 +260,7 @@ pub fn idempotency_scope_hash(
     tenant_id: Option<Uuid>,
     principal_id: Uuid,
 ) -> ScopeHash {
-    let mut hasher = Context::new(&SHA256);
+    let mut hasher = Sha256::new();
     write_field(&mut hasher, b"tr-idem-scope-v1");
     write_field(&mut hasher, &[plane_tag(plane)]);
     write_field(
@@ -269,14 +268,14 @@ pub fn idempotency_scope_hash(
         tenant_id.as_ref().map_or(&[][..], |t| t.as_bytes()),
     );
     write_field(&mut hasher, principal_id.as_bytes());
-    let digest = hasher.finish();
+    let digest = hasher.finalize();
     let mut bytes = [0; 32];
     bytes.copy_from_slice(digest.as_ref());
     ScopeHash(bytes)
 }
 
-fn write_field(hasher: &mut Context, bytes: &[u8]) {
-    hasher.update(&field_len(bytes.len()));
+fn write_field(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(field_len(bytes.len()));
     hasher.update(bytes);
 }
 

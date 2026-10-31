@@ -443,7 +443,7 @@ impl Service {
             .await
             .map_err(map_plugin_err)?
         {
-            return Ok(self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec())));
+            return self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec()));
         }
 
         // Cold-start bootstrap. Jitter, then re-check: a peer may have won.
@@ -453,7 +453,7 @@ impl Service {
             .await
             .map_err(map_plugin_err)?
         {
-            return Ok(self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec())));
+            return self.store_fence_key(zeroize::Zeroizing::new(v.as_bytes().to_vec()));
         }
 
         // Still absent: publish a candidate, settle, then adopt what landed.
@@ -480,12 +480,20 @@ impl Service {
             .map_or(candidate, |v| {
                 zeroize::Zeroizing::new(v.as_bytes().to_vec())
             });
-        Ok(self.store_fence_key(stored))
+        self.store_fence_key(stored)
     }
 
     /// Publish `key_bytes` as the cached fence key, timestamped for the TTL
     /// re-read, and hand back the shared handle.
-    fn store_fence_key(&self, key_bytes: zeroize::Zeroizing<Vec<u8>>) -> FenceKey {
+    fn store_fence_key(
+        &self,
+        key_bytes: zeroize::Zeroizing<Vec<u8>>,
+    ) -> Result<FenceKey, DomainError> {
+        if key_bytes.len() != fence::FENCE_KEY_LEN {
+            return Err(DomainError::internal(
+                "fence key must contain exactly 32 bytes",
+            ));
+        }
         let key: FenceKey = Arc::new(key_bytes);
         *self
             .fence_key
@@ -494,7 +502,7 @@ impl Service {
             key: Arc::clone(&key),
             loaded_at: Instant::now(),
         });
-        key
+        Ok(key)
     }
 
     /// Sleep a random `0..=FENCE_BOOTSTRAP_JITTER_MAX_MS` to de-synchronise
@@ -512,7 +520,7 @@ impl Service {
         value: &SecretValue,
     ) -> Result<Vec<u8>, DomainError> {
         let key = self.fence_key(plugin).await?;
-        Ok(fence::compute_fp(key.as_slice(), value.as_bytes()))
+        fence::compute_fp(key.as_slice(), value.as_bytes())
     }
 
     /// Best-effort lazy fingerprint backfill of an out-of-band seeded row
@@ -677,12 +685,12 @@ impl Service {
             // pre-rotation row would fail closed here — see feature spec §3
             // `inst-fcv-2` / `algo-fp-compute-verify`.
             let fkey = self.fence_key(&plugin).await?;
-            let mut fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
+            let mut fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp)?;
             if !fp_ok {
                 // One-shot key refresh: a replica whose cached key went stale
                 // (key re-created under it) self-heals before failing closed.
                 let fkey = self.refresh_fence_key(&plugin).await?;
-                fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp);
+                fp_ok = fence::verify_fp(fkey.as_slice(), value.as_bytes(), stored_fp)?;
             }
             if fp_ok {
                 self.metrics.fence_verify(FenceVerify::Ok);

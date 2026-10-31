@@ -1,8 +1,8 @@
 //! Fingerprints of proposed business content and the common effective date.
 
 use crate::model::ItemRef;
-use aws_lc_rs::digest::{SHA256, digest};
 use time::Date;
+use toolkit_security::crypto::hash::Sha256;
 
 /// SHA-256 hex of canonical JSON (sorted keys, items sorted by type then id) of what
 /// the reviewer approves: every item's `after` and the common effective date.
@@ -18,7 +18,7 @@ pub fn snapshot_hash(items: &[ItemRef], common_effective_date: Option<Date>) -> 
     // digest of the error text, which can equal nothing a healthy run produces.
     let bytes =
         serde_json::to_vec(&canonical(&canon)).unwrap_or_else(|e| e.to_string().into_bytes());
-    let digested = digest(&SHA256, &bytes);
+    let digested = Sha256::digest(&bytes);
     hex_encode(digested.as_ref())
 }
 

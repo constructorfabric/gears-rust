@@ -14,9 +14,9 @@
 //! served after GitHub answers `304` to the caller's own request.
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{self, SHA256};
 use chrono::{DateTime, Utc};
 use toolkit_security::AccessScope;
+use toolkit_security::crypto::hash::Sha256;
 
 use crate::domain::error::DomainError;
 
@@ -33,13 +33,13 @@ impl CacheKey {
     /// Compute the key for one request.
     #[must_use]
     pub fn compute(method: &str, url: &str, accept: &str) -> Self {
-        let mut hasher = digest::Context::new(&SHA256);
+        let mut hasher = Sha256::new();
         hasher.update(method.to_ascii_uppercase().as_bytes());
         hasher.update(b"\x00");
         hasher.update(url.as_bytes());
         hasher.update(b"\x00");
         hasher.update(accept.as_bytes());
-        Self(hex::encode(hasher.finish().as_ref()))
+        Self(hex::encode(hasher.finalize().as_ref()))
     }
 
     #[must_use]

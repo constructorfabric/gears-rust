@@ -7,10 +7,12 @@
 //! or a classification and every lifecycle change demand credential step-up,
 //! and a gear's contributed declarations are not admin-editable at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use toolkit_macros::domain_model;
 
+use futures_util::StreamExt as _;
 use secrecy::ExposeSecret;
 use serde_json::{Map, Value};
 use settings_service_sdk::{SettingKey, SettingKeyError};
@@ -27,13 +29,16 @@ use crate::domain::declaration::{
     DeclarationStatus,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ports::{SecretManager, StepUpOperation, WriteMetrics};
 use crate::domain::precondition::{self, ETag};
 use crate::domain::resolution::EffectiveCache;
+use crate::domain::secrets::pending::PendingSecretRepository;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier};
 use crate::domain::validation::{TraitSet, TypeValidator};
 use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
 use crate::domain::writes::WriteActor;
 use crate::field;
+use crate::log_text::LogSafe;
 
 /// Conflict reasons this path raises; the text a `409` carries starts with one.
 pub mod conflict {
@@ -51,6 +56,51 @@ pub mod conflict {
     /// A revive names another value type; the setting's own GTS type stays
     /// registered with the one it was declared with.
     pub const VALUE_TYPE_CHANGED: &str = "value_type_changed";
+    /// A purge removes only a retired declaration; it never retires one.
+    pub const NOT_RETIRED: &str = "declaration_not_retired";
+}
+
+/// How many Credential Store releases a purge has in flight at once.
+const RELEASE_CONCURRENCY: usize = 4;
+
+/// A Credential Store entry a purged declaration held: what the release asks
+/// the Secret Manager to delete.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldSecret {
+    /// The tenant the entry was stored for.
+    pub tenant: Uuid,
+    /// The reference of the entry; never logged.
+    pub secret_ref: String,
+}
+
+/// What a committed purge hands on: the key it freed and the entries to release.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PurgedDeclaration {
+    /// The id of the declaration that is gone.
+    pub id: Uuid,
+    /// The key of the declaration that is gone.
+    pub key: String,
+    /// Every entry its values and staged secrets held, each reference once,
+    /// less those another declaration still holds.
+    pub secrets: Vec<HeldSecret>,
+    /// The references left out because a value or staged row of another
+    /// declaration still names them: an evolution copies a retired
+    /// predecessor's references into its successor. Checked again after the
+    /// commit ([`DeclarationAdmin::reclaim_kept`]): the other declaration may
+    /// have been purged meanwhile, and then nobody else would release them.
+    pub kept_secrets: Vec<HeldSecret>,
+}
+
+/// How a release ended.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseSummary {
+    /// Entries the store released, or already did not hold.
+    pub released: usize,
+    /// Entries the store refused; left to an operator's reconcile.
+    pub failed: usize,
 }
 
 /// What an administrator supplies to declare a setting.
@@ -555,7 +605,7 @@ fn optional_string(value: &Value) -> Option<String> {
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-audit:p1
 // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-revival-report:p1
 #[domain_model]
-pub struct DeclarationAdmin<R, Cat, Val, S> {
+pub struct DeclarationAdmin<R, Cat, Val, S, P> {
     declarations: R,
     categories: Cat,
     values: Val,
@@ -564,14 +614,18 @@ pub struct DeclarationAdmin<R, Cat, Val, S> {
     step_up: Arc<dyn StepUpVerifier>,
     sink: S,
     cache: Arc<EffectiveCache>,
+    pending: P,
+    secrets: Arc<dyn SecretManager>,
+    metrics: Arc<dyn WriteMetrics>,
 }
 
-impl<R, Cat, Val, S> DeclarationAdmin<R, Cat, Val, S>
+impl<R, Cat, Val, S, P> DeclarationAdmin<R, Cat, Val, S, P>
 where
     R: DeclarationRepository,
     Cat: CategoryRepository,
     Val: ValueRepository,
     S: AuditSink,
+    P: PendingSecretRepository,
 {
     /// Assemble the service over its repositories and ports.
     #[allow(clippy::too_many_arguments)]
@@ -584,6 +638,9 @@ where
         step_up: Arc<dyn StepUpVerifier>,
         sink: S,
         cache: Arc<EffectiveCache>,
+        pending: P,
+        secrets: Arc<dyn SecretManager>,
+        metrics: Arc<dyn WriteMetrics>,
     ) -> Self {
         Self {
             declarations,
@@ -594,6 +651,9 @@ where
             step_up,
             sink,
             cache,
+            pending,
+            secrets,
+            metrics,
         }
     }
 
@@ -1167,8 +1227,26 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
         // Reactivation changes whether a live setting resolves: gated like a
         // value change, before anything else is inspected.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Reactivate)
+            .await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-8
+        // The row for update, then read again by id: a purge of this retired
+        // declaration holds the row until it commits, so this waits for it and
+        // finds the row gone (`404`) rather than writing against it. What was
+        // read before the lock is only a hint.
+        self.declarations
+            .lock_for_update(conn, scope, retired.id)
+            .await?;
+        let retired = self.find(conn, scope, retired.id).await?;
+        if !retired.status.is_retired() {
+            return Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is an active declaration; metadata changes use PATCH",
+                    retired.key
+                ),
+            ));
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-reactivate:p1:inst-decl-react-7
         // Again here, whoever calls: `create` asks first, before the default.
         revive_refusal(&retired, request, derived)?;
@@ -1277,7 +1355,24 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
         // Evolution retires a live setting's current major: gated like a value
         // change, before anything else is inspected.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Evolve).await?;
+        // The active row for update, then read again by id: a retire and a
+        // purge of it, or another evolution, hold it until they commit, so
+        // this waits for them and sees what they left — a row gone is `404`,
+        // one no longer active is the conflict a second evolution gets.
+        self.declarations
+            .lock_for_update(conn, scope, active.id)
+            .await?;
+        let active = self.find(conn, scope, active.id).await?;
+        if !active.status.is_active() {
+            return Err(conflict(
+                conflict::KEY_CONFLICT,
+                format!(
+                    "`{}` is no longer the active declaration of this setting; read it again",
+                    active.key
+                ),
+            ));
+        }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-3
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-evolve:p1:inst-decl-evolve-4
         // A contributed declaration never reaches this point: `create` refuses
@@ -1503,7 +1598,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-8
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         if needs_step_up {
-            self.verify_step_up(actor).await?;
+            self.verify_step_up(actor, StepUpOperation::Update).await?;
         }
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-11
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-update:p1:inst-decl-update-10
@@ -1623,7 +1718,7 @@ where
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // Retire drops a live setting out of resolution at once: gated like a
         // value change, before the declaration is even looked up.
-        self.verify_step_up(actor).await?;
+        self.verify_step_up(actor, StepUpOperation::Retire).await?;
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-6
@@ -1683,6 +1778,307 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-14
     }
 
+    /// Purge a retired, admin-authored declaration: the row, and by cascade
+    /// every value, restriction and staged secret filed under it. Irreversible.
+    ///
+    /// Answers the Credential Store entries those rows held, for the caller to
+    /// release once the transaction has committed ([`Self::release_purged`]).
+    ///
+    /// # Errors
+    /// [`DomainError::StepUpRequired`] / [`DomainError::Unauthorized`] /
+    /// [`DomainError::Unavailable`] without step-up, judged before anything is
+    /// read; [`DomainError::NotFound`]; [`DomainError::Conflict`] on a
+    /// contributed declaration and on one that is not retired; the
+    /// precondition errors on the tag.
+    // @cpt-dod:cpt-cf-settings-service-dod-setting-declarations-purge:p2
+    pub async fn purge<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+    ) -> Result<PurgedDeclaration, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-5
+        // Irreversible, and it frees the key and the category: gated before the
+        // declaration is even looked up.
+        self.verify_step_up(actor, StepUpOperation::Purge).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-5
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-4
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-7
+        // The row for update: a value write in flight holds it for share, and a
+        // concurrent revive or retire takes it too, so each is serialized
+        // against this purge and what is read below is what gets deleted.
+        self.declarations.lock_for_update(conn, scope, id).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-7
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-8
+        let current = self.find(conn, scope, id).await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-8
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-9
+        // Before the status: a module owns what it contributes, retired or not.
+        Self::refuse_contributed(&current)?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-9
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-10
+        if !current.status.is_retired() {
+            return Err(conflict(
+                conflict::NOT_RETIRED,
+                format!(
+                    "`{}` is {}; only a retired declaration is purged, and a purge never \
+                     retires",
+                    current.key,
+                    current.status.as_str()
+                ),
+            ));
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-10
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
+        precondition::evaluate(if_match, &etag_of(&current))?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-11
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-12
+        // Collected under the lock and before the delete: the cascade removes
+        // the rows, and with them the only record of what the store holds.
+        let mut seen = HashSet::new();
+        let mut entries = Vec::new();
+        let held = self.values.secret_refs(conn, id).await?;
+        let staged = self
+            .pending
+            .list_for_declaration(conn, id)
+            .await?
+            .into_iter()
+            .map(|row| (row.tenant_id, row.secret_ref));
+        for (tenant, secret_ref) in held.into_iter().chain(staged) {
+            if seen.insert(secret_ref.clone()) {
+                entries.push(HeldSecret { tenant, secret_ref });
+            }
+        }
+        // An evolution copies the predecessor's references into the successor's
+        // rows, and the store deletes by reference: what another declaration's
+        // value or staged row still names is that declaration's, not ours.
+        let references: Vec<String> = entries.iter().map(|e| e.secret_ref.clone()).collect();
+        let mut others = self
+            .values
+            .references_held_by_others(conn, id, &references)
+            .await?;
+        others.extend(
+            self.pending
+                .references_held_by_others(conn, id, &references)
+                .await?,
+        );
+        let (entries, kept): (Vec<HeldSecret>, Vec<HeldSecret>) = entries
+            .into_iter()
+            .partition(|entry| !others.contains(&entry.secret_ref));
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-12
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-13
+        self.declarations
+            .delete(conn, scope, id, current.updated_at)
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-13
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-14
+        // The definition is the pre-image; nothing is left to be a post-image.
+        self.record(
+            conn,
+            &current,
+            actor,
+            AuditOperation::Remove,
+            Some(snapshot(&current)),
+            None,
+        )
+        .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-14
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-15
+        self.cache.invalidate_key(&current.key);
+        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-15
+        Ok(PurgedDeclaration {
+            id,
+            key: current.key,
+            secrets: entries,
+            kept_secrets: kept,
+        })
+    }
+
+    /// After the commit, re-check the Credential Store references the purge
+    /// kept because another declaration still held them, and move every one
+    /// nobody holds any more into the set to release.
+    ///
+    /// Needed when two retired declarations sharing an entry are purged at the
+    /// same time: each keeps it for the other, so without this re-check nobody
+    /// would release it. Runs on its own connection, after the purge's
+    /// transaction. A failed check leaves the references kept and logs it; the
+    /// purge is committed and stands.
+    pub async fn reclaim_kept<C: DBRunner>(&self, conn: &C, purged: &mut PurgedDeclaration) {
+        if purged.kept_secrets.is_empty() {
+            return;
+        }
+        let references: Vec<String> = purged
+            .kept_secrets
+            .iter()
+            .map(|e| e.secret_ref.clone())
+            .collect();
+        let mut others = match self
+            .values
+            .references_held_by_others(conn, purged.id, &references)
+            .await
+        {
+            Ok(others) => others,
+            Err(err) => {
+                tracing::warn!(
+                    key = %purged.key,
+                    kept = purged.kept_secrets.len(),
+                    err = %LogSafe(&err),
+                    "declaration purge: the kept references could not be checked again; they stay kept"
+                );
+                return;
+            }
+        };
+        match self
+            .pending
+            .references_held_by_others(conn, purged.id, &references)
+            .await
+        {
+            Ok(more) => others.extend(more),
+            Err(err) => {
+                tracing::warn!(
+                    key = %purged.key,
+                    kept = purged.kept_secrets.len(),
+                    err = %LogSafe(&err),
+                    "declaration purge: the kept references could not be checked again; they stay kept"
+                );
+                return;
+            }
+        }
+        let (still, freed): (Vec<HeldSecret>, Vec<HeldSecret>) =
+            std::mem::take(&mut purged.kept_secrets)
+                .into_iter()
+                .partition(|entry| others.contains(&entry.secret_ref));
+        purged.kept_secrets = still;
+        purged.secrets.extend(freed);
+    }
+
+    /// Release the Credential Store entries of a committed purge, at most
+    /// [`RELEASE_CONCURRENCY`] at a time, and answer how it went.
+    ///
+    /// The work runs in a spawned task, so a caller that is dropped
+    /// mid-release does not cut it short. A refusal never undoes the purge:
+    /// it is counted and logged without the secret, and the entry is left as
+    /// an orphan an operator reconciles; nothing retries it. A task that
+    /// panics or is torn down counts every entry it did not report as failed.
+    pub async fn release_purged(
+        &self,
+        purged: PurgedDeclaration,
+        request_id: &str,
+    ) -> ReleaseSummary {
+        let store = Arc::clone(&self.secrets);
+        let metrics = Arc::clone(&self.metrics);
+        let request_id = request_id.to_owned();
+        let total = purged.secrets.len();
+        let key_for_loss = purged.key.clone();
+        // Shared with the task, so what it reported survives it.
+        let released = Arc::new(AtomicUsize::new(0));
+        let failed = Arc::new(AtomicUsize::new(0));
+        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-18
+        let task = tokio::spawn({
+            let metrics = Arc::clone(&metrics);
+            let request_id = request_id.clone();
+            let released = Arc::clone(&released);
+            let failed = Arc::clone(&failed);
+            async move {
+                let PurgedDeclaration {
+                    key,
+                    secrets,
+                    kept_secrets,
+                    ..
+                } = purged;
+                tracing::info!(
+                    key = %key,
+                    entries = secrets.len(),
+                    kept = kept_secrets.len(),
+                    request_id = %request_id,
+                    "declaration purge: releasing credential store entries"
+                );
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-18
+                // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-19
+                let mut in_flight = futures_util::stream::iter(secrets)
+                    .map(|entry| {
+                        let store = Arc::clone(&store);
+                        let key = key.as_str();
+                        async move {
+                            let outcome = store
+                                .delete_secret(key, entry.tenant, &entry.secret_ref)
+                                .await;
+                            (entry.tenant, outcome)
+                        }
+                    })
+                    .buffer_unordered(RELEASE_CONCURRENCY);
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-19
+                while let Some((tenant, outcome)) = in_flight.next().await {
+                    match outcome {
+                        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-20
+                        Ok(()) => {
+                            metrics.purge_released();
+                            released.fetch_add(1, Ordering::SeqCst);
+                        }
+                        // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-20
+                        // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-21
+                        Err(err) => {
+                            // Neither the secret nor its reference: the
+                            // reference names the entry an operator would
+                            // reach for.
+                            tracing::error!(
+                                key = %key,
+                                tenant = %tenant,
+                                err = %LogSafe(&err),
+                                "declaration purge: a credential store entry was not released"
+                            );
+                            metrics.purge_release_failed();
+                            failed.fetch_add(1, Ordering::SeqCst);
+                        } // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-21
+                    }
+                }
+                // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-22
+                let summary = ReleaseSummary {
+                    released: released.load(Ordering::SeqCst),
+                    failed: failed.load(Ordering::SeqCst),
+                };
+                tracing::info!(
+                    key = %key,
+                    released = summary.released,
+                    failed = summary.failed,
+                    request_id = %request_id,
+                    "declaration purge: credential store release finished"
+                );
+                // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-purge:p2:inst-decl-purge-22
+                summary
+            }
+        });
+        match task.await {
+            Ok(summary) => summary,
+            Err(err) => {
+                // The purge is committed; a task that panicked or was torn down
+                // with the runtime does not turn that into a failed request.
+                // What it did not report is counted as failed: no one knows
+                // those entries were released.
+                let done_ok = released.load(Ordering::SeqCst);
+                let done_failed = failed.load(Ordering::SeqCst);
+                let unreached = total.saturating_sub(done_ok + done_failed);
+                for _ in 0..unreached {
+                    metrics.purge_release_failed();
+                }
+                tracing::error!(
+                    key = %key_for_loss,
+                    request_id = %request_id,
+                    entries = total,
+                    err = %LogSafe(&err),
+                    "declaration purge: the release task did not finish"
+                );
+                ReleaseSummary {
+                    released: done_ok,
+                    failed: done_failed + unreached,
+                }
+            }
+        }
+    }
+
     /// Evict a key from the effective cache, once the change is durable.
     pub fn evict(&self, key: &str) {
         self.cache.invalidate_key(key);
@@ -1734,9 +2130,15 @@ where
 
     /// The step-up gate, as the value write path applies it: an interactive
     /// caller must present a fresh assertion; a service principal cannot and
-    /// is refused outright.
-    async fn verify_step_up(&self, actor: &WriteActor) -> Result<(), DomainError> {
+    /// is refused outright. The outcome is counted in `settings_step_up_total`
+    /// under `operation`.
+    async fn verify_step_up(
+        &self,
+        actor: &WriteActor,
+        operation: StepUpOperation,
+    ) -> Result<(), DomainError> {
         if !actor.is_interactive() {
+            self.metrics.step_up(operation, "service_principal");
             return Err(DomainError::Unauthorized {
                 resource: settings_service_sdk::gts::DECLARATION_SCHEMA,
             });
@@ -1753,19 +2155,27 @@ where
             )
             .await
         {
-            Ok(()) => Ok(()),
-            // An outage of the platform's AuthN is not a verdict on the token:
-            // the client retries rather than re-authenticates.
-            Err(StepUpRefusal::Unavailable(detail)) => Err(DomainError::Unavailable {
-                detail: format!("step-up could not be verified: {detail}"),
-            }),
+            Ok(()) => {
+                self.metrics.step_up(operation, "verified");
+                Ok(())
+            }
             Err(refusal) => {
-                let requirement = self.step_up.requirement();
-                Err(DomainError::StepUpRequired {
-                    reason: refusal.code(),
-                    max_age_seconds: requirement.max_age.as_secs(),
-                    acr_values: requirement.acr_values.clone(),
-                })
+                self.metrics.step_up(operation, refusal.code());
+                match refusal {
+                    // An outage of the platform's AuthN is not a verdict on the
+                    // token: the client retries rather than re-authenticates.
+                    StepUpRefusal::Unavailable(detail) => Err(DomainError::Unavailable {
+                        detail: format!("step-up could not be verified: {detail}"),
+                    }),
+                    refusal => {
+                        let requirement = self.step_up.requirement();
+                        Err(DomainError::StepUpRequired {
+                            reason: refusal.code(),
+                            max_age_seconds: requirement.max_age.as_secs(),
+                            acr_values: requirement.acr_values.clone(),
+                        })
+                    }
+                }
             }
         }
     }

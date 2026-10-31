@@ -13,6 +13,8 @@
 //! subject that staged it, and short-lived: an unclaimed one is swept together
 //! with its entry once `expires_at` has passed.
 
+use std::collections::HashSet;
+
 use serde_json::Value;
 use time::{Duration, OffsetDateTime};
 use toolkit_db::secure::DBRunner;
@@ -117,6 +119,35 @@ pub trait PendingSecretRepository: Send + Sync {
         id: Uuid,
         now: OffsetDateTime,
     ) -> Result<bool, DomainError>;
+
+    /// Every staged row of one declaration, whatever its tenant, subject or
+    /// expiry.
+    ///
+    /// Deliberately unscoped: a purge's cascade removes them all, so the
+    /// collect of the entries to release must see them all.
+    ///
+    /// # Errors
+    /// [`DomainError::Internal`] when the read fails.
+    async fn list_for_declaration<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<PendingSecret>, DomainError>;
+
+    /// Which of `refs` a staged row of a declaration **other than**
+    /// `declaration_id` still holds, whatever its expiry.
+    ///
+    /// Deliberately unscoped, like [`Self::list_for_declaration`]; queried in
+    /// chunks so the set of references does not bound the statement.
+    ///
+    /// # Errors
+    /// [`DomainError::Internal`] when the read fails.
+    async fn references_held_by_others<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<HashSet<String>, DomainError>;
 
     /// Up to `limit` rows whose `expires_at` lies behind `now`, oldest first.
     ///

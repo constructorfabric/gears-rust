@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::domain::model::{HttpMethod, ListQuery, Route, Upstream};
@@ -9,9 +11,10 @@ use uuid::Uuid;
 // Errors
 // ---------------------------------------------------------------------------
 
-/// Errors returned by repository operations.
+/// Errors returned by repository operations. `Clone`, so the requests
+/// waiting on one proxy-cache load all receive its error (ADR-0020).
 #[domain_model]
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum RepositoryError {
     /// The requested entity does not exist (for the tenant).
     #[error("{entity} not found: {id}")]
@@ -198,6 +201,17 @@ pub trait RouteRepository: Send + Sync {
         tags: Tags,
     ) -> Result<Route, RepositoryError>;
 
+    /// The enabled HTTP routes of each upstream in `upstreams`, in full but
+    /// without tags: what the proxy configuration cache stores per upstream
+    /// (ADR-0020). One entry per distinct key, in the order the keys first
+    /// appear, with its routes in ID order; the entry is empty when the
+    /// key's tenant has no such upstream or the upstream has no enabled HTTP
+    /// route. A route without a method can never match and is left out.
+    async fn list_proxy_routes(
+        &self,
+        upstreams: &[RowKey],
+    ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError>;
+
     /// Update an existing route, matched on `(id, tenant_id)`. Returns NotFound
     /// otherwise. The stored `managed_by` is never changed and is returned as
     /// stored. `upstream_id` is written as given: the Control Plane passes the
@@ -224,6 +238,27 @@ pub trait RouteRepository: Send + Sync {
         tenant_id: Uuid,
         upstream_id: Uuid,
     ) -> Result<(), RepositoryError>;
+}
+
+/// The proxy path's configuration reads, without tags (ADR-0020). On a
+/// database with the proxy configuration cache enabled they are served from
+/// the per-replica cache; the uncached path reads the repositories.
+#[async_trait]
+pub trait ProxyConfigReader: Send + Sync {
+    /// Every upstream with `alias` owned by a tenant in `chain`, including
+    /// disabled ones, in unspecified order; empty when there is none. The
+    /// `alias` must already be normalized, as for
+    /// [`UpstreamRepository::list_by_alias_for_tenants`].
+    async fn upstreams_by_alias(
+        &self,
+        alias: &str,
+        chain: &[Uuid],
+    ) -> Result<Arc<[Upstream]>, RepositoryError>;
+
+    /// The enabled HTTP routes of each upstream, in full, as
+    /// [`RouteRepository::list_proxy_routes`] returns them: one entry per key,
+    /// in the order of `upstreams`.
+    async fn routes_of(&self, upstreams: &[RowKey]) -> Result<Vec<Arc<[Route]>>, RepositoryError>;
 }
 
 /// The registry reconcile's own access to registry-managed rows: reads
@@ -304,4 +339,57 @@ pub trait RegistryStateStore: Send + Sync {
         owner: Uuid,
         content_hash: Option<&str>,
     ) -> Result<bool, RepositoryError>;
+}
+
+// ---------------------------------------------------------------------------
+// Waits after a write
+// ---------------------------------------------------------------------------
+
+/// A repository may wait after a write until the write's effect has reached
+/// other replicas (the proxy configuration change log, ADR-0020 *Keeping the
+/// Cache Fresh*), so a caller that writes and then calls another replica
+/// sees it there. Writes with no such caller, such as a registry reconcile
+/// run, can run in [`one_wait_at_the_end`] instead.
+type WaitAfterWrite = futures_util::future::BoxFuture<'static, ()>;
+
+tokio::task_local! {
+    /// The wait of the latest write in the enclosing [`one_wait_at_the_end`].
+    static DEFERRED_WAIT: Arc<parking_lot::Mutex<Option<WaitAfterWrite>>>;
+}
+
+/// Run `work`, letting each repository write it makes return without its
+/// wait after the write, then wait once, for the latest write's. That covers
+/// every earlier write: the publisher acks appends in the order it was handed
+/// the changes.
+///
+/// The scope is task-local: a write `work` spawns onto another task waits
+/// as usual.
+pub(crate) async fn one_wait_at_the_end<F: Future>(work: F) -> F::Output {
+    let deferred = Arc::new(parking_lot::Mutex::new(None));
+    let output = DEFERRED_WAIT.scope(Arc::clone(&deferred), work).await;
+    let wait = deferred.lock().take();
+    if let Some(wait) = wait {
+        wait.await;
+    }
+    output
+}
+
+/// Hand a write's `wait` to the enclosing [`one_wait_at_the_end`], replacing
+/// the previous write's. Outside of one, `wait` comes back for the caller to
+/// await.
+///
+/// # Errors
+///
+/// `wait`, back, when no [`one_wait_at_the_end`] encloses the call.
+#[cfg_attr(
+    not(feature = "cluster"),
+    expect(
+        dead_code,
+        reason = "only the proxy configuration cache's cluster change log waits after a write"
+    )
+)]
+pub(crate) fn defer_wait(wait: WaitAfterWrite) -> Result<(), WaitAfterWrite> {
+    let mut wait = Some(wait);
+    let _ = DEFERRED_WAIT.try_with(|deferred| *deferred.lock() = wait.take());
+    wait.map_or(Ok(()), Err)
 }

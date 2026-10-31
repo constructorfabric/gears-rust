@@ -355,7 +355,8 @@ Fetch a fresh token from the IdP on every proxied request.
 
 - [ADR: Plugin System](./0003-plugin-system.md) — `AuthPlugin` trait and execution model
 - [ADR: Component Architecture](./0001-component-architecture.md) — `DataPlaneService`, `AuthPluginRegistry`
-- [ADR: Control Plane Caching](./0007-data-plane-caching.md) — Cache invalidation pattern
+- [ADR: Control Plane Caching](./0007-data-plane-caching.md) — Cache invalidation pattern (superseded by ADR-0020)
+- [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md) — Per-replica proxy configuration cache, a separate cache from the token cache
 - [ADR: State Management](./0008-state-management.md) — Cache eviction and state coordination
 
 ## References

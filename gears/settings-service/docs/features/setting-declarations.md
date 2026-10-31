@@ -1,5 +1,5 @@
 <!-- Created: 2026-08-10 by Virtuozzo International GmbH -->
-<!-- Updated: 2026-10-08 by Virtuozzo International GmbH -->
+<!-- Updated: 2026-10-28 by Virtuozzo International GmbH -->
 
 # Feature: Setting Declarations and Scope Class
 
@@ -20,6 +20,7 @@
   - [Retire Declaration](#retire-declaration)
   - [Reactivate Declaration](#reactivate-declaration)
   - [Report a Revival](#report-a-revival)
+  - [Purge Declaration](#purge-declaration)
   - [Evolve Declaration](#evolve-declaration)
   - [Declare Dependency Group](#declare-dependency-group)
   - [Read Declarations](#read-declarations)
@@ -38,6 +39,7 @@
   - [Mutation Class Discipline](#mutation-class-discipline)
   - [Retire and Reactivate Lifecycle](#retire-and-reactivate-lifecycle)
   - [Revival Report](#revival-report)
+  - [Purge of a Retired Declaration](#purge-of-a-retired-declaration)
   - [Contributed Declaration Protection](#contributed-declaration-protection)
   - [Dependency Group Declaration](#dependency-group-declaration)
   - [Declaration Read Surface](#declaration-read-surface)
@@ -50,7 +52,7 @@
 
 ### 1.1 Overview
 
-Introduces the setting declaration as an entity distinct from its value: an admin-authored record keyed by a GTS **type** identifier derived from the Settings gear's abstract `setting_type` base ([ADR-002](../ADR/ADR-002-setting-key-gts-type-id.md)), filed under a category, carrying a mandatory Schema Default and a first-class scope class from which cascade and override behaviour is derived rather than configured. Includes the retire and reactivate lifecycle, the mutation-class discipline that governs which fields may change and how, and Dependency Group declaration.
+Introduces the setting declaration as an entity distinct from its value: an admin-authored record keyed by a GTS **type** identifier derived from the Settings gear's abstract `setting_type` base ([ADR-002](../ADR/ADR-002-setting-key-gts-type-id.md)), filed under a category, carrying a mandatory Schema Default and a first-class scope class from which cascade and override behaviour is derived rather than configured. Includes the retire, reactivate and purge lifecycle, the mutation-class discipline that governs which fields may change and how, and Dependency Group declaration.
 
 ### 1.2 Purpose
 
@@ -58,9 +60,9 @@ The declaration-value split is the design's central principle, and this feature 
 
 Scope class replaces the older pattern of hand-set override and inheritance booleans. Because behaviour is derived from a single mandatory attribute, a setting cannot end up tenant-overridable because someone forgot to clear a flag: an infrastructure setting is `global` by declaration, and no tenant holds a value for it. What a tenant may *do* with a setting is a separate, sparse decision — a `tenant_permissions` row of `read_only` or `hidden` recorded by an ancestor's administrator, absence meaning `overridable` — never a pair of booleans on the declaration. The two flags the declaration does carry gate people, not scopes: `requires_step_up`, whose default is the protective `true`, and `anonymous_exposable`, which the schema refuses on a `secret` or `pii` classification.
 
-The hardest constraint here is not any single field but the rule connecting them: **no declaration edit may silently change a live setting's effective resolution.** That is enforced by partitioning every field and action into mutation classes — descriptive metadata is immediate, resolution-affecting fields are immutable, and the two actions that change whether a setting resolves at all require credential step-up. Getting this partition wrong is how an ungated `PATCH` would quietly re-point production configuration.
+The hardest constraint here is not any single field but the rule connecting them: **no declaration edit may silently change a live setting's effective resolution.** That is enforced by partitioning every field and action into mutation classes — descriptive metadata is immediate, resolution-affecting fields are immutable, and the two actions that change whether a setting resolves at all require credential step-up. Purge is a further step-up-gated action: it does not change resolution — a retired declaration is already out of it — but it is irreversible and frees the key and its category. Getting this partition wrong is how an ungated `PATCH` would quietly re-point production configuration.
 
-**Requirements**: `cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-dependency-group-declaration`, `cpt-cf-settings-service-nfr-versatility-gts-scope-class`
+**Requirements**: `cpt-cf-settings-service-fr-setting-scope-class`, `cpt-cf-settings-service-fr-dependency-group-declaration`, `cpt-cf-settings-service-nfr-versatility-gts-scope-class`, `cpt-cf-settings-service-fr-declaration-purge`
 
 **Principles**: `cpt-cf-settings-service-principle-declaration-value-split`, `cpt-cf-settings-service-principle-scope-class-derivation`, `cpt-cf-settings-service-principle-fail-closed`
 
@@ -68,7 +70,7 @@ The hardest constraint here is not any single field but the rule connecting them
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-settings-service-actor-platform-admin` | Authors, updates, retires, and reactivates admin declarations, and declares Dependency Groups over them |
+| `cpt-cf-settings-service-actor-platform-admin` | Authors, updates, retires, reactivates and purges admin declarations, and declares Dependency Groups over them |
 | `cpt-cf-settings-service-actor-tenant-admin` | Reads declarations exposed by the visibility, domain, and licence gates |
 | `cpt-cf-settings-service-actor-contributing-module` | Owns `module_contributed` declarations, which this feature reads and protects from admin edit but does not itself write |
 | `cpt-cf-settings-service-actor-authz-resolver` | Supplies the authorization decision and the `AccessScope` constraints applied to reads |
@@ -76,11 +78,11 @@ The hardest constraint here is not any single field but the rule connecting them
 
 ### 1.4 References
 
-- **PRD**: [PRD.md](../PRD.md) — §5.1 Settings and Category Model, §5.5 Validate and Set Values, §5.6 Multi-Tenant Overrides
-- **Design**: [DESIGN.md](../DESIGN.md) — §4.1 (Entity `SettingDeclaration`, `ScopeClass`, `DeclarationSource` / `DeclarationStatus` / `DomainAffinity`), §4.2 (Component: Declaration Management, including the Declaration Mutation Classes table), §4.3 (REST API — Setting Declarations), §4.7 (Tables `setting_declarations` and `tenant_permissions`, GTS Type & Schema Identifiers)
+- **PRD**: [PRD.md](../PRD.md) — §5.1 Settings and Category Model and Purge of a Retired Setting (`cpt-cf-settings-service-fr-declaration-purge`), §5.5 Validate and Set Values, §5.6 Multi-Tenant Overrides
+- **Design**: [DESIGN.md](../DESIGN.md) — §4.1 (Entity `SettingDeclaration`, `ScopeClass`, `DeclarationSource` / `DeclarationStatus` / `DomainAffinity`), §4.2 (Component: Declaration Management, including the Declaration Mutation Classes table and `purge_declaration`), §4.3 (REST API — Setting Declarations, the purge route and its Rules), §4.6 (`cpt-cf-settings-service-seq-declaration-purge`), §4.7 (Tables `setting_declarations` and `tenant_permissions`, the cascades, GTS Type & Schema Identifiers), §4.8 (the `delete` action)
 - **DECOMPOSITION**: [DECOMPOSITION.md](../DECOMPOSITION.md) entry 2.3
 - **Dependencies**: entry 2.2 category management, since a declaration carries a non-null `category_id` and embeds the category slug in its key; and entry 2.1 gear foundation for persistence, Problem mapping, the `If-Match` precondition helper, the `PolicyEnforcer` PEP with credential step-up, and the Audit Emitter.
-- **Forward seam**: DESIGN §4.2 lists `TypeValidator` among this component's dependencies, because creating a declaration validates its Schema Default against the value type and resolves that type's traits. The validator itself is delivered in entry 2.4. Build this feature against the validator's trait rather than its implementation, so the two can land in either order; the trait belongs with the SDK contracts from 2.1. This is the one place in the first wave where a feature reaches forward rather than back.
+- **Forward seam**: DESIGN §4.2 lists `TypeValidator` among this component's dependencies, because creating a declaration validates its Schema Default against the value type and resolves that type's traits. The validator itself is delivered in entry 2.4. Build this feature against the validator's trait rather than its implementation, so the two can land in either order; the trait belongs with the SDK contracts from 2.1. This is the one place in the first wave where a feature reaches forward rather than back. The purge reaches forward further than that, and is the one part of this entry that waits for later ones: it collects from `setting_values` (entry 2.4), its cascade removes rows of `tenant_permissions` (2.7) and `pending_secrets` (2.9), and it releases Credential Store entries through the Secret Manager port (`SecretManager::delete_secret`), which 2.9 delivers. It is built after 2.9 has landed, and its acceptance criteria run from then on.
 - **Not applicable**: Module-contributed declaration authoring is owned by the Contribution Reconciler in a later wave; this feature only reads such declarations and refuses admin edits to them. Value writes belong to the Value Writer of entry 2.8 and are out of scope. Frontend presentation is owned by a future frontend DESIGN.
 
 ## 2. Actor Flows (CDSL)
@@ -215,7 +217,7 @@ The hardest constraint here is not any single field but the rule connecting them
 7. [x] - `p1` - **IF** the retired declaration is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, nothing written: a gear's declaration changes only through its owning module, a revive would replace its Schema Default and metadata, and the `settings` package an admin key is composed with is not reserved from modules — judged right after the key is looked up, before the request's value type, classification or default is resolved and before step-up, so no refusal about them stands in front of it - `inst-decl-react-15`
 8. [x] - `p1` - **IF** the re-declaration flips the secret trait, changes the Scope Class or names a different `value_type_id` → **RETURN** `409` naming which, nothing written — judged before the Schema Default is validated, so a revive that cannot happen is refused as such rather than for a default that does not fit a type it could never adopt: the first two would move stored values rather than re-interpret them, and the setting's own GTS type is registered with its value type, which the Types Registry does not replace - `inst-decl-react-13`
 9. [x] - `p1` - Validate the Schema Default and the remaining body fields against the stored value type before step-up is asked, as the create does - `inst-decl-react-16`
-10. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves - `inst-decl-react-7`
+10. [x] - `p1` - Require a valid credential step-up assertion, because reactivation changes whether a live setting resolves; then take the retired row for update and read it again — a row gone, or outside the caller's administrative domain, answers `404`, and one no longer retired answers `409` - `inst-decl-react-7`
 11. [x] - `p1` - **IF** step-up is absent or invalid → **RETURN** `403` - `inst-decl-react-8`
 12. [x] - `p1` - Confirm the setting's own type in the Types Registry under the stored value type before anything is written, as a create registers before it inserts - `inst-decl-react-14`
 13. [x] - `p1` - DB: UPDATE setting_declarations SET `status` = 'active', the re-declared Schema Default and metadata WHERE key = {key}; re-validate every retained value against the value type, which may have gained a compatible revision while the setting sat retired, flagging what no longer validates `needs_review` with its detail and clearing the flag on what validates again - `inst-decl-react-9`
@@ -255,6 +257,53 @@ The hardest constraint here is not any single field but the rule connecting them
 10. [x] - `p1` - Mask each listed value by the stricter of its stored classification and the one the body derives, and withhold the re-validation detail whenever the value is masked - `inst-decl-revival-10`
 11. [x] - `p1` - **RETURN** `200` with the declaration's `key` and id, the first `limit` values in traversal order, `total`, `total_needs_review`, `scanned` and `complete`; nothing stored, no step-up, no audit, no cache touched - `inst-decl-revival-11`
 
+### Purge Declaration
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-purge`
+
+**Actor**: `cpt-cf-settings-service-actor-platform-admin`
+
+**Success Scenarios**:
+- A retired admin-authored declaration is removed for good in one transaction, with its values, tenant-access restrictions and staged secrets; its Credential Store entries are released after the commit; `204`
+
+**Error Scenarios**:
+- The actor is not authorized
+- Credential step-up absent or invalid
+- The declaration is not found or is outside the caller's administrative domain
+- The declaration is `module_contributed`
+- The declaration is not `retired`
+- `If-Match` absent or stale
+- A Credential Store release is refused — the purge stands
+
+**Steps**:
+1. [x] - `p2` - Actor sends POST /settings-service/v1/declarations/{id}/purge with `If-Match` and a step-up assertion - `inst-decl-purge-1`
+2. [x] - `p2` - Authorize `delete` on `gts.cf.core.settings.declaration.v1~` - `inst-decl-purge-2`
+3. [x] - `p2` - **IF** the decision is deny or cannot be obtained → **RETURN** `403` - `inst-decl-purge-3`
+4. [x] - `p2` - Require a valid credential step-up assertion, because purge is irreversible and frees the key and its category - `inst-decl-purge-4`
+5. [x] - `p2` - Count the step-up outcome in `settings_step_up_total` under the operation `purge` - `inst-decl-purge-5`
+6. [x] - `p2` - **IF** step-up is absent or invalid → **RETURN** the step-up challenge (`401`/`403`); nothing is read - `inst-decl-purge-6`
+7. [x] - `p2` - DB: open one transaction and take the declaration row for update, so a value write in flight and a concurrent revive or retire are serialized against the purge - `inst-decl-purge-7`
+8. [x] - `p2` - **IF** the row is absent or outside the caller's administrative domain → **RETURN** `404` - `inst-decl-purge-8`
+9. [x] - `p2` - **IF** `source` is `module_contributed` → **RETURN** `409 ContributedDeclarationImmutable`, judged before the status - `inst-decl-purge-9`
+10. [x] - `p2` - **IF** `status` is not `retired` → **RETURN** `409 DeclarationNotRetired`; purge never retires - `inst-decl-purge-10`
+11. [x] - `p2` - Evaluate the `If-Match` precondition; **IF** absent → **RETURN** `428`; **IF** stale → **RETURN** `412` - `inst-decl-purge-11`
+12. [x] - `p2` - DB: SELECT the `(tenant_id, secret_ref)` pairs of every `setting_values` row of the declaration that holds a `secret_ref` — at any scope and with or without a subject, whatever the caller's scope, because the cascade removes them all — and of every `pending_secrets` row of the declaration, keeping out every reference a row of another declaration still holds (an evolution copies its predecessor's references into the successor) - `inst-decl-purge-12`
+13. [x] - `p2` - DB: DELETE FROM setting_declarations WHERE id = {id} AND `updated_at` = {the version the tag was compared against}; `setting_values`, `tenant_permissions` and `pending_secrets` go by `ON DELETE CASCADE`; **IF** no row matched → **RETURN** `412` - `inst-decl-purge-13`
+14. [x] - `p2` - Emit the declaration-purged audit record, attributed to the authenticated caller: operation `remove` on the definition resource, the definition as pre-image, no post-image and no stored value - `inst-decl-purge-14`
+15. [x] - `p2` - Invalidate the local cache for the key inside the transaction - `inst-decl-purge-15`
+16. [x] - `p2` - Commit the transaction - `inst-decl-purge-16`
+17. [x] - `p2` - Evict the key from the effective cache again, and check the references kept for another declaration again: one no declaration holds any more joins the release - `inst-decl-purge-17`
+18. [x] - `p2` - Start the release task, detached from the request, with the key and the collected pairs; log one `info` line with the key, the number of entries, the number kept for another declaration and the request id - `inst-decl-purge-18`
+19. [x] - `p2` - **FOR EACH** collected pair, at most 4 at a time → ask the Secret Manager to release the entry - `inst-decl-purge-19`
+20. [x] - `p2` - **IF** the entry is released, or is already absent → count `ok` in `settings_declaration_purge_secret_releases_total` - `inst-decl-purge-20`
+21. [x] - `p2` - **ELSE** → log at `error` with the key, the tenant and the error's log-safe text — never the secret — count `failed`, and keep the purge - `inst-decl-purge-21`
+22. [x] - `p2` - When every pair is done, log one `info` line with the released and failed counts and the request id - `inst-decl-purge-22`
+23. [x] - `p2` - Wait for the release task and **RETURN** `204`; a dropped request does not stop the task - `inst-decl-purge-23`
+
+A start line without an end line shows a release cut short by a process stop: nothing retries it, the purge stands, and the entries it did not reach are orphans an operator finds in the Credential Store under the reference prefix the gear derives from the key and the tenant the log names.
+
+A purge's duration grows with the number of Credential Store entries it releases (at most 4 at a time), so it is excluded from the REST latency target `cpt-cf-settings-service-nfr-performance-read-cache` (DESIGN §7).
+
 ### Evolve Declaration
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-flow-setting-declarations-evolve`
@@ -274,7 +323,7 @@ The hardest constraint here is not any single field but the rule connecting them
 1. [x] - `p1` - Look up every declaration on the request's version-stripped path — `(vendor, category, leaf name)`, whatever the major or status; **IF** one is active, the request is an evolution rather than a create or a revive - `inst-decl-evolve-1`
 2. [x] - `p1` - **IF** the active declaration is contributed by a gear → **RETURN** `409 ContributedDeclarationImmutable`, nothing written — judged before anything about the request is resolved and before step-up, since it decides who may change the row at all; a gear's declaration evolves when that gear registers a new major - `inst-decl-evolve-8`
 3. [x] - `p1` - **IF** the request changes none of the value type, the Schema Default and the scope class of the active declaration → **RETURN** `409` for the duplicate key - `inst-decl-evolve-2`
-4. [x] - `p1` - Require a valid credential step-up assertion, because evolution retires a live setting's current major; **IF** absent or invalid → **RETURN** `401`/`403` - `inst-decl-evolve-3`
+4. [x] - `p1` - Require a valid credential step-up assertion, because evolution retires a live setting's current major; **IF** absent or invalid → **RETURN** `401`/`403`; then take the active row for update and read it again — a row gone, or outside the caller's administrative domain, answers `404`, and one no longer active answers `409` - `inst-decl-evolve-3`
 5. [x] - `p1` - **IF** the new value type flips the secret trait → **RETURN** `409`, since stored values would be re-interpreted rather than moved - `inst-decl-evolve-4`
 6. [x] - `p1` - Mint the next free major: one above the highest major the path has ever used, retired ones included, composed as `<vendor>.settings.<category>.<name>.vN~` - `inst-decl-evolve-5`
 7. [x] - `p1` - In one transaction: retire the active predecessor and record it; insert the successor at the new key — its own GTS setting type registered first, its create recorded; copy every predecessor value to it at the same scope under an update lock, carrying `set_by` and `set_by_tenant` unchanged, re-validating each against the new value type and flagging what fails `needs_review` with its detail, never coercing or dropping it - `inst-decl-evolve-6`
@@ -400,6 +449,8 @@ The hardest constraint here is not any single field but the rule connecting them
 4. [x] - `p1` - **FROM** `retired` **TO** `retired` **WHEN** values remain stored against the declaration, since retire never deletes values and a retired declaration continues to occupy its category - `inst-decl-state-4`
 5. [x] - `p1` - **FROM** `active` **TO** `retired` **WHEN** the setting evolves to a new major with a valid credential step-up assertion; the successor enters `active` as a new declaration in the same transaction - `inst-decl-state-5`
 
+A `retired` declaration leaves this machine when it is purged (`cpt-cf-settings-service-flow-setting-declarations-purge`): the row is deleted, so there is no terminal state to record; an `active` declaration cannot be purged.
+
 ## 5. Definitions of Done
 
 ### Declaration Entity and Schema
@@ -522,6 +573,33 @@ The system **MUST** serve `POST /settings-service/v1/declarations/revival-previe
 **Touches**:
 - API: `POST /settings-service/v1/declarations/revival-preview`
 - DB Table: `setting_values`
+
+### Purge of a Retired Declaration
+
+- [x] `p2` - **ID**: `cpt-cf-settings-service-dod-setting-declarations-purge`
+
+Purge **MUST** refuse a declaration that is `module_contributed` (`409 ContributedDeclarationImmutable`, judged first) or not `retired` (`409 DeclarationNotRetired`), and one that is absent or outside the caller's administrative domain (`404`); it **MUST** require `If-Match`. `delete` authorization and credential step-up **MUST** be judged before any row is read. Every declaration action that requires credential step-up — retire, reactivate, evolve, a metadata update that loosens the classification or clears a step-up flag, and purge — **MUST** count its step-up outcome in `settings_step_up_total` under its own operation (`retire`, `reactivate`, `evolve`, `update`, `purge`).
+
+Purge **MUST** run as one transaction that first takes the declaration row for update, judges the refusals on the locked row, collects the `(tenant, secret_ref)` pairs of every value row of the declaration — whatever its scope or subject — and of every staged secret, except a reference another declaration still holds, hard-deletes the row guarded on the compared `updated_at` (cascading its values, tenant permissions and staged secrets) and writes one audit record, attributed to the authenticated caller (`remove` on the definition resource, the definition as pre-image, no post-image, no stored value).
+
+After the commit it **MUST** check the references it kept for another declaration again and add every one no declaration holds any more, then release every collected entry through the Secret Manager in a task detached from the request, at most 4 at a time, counting each outcome in `settings_declaration_purge_secret_releases_total{result}`, logging a refusal at `error` with the key, the tenant and the error's log-safe text, never the secret, and one line when the task starts and one when it ends, both carrying the request id. A refusal **MUST NOT** undo the purge; the request **MUST** wait for the task before answering `204`, and a dropped request **MUST NOT** stop the task.
+
+Purge **MUST** publish no domain event and **MUST NOT** remove or alter existing audit records. A later declaration at the key **MUST** be accepted under the same value type only — the Types Registry keeps the key's type after the row is gone, and the create flow's type registration answers a different value type with `409` (DESIGN §4.7), as for any existing key. A category whose last declaration, active or retired, is purged **MUST** become deletable (`cpt-cf-settings-service-fr-settings-category-model`). The design is `cpt-cf-settings-service-component-declaration-management` and `cpt-cf-settings-service-seq-declaration-purge`.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-setting-declarations-purge`
+
+**Constraints**: `cpt-cf-settings-service-constraint-step-up-at-idp`, `cpt-cf-settings-service-constraint-optimistic-concurrency`, `cpt-cf-settings-service-constraint-audit-and-events`
+
+**Touches**:
+- API: `POST /settings-service/v1/declarations/{id}/purge`
+- DB Table: `setting_declarations`
+- DB Table: `setting_values`
+- DB Table: `tenant_permissions`
+- DB Table: `pending_secrets`
+- DB Table: `audit_records`
+- Entities: `SettingDeclaration`, `DeclarationStatus`
+- Port: the Credential Store through the Secret Manager (`delete_secret`)
 
 ### Contributed Declaration Protection
 
@@ -646,3 +724,26 @@ The system **MUST** emit an audit record through the Audit Emitter for every dec
 - [x] A declaration row that predates the `display_name` column reads as having no display name
 - [x] An evolution copies every value with its original `set_by` and `set_by_tenant` unchanged
 - [x] A tenant administrator's own value stays shown to that tenant after evolve
+- [x] Purge of an `active` declaration returns `409 DeclarationNotRetired` and the row stays active
+- [x] Purge of a retired `module_contributed` declaration returns `409 ContributedDeclarationImmutable`, judged before the status, and removes nothing
+- [x] Purge without a fresh step-up assertion returns `401`/`403` and removes nothing
+- [x] Purge without `If-Match` returns `428`, and with a stale `If-Match` returns `412`; neither removes anything
+- [x] Purge of a declaration outside the caller's administrative domain returns `404`
+- [x] Purge of a retired admin-authored declaration returns `204`, a following GET returns `404`, and its `setting_values`, `tenant_permissions` and `pending_secrets` rows are gone
+- [x] After a purge, its category can be deleted when no other declaration references it
+- [x] Every `secret_ref` of the purged declaration's values — at any scope, with or without a subject — and of its staged secrets is released through the Secret Manager after the commit, each release counting `result=ok`
+- [x] After an evolution of a secret setting, a purge of its retired predecessor releases none of the entries the successor still holds, and the successor still resolves its secret values
+- [x] Two purges of declarations that share an entry, committed together, still release it: the later re-check after its commit finds no declaration holding it
+- [x] A release the Credential Store refuses leaves the purge done, logs one `error` line with the key, the tenant and the error's log-safe text and never the secret, and counts `result=failed`
+- [x] The release task runs at most 4 releases at a time, logs one `info` line when it starts and one when it ends, both carrying the request id, and finishes even when the request that started it is dropped
+- [x] Purge writes exactly one audit record, attributed to the authenticated caller — `remove` on the definition resource with the definition as pre-image, no post-image and no stored value — and leaves every earlier record of the key in place
+- [x] Purge publishes no domain event
+- [x] The `204` is answered only after the release task has ended
+- [x] After a purge commits, the next effective read of the key finds no declaration, because the key is evicted from the effective cache
+- [x] Purge without `delete` authorization returns `403` and removes nothing
+- [x] The gates are judged before any row is read: purge of a non-existent id or of an `active` declaration answers `403` without `delete` authorization and `401`/`403` without a fresh step-up — never `404` or `409`
+- [x] After a purge, a declaration at the key is accepted under the same value type and refused `409` under a different one
+- [x] A purge racing a revive of the same declaration lets exactly one win and never deletes an active declaration
+- [x] A revive that loses the race to a purge answers `404`, never `500`
+- [x] A purge racing a value write that stores a secret leaves no Credential Store entry unreleased
+- [x] Retire, reactivate, evolve, a step-up-gated metadata update and purge each count their step-up outcome in `settings_step_up_total` under their own operation

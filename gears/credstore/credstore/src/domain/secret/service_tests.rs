@@ -2859,7 +2859,7 @@ async fn crosswise_lww_desync_reads_fail_closed_not_disclosed() {
 
     let plugin = FakePlugin::new();
     plugin.seed_fence_key();
-    let fp_alice = fence::compute_fp(&TEST_FENCE_KEY, b"value-alice");
+    let fp_alice = fence::compute_fp(&TEST_FENCE_KEY, b"value-alice").unwrap();
     let repo = Arc::new(FakeSecretRepo::new());
     repo.seed(SecretRow {
         id: Uuid::new_v4(),
@@ -3123,7 +3123,7 @@ async fn legacy_seeded_row_serves_and_backfills_without_version_bump() {
 
     // The row is now fenced with the fp of the seeded value under key id 1.
     let row = &repo.rows()[0];
-    let expected_fp = fence::compute_fp(&TEST_FENCE_KEY, b"seeded-value");
+    let expected_fp = fence::compute_fp(&TEST_FENCE_KEY, b"seeded-value").unwrap();
     assert_eq!(row.value_fp.as_deref(), Some(expected_fp.as_slice()));
     assert_eq!(row.fp_key_id, Some(fence::CURRENT_FENCE_KEY_ID));
     assert_eq!(row.version, 1);
@@ -3268,7 +3268,7 @@ async fn stale_cached_key_self_heals_via_refresh_on_mismatch() {
         version: 1,
         secret_type_uuid: SecretType::generic().uuid(),
         expires_at: None,
-        value_fp: Some(fence::compute_fp(&k2, b"vx")),
+        value_fp: Some(fence::compute_fp(&k2, b"vx").unwrap()),
         fp_key_id: Some(fence::CURRENT_FENCE_KEY_ID),
     });
 
@@ -3340,7 +3340,11 @@ async fn reaper_backfill_sweep_stamps_unread_seeded_rows() {
     };
     assert_eq!(
         fp_of("swept-a").as_deref(),
-        Some(fence::compute_fp(&TEST_FENCE_KEY, b"va").as_slice())
+        Some(
+            fence::compute_fp(&TEST_FENCE_KEY, b"va")
+                .unwrap()
+                .as_slice()
+        )
     );
     assert!(fp_of("swept-b").is_some());
     assert!(
@@ -3465,4 +3469,80 @@ async fn delete_with_no_plugin_fails_without_marking_deprovisioning() {
         SecretStatus::Active,
         "delete must not mark deprovisioning when no plugin is available"
     );
+}
+
+#[test]
+fn malformed_fence_keys_are_rejected_before_caching() {
+    let svc = make_service_noop(
+        Arc::new(FakeSecretRepo::new()),
+        Arc::new(FakeDir::single(Uuid::new_v4())),
+        mock_enforcer(),
+        FakePlugin::new(),
+    );
+    for length in [0, 1, 13, 14, 31, 33, 64] {
+        assert!(matches!(
+            svc.store_fence_key(zeroize::Zeroizing::new(vec![7; length])),
+            Err(DomainError::Internal { .. })
+        ));
+        assert!(svc.fence_key.read().unwrap().is_none());
+    }
+    let valid = svc
+        .store_fence_key(zeroize::Zeroizing::new(vec![7; 32]))
+        .unwrap();
+    assert!(
+        svc.store_fence_key(zeroize::Zeroizing::new(vec![9; 31]))
+            .is_err()
+    );
+    assert_eq!(
+        svc.fence_key
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .key
+            .as_slice(),
+        valid.as_slice()
+    );
+}
+
+#[tokio::test]
+async fn malformed_backend_fence_key_is_an_internal_error_on_read() {
+    use crate::domain::secret::fence;
+    let tenant = Uuid::new_v4();
+    let subject = Uuid::new_v4();
+    let ctx = make_ctx(subject, tenant);
+    let k = key("bad-fence");
+    let plugin = FakePlugin::new();
+    let repo = Arc::new(FakeSecretRepo::new());
+    plugin.seed_value(
+        &TenantId(Uuid::nil()),
+        &key(fence::FENCE_KEY_REF),
+        None,
+        &[7; 31],
+    );
+    plugin.seed_value(&TenantId(tenant), &k, None, b"value");
+    repo.seed(SecretRow {
+        id: Uuid::new_v4(),
+        tenant_id: TenantId(tenant),
+        reference: "bad-fence".into(),
+        sharing: SharingMode::Tenant,
+        owner_id: OwnerId(subject),
+        status: SecretStatus::Active,
+        version: 1,
+        secret_type_uuid: SecretType::generic().uuid(),
+        expires_at: None,
+        value_fp: Some(fence::compute_fp(&[7; 32], b"value").unwrap()),
+        fp_key_id: Some(fence::CURRENT_FENCE_KEY_ID),
+    });
+    let svc = make_service_noop(
+        repo,
+        Arc::new(FakeDir::single(tenant)),
+        mock_enforcer(),
+        plugin,
+    );
+    assert!(matches!(
+        svc.get(&ctx, &k).await,
+        Err(DomainError::Internal { .. })
+    ));
+    assert!(svc.fence_key.read().unwrap().is_none());
 }

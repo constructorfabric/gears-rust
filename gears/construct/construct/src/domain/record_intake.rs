@@ -132,13 +132,13 @@ impl RecordKey {
     /// The key of an identity.
     #[must_use]
     pub fn of(parts: IdentityParts<'_>) -> Self {
-        let mut hash = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        let mut hash = toolkit_security::crypto::hash::Sha256::new();
         for part in [parts.connector, parts.provenance, parts.version] {
             let bytes = part.as_bytes();
-            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update((bytes.len() as u64).to_be_bytes());
             hash.update(bytes);
         }
-        Self(hex::encode(hash.finish()))
+        Self(hex::encode(hash.finalize()))
     }
 
     /// The key of a received record's identity.

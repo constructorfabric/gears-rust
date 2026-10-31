@@ -3,13 +3,13 @@
 //! The tag is not a row version. Single-resource reads keep their strong `ETag`
 //! for `If-Match`. A list body differs per caller, so this tag does too.
 
-use aws_lc_rs::digest::{SHA256, digest};
 use axum::body::Body;
 use axum::response::{IntoResponse, Response};
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use http::{HeaderMap, HeaderValue, StatusCode, header};
 use toolkit_canonical_errors::CanonicalError;
+use toolkit_security::crypto::hash::Sha256;
 
 /// `Cache-Control` for one conditional read.
 #[derive(Clone, Copy, Debug)]
@@ -29,8 +29,8 @@ const TAG_CHARS: usize = 22;
 /// The weak tag over `body`: `W/"<22 b64url chars of sha256>"`.
 #[must_use]
 pub fn weak_etag(body: &[u8]) -> HeaderValue {
-    let digested = digest(&SHA256, body);
-    let encoded = URL_SAFE_NO_PAD.encode(digested.as_ref());
+    let digested = Sha256::digest(body);
+    let encoded = URL_SAFE_NO_PAD.encode(digested);
     let short = encoded.get(..TAG_CHARS).unwrap_or(encoded.as_str());
     ascii_header(&format!("W/\"{short}\""))
 }

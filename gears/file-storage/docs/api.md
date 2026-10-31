@@ -606,23 +606,12 @@ avoid leaving this unswept sibling behind.
 
 ## Signed URLs
 
-- **Ed25519-signed compact token, asymmetric, stateless — codec-equivalent to PASETO `v4.public`, not literal
-  PASETO.** ADR-0004 specifies PASETO `v4.public`; the wire format is `base64url(JSON payload).base64url(signature)`
-  (`infra::signed_url::Issuer`/`Verifier`) — same asymmetric control-signs/sidecar-verifies property and the same
-  opaque, evolvable claim-set, but **no PASETO footer and no `kid`** — key rotation is instead handled by the
-  sidecar verifying against a small ordered set of public keys (active + previously-active,
-  `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), so no `kid` is needed to select one; see `docs/operations.md`'s
-  `signing_key_seed` → Rotation section for the zero-outage procedure. The
-  control plane signs with the Ed25519 private key (sole minter); the sidecar verifies with the public key and can
-  never mint. **Not JWT** (no `alg` field → no algorithm-confusion). No DB lookup to verify. No per-token
-  revocation — emergency revocation is the platform auth module's token revocation. See
-  [ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md).
-  - **Implementation note:** because the token is opaque (below), the concrete codec is an internal detail of
-    control + sidecar and may move to a literal PASETO library (with a real footer/`kid`) later without any
-    client-visible change.
-  - **FIPS posture:** the sign/verify primitive sits behind an in-house `SignatureProvider` abstraction specifically
-    so a FIPS-validated module or algorithm can replace it without a codec change; see
-    [DESIGN.md](./DESIGN.md) §4.8 and ADR-0004 "FIPS posture" for the detail.
+- **ECDSA P-256/SHA-256-signed compact token, asymmetric and stateless.** The private
+  codec is `base64url(JSON payload).base64url(ASN.1 DER signature)`. It is not JWT or
+  PASETO and has no algorithm field. Only the control plane holds the PKCS#8 private
+  key; the sidecar receives its 65-byte uncompressed SEC1 public point. Crypto goes
+  through toolkit-security, including native providers in FIPS builds. Existing
+  Ed25519 keys and tokens require the [coordinated migration](operations.md#ed25519-to-p-256-migration).
 - **Opaque to everyone but control + sidecar.** The token's claim-set and crypto are private to the minter and verifier;
   every other participant (browser, CDN, proxy, app, logs, SDK transport) MUST treat it as **opaque bytes** and never
   parse it — the format can and will change ("Token Opacity Contract").

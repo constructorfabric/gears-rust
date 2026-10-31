@@ -1371,6 +1371,15 @@ impl DeclarationRepository for JournalingDeclarations {
     ) -> Result<(), crate::domain::error::DomainError> {
         DeclarationRepo.lock_for_update(conn, scope, id).await
     }
+    async fn delete<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        expected: time::OffsetDateTime,
+    ) -> Result<(), crate::domain::error::DomainError> {
+        DeclarationRepo.delete(conn, scope, id, expected).await
+    }
     async fn set_default<C: toolkit_db::secure::DBRunner>(
         &self,
         conn: &C,

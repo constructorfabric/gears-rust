@@ -7,13 +7,13 @@
 //! identity and minimization (D-96/D-103, keyed by D-204). Pure rules only; the locked transactional writer is
 //! `infra::storage::repo::audit`. New writers seal v3; v1/v2 stay verifiable and every other
 //! version is refused, never decoded as a fallback.
-use aws_lc_rs::{digest, hmac};
 use bss_orders_sdk::catalog::{OrderState, Reason, Trigger};
 use bss_orders_sdk::models::{DelegationProofRef, IdempotencyKey};
 use serde_json::Value;
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use toolkit_security::SecurityContext;
+use toolkit_security::crypto::{CryptoError, hash::Sha256, mac::HmacSha256};
 use uuid::Uuid;
 
 use super::failure::FailureReason;
@@ -221,9 +221,7 @@ pub fn normalize_instant(value: OffsetDateTime) -> Result<OffsetDateTime, AuditE
 }
 
 fn sha256(bytes: &[u8]) -> Digest {
-    let mut out = [0u8; DIGEST_LEN];
-    out.copy_from_slice(digest::digest(&digest::SHA256, bytes).as_ref());
-    out
+    Sha256::digest(bytes)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -906,7 +904,7 @@ pub fn checkpoint_hash(
 /// refuses a member count that differs from the header, exactly as the slice form does.
 #[domain_model]
 pub struct CheckpointDigest {
-    context: digest::Context,
+    context: Sha256,
     expected: i64,
     pushed: i64,
     last: Option<Uuid>,
@@ -948,8 +946,8 @@ impl CheckpointDigest {
         f.instant("captured_at", *captured_at)?;
         f.count("member_count", *member_count)?;
         f.digest("prev_checkpoint_hash", Some(prev_checkpoint_hash))?;
-        let mut context = digest::Context::new(&digest::SHA256);
-        context.update(&f.finish());
+        let mut context = Sha256::new();
+        context.update(f.finish());
         Ok(Self {
             context,
             expected: *member_count,
@@ -981,7 +979,7 @@ impl CheckpointDigest {
         f.uuid("member.order_id", Some(*order_id))?;
         f.positive("member.audit_sequence", Some(*audit_sequence))?;
         f.digest("member.entry_hash", Some(entry_hash))?;
-        self.context.update(&f.finish());
+        self.context.update(f.finish());
         self.pushed += 1;
         self.last = Some(*order_id);
         Ok(())
@@ -1000,7 +998,7 @@ impl CheckpointDigest {
             return Err(AuditError::Shape("checkpoint member count"));
         }
         let mut out = [0u8; DIGEST_LEN];
-        out.copy_from_slice(self.context.finish().as_ref());
+        out.copy_from_slice(self.context.finalize().as_ref());
         Ok(out)
     }
 }
@@ -1372,6 +1370,9 @@ pub enum AdminTextKeyError {
     /// The key is shorter than 32 or longer than 1024 bytes.
     #[error("key must be 32..=1024 bytes")]
     KeyLength,
+    /// The configured crypto backend could not initialize the HMAC key.
+    #[error("audit crypto backend failed: {0}")]
+    Crypto(CryptoError),
 }
 
 /// The keyed minimization secret for `display_label`/`internal_notes` (D-204, amending D-96's
@@ -1379,12 +1380,12 @@ pub enum AdminTextKeyError {
 #[domain_model]
 pub struct AdminTextKey {
     key_id: String,
-    key: hmac::Key,
+    key: HmacSha256,
 }
 impl AdminTextKey {
     /// # Errors
     /// A malformed key ID, or a key shorter than [`MIN_ADMIN_TEXT_KEY_BYTES`] or longer than
-    /// [`MAX_ADMIN_TEXT_KEY_BYTES`].
+    /// [`MAX_ADMIN_TEXT_KEY_BYTES`], or an unavailable crypto backend.
     pub fn new(key_id: &str, key: &[u8]) -> Result<Self, AdminTextKeyError> {
         if key_id.is_empty()
             || key_id.len() > MAX_ADMIN_TEXT_KEY_ID_CHARS
@@ -1399,7 +1400,7 @@ impl AdminTextKey {
         }
         Ok(Self {
             key_id: key_id.to_owned(),
-            key: hmac::Key::new(hmac::HMAC_SHA256, key),
+            key: HmacSha256::new(key).map_err(AdminTextKeyError::Crypto)?,
         })
     }
     /// The non-secret identifier recorded in every value this key produces.
@@ -1424,16 +1425,22 @@ impl std::fmt::Debug for AdminTextKey {
 /// `upreq-audit-identity-lifecycle`). The key ID names the key so rotation never makes two
 /// keys' tags look comparable. Audit verification hashes the stored text and never needs the
 /// key. A further replacement changes only this function, not the row shape.
+///
+/// # Panics
+/// Panics if the crypto backend is unavailable or text exceeds the portable MAC limit.
 #[must_use]
 pub fn minimized_text_digest(key: &AdminTextKey, value: &str) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     const PREFIX: &str = "hmac-sha256:v1:";
-    let tag = hmac::sign(&key.key, value.as_bytes());
+    let tag = key
+        .key
+        .sign(value.as_bytes())
+        .unwrap_or_else(|error| panic!("administrative text MAC failed: {error}"));
     let mut out = String::with_capacity(PREFIX.len() + key.key_id.len() + 1 + 2 * DIGEST_LEN);
     out.push_str(PREFIX);
     out.push_str(&key.key_id);
     out.push(':');
-    for byte in tag.as_ref() {
+    for byte in &tag {
         out.push(char::from(DIGITS[usize::from(byte >> 4)]));
         out.push(char::from(DIGITS[usize::from(byte & 15)]));
     }

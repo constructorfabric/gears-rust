@@ -10,11 +10,11 @@ use crate::error::codes as reason;
 use crate::error::domain::DomainError;
 use crate::state::journal::Journal;
 use crate::{RunId, StartOptions, StartResult};
-use aws_lc_rs::digest::{SHA256, digest};
 use chrono::Utc;
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, EntityTrait, sea_query::Expr};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, SecureUpdateExt, secure_insert};
 use toolkit_security::AccessScope;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 // Resolve old physical IDs by the scoped logical key before any fenced update.
@@ -478,7 +478,7 @@ async fn insert_run<C: DBRunner>(
     Ok(())
 }
 fn hash(key: &str) -> String {
-    hex::encode(digest(&SHA256, key.as_bytes()).as_ref())
+    hex::encode(Sha256::digest(key.as_bytes()).as_ref())
 }
 fn coalescing_key_hash(j: &Journal, key: &str) -> String {
     if j.registration_generation == 0 {
@@ -516,10 +516,10 @@ struct InputHashes {
 }
 impl InputHashes {
     fn new(input: &serde_json::Value) -> Result<Self, StoreError> {
-        let encoded = hex::encode(digest(&SHA256, &serde_json::to_vec(input)?).as_ref());
+        let encoded = hex::encode(Sha256::digest(&serde_json::to_vec(input)?).as_ref());
         let mut canonical = input.clone();
         canonical.sort_all_objects();
-        let canonical = hex::encode(digest(&SHA256, &serde_json::to_vec(&canonical)?).as_ref());
+        let canonical = hex::encode(Sha256::digest(&serde_json::to_vec(&canonical)?).as_ref());
         Ok(Self { canonical, encoded })
     }
     async fn matches<C: DBRunner>(

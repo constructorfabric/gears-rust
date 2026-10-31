@@ -6,8 +6,9 @@ pub mod repo;
 pub mod service;
 
 pub use admin::{
-    CreateDeclaration, Created, DeclarationAdmin, FieldClass, NOTHING_TO_REVIVE, RevivalPlan,
-    RevivalReadGate, RevivalReport, RevivalRow, Walk, strictest_classification,
+    CreateDeclaration, Created, DeclarationAdmin, FieldClass, HeldSecret, NOTHING_TO_REVIVE,
+    PurgedDeclaration, ReleaseSummary, RevivalPlan, RevivalReadGate, RevivalReport, RevivalRow,
+    Walk, strictest_classification,
 };
 pub use kinds::{DataClassification, DeclarationStatus, UnknownKind};
 pub use repo::{

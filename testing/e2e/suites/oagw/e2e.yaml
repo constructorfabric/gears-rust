@@ -1,6 +1,9 @@
 suite: oagw
 features:
+  # `oagw` stays listed so `make e2e-local GEAR=oagw` still finds this suite.
   - oagw
+  # The cluster gear in process, for the sqlite profile's change log (ADR-0020).
+  - oagw-embedded
   - credstore
   - static-credstore
   - static-tenants
@@ -11,6 +14,9 @@ config_gears:
   - oagw
   - credstore
   - static-credstore-plugin
+  - grpc-hub
+  # Its block in config/e2e-local.yaml carries the `oagw` profile.
+  - cluster
 env:
   APP__SERVER__HOME_DIR: "{root}/target/e2e-home-{suite_key}"
 # Keep previous seed revisions and OAGW rows out of independent suite runs.

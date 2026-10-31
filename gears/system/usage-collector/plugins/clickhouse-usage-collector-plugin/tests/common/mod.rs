@@ -93,7 +93,7 @@ async fn bring_up_inner() -> anyhow::Result<ChHarness> {
     // `OnceLock`, so a second call returns `Err`, which is deliberately
     // dropped. `drop` rather than `let _ =` satisfies
     // `clippy::let_underscore_must_use`.
-    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+    drop(toolkit_security::tls::configured_provider().install_default());
 
     let client = build_client(&cfg)?;
 

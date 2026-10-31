@@ -20,7 +20,6 @@ uuid = { workspace = true }
 time = { workspace = true }
 rust_decimal = { workspace = true }
 bss-money = { workspace = true }
-aws-lc-rs = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

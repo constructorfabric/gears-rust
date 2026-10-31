@@ -18,9 +18,12 @@ use crate::domain::model::{
     CreateRouteRequest, CreateUpstreamRequest, ListQuery, ManagedBy, Route, UpdateRouteRequest,
     UpdateUpstreamRequest, Upstream,
 };
-use crate::domain::repo::{RepositoryError, RouteRepository, Tags, UpstreamRepository};
+use crate::domain::repo::{
+    ProxyConfigReader, RepositoryError, RouteRepository, Tags, UpstreamRepository,
+};
 
-#[cfg(test)]
+// The change log decoder bounds aliases with it (the `cluster` feature).
+#[cfg(any(test, feature = "cluster"))]
 pub(crate) use alias::MAX_ALIAS_LENGTH;
 #[cfg(test)]
 use alias::compute_derived_alias;
@@ -69,10 +72,13 @@ pub(crate) struct ControlPlaneServiceImpl {
     policy_enforcer: PolicyEnforcer,
     credstore: Arc<dyn CredStoreClientV1>,
     ssrf_guard: Arc<SsrfGuard>,
+    proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
 }
 
 impl ControlPlaneServiceImpl {
     /// Create the control-plane service from its repositories and collaborators.
+    /// With `proxy_reader`, proxy resolution without tags reads through it
+    /// (ADR-0020); without, it reads the repositories.
     #[must_use]
     pub(crate) fn new(
         upstreams: Arc<dyn UpstreamRepository>,
@@ -81,6 +87,7 @@ impl ControlPlaneServiceImpl {
         policy_enforcer: PolicyEnforcer,
         credstore: Arc<dyn CredStoreClientV1>,
         ssrf_guard: Arc<SsrfGuard>,
+        proxy_reader: Option<Arc<dyn ProxyConfigReader>>,
     ) -> Self {
         Self {
             upstreams,
@@ -89,6 +96,7 @@ impl ControlPlaneServiceImpl {
             policy_enforcer,
             credstore,
             ssrf_guard,
+            proxy_reader,
         }
     }
 }

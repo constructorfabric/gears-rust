@@ -60,6 +60,32 @@ impl SyncMode {
     }
 }
 
+/// How toolkit-db begins a `SQLite` transaction that may write (`transaction_mode`).
+///
+/// Not a PRAGMA: toolkit-db reads it from the DSN like one and strips it before connecting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TransactionMode {
+    /// `transaction_mode=deferred` (the default): a plain `BEGIN`, which takes no lock until the
+    /// first statement. A transaction that reads and then writes fails at once with
+    /// `SQLITE_BUSY` while another connection holds the write lock; `busy_timeout` does not apply.
+    #[default]
+    Deferred,
+    /// `transaction_mode=immediate`: `BEGIN IMMEDIATE`, which takes the write lock up front and
+    /// waits for it under `busy_timeout`, so concurrent writers queue instead of failing.
+    Immediate,
+}
+
+impl TransactionMode {
+    /// Parse from string (case-insensitive); the one parser for the DSN and `params` paths.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_uppercase().as_str() {
+            "DEFERRED" => Some(TransactionMode::Deferred),
+            "IMMEDIATE" => Some(TransactionMode::Immediate),
+            _ => None,
+        }
+    }
+}
+
 /// Parsed `SQLite` PRAGMA parameters.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Pragmas {
@@ -92,6 +118,8 @@ impl Pragmas {
                 "wal" => {
                     pragmas.wal_toggle = Self::parse_wal_toggle(value);
                 }
+                // Not a PRAGMA, and parsed strictly by the caller (`sqlite_pragma::transaction_mode`).
+                "transaction_mode" => {}
                 _ => {
                     tracing::debug!("Unknown SQLite PRAGMA parameter: {}", key);
                 }
@@ -237,6 +265,19 @@ mod tests {
 
         let pragmas = Pragmas::from_pairs(&pairs);
         assert_eq!(pragmas.wal_toggle, Some(false));
+    }
+
+    #[test]
+    fn test_transaction_mode_parsing() {
+        assert_eq!(
+            TransactionMode::parse("immediate"),
+            Some(TransactionMode::Immediate)
+        );
+        assert_eq!(
+            TransactionMode::parse("DEFERRED"),
+            Some(TransactionMode::Deferred)
+        );
+        assert_eq!(TransactionMode::parse("exclusive"), None);
     }
 
     #[test]

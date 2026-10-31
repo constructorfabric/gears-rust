@@ -326,6 +326,16 @@ pub(crate) fn category_tx_config(state: &ApiState) -> toolkit_db::secure::TxConf
     }
 }
 
+/// [`category_tx_config`] for a transaction that only reads. On a database whose writers begin
+/// `IMMEDIATE` (`transaction_mode`) it keeps `SQLite`'s deferred `BEGIN`, so it never queues for
+/// the write lock; Postgres refuses any write in it.
+pub(crate) fn read_tx_config(state: &ApiState) -> toolkit_db::secure::TxConfig {
+    toolkit_db::secure::TxConfig {
+        access_mode: Some(toolkit_db::secure::TxAccessMode::ReadOnly),
+        ..category_tx_config(state)
+    }
+}
+
 /// Map the PEP denial while keeping PDP outages fail-closed.
 pub(crate) fn authz_error_to_canonical(
     err: crate::authz::AuthzError,

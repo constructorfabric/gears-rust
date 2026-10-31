@@ -792,18 +792,18 @@ fn the_empty_subject_set_still_fingerprints_deterministically() {
 fn a_subject_key_is_pinned_to_its_byte_form() {
     // Golden vector: one pair, each field length-prefixed big-endian.
     let expected = {
-        use aws_lc_rs::digest::{Context, SHA256};
-        let mut hasher = Context::new(&SHA256);
+        use toolkit_security::crypto::hash::Sha256;
+        let mut hasher = Sha256::new();
         for field in ["gts.cf.core.qe.subj.v1~acme.tenant.v1", "t-1"] {
             hasher.update(
-                &u32::try_from(field.len())
+                u32::try_from(field.len())
                     .expect("short field")
                     .to_be_bytes(),
             );
             hasher.update(field.as_bytes());
         }
         {
-            let digest = hasher.finish();
+            let digest = hasher.finalize();
             let mut bytes = [0; 32];
             bytes.copy_from_slice(digest.as_ref());
             IdempotencySubjectKey::from_bytes(bytes)

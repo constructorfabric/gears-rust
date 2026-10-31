@@ -6,7 +6,7 @@ decision-makers: Constructor Fabric Steering Committee
 
 # State Management — Data Plane L1 Cache and Rate Limiter Ownership
 
-> **Implementation status:** the Data Plane L1 cache is not implemented ([ADR-0007](./0007-data-plane-caching.md)); its invalidation described here does not exist yet. Rate-limit counters are per instance as described.
+> **Implementation status:** the Data Plane L1 cache described here was never implemented; it is replaced by [ADR: Proxy Configuration Cache](./0020-proxy-config-cache.md) (status `proposed` until its benchmark). OAGW runs both planes in one process, so one per-replica cache serves them, kept fresh through a cluster change log with a TTL backstop. The rate-limiter part of this ADR stays: rate-limit counters are per instance as described.
 
 
 <!-- toc -->

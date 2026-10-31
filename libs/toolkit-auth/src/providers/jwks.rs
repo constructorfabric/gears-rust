@@ -2,7 +2,9 @@ use crate::{claims_error::ClaimsError, traits::KeyProvider};
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use jsonwebtoken::{Algorithm, DecodingKey, Header, decode_header};
+use jsonwebtoken::{
+    Algorithm, AlgorithmFamily, DecodingKey, DecodingKeyKind, Header, decode_header,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
@@ -11,6 +13,10 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use toolkit_security::crypto::{
+    CryptoError,
+    signature::{RsaAlgorithm, verify_rsa_components},
+};
 
 #[derive(Debug, Clone, Deserialize)]
 struct Jwk {
@@ -342,7 +348,7 @@ impl JwksKeyProvider {
 
     /// Validate JWT signature and decode claims without re-parsing the header.
     ///
-    /// Uses `jsonwebtoken::crypto::verify` directly instead of `decode()`,
+    /// Uses the platform crypto facade instead of `decode()`,
     /// because `decode()` internally calls `decode_header()` which fails
     /// on non-string custom header fields (e.g. `"eap": 1`).
     fn validate_token(
@@ -359,20 +365,20 @@ impl JwksKeyProvider {
         let payload_b64 = parts[1];
         let signature = parts[2];
 
-        // Enforce the FIPS-approved JWT algorithm allow-list before invoking
-        // the underlying crypto library — an attacker who controls the header
-        // must not be able to pick a non-FIPS algorithm.
-        fips_allow_alg(header.alg)?;
-
-        // Verify signature over header.payload (the original signing input)
-        let valid =
-            jsonwebtoken::crypto::verify(signature, signing_input.as_bytes(), key, header.alg)
-                .map_err(|e| {
-                    ClaimsError::DecodeFailed(format!("JWT signature verification failed: {e}"))
-                })?;
-        if !valid {
+        let algorithm = rsa_algorithm(header.alg)?;
+        if key.family() != AlgorithmFamily::Rsa {
             return Err(ClaimsError::InvalidSignature);
         }
+        let signature = URL_SAFE_NO_PAD
+            .decode(signature)
+            .map_err(|e| ClaimsError::DecodeFailed(format!("JWT signature decode failed: {e}")))?;
+        // This provider imports only JWK RSA components. Do not reinterpret a
+        // SecretOrDer value (which may belong to another algorithm family).
+        let DecodingKeyKind::RsaModulusExponent { n, e } = key.kind() else {
+            return Err(ClaimsError::InvalidSignature);
+        };
+        verify_rsa_components(algorithm, n, e, signing_input.as_bytes(), &signature)
+            .map_err(map_signature_error)?;
 
         // Decode payload
         let payload_bytes = URL_SAFE_NO_PAD
@@ -516,43 +522,32 @@ fn map_http_error(e: &toolkit_http::HttpError) -> ClaimsError {
     ClaimsError::JwksFetchFailed(crate::http_error::format_http_error(e, "JWKS"))
 }
 
-/// FIPS-140-3 approved JWT signature algorithms.
-///
-/// An attacker who controls the JWT header can otherwise pick any algorithm
-/// that the underlying crypto library recognises (e.g. `EdDSA`, or an `ES384`
-/// over a non-FIPS curve). This list is the defensive allow-list that gates
-/// `jsonwebtoken::crypto::verify` in `validate_token`.
-///
-/// | Family     | Approved algorithms      |
-/// |------------|--------------------------|
-/// | RSA PKCS#1 | `RS256`, `RS384`, `RS512` |
-/// | RSA-PSS    | `PS256`, `PS384`, `PS512` |
-/// | ECDSA      | `ES256`, `ES384`          |
-/// | HMAC       | `HS256`, `HS384`, `HS512` |
-///
-/// # Errors
-/// Returns `ClaimsError::UnsupportedAlgorithm` for any algorithm outside the
-/// approved set. The conversion in `claims_error.rs` surfaces this as
-/// `AuthError::UnsupportedAlgorithm` at the public API boundary.
-fn fips_allow_alg(alg: Algorithm) -> Result<(), ClaimsError> {
-    // The match is intentionally exhaustive (no wildcard arm) so that adding a
-    // new variant to `jsonwebtoken::Algorithm` forces a compile-time decision
-    // here. For a defensive security gate, fail-closed-at-build-time is the
-    // correct default — wildcards silently default-allow or default-reject
-    // future variants without human review.
+// Key/signature errors belong to the token; provider failures are operational.
+fn map_signature_error(error: CryptoError) -> ClaimsError {
+    match error {
+        CryptoError::InvalidKey | CryptoError::InvalidSignature | CryptoError::MessageTooLong => {
+            ClaimsError::InvalidSignature
+        }
+        _ => ClaimsError::Provider(format!("JWT crypto backend failed: {error}")),
+    }
+}
+
+/// Map this RSA-only JWKS provider's algorithms to the platform facade.
+/// The match is exhaustive so a new jsonwebtoken variant requires review.
+fn rsa_algorithm(alg: Algorithm) -> Result<RsaAlgorithm, ClaimsError> {
     match alg {
-        Algorithm::RS256
-        | Algorithm::RS384
-        | Algorithm::RS512
-        | Algorithm::PS256
-        | Algorithm::PS384
-        | Algorithm::PS512
-        | Algorithm::ES256
+        Algorithm::RS256 => Ok(RsaAlgorithm::Pkcs1Sha256),
+        Algorithm::RS384 => Ok(RsaAlgorithm::Pkcs1Sha384),
+        Algorithm::RS512 => Ok(RsaAlgorithm::Pkcs1Sha512),
+        Algorithm::PS256 => Ok(RsaAlgorithm::PssSha256),
+        Algorithm::PS384 => Ok(RsaAlgorithm::PssSha384),
+        Algorithm::PS512 => Ok(RsaAlgorithm::PssSha512),
+        Algorithm::ES256
         | Algorithm::ES384
         | Algorithm::HS256
         | Algorithm::HS384
-        | Algorithm::HS512 => Ok(()),
-        Algorithm::EdDSA => Err(ClaimsError::UnsupportedAlgorithm(format!("{alg:?}"))),
+        | Algorithm::HS512
+        | Algorithm::EdDSA => Err(ClaimsError::UnsupportedAlgorithm(format!("{alg:?}"))),
     }
 }
 
@@ -1252,8 +1247,24 @@ F8gvjIeiwVfp4nDnO2JFexiy
     }
 
     #[test]
-    fn test_fips_allow_alg_accepts_full_approved_set() {
-        // Every algorithm in the FIPS-approved table must pass the helper.
+    fn backend_failure_is_not_reported_as_a_bad_signature() {
+        assert!(matches!(
+            map_signature_error(CryptoError::FipsUnavailable),
+            ClaimsError::Provider(_)
+        ));
+        assert!(matches!(
+            map_signature_error(CryptoError::UnsupportedAlgorithm),
+            ClaimsError::Provider(_)
+        ));
+        assert!(matches!(
+            map_signature_error(CryptoError::InvalidSignature),
+            ClaimsError::InvalidSignature
+        ));
+    }
+
+    #[test]
+    fn test_rsa_algorithm_accepts_all_six_schemes() {
+        // This JWKS provider imports RSA keys only.
         for alg in [
             Algorithm::RS256,
             Algorithm::RS384,
@@ -1261,26 +1272,80 @@ F8gvjIeiwVfp4nDnO2JFexiy
             Algorithm::PS256,
             Algorithm::PS384,
             Algorithm::PS512,
-            Algorithm::ES256,
-            Algorithm::ES384,
-            Algorithm::HS256,
-            Algorithm::HS384,
-            Algorithm::HS512,
         ] {
-            fips_allow_alg(alg)
-                .unwrap_or_else(|e| panic!("expected {alg:?} to be FIPS-approved, got: {e:?}"));
+            rsa_algorithm(alg)
+                .unwrap_or_else(|e| panic!("expected RSA scheme {alg:?}, got: {e:?}"));
         }
     }
 
     #[test]
-    fn test_fips_allow_alg_rejects_eddsa() {
-        let err = fips_allow_alg(Algorithm::EdDSA)
-            .expect_err("EdDSA must be rejected by the FIPS allow-list");
+    fn test_rsa_algorithm_rejects_eddsa() {
+        let err = rsa_algorithm(Algorithm::EdDSA)
+            .expect_err("EdDSA must be rejected by the RSA allow-list");
         match err {
             ClaimsError::UnsupportedAlgorithm(name) => {
                 assert_eq!(name, "EdDSA", "error must name the rejected algorithm");
             }
             other => panic!("expected UnsupportedAlgorithm, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn all_rsa_schemes_verify_independent_signatures_and_reject_substitutions() {
+        let jwks: JwksResponse = serde_json::from_str(signed_jwks_json()).unwrap();
+        let jwk = &jwks.keys[0];
+        let key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e).unwrap();
+        let signing_key = jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM).unwrap();
+        let algorithms = [
+            Algorithm::RS256,
+            Algorithm::RS384,
+            Algorithm::RS512,
+            Algorithm::PS256,
+            Algorithm::PS384,
+            Algorithm::PS512,
+        ];
+        for algorithm in algorithms {
+            let header = Header::new(algorithm);
+            let claims = serde_json::json!({"sub": "rsa-facade"});
+            let token = jsonwebtoken::encode(&header, &claims, &signing_key).unwrap();
+            assert_eq!(
+                JwksKeyProvider::validate_token(&token, &key, &header).unwrap(),
+                claims
+            );
+            for wrong in algorithms.into_iter().filter(|other| *other != algorithm) {
+                assert!(
+                    JwksKeyProvider::validate_token(&token, &key, &Header::new(wrong)).is_err()
+                );
+            }
+            let parts: Vec<_> = token.split('.').collect();
+            let tampered = format!(
+                "{}.{}.{}",
+                parts[0],
+                URL_SAFE_NO_PAD.encode(b"{}"),
+                parts[2]
+            );
+            assert!(JwksKeyProvider::validate_token(&tampered, &key, &header).is_err());
+            let padded = format!("{token}=");
+            assert!(matches!(
+                JwksKeyProvider::validate_token(&padded, &key, &header),
+                Err(ClaimsError::DecodeFailed(_))
+            ));
+            // Identical bytes labelled as an HMAC secret must never become an RSA key.
+            let wrong_family = DecodingKey::from_secret(b"not an RSA key");
+            assert!(JwksKeyProvider::validate_token(&token, &wrong_family, &header).is_err());
+        }
+        for algorithm in [
+            Algorithm::HS256,
+            Algorithm::HS384,
+            Algorithm::HS512,
+            Algorithm::ES256,
+            Algorithm::ES384,
+            Algorithm::EdDSA,
+        ] {
+            assert!(matches!(
+                rsa_algorithm(algorithm),
+                Err(ClaimsError::UnsupportedAlgorithm(_))
+            ));
         }
     }
 
@@ -1300,7 +1365,7 @@ F8gvjIeiwVfp4nDnO2JFexiy
     async fn test_validate_and_decode_rejects_disallowed_algorithm() {
         // A token with `alg: "EdDSA"` must be rejected with
         // `ClaimsError::UnsupportedAlgorithm` before the underlying
-        // `crypto::verify` is ever invoked. The kid matches a real RSA key in
+        // facade verification is ever invoked. The kid matches a real RSA key in
         // the served JWKS so the early failure isolates the algorithm check
         // from unrelated lookup failures.
         let server = MockServer::start();

@@ -14,11 +14,11 @@
 //! at cosine distance zero.
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{Context, SHA256};
 use graph_storage_sdk::models::EmbeddingSpaceId;
 use graph_storage_sdk::plugin_api::{
     EmbedRequest, EmbedResponse, EmbeddingProviderError, EmbeddingProviderV1,
 };
+use toolkit_security::crypto::hash::Sha256;
 
 /// Bytes of hash material consumed per vector lane.
 const BYTES_PER_LANE: usize = 4;
@@ -66,10 +66,10 @@ impl FakeEmbeddingProvider {
         let mut lanes: Vec<f32> = Vec::with_capacity(dimension);
         let mut block: u64 = 0;
         while lanes.len() < dimension {
-            let mut hasher = Context::new(&SHA256);
+            let mut hasher = Sha256::new();
             hasher.update(input.as_bytes());
-            hasher.update(&block.to_be_bytes());
-            let digest = hasher.finish();
+            hasher.update(block.to_be_bytes());
+            let digest = hasher.finalize();
             for lane in digest.as_ref().as_chunks::<BYTES_PER_LANE>().0 {
                 if lanes.len() == dimension {
                     break;

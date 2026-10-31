@@ -24,24 +24,21 @@ drift with every edit.
 
 All fields are `#[serde(default = "…")]`, so an operator's YAML only needs to override what it wants to change; a
 gear started with no `file-storage` config section at all gets every default below — **except that it still cannot
-actually boot**: `require_signing_key_seed` defaults to `true` with `signing_key_seed` unset, and
-`FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key_seed` below).
-A genuinely zero-config deployment is dev/test-only (set `require_signing_key_seed: false` there).
+actually boot**: `require_signing_key` defaults to `true` with `signing_key_pkcs8` unset, and
+`FileStorageConfig::validate()` fails gear init on exactly that combination (see `require_signing_key` below).
+A genuinely zero-config deployment is dev/test-only (set `require_signing_key: false` there).
 `FileStorageConfig::validate()` (called at gear init, before anything is wired up) rejects invalid configurations —
 missing-secret/zero-value guards (`default_url_ttl_secs`, `multipart_session_ttl_secs`,
 `multipart_complete_lease_secs` equal to `0`, instead of
-silently using one second; `default_page_size` or `max_page_size` equal to `0`; `signing_key_seed` absent while
+silently using one second; `default_page_size` or `max_page_size` equal to `0`; `signing_key_pkcs8` absent while
 required; `finalize_internal_secret` absent or empty);
 absolute ceilings (`finalize_token_grace_secs` above `MAX_FINALIZE_TOKEN_GRACE_SECS`, 7 days; `max_page_size` above
 `MAX_PAGE_SIZE_CEILING`, 200; `max_url_ttl_secs` above `MAX_URL_TTL_CEILING`, 30 days; `multipart_session_ttl_secs`
 above `MAX_MULTIPART_SESSION_TTL_SECS`, 30 days; `multipart_complete_lease_secs` above
 `MAX_MULTIPART_COMPLETE_LEASE_SECS`, 1 day;
-`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days; `previous_signing_public_keys` having more than
-`infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS`, 8, entries — see those fields below); cross-field ordering
+`idempotency_ttl_secs` above `MAX_IDEMPOTENCY_TTL_SECS`, 30 days); cross-field ordering
 invariants (`default_url_ttl_secs` vs. `max_url_ttl_secs`; `default_page_size` vs. `max_page_size`;
-`multipart_session_ttl_secs` vs. `default_url_ttl_secs`); and one per-entry format check (each
-`previous_signing_public_keys` entry must be a validly-formed, 32-byte Ed25519 public key — see that field below) —
-noted inline below. Function names (rather than line numbers) are used as source pointers throughout this
+`multipart_session_ttl_secs` vs. `default_url_ttl_secs`), as noted inline below. Function names (rather than line numbers) are used as source pointers throughout this
 table since line numbers drift with every edit.
 
 **Removed keys.** `enable_background_sweep`, `sweep_interval_secs`, `sweep_time_budget_secs`, `orphan_grace_secs` and
@@ -62,14 +59,13 @@ there is no standalone TOML/JSON file of its own.
 | `default_page_size` | `25` | `default_page_size()` |
 | `max_page_size` | `200` | `default_max_page_size()` |
 | `storage_root` | `"./.file-storage-data"` | `default_storage_root()` |
-| `signing_key_seed` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
-| `require_signing_key_seed` | `true` | `default_require_signing_key_seed()` |
+| `signing_key_pkcs8` | `None` (no `#[serde(default = …)]`, just `Option::default()`) | struct field default |
+| `require_signing_key` | `true` | `default_require_signing_key()` |
 | `idempotency_ttl_secs` | `86400` (24h) | `default_idempotency_ttl_secs()` |
 | `enable_in_memory_backend` | `false` (bare `#[serde(default)]`) | struct field default |
 | `s3_backends` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
 | `default_backend_id` | `None` (bare `#[serde(default)]`) | struct field default |
 | `finalize_internal_secret` | **required** (`None` fails `validate()`) | struct field default |
-| `previous_signing_public_keys` | `[]` (empty, bare `#[serde(default)]`) | struct field default |
 
 ### `default_url_ttl_secs`
 Default TTL (seconds) baked into every signed URL the control plane mints (`900` = 15 minutes), unless the caller's
@@ -173,89 +169,31 @@ upload hard-links the written temp file into place, and there is deliberately no
 overwrite). On a filesystem without them (FAT/exFAT, some FUSE and SMB mounts) every single-part upload fails. The
 sidecar's `/readyz` checks this with a probe file in the root (a success is cached for the process, a failure is retried on the next probe) and reports the backend as not ready.
 
-### `signing_key_seed`
-Base64url-encoded 32-byte Ed25519 seed for the URL-signing keypair. When set, the keypair (and the public key the
+### `signing_key_pkcs8`
+Base64url-encoded PKCS#8 DER ECDSA P-256 private key for the URL-signing keypair. When set, the keypair (and the public key the
 sidecar verifies against) is **stable across restarts**; when absent, `gear.rs::init` generates an ephemeral key
 every boot (logged at `info` level with an explicit warning). **Production recommendation**: always set this in any
 real deployment, and treat it as a secret (same handling tier as any other private key material) — never log or
 serialize it (`FileStorageConfig`'s manual `Debug` impl redacts it deliberately). **Multi-replica warning**: every
-replica must be configured with the **same** seed. If replicas each generate their own ephemeral key (i.e. the seed
+replica must be configured with the **same** key. If replicas each generate their own ephemeral key (i.e. the key
 is unset in a multi-replica deployment), signed URLs minted by one replica fail verification at the sidecar (which
 is configured with only one public key via `FS_SIDECAR_PUBLIC_KEY`) — this looks like intermittent, replica-dependent
-upload/download failures. `require_signing_key_seed` (below) exists specifically to fail fast on this misconfiguration
+upload/download failures. `require_signing_key` (below) exists specifically to fail fast on this misconfiguration
 instead of degrading silently into that failure mode.
 
-**Rotation is zero-outage** if BOTH of the platform's independent acceptance points are given the old key during the
-rotation window, not just one of them: the sidecar verifies a token against its own small ordered set of public
-keys (`FS_SIDECAR_PUBLIC_KEY` plus, optionally, `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`), and — separately — the control
-plane verifies the sidecar's finalize/report-part callbacks against its OWN small ordered set (the current seed's
-key plus, optionally, `previous_signing_public_keys` below). The sidecar's set does nothing for the control plane's
-own callback verification; each side needs the old key configured on its own terms. Procedure:
+**Rotation:** only one active key is implemented. Key replacement requires draining
+outstanding URLs/uploads and coordinating control-plane and sidecar configuration.
+Follow [the migration procedure](#ed25519-to-p-256-migration), also for later P-256
+key rotations. On compromise, deliberately invalidate outstanding URLs and issue new
+ones after replacing both components' keys.
 
-1. Generate the new seed and get its public key **before** touching anything else. The reliable way to do this
-   without a dedicated derivation utility: start (or restart, in staging) one control-plane replica with the new
-   seed and read its own startup log — `gear.rs::init` always logs
-   `sidecar_public_key = <base64url>` (`"file-storage URL-signing public key (configure FS_SIDECAR_PUBLIC_KEY with
-   this)"`) derived from whichever seed it booted with, precisely so this key never has to be computed by hand.
-2. Roll out the sidecar fleet with the NEW key added to its set — either as the new `FS_SIDECAR_PUBLIC_KEY` with the
-   old key moved into `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`, or left as `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` alongside the
-   still-current primary. Order only changes verification cost (the primary is tried first), never correctness —
-   every sidecar now accepts tokens signed by either key. This must complete before step 3: the control plane must
-   never sign with a key no sidecar accepts yet.
-3. Restart the control plane on the new seed — **every replica at once** (see the multi-replica warning above: a
-   mixed-seed control-plane fleet is exactly the failure mode that warns about) — with the OLD seed's public key set
-   in `previous_signing_public_keys`. Tokens already issued under the old seed keep verifying at the sidecar,
-   because step 2 already taught the sidecars the old key too; their finalize/report-part callbacks keep verifying
-   at the control plane too, because this step's `previous_signing_public_keys` now teaches the control plane the
-   old key. Skipping `previous_signing_public_keys` here reproduces exactly the bug this field exists to close:
-   every upload started before the restart would fail its finalize/report-part callback the instant the control
-   plane comes back up, even though the sidecar fleet still honours its signed URL.
-4. Only once `max_url_ttl_secs + finalize_token_grace_secs` (default 7 days + 1h) has passed since step 3, remove
-   the old key from every sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`/`FS_SIDECAR_PUBLIC_KEY` **and** from the
-   control plane's `previous_signing_public_keys`. This is longer than the sidecar-only bound an earlier version of
-   this procedure used (`max_url_ttl_secs` alone): a token minted under the OLD seed right up until this restart can
-   carry an `exp` up to `max_url_ttl_secs` after it, and the control plane's finalize/report-part routes then accept
-   that same token up to `finalize_token_grace_secs` *past* that `exp` (`Verifier::verify_with_grace` — the same
-   slack that lets an ordinary slow-but-live upload finalize after its token's nominal TTL). Removing the old key
-   any earlier can reject the finalize/report-part callback of a legitimate, still-in-flight upload that happened to
-   straddle both its own token's TTL and this rotation window.
+Previously documented overlap settings (`previous_signing_public_keys` and
+`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`) are **not implemented**. Do not configure them:
+the control plane rejects the unknown field and the sidecar ignores the environment
+variable. There is no zero-outage multi-key rotation in this implementation.
 
-**Compromise** follows the same four steps, except step 4 happens immediately, as a deliberate invalidation of every
-URL the old key could still authorize (including its finalize/report-part callback) rather than something to wait
-out: a holder of the private key can mint a token for *any* `file_id`/`op`/`backend_path`, so containing that risk
-outweighs preserving in-flight URLs — and their callbacks — signed under it. Concretely:
-- Outstanding **download** URLs simply get re-issued (a fresh `GET`/`HEAD` against the control plane mints a new one
-  under the new key).
-- An in-flight **single-part upload** resumes via a repeat `POST /files` with the same `idempotency_key` — the
-  replay re-signs the returned upload URL under the current (new) key rather than replaying the old one (see F1 in
-  [concurrency-and-failure-model.md](./concurrency-and-failure-model.md)).
-- An in-flight **multipart session** survives the rotation through its existing resume path: `GET
-  /files/{id}/multipart/{upload_id}` re-signs the remaining parts' URLs under the current key, still capped by the
-  session's own `expires_at` — no special-casing needed for a key rotation specifically.
-
-### `previous_signing_public_keys`
-Public keys of previously-active `signing_key_seed`s that the control plane's OWN finalize/report-part callback
-verification (`FileService::verifier`, `Verifier::verify_with_grace`) still accepts, on top of the current seed's
-key. Empty (`[]`) by default. Each entry is a base64url-encoded (`URL_SAFE_NO_PAD`) raw Ed25519 **public** key — the
-same wire format as one element of the sidecar's `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` list — never a seed or any other
-private key material; the control plane only ever needs to hold retired *public* keys, never the retired seed
-itself. This is a second, independent acceptance point from the sidecar's own `FS_SIDECAR_PUBLIC_KEY`/
-`FS_SIDECAR_PREVIOUS_PUBLIC_KEYS`: that set only widens what the *sidecar* accepts for PUT/GET/part-upload requests,
-and does nothing for the control plane's own verification of the sidecar's finalize/report-part callbacks — see
-`signing_key_seed`'s **Rotation** procedure above, which this field is a step of. **Production recommendation**:
-leave empty outside an active rotation window; populate it with exactly the retiring seed's public key per step 3
-of the **Rotation** procedure, and clear it again once step 4 completes. **Misconfiguration risk**: leaving it unset
-during a rotation reproduces the bug this field exists to close — every upload started before the control-plane
-restart fails its finalize/report-part callback the instant the restart happens, even though the sidecar fleet
-still honours the client's in-flight signed URL. `validate()` fails gear init on a malformed entry (bad base64, or
-the wrong decoded length), or on more than `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries — the
-same ceiling, and for the same reason (an unbounded per-callback linear scan through `Verifier::verify`), as the
-sidecar's own `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` below; harmless duplicates (of the current key, or within this
-list) are silently deduped with a startup warning once the current key is actually known — see
-`FileService::with_previous_signing_public_keys` and `infra::signed_url::dedupe_public_keys`.
-
-### `require_signing_key_seed`
-When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_seed` is
+### `require_signing_key`
+When `true` (the default), `FileStorageConfig::validate()` makes gear init **fail fast** if `signing_key_pkcs8` is
 absent, instead of silently minting an ephemeral per-boot key. **Production recommendation**: leave at `true`
 everywhere except local dev/test harnesses that construct a `FileStorageConfig` directly and intentionally want the
 ephemeral-key behaviour — set `false` explicitly there. **Misconfiguration risk**: setting `false` in a real
@@ -388,8 +326,7 @@ share `FileStorageConfig`. All of these are read once in `main()`.
 | Variable | Default | Notes |
 |---|---|---|
 | `FS_SIDECAR_ADDR` | `0.0.0.0:8087` | Bind address. |
-| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url Ed25519 **primary** public key; must match the control plane's `signing_key_seed`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
-| `FS_SIDECAR_PREVIOUS_PUBLIC_KEYS` | unset (no previous keys) | Optional comma-separated list of additional base64url Ed25519 public keys, checked **after** the primary (same "try each, first match wins" verifier — no `kid`). Exists purely to give a `signing_key_seed` rotation a window where tokens signed by either the old or the new key still verify — see `signing_key_seed`'s **Rotation** paragraph below for the procedure. **Cost**: one extra Ed25519 verification per token that fails against the primary, times the list length — keep it short (one entry covering the immediately-prior seed is the normal case) and drop a key once `max_url_ttl_secs` has passed since the seed that produced it stopped being primary, so no still-valid token could possibly have been signed with it. Capped at `infra::signed_url::MAX_PREVIOUS_SIGNING_PUBLIC_KEYS` (8) entries; `build_config` fails sidecar startup above it, for the same unbounded-linear-scan reason as the control plane's own `previous_signing_public_keys` ceiling above. An entry that duplicates `FS_SIDECAR_PUBLIC_KEY` or repeats elsewhere within the list is dropped at startup with a `warn`-level log (`dropped_duplicates`) rather than rejected — a harmless no-op, not a startup error, since the list need not be scrubbed the instant a rotation finishes, but the warning is a signal that step 4 of the rotation procedure has not been completed yet. A malformed entry fails sidecar startup exactly like a malformed `FS_SIDECAR_PUBLIC_KEY`. |
+| `FS_SIDECAR_PUBLIC_KEY` | **required, no default** | Base64url ECDSA P-256/SHA-256 **primary** public key; must match the control plane's `signing_key_pkcs8`-derived keypair (see above). Startup fails (`anyhow::anyhow!`) if unset or malformed. |
 | `FS_SIDECAR_BACKEND_ROOT` | `./.file-storage-data` | Local-fs backend root — same durability caveat as the control plane's `storage_root`; the two should point at the **same** underlying storage for a single-backend deployment, or the sidecar will read/write blobs the control plane's metadata doesn't expect to find there. |
 | `FS_SIDECAR_CONTROL_URL` | `http://localhost:8080` | Base URL of the control plane, used for the finalize/report-part callbacks. Setting it to the **empty string** explicitly disables the callback (dev/test only) — uploaded versions then stay `pending` forever, since nothing ever calls finalize; production must always set this to a reachable control-plane URL. The scheme is **not** validated, and the callbacks carry `x-fs-token` plus the `x-fs-internal-token` shared secret — so keep this hop inside a trusted network boundary or point it at an HTTPS/mTLS endpoint; a plain-HTTP URL puts that secret on the wire in the clear. |
 | `FS_SIDECAR_MAX_BODY_BYTES` | `5368709120` (5 GiB) | Raises axum's blanket request-body floor (default 2 MiB). The limit is a `DefaultBodyLimit` layer on the **whole** sidecar router (`build_router`), so it applies to the request bodies of the single-part `PUT` and of multipart part uploads alike — not only to the single-part route. It does **not** bound download responses: the limit governs request-body extraction, and a download is a `GET`/`HEAD` whose response is streamed past it. This is a transport-layer ceiling only — the real per-request limit is the signed token's `max_size`/`exact_size` claim. **Misconfiguration risk**: setting it below the largest policy-permitted single-part upload causes legitimate uploads to be rejected at the transport layer before the token-level check even runs; because the planner may widen `part_size` up to `MAX_PART_SIZE` (5 GiB) for very large objects, lowering this variable can also reject every *part* of a multipart upload with `413`, which is easy to miss when tuning it with only single-part uploads in mind. |
@@ -612,15 +549,52 @@ were added by migration `m20260707_000001_content_hash_modes`.
 
 ## The `SignatureProvider` / `SignatureVerifier` abstraction
 
-Signing and verification of the URL-signing token are behind an in-house trait pair
-(`infra::signed_url::SignatureProvider` / `SignatureVerifier`), not called directly against a hard-wired crypto
-library. The implementation is Ed25519 (`Issuer::from_seed`/`Issuer::generate`), codec-equivalent to
-PASETO `v4.public` (see `docs/api.md`'s "Signed URLs" section). The abstraction exists specifically for **FIPS
-posture**: a FIPS-validated deployment needs the sign/verify primitive to run inside a FIPS-validated module (the
-platform's `rustls-corecrypto-provider`); the trait boundary lets that primitive be swapped (e.g. for ECDSA P-256)
-without any change to the token's opaque wire format or any client-visible change. **The provider shipped today is
-not FIPS-validated**: `Ed25519Provider` is a generic Ed25519 implementation, and while Ed25519 itself is approved
-under FIPS 186-5, that approval requires the primitive to run inside a validated module. It therefore **MUST NOT**
-be deployed in a FIPS-constrained environment until the provider behind it is swapped — the abstraction makes that
-swap cheap, but it has not been made. See
-[ADR-0004](./ADR/0004-cpt-cf-file-storage-adr-signed-url-transport.md) "FIPS posture" for the full rationale.
+Signed URLs use ECDSA P-256/SHA-256 through `toolkit_security::crypto`. Private keys
+use PKCS#8 DER, public keys use 65-byte uncompressed SEC1 points, and signatures use
+ASN.1 DER. The private two-part token codec is not JWT or PASETO. Signing failures
+propagate as errors. Sidecar startup checks the public-key length, uncompressed
+encoding and backend availability before creating HTTP clients. The backend checks
+the curve point during signature verification. The sidecar explicitly installs
+the facade-selected TLS provider.
+
+### Ed25519 to P-256 migration
+
+This change requires new keys and coordinated control-plane/sidecar deployment.
+Old Ed25519 seeds, public keys and outstanding tokens are not accepted. File contents,
+content hashes and metadata do not change.
+
+1. Generate a new P-256 private key with an embedded public point, and export PKCS#8 DER:
+
+   ```sh
+   umask 077
+   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out signing-key.pem
+   openssl pkcs8 -topk8 -nocrypt -in signing-key.pem -outform DER -out signing-key.pk8
+   ```
+
+   Provision the base64url encoding without padding as secret `signing_key_pkcs8`.
+   Use an approved provisioning process where the deployment's FIPS policy requires one.
+   Do not reuse the public fixture shipped in local/E2E configs.
+2. Stop issuing old signed URLs and drain outstanding uploads/downloads. Wait for the
+   maximum lifetime of old URLs and multipart sessions, including callback grace, or
+   schedule an outage that explicitly invalidates outstanding URLs and sessions.
+3. Configure all control-plane replicas with the same new key. Obtain its
+   `sidecar_public_key` startup log value and configure `FS_SIDECAR_PUBLIC_KEY` on all
+   sidecars. Roll both components together; mixed Ed25519/P-256 fleets do not interoperate.
+4. Resume traffic and obtain fresh URLs. For rollback, restore both old binaries and
+   their matching old key configuration; newly issued P-256 tokens will be invalid.
+
+The old `signing_key_seed` / `require_signing_key_seed` settings have been replaced by
+`signing_key_pkcs8` / `require_signing_key`. A seed is not a PKCS#8 key and must not be
+copied into the new setting. The new required-key flag remains true by default.
+
+### Building the sidecar with FIPS policy
+
+Use the existing toolkit feature; an ordinary build does not enable FIPS policy:
+
+```sh
+cargo build --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+```
+
+This enables toolkit-security's native backend policy and toolkit-http's FIPS
+configuration. On Windows the production process still requires system FIPS policy;
+on all targets the module's supported operating environment remains a deployment requirement.

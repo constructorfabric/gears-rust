@@ -14,7 +14,7 @@ use axum::{
 use toolkit::api::canonical_prelude::{CanonicalError, resource_error};
 use toolkit_db::{
     Db, DbTx,
-    secure::{AccessScope, DBRunner},
+    secure::{AccessScope, DBRunner, TxAccessMode, TxConfig},
 };
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
@@ -552,26 +552,58 @@ pub async fn transaction_door<T: Send + 'static>(
         Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
     > + Send,
 ) -> Result<T, DoorError> {
-    transaction_coded(db, CONTENDED, work).await
+    transaction_coded(db, CONTENDED, TxConfig::serializable(), work).await
 }
-/// Run `work` serializably with the toolkit's contention retries. A driver error the retry
-/// classifier still calls contention after the last attempt becomes 409 `code`.
-async fn transaction_coded<T: Send + 'static>(
+/// [`transaction`] for a door that only reads.
+/// # Errors
+/// As [`transaction`].
+pub async fn transaction_read<T: Send + 'static>(
     db: &Db,
-    code: &'static str,
+    work: impl for<'a> FnMut(
+        &'a DbTx<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
+    > + Send,
+) -> Result<T, CanonicalError> {
+    transaction_door_read(db, work).await.map_err(Into::into)
+}
+/// [`transaction_door`] for a door that only reads: serializable and read-only. On a database
+/// whose writers begin `IMMEDIATE` (`transaction_mode`) it keeps `SQLite`'s deferred `BEGIN`, so
+/// it never queues for the write lock; Postgres refuses any write in it.
+/// # Errors
+/// As [`transaction_door`].
+pub async fn transaction_door_read<T: Send + 'static>(
+    db: &Db,
     work: impl for<'a> FnMut(
         &'a DbTx<'a>,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
     > + Send,
 ) -> Result<T, DoorError> {
-    db.transaction_with_retry(
-        toolkit_db::secure::TxConfig::serializable(),
-        driver_source,
-        work,
-    )
-    .await
-    .map_err(|error| exhausted_contention(db.backend(), code, error))
+    transaction_coded(db, CONTENDED, read_only(), work).await
+}
+/// Serializable and read-only: the reading doors' transaction.
+fn read_only() -> TxConfig {
+    TxConfig {
+        access_mode: Some(TxAccessMode::ReadOnly),
+        ..TxConfig::serializable()
+    }
+}
+/// Run `work` under `config` with the toolkit's contention retries. A driver error the retry
+/// classifier still calls contention after the last attempt becomes 409 `code`.
+async fn transaction_coded<T: Send + 'static>(
+    db: &Db,
+    code: &'static str,
+    config: TxConfig,
+    work: impl for<'a> FnMut(
+        &'a DbTx<'a>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
+    > + Send,
+) -> Result<T, DoorError> {
+    db.transaction_with_retry(config, driver_source, work)
+        .await
+        .map_err(|error| exhausted_contention(db.backend(), code, error))
 }
 /// The driver error the retry classifier judges, if the door's error carries one.
 fn driver_source(error: &DoorError) -> Option<&sea_orm::DbErr> {
@@ -677,15 +709,24 @@ pub async fn unit_transaction_observed_with_events<T: Send + 'static>(
         Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
     > + Send,
 ) -> Result<T, DoorError> {
-    events::transaction_with_attempts(
-        db,
-        sink,
-        toolkit_db::secure::TxConfig::serializable(),
-        1,
-        driver_source,
-        work,
-    )
-    .await
+    events::transaction_with_attempts(db, sink, TxConfig::serializable(), 1, driver_source, work)
+        .await
+}
+/// [`unit_transaction_observed_with_events`] for a capture that only reads (see
+/// [`transaction_door_read`]).
+/// # Errors
+/// As [`unit_transaction_observed_with_events`].
+pub async fn unit_transaction_observed_read<T: Send + 'static>(
+    db: &Db,
+    sink: &EventSink,
+    work: impl for<'a> FnMut(
+        &'a DbTx<'a>,
+        TxOutbox,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
+    > + Send,
+) -> Result<T, DoorError> {
+    events::transaction_with_attempts(db, sink, read_only(), 1, driver_source, work).await
 }
 
 /// [`transaction_coded`] through [`events::transaction`]: the same isolation, retries and
@@ -701,15 +742,9 @@ async fn events_coded<T: Send + 'static>(
         Box<dyn std::future::Future<Output = Result<T, DoorError>> + Send + 'a>,
     > + Send,
 ) -> Result<T, DoorError> {
-    events::transaction(
-        db,
-        sink,
-        toolkit_db::secure::TxConfig::serializable(),
-        driver_source,
-        work,
-    )
-    .await
-    .map_err(|error| exhausted_contention(db.backend(), code, error))
+    events::transaction(db, sink, TxConfig::serializable(), driver_source, work)
+        .await
+        .map_err(|error| exhausted_contention(db.backend(), code, error))
 }
 /// Classify a finished transaction's error: retryable contention is the door's 409 `code`, kept
 /// as a typed conflict so each door names its own resource (phase 4 second review B-1): an

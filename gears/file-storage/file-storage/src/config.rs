@@ -25,7 +25,7 @@ pub(crate) const MAX_PAGE_SIZE_CEILING: u64 = 200;
 
 /// Configuration for the `file-storage` gear.
 ///
-/// `Debug` is implemented manually so the `signing_key_seed` private key is never
+/// `Debug` is implemented manually so the `signing_key_pkcs8` private key is never
 /// printed (a config dump must not leak the URL-signing key).
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -72,19 +72,19 @@ pub struct FileStorageConfig {
     #[serde(default = "default_storage_root")]
     pub storage_root: String,
 
-    /// Base64url-encoded 32-byte Ed25519 seed for the URL-signing key, making the key
+    /// Base64url-encoded PKCS#8 DER ECDSA P-256 private key for the URL-signing key, making the key
     /// stable across restarts. When absent an ephemeral key is generated at boot (dev
     /// only: signed URLs do not survive a restart and the sidecar needs reconfiguring).
     #[serde(
         default,
         serialize_with = "toolkit_utils::secret_string::serialize_option_exposed"
     )]
-    pub signing_key_seed: Option<SecretString>,
+    pub signing_key_pkcs8: Option<SecretString>,
 
-    /// When `true` (default), gear init fails if `signing_key_seed` is absent, since
+    /// When `true` (default), gear init fails if `signing_key_pkcs8` is absent, since
     /// replicas would otherwise each mint a different key. Set `false` for dev/test.
-    #[serde(default = "default_require_signing_key_seed")]
-    pub require_signing_key_seed: bool,
+    #[serde(default = "default_require_signing_key")]
+    pub require_signing_key: bool,
 
     /// Seconds an idempotency key is retained (default 86400); after that a retry with
     /// the same key is a fresh request.
@@ -183,10 +183,10 @@ impl FileStorageConfig {
     /// Validates cross-field invariants that `serde` cannot express; called at gear
     /// init so a misconfiguration fails fast.
     pub fn validate(&self) -> anyhow::Result<()> {
-        if self.require_signing_key_seed && self.signing_key_seed.is_none() {
+        if self.require_signing_key && self.signing_key_pkcs8.is_none() {
             anyhow::bail!(
-                "invalid file-storage config: signing_key_seed is required (set \
-                 require_signing_key_seed: false to allow an ephemeral per-boot key in dev)"
+                "invalid file-storage config: signing_key_pkcs8 is required (set \
+                 require_signing_key: false to allow an ephemeral per-boot key in dev)"
             );
         }
         // finalize trusts the size/hash the sidecar reports, so the secret is mandatory.
@@ -304,10 +304,10 @@ impl fmt::Debug for FileStorageConfig {
             .field("enable_in_memory_backend", &self.enable_in_memory_backend)
             // Never print the signing key — only whether one is configured.
             .field(
-                "signing_key_seed",
-                &self.signing_key_seed.as_ref().map(|_| "<redacted>"),
+                "signing_key_pkcs8",
+                &self.signing_key_pkcs8.as_ref().map(|_| "<redacted>"),
             )
-            .field("require_signing_key_seed", &self.require_signing_key_seed)
+            .field("require_signing_key", &self.require_signing_key)
             // Safe: `S3BackendConfig` has its own redacting `Debug`.
             .field("s3_backends", &self.s3_backends)
             .field("default_backend_id", &self.default_backend_id)
@@ -332,8 +332,8 @@ impl Default for FileStorageConfig {
             default_page_size: default_page_size(),
             max_page_size: default_max_page_size(),
             storage_root: default_storage_root(),
-            signing_key_seed: None,
-            require_signing_key_seed: default_require_signing_key_seed(),
+            signing_key_pkcs8: None,
+            require_signing_key: default_require_signing_key(),
             idempotency_ttl_secs: default_idempotency_ttl_secs(),
             enable_in_memory_backend: false,
             s3_backends: Vec::new(),
@@ -385,8 +385,8 @@ fn default_idempotency_ttl_secs() -> u64 {
     86400 // 24 hours
 }
 
-fn default_require_signing_key_seed() -> bool {
-    true // secure-by-default: no seed configured must not silently accept an ephemeral key
+fn default_require_signing_key() -> bool {
+    true // secure-by-default: no private key configured must not silently accept an ephemeral key
 }
 
 #[cfg(test)]

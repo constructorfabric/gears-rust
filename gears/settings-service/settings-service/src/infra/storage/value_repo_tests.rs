@@ -415,3 +415,86 @@ async fn the_listing_projection_returns_the_columns_of_the_rows_the_full_read_re
     assert_eq!(listed, projected);
     assert_eq!(listed.len(), 2, "the subject row is not listed");
 }
+
+#[tokio::test]
+async fn the_secret_references_of_a_declaration_include_every_subject_and_tenant() {
+    // The collect behind a purge: the cascade removes every row whatever the
+    // caller's scope, so it must see the subject rows and the other tenants'.
+    let h = ResolutionHarness::new().await;
+    let id = h.declare("one", scope_class::LOCAL, json!(true)).await;
+    let other = h.declare("other", scope_class::LOCAL, json!(true)).await;
+    h.set(id, h.tree.root, json!(false)).await;
+    h.set_secret(id, h.tree.a, "ref-a").await;
+    h.set_secret(id, h.tree.b, "ref-b").await;
+    h.set_subject_secret(id, h.tree.c, "ref-subject").await;
+    h.set_secret(other, h.tree.a, "ref-other").await;
+    let conn = h.db.conn().expect("connection");
+
+    let mut held = ValueRepo.secret_refs(&conn, id).await.expect("refs");
+    held.sort();
+
+    let mut expected = vec![
+        (h.tree.a, "ref-a".to_owned()),
+        (h.tree.b, "ref-b".to_owned()),
+        (h.tree.c, "ref-subject".to_owned()),
+    ];
+    expected.sort();
+    assert_eq!(held, expected, "no inline row, no other declaration's");
+}
+
+#[tokio::test]
+async fn the_references_another_declaration_holds_count_whether_it_holds_them_as_values_or_not_at_all()
+ {
+    // What keeps a purge from releasing an entry an evolution's successor
+    // still names: the other declaration's rows are asked for, never the
+    // declaration's own.
+    let h = ResolutionHarness::new().await;
+    let id = h.declare("one", scope_class::LOCAL, json!(true)).await;
+    let other = h.declare("other", scope_class::LOCAL, json!(true)).await;
+    h.set_secret(id, h.tree.a, "own-only").await;
+    h.set_secret(id, h.tree.b, "shared").await;
+    h.set_secret(other, h.tree.b, "shared").await;
+    h.set_subject_secret(other, h.tree.c, "other-subject").await;
+    h.set_secret(other, h.tree.a, "other-only").await;
+    let conn = h.db.conn().expect("connection");
+    let asked: Vec<String> = ["own-only", "shared", "other-subject", "nobody-has-it"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+    let held = ValueRepo
+        .references_held_by_others(&conn, id, &asked)
+        .await
+        .expect("held");
+
+    let mut held: Vec<_> = held.into_iter().collect();
+    held.sort();
+    assert_eq!(held, vec!["other-subject".to_owned(), "shared".to_owned()]);
+    assert!(
+        ValueRepo
+            .references_held_by_others(&conn, id, &[])
+            .await
+            .expect("empty")
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_set_of_references_larger_than_one_chunk_is_answered_in_full() {
+    let h = ResolutionHarness::new().await;
+    let id = h.declare("one", scope_class::LOCAL, json!(true)).await;
+    let other = h.declare("other", scope_class::LOCAL, json!(true)).await;
+    h.set_secret(other, h.tree.a, "held-by-the-other").await;
+    let conn = h.db.conn().expect("connection");
+    // The one that is held sits in the last chunk.
+    let mut asked: Vec<String> = (0..1_200).map(|i| format!("nobody-{i}")).collect();
+    asked.push("held-by-the-other".to_owned());
+
+    let held = ValueRepo
+        .references_held_by_others(&conn, id, &asked)
+        .await
+        .expect("held");
+
+    assert_eq!(held.len(), 1);
+    assert!(held.contains("held-by-the-other"));
+}

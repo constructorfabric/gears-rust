@@ -48,7 +48,7 @@ This feature realizes the per-primitive resolution sequence (DESIGN §3.13) and 
 | Actor | Role in Feature |
 |-------|-----------------|
 | `cpt-cf-clst-actor-platform-gear` | Resolves the cache and uses it for application-level shared state |
-| `cpt-cf-clst-actor-oagw` | Uses high-throughput CAS for shared counters |
+| `cpt-cf-clst-actor-oagw` | With a database, keeps its proxy configuration change log in one key of its `oagw` profile, appended with CAS and watched by exact key (OAGW ADR-0020); high-throughput CAS for shared rate-limit counters is planned (OAGW's rate limits are per replica today) |
 | `cpt-cf-clst-actor-event-broker` | Publishes shard-assignment state and watches by prefix |
 
 ### 1.4 References

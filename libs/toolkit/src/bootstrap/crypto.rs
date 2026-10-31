@@ -7,6 +7,9 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CryptoProviderError {
+    /// Application primitives cannot use the configured crypto backend.
+    #[error("application crypto initialization failed: {0}")]
+    ApplicationCryptoUnavailable(toolkit_security::crypto::CryptoError),
     /// Another crypto provider was already installed (FIPS mode).
     #[error("failed to install FIPS crypto provider - another provider is already installed")]
     FipsProviderConflict,
@@ -116,14 +119,8 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
         .get_or_init(|| {
             #[cfg(all(feature = "fips", target_os = "macos"))]
             {
-                // Under toolkit's `fips` feature the dependency tree
-                // activates `rustls-corecrypto-provider/fips`, which
-                // routes `default_provider()` to the TLS-1.3-only FIPS-
-                // claim variant — same pattern as `rustls-cng-crypto`'s
-                // feature flag. We therefore install the unified entry
-                // point (no need to remember which factory under which
-                // build profile).
-                if let Err(prev) = rustls_corecrypto_provider::default_provider().install_default()
+                // The facade owns target selection and explicitly selects fips_provider().
+                if let Err(prev) = toolkit_security::tls::configured_provider().install_default()
                 {
                     tracing::error!(
                         previous_provider = ?prev,
@@ -146,7 +143,7 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
                 // `BCryptGetFipsAlgorithmMode` ourselves. Refuse to install
                 // rather than degrade the FIPS claim with a non-handshakeable
                 // provider.
-                let provider = rustls_cng_crypto::fips_provider();
+                let provider = toolkit_security::tls::configured_provider();
                 if provider.cipher_suites.is_empty() {
                     tracing::error!(
                         "Windows FIPS mode not enabled (FipsAlgorithmPolicy != 1); \
@@ -166,7 +163,7 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
 
             #[cfg(all(feature = "fips", not(any(target_os = "macos", target_os = "windows"))))]
             {
-                if let Err(prev) = rustls::crypto::default_fips_provider().install_default() {
+                if let Err(prev) = toolkit_security::tls::configured_provider().install_default() {
                     tracing::error!(
                         previous_provider = ?prev,
                         "FIPS crypto provider conflict: another rustls provider was already installed"
@@ -190,7 +187,7 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
 
             #[cfg(not(feature = "fips"))]
             {
-                if let Err(prev) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+                if let Err(prev) = toolkit_security::tls::configured_provider().install_default() {
                     // Non-fatal: another provider is already active, TLS still works.
                     tracing::warn!(
                         previous_provider = ?prev,
@@ -201,6 +198,8 @@ pub fn init_crypto_provider() -> Result<(), CryptoProviderError> {
                 }
             }
 
+            toolkit_security::crypto::initialize()
+                .map_err(CryptoProviderError::ApplicationCryptoUnavailable)?;
             Ok(())
         })
         .clone()

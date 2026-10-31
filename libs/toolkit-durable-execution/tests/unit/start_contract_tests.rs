@@ -39,11 +39,7 @@ async fn reordered_nested_json_replays_both_request_keys() {
         );
         // Simulate an input hash persisted by an older preserve_order host.
         let legacy = hex::encode(
-            digest(
-                &SHA256,
-                br#"{"nested":{"b":2,"a":1},"array":[{"d":4,"c":3}]}"#,
-            )
-            .as_ref(),
+            Sha256::digest(br#"{"nested":{"b":2,"a":1},"array":[{"d":4,"c":3}]}"#).as_ref(),
         );
         let scope = AccessScope::allow_all();
         let conn = store.db.conn().unwrap();

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -319,8 +319,7 @@ impl VacuumTask {
         processed_seq: i64,
         batch_limit: i64,
     ) -> Result<usize, OutboxError> {
-        let conn = db.sea_internal();
-        let txn = conn.begin().await?;
+        let txn = db.begin_tx().await?;
 
         let limit = batch_limit;
 

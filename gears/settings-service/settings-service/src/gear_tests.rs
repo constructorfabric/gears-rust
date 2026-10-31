@@ -74,6 +74,14 @@ fn an_uninitialized_gear_refuses_to_hand_out_the_enforcer() {
 }
 
 #[test]
+fn an_uninitialized_gear_refuses_to_hand_out_the_names() {
+    // The name resolver is built at init with the hub's optional directory;
+    // a default here would answer for a hub it never saw.
+    let gear = SettingsService::default();
+    assert!(gear.names().is_err());
+}
+
+#[test]
 fn an_uninitialized_gear_refuses_to_hand_out_the_validator() {
     // A default validator that accepted everything would be the vacuous pass
     // the fail-closed rule exists to prevent.
@@ -386,6 +394,7 @@ async fn init_fills_every_lock_and_binds_both_sdk_traits_into_the_hub() {
         gear.writes().is_ok(),
         gear.access().is_ok(),
         gear.hierarchy().is_ok(),
+        gear.names().is_ok(),
     ] {
         assert!(accessor, "init leaves no accessor empty");
     }

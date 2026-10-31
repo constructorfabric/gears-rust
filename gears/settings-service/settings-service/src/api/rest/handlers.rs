@@ -20,7 +20,7 @@ use crate::api::rest::dto::CategoryDto;
 use crate::api::rest::if_match;
 use crate::api::rest::page_dto::PageDto;
 use crate::audit::AuditSink;
-use crate::domain::category::service::Actor;
+use crate::domain::category::service::{Actor, refusal_with_count};
 use crate::domain::category::{CategoryRepository, CategoryService};
 use crate::domain::declaration::CategoryTally;
 use crate::domain::error::DomainError;
@@ -317,25 +317,71 @@ pub async fn delete_category<R: CategoryRepository + 'static, S: AuditSink + 'st
 
     let request_id = super::audit_request_id(&headers);
     let if_match = if_match(&headers).map(str::to_owned);
-    db.db()
-        .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
-            Box::pin(async move {
-                svc.delete(
-                    tx,
-                    &scope,
-                    id,
-                    if_match.as_deref(),
-                    Actor {
-                        ctx: &ctx,
-                        request_id: &request_id,
-                    },
-                )
-                .await
-            })
-        })
-        .await?;
+    delete_reporting_count(
+        &db,
+        &svc,
+        &scope,
+        id,
+        if_match.as_deref(),
+        &request_id,
+        &ctx,
+    )
+    .await?;
 
     // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-13
     Ok(StatusCode::NO_CONTENT)
     // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-13
+}
+
+/// Run the delete in a transaction; when the foreign key refuses it, count the
+/// blocking declarations again **after** the rollback, on a fresh connection.
+///
+/// A failed statement leaves a `PostgreSQL` transaction unusable, so the count
+/// cannot ride on the refused one. The count is best effort: the refusal keeps
+/// its plain `409` when the count cannot answer.
+///
+/// # Errors
+/// As [`CategoryService::delete`].
+pub async fn delete_reporting_count<R: CategoryRepository + 'static, S: AuditSink + 'static>(
+    db: &toolkit_db::DBProvider<toolkit_db::DbError>,
+    svc: &Arc<CategoryService<R, S>>,
+    scope: &toolkit_security::AccessScope,
+    id: Uuid,
+    if_match: Option<&str>,
+    request_id: &str,
+    ctx: &SecurityContext,
+) -> Result<(), DomainError> {
+    let (tx_svc, scope, if_match) = (Arc::clone(svc), scope.clone(), if_match.map(str::to_owned));
+    let (ctx, request_id) = (ctx.clone(), request_id.to_owned());
+    let outcome = db
+        .db()
+        .transaction_ref_mapped::<_, _, DomainError>(move |tx| {
+            Box::pin(async move {
+                tx_svc
+                    .delete(
+                        tx,
+                        &scope,
+                        id,
+                        if_match.as_deref(),
+                        Actor {
+                            ctx: &ctx,
+                            request_id: &request_id,
+                        },
+                    )
+                    .await
+            })
+        })
+        .await;
+    // @cpt-begin:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
+    match outcome {
+        Err(refusal @ DomainError::Conflict { .. }) => {
+            let count = match db.conn() {
+                Ok(conn) => svc.blocking_declarations(&conn, id).await.ok(),
+                Err(_) => None,
+            };
+            Err(refusal_with_count(refusal, count))
+        }
+        other => other,
+    }
+    // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-11
 }

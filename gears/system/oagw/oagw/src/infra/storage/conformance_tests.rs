@@ -31,8 +31,8 @@ use crate::domain::model::{
     Route, Scheme, Server, SharingMode, SustainedRate, Upstream, Window,
 };
 use crate::domain::repo::{
-    DeleteOutcome, RegistryRowRepository, RepositoryError, RouteOverlap, RouteRepository, Tags,
-    UpstreamRepository,
+    DeleteOutcome, RegistryRowRepository, RepositoryError, RouteOverlap, RouteRepository, RowKey,
+    Tags, UpstreamRepository,
 };
 use crate::domain::services::management::overlapping_method;
 use crate::infra::storage::route_db_repo::DbRouteRepo;
@@ -102,6 +102,8 @@ macro_rules! conformance_suite {
             case_upstream_delete_removes_every_child_kind,
             case_list_by_alias_for_tenants_over_chain,
             case_proxy_reads_skip_only_tags,
+            case_list_proxy_routes_returns_enabled_http_routes_per_upstream,
+            case_list_proxy_routes_follows_writes,
             case_find_matching_prefers_upstream_order,
             case_find_matching_falls_back_to_ancestor_upstream,
             case_find_matching_longest_prefix_wins,
@@ -1181,6 +1183,131 @@ async fn case_proxy_reads_skip_only_tags(f: &Fixture) {
             .unwrap(),
         route
     );
+}
+
+/// `route` as the proxy reads it: without tags.
+fn untagged(mut route: Route) -> Route {
+    route.tags.clear();
+    route
+}
+
+/// The proxy configuration cache's route load (ADR-0020): per key, the
+/// upstream's enabled HTTP routes in full (methods canonical, plugins in
+/// position order) without tags, in ID order; one entry per distinct key in
+/// first-appearance order; nothing for an upstream of another tenant, a
+/// missing upstream or an upstream without routes.
+async fn case_list_proxy_routes_returns_enabled_http_routes_per_upstream(f: &Fixture) {
+    let chain = tenant_chain(2);
+    let other_tenant = Uuid::new_v4();
+    let child = add_upstream(f, upstream(chain[0], "api")).await;
+    let parent = add_upstream(f, upstream(chain[1], "api")).await;
+    let bare = add_upstream(f, upstream(chain[0], "bare")).await;
+    let foreign = add_upstream(f, upstream(other_tenant, "api")).await;
+
+    let full = add_route(f, full_http_route(chain[0], child.id)).await;
+    let short = add_route(f, http_route(chain[0], child.id, "/v1", 0)).await;
+    add_route(
+        f,
+        Route {
+            enabled: false,
+            ..http_route(chain[0], child.id, "/v2", 0)
+        },
+    )
+    .await;
+    add_route(f, grpc_route(chain[0], child.id)).await;
+    let inherited = add_route(f, http_route(chain[1], parent.id, "/v1", 0)).await;
+    add_route(f, http_route(other_tenant, foreign.id, "/v1", 0)).await;
+
+    let key = |tenant_id: Uuid, id: Uuid| RowKey { tenant_id, id };
+    let keys = [
+        key(chain[0], child.id),
+        key(chain[1], parent.id),
+        key(chain[0], bare.id),
+        key(chain[0], child.id),
+        // Another tenant's upstream, and a tenant that does not own the ID.
+        key(chain[0], foreign.id),
+        key(chain[1], child.id),
+        key(chain[0], Uuid::new_v4()),
+    ];
+    let loaded = f
+        .routes
+        .list_proxy_routes(&keys)
+        .await
+        .expect("list proxy routes");
+
+    assert_eq!(
+        loaded,
+        vec![
+            (
+                keys[0],
+                sorted_routes(vec![untagged(full), untagged(short)])
+            ),
+            (keys[1], vec![untagged(inherited)]),
+            (keys[2], vec![]),
+            (keys[4], vec![]),
+            (keys[5], vec![]),
+            (keys[6], vec![]),
+        ]
+    );
+    assert_eq!(f.routes.list_proxy_routes(&[]).await.unwrap(), vec![]);
+}
+
+/// The route load reads what is stored now: an update, a disable, a move
+/// and a delete each show in the next load.
+async fn case_list_proxy_routes_follows_writes(f: &Fixture) {
+    let tenant = Uuid::new_v4();
+    let from = add_upstream(f, upstream(tenant, "from")).await;
+    let to = add_upstream(f, upstream(tenant, "to")).await;
+    let keys = [
+        RowKey {
+            tenant_id: tenant,
+            id: from.id,
+        },
+        RowKey {
+            tenant_id: tenant,
+            id: to.id,
+        },
+    ];
+    let load = || async { f.routes.list_proxy_routes(&keys).await.unwrap() };
+    let route = add_route(f, full_http_route(tenant, from.id)).await;
+
+    let updated = f
+        .routes
+        .update(with_methods(route.clone(), &[HttpMethod::Delete]))
+        .await
+        .unwrap();
+    assert_eq!(
+        load().await,
+        vec![
+            (keys[0], vec![untagged(updated.clone())]),
+            (keys[1], vec![])
+        ]
+    );
+
+    f.routes
+        .update(Route {
+            enabled: false,
+            ..updated.clone()
+        })
+        .await
+        .unwrap();
+    assert_eq!(load().await, vec![(keys[0], vec![]), (keys[1], vec![])]);
+
+    let moved = f
+        .routes
+        .update(Route {
+            upstream_id: to.id,
+            ..updated
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        load().await,
+        vec![(keys[0], vec![]), (keys[1], vec![untagged(moved)])]
+    );
+
+    f.routes.delete(tenant, route.id).await.unwrap();
+    assert_eq!(load().await, vec![(keys[0], vec![]), (keys[1], vec![])]);
 }
 
 /// One upstream aliased `api` per tenant of a 5-level chain; IDs closest-first.

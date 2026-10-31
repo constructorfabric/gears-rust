@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-graph-storage-onnx-embedding-plugin"
-version = "0.1.1"
+version = "0.1.2"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,6 +19,7 @@ name = "onnx_embedding_plugin"
 workspace = true
 
 [dependencies]
+toolkit-security = { workspace = true }
 graph-storage-sdk = { workspace = true }
 
 async-trait = { workspace = true }
@@ -26,7 +27,6 @@ thiserror = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing = { workspace = true }
-aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 
 # The ONNX Runtime -- the pinned `ort`, the session's open under a deadline,

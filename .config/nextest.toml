@@ -40,11 +40,6 @@ filter = '''package(cf-gears-event-broker) & binary(consumer_group_rebalance_int
 )'''
 retries = 2
 
-# Seen failing on #5354 (Integration tests). Quarantine, to be fixed.
-[[profile.default.overrides]]
-filter = 'package(cf-gears-bss-ledger) & binary(postgres_chargeback_concurrency) & test(=concurrent_lost_on_one_dispute_claws_back_once)'
-retries = 2
-
 # Seen failing on #4899 (coverage). Quarantine, to be fixed.
 [[profile.default.overrides]]
 filter = 'package(cf-gears-cluster-sdk) & test(=lease::lease_tests::the_clock_follows_virtual_time)'

@@ -36,7 +36,13 @@ pub(crate) fn split_sqlite_dsn(dsn: &str) -> (&str, Option<&str>) {
 /// - the DSN with Toolkit PRAGMA parameters removed;
 /// - decoded PRAGMA pairs with lowercase keys.
 pub fn extract_sqlite_pragmas(dsn: &str) -> (String, HashMap<String, String>) {
-    const SQLITE_PRAGMA_PARAMS: &[&str] = &["wal", "synchronous", "busy_timeout", "journal_mode"];
+    const SQLITE_PRAGMA_PARAMS: &[&str] = &[
+        "wal",
+        "synchronous",
+        "busy_timeout",
+        "journal_mode",
+        "transaction_mode",
+    ];
 
     let Some((path, query)) = dsn.split_once('?') else {
         return (dsn.to_owned(), HashMap::new());
@@ -111,12 +117,12 @@ mod tests {
 
     #[test]
     fn test_extract_sqlite_pragmas_all_params() {
-        let dsn =
-            "sqlite:///test.db?wal=false&synchronous=OFF&busy_timeout=5000&journal_mode=DELETE";
+        let dsn = "sqlite:///test.db?wal=false&synchronous=OFF&busy_timeout=5000&journal_mode=DELETE&transaction_mode=immediate";
         let (clean_dsn, pairs) = extract_sqlite_pragmas(dsn);
 
         assert_eq!(clean_dsn, "sqlite:///test.db");
-        assert_eq!(pairs.len(), 4);
+        assert_eq!(pairs.len(), 5);
+        assert_eq!(pairs.get("transaction_mode"), Some(&"immediate".to_owned()));
         assert_eq!(pairs.get("wal"), Some(&"false".to_owned()));
         assert_eq!(pairs.get("synchronous"), Some(&"OFF".to_owned()));
         assert_eq!(pairs.get("busy_timeout"), Some(&"5000".to_owned()));

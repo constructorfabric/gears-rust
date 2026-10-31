@@ -66,7 +66,7 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 
 - **PRD**: [PRD.md](../PRD.md)
 - **Design**: [DESIGN.md](../DESIGN.md)
-- **ADRs**: [0009 Storage Schema](../ADR/0009-storage-schema.md), [0010 Resource Identification](../ADR/0010-resource-identification.md), [0018 Optional Persistence](../ADR/0018-optional-persistence.md)
+- **ADRs**: [0009 Storage Schema](../ADR/0009-storage-schema.md), [0010 Resource Identification](../ADR/0010-resource-identification.md), [0018 Optional Persistence](../ADR/0018-optional-persistence.md), [0020 Proxy Configuration Cache](../ADR/0020-proxy-config-cache.md)
 - **Dependencies**: `cpt-cf-oagw-feature-domain-foundation`
 
 **Out of scope**:
@@ -83,6 +83,8 @@ Adheres to `cpt-cf-oagw-principle-tenant-scope` (all operations tenant-scoped vi
 > **Authorization note**: the management API authenticates every request and scopes it to the caller's tenant, but does not evaluate the GTS permissions named in the steps below (`gts.cf.core.oagw.upstream.v1~:…`, `gts.cf.core.oagw.route.v1~:…`); no Control Plane operation calls `PolicyEnforcer` for them. Only binding to an ancestor's upstream is authorized. Within a tenant, any authenticated subject can therefore create, update, read and delete upstreams and routes. The permission steps stay unchecked until this is implemented.
 
 > **Storage note**: `Repo:` steps run against the repositories selected at startup by `cpt-cf-oagw-algo-domain-storage-selection` — in-memory without a database, the `cpt-cf-oagw-adr-storage-schema` tables with one (`cpt-cf-oagw-adr-optional-persistence`). With a database, each `Repo:` create and update runs in one transaction that covers the parent row and its child rows (tags, match keys, methods, plugin bindings), and a failure rolls the whole write back; each delete is one statement. Get and list read the parent and child rows in one read-only snapshot transaction.
+
+> **Cache note**: with a database, every `Repo:` create, update and delete also evicts the proxy configuration cache entries it affects and appends the change to the cluster change log, so every replica evicts them too (`cpt-cf-oagw-adr-proxy-config-cache`). This happens at the repository boundary after the call ends, succeeded or failed, so it covers the Management API, the SDK and the registry reconcile. The write waits at most 2 s for the append (a registry reconcile run waits once, at its end); a failed or slow append is logged and counted, and the write keeps its own result.
 
 ### Create Upstream Flow
 
@@ -516,6 +518,7 @@ The system **MUST** return all management API errors in RFC 9457 Problem Details
 - [x] Deleting an upstream with a database configured writes with one `DELETE` statement, after a read of the upstream's owner; the foreign-key cascade removes the upstream's tags and plugin bindings, its routes, and the routes' child rows
 - [x] Update and delete of an upstream or route managed by the types registry return 400 `failed_precondition` with violation type `REGISTRY_MANAGED` and change nothing; a route created through the API on a registry-managed upstream is accepted
 - [x] A failed multi-table write with a database configured leaves no partial rows
+- [x] With a database, each upstream and route create, update and delete evicts the proxy configuration cache entries it affects, on this replica before it answers and on the other replicas through the cluster change log; a write whose request is cancelled mid-call still evicts locally; a failed change log append does not fail the write
 - [x] Tags, HTTP path prefixes and gRPC service and method names within the stored field limits are accepted on create and update; longer values or values with control characters are rejected with 400 on every storage backend
 - [x] Tags and HTTP methods are de-duplicated and returned in canonical order (tags ascending; methods `GET, POST, PUT, DELETE, PATCH`) on both storage backends
 - [ ] OData $filter, $select, $orderby, $top (default 50, max 100), $skip supported on list endpoints; invalid syntax returns 400

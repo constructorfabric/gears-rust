@@ -104,6 +104,7 @@ mod db_provider;
 mod pool_opts;
 #[cfg(feature = "sqlite")]
 mod sqlite;
+mod tx_begin;
 
 // Re-export important types from new gears
 pub use config::{DbConnConfig, GlobalDatabaseConfig, PoolCfg};
@@ -359,6 +360,9 @@ pub(crate) struct DbHandle {
     dsn: String,
     sea: DatabaseConnection,
     locks: advisory_locks::LockManager,
+    /// `SQLite` `transaction_mode=immediate`: [`Db`]'s transactions that may write begin with
+    /// `BEGIN IMMEDIATE` (see `tx_begin`). Always `false` on other engines.
+    sqlite_begin_immediate: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -415,6 +419,7 @@ impl DbHandle {
                     dsn: dsn.to_owned(),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 })
             }
             #[cfg(not(feature = "pg"))]
@@ -435,6 +440,7 @@ impl DbHandle {
                     dsn: dsn.to_owned(),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 })
             }
             #[cfg(not(feature = "mysql"))]
@@ -446,6 +452,8 @@ impl DbHandle {
                 // Extract SQLite PRAGMA parameters from DSN
                 let (clean_dsn, pairs) = extract_sqlite_pragmas(&dsn);
                 let pragmas = Pragmas::from_pairs(&pairs);
+                // Strict, as in a gear's `params`: a typo must not silently leave writers deferred.
+                let transaction_mode = options::sqlite_pragma::transaction_mode(&pairs)?;
 
                 // Build pool options with shared trait
                 let o = SqlitePoolOptions::new().apply(&opts);
@@ -517,6 +525,8 @@ impl DbHandle {
                     dsn: clean_dsn,
                     sea,
                     locks,
+                    sqlite_begin_immediate: transaction_mode
+                        == sqlite::pragmas::TransactionMode::Immediate,
                 })
             }
             #[cfg(not(feature = "sqlite"))]
@@ -569,6 +579,11 @@ impl DbHandle {
     #[must_use]
     pub(crate) fn sea_internal_ref(&self) -> &DatabaseConnection {
         &self.sea
+    }
+
+    /// Whether [`Db`]'s `SQLite` transactions that may write begin with `BEGIN IMMEDIATE`.
+    pub(crate) fn sqlite_begin_immediate(&self) -> bool {
+        self.sqlite_begin_immediate
     }
 
     // --- Advisory locks ---

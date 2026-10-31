@@ -7,7 +7,9 @@
 //! and `DbConn` are all sealed so a raw database handle cannot escape the
 //! framework. That is a deliberate security property, and its consequence is
 //! that a gear cannot drive its own services from a unit test, even against a
-//! stub repository.
+//! stub repository. The one exception is the `foreign_key_path` module, which
+//! drives the service over the harness's real connection with a fake
+//! repository -- the connection is only passed through, never constructed here.
 //!
 //! So the rules that can be stated without a connection are extracted and
 //! pinned here. The orchestration around them — that the precondition is
@@ -217,5 +219,211 @@ mod transactional {
             .await
             .expect("lookup");
         assert!(found.is_none());
+    }
+}
+
+mod foreign_key_path {
+    //! The foreign key refuses a delete the advisory check let through; the
+    //! service passes the refusal on and asks nothing more of the refused
+    //! transaction -- the recount belongs after the rollback.
+
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use toolkit_db::secure::DBRunner;
+    use toolkit_odata::ODataQuery;
+
+    use crate::domain::odata::Listing;
+    use toolkit_security::{AccessScope, SecurityContext};
+    use uuid::Uuid;
+
+    use crate::domain::category::service::Actor;
+    use crate::domain::category::visibility::DomainVisibility;
+    use crate::domain::category::{
+        Category, CategoryDraft, CategoryKey, CategoryPatch, CategoryRepository, CategoryService,
+    };
+    use crate::domain::error::DomainError;
+    use crate::domain::precondition::ETag;
+    use crate::test_support::{RecordingAudit, ResolutionHarness};
+
+    /// Answers 0 to the first count (the pre-check passes), 3 afterwards, and
+    /// refuses the delete the way `ON DELETE RESTRICT` does.
+    struct RacedRepo {
+        category: Category,
+        counts: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CategoryRepository for RacedRepo {
+        async fn find<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _id: Uuid,
+        ) -> Result<Option<Category>, DomainError> {
+            Ok(Some(self.category.clone()))
+        }
+
+        async fn find_by_key<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _key: &CategoryKey,
+        ) -> Result<Option<Category>, DomainError> {
+            unimplemented!()
+        }
+
+        async fn insert<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _draft: CategoryDraft,
+        ) -> Result<Category, DomainError> {
+            unimplemented!()
+        }
+
+        async fn update<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _id: Uuid,
+            _patch: CategoryPatch,
+            _expected: time::OffsetDateTime,
+        ) -> Result<Category, DomainError> {
+            unimplemented!()
+        }
+
+        async fn delete<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _id: Uuid,
+            _expected: time::OffsetDateTime,
+        ) -> Result<(), DomainError> {
+            Err(DomainError::Conflict {
+                detail: "the category still has declarations referencing it".to_owned(),
+            })
+        }
+
+        async fn list<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _scope: &AccessScope,
+            _visibility: &DomainVisibility,
+            _query: &ODataQuery,
+        ) -> Result<Listing<Category>, DomainError> {
+            unimplemented!()
+        }
+
+        async fn count_referencing_declarations<C: DBRunner>(
+            &self,
+            _conn: &C,
+            _id: Uuid,
+        ) -> Result<u64, DomainError> {
+            let call = self.counts.fetch_add(1, Ordering::SeqCst);
+            Ok(if call == 0 { 0 } else { 3 })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_issues_no_further_statement_on_the_transaction() {
+        // A failed statement leaves a PostgreSQL transaction unusable, so the
+        // refusal is returned as the repository gave it and the only count
+        // taken is the pre-check's.
+        let h = ResolutionHarness::new().await;
+        let conn = h.db.conn().expect("connection");
+        let counts = Arc::new(AtomicUsize::new(0));
+        let category = Category {
+            id: Uuid::new_v4(),
+            key: CategoryKey::parse("network").expect("slug"),
+            name: "network".to_owned(),
+            description: None,
+            domain_affinity: None,
+            sort_order: 0,
+            icon: None,
+            etag: ETag::new("\"v1\""),
+            updated_at: time::OffsetDateTime::now_utc(),
+        };
+        let id = category.id;
+        let svc = CategoryService::new(
+            RacedRepo {
+                category,
+                counts: Arc::clone(&counts),
+            },
+            Arc::new(RecordingAudit::default()),
+        );
+        let ctx = SecurityContext::anonymous();
+
+        let refused = svc
+            .delete(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                Some("\"v1\""),
+                Actor {
+                    ctx: &ctx,
+                    request_id: "req-1",
+                },
+            )
+            .await
+            .expect_err("the constraint refuses");
+
+        match refused {
+            DomainError::Conflict { detail } => {
+                assert_eq!(detail, "the category still has declarations referencing it");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            counts.load(Ordering::SeqCst),
+            1,
+            "only the pre-check counts; the recount happens after the rollback"
+        );
+    }
+}
+
+mod refusal_with_count {
+    //! The recount after a refused delete is an enrichment: it may sharpen the
+    //! refusal, never replace it with something worse.
+
+    use crate::domain::category::service::refusal_with_count;
+    use crate::domain::error::DomainError;
+
+    fn original() -> DomainError {
+        DomainError::Conflict {
+            detail: "the category still has declarations referencing it".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_positive_count_is_named_in_the_refusal() {
+        match refusal_with_count(original(), Some(3)) {
+            DomainError::Conflict { detail } => {
+                assert!(detail.contains("3 declaration"), "{detail}");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_zero_count_keeps_the_original_refusal() {
+        // The racing declaration vanished again.
+        match refusal_with_count(original(), Some(0)) {
+            DomainError::Conflict { detail } => {
+                assert_eq!(detail, "the category still has declarations referencing it");
+            }
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_count_keeps_the_original_refusal() {
+        match refusal_with_count(original(), None) {
+            DomainError::Conflict { detail } => {
+                assert_eq!(detail, "the category still has declarations referencing it");
+            }
+            other => panic!("a failed recount must not change the refusal, got {other:?}"),
+        }
     }
 }

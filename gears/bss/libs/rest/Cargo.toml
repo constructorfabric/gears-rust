@@ -10,7 +10,6 @@ name = "bss_rest"
 [dependencies]
 axum = { workspace = true }       # the response type the gears return
 http = { workspace = true }       # HeaderMap, HeaderValue, status codes
-aws-lc-rs = { workspace = true }  # SHA-256 of the served body
 base64 = { workspace = true }     # base64url of that digest
 serde = { workspace = true }      # Serialize bound on the response value
 serde_json = { workspace = true } # the exact JSON bytes the tag covers

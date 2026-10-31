@@ -52,7 +52,7 @@ use std::{
     time::Duration,
 };
 
-use sea_orm::{DatabaseConnection, DatabaseTransaction, TransactionTrait};
+use sea_orm::{DatabaseConnection, DatabaseTransaction};
 
 use super::tx_config::{TxConfig, TxIsolationLevel};
 use super::tx_error::TxError;
@@ -426,6 +426,53 @@ impl Db {
         self.handle.sea_internal_ref().get_database_backend()
     }
 
+    /// Begin a transaction that may write, at the database's default isolation
+    /// ([`Self::begin_tx_with_config`] with [`TxConfig::default`]).
+    pub(crate) async fn begin_tx(&self) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+        self.begin_tx_with_config(TxConfig::default()).await
+    }
+
+    /// Begin a transaction with `config`'s isolation and access mode. On a `SQLite`
+    /// database with `transaction_mode=immediate`, one that may write begins
+    /// `IMMEDIATE` (see `tx_begin`). The outbox workers begin theirs here too.
+    pub(crate) async fn begin_tx_with_config(
+        &self,
+        config: TxConfig,
+    ) -> Result<DatabaseTransaction, sea_orm::DbErr> {
+        crate::tx_begin::begin(
+            self.handle.sea_internal_ref(),
+            config.isolation.map(Into::into),
+            config.access_mode.map(Into::into),
+            self.handle.sqlite_begin_immediate(),
+        )
+        .await
+    }
+
+    /// **Test support**: close the pool and wait until each of its connections has closed.
+    ///
+    /// Dropping the last `Db` closes the pool too, but in the background: a
+    /// `SQLite` connection can still hold the file (finishing its WAL checkpoint)
+    /// when the next connection opens it, and that open fails with `database is
+    /// locked`. A test that reopens a file database calls this first.
+    ///
+    /// It closes the pool every clone of this `Db` shares (a manager-cached `Db`
+    /// included), so it is not for service code; and it waits for checked-out
+    /// connections, so calling it while this task holds a transaction or
+    /// `DbConn` on the pool never returns. It does not close the dedicated
+    /// advisory-lock session that `PostgreSQL` and `MySQL` keep beside the pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the driver fails to close the pool.
+    #[cfg(feature = "test-support")]
+    pub async fn close(&self) -> Result<(), DbError> {
+        self.handle
+            .sea_internal_ref()
+            .close_by_ref()
+            .await
+            .map_err(DbError::from)
+    }
+
     // --- Advisory locks (forwarded, no `DbHandle` exposure) ---
 
     /// Acquire an advisory lock with the given key and gear namespace.
@@ -491,7 +538,7 @@ impl Db {
             + Send,
         T: Send + 'static,
     {
-        let txn = self.handle.sea_internal_ref().begin().await?;
+        let txn = self.begin_tx().await?;
         let tx = DbTx { tx: &txn };
 
         // Run the closure with the transaction guard set
@@ -535,9 +582,7 @@ impl Db {
         T: Send + 'static,
     {
         let txn = self
-            .handle
-            .sea_internal_ref()
-            .begin()
+            .begin_tx()
             .await
             .map_err(DbError::from)
             .map_err(E::from)?;
@@ -611,15 +656,8 @@ impl Db {
             + Send,
         T: Send + 'static,
     {
-        use sea_orm::{AccessMode, IsolationLevel};
-
-        let isolation: Option<IsolationLevel> = tx_config.isolation.map(Into::into);
-        let access_mode: Option<AccessMode> = tx_config.access_mode.map(Into::into);
-
         let txn = self
-            .handle
-            .sea_internal_ref()
-            .begin_with_config(isolation, access_mode)
+            .begin_tx_with_config(tx_config.clone())
             .await
             .map_err(DbError::from)
             .map_err(E::from)
@@ -926,7 +964,7 @@ impl Db {
             + Send,
         T: Send + 'static,
     {
-        let txn = match self.handle.sea_internal_ref().begin().await {
+        let txn = match self.begin_tx().await {
             Ok(t) => t,
             Err(e) => return (self, Err(e.into())),
         };
@@ -976,7 +1014,7 @@ impl Db {
     {
         use super::tx_error::InfraError;
 
-        let txn = match self.handle.sea_internal_ref().begin().await {
+        let txn = match self.begin_tx().await {
             Ok(txn) => txn,
             Err(e) => return (self, Err(TxError::Infra(InfraError::new(e.to_string())))),
         };
@@ -1030,17 +1068,7 @@ impl Db {
                 -> Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send + 'a>>
             + Send,
     {
-        use sea_orm::{AccessMode, IsolationLevel};
-
-        let isolation: Option<IsolationLevel> = config.isolation.map(Into::into);
-        let access_mode: Option<AccessMode> = config.access_mode.map(Into::into);
-
-        let txn = match self
-            .handle
-            .sea_internal_ref()
-            .begin_with_config(isolation, access_mode)
-            .await
-        {
+        let txn = match self.begin_tx_with_config(config.clone()).await {
             Ok(t) => t,
             Err(e) => return (self, Err(e.into())),
         };

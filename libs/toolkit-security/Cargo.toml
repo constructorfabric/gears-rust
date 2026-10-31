@@ -18,11 +18,29 @@ name = "toolkit_security"
 [lints]
 workspace = true
 
+# This dependency only unifies target-gated FIPS features on rustls.
+[package.metadata.cargo-shear]
+ignored = ["rustls-fips-shim"]
+
 [features]
+# JWT decoding keeps jsonwebtoken's claim validation after facade verification.
+jwt = ["dep:jsonwebtoken", "dep:base64", "dep:spki"]
+# Application primitives use the same native backend policy as TLS.
+fips = ["dep:rustls-fips-shim", "dep:rustls-corecrypto-provider", "rustls-corecrypto-provider/fips", "dep:rustls-cng-crypto", "dep:security-framework", "dep:win-crypto-ng"]
 # Enables `internal_auth_cache::CachingInternalAuthenticator`.
-internal-auth-cache = ["dep:tokio", "dep:base64", "dep:serde_json", "dep:parking_lot", "dep:sha2"]
+internal-auth-cache = ["dep:tokio", "dep:base64", "dep:serde_json", "dep:parking_lot"]
 
 [dependencies]
+rustls = { workspace = true }
+aws-lc-rs = { workspace = true }
+rustls-fips-shim = { workspace = true, optional = true }
+pkcs1 = { version = "0.7", features = ["alloc"] }
+pkcs8 = { workspace = true }
+sec1 = { workspace = true }
+spki = { version = "0.7", optional = true }
+jsonwebtoken = { workspace = true, optional = true }
+subtle = "2"
+zeroize = { workspace = true }
 uuid = { workspace = true, features = ["v4"] }
 serde = { workspace = true }
 postcard = { workspace = true }
@@ -36,10 +54,17 @@ parking_lot = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["sync", "time"], optional = true }
 serde_json = { workspace = true, optional = true }
-# Cache keys are a digest of the credential, never the credential itself.
-sha2 = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3.7", optional = true }
+rustls-corecrypto-provider = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+win-crypto-ng = { version = "0.5.1", optional = true }
+rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
+hex = { workspace = true }
 serde_json = { workspace = true }
 toolkit-gts = { package = "cf-gears-toolkit-gts", path = "../toolkit-gts" }
 trybuild = { workspace = true }

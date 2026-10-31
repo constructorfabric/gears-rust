@@ -69,7 +69,64 @@ pub struct OagwConfig {
     /// Provisioning*).
     #[serde(default)]
     pub registry_provisioning: RegistryProvisioningConfig,
+    /// The proxy configuration cache on a database backend (ADR-0020).
+    #[serde(default)]
+    pub proxy_cache: ProxyCacheConfig,
 }
+
+/// The per-replica cache of the configuration the proxy reads. Without a
+/// database it has no effect: the in-memory store is read directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyCacheConfig {
+    /// Whether proxy resolution reads through the cache. With `false` every
+    /// lookup reads the database, writes publish nothing to the cluster change
+    /// log, and no cluster is needed. Set it alike on every replica of one
+    /// database: replicas that cache see a non-caching replica's writes only
+    /// after the TTL. Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// How long an entry lives: the bound on staleness when a change is not
+    /// delivered. Humantime (`60s`). From 1 second to 1 hour. Default:
+    /// 60 seconds.
+    #[serde(
+        default = "default_proxy_cache_ttl",
+        with = "toolkit_utils::humantime_serde"
+    )]
+    pub ttl: Duration,
+    /// Entries per section (upstream candidates by alias, routes by
+    /// upstream); when a section is full the least recently used entry goes. From
+    /// 1 to 1 000 000. Default: 10 000.
+    #[serde(default = "default_proxy_cache_max_entries")]
+    pub max_entries: usize,
+}
+
+impl Default for ProxyCacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            ttl: default_proxy_cache_ttl(),
+            max_entries: default_proxy_cache_max_entries(),
+        }
+    }
+}
+
+fn default_proxy_cache_ttl() -> Duration {
+    Duration::from_mins(1)
+}
+
+fn default_proxy_cache_max_entries() -> usize {
+    10_000
+}
+
+/// Bounds of `proxy_cache.ttl`: below a second the cache barely serves a
+/// burst; above an hour a lost change stays visible too long.
+const PROXY_CACHE_TTL_MIN: Duration = Duration::from_secs(1);
+const PROXY_CACHE_TTL_MAX: Duration = Duration::from_hours(1);
+
+/// Upper bound of `proxy_cache.max_entries`, per section: two sections of a
+/// million entries can hold gigabytes, so a larger value is a typo.
+const PROXY_CACHE_MAX_ENTRIES_MAX: usize = 1_000_000;
 
 /// The registry reconcile on a database backend.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +211,7 @@ impl Default for OagwConfig {
             ssrf_policy: SsrfPolicy::default(),
             metrics: MetricsConfig::default(),
             registry_provisioning: RegistryProvisioningConfig::default(),
+            proxy_cache: ProxyCacheConfig::default(),
         }
     }
 }
@@ -219,6 +277,23 @@ impl OagwConfig {
             return Err(format!(
                 "registry_provisioning.generation must be at most {} (stored as BIGINT), got {generation}",
                 i64::MAX
+            ));
+        }
+        let ttl = self.proxy_cache.ttl;
+        if !(PROXY_CACHE_TTL_MIN..=PROXY_CACHE_TTL_MAX).contains(&ttl) {
+            return Err(format!(
+                "proxy_cache.ttl must be between 1s and 1h, got {ttl:?}"
+            ));
+        }
+        let max_entries = self.proxy_cache.max_entries;
+        if max_entries == 0 {
+            return Err(format!(
+                "proxy_cache.max_entries must be at least 1, got {max_entries}"
+            ));
+        }
+        if max_entries > PROXY_CACHE_MAX_ENTRIES_MAX {
+            return Err(format!(
+                "proxy_cache.max_entries must be at most {PROXY_CACHE_MAX_ENTRIES_MAX}, got {max_entries}"
             ));
         }
         #[cfg(feature = "fips")]
@@ -306,6 +381,7 @@ impl fmt::Debug for OagwConfig {
             .field("management_api_enabled", &self.management_api_enabled)
             .field("ssrf_policy", &self.ssrf_policy)
             .field("registry_provisioning", &self.registry_provisioning)
+            .field("proxy_cache", &self.proxy_cache)
             .finish()
     }
 }
@@ -454,6 +530,90 @@ mod tests {
         assert_eq!(with(i64::MAX as u64), Ok(()));
         let err = with(i64::MAX as u64 + 1).expect_err("beyond BIGINT");
         assert!(err.contains("registry_provisioning.generation"), "{err}");
+    }
+
+    #[test]
+    fn proxy_cache_defaults_to_enabled_one_minute_and_ten_thousand_entries() {
+        let config: OagwConfig = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(config.proxy_cache.enabled);
+        assert_eq!(config.proxy_cache.ttl, Duration::from_secs(60));
+        assert_eq!(config.proxy_cache.max_entries, 10_000);
+        let partial: OagwConfig = serde_json::from_value(serde_json::json!({
+            "proxy_cache": { "enabled": false }
+        }))
+        .unwrap();
+        assert!(!partial.proxy_cache.enabled);
+        assert_eq!(
+            partial.proxy_cache.ttl,
+            Duration::from_secs(60),
+            "the rest defaults"
+        );
+        assert_eq!(partial.proxy_cache.max_entries, 10_000);
+    }
+
+    #[test]
+    fn proxy_cache_reads_a_humantime_ttl_and_rejects_unknown_keys() {
+        let config: OagwConfig = serde_json::from_value(serde_json::json!({
+            "proxy_cache": { "enabled": true, "ttl": "2m 30s", "max_entries": 5 }
+        }))
+        .unwrap();
+        assert_eq!(config.proxy_cache.ttl, Duration::from_secs(150));
+        assert_eq!(config.proxy_cache.max_entries, 5);
+        let unknown = serde_json::from_value::<OagwConfig>(serde_json::json!({
+            "proxy_cache": { "ttl_secs": 60 }
+        }));
+        assert!(unknown.is_err(), "unknown keys are rejected");
+    }
+
+    #[test]
+    fn validate_bounds_the_proxy_cache_ttl_from_one_second_to_an_hour() {
+        let with = |ttl| {
+            let mut config = OagwConfig::default();
+            config.proxy_cache.ttl = ttl;
+            config.validate()
+        };
+        for rejected in [
+            Duration::ZERO,
+            Duration::from_millis(999),
+            Duration::from_hours(1) + Duration::from_millis(1),
+        ] {
+            let err = with(rejected).expect_err("out of range");
+            assert!(err.contains("proxy_cache.ttl"), "{err}");
+            assert!(err.contains(&format!("{rejected:?}")), "{err}");
+        }
+        for accepted in [
+            Duration::from_secs(1),
+            Duration::from_mins(1),
+            Duration::from_hours(1),
+        ] {
+            assert_eq!(with(accepted), Ok(()));
+        }
+    }
+
+    #[test]
+    fn validate_needs_at_least_one_proxy_cache_entry() {
+        let with = |max_entries| {
+            let mut config = OagwConfig::default();
+            config.proxy_cache.max_entries = max_entries;
+            config.validate()
+        };
+        let err = with(0).expect_err("no room");
+        assert!(err.contains("proxy_cache.max_entries"), "{err}");
+        assert!(err.contains("got 0"), "{err}");
+        assert_eq!(with(1), Ok(()));
+    }
+
+    #[test]
+    fn validate_bounds_the_proxy_cache_entries_at_a_million() {
+        let with = |max_entries| {
+            let mut config = OagwConfig::default();
+            config.proxy_cache.max_entries = max_entries;
+            config.validate()
+        };
+        assert_eq!(with(1_000_000), Ok(()));
+        let err = with(1_000_001).expect_err("too many");
+        assert!(err.contains("proxy_cache.max_entries"), "{err}");
+        assert!(err.contains("got 1000001"), "{err}");
     }
 
     #[cfg(feature = "fips")]

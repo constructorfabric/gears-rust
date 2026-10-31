@@ -63,6 +63,7 @@ pub struct SettingsService {
     config: OnceLock<Arc<SettingsServiceConfig>>,
     db: OnceLock<Arc<DBProvider<DbError>>>,
     enforcer: OnceLock<Arc<PolicyEnforcer>>,
+    names: OnceLock<Arc<crate::infra::actor_names::ActorNameResolver>>,
     types: OnceLock<Arc<dyn TypesRegistryClient>>,
     validator: OnceLock<Arc<dyn TypeValidator>>,
     categories: OnceLock<
@@ -94,6 +95,7 @@ impl Default for SettingsService {
             config: OnceLock::new(),
             db: OnceLock::new(),
             enforcer: OnceLock::new(),
+            names: OnceLock::new(),
             types: OnceLock::new(),
             validator: OnceLock::new(),
             categories: OnceLock::new(),
@@ -409,6 +411,17 @@ impl SettingsService {
             .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
     }
 
+    /// The actor name resolver, once initialization has run.
+    ///
+    /// # Errors
+    /// Returns an error when called before [`Gear::init`].
+    pub fn names(&self) -> anyhow::Result<Arc<crate::infra::actor_names::ActorNameResolver>> {
+        self.names
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} gear not initialized", Self::MODULE_NAME))
+    }
+
     /// The GTS types registry, once initialization has run.
     ///
     /// A declaration's value type lives in the registry, not here: the read
@@ -545,6 +558,15 @@ impl Gear for SettingsService {
         self.enforcer
             .set(Arc::new(PolicyEnforcer::from_hub(Arc::clone(&hub))))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        // Actor names on the history read: AM is found in the hub at each pass.
+        self.names
+            .set(Arc::new(
+                crate::infra::actor_names::ActorNameResolver::from_hub(
+                    Arc::clone(&hub),
+                    Arc::new(crate::infra::actor_name_metrics::OtelActorNameMetrics::new()),
+                ),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         let platform_scope: Arc<dyn PlatformScope> =
             Arc::new(crate::infra::platform_scope::HubPlatformScope::new(hub));
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-6
@@ -659,6 +681,11 @@ impl Gear for SettingsService {
             crate::infra::secret_manager::CredStoreSecretManager::new(credstore),
         );
         let step_up_for_admin = Arc::clone(&step_up);
+        // One counter set for the write path and the declaration admin, so
+        // `settings_step_up_total` is one series per operation.
+        let write_metrics: Arc<dyn crate::domain::ports::WriteMetrics> =
+            Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new());
+        let secrets_for_admin = Arc::clone(&secrets);
         let writer = Arc::new(crate::domain::writes::ValueWriter::new(
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),
@@ -668,7 +695,7 @@ impl Gear for SettingsService {
             Arc::clone(&secrets),
             crate::infra::storage::pending_secret_repo::PendingSecretRepo,
             Arc::new(crate::infra::write_metrics::LoggingPublisher),
-            Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
+            Arc::clone(&write_metrics),
         ));
         self.writes
             .set(Arc::new(crate::infra::value_writes::WriteCoordinator::new(
@@ -744,6 +771,9 @@ impl Gear for SettingsService {
                 Arc::clone(&step_up_for_admin),
                 crate::infra::storage::audit_store::AuditStore,
                 Arc::clone(&cache),
+                crate::infra::storage::pending_secret_repo::PendingSecretRepo,
+                secrets_for_admin,
+                write_metrics,
             )))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
@@ -800,6 +830,7 @@ impl RestApiCapability for SettingsService {
             self.resolver()?,
             self.db()?,
             self.enforcer()?,
+            self.names()?,
         );
         let router = crate::api::rest::value_routes::register_routes(
             router,

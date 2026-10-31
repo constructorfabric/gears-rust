@@ -165,7 +165,7 @@ async fn get_price(
     .await
     .map_err(price_denied)?;
     let tenant = ctx.subject_tenant_id();
-    let body = support::transaction_door(&state.db.db(), move |tx| {
+    let body = support::transaction_door_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move {
             load_price(tx, &scope, tenant, id)

@@ -471,7 +471,7 @@ async fn snapshot(
     item: Option<Uuid>,
     date: Date,
 ) -> Result<ReadSnapshot, CanonicalError> {
-    support::transaction_door(&state.db.db(), move |tx| {
+    support::transaction_door_read(&state.db.db(), move |tx| {
         let scope = scope.clone();
         Box::pin(async move {
             read_stored_at(

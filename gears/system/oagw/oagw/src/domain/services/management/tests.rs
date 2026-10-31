@@ -4,7 +4,9 @@ use crate::domain::model::{
     Endpoint, GrpcMatch, HttpMatch, HttpMethod, MatchRules, PathSuffixMode, Scheme, Server,
 };
 use crate::domain::repo::{RowKey, Tags};
-use crate::domain::services::registry_reconcile::tests::{Backend, Stores, in_memory_planes};
+use crate::domain::services::registry_reconcile::tests::{
+    Backend, CachedPlanes, Failed, Resolved, Stores, in_memory_planes, is_disabled, is_not_found,
+};
 use crate::domain::services::{RegistryProvisioner, UpstreamCheck};
 use crate::domain::ssrf::{SsrfGuard, SsrfPolicy};
 
@@ -24,6 +26,7 @@ fn make_service() -> ControlPlaneServiceImpl {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     )
 }
 
@@ -35,6 +38,7 @@ fn make_service_with_resolver(resolver: MockTenantResolverClient) -> ControlPlan
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     )
 }
 
@@ -49,6 +53,7 @@ fn make_service_with_resolver_and_creds(
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::with_secrets(creds)),
         Arc::new(SsrfGuard::disabled()),
+        None,
     )
 }
 
@@ -874,6 +879,7 @@ async fn alias_shadowing_over_four_levels(backend: Backend) {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let shared = |enabled| CreateUpstreamRequest {
         auth: Some(AuthConfig {
@@ -1200,6 +1206,21 @@ fn make_rate_limit(sharing: SharingMode, rate: u32, window: Window) -> RateLimit
         response_headers: true,
         pool_owner_id: None,
     }
+}
+
+/// A candidate whose tenant is not in the chain sorts after the chain's,
+/// so it never wins over the subject tenant's own upstream.
+#[test]
+fn select_upstream_ranks_a_tenant_outside_the_chain_last() {
+    let (child, parent) = (Uuid::new_v4(), Uuid::new_v4());
+    let shared = Some(make_rate_limit(SharingMode::Inherit, 10, Window::Second));
+    let outsider = make_upstream(Uuid::new_v4(), "a", None, shared, None, vec![]);
+    let own = make_upstream(child, "a", None, None, None, vec![]);
+
+    let (selected, _) =
+        super::resolution::select_upstream(&[outsider, own.clone()], child, &[child, parent])
+            .expect("selected");
+    assert_eq!(selected.id, own.id);
 }
 
 #[test]
@@ -1995,6 +2016,7 @@ async fn bind_maps_not_found_error_to_secret_ref_not_accessible() {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::erroring_not_found()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
 
     let root_ctx = test_ctx(root);
@@ -2053,6 +2075,7 @@ async fn secret_ref_check_maps_a_credstore_outage_to_internal() {
             allow_all_enforcer(),
             Arc::new(crate::domain::test_support::ErroringCredStore(error)),
             Arc::new(SsrfGuard::disabled()),
+            None,
         );
         let mut req = make_create_upstream_hostname();
         req.auth = Some(auth_with_secret_ref("cred://my-key"));
@@ -2081,6 +2104,7 @@ async fn malformed_secret_ref_is_rejected_before_the_credstore_is_asked() {
             credstore_sdk::CredStoreError::NoPluginAvailable
         })),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let mut req = make_create_upstream_hostname();
     req.auth = Some(auth_with_secret_ref("cred://has spaces/and..dots"));
@@ -5016,6 +5040,7 @@ fn make_service_ssrf_enabled() -> ControlPlaneServiceImpl {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::from_config(&Default::default()).unwrap()),
+        None,
     )
 }
 
@@ -5219,6 +5244,7 @@ fn make_service_over(
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     )
 }
 
@@ -5879,6 +5905,7 @@ async fn resolution_rejects_an_upstream_whose_hostname_was_denied_later() {
             allow_all_enforcer(),
             Arc::new(MockCredStoreClient::empty()),
             Arc::new(guard),
+            None,
         )
     };
     let ctx = test_ctx(Uuid::new_v4());
@@ -5936,6 +5963,7 @@ async fn route_create_after_its_upstream_was_deleted_is_a_validation_error() {
         allow_all_enforcer(),
         Arc::new(MockCredStoreClient::empty()),
         Arc::new(SsrfGuard::disabled()),
+        None,
     );
     let ctx = test_ctx(Uuid::new_v4());
     // Only the in-memory repository the check reads holds the upstream.
@@ -6087,4 +6115,851 @@ async fn registry_writes_to_api_rows_are_conflicts() {
     );
     assert!(svc.get_route(&ctx, route.id).await.is_ok());
     assert!(svc.get_upstream(&ctx, upstream.id).await.is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// Resolution through the proxy configuration cache (ADR-0020)
+// ---------------------------------------------------------------------------
+
+/// A [`ProxyConfigReader`] over a real [`CachedProxyConfigReader`] that
+/// counts its calls, so a test knows resolution went through it.
+struct CountingReader {
+    inner: crate::infra::proxy_cache::CachedProxyConfigReader,
+    aliases: std::sync::atomic::AtomicUsize,
+    routes: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingReader {
+    fn calls(&self) -> (usize, usize) {
+        use std::sync::atomic::Ordering::SeqCst;
+        (self.aliases.load(SeqCst), self.routes.load(SeqCst))
+    }
+}
+
+#[async_trait]
+impl ProxyConfigReader for CountingReader {
+    async fn upstreams_by_alias(
+        &self,
+        alias: &str,
+        chain: &[Uuid],
+    ) -> Result<Arc<[Upstream]>, RepositoryError> {
+        self.aliases
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.upstreams_by_alias(alias, chain).await
+    }
+
+    async fn routes_of(&self, upstreams: &[RowKey]) -> Result<Vec<Arc<[Route]>>, RepositoryError> {
+        self.routes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.routes_of(upstreams).await
+    }
+}
+
+/// Two Control Planes over one store and tenant hierarchy (root first): the
+/// first resolves through a proxy configuration cache over the store, the
+/// second reads the store. The reader counts the cached one's reads.
+fn cached_and_uncached(
+    stores: &Stores,
+    hierarchy: &[Uuid],
+) -> (
+    ControlPlaneServiceImpl,
+    ControlPlaneServiceImpl,
+    Arc<CountingReader>,
+) {
+    use crate::infra::proxy_cache::{CachedProxyConfigReader, ProxyConfigCache};
+
+    let reader = Arc::new(CountingReader {
+        inner: CachedProxyConfigReader::new(
+            Arc::new(ProxyConfigCache::new(
+                std::time::Duration::from_secs(60),
+                100,
+                Arc::new(crate::domain::ports::NoopMetrics),
+            )),
+            stores.upstreams.clone(),
+            stores.routes.clone(),
+        ),
+        aliases: std::sync::atomic::AtomicUsize::new(0),
+        routes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let service = |reader: Option<Arc<dyn ProxyConfigReader>>| {
+        ControlPlaneServiceImpl::new(
+            stores.upstreams.clone(),
+            stores.routes.clone(),
+            Arc::new(MockTenantResolverClient::with_hierarchy(
+                hierarchy.iter().copied().map(TenantId).collect(),
+            )),
+            allow_all_enforcer(),
+            Arc::new(MockCredStoreClient::empty()),
+            Arc::new(SsrfGuard::disabled()),
+            reader,
+        )
+    };
+    (service(Some(reader.clone())), service(None), reader)
+}
+
+/// What `tenant` resolves `alias` (and `method_path`) to, as a comparable
+/// value: the effective upstream and route, or the error.
+async fn resolution(
+    svc: &ControlPlaneServiceImpl,
+    tenant: Uuid,
+    alias: &str,
+    method_path: Option<(&str, &str)>,
+) -> Resolved {
+    let ctx = test_ctx(tenant);
+    let chain = svc.build_tenant_chain(&ctx).await.unwrap();
+    svc.resolve_alias(&ctx, &chain, alias, method_path, Tags::Skip)
+        .await
+        .map_err(Failed)
+}
+
+/// Over four levels, with a shadowing child, an unshared middle upstream,
+/// inherited rate limits and routes on several levels, every tenant resolves
+/// every target through the cache to the same upstream, route and effective
+/// config as without it, on a miss and on a hit.
+///
+/// ADR-0020: CACHE-HIT-002.
+async fn cached_resolution_matches_uncached(backend: Backend) {
+    let [root, a, b, leaf] = std::array::from_fn(|_| Uuid::new_v4());
+    let stores = Stores::new(backend);
+    let (cached, uncached, reader) = cached_and_uncached(&stores, &[root, a, b, leaf]);
+    let shared = |rate| CreateUpstreamRequest {
+        auth: Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        }),
+        rate_limit: Some(make_rate_limit(SharingMode::Inherit, rate, Window::Minute)),
+        ..make_create_upstream_hostname()
+    };
+    let route = |upstream_id, methods, path: &str, priority| CreateRouteRequest {
+        match_rules: MatchRules {
+            http: Some(HttpMatch {
+                methods,
+                path: path.into(),
+                query_allowlist: vec![],
+                path_suffix_mode: PathSuffixMode::Append,
+            }),
+            grpc: None,
+        },
+        priority,
+        ..make_create_route(upstream_id)
+    };
+    let root_up = uncached
+        .create_upstream(&test_ctx(root), shared(1000))
+        .await
+        .unwrap();
+    let a_up = uncached
+        .create_upstream(&test_ctx(a), make_create_upstream_hostname())
+        .await
+        .unwrap();
+    let b_up = uncached
+        .create_upstream(&test_ctx(b), shared(100))
+        .await
+        .unwrap();
+    let root_chat = uncached
+        .create_route(&test_ctx(root), make_create_route(root_up.id))
+        .await
+        .unwrap();
+    let root_v1 = CreateRouteRequest {
+        rate_limit: Some(make_rate_limit(SharingMode::Private, 10, Window::Minute)),
+        ..route(
+            root_up.id,
+            vec![HttpMethod::Get, HttpMethod::Post],
+            "/v1",
+            0,
+        )
+    };
+    uncached
+        .create_route(&test_ctx(root), root_v1)
+        .await
+        .unwrap();
+    // A better match on the unshared upstream, which b and leaf must not see.
+    uncached
+        .create_route(
+            &test_ctx(a),
+            route(a_up.id, vec![HttpMethod::Post], "/v1/chat/completions", 9),
+        )
+        .await
+        .unwrap();
+    let b_embeddings = uncached
+        .create_route(
+            &test_ctx(b),
+            route(b_up.id, vec![HttpMethod::Post], "/v1/embeddings", 1),
+        )
+        .await
+        .unwrap();
+
+    let targets = [
+        None,
+        Some(("POST", "/v1/chat/completions")),
+        Some(("POST", "/v1/embeddings/x")),
+        Some(("GET", "/v1/models")),
+        Some(("DELETE", "/v1/models")),
+        Some(("BREW", "/v1")),
+        Some(("POST", "/v2")),
+    ];
+    for pass in ["miss", "hit"] {
+        for tenant in [root, a, b, leaf] {
+            for target in targets {
+                assert_eq!(
+                    resolution(&cached, tenant, "API.openai.com", target).await,
+                    resolution(&uncached, tenant, "API.openai.com", target).await,
+                    "{pass}: tenant {tenant}, {target:?}"
+                );
+            }
+        }
+    }
+    let lookups = 2 * 4 * targets.len();
+    assert_eq!(reader.calls().0, lookups, "every lookup reads its alias");
+    assert_eq!(
+        reader.calls().1,
+        lookups - 2 * 4 * 2,
+        "every lookup with a known method reads its routes"
+    );
+
+    // The hierarchy resolves as designed, so the comparison covers it.
+    let resolved = async |tenant, target| {
+        let (upstream, route) = resolution(&cached, tenant, "api.openai.com", Some(target))
+            .await
+            .unwrap();
+        (upstream.id, route.map(|r| r.id))
+    };
+    let chat = ("POST", "/v1/chat/completions");
+    let embeddings = ("POST", "/v1/embeddings/x");
+    assert_eq!(resolved(leaf, chat).await, (b_up.id, Some(root_chat.id)));
+    assert_eq!(
+        resolved(leaf, embeddings).await,
+        (b_up.id, Some(b_embeddings.id))
+    );
+    assert_eq!(
+        resolved(a, chat).await.0,
+        a_up.id,
+        "its own, though unshared"
+    );
+    assert_ne!(resolved(a, chat).await.1, Some(root_chat.id));
+}
+
+mod cached_resolution_matches_uncached {
+    use super::{Backend, cached_resolution_matches_uncached as case};
+
+    #[tokio::test]
+    async fn in_memory() {
+        case(Backend::Memory).await;
+    }
+
+    #[tokio::test]
+    async fn sqlite() {
+        case(Backend::Db(
+            crate::infra::storage::testing::shared_sqlite().await,
+        ))
+        .await;
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres() {
+        let server = crate::infra::storage::testing::postgres_server().await;
+        case(Backend::Db(server.fresh().await)).await;
+    }
+
+    #[cfg(feature = "integration")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mysql() {
+        let server = crate::infra::storage::testing::mysql_server().await;
+        case(Backend::Db(server.fresh().await)).await;
+    }
+}
+
+/// Through the cache, an unknown alias is not found, an alias whose visible
+/// upstreams are all disabled is disabled, and a target no route matches is
+/// a route not found, as without it, on a miss and on a hit.
+///
+/// ADR-0020: CACHE-HIT-002.
+#[tokio::test]
+async fn cached_resolution_answers_not_found_and_disabled_as_uncached() {
+    let [root, child] = std::array::from_fn(|_| Uuid::new_v4());
+    let stores = Stores::new(Backend::Db(
+        crate::infra::storage::testing::shared_sqlite().await,
+    ));
+    let (cached, uncached, reader) = cached_and_uncached(&stores, &[root, child]);
+    let disabled = CreateUpstreamRequest {
+        auth: Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        }),
+        enabled: false,
+        ..make_create_upstream_ip("off")
+    };
+    uncached
+        .create_upstream(&test_ctx(root), disabled)
+        .await
+        .unwrap();
+    let up = uncached
+        .create_upstream(&test_ctx(child), make_create_upstream_hostname())
+        .await
+        .unwrap();
+    uncached
+        .create_route(&test_ctx(child), make_create_route(up.id))
+        .await
+        .unwrap();
+
+    let not_found: fn(&Resolved) -> bool = is_not_found;
+    let cases = [
+        ("nope", Some(("POST", "/v1/chat/completions")), not_found),
+        ("off", None, is_disabled),
+        ("off", Some(("POST", "/v1/chat/completions")), is_disabled),
+        (
+            "api.openai.com",
+            Some(("GET", "/v1/chat/completions")),
+            not_found,
+        ),
+        ("api.openai.com", Some(("POST", "/v2")), not_found),
+    ];
+    for pass in ["miss", "hit"] {
+        for (alias, target, expected) in cases {
+            let got = resolution(&cached, child, alias, target).await;
+            assert_eq!(
+                got,
+                resolution(&uncached, child, alias, target).await,
+                "{pass}: {alias} {target:?}"
+            );
+            assert!(expected(&got), "{pass}: {alias} {target:?}: {got:?}");
+        }
+    }
+    assert_eq!(reader.calls(), (10, 4));
+}
+
+/// An alias no upstream can have (longer than the alias rules allow, with a
+/// character an alias cannot hold, or empty once normalized) is not found,
+/// as without the cache, and never reaches the cache: nothing is loaded or
+/// stored for it.
+///
+/// ADR-0020: CACHE-HIT-002.
+#[tokio::test]
+async fn an_alias_no_upstream_can_have_is_not_found_without_touching_the_cache() {
+    let tenant = Uuid::new_v4();
+    let stores = Stores::new(Backend::Db(
+        crate::infra::storage::testing::shared_sqlite().await,
+    ));
+    let (cached, uncached, reader) = cached_and_uncached(&stores, &[tenant]);
+    let too_long = "a".repeat(MAX_ALIAS_LENGTH + 1);
+    for alias in [too_long.as_str(), "api/openai", "...", "-"] {
+        for target in [None, Some(("GET", "/v1"))] {
+            assert_eq!(
+                resolution(&cached, tenant, alias, target).await,
+                resolution(&uncached, tenant, alias, target).await,
+                "{alias} {target:?}"
+            );
+            let ctx = test_ctx(tenant);
+            let chain = cached.build_tenant_chain(&ctx).await.unwrap();
+            let err = cached
+                .resolve_alias(&ctx, &chain, alias, target, Tags::Skip)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, DomainError::NotFound { .. }),
+                "{alias} {target:?}: {err:?}"
+            );
+        }
+    }
+    assert_eq!(reader.calls(), (0, 0), "nothing loaded or stored");
+}
+
+/// A lookup with tags reads the repositories, never the cache: the cache
+/// holds no tags.
+///
+/// ADR-0020: CACHE-CONF-003.
+#[tokio::test]
+async fn resolution_with_tags_bypasses_the_cache() {
+    let tenant = Uuid::new_v4();
+    let stores = Stores::new(Backend::Db(
+        crate::infra::storage::testing::shared_sqlite().await,
+    ));
+    let (cached, _, reader) = cached_and_uncached(&stores, &[tenant]);
+    let ctx = test_ctx(tenant);
+    let up = cached
+        .create_upstream(
+            &ctx,
+            CreateUpstreamRequest {
+                tags: vec!["team-a".into()],
+                ..make_create_upstream_hostname()
+            },
+        )
+        .await
+        .unwrap();
+    cached
+        .create_route(
+            &ctx,
+            CreateRouteRequest {
+                tags: vec!["chat".into()],
+                ..make_create_route(up.id)
+            },
+        )
+        .await
+        .unwrap();
+
+    for _ in 0..2 {
+        let (upstream, route) = cached
+            .resolve_proxy_target(
+                &ctx,
+                "api.openai.com",
+                "POST",
+                "/v1/chat/completions",
+                Tags::Load,
+            )
+            .await
+            .unwrap();
+        // The effective config carries the upstream's and the route's tags.
+        assert_eq!(upstream.tags, ["team-a", "chat"]);
+        assert_eq!(route.tags, ["chat"]);
+    }
+    assert_eq!(reader.calls(), (0, 0));
+}
+
+// ---------------------------------------------------------------------------
+// Freshness of the proxy configuration cache (ADR-0020)
+// ---------------------------------------------------------------------------
+
+/// On one Control Plane resolving through the cache, the next lookup sees
+/// each upstream and route write, including the registry reconcile's
+/// upstream renames and route moves.
+///
+/// ADR-0020: CACHE-FRESH-001.
+#[tokio::test]
+async fn each_write_is_seen_by_the_next_cached_lookup() {
+    let tenant = Uuid::new_v4();
+    let f = CachedPlanes::new(Arc::new(MockTenantResolverClient::single_tenant())).await;
+    let ctx = test_ctx(tenant);
+    let chat = Some(("POST", "/v1/chat/completions"));
+    let openai = |target| (tenant, "api.openai.com", target);
+
+    let up = f
+        .assert_sees(
+            "upstream create",
+            &[openai(None), openai(chat)],
+            async || {
+                f.cp.create_upstream(&ctx, make_create_upstream_hostname())
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+    let route = f
+        .assert_sees("route create", &[openai(chat)], async || {
+            f.cp.create_route(&ctx, make_create_route(up.id))
+                .await
+                .unwrap()
+        })
+        .await;
+    let route = f
+        .assert_sees("route update", &[openai(chat)], async || {
+            let req = UpdateRouteRequest {
+                priority: 5,
+                ..make_update_from_route(&route)
+            };
+            f.cp.update_route(&ctx, route.id, req).await.unwrap()
+        })
+        .await;
+    let mut route = route;
+    for (name, enabled) in [("route disable", false), ("route enable", true)] {
+        route = f
+            .assert_sees(name, &[openai(chat)], async || {
+                let req = UpdateRouteRequest {
+                    enabled,
+                    ..make_update_from_route(&route)
+                };
+                f.cp.update_route(&ctx, route.id, req).await.unwrap()
+            })
+            .await;
+    }
+    let up = f
+        .assert_sees(
+            "upstream update",
+            &[openai(None), openai(chat)],
+            async || {
+                let req = UpdateUpstreamRequest {
+                    rate_limit: Some(make_rate_limit(SharingMode::Private, 10, Window::Minute)),
+                    ..make_update_from_upstream(&up)
+                };
+                f.cp.update_upstream(&ctx, up.id, req).await.unwrap()
+            },
+        )
+        .await;
+    for (name, enabled) in [("upstream disable", false), ("upstream enable", true)] {
+        f.assert_sees(name, &[openai(None), openai(chat)], async || {
+            let req = UpdateUpstreamRequest {
+                enabled,
+                ..make_update_from_upstream(&up)
+            };
+            f.cp.update_upstream(&ctx, up.id, req).await.unwrap()
+        })
+        .await;
+    }
+    f.assert_sees("route delete", &[openai(chat)], async || {
+        f.cp.delete_route(&ctx, route.id).await.unwrap();
+    })
+    .await;
+    f.assert_sees("upstream delete", &[openai(None)], async || {
+        f.cp.delete_upstream(&ctx, up.id).await.unwrap();
+    })
+    .await;
+
+    let registry = &f.provisioner;
+    let from = registry
+        .create_registry_upstream(&ctx, make_create_upstream_ip("from"))
+        .await
+        .unwrap();
+    let to = registry
+        .create_registry_upstream(&ctx, make_create_upstream_ip("to"))
+        .await
+        .unwrap();
+    let route = registry
+        .create_registry_route(&ctx, make_create_route(from.id), UpstreamCheck::Read)
+        .await
+        .unwrap();
+    f.assert_sees(
+        "route move",
+        &[(tenant, "from", chat), (tenant, "to", chat)],
+        async || {
+            registry
+                .update_registry_route(
+                    &ctx,
+                    route.id,
+                    to.id,
+                    make_update_from_route(&route),
+                    UpstreamCheck::Read,
+                )
+                .await
+                .unwrap()
+        },
+    )
+    .await;
+    let renamed = f
+        .assert_sees(
+            "upstream rename",
+            &[
+                (tenant, "to", None),
+                (tenant, "to", chat),
+                (tenant, "renamed", None),
+                (tenant, "renamed", chat),
+            ],
+            async || {
+                let req = UpdateUpstreamRequest {
+                    alias: Some("renamed".into()),
+                    ..make_update_from_upstream(&to)
+                };
+                registry
+                    .update_registry_upstream(&ctx, to.id, req)
+                    .await
+                    .unwrap()
+            },
+        )
+        .await;
+    assert_eq!(renamed.alias, "renamed");
+}
+
+/// An upstream repository whose update commits, then never returns.
+struct UpdateThenHang {
+    inner: Arc<dyn UpstreamRepository>,
+    committed: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl UpstreamRepository for UpdateThenHang {
+    async fn create(&self, upstream: Upstream) -> Result<Upstream, RepositoryError> {
+        self.inner.create(upstream).await
+    }
+
+    async fn get_by_id(&self, tenant_id: Uuid, id: Uuid) -> Result<Upstream, RepositoryError> {
+        self.inner.get_by_id(tenant_id, id).await
+    }
+
+    async fn list(
+        &self,
+        tenant_id: Uuid,
+        query: &ListQuery,
+    ) -> Result<Vec<Upstream>, RepositoryError> {
+        self.inner.list(tenant_id, query).await
+    }
+
+    async fn update(&self, upstream: Upstream) -> Result<Upstream, RepositoryError> {
+        self.inner.update(upstream).await?;
+        self.committed.notify_one();
+        std::future::pending().await
+    }
+
+    async fn delete(&self, tenant_id: Uuid, id: Uuid) -> Result<(), RepositoryError> {
+        self.inner.delete(tenant_id, id).await
+    }
+
+    async fn list_by_alias_for_tenants(
+        &self,
+        alias: &str,
+        tenant_ids: &std::collections::HashSet<Uuid>,
+        tags: Tags,
+    ) -> Result<Vec<Upstream>, RepositoryError> {
+        self.inner
+            .list_by_alias_for_tenants(alias, tenant_ids, tags)
+            .await
+    }
+}
+
+/// A write whose future is dropped after its commit (its HTTP request was
+/// cancelled) is still seen by the next lookup.
+///
+/// ADR-0020: CACHE-FRESH-002.
+#[tokio::test]
+async fn a_write_dropped_after_its_commit_is_seen_by_the_next_lookup() {
+    let tenant = Uuid::new_v4();
+    let (db, recorder) = crate::infra::storage::testing::recorded_sqlite().await;
+    let stores = Stores::new(Backend::Db(db));
+    let committed = Arc::new(tokio::sync::Notify::new());
+    let hanging = UpdateThenHang {
+        inner: stores.upstreams.clone(),
+        committed: committed.clone(),
+    };
+    let f = CachedPlanes::over(
+        Stores {
+            upstreams: Arc::new(hanging),
+            ..stores
+        },
+        recorder,
+        Arc::new(MockTenantResolverClient::single_tenant()),
+    );
+    let ctx = test_ctx(tenant);
+    let up =
+        f.cp.create_upstream(&ctx, make_create_upstream_hostname())
+            .await
+            .unwrap();
+
+    let disabled = UpdateUpstreamRequest {
+        enabled: false,
+        ..make_update_from_upstream(&up)
+    };
+    let lookup = (tenant, "api.openai.com", None);
+    f.assert_sees("a dropped upstream update", &[lookup], async || {
+        let update = f.cp.update_upstream(&ctx, up.id, disabled);
+        tokio::select! {
+            result = update => panic!("the update never returns: {result:?}"),
+            () = committed.notified() => {}
+        }
+        // `update` is dropped here, after its commit.
+    })
+    .await;
+}
+
+/// Writes in an ancestor tenant, sharing changes included, change a
+/// descendant's next lookup through the cache.
+///
+/// ADR-0020: CACHE-FRESH-004.
+#[tokio::test]
+async fn an_ancestor_write_is_seen_by_a_descendant() {
+    let [root, child] = std::array::from_fn(|_| Uuid::new_v4());
+    let f = CachedPlanes::new(Arc::new(MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(child),
+    ])))
+    .await;
+    let ctx = test_ctx(root);
+    let chat = Some(("POST", "/v1/chat/completions"));
+    let lookups = [
+        (child, "api.openai.com", None),
+        (child, "api.openai.com", chat),
+    ];
+    let auth = |sharing| {
+        Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing,
+            config: None,
+        })
+    };
+    let shared = CreateUpstreamRequest {
+        auth: auth(SharingMode::Inherit),
+        ..make_create_upstream_hostname()
+    };
+
+    let up = f
+        .assert_sees("ancestor upstream create", &lookups, async || {
+            f.cp.create_upstream(&ctx, shared).await.unwrap()
+        })
+        .await;
+    f.assert_sees("ancestor route create", &lookups[1..], async || {
+        f.cp.create_route(&ctx, make_create_route(up.id))
+            .await
+            .unwrap()
+    })
+    .await;
+    // Private: nothing on the upstream is shared, so the descendant no
+    // longer sees it; shared again, it does.
+    let mut up = up;
+    for (name, sharing, visible) in [
+        (
+            "ancestor upstream made private",
+            SharingMode::Private,
+            false,
+        ),
+        ("ancestor upstream shared again", SharingMode::Inherit, true),
+    ] {
+        up = f
+            .assert_sees(name, &lookups, async || {
+                let req = UpdateUpstreamRequest {
+                    auth: auth(sharing),
+                    ..make_update_from_upstream(&up)
+                };
+                f.cp.update_upstream(&ctx, up.id, req).await.unwrap()
+            })
+            .await;
+        let answer = f.cached(lookups[0]).await;
+        if visible {
+            assert_eq!(answer.map(|(u, _)| u.id), Ok(up.id), "{name}");
+        } else {
+            assert!(is_not_found(&answer), "{name}: {answer:?}");
+        }
+    }
+    let up = f
+        .assert_sees("ancestor upstream update", &lookups, async || {
+            let req = UpdateUpstreamRequest {
+                rate_limit: Some(make_rate_limit(SharingMode::Inherit, 10, Window::Minute)),
+                ..make_update_from_upstream(&up)
+            };
+            f.cp.update_upstream(&ctx, up.id, req).await.unwrap()
+        })
+        .await;
+    f.assert_sees("ancestor upstream disable", &lookups, async || {
+        let req = UpdateUpstreamRequest {
+            enabled: false,
+            ..make_update_from_upstream(&up)
+        };
+        f.cp.update_upstream(&ctx, up.id, req).await.unwrap()
+    })
+    .await;
+    f.assert_sees("ancestor upstream delete", &lookups, async || {
+        f.cp.delete_upstream(&ctx, up.id).await.unwrap();
+    })
+    .await;
+    for lookup in lookups {
+        let answer = f.cached(lookup).await;
+        assert!(is_not_found(&answer), "deleted: {lookup:?}: {answer:?}");
+    }
+}
+
+/// A tenant whose chain changed (it moved under another parent) resolves
+/// under a new key: the answer for its new chain, while its old chain's
+/// entry stays cached.
+///
+/// ADR-0020: CACHE-FRESH-006.
+#[tokio::test]
+async fn a_changed_tenant_chain_resolves_under_a_new_key() {
+    let [root, before, after, tenant] = std::array::from_fn(|_| Uuid::new_v4());
+    let f = CachedPlanes::new(Arc::new(MockTenantResolverClient::single_tenant())).await;
+    let shared = CreateUpstreamRequest {
+        auth: Some(AuthConfig {
+            plugin_type: "noop".into(),
+            sharing: SharingMode::Inherit,
+            config: None,
+        }),
+        ..make_create_upstream_ip("x")
+    };
+    let mut ids = Vec::new();
+    for parent in [before, after] {
+        let up =
+            f.cp.create_upstream(&test_ctx(parent), shared.clone())
+                .await
+                .unwrap();
+        ids.push(up.id);
+    }
+    // As `build_tenant_chain` returns them: the tenant, then its ancestors.
+    let (old, new) = ([tenant, before, root], [tenant, after, root]);
+    let lookup = async |svc: &ControlPlaneServiceImpl, chain: &[Uuid]| {
+        svc.resolve_alias(&test_ctx(tenant), chain, "x", None, Tags::Skip)
+            .await
+            .map(|(upstream, _)| upstream.id)
+            .map_err(Failed)
+    };
+
+    assert_eq!(lookup(&f.cp, &old).await, Ok(ids[0]));
+    let selects = f.selects();
+    assert_eq!(lookup(&f.cp, &old).await, Ok(ids[0]));
+    assert_eq!(f.selects(), selects, "the old chain's answer is cached");
+
+    assert_eq!(lookup(&f.cp, &new).await, Ok(ids[1]));
+    assert_eq!(lookup(&f.uncached, &new).await, Ok(ids[1]));
+    assert!(f.selects() > selects, "the new chain loads");
+
+    let selects = f.selects();
+    assert_eq!(lookup(&f.cp, &old).await, Ok(ids[0]));
+    assert_eq!(f.selects(), selects, "the old chain's entry stays cached");
+}
+
+/// The SSRF check runs on every lookup, also on an upstream served from the
+/// cache: a Control Plane whose policy denies the host rejects an upstream
+/// another Control Plane cached, from that entry (no `SELECT`).
+///
+/// ADR-0020: CACHE-SAFE-001.
+#[tokio::test]
+async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
+    use crate::infra::proxy_cache::{CachedProxyConfigReader, ProxyConfigCache};
+    use toolkit_db::test_support::QueryKind;
+
+    let (db, recorder) = crate::infra::storage::testing::recorded_sqlite().await;
+    let stores = Stores::new(Backend::Db(db));
+    let reader: Arc<dyn ProxyConfigReader> = Arc::new(CachedProxyConfigReader::new(
+        Arc::new(ProxyConfigCache::new(
+            std::time::Duration::from_secs(60),
+            100,
+            Arc::new(crate::domain::ports::NoopMetrics),
+        )),
+        stores.upstreams.clone(),
+        stores.routes.clone(),
+    ));
+    let service = |policy: SsrfPolicy| {
+        ControlPlaneServiceImpl::new(
+            stores.upstreams.clone(),
+            stores.routes.clone(),
+            Arc::new(MockTenantResolverClient::single_tenant()),
+            allow_all_enforcer(),
+            Arc::new(MockCredStoreClient::empty()),
+            Arc::new(SsrfGuard::from_config(&policy).unwrap()),
+            Some(reader.clone()),
+        )
+    };
+    let selects = || {
+        recorder
+            .events()
+            .iter()
+            .filter(|e| e.kind == QueryKind::Select)
+            .count()
+    };
+    let ctx = test_ctx(Uuid::new_v4());
+    let before = service(SsrfPolicy::default());
+    let upstream = before
+        .create_upstream(&ctx, make_create_upstream_hostname())
+        .await
+        .unwrap();
+    before
+        .create_route(&ctx, make_create_route(upstream.id))
+        .await
+        .unwrap();
+    let target = (&upstream.alias, "POST", "/v1/chat/completions");
+    before
+        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Skip)
+        .await
+        .expect("resolves before the policy changes");
+
+    let after = service(SsrfPolicy {
+        extra_deny_hostnames: vec!["api.openai.com".into()],
+        ..SsrfPolicy::default()
+    });
+    let cached = selects();
+    let err = after
+        .resolve_proxy_target(&ctx, target.0, target.1, target.2, Tags::Skip)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, DomainError::Validation { detail, .. }
+            if detail.contains("is blocked by SSRF protection")),
+        "{err:?}"
+    );
+    assert_eq!(selects(), cached, "the upstream came from the cache");
 }

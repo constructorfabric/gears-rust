@@ -558,7 +558,7 @@ async fn opened(
     Arc<bss_pricing::api::rest::authoring::AuthoringState>,
 ) {
     let db = toolkit_db::connect_db(
-        &f.dsn,
+        &plan_support::entry_support::toolkit_dsn(&f.dsn),
         toolkit_db::ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),

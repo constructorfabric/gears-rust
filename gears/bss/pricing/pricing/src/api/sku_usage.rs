@@ -70,7 +70,7 @@ impl SkuUsageV1 for PricingSkuUsage {
     ) -> Result<Vec<SkuUsage>, CanonicalError> {
         let scope = self.entry_scope(ctx).await?;
         let skus = sku_ids.to_vec();
-        support::transaction(&self.state.db.db(), move |tx| {
+        support::transaction_read(&self.state.db.db(), move |tx| {
             let (scope, skus) = (scope.clone(), skus.clone());
             Box::pin(
                 async move { Ok(crate::infra::usage::sku_usage(tx, &scope, tenant, &skus).await?) },
@@ -89,7 +89,7 @@ impl SkuUsageV1 for PricingSkuUsage {
         tenant: Uuid,
     ) -> Result<SkuUsageSets, CanonicalError> {
         let scope = self.entry_scope(ctx).await?;
-        support::transaction(&self.state.db.db(), move |tx| {
+        support::transaction_read(&self.state.db.db(), move |tx| {
             let scope = scope.clone();
             Box::pin(
                 async move { Ok(crate::infra::usage::sku_usage_sets(tx, &scope, tenant).await?) },
@@ -119,7 +119,7 @@ impl SkuUsageV1 for PricingSkuUsage {
             // A revision's SKUs are plan content (P-D-246).
             UsageScope::Revision(_) => self.read_scope(ctx, &resource_types::PLAN).await?,
         };
-        support::transaction(&self.state.db.db(), move |tx| {
+        support::transaction_read(&self.state.db.db(), move |tx| {
             let under = under.clone();
             Box::pin(async move {
                 Ok(match scope {

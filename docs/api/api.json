@@ -968,6 +968,13 @@
             "description": "Whether `actor` carries the mask token, whether because the caller lacks\nthe unmasked-PII entitlement or because the boundary withheld it\n(`actor_withheld` tells the two apart).",
             "type": "boolean"
           },
+          "actor_name": {
+            "description": "The actor's name as the Actor Name Resolver reads it: a user's current\nname, `\"System\"` for the nil id, or `null` when the actor is masked or\nwithheld, a module, or no name could be had.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "actor_withheld": {
             "description": "Whether `actor` is withheld by the upward disclosure boundary, whatever\nthe entitlement: its tenant is not on the path from the reader tenant to\nthe record's.",
             "type": "boolean"
@@ -1022,9 +1029,11 @@
         },
         "required": [
           "id",
+          "tenant_id",
           "operation",
           "actor",
           "actor_masked",
+          "actor_name",
           "values_masked",
           "outcome",
           "request_id",
@@ -62857,7 +62866,7 @@
         "operationId": "settings_service.create_declaration",
         "parameters": [
           {
-            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, a purge, and any edit that loosens a gate or a classification.",
             "in": "header",
             "name": "X-Step-Up-Token",
             "required": false,
@@ -63171,7 +63180,7 @@
             }
           },
           {
-            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, a purge, and any edit that loosens a gate or a classification.",
             "in": "header",
             "name": "X-Step-Up-Token",
             "required": false,
@@ -63417,7 +63426,7 @@
             }
           },
           {
-            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, and any edit that loosens a gate or a classification.",
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, a purge, and any edit that loosens a gate or a classification.",
             "in": "header",
             "name": "X-Step-Up-Token",
             "required": false,
@@ -63553,6 +63562,145 @@
           }
         ],
         "summary": "Edit a declaration's metadata",
+        "tags": [
+          "settings-declarations"
+        ]
+      }
+    },
+    "/settings-service/v1/declarations/{id}/purge": {
+      "post": {
+        "description": "Purge a retired, admin-authored declaration: the row is deleted and, with it, every value, tenant restriction and staged secret filed under it. Irreversible, and it frees the key and its category. Only a retired declaration is purged (`409` otherwise, and never retired by the purge); a gear's contributed declaration is refused with a conflict. The Credential Store entries held for the setting alone (its secret values and staged secrets; an entry another declaration still holds is kept) are released after the commit, best-effort: a refused release does not undo the purge. Requires step-up and `If-Match`; answers `204`.",
+        "operationId": "settings_service.purge_declaration",
+        "parameters": [
+          {
+            "description": "Declaration UUID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "The `ETag` from the caller's last read of this declaration. Absent -> 428; stale -> 412. The edit happens only against the representation the caller saw.",
+            "in": "header",
+            "name": "If-Match",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "A fresh token from the identity provider proving the caller re-authenticated just now; absent, the bearer token itself is checked. Required by a retire, a revive, a purge, and any edit that loosens a gate or a classification.",
+            "in": "header",
+            "name": "X-Step-Up-Token",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The retired declaration was purged"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Conflict"
+          },
+          "412": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "The supplied If-Match is stale: re-read and retry"
+          },
+          "428": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "If-Match is required on a conditional write"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Purge a retired setting declaration",
         "tags": [
           "settings-declarations"
         ]

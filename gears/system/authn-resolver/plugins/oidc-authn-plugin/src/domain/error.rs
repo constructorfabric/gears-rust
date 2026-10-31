@@ -20,6 +20,10 @@ pub enum AuthNError {
     #[error("signature invalid")]
     SignatureInvalid,
 
+    /// The local crypto backend cannot verify tokens.
+    #[error("crypto backend unavailable: {0}")]
+    CryptoUnavailable(String),
+
     /// Bearer token is not a JWT and opaque token introspection is unsupported.
     #[error("unsupported token format")]
     UnsupportedTokenFormat,
@@ -97,7 +101,7 @@ impl From<AuthNError> for AuthNResolverError {
             | AuthNError::UnsupportedAlgorithm
             | AuthNError::InvalidAudience
             | AuthNError::InvalidTokenType => AuthNResolverError::Unauthorized(format!("{value}")),
-            AuthNError::IdpUnreachable => {
+            AuthNError::IdpUnreachable | AuthNError::CryptoUnavailable(_) => {
                 AuthNResolverError::ServiceUnavailable(format!("{value}"))
             }
             AuthNError::TokenEndpointUnsuccessfulStatus(_)

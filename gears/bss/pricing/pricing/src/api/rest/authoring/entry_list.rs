@@ -13,7 +13,7 @@ use super::{
     AuthoringState, books,
     dto::PricingPriceBookEntryList,
     price_book_entries,
-    support::{self, authz_failure, invalid_because, require_authenticated, transaction},
+    support::{self, authz_failure, invalid_because, require_authenticated, transaction_read},
 };
 use crate::{
     authz::{self, actions, resource_types},
@@ -253,7 +253,7 @@ async fn list_entries(
     odata.filter_hash = Some(hash);
     let dated = day != today;
     let tenant = ctx.subject_tenant_id();
-    let body = transaction(&state.db.db(), move |tx| {
+    let body = transaction_read(&state.db.db(), move |tx| {
         let (scope, books, odata) = (scope.clone(), books.clone(), odata.clone());
         Box::pin(async move {
             books::find(tx, &AccessScope::for_tenant(tenant), tenant, id).await?;
