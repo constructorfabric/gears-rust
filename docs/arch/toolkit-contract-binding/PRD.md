@@ -132,6 +132,10 @@ Collapsing to fewer contract types would force callers into unnecessary defensiv
 - Feature-gated REST client dependencies (`rest-client` feature flag)
 - `#[non_exhaustive]` on request/response structs for additive non-breaking changes
 - Default trait methods for new transport projection methods
+- Typed per-method manual REST clients and shared opaque HTTP transport support
+  ([ADR-0009](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md)). OAGW SDK
+  adoption and stateful handler factories in generated wiring are not implemented
+  yet.
 
 ### 4.2 Out of Scope
 
@@ -258,6 +262,37 @@ Transport projection methods MUST declare their HTTP method and path via annotat
 
 - **Rationale**: HTTP routing is explicit in the trait, not in configuration or convention.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
+
+#### Per-Method Manual REST Clients
+
+- [ ] `p1` - **ID**: `cpt-cf-binding-fr-manual-client-methods`
+
+The system SHALL support explicit manual dispatch for individual REST projection
+methods while generating ordinary methods on the same client. A generated public,
+sealed handler trait and a generic handler parameter, supplied through `Arc` at
+construction, SHALL preserve the base method signatures and compile-time coverage.
+Only the SDK SHALL implement the handler trait; applications MAY configure and
+inject SDK-provided concrete or `dyn` handlers through `with_manual`. Missing SDK
+handler implementations SHALL fail to compile. An optional SDK-chosen default
+SHALL preserve existing constructor signatures and default wiring. Unannotated
+clients SHALL retain their existing constructors and behavior. Endpoint changes
+SHALL preserve handler state and refresh the transport context.
+
+Stateful factory integration is deferred. When introduced, consumer factories
+SHALL run after all gear initializations, while provider factories called inside
+`init` SHALL rely only on declared dependencies already initialized. An unavailable
+required dependency SHALL cause a startup wiring error on either path. Manual
+methods SHALL remain in binding metadata and validation; methods marked both
+`client_manual` and `server_manual` SHALL impose no JSON serialization or schema
+bounds on opaque types. Generated server routes SHALL retain the bounds they need.
+The sealed handler trait SHALL follow its projection's contract major version;
+compatible additions SHALL preserve existing public signatures, object safety and
+behavior. See [ADR-0009](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md) for
+the marker, injection model and compatibility checks.
+
+- **Rationale**: One exceptional transport operation must not force an SDK to
+  reimplement every ordinary operation or erase method signatures in a registry.
+- **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-ci-pipeline`
 
 #### Parameter Annotations
 
@@ -513,6 +548,25 @@ The runtime crate SHALL provide a `with_retry()` function implementing exponenti
 - **Rationale**: Shared retry logic for generated clients and manual usage.
 - **Actors**: `cpt-cf-binding-actor-gear-developer`
 
+#### Opaque HTTP Runtime Support
+
+- [ ] `p1` - **ID**: `cpt-cf-binding-fr-opaque-http-runtime`
+
+The runtime SHALL offer a shared raw HTTP execution primitive for manual methods,
+preserving status, end-to-end headers and opaque streaming bodies with backpressure
+and cancellation. It SHALL reuse the applicable destination, credential, tracing
+and transport policies without parsing JSON/SSE, decompressing, following
+redirects or automatically replaying requests. Non-2xx responses SHALL remain
+responses; transport and body failures SHALL remain observable errors. Binding
+metadata SHALL represent supported method sets, wildcard paths and opaque bodies
+explicitly, with compatibility handling for existing public IR construction and
+serialized forms. Protocol-specific error interpretation SHALL remain in the SDK
+adapter. See [ADR-0009](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md).
+
+- **Rationale**: Transparent proxy operations need shared transport policy without
+  the typed JSON/SSE transformations of an ordinary generated client.
+- **Actors**: `cpt-cf-binding-actor-gear-developer`, `cpt-cf-binding-actor-api-consumer`
+
 #### REST Client Feature Gate
 
 - [ ] `p1` - **ID**: `cpt-cf-binding-fr-feature-gate`
@@ -684,4 +738,5 @@ SDK crates with the `rest-client` feature disabled MUST NOT incur additional com
 - **ADR-0001** — contract source of truth: [`./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md`](./ADR/0001-cpt-cf-binding-adr-contract-source-of-truth.md)
 - **ADR-0002** — OpenAPI spec limits: [`./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md`](./ADR/0002-cpt-cf-binding-adr-openapi-spec-limits.md)
 - **ADR-0006** — client observability (tracing/OTEL): [`./ADR/0006-cpt-cf-binding-adr-client-observability.md`](./ADR/0006-cpt-cf-binding-adr-client-observability.md)
+- **ADR-0009** — typed manual client methods and raw HTTP runtime (proposed): [`./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md`](./ADR/0009-cpt-cf-binding-adr-manual-client-methods.md)
 - **PoC**: [striped-zebra-dev/toolkit-binding-poc](https://github.com/striped-zebra-dev/toolkit-binding-poc)
