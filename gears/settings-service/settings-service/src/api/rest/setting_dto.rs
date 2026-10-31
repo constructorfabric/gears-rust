@@ -14,7 +14,8 @@ use crate::domain::writes::value_state_tag;
 /// absent-state tag, which the read returns for the same state.
 pub const ABSENT_STATE_TAG: &str = crate::domain::writes::ABSENT_VALUE_TAG;
 
-fn rfc3339(at: OffsetDateTime) -> String {
+/// A timestamp as the wire carries it: RFC 3339.
+pub(crate) fn rfc3339(at: OffsetDateTime) -> String {
     at.format(&Rfc3339).unwrap_or_else(|_| at.to_string())
 }
 
@@ -422,6 +423,36 @@ pub struct AuditRecordDto {
     pub change_set_id: Option<Uuid>,
     /// When it happened.
     pub occurred_at: String,
+    /// On an `activation` record, the id of the change record it answers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<Uuid>,
+    /// On a `failure` `activation` record, the consumer's detail, free of
+    /// values and secrets by contract.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The consumers' reports on this record, newest first, at every tenant of
+    /// the caller's subtree where the caller may read the setting; empty when
+    /// nothing answers it. Not paged and not counted.
+    pub activations: Vec<ActivationReportDto>,
+}
+
+/// One subscriber's report on a change, attached under the change's record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[toolkit_macros::api_dto(response)]
+pub struct ActivationReportDto {
+    /// The id of the change record the report answers.
+    pub change_ref: Uuid,
+    /// The subscriber, a gear identity, shown as recorded.
+    pub actor: String,
+    /// `success` or `failure`.
+    pub outcome: String,
+    /// The consumer's detail on a `failure`; absent on a `success`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// The tenant the report was made for.
+    pub tenant_id: Uuid,
+    /// When the report was recorded.
+    pub occurred_at: String,
 }
 
 /// One image as a reader is shown it. A secret was recorded as its mask. A
@@ -455,10 +486,12 @@ fn recorded(
 #[must_use]
 pub fn render_record(
     record: &crate::audit::StoredAuditRecord,
+    attached: &[crate::audit::StoredAuditRecord],
     values_are_pii: bool,
     may_read_pii: bool,
 ) -> AuditRecordDto {
     // @cpt-begin:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-8
+    // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-5
     let actor_masked =
         record.actor_classification == crate::audit::ActorClassification::Pii && !may_read_pii;
     let values_masked = (values_are_pii || record.has_pii_image()) && !may_read_pii;
@@ -479,6 +512,52 @@ pub fn render_record(
         request_id: record.request_id.clone(),
         change_set_id: record.change_set_id,
         occurred_at: rfc3339(record.occurred_at),
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-6
+        // A listed `activation` record names its change and, on a failure,
+        // says why; it never carries a pre-value or post-value.
+        change_ref: record.change_ref,
+        detail: failure_detail(record),
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-6
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-10
+        activations: attached
+            .iter()
+            .filter_map(|report| render_report(report, may_read_pii))
+            .collect(),
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-10
     }
+    // @cpt-end:cpt-cf-settings-service-flow-activation-read-history:p1:inst-ar-history-5
     // @cpt-end:cpt-cf-settings-service-flow-audit-store-history:p1:inst-as-hist-8
+}
+
+/// The detail of a record, only when it is a failure: a success carries none.
+fn failure_detail(record: &crate::audit::StoredAuditRecord) -> Option<String> {
+    record
+        .detail
+        .clone()
+        .filter(|_| record.outcome == crate::audit::AuditOutcome::Failure)
+}
+
+/// A report as it is attached under its change: no pre-value, post-value or
+/// `request_id`, the actor masked as a listed record's is. A record that names
+/// no change or no tenant is not a report and renders as nothing.
+fn render_report(
+    report: &crate::audit::StoredAuditRecord,
+    may_read_pii: bool,
+) -> Option<ActivationReportDto> {
+    // @cpt-begin:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-7
+    let masked =
+        report.actor_classification == crate::audit::ActorClassification::Pii && !may_read_pii;
+    Some(ActivationReportDto {
+        change_ref: report.change_ref?,
+        actor: if masked {
+            MASK_TOKEN.to_owned()
+        } else {
+            report.actor.clone()
+        },
+        outcome: report.outcome.as_str().to_owned(),
+        detail: failure_detail(report),
+        tenant_id: report.tenant_id?,
+        occurred_at: rfc3339(report.occurred_at),
+    })
+    // @cpt-end:cpt-cf-settings-service-algo-activation-read-attach:p1:inst-ar-attach-7
 }

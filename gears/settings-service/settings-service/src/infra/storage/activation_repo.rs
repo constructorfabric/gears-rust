@@ -547,6 +547,29 @@ impl ActivationRepository for ActivationRepo {
         row.map(state_of).transpose()
     }
 
+    async fn states_of<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &str,
+        tenant: &str,
+    ) -> Result<Vec<ActivationState>, DomainError> {
+        // One statement on the key and the tenant, through
+        // `idx_activation_key_tenant`, in subscriber order; a failed read is
+        // the store being unavailable, never an absent state.
+        let rows = StateEntity::find()
+            .filter(activation_state::Column::Key.eq(key))
+            .filter(activation_state::Column::Tenant.eq(tenant))
+            .order_by_asc(activation_state::Column::Subscriber)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(|err| {
+                DomainError::dependency_unavailable("activation store", "read the states", err)
+            })?;
+        rows.into_iter().map(state_of).collect()
+    }
+
     async fn report<C: DBRunner>(
         &self,
         conn: &C,

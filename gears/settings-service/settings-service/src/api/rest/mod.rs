@@ -48,6 +48,9 @@ pub(crate) fn audit_request_id(headers: &axum::http::HeaderMap) -> String {
 pub mod access_dto;
 pub mod access_handlers;
 pub mod access_routes;
+pub mod activation_dto;
+pub mod activation_handlers;
+pub mod activation_routes;
 pub mod declaration_dto;
 pub mod declaration_handlers;
 pub mod declaration_routes;
@@ -149,3 +152,7 @@ mod revival_surface_tests;
 #[cfg(test)]
 #[path = "value_surface_tests.rs"]
 mod value_surface_tests;
+
+#[cfg(test)]
+#[path = "activation_surface_tests.rs"]
+mod activation_surface_tests;

@@ -108,6 +108,18 @@ pub trait ActivationRepository: Send + Sync {
         tenant: &str,
     ) -> Result<Option<ActivationState>, DomainError>;
 
+    /// Every activation state of `key` at `tenant`, ordered by subscriber, in
+    /// one statement through `idx_activation_key_tenant`.
+    ///
+    /// # Errors
+    /// [`DomainError::Unavailable`] when the read fails.
+    async fn states_of<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &str,
+        tenant: &str,
+    ) -> Result<Vec<ActivationState>, DomainError>;
+
     /// Settle the state a report decided on: set `status`, `applied_value`,
     /// `detail`, `reported_at` now and `updated_at` now, guarded on the row
     /// still naming the transition's `change_ref` and still being `awaiting`.
@@ -189,6 +201,15 @@ impl ActivationRepository for NoActivation {
         _tenant: &str,
     ) -> Result<Option<ActivationState>, DomainError> {
         Ok(None)
+    }
+
+    async fn states_of<C: DBRunner>(
+        &self,
+        _conn: &C,
+        _key: &str,
+        _tenant: &str,
+    ) -> Result<Vec<ActivationState>, DomainError> {
+        Ok(Vec::new())
     }
 
     async fn report<C: DBRunner>(

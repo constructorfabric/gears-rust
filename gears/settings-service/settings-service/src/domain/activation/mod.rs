@@ -9,6 +9,7 @@
 //! `secret`-trait setting), and the change's audit record id as `change_ref`.
 //! Delivery and the consumer's report are other halves of the feature.
 
+pub mod attachment;
 pub mod canonical;
 pub mod notifier;
 pub mod publisher;
@@ -71,6 +72,53 @@ impl ActivationStatus {
             _ => None,
         }
     }
+}
+
+/// One subscriber's activation state as the activation read shows it: the
+/// state of the current value and nothing of its content — no expected value,
+/// applied value, hash or delivery stamp.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationItem {
+    /// The consumer identity.
+    pub subscriber: String,
+    /// Where the state stands.
+    pub status: ActivationStatus,
+    /// The change the state answers: its audit record's id.
+    pub change_ref: Uuid,
+    /// When the settling report arrived; absent while `awaiting`.
+    pub reported_at: Option<time::OffsetDateTime>,
+    /// The consumer's failure detail; present only on a `failed` state.
+    pub detail: Option<String>,
+}
+
+impl From<ActivationState> for ActivationItem {
+    fn from(state: ActivationState) -> Self {
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-11
+        // Only the fields the read names are carried over; `reported_at` only
+        // for a settled state and `detail` only for a failed one.
+        let settled = state.status != ActivationStatus::Awaiting;
+        let failed = state.status == ActivationStatus::Failed;
+        Self {
+            subscriber: state.subscriber,
+            status: state.status,
+            change_ref: state.change_ref,
+            reported_at: state.reported_at.filter(|_| settled),
+            detail: state.detail.filter(|_| failed),
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-11
+    }
+}
+
+/// What the activation read answers: the tenant as normalised and one item per
+/// subscriber, in subscriber order.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationRead {
+    /// The tenant the read answers for.
+    pub tenant: Uuid,
+    /// The activation states of the key at the tenant.
+    pub items: Vec<ActivationItem>,
 }
 
 /// One consumer's registration for one setting at one tenant.

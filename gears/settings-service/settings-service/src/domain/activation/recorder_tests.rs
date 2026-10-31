@@ -769,6 +769,15 @@ impl ActivationRepository for RacingRepo {
         ActivationRepo.state(conn, subscriber, key, tenant).await
     }
 
+    async fn states_of<C: DBRunner>(
+        &self,
+        conn: &C,
+        key: &str,
+        tenant: &str,
+    ) -> Result<Vec<ActivationState>, DomainError> {
+        ActivationRepo.states_of(conn, key, tenant).await
+    }
+
     async fn report<C: DBRunner>(
         &self,
         conn: &C,

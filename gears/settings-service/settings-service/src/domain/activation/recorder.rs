@@ -15,6 +15,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use settings_service_sdk::SettingKey;
 use toolkit_db::secure::DBRunner;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_macros::domain_model;
@@ -22,10 +23,18 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::subscriptions::ActivationRepository;
-use super::{ActivationState, ActivationStatus, NotifyMetrics, subscriber_of, tenant_text};
+use super::{
+    ActivationItem, ActivationRead, ActivationState, ActivationStatus, NotifyMetrics,
+    subscriber_of, tenant_text,
+};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink};
+use crate::domain::access::AccessRepository;
+use crate::domain::category::visibility::{domain_visibility, is_visible};
+use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
+use crate::domain::resolution::{ScopeTarget, ValueResolver};
 use crate::domain::validation::guards::MAX_SERIALIZED_BYTES;
+use crate::domain::value::ValueRepository;
 use crate::field;
 
 /// The longest `detail` a report keeps: 1 KiB, longer input truncated.
@@ -224,6 +233,27 @@ fn invalid(field_name: &str, message: &str) -> DomainError {
     }
 }
 
+/// The one answer of the four cases of an authorized caller that cannot read
+/// the activation: it carries nothing that tells them apart.
+fn absent() -> DomainError {
+    DomainError::NotFound {
+        resource: "declaration",
+    }
+}
+
+/// A read of the gear's own tables that failed is the store being unavailable,
+/// not an internal fault the caller cannot act on. That holds for an integrity
+/// fault of a declaration or restriction row the activation read looks at too:
+/// it is answered `503` here, where the history keeps its own mapping.
+fn store_down(err: DomainError) -> DomainError {
+    match err {
+        DomainError::Internal { diagnostic } => {
+            DomainError::dependency_unavailable("database", "read the setting", diagnostic)
+        }
+        other => other,
+    }
+}
+
 /// The input rules: a UUID `tenant` and `change_ref`, a status of `success` or
 /// `failed`, no NUL byte in the text fields and a key within
 /// [`KEY_LIMIT_BYTES`]; the detail truncated. An `applied_value` above the
@@ -386,6 +416,115 @@ where
         Ok(self.counted(settled))
     }
 
+    /// The activation state of the current value of `key` at `tenant`: one item
+    /// per subscriber, ordered by subscriber, with no value of any kind.
+    ///
+    /// `scope` is the caller's `AccessScope` of the `read` decision on the
+    /// value resource; the caller took that decision first and a denial never
+    /// reaches here, so the answer to it is the same for every key and tenant.
+    /// What follows it is the second question, answered
+    /// [`DomainError::NotFound`] in four indistinguishable cases: `tenant`
+    /// outside the caller's subtree (a standalone descendant and the tenants
+    /// below it included), an undeclared key, a declaration outside the
+    /// caller's administrative domain, and a key hidden from the caller. A
+    /// retired declaration is read like an active one. `tenant` defaults to the
+    /// caller's own.
+    ///
+    /// # Errors
+    /// [`DomainError::NotFound`] as above; [`DomainError::Unavailable`] when the
+    /// Tenant Resolver or the database cannot answer at any step that asks —
+    /// decided at the subtree test before its `NotFound`, and never read as one.
+    pub async fn activation_status<D, V, X>(
+        &self,
+        resolver: &ValueResolver<D, V, X>,
+        ctx: &SecurityContext,
+        scope: &AccessScope,
+        key: &SettingKey,
+        tenant: Option<Uuid>,
+    ) -> Result<ActivationRead, DomainError>
+    where
+        D: DeclarationRepository,
+        V: ValueRepository + Clone,
+        X: AccessRepository,
+    {
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-3
+        // The caller's own tenant when none is named; a `Uuid` renders as a
+        // bare lowercase string, which is the normalisation.
+        let caller = ctx.subject_tenant_id();
+        let tenant = tenant.unwrap_or(caller);
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-3
+        let conn = self.db.conn().map_err(|err| {
+            DomainError::dependency_unavailable("database", "open a connection", err)
+        })?;
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-6
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-7
+        // The subtree test: a resolver that cannot answer fails the read here,
+        // before any `NotFound` is decided; a tenant the resolver does not
+        // know is outside the subtree like any other.
+        if tenant != caller {
+            let hierarchy = resolver.hierarchy();
+            let inside = match hierarchy.is_within_subtree(caller, tenant).await {
+                Ok(inside) => inside,
+                Err(DomainError::NotFound { .. }) => false,
+                Err(err) => return Err(err),
+            };
+            // Outside the subtree is decided: the standalone question is
+            // asked only for a tenant inside it, so a resolver failing on
+            // that second question never turns a settled `NotFound` into 503.
+            if !inside {
+                return Err(absent());
+            }
+            // A tenant the resolver does not know is no more a standalone
+            // one than it is inside: the one `NotFound`.
+            let standalone = match hierarchy.is_standalone(tenant).await {
+                Ok(standalone) => standalone,
+                Err(DomainError::NotFound { .. }) => true,
+                Err(err) => return Err(err),
+            };
+            if standalone {
+                return Err(absent());
+            }
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-7
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-6
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-8
+        // Retired passes: the declaration is read whatever its status.
+        let declaration = resolver
+            .find_declaration(&conn, key)
+            .await
+            .map_err(store_down)?
+            .filter(|d| is_visible(&domain_visibility(scope), d.domain_affinity.as_deref()))
+            .ok_or_else(absent)?;
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-8
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-9
+        // Whose access decides is the caller's, over its own root-to-self
+        // chain, as the value read and the history decide it.
+        let root = resolver.root_tenant().await?;
+        let hidden = resolver
+            .effective_access(
+                &conn,
+                declaration.id,
+                ScopeTarget::Tenant(caller).normalize(root),
+            )
+            .await
+            .map_err(store_down)?
+            .is_hidden();
+        if hidden {
+            return Err(absent());
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-9
+        // @cpt-begin:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-10
+        let states = self
+            .repo
+            .states_of(&conn, key.as_str(), &tenant_text(tenant))
+            .await?;
+        // @cpt-end:cpt-cf-settings-service-flow-activation-read-status:p1:inst-ar-status-10
+        Ok(ActivationRead {
+            tenant,
+            items: states.into_iter().map(ActivationItem::from).collect(),
+        })
+    }
+
     /// The metrics of a committed or ignored report, and the answer.
     fn counted(&self, settled: Settled) -> ReportResult {
         match settled {
@@ -514,3 +653,7 @@ where
 #[cfg(test)]
 #[path = "recorder_tests.rs"]
 mod recorder_tests;
+
+#[cfg(test)]
+#[path = "status_tests.rs"]
+mod status_tests;

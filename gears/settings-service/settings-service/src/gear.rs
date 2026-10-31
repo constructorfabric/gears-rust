@@ -1278,6 +1278,13 @@ impl RestApiCapability for SettingsService {
             self.db()?,
             self.enforcer()?,
         );
+        let router = crate::api::rest::activation_routes::register_routes(
+            router,
+            openapi,
+            self.resolver()?,
+            self.recorder()?,
+            self.enforcer()?,
+        );
         let router = crate::api::rest::value_routes::register_routes(
             router,
             openapi,

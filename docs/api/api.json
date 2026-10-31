@@ -117,6 +117,107 @@
         ],
         "type": "object"
       },
+      "ActivationDto": {
+        "description": "The activation of a setting at one tenant: a single resource, not a page.",
+        "properties": {
+          "items": {
+            "description": "One item per subscriber of the setting at the tenant, ordered by\nsubscriber; empty when nobody subscribed or no change has affected the\nsubscriptions yet.",
+            "items": {
+              "$ref": "#/components/schemas/ActivationItemDto"
+            },
+            "type": "array"
+          },
+          "tenant": {
+            "description": "The tenant the answer is for, a bare lowercase UUID string.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "tenant",
+          "items"
+        ],
+        "type": "object"
+      },
+      "ActivationItemDto": {
+        "description": "One subscriber's activation state of the current value, as\n`GET /settings-service/v1/settings/{key}/activation` returns it. It carries\nno value of any kind: no expected value, applied value or hash.",
+        "properties": {
+          "change_ref": {
+            "description": "The change the state answers: the id of its audit record in the history.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "detail": {
+            "description": "The consumer's failure detail; present only on a `failed` state.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reported_at": {
+            "description": "When the settling report arrived, RFC 3339; absent while `awaiting`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "`awaiting`, `succeeded` or `failed`. Treat the set as open: a client\nmeets an unknown status as \"not known to have activated\".",
+            "type": "string"
+          },
+          "subscriber": {
+            "description": "The consumer identity.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "subscriber",
+          "status",
+          "change_ref"
+        ],
+        "type": "object"
+      },
+      "ActivationReportDto": {
+        "description": "One subscriber's report on a change, attached under the change's record.",
+        "properties": {
+          "actor": {
+            "description": "The subscriber, a gear identity, shown as recorded.",
+            "type": "string"
+          },
+          "change_ref": {
+            "description": "The id of the change record the report answers.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "detail": {
+            "description": "The consumer's detail on a `failure`; absent on a `success`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "occurred_at": {
+            "description": "When the report was recorded.",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "`success` or `failure`.",
+            "type": "string"
+          },
+          "tenant_id": {
+            "description": "The tenant the report was made for.",
+            "format": "uuid",
+            "type": "string"
+          }
+        },
+        "required": [
+          "change_ref",
+          "actor",
+          "outcome",
+          "tenant_id",
+          "occurred_at"
+        ],
+        "type": "object"
+      },
       "ActorDto": {
         "description": "GitHub `{ \"login\": ... }` actor object.",
         "properties": {
@@ -960,6 +1061,13 @@
       "AuditRecordDto": {
         "description": "One audit record, as `GET /settings-service/v1/settings/{key}/history`\nreturns it.",
         "properties": {
+          "activations": {
+            "description": "The consumers' reports on this record, newest first, at every tenant of\nthe caller's subtree where the caller may read the setting; empty when\nnothing answers it. Not paged and not counted.",
+            "items": {
+              "$ref": "#/components/schemas/ActivationReportDto"
+            },
+            "type": "array"
+          },
           "actor": {
             "description": "Who did it, masked when the identity is PII the caller may not see.",
             "type": "string"
@@ -968,9 +1076,24 @@
             "description": "Whether `actor` carries the mask token.",
             "type": "boolean"
           },
+          "change_ref": {
+            "description": "On an `activation` record, the id of the change record it answers.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "change_set_id": {
             "description": "The change set the mutation was produced under.",
             "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "detail": {
+            "description": "On a `failure` `activation` record, the consumer's detail, free of\nvalues and secrets by contract.",
             "type": [
               "string",
               "null"
@@ -1024,7 +1147,8 @@
           "values_masked",
           "outcome",
           "request_id",
-          "occurred_at"
+          "occurred_at",
+          "activations"
         ],
         "type": "object"
       },
@@ -64184,9 +64308,116 @@
         ]
       }
     },
+    "/settings-service/v1/settings/{key}/activation": {
+      "get": {
+        "description": "Which consumers of a setting have taken its current value up at one tenant: one item per subscriber, ordered by subscriber, with its `status`, the `change_ref` of the change it answers, `reported_at` once the state is settled and `detail` on a `failed` state. The answer carries no value, expected or applied, and no hash. `status` is `awaiting`, `succeeded` or `failed`; treat it as an open set and read an unknown status as not known to have activated. An `awaiting` item stays listed until a report or a later change, with no deadline. `tenant` follows the read surface: omitted, the caller's own tenant; the answer repeats it as a bare lowercase UUID. A setting nobody subscribed to at the tenant answers 200 with no items. A caller the policy denies answers 403 for every key and tenant; a tenant outside the caller's subtree (a standalone descendant and the tenants below it included), an unknown key, a declaration outside the caller's administrative domain and a setting hidden from the caller all answer the same 404. A retired declaration is read like an active one. The read is a single resource: `$filter`, `$orderby`, `$select`, `cursor` and `limit` answer 400. The per-change account of the reports is the setting's history.",
+        "operationId": "settings_service.get_setting_activation",
+        "parameters": [
+          {
+            "description": "The setting key, a URL-encoded GTS type id",
+            "in": "path",
+            "name": "key",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Tenant id; omitted, the caller's own tenant",
+            "in": "query",
+            "name": "tenant",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivationDto"
+                }
+              }
+            },
+            "description": "The activation states of the setting's current value at the tenant, one per subscriber"
+          },
+          "400": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Bad Request"
+          },
+          "401": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Forbidden"
+          },
+          "404": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Not Found"
+          },
+          "500": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Internal Server Error"
+          },
+          "503": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "Service Unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          }
+        ],
+        "summary": "Read a setting's activation at a tenant",
+        "tags": [
+          "settings-values"
+        ]
+      }
+    },
     "/settings-service/v1/settings/{key}/history": {
       "get": {
-        "description": "The mutation history of one setting at one scope, newest first and cursor-paginated, served from the gear's own audit store. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, are masked for a caller without the PII entitlement; a secret was never recorded in plaintext. A retired declaration keeps its history. An empty history is an empty page. `$filter`, `$orderby` and `$select` are refused.",
+        "description": "The mutation history of one setting at one scope, newest first and cursor-paginated, served from the gear's own audit store. `tenant` follows the read surface: omitted, the caller's own tenant; a tenant outside the caller's subtree or a standalone descendant answers 403. A `pii` actor, and `pii` values, are masked for a caller without the PII entitlement; a secret was never recorded in plaintext. A retired declaration keeps its history. An empty history is an empty page. `$filter`, `$orderby` and `$select` are refused. Every record carries `activations`: the consumers' reports on that change, newest first, the report's `id`, descending, breaking a tie, from every tenant of the caller's subtree where the caller may read the setting, an empty list when nothing answers it. A report made at the history's own tenant appears only there, under its change, on whichever page the change falls; a report at another tenant is also an ordinary record of that tenant's history, as is one whose change record retention removed, carrying its `change_ref` and, on a failure, its `detail`. `limit`, the cursor and `total_count` count the listed records only.",
         "operationId": "settings_service.get_setting_history",
         "parameters": [
           {

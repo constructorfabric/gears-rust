@@ -231,6 +231,16 @@ pub async fn sqlite_provider() -> Arc<DBProvider<DbError>> {
     migrated(db).await
 }
 
+/// A database with no migration applied: every read of the gear's tables fails
+/// as a database that cannot answer does.
+pub async fn sqlite_provider_unmigrated() -> Arc<DBProvider<DbError>> {
+    Arc::new(DBProvider::new(
+        connect_db("sqlite::memory:", sqlite_opts())
+            .await
+            .expect("in-memory sqlite connects"),
+    ))
+}
+
 /// As [`sqlite_provider`], with a pool that gives up on a busy connection after
 /// `wait`: a transaction that begins while another holds the one connection
 /// fails to begin, as an exhausted pool does.
@@ -267,6 +277,45 @@ fn sqlite_opts() -> ConnectOpts {
     }
 }
 
+/// The harness's last migration: the connection stops enforcing `CHECK`
+/// constraints. The provider never hands out its connection, and the one
+/// connection of an in-memory database carries the pragma for the rest of the
+/// test — the way to store what the schema refuses, an `activation` record
+/// with an outcome the service does not know.
+#[derive(sea_orm_migration::prelude::DeriveMigrationName)]
+struct IgnoreCheckConstraints;
+
+#[allow(elided_lifetimes_in_paths)]
+#[async_trait]
+impl sea_orm_migration::MigrationTrait for IgnoreCheckConstraints {
+    async fn up(
+        &self,
+        manager: &sea_orm_migration::SchemaManager,
+    ) -> Result<(), sea_orm_migration::sea_orm::DbErr> {
+        use sea_orm_migration::sea_orm::ConnectionTrait as _;
+        manager
+            .get_connection()
+            .execute_unprepared("PRAGMA ignore_check_constraints = ON")
+            .await
+            .map(|_| ())
+    }
+}
+
+/// As [`sqlite_provider`], on a connection that no longer enforces `CHECK`
+/// constraints.
+pub async fn sqlite_provider_ignoring_checks() -> Arc<DBProvider<DbError>> {
+    let db = connect_db("sqlite::memory:", sqlite_opts())
+        .await
+        .expect("in-memory sqlite connects");
+    let mut migrations = crate::infra::storage::migrations::Migrator::migrations();
+    migrations.push(Box::new(IgnoreCheckConstraints));
+    run_migrations_for_testing(&db, migrations)
+        .await
+        .map_err(|e| e.to_string())
+        .expect("migrations apply on sqlite");
+    Arc::new(DBProvider::new(db))
+}
+
 async fn migrated(db: Db) -> Arc<DBProvider<DbError>> {
     run_migrations_for_testing(
         &db,
@@ -289,6 +338,9 @@ pub struct FakeHierarchy {
     pub standalone: Mutex<HashSet<Uuid>>,
     pub chain_calls: std::sync::atomic::AtomicUsize,
     pub unavailable: std::sync::atomic::AtomicBool,
+    /// The subtree and standalone tests alone fail as unavailable, the chain
+    /// still answering: a resolver that goes down at the gate of one read.
+    pub membership_unavailable: std::sync::atomic::AtomicBool,
     /// How many of the next `chain` calls fail as unavailable before the
     /// resolver answers again: a transient outage, not a standing one.
     pub failing_chains: std::sync::atomic::AtomicUsize,
@@ -304,6 +356,12 @@ pub struct FakeHierarchy {
     /// Never answer a bounded walk: a tenant resolver that has stopped
     /// answering, for the time budget a walk runs under.
     pub stall_subtrees: std::sync::atomic::AtomicBool,
+    /// Tenants the standalone test answers `NotFound` for although the tree
+    /// holds them: a resolver that lost the tenant between two questions.
+    pub unknown_to_standalone: Mutex<HashSet<Uuid>>,
+    /// Tenants whose chain fails as unavailable while every other chain still
+    /// answers: a resolver down for one tenant's lookup only.
+    pub failing_chain_for: Mutex<HashSet<Uuid>>,
 }
 
 /// What [`FakeHierarchy::on_chain`] runs.
@@ -325,10 +383,41 @@ impl FakeHierarchy {
             .store(unavailable, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Make the subtree and standalone tests fail as unavailable, or stop.
+    pub fn set_membership_unavailable(&self, unavailable: bool) {
+        self.membership_unavailable
+            .store(unavailable, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn membership_down(&self) -> Result<(), DomainError> {
+        if self
+            .membership_unavailable
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable {
+                detail: "tenant resolver down".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
     /// Fail the next `n` `chain` calls, then answer normally.
     pub fn fail_next_chains(&self, n: usize) {
         self.failing_chains
             .store(n, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Make the standalone test answer `NotFound` for `tenant`.
+    pub fn forget_for_standalone(&self, tenant: Uuid) {
+        self.unknown_to_standalone
+            .lock()
+            .expect("lock")
+            .insert(tenant);
+    }
+
+    /// Fail the chain of `tenant`, and of it alone, as unavailable.
+    pub fn fail_chain_for(&self, tenant: Uuid) {
+        self.failing_chain_for.lock().expect("lock").insert(tenant);
     }
 
     pub fn chain_calls(&self) -> usize {
@@ -389,7 +478,12 @@ impl TenantHierarchy for FakeHierarchy {
                 |left| left.checked_sub(1),
             )
             .is_ok();
-        if transient || self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
+        let failing_here = self
+            .failing_chain_for
+            .lock()
+            .expect("lock")
+            .contains(&tenant);
+        if transient || failing_here || self.unavailable.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(DomainError::Unavailable {
                 detail: "tenant resolver down".to_owned(),
             });
@@ -406,6 +500,7 @@ impl TenantHierarchy for FakeHierarchy {
         if caller == target {
             return Ok(true);
         }
+        self.membership_down()?;
         let path = self.path_to_root(target)?;
         let standalone = self.standalone.lock().expect("lock");
         // Walk up from the target; a barrier strictly below the caller seals
@@ -422,6 +517,15 @@ impl TenantHierarchy for FakeHierarchy {
     }
 
     async fn is_standalone(&self, tenant: Uuid) -> Result<bool, DomainError> {
+        self.membership_down()?;
+        if self
+            .unknown_to_standalone
+            .lock()
+            .expect("lock")
+            .contains(&tenant)
+        {
+            return Err(DomainError::NotFound { resource: "tenant" });
+        }
         self.path_to_root(tenant)?;
         Ok(self.standalone.lock().expect("lock").contains(&tenant))
     }
@@ -551,6 +655,15 @@ impl ResolutionHarness {
 
     pub async fn with_ttl(ttl: Duration) -> Self {
         Self::over(sqlite_provider().await, ttl).await
+    }
+
+    /// A harness whose database no longer enforces `CHECK` constraints.
+    pub async fn ignoring_checks() -> Self {
+        Self::over(
+            sqlite_provider_ignoring_checks().await,
+            Duration::from_secs(30),
+        )
+        .await
     }
 
     /// A harness whose database records every statement.
@@ -1338,6 +1451,8 @@ pub struct RestHarness {
     /// The activation state half every value and restriction change goes
     /// through: the lock table a test holds a key in.
     pub activation: ActivationRig,
+    /// The Recorder behind the activation read, over the harness's database.
+    pub recorder: Arc<crate::gear::ConcreteRecorder>,
     router: axum::Router,
 }
 
@@ -1384,6 +1499,16 @@ impl RestHarness {
         Self::build(Arc::new(AllowButMasked), Arc::new(FixedStepUp::verified())).await
     }
 
+    /// The same surface over a database that stores what the schema refuses.
+    pub async fn ignoring_checks() -> Self {
+        Self::build_over(
+            ResolutionHarness::ignoring_checks().await,
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            resolution_catalogue(),
+        )
+    }
+
     /// The same surface for a caller that may read categories and
     /// declarations but not values.
     pub async fn without_value_read() -> Self {
@@ -1409,12 +1534,38 @@ impl RestHarness {
         Self::build_with(pdp, step_up, resolution_catalogue()).await
     }
 
+    /// The same surface over a database that records every statement, for the
+    /// tests that pin how many a read makes.
+    pub async fn recorded() -> (Self, QueryRecorder) {
+        let (inner, recorder) = ResolutionHarness::recorded().await;
+        let harness = Self::build_over(
+            inner,
+            Arc::new(AllowAll),
+            Arc::new(FixedStepUp::verified()),
+            resolution_catalogue(),
+        );
+        (harness, recorder)
+    }
+
     async fn build_with(
         pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
         step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
         admin_catalogue: FakeSource,
     ) -> Self {
-        let inner = ResolutionHarness::new().await;
+        Self::build_over(
+            ResolutionHarness::new().await,
+            pdp,
+            step_up,
+            admin_catalogue,
+        )
+    }
+
+    fn build_over(
+        inner: ResolutionHarness,
+        pdp: Arc<dyn authz_resolver_sdk::AuthZResolverApi>,
+        step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+        admin_catalogue: FakeSource,
+    ) -> Self {
         let enforcer = Arc::new(authz_resolver_sdk::PolicyEnforcer::new(pdp));
         let openapi = toolkit::api::OpenApiRegistryImpl::new();
         let search = Arc::new(crate::domain::search::service::SearchService::new(
@@ -1445,6 +1596,19 @@ impl RestHarness {
             search,
             Arc::clone(&inner.resolver),
             Arc::clone(&inner.db),
+            Arc::clone(&enforcer),
+        );
+        let recorder = Arc::new(crate::domain::activation::ActivationRecorder::new(
+            Arc::clone(&inner.db),
+            crate::infra::storage::activation_repo::ActivationRepo,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::new(crate::domain::activation::NoNotifyMetrics),
+        ));
+        let router = crate::api::rest::activation_routes::register_routes(
+            router,
+            &openapi,
+            Arc::clone(&inner.resolver),
+            Arc::clone(&recorder),
             Arc::clone(&enforcer),
         );
         let secrets = Arc::new(RecordingSecrets::default());
@@ -1529,6 +1693,7 @@ impl RestHarness {
             published,
             registrar,
             activation,
+            recorder,
             router,
         }
     }

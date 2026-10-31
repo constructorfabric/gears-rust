@@ -381,16 +381,32 @@ async fn a_set_is_notified_re_read_applied_and_reported_to_succeeded() {
         )
         .await
         .expect("history");
-    let activation: Vec<_> = listing
+    // The report is at the tenant its change was written at: the history
+    // attaches it under the change and does not list it beside it.
+    assert!(
+        listing
+            .items
+            .iter()
+            .all(|r| r.operation.as_str() != "activation"),
+        "a report of this history's own change is not listed"
+    );
+    let change_id = listing
         .items
         .iter()
-        .filter(|r| r.operation.as_str() == "activation")
-        .collect();
-    assert_eq!(activation.len(), 1, "visible through the audit store");
-    assert_eq!(
-        activation[0].change_ref.map(|c| c.to_string()),
-        Some(change)
-    );
+        .find(|r| r.id.to_string() == change)
+        .map(|r| r.id)
+        .expect("the change record is listed");
+    let attached = AuditStore
+        .reports_for(
+            &conn,
+            &AccessScope::allow_all(),
+            s.key.as_str(),
+            &[change_id],
+        )
+        .await
+        .expect("attachment lookup");
+    assert_eq!(attached.len(), 1, "visible through the audit store");
+    assert_eq!(attached[0].change_ref.map(|c| c.to_string()), Some(change));
     // *No secret in stream*, as far as a plain value goes: no event carries it.
     // Asserted on the published JSON's key set, not on a substring of its text:
     // identifiers only, no attribute that could carry a value — for the

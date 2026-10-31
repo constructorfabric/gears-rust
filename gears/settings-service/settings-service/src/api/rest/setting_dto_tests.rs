@@ -200,23 +200,39 @@ mod history {
 
     #[test]
     fn a_pii_actor_is_masked_without_the_entitlement_and_shown_with_it() {
-        let hidden = render_record(&record(ActorClassification::Pii), false, false);
+        let hidden = render_record(&record(ActorClassification::Pii), &[], false, false);
         assert_eq!(
             (hidden.actor.as_str(), hidden.actor_masked),
             (MASK_TOKEN, true)
         );
-        let shown = render_record(&record(ActorClassification::Pii), false, true);
+        let shown = render_record(&record(ActorClassification::Pii), &[], false, true);
         assert_eq!(
             (shown.actor.as_str(), shown.actor_masked),
             ("admin@acme", false)
         );
-        let module = render_record(&record(ActorClassification::Public), false, false);
+        let module = render_record(&record(ActorClassification::Public), &[], false, false);
         assert_eq!(module.actor, "admin@acme");
     }
 
     #[test]
+    fn an_attached_pii_report_actor_is_masked_without_the_entitlement_and_shown_with_it() {
+        let mut report = record(ActorClassification::Pii);
+        report.operation = AuditOperation::Activation;
+        report.actor = "consumer@acme".to_owned();
+        report.change_ref = Some(Uuid::nil());
+        // The listed record's own actor is public, so only the attached
+        // report's actor can ask for the entitlement.
+        let listed = record(ActorClassification::Public);
+        let hidden = render_record(&listed, std::slice::from_ref(&report), false, false);
+        assert_eq!(hidden.activations.len(), 1);
+        assert_eq!(hidden.activations[0].actor, MASK_TOKEN);
+        let shown = render_record(&listed, std::slice::from_ref(&report), false, true);
+        assert_eq!(shown.activations[0].actor, "consumer@acme");
+    }
+
+    #[test]
     fn recorded_values_follow_the_setting_classification_and_secrets_stay_masked() {
-        let public = render_record(&record(ActorClassification::Public), false, false);
+        let public = render_record(&record(ActorClassification::Public), &[], false, false);
         assert_eq!(public.pre_value, Some(json!("old")));
         assert_eq!(
             public.post_value,
@@ -225,10 +241,10 @@ mod history {
         );
         assert!(!public.values_masked);
 
-        let pii = render_record(&record(ActorClassification::Public), true, false);
+        let pii = render_record(&record(ActorClassification::Public), &[], true, false);
         assert_eq!(pii.pre_value, Some(json!(MASK_TOKEN)));
         assert!(pii.values_masked);
-        let entitled = render_record(&record(ActorClassification::Public), true, true);
+        let entitled = render_record(&record(ActorClassification::Public), &[], true, true);
         assert_eq!(entitled.pre_value, Some(json!("old")));
     }
 }
