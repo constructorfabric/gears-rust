@@ -22,5 +22,8 @@ pub mod api;
 pub mod config;
 #[doc(hidden)]
 pub mod domain;
+/// The base ontology and the permissions, published through the `toolkit-gts`
+/// inventory for types-registry to seed.
+pub(crate) mod gts;
 #[doc(hidden)]
 pub mod infra;

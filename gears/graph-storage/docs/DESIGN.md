@@ -118,6 +118,7 @@ The gear follows the standard ToolKit gear anatomy: an SDK crate exposing a type
 | [`cpt-cf-graph-storage-adr-embedding-provider`](./ADR/0004-cpt-cf-graph-storage-adr-embedding-provider.md) | Pluggable embedding provider; in-process ONNX default, remote plugin, deterministic fake for CI | `cpt-cf-graph-storage-component-embedding-coordinator`, `cpt-cf-graph-storage-constraint-single-embedding-space` |
 | [`cpt-cf-graph-storage-adr-sqlpgq-access`](./ADR/0005-cpt-cf-graph-storage-adr-sqlpgq-access.md) | **Superseded 2026-10-14**: the gear no longer emits SQL/PGQ | `cpt-cf-graph-storage-component-traversal-service`, `cpt-cf-graph-storage-component-storage-layer` |
 | [`cpt-cf-graph-storage-adr-type-evolution`](./ADR/0006-cpt-cf-graph-storage-adr-type-evolution.md) | A backward-compatible schema change is admitted under the same GTS identifier (types-registry ADR-0003 direction, the gear's own data-backed second ground, a bounded synchronous migration as the third); a byte-identical re-registration converges, an incompatible change is refused naming its location; asking what an edit costs is its own read-only operation | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-fr-type-registration` |
+| [`cpt-cf-graph-storage-adr-types-registry-staging`](./ADR/0007-cpt-cf-graph-storage-adr-types-registry-staging.md) | *Proposed.* Graph types move to the platform types-registry in stages: the base ontology and the permissions are seeded from the inventory now, with no runtime dependency; producer types follow when the registry holds tenant-owned types, and the graph rules when it has validation hooks | `cpt-cf-graph-storage-component-ontology-registry`, `cpt-cf-graph-storage-dbtable-gts-type` |
 
 Two decisions this gear depends on are owned by the `graph-analytics` gear and
 recorded in its ADR set: [how metrics are computed and what determinism they
@@ -862,7 +863,7 @@ GTS identifier parsing and UUIDv5 derivation; draft-07 schema validation across 
 
 ##### Responsibility boundaries
 
-Does not validate instance payloads at query time (ingest does), does not own permission checks (routes do), does not publish the gear's own base types to the platform types-registry. **Status, found while integrating: that publication is not built.** The gear's type catalogue (`gts_type`) is the one ingest validates against, and the gear has no runtime dependency on the registry (`deps = [authz_resolver]`; readiness reports `types_registry` as `not_implemented`), so a producer registers its types with graph-storage only, and deployment has no order beyond authz-resolver.
+Does not validate instance payloads at query time (ingest does), does not own permission checks (routes do), does not publish the gear's own base types to the platform types-registry at runtime: they are submitted to the `toolkit-gts` inventory, which the registry seeds at its own startup (§ Base Ontology Publication). The gear's type catalogue (`gts_type`) is the one ingest validates against and the authority for producer types until the registry holds tenant-owned types; the gear has no runtime dependency on the registry (`deps = [authz_resolver]`; readiness reports `types_registry` as `not_implemented`), so a producer registers its types with graph-storage only, and deployment has no order beyond authz-resolver. ADR-0007 (`cpt-cf-graph-storage-adr-types-registry-staging`) records the interim and the stages.
 
 ##### Related components (by ID)
 
@@ -1952,12 +1953,16 @@ depends on.**
 
 **ID**: `cpt-cf-graph-storage-dbtable-gts-type`
 
-Per-tenant projection of the platform types-registry. It exists for two reasons,
-both measurable: interning, so every node and edge row carries a 4-byte reference
+The gear's per-tenant type catalogue. It exists for two reasons, both
+measurable: interning, so every node and edge row carries a 4-byte reference
 instead of a 16-byte UUID or a GTS identifier of up to 1024 characters; and the
 chain-resolved schema and traits, so a 10,000-item batch validates without a
-types-registry round trip per item. The registry stays authoritative — this table
-is a cache with a foreign identity, never a second source of truth.
+registry round trip per item. **Today it is the authority for producer types**:
+ingest validates against it and producers register with the gear only, because
+types-registry holds global entities alone until its P1. The target is the
+reverse — the registry authoritative and this table its projection — reached in
+the stages of ADR-0007 (`cpt-cf-graph-storage-adr-types-registry-staging`). The base ontology rows are byte-identical to the
+schemas the registry seeds from the gear's inventory.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -2742,7 +2747,7 @@ log instead.
 | Database, migrations | `Unhealthy` — unreachable or migrations unapplied | Everything; gear not ready, no traffic admitted | None | Connectivity restored and migrations applied; probe re-runs on an interval and flips to `Healthy` without restart |
 | AuthZ resolver | `Degraded` — elevated latency | Nothing; requests consume more of their deadline | All | Automatic when latency returns below threshold |
 | AuthZ resolver | `Unhealthy` — unreachable | Every authenticated data path fails closed, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | Unauthenticated health/readiness endpoints only | Automatic on reconnect; no local state to rebuild |
-| Types registry | `Unhealthy` — unreachable | Type registration and any request needing an unresolved type, `unavailable` / `DEPENDENCY_UNAVAILABLE`; gear not ready | — | Automatic on reconnect; the local type cache is re-validated before flipping to `Healthy` |
+| Types registry | `Unhealthy` — unreachable (from ADR-0007 stage 2) | Registration of new types, `unavailable` / `DEPENDENCY_UNAVAILABLE`; ingest against known types continues from the projection | — | Automatic on reconnect; the projection is re-validated before flipping to `Healthy` |
 | Embedding provider | `Degraded` — provider unavailable | Requests with `embed=true`, `unavailable` / `DEPENDENCY_UNAVAILABLE`; vector arms of search omitted with the response saying so | Ingest with `embed=false`, lexical search, traversal, projections, reads | Automatic on provider recovery; vectors missed while degraded are stale by input hash and re-embedded by the normal path |
 | Embedding-space identity | `Unhealthy` — active identity ≠ stored identity | Vector and hybrid search, `failed_precondition` / `EMBEDDING_SPACE_MISMATCH` | Lexical search, ingest, traversal, projections, reads — the gear stays ready | Operator runs the re-embedding lifecycle (ADR-0004) to `cutover`; identity match restores the capability automatically at cutover |
 | Graph-engine plugin | `Degraded` — stale projection or unprovable cursor | Capabilities unique to the plugin, `unimplemented` / `CAPABILITY_UNSUPPORTED` | Everything routable to the built-in PostgreSQL engine | Plugin acknowledges a rebuild from the current `(source_epoch, graph_revision)`; the gear re-activates it through the activation gate |
@@ -3017,11 +3022,17 @@ scan.
 
 ### Base Ontology Publication
 
-At startup the gear registers the base ontology defined in § 3.1 (Base Ontology
-GTS Schemas) — the three abstract bases and the six family types — and its
-permission instances with the platform types-registry through the standard
-inventory mechanism, so producers can derive types and administrators can grant
-permissions before any runtime registration happens. Registration is idempotent
+The gear submits the base ontology defined in § 3.1 (Base Ontology GTS
+Schemas) — the three abstract bases and the six family types — and its
+permission instances (one `AuthzPermissionV1` per resource and action the PEP
+checks: node read, write and delete; type read and admin) to the `toolkit-gts`
+inventory (`src/gts.rs`). types-registry seeds the inventory at its own startup,
+so producers can derive types and administrators can grant permissions before
+any runtime registration happens, and the gear makes no call to the registry.
+The submitted schemas are the same embedded documents the gear validates
+against; `tests/types_registry.rs` seeds the real registry with them and reads
+them back byte-identical, because one entry the registry refused would stop its
+startup and the platform's. Registration is idempotent
 for byte-identical schemas; a schema change to a base type is a new GTS version,
 never an in-place edit, because producer types are already derived from the
 existing one.
