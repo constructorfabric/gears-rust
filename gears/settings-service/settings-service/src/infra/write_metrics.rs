@@ -10,12 +10,14 @@ use tracing::info;
 use crate::domain::ports::{ChangePublisher, StepUpOperation, ValueEvent, WriteMetrics};
 use crate::log_text::LogSafe;
 
-/// `settings_value_writes_total` and `settings_step_up_total` on the
-/// process's meter. The failure ratio is a dashboard derivation of the first.
+/// `settings_value_writes_total`, `settings_step_up_total` and
+/// `settings_changes_committed_total` on the process's meter. The failure ratio
+/// is a dashboard derivation of the first; the third is its per-type breakdown.
 pub struct OtelWriteMetrics {
     writes: Counter<u64>,
     step_ups: Counter<u64>,
     purge_releases: Counter<u64>,
+    changes: Counter<u64>,
 }
 
 impl OtelWriteMetrics {
@@ -35,6 +37,10 @@ impl OtelWriteMetrics {
             purge_releases: meter
                 .u64_counter("settings_declaration_purge_secret_releases_total")
                 .with_description("Credential Store releases after a declaration purge, by result")
+                .build(),
+            changes: meter
+                .u64_counter("settings_changes_committed_total")
+                .with_description("Value changes by change type and outcome")
                 .build(),
         }
     }
@@ -68,6 +74,16 @@ impl WriteMetrics for OtelWriteMetrics {
     fn purge_release_failed(&self) {
         self.purge_releases
             .add(1, &[KeyValue::new("result", "failed")]);
+    }
+
+    fn change(&self, change_type: &'static str, outcome: &'static str) {
+        self.changes.add(
+            1,
+            &[
+                KeyValue::new("change_type", change_type),
+                KeyValue::new("outcome", outcome),
+            ],
+        );
     }
 }
 

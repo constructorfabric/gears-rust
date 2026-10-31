@@ -30,6 +30,7 @@ use crate::domain::declaration::{
     strictest_classification,
 };
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecurityMetrics;
 use crate::domain::resolution::{MASK_TOKEN, SUBTREE_BUDGET, scope_path};
 use crate::field;
 use crate::gear::ConcreteResolver;
@@ -121,6 +122,7 @@ pub async fn revival_report(
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<RevivalParams>,
     body: Result<Json<CreateDeclarationRequest>, JsonRejection>,
 ) -> ApiResult<Response> {
@@ -130,9 +132,24 @@ pub async fn revival_report(
     // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-2
     // Both decisions come before the body is answered, so the answer does
     // not depend on what exists.
-    let declaration_scope =
-        authz::access_scope(&enforcer, &ctx, &resource::DECLARATION, "create", None).await?;
-    let value_scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, "read", None).await?;
+    let declaration_scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::DECLARATION,
+        "create",
+        None,
+    )
+    .await?;
+    let value_scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        "read",
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-setting-declarations-revival-report:p1:inst-decl-revival-2
     let conn = db.conn().map_err(|err| conn_error(&err))?;
     // The caller's chain is read before anything else is asked, so a tenant

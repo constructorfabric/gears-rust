@@ -19,6 +19,7 @@ use crate::api::rest::setting_handlers::{
     conn_error, gate_target, may_read_pii, parse_tenant, unsupported,
 };
 use crate::domain::category::visibility;
+use crate::domain::ports::SecurityMetrics;
 use crate::domain::resolution::{SUBTREE_BUDGET, subtree_too_large};
 use crate::domain::search::service::SearchService;
 use crate::domain::search::{Corpus, Needle, SEARCH_OVERRIDE_LIMIT, SearchRequest, cursor_binding};
@@ -54,12 +55,17 @@ pub struct SearchParams {
 /// values or the target is outside its subtree or standalone; 503 when a
 /// dependency cannot answer.
 // @cpt-dod:cpt-cf-settings-service-dod-search-discoverability-surface:p2
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn search_settings(
     Extension(ctx): Extension<SecurityContext>,
     Extension(search): Extension<Arc<ConcreteSearchService>>,
     Extension(resolver): Extension<Arc<ConcreteResolver>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Query(params): Query<SearchParams>,
     OData(query): OData,
 ) -> ApiResult<impl IntoResponse> {
@@ -83,8 +89,15 @@ pub async fn search_settings(
     // One decision on the value resource for the whole request; its
     // constraints are the secure scope of the declarations query, so a setting
     // the caller may not read is absent from the results and from the count.
-    let scope: AccessScope =
-        authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope: AccessScope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-2
 
     // @cpt-begin:cpt-cf-settings-service-flow-search-discoverability-search:p2:inst-sd-search-3

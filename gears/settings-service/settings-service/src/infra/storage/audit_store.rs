@@ -4,6 +4,8 @@
 //! mutation's transaction, read back for the per-(setting, scope) history, and
 //! pruned by retention and nothing else.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
 use time::{Duration, OffsetDateTime};
@@ -20,6 +22,9 @@ use crate::audit::{
 };
 use crate::domain::error::DomainError;
 use crate::domain::odata::Listing;
+#[cfg(test)]
+use crate::domain::ports::NoMetrics;
+use crate::domain::ports::{SecurityMetrics, labels};
 use crate::infra::storage::entity::audit_record::{self, Entity as AuditEntity};
 use crate::infra::storage::listing::list_counted;
 
@@ -29,9 +34,35 @@ const HISTORY_LIMIT_CFG: LimitCfg = LimitCfg {
     max: 200,
 };
 
-/// The store. Stateless: every operation takes its connection.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct AuditStore;
+/// The store. Every operation takes its connection; the only state is the
+/// port the appends are counted on.
+#[derive(Clone)]
+pub struct AuditStore {
+    metrics: Arc<dyn SecurityMetrics>,
+}
+
+impl AuditStore {
+    /// A store whose appends are counted on `metrics`.
+    #[must_use]
+    pub fn new(metrics: Arc<dyn SecurityMetrics>) -> Self {
+        Self { metrics }
+    }
+}
+
+/// A store that counts nothing: the test binding. Production code builds the
+/// store with the counting port in `init`; it never binds this one.
+#[cfg(test)]
+impl Default for AuditStore {
+    fn default() -> Self {
+        Self::new(Arc::new(NoMetrics))
+    }
+}
+
+impl std::fmt::Debug for AuditStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuditStore").finish_non_exhaustive()
+    }
+}
 
 fn unavailable(err: impl std::fmt::Display) -> DomainError {
     DomainError::dependency_unavailable("audit store", "complete the operation", err)
@@ -163,6 +194,11 @@ impl AuditSink for AuditStore {
         record: AuditRecord,
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4
+        let kind = if record.operation == AuditOperation::SecretUse {
+            labels::SECRET_USE
+        } else {
+            labels::MUTATION
+        };
         let active = audit_record::ActiveModel {
             id: Set(Uuid::new_v4()),
             resource: Set(record.resource),
@@ -197,11 +233,18 @@ impl AuditSink for AuditStore {
         // else is tracked — the record lives or dies with the mutation.
         toolkit_db::secure::secure_insert::<AuditEntity>(active, scope, conn)
             .await
-            .map(|_| ())
-            .map_err(unavailable)
+            .map_err(unavailable)?;
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-7
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-6
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-5
+        // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-9
+        // Counted on the successful insert, inside the mutation's transaction: a
+        // failed insert counts nothing, but a transaction that rolls back
+        // afterwards overcounts by the records already appended (the DESIGN
+        // accepts this).
+        self.metrics.audit_event(kind);
+        Ok(())
+        // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-9
     }
 }
 
@@ -292,7 +335,6 @@ impl AuditStore {
     /// # Errors
     /// [`DomainError`] when the delete fails.
     pub async fn prune_expired<C: DBRunner>(
-        &self,
         conn: &C,
         scope: &AccessScope,
         now: OffsetDateTime,
@@ -364,7 +406,6 @@ impl AuditStore {
     /// [`DomainError`] when the write fails, `days` does not fit the column, or
     /// the seeded row is missing.
     pub async fn record_retention<C: DBRunner>(
-        &self,
         conn: &C,
         scope: &AccessScope,
         days: u32,

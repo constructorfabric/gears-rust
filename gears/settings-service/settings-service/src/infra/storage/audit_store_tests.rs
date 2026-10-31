@@ -46,7 +46,7 @@ async fn history(
     cursor: Option<toolkit_odata::CursorV1>,
 ) -> crate::domain::odata::Listing<crate::audit::StoredAuditRecord> {
     let conn = db.conn().expect("connection");
-    AuditStore
+    AuditStore::default()
         .history(
             &conn,
             &AccessScope::allow_all(),
@@ -68,12 +68,12 @@ async fn appended_records_come_back_newest_first_for_their_pair_only() {
     let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
     let conn = db.conn().expect("connection");
     for request in ["r1", "r2", "r3"] {
-        AuditStore
+        AuditStore::default()
             .append(&conn, &AccessScope::allow_all(), record(a, request))
             .await
             .expect("append");
     }
-    AuditStore
+    AuditStore::default()
         .append(&conn, &AccessScope::allow_all(), record(b, "other-tenant"))
         .await
         .expect("append");
@@ -101,7 +101,7 @@ async fn a_second_page_follows_the_cursor_without_duplicates() {
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
     for i in 0..5 {
-        AuditStore
+        AuditStore::default()
             .append(
                 &conn,
                 &AccessScope::allow_all(),
@@ -145,7 +145,7 @@ async fn a_secret_image_is_stored_masked_and_read_back_masked() {
         json!("hunter2"),
         crate::audit::ImageClass::Secret,
     ));
-    AuditStore
+    AuditStore::default()
         .append(&conn, &AccessScope::allow_all(), rec)
         .await
         .expect("append");
@@ -176,7 +176,7 @@ async fn a_pii_image_keeps_its_class_through_the_store() {
         json!("alice@example.com"),
         crate::audit::ImageClass::Pii,
     ));
-    AuditStore
+    AuditStore::default()
         .append(&conn, &AccessScope::allow_all(), rec)
         .await
         .expect("append");
@@ -199,7 +199,7 @@ async fn pruning_removes_only_records_past_their_horizon() {
     let conn = db.conn().expect("connection");
     let now = OffsetDateTime::now_utc();
     // Explicit horizons: one behind us, one ahead.
-    AuditStore
+    AuditStore::default()
         .append(
             &conn,
             &AccessScope::allow_all(),
@@ -207,7 +207,7 @@ async fn pruning_removes_only_records_past_their_horizon() {
         )
         .await
         .expect("append");
-    AuditStore
+    AuditStore::default()
         .append(
             &conn,
             &AccessScope::allow_all(),
@@ -216,21 +216,20 @@ async fn pruning_removes_only_records_past_their_horizon() {
         .await
         .expect("append");
     // No horizon: the default applies from when it was written, which is now.
-    AuditStore
+    AuditStore::default()
         .append(&conn, &AccessScope::allow_all(), record(tenant, "default"))
         .await
         .expect("append");
 
-    let pruned = AuditStore
-        .prune_expired(
-            &conn,
-            &AccessScope::allow_all(),
-            now,
-            Duration::days(365),
-            1_000,
-        )
-        .await
-        .expect("prune");
+    let pruned = AuditStore::prune_expired(
+        &conn,
+        &AccessScope::allow_all(),
+        now,
+        Duration::days(365),
+        1_000,
+    )
+    .await
+    .expect("prune");
     assert_eq!(pruned, 1);
     let left: Vec<String> = history(&db, tenant, None, None)
         .await
@@ -242,16 +241,15 @@ async fn pruning_removes_only_records_past_their_horizon() {
     assert!(left.contains(&"kept".to_owned()) && left.contains(&"default".to_owned()));
 
     // Far enough in the future the default horizon has passed too.
-    let pruned = AuditStore
-        .prune_expired(
-            &conn,
-            &AccessScope::allow_all(),
-            now + Duration::days(400),
-            Duration::days(365),
-            1_000,
-        )
-        .await
-        .expect("prune");
+    let pruned = AuditStore::prune_expired(
+        &conn,
+        &AccessScope::allow_all(),
+        now + Duration::days(400),
+        Duration::days(365),
+        1_000,
+    )
+    .await
+    .expect("prune");
     assert_eq!(pruned, 2);
 }
 
@@ -261,7 +259,7 @@ async fn a_failed_append_is_unavailability() {
     // as unavailability for the caller to roll back on.
     let db = db().await;
     let conn = db.conn().expect("connection");
-    let err = AuditStore
+    let err = AuditStore::default()
         .append(&conn, &AccessScope::deny_all(), record(Uuid::new_v4(), "r"))
         .await
         .expect_err("refused");
@@ -274,7 +272,7 @@ async fn records_of_one_change_set_are_retrievable_together() {
     let conn = db.conn().expect("connection");
     let change_set = Uuid::new_v4();
     for tenant in [Uuid::new_v4(), Uuid::new_v4()] {
-        AuditStore
+        AuditStore::default()
             .append(
                 &conn,
                 &AccessScope::allow_all(),
@@ -283,7 +281,7 @@ async fn records_of_one_change_set_are_retrievable_together() {
             .await
             .expect("append");
     }
-    AuditStore
+    AuditStore::default()
         .append(
             &conn,
             &AccessScope::allow_all(),
@@ -291,7 +289,7 @@ async fn records_of_one_change_set_are_retrievable_together() {
         )
         .await
         .expect("append");
-    let together = AuditStore
+    let together = AuditStore::default()
         .by_change_set(&conn, &AccessScope::allow_all(), change_set)
         .await
         .expect("by change set");
@@ -361,7 +359,7 @@ async fn the_store_itself_refuses_to_rewrite_a_record() {
     let db = db().await;
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
-    AuditStore
+    AuditStore::default()
         .append(&conn, &AccessScope::allow_all(), record(tenant, "once"))
         .await
         .expect("append");
@@ -393,7 +391,7 @@ async fn a_cursor_minted_for_one_history_is_refused_on_another() {
     {
         let conn = db.conn().expect("connection");
         for (tenant, request) in [(a, "a1"), (a, "a2"), (b, "b1"), (b, "b2")] {
-            AuditStore
+            AuditStore::default()
                 .append(&conn, &AccessScope::allow_all(), record(tenant, request))
                 .await
                 .expect("append");
@@ -414,7 +412,7 @@ async fn a_cursor_minted_for_one_history_is_refused_on_another() {
 
     // Another scope's history refuses it.
     let conn = db.conn().expect("connection");
-    let foreign = AuditStore
+    let foreign = AuditStore::default()
         .history(
             &conn,
             &AccessScope::allow_all(),
@@ -442,7 +440,7 @@ async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
     let conn = db.conn().expect("connection");
     let now = OffsetDateTime::now_utc();
     for i in 0..5 {
-        AuditStore
+        AuditStore::default()
             .append(
                 &conn,
                 &AccessScope::allow_all(),
@@ -451,7 +449,7 @@ async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
             .await
             .expect("append");
     }
-    AuditStore
+    AuditStore::default()
         .append(
             &conn,
             &AccessScope::allow_all(),
@@ -463,16 +461,15 @@ async fn a_prune_deletes_at_most_its_batch_and_only_what_is_expired() {
     let later = now + Duration::days(400);
     let mut passes = Vec::new();
     loop {
-        let pruned = AuditStore
-            .prune_expired(
-                &conn,
-                &AccessScope::allow_all(),
-                later,
-                Duration::days(365),
-                2,
-            )
-            .await
-            .expect("prune");
+        let pruned = AuditStore::prune_expired(
+            &conn,
+            &AccessScope::allow_all(),
+            later,
+            Duration::days(365),
+            2,
+        )
+        .await
+        .expect("prune");
         passes.push(pruned);
         if pruned == 0 {
             break;
@@ -497,7 +494,7 @@ async fn a_record_is_stamped_on_the_shared_microsecond_clock() {
     let tenant = Uuid::new_v4();
     let conn = db.conn().expect("connection");
     for i in 0..5 {
-        AuditStore
+        AuditStore::default()
             .append(
                 &conn,
                 &AccessScope::allow_all(),
@@ -514,4 +511,110 @@ async fn a_record_is_stamped_on_the_shared_microsecond_clock() {
             item.occurred_at
         );
     }
+}
+
+// ---- `settings_audit_events_total`: counted at the sink's append.
+
+fn counting_store() -> (
+    AuditStore,
+    Arc<crate::test_support::RecordingSecurityMetrics>,
+) {
+    let metrics = Arc::new(crate::test_support::RecordingSecurityMetrics::default());
+    (AuditStore::new(Arc::clone(&metrics) as _), metrics)
+}
+
+#[tokio::test]
+async fn a_mutation_record_counts_one_mutation_event() {
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let (store, metrics) = counting_store();
+    for operation in [
+        AuditOperation::Create,
+        AuditOperation::Change,
+        AuditOperation::Revert,
+        AuditOperation::Remove,
+        AuditOperation::Clone,
+    ] {
+        store
+            .append(
+                &conn,
+                &AccessScope::allow_all(),
+                AuditRecord::new(
+                    KEY,
+                    Some(Uuid::new_v4()),
+                    "admin",
+                    ActorTenant::machine(),
+                    operation,
+                    "req",
+                ),
+            )
+            .await
+            .expect("append");
+    }
+    assert_eq!(metrics.audit_events(), vec!["mutation"; 5]);
+}
+
+#[tokio::test]
+async fn a_staged_record_counts_as_a_mutation() {
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let (store, metrics) = counting_store();
+    store
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            AuditRecord::new(
+                KEY,
+                Some(Uuid::new_v4()),
+                "admin",
+                ActorTenant::machine(),
+                AuditOperation::Stage,
+                "req",
+            )
+            .with_post_image(AuditValue::Masked),
+        )
+        .await
+        .expect("append");
+    assert_eq!(metrics.audit_events(), vec!["mutation"]);
+}
+
+#[tokio::test]
+async fn a_secret_use_record_counts_one_secret_use_event() {
+    let db = db().await;
+    let conn = db.conn().expect("connection");
+    let (store, metrics) = counting_store();
+    store
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            AuditRecord::new(
+                KEY,
+                Some(Uuid::new_v4()),
+                "service",
+                ActorTenant::machine(),
+                AuditOperation::SecretUse,
+                "req",
+            ),
+        )
+        .await
+        .expect("append");
+    assert_eq!(metrics.audit_events(), vec!["secret_use"]);
+}
+
+#[tokio::test]
+async fn a_failed_append_counts_nothing() {
+    // A database without the audit table: the insert fails.
+    let broken = crate::test_support::schemaless_provider().await;
+    let conn = broken.conn().expect("connection");
+    let (store, metrics) = counting_store();
+    let err = store
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(Uuid::new_v4(), "req"),
+        )
+        .await
+        .expect_err("the insert fails");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+    assert!(metrics.audit_events().is_empty());
 }

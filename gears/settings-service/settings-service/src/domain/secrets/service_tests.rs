@@ -19,8 +19,8 @@ use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::test_support::{
-    AllowAllGate, DenyAllGate, FailingSink, RecordingAudit, RecordingSecrets, ResolutionHarness,
-    SECRET,
+    AllowAllGate, DenyAllGate, FailingSink, RecordingAudit, RecordingSecrets,
+    RecordingSecurityMetrics, ResolutionHarness, SECRET,
 };
 
 type Resolver = SecretResolver<DeclarationRepo, ValueRepo, AccessRepo, Arc<RecordingAudit>>;
@@ -29,6 +29,7 @@ struct Harness {
     base: ResolutionHarness,
     secrets: Arc<RecordingSecrets>,
     audit: Arc<RecordingAudit>,
+    metrics: Arc<RecordingSecurityMetrics>,
     resolver: Resolver,
 }
 
@@ -37,16 +38,19 @@ impl Harness {
         let base = ResolutionHarness::new().await;
         let secrets = Arc::new(RecordingSecrets::default());
         let audit = Arc::new(RecordingAudit::default());
+        let metrics = Arc::new(RecordingSecurityMetrics::default());
         let resolver = SecretResolver::new(
             Arc::clone(&base.resolver),
             Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
             gate,
             Arc::clone(&audit),
+            Arc::clone(&metrics) as Arc<dyn crate::domain::ports::SecurityMetrics>,
         );
         Self {
             base,
             secrets,
             audit,
+            metrics,
             resolver,
         }
     }
@@ -256,6 +260,7 @@ async fn a_resolution_whose_record_cannot_be_written_yields_no_plaintext() {
         Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
         Arc::new(AllowAllGate),
         FailingSink,
+        Arc::new(crate::domain::ports::NoMetrics),
     );
     let d = base
         .declare_typed(
@@ -280,4 +285,79 @@ async fn a_resolution_whose_record_cannot_be_written_yields_no_plaintext() {
         .await
         .expect_err("no record, no plaintext");
     assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+}
+
+// ---- `settings_secret_use_total`: counted at the Secret Manager.
+
+#[tokio::test]
+async fn an_allowed_resolution_counts_one_allowed_secret_use() {
+    let h = Harness::new(Arc::new(AllowAllGate)).await;
+    let d = h.declare_secret("api_token").await;
+    let t = &h.base.tree;
+    h.configure(d, t.a, "hunter2").await;
+
+    h.resolve(&h.handle("api_token", t.a))
+        .await
+        .expect("resolved");
+
+    assert_eq!(h.metrics.secret_uses(), vec!["allowed"]);
+    assert!(
+        h.metrics.denials().is_empty(),
+        "a permitted resolution is not a refusal"
+    );
+}
+
+#[tokio::test]
+async fn a_resolution_the_gate_refuses_counts_one_denied_secret_use() {
+    // The gate here is the double that refuses; the authorization denial the
+    // production gate adds is asserted on the gate itself
+    // (`secret_manager_tests`).
+    let gate = Arc::new(DenyAllGate::default());
+    let h = Harness::new(Arc::clone(&gate) as Arc<dyn SecretResolveGate>).await;
+    let d = h.declare_secret("api_token").await;
+    let t = &h.base.tree;
+    h.configure(d, t.a, "hunter2").await;
+
+    let err = h
+        .resolve(&h.handle("api_token", t.a))
+        .await
+        .expect_err("denied");
+
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+    assert_eq!(h.metrics.secret_uses(), vec!["denied"]);
+}
+
+#[tokio::test]
+async fn a_malformed_handle_a_missing_credential_and_a_store_outage_count_no_secret_use() {
+    let h = Harness::new(Arc::new(AllowAllGate)).await;
+    let d = h.declare_secret("api_token").await;
+    let t = &h.base.tree;
+
+    // A malformed handle.
+    let bad = SecretHandle::new("not-a-handle");
+    h.resolve(&bad).await.expect_err("malformed");
+
+    // A secret nobody configured: no credential.
+    h.declare_secret("unset_token").await;
+    h.resolve(&h.handle("unset_token", t.a))
+        .await
+        .expect_err("no credential");
+
+    // A configured secret whose store cannot answer.
+    h.configure(d, t.a, "hunter2").await;
+    h.secrets.go_down();
+    h.resolve(&h.handle("api_token", t.a))
+        .await
+        .expect_err("store outage");
+
+    assert!(h.metrics.secret_uses().is_empty());
+
+    // The recorder is wired: the same path, answered, counts.
+    h.secrets
+        .unavailable
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    h.resolve(&h.handle("api_token", t.a))
+        .await
+        .expect("resolved");
+    assert_eq!(h.metrics.secret_uses(), vec!["allowed"]);
 }

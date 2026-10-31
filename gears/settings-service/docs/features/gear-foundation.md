@@ -32,6 +32,7 @@
   - [REST and OData Infrastructure](#rest-and-odata-infrastructure)
   - [Policy Enforcement Point and Step-Up Gate](#policy-enforcement-point-and-step-up-gate)
   - [Audit Emitter](#audit-emitter)
+  - [Telemetry Is Secret-Free and Bounded](#telemetry-is-secret-free-and-bounded)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
 <!-- /toc -->
@@ -99,6 +100,8 @@ Not applicable. This feature delivers SDK contracts and gear infrastructure with
 10. [ ] - `p1` - Register the gear's remaining GTS control-plane schemas — category, declaration, value, effective value, change set, and the event schemas — the same way, so they are resolvable before the first row is written - `inst-gf-init-10`
 11. [ ] - `p1` - Seed the minimal category set by idempotent upsert, so a fresh installation carries the categories the platform's own declarations file under and a restart changes nothing - `inst-gf-init-11`
 12. [x] - `p1` - Mark the gear ready and begin serving - `inst-gf-init-12`
+13. [x] - `p1` - Set `settings_service_up` to `1` as the managed lifecycle starts and to `0` on its shutdown signal - `inst-gf-init-13`
+14. [x] - `p1` - On the lifecycle's once-a-minute tick refresh `settings_declarations_total` by `source` and `status` and `settings_values_total` by `scope_class` and `scope_kind` (`platform` for a row at the root tenant, `tenant` otherwise), by grouped counts — one for the declarations gauge, one per scope kind for the values gauge, joining `setting_values` to `setting_declarations` on the declaration id — every label combination published on every refresh, zero included, a failed refresh logged and the gauges left as they were - `inst-gf-init-14`
 
 ### Setting Key Parsing and Validation
 
@@ -168,6 +171,7 @@ GTS grammar is **not** re-implemented here. The platform GTS identifier library 
 7. [x] - `p1` - **IF** the token is absent, outside the window, or not bound to this principal → **RETURN** denial carrying the RFC 9470 challenge, `401` with `insufficient_user_authentication`, so the client learns what to ask the provider for; a service principal writing to such a declaration is refused outright, since no ceremony a machine performs proves a person is present - `inst-gf-authz-7`
 8. [x] - `p1` - Build the `AccessScope` from the decision's constraints - `inst-gf-authz-8`
 9. [x] - `p1` - **RETURN** the `AccessScope` for the handler to apply as a query and visibility predicate - `inst-gf-authz-9`
+10. [x] - `p1` - On a refusal of step 4, 5 or 8 — the decision point unreachable (4), the decision deny (5), or its constraints not compilable (8) — count `settings_authz_denial_total` by `operation` (the action asked) and `reason` (`unavailable`, `denied`, `constraints`) before the refusal is collapsed into the one undifferentiated answer; the response discloses no reason, the metric is the operator's. Only a refusal that fails the request counts: a probe answered otherwise — the unmasked-read entitlement, answered by masking, and the category tallies, answered by omitting the counts — goes through a separate probe call that counts nothing, and the write gate's own refusals are business rules, not enforcement - `inst-gf-authz-10`
 
 ## 4. States (CDSL)
 
@@ -289,7 +293,7 @@ An earlier wording required *"SeaORM entity scaffolding"* here. That could not b
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-gear-scaffold`
 
-The system **MUST** provide a `#[toolkit::gear]` annotated gear that declares only the client it calls during its own init — `deps = [types_registry]` — and reaches every consumed client through `#[toolkit::consumes]` at first use; **MUST** register its client traits into `ClientHub` and bind them per the active deployment profile, failing startup on a remote binding while the release is Embedded-only; **MUST** register its GTS control-plane schemas and the abstract `setting_type` base, and seed the minimal category set idempotently, at init; and **MUST** take bootstrap configuration — database and broker endpoints, service identity, TLS, ports, and the step-up freshness window and pins — from ToolKit config at gear init, never from a managed setting.
+The system **MUST** provide a `#[toolkit::gear]` annotated gear that declares only the client it calls during its own init — `deps = [types_registry]` — and reaches every consumed client through `#[toolkit::consumes]` at first use; **MUST** register its client traits into `ClientHub` and bind them per the active deployment profile, failing startup on a remote binding while the release is Embedded-only; **MUST** register its GTS control-plane schemas and the abstract `setting_type` base, and seed the minimal category set idempotently, at init; and **MUST** take bootstrap configuration — database and broker endpoints, service identity, TLS, ports, and the step-up freshness window and pins — from ToolKit config at gear init, never from a managed setting. The lifecycle **MUST** set `settings_service_up` to 1 on start and 0 on its shutdown signal and sample `settings_declarations_total` and `settings_values_total` on its once-a-minute tick under the rules of the needs-review gauge (`cpt-cf-settings-service-dod-typed-value-validation-needs-review-gauge`) — every label combination published each refresh, zero included, a failed refresh logged and the gauges left as they were.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-gear-init`
@@ -303,10 +307,12 @@ The system **MUST** provide a `#[toolkit::gear]` annotated gear that declares on
 
 - [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-rest-odata`
 
-The system **MUST** provide shared `OperationBuilder` wiring, OData `$filter`, `$select`, and `$orderby` parsing against a per-resource field mapping, cursor-based pagination helpers, and `If-Match` and ETag handling returning `428` when the header is missing on a mutating request and `412` when it is stale. An expression referencing an unmapped field or unsupported operator **MUST** be rejected rather than silently ignored.
+The system **MUST** provide shared `OperationBuilder` wiring, OData `$filter`, `$select`, and `$orderby` parsing against a per-resource field mapping, cursor-based pagination helpers, and `If-Match` and ETag handling returning `428` when the header is missing on a mutating request and `412` when it is stale. An expression referencing an unmapped field or unsupported operator **MUST** be rejected rather than silently ignored. The gear's router **MUST NOT** install an HTTP latency histogram of its own: the host's `api-gateway` owns the router and records `http.server.request.duration` by `http.route` for every route the gear registers, and a second layer would double-count.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-precondition`
+
+**Constraints**: `cpt-cf-settings-service-constraint-supplied-as-gear`
 
 **Touches**:
 - Entities: OData field mapping, pagination cursor, ETag
@@ -315,7 +321,7 @@ The system **MUST** provide shared `OperationBuilder` wiring, OData `$filter`, `
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-authz-stepup`
 
-The system **MUST** enforce authorization through the `PolicyEnforcer` PEP against the target GTS resource type, **MUST** derive an `AccessScope` from the decision's constraints for handlers to apply as a query and visibility predicate, and **MUST** verify a fresh step-up token established at the identity provider before any behavior-affecting declaration action and before an interactive value write to a declaration that requires elevated confirmation. Verification **MUST** go through the gear's own `StepUpVerifier` port, whose default binding has the platform's AuthN resolver authenticate the token and checks its claims, as DESIGN.md §4.2 *Value Writer* specifies; a binding that cannot fail is not a binding. Authorization **MUST** be decided before step-up is consulted, and an authorization or entitlement decision that cannot be obtained **MUST** deny.
+The system **MUST** enforce authorization through the `PolicyEnforcer` PEP against the target GTS resource type, **MUST** derive an `AccessScope` from the decision's constraints for handlers to apply as a query and visibility predicate, and **MUST** verify a fresh step-up token established at the identity provider before any behavior-affecting declaration action and before an interactive value write to a declaration that requires elevated confirmation. Verification **MUST** go through the gear's own `StepUpVerifier` port, whose default binding has the platform's AuthN resolver authenticate the token and checks its claims, as DESIGN.md §4.2 *Value Writer* specifies; a binding that cannot fail is not a binding. Authorization **MUST** be decided before step-up is consulted, and an authorization or entitlement decision that cannot be obtained **MUST** deny. A denial **MUST** be counted on `settings_authz_denial_total` by operation and reason (`denied`, `unavailable`, `constraints`) before the denials collapse into the one undifferentiated answer — PDP decisions at an enforcement point only; a probe's refusal and the write gate's own refusals are business rules and are not counted.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-gear-foundation-authz-stepup`
@@ -333,6 +339,21 @@ The system **MUST** provide the shared Audit Emitter through which every mutatin
 
 **Touches**:
 - Entities: Audit Emitter
+
+### Telemetry Is Secret-Free and Bounded
+
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-gear-foundation-telemetry`
+
+Every metric the gear emits **MUST** be registered on the gear's meter through a domain port whose methods take only static labels and numbers; no label **MAY** carry a setting key, tenant id, actor, value, secret or request path; label sets **MUST** be the finite sets the DESIGN names; and the test binding **MUST** count nothing.
+
+**Implements**:
+- `cpt-cf-settings-service-algo-gear-foundation-gear-init`
+- `cpt-cf-settings-service-algo-gear-foundation-authz-stepup`
+
+**Constraints**: `cpt-cf-settings-service-constraint-secrets-by-reference`
+
+**Touches**:
+- Entities: meter
 
 ## 6. Acceptance Criteria
 
@@ -371,3 +392,10 @@ The system **MUST** provide the shared Audit Emitter through which every mutatin
 - [ ] A behavior-affecting action without a valid step-up assertion is denied, and one with a step-up assertion bound to a different principal is also denied
 - [ ] An `AccessScope` returned by the PEP is applied as a query predicate and not merely as a post-filter
 - [x] The Audit Emitter records a mutation with both pre-image and post-image available to the caller
+- [x] A PDP deny, an unreachable PDP and an uncompilable constraint count one denial each by reason, under the operation asked, and the response is the same `403` for all three; a category listing whose tally probe is refused and a masked read by a caller without the unmasked entitlement count no denial
+- [x] The gear's router installs no HTTP latency histogram of its own; REST latency comes from the host's `http.server.request.duration` by `http.route`
+- [x] `settings_service_up` reads 1 after start and 0 after shutdown
+- [x] Every source×status and scope_class×scope_kind combination is published on each refresh, zero included, and a failed refresh leaves the gauges as they were
+- [x] No metric label carries a key, tenant, actor, value or path
+- [x] The test binding of every metrics port counts nothing
+- [x] `settings_values_total` labels a row at the root tenant `scope_kind` `platform` and any other row `tenant`

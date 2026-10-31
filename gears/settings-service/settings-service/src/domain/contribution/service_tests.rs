@@ -1446,6 +1446,14 @@ impl DeclarationRepository for JournalingDeclarations {
             .tally_by_category(conn, scope, visibility, hidden_for, category_ids)
             .await
     }
+    async fn count_by_source_status<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+    ) -> Result<std::collections::HashMap<(String, String), u64>, crate::domain::error::DomainError>
+    {
+        DeclarationRepo.count_by_source_status(conn, scope).await
+    }
 }
 
 #[tokio::test]

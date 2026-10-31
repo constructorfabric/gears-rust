@@ -31,6 +31,7 @@ fn effective(classification: &str) -> EffectiveValue {
             set_by_tenant: None,
             last_change_at: Some(at(200)),
         }],
+        scope_class: "cascading",
         data_classification: classification.to_owned(),
         declaration_last_change_at: at(100),
         resolved_row_last_change_at: Some(at(200)),

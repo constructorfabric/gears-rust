@@ -9,6 +9,8 @@ pub mod cache;
 pub mod resolver;
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use toolkit_macros::domain_model;
 
 use async_trait::async_trait;
@@ -33,6 +35,27 @@ pub mod scope_class {
     pub const CASCADING: &str = "cascading";
     /// One value per tenant, never inherited.
     pub const LOCAL: &str = "local";
+
+    /// The class a stored declaration names, onto its constant; `None` for
+    /// anything else, which the table's CHECK constraint makes unreachable.
+    #[must_use]
+    pub fn label_of(class: &str) -> Option<&'static str> {
+        match class {
+            GLOBAL => Some(GLOBAL),
+            CASCADING => Some(CASCADING),
+            LOCAL => Some(LOCAL),
+            _ => None,
+        }
+    }
+}
+
+/// Whether an override sits at the platform (the root tenant) or at a tenant:
+/// the `scope_kind` label of the values gauge.
+pub mod scope_kind {
+    /// A row at the root tenant.
+    pub const PLATFORM: &str = "platform";
+    /// A row at any other tenant.
+    pub const TENANT: &str = "tenant";
 }
 
 /// Where a read is resolved for: the platform, or one tenant.
@@ -255,6 +278,21 @@ pub struct OwnRow {
     pub updated_at: OffsetDateTime,
 }
 
+/// What a reader-boundary resolve reports beside the value: where it was
+/// answered from and how long the answer took, for the reader to record. The
+/// resolver itself records nothing.
+#[domain_model]
+#[derive(Debug, Clone)]
+pub struct ReaderRead {
+    /// The resolved value.
+    pub value: Arc<EffectiveValue>,
+    /// `cache` for a hit, `resolve` for a lookup that had to resolve.
+    pub source: &'static str,
+    /// From the cache lookup to the outcome, the platform-scope read and the
+    /// chain walk included.
+    pub elapsed: Duration,
+}
+
 /// A resolved effective value with its trace — computed, never persisted.
 // @cpt-dod:cpt-cf-settings-service-dod-value-resolution-shape:p1
 #[domain_model]
@@ -292,6 +330,10 @@ pub struct EffectiveValue {
     pub traits: Value,
     /// The scopes inspected, root to self — the caller's own chain only.
     pub trail: Vec<TrailEntry>,
+    /// The declaration's scope class (`global`, `cascading` or `local`), carried
+    /// through the cache entry so a read can be labelled without loading the
+    /// declaration again.
+    pub scope_class: &'static str,
     /// The declaration's classification.
     pub data_classification: String,
     /// The declaration's administrative domain, for the visibility rule the

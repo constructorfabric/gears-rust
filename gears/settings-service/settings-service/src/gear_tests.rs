@@ -6,6 +6,7 @@
 //! resources it has not acquired.
 
 use super::SettingsService;
+use crate::test_support::RecordingLifecycleMetrics;
 
 #[test]
 fn an_uninitialized_gear_refuses_to_hand_out_config() {
@@ -657,7 +658,7 @@ async fn a_retention_pass_prunes_what_is_past_its_horizon_and_nothing_younger() 
     let tenant = uuid::Uuid::new_v4();
     {
         let conn = db.conn().expect("connection");
-        crate::infra::storage::audit_store::AuditStore
+        crate::infra::storage::audit_store::AuditStore::default()
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
@@ -709,7 +710,7 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     {
         let conn = db.conn().expect("connection");
         for i in 0..5 {
-            crate::infra::storage::audit_store::AuditStore
+            crate::infra::storage::audit_store::AuditStore::default()
                 .append(
                     &conn,
                     &toolkit_security::AccessScope::allow_all(),
@@ -752,7 +753,7 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
     // A lifecycle being stopped prunes nothing more.
     {
         let conn = db.conn().expect("connection");
-        crate::infra::storage::audit_store::AuditStore
+        crate::infra::storage::audit_store::AuditStore::default()
             .append(
                 &conn,
                 &toolkit_security::AccessScope::allow_all(),
@@ -774,23 +775,6 @@ async fn a_retention_pass_works_in_batches_up_to_its_cap_and_stops_when_cancelle
         SettingsService::prune_once(&db, year, later, capped, &stopped, &quiet).await,
         0
     );
-}
-
-/// Records what the lifecycle passes publish, in order.
-#[derive(Default)]
-struct RecordingLifecycleMetrics {
-    review: std::sync::Mutex<Vec<(&'static str, u64)>>,
-    retention: std::sync::Mutex<Vec<(&'static str, u64)>>,
-}
-
-impl crate::domain::ports::LifecycleMetrics for RecordingLifecycleMetrics {
-    fn needs_review(&self, source: &'static str, count: u64) {
-        self.review.lock().expect("lock").push((source, count));
-    }
-
-    fn retention_pass(&self, result: &'static str, pruned: u64) {
-        self.retention.lock().expect("lock").push((result, pruned));
-    }
 }
 
 #[tokio::test]
@@ -941,7 +925,7 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
     let now = time::OffsetDateTime::now_utc();
     let recorded = || async {
         let conn = db.conn().expect("connection");
-        crate::infra::storage::audit_store::AuditStore
+        crate::infra::storage::audit_store::AuditStore::default()
             .recorded_retention(&conn, &toolkit_security::AccessScope::allow_all())
             .await
             .expect("readable")
@@ -958,4 +942,304 @@ async fn a_retention_pass_writes_the_configured_retention_where_the_trigger_read
     let year = std::time::Duration::from_hours(400 * 24);
     SettingsService::prune_once(&db, year, now, batches, &live, &quiet).await;
     assert_eq!(recorded().await, Some(400));
+}
+
+// ---- `settings_service_up` and the inventory gauges.
+
+/// A ready signal and the receiver that learns the lifecycle is running.
+fn ready_pair() -> (
+    toolkit::lifecycle::ReadySignal,
+    tokio::sync::oneshot::Receiver<()>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    (toolkit::lifecycle::ReadySignal::from_sender(tx), rx)
+}
+
+/// The lifecycle over a harness, running on its own task, with the recording
+/// port it reports to.
+struct RunningLifecycle {
+    metrics: std::sync::Arc<RecordingLifecycleMetrics>,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+async fn start_lifecycle(h: &crate::test_support::ResolutionHarness) -> RunningLifecycle {
+    use std::sync::Arc;
+    let writes = crate::test_support::write_coordinator(
+        h,
+        Arc::new(crate::test_support::RecordingSecrets::default()),
+        Arc::new(crate::test_support::RecordingPublisher::default()),
+        Arc::new(crate::test_support::FixedStepUp::verified()),
+    );
+    let metrics = Arc::new(RecordingLifecycleMetrics::default());
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (ready, started) = ready_pair();
+    let task = {
+        let db = Arc::clone(&h.db);
+        let metrics: Arc<dyn crate::domain::ports::LifecycleMetrics> = metrics.clone();
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            SettingsService::run_lifecycle(
+                &writes,
+                &db,
+                std::time::Duration::from_hours(365 * 24),
+                metrics,
+                ready,
+                &cancel,
+            )
+            .await;
+        })
+    };
+    started.await.expect("the lifecycle signals it is running");
+    RunningLifecycle {
+        metrics,
+        cancel,
+        task,
+    }
+}
+
+#[tokio::test]
+async fn the_service_is_up_after_start_and_down_after_the_shutdown_signal() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let running = start_lifecycle(&h).await;
+    assert_eq!(
+        *running.metrics.up.lock().expect("lock"),
+        vec![true],
+        "1 once the lifecycle is running"
+    );
+
+    running.cancel.cancel();
+    running.task.await.expect("the lifecycle ends");
+    assert_eq!(
+        *running.metrics.up.lock().expect("lock"),
+        vec![true, false],
+        "0 once it is told to stop"
+    );
+}
+
+#[tokio::test]
+async fn the_review_tick_refreshes_the_inventory_gauges_beside_the_needs_review_gauge() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    h.declare("proxy", "cascading", serde_json::json!(true))
+        .await;
+    let running = start_lifecycle(&h).await;
+
+    // The first tick of the interval fires at once: wait for the pass to land.
+    for _ in 0..200 {
+        if !running.metrics.review.lock().expect("lock").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // The inventory refresh rides the same tick; give it the moment it needs.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    running.cancel.cancel();
+    running.task.await.expect("the lifecycle ends");
+
+    assert!(
+        !running.metrics.review.lock().expect("lock").is_empty(),
+        "the needs-review gauge is refreshed on the tick"
+    );
+    // One tick published every zero-filled combination, the one declaration
+    // counted where it sits.
+    let mut declarations = Vec::new();
+    for source in crate::domain::declaration::SOURCES {
+        for status in crate::domain::declaration::STATUSES {
+            let count = u64::from(source == "module_contributed" && status == "active");
+            declarations.push((source, status, count));
+        }
+    }
+    let mut values = Vec::new();
+    for class in CLASSES {
+        for kind in KINDS {
+            values.push((class, kind, 0));
+        }
+    }
+    let seen_declarations = running.metrics.declarations.lock().expect("lock").clone();
+    let seen_values = running.metrics.values.lock().expect("lock").clone();
+    assert_eq!(
+        sorted(seen_declarations[..declarations.len()].to_vec()),
+        sorted(declarations),
+        "the declarations gauge: every source x status of the first tick, zero included"
+    );
+    assert_eq!(
+        sorted(seen_values[..values.len()].to_vec()),
+        sorted(values),
+        "the values gauge: every scope_class x scope_kind of the first tick, zero included"
+    );
+}
+
+#[tokio::test]
+async fn every_review_tick_re_records_the_service_up_as_a_heartbeat() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let writes = crate::test_support::write_coordinator(
+        &h,
+        std::sync::Arc::new(crate::test_support::RecordingSecrets::default()),
+        std::sync::Arc::new(crate::test_support::RecordingPublisher::default()),
+        std::sync::Arc::new(crate::test_support::FixedStepUp::verified()),
+    );
+    let metrics = RecordingLifecycleMetrics::default();
+    for _ in 0..3 {
+        SettingsService::review_tick(&writes, &h.db, &metrics).await;
+    }
+    assert_eq!(*metrics.up.lock().expect("lock"), vec![true; 3]);
+}
+
+#[tokio::test]
+async fn the_lifecycle_records_one_up_at_the_start_one_per_tick_and_one_down_after_the_cancel() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let running = start_lifecycle(&h).await;
+    // The first tick of the review interval fires at once.
+    for _ in 0..200 {
+        if !running.metrics.review.lock().expect("lock").is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    running.cancel.cancel();
+    running.task.await.expect("the lifecycle ends");
+
+    assert_eq!(
+        running.metrics.review.lock().expect("lock").len(),
+        crate::domain::declaration::SOURCES.len(),
+        "one review tick ran: one count per source"
+    );
+    let up = running.metrics.up.lock().expect("lock").clone();
+    assert_eq!(up, vec![true, true, false], "N + 1 ups, then one 0: {up:?}");
+}
+
+#[tokio::test]
+async fn a_lifecycle_whose_task_is_aborted_still_records_the_service_down() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let running = start_lifecycle(&h).await;
+    running.task.abort();
+    assert!(running.task.await.expect_err("aborted").is_cancelled());
+    let up = running.metrics.up.lock().expect("lock").clone();
+    assert_eq!(up.last(), Some(&false), "an abort publishes 0: {up:?}");
+}
+
+const CLASSES: [&str; 3] = ["global", "cascading", "local"];
+const KINDS: [&str; 2] = ["platform", "tenant"];
+
+fn sorted<T: Ord>(mut items: Vec<T>) -> Vec<T> {
+    items.sort();
+    items
+}
+
+#[tokio::test]
+async fn an_empty_store_publishes_every_combination_with_a_zero() {
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let metrics = RecordingLifecycleMetrics::default();
+
+    SettingsService::inventory_once(&h.db, h.tree.root, &metrics).await;
+
+    let mut declarations = Vec::new();
+    for source in crate::domain::declaration::SOURCES {
+        for status in crate::domain::declaration::STATUSES {
+            declarations.push((source, status, 0));
+        }
+    }
+    assert_eq!(
+        sorted(metrics.declarations.lock().expect("lock").clone()),
+        sorted(declarations),
+        "every source x status, zero included"
+    );
+    let mut values = Vec::new();
+    for class in CLASSES {
+        for kind in KINDS {
+            values.push((class, kind, 0));
+        }
+    }
+    assert_eq!(
+        sorted(metrics.values.lock().expect("lock").clone()),
+        sorted(values),
+        "every scope_class x scope_kind, zero included"
+    );
+}
+
+#[tokio::test]
+async fn a_seeded_store_publishes_the_right_counts_by_source_status_class_and_kind() {
+    use serde_json::json;
+    let h = crate::test_support::ResolutionHarness::new().await;
+    let t = &h.tree;
+    let global = h.declare("flag", "global", json!(false)).await;
+    let cascading = h.declare("proxy", "cascading", json!(false)).await;
+    let local = h.declare("note", "local", json!(false)).await;
+    let old = h.declare("old", "local", json!(false)).await;
+    h.retire(old).await;
+    {
+        use crate::domain::declaration::{DeclarationDraft, DeclarationRepository as _};
+        let conn = h.db.conn().expect("connection");
+        crate::infra::storage::declaration_repo::DeclarationRepo
+            .insert(
+                &conn,
+                &toolkit_security::AccessScope::allow_all(),
+                DeclarationDraft {
+                    key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.retry.v1~"
+                        .to_owned(),
+                    leaf_slug: "retry".to_owned(),
+                    value_type_id: crate::test_support::BOOL.to_owned(),
+                    category_id: h.category_id(),
+                    default_value: json!(false),
+                    scope_class: "cascading".to_owned(),
+                    mode: "standard".to_owned(),
+                    requires_step_up: false,
+                    anonymous_exposable: false,
+                    domain_affinity: None,
+                    has_secret_trait: false,
+                    data_classification: "public".to_owned(),
+                    source: "admin_authored".to_owned(),
+                    owner_module: None,
+                    licence_feature: None,
+                    display_name: None,
+                    description: None,
+                    created_by: "test".to_owned(),
+                },
+            )
+            .await
+            .expect("an admin declaration");
+    }
+    h.set(global, t.root, json!(true)).await;
+    h.set(cascading, t.root, json!(true)).await;
+    h.set(cascading, t.a, json!(true)).await;
+    h.set(cascading, t.b, json!(true)).await;
+    h.set(local, t.a, json!(true)).await;
+    let metrics = RecordingLifecycleMetrics::default();
+
+    SettingsService::inventory_once(&h.db, t.root, &metrics).await;
+
+    assert_eq!(
+        sorted(metrics.declarations.lock().expect("lock").clone()),
+        sorted(vec![
+            ("admin_authored", "active", 1),
+            ("admin_authored", "retired", 0),
+            ("module_contributed", "active", 3),
+            ("module_contributed", "retired", 1),
+        ])
+    );
+    assert_eq!(
+        sorted(metrics.values.lock().expect("lock").clone()),
+        sorted(vec![
+            ("global", "platform", 1),
+            ("global", "tenant", 0),
+            ("cascading", "platform", 1),
+            ("cascading", "tenant", 2),
+            ("local", "platform", 0),
+            ("local", "tenant", 1),
+        ])
+    );
+}
+
+#[tokio::test]
+async fn a_failed_inventory_refresh_publishes_nothing_so_the_gauges_keep_their_last_values() {
+    // All or nothing, as for the needs-review pass: a refresh that cannot count
+    // everything records no combination, rather than a zero for the ones it did
+    // not reach.
+    let broken = crate::test_support::schemaless_provider().await;
+    let metrics = RecordingLifecycleMetrics::default();
+
+    SettingsService::inventory_once(&broken, uuid::Uuid::new_v4(), &metrics).await;
+
+    assert!(metrics.declarations.lock().expect("lock").is_empty());
+    assert!(metrics.values.lock().expect("lock").is_empty());
 }

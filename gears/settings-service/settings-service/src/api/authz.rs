@@ -24,6 +24,7 @@ use authz_resolver_sdk::pep::{AccessRequest, ResourceType};
 use toolkit_security::AccessScope;
 
 use crate::domain::error::DomainError;
+use crate::domain::ports::{NoMetrics, SecurityMetrics, labels};
 
 /// The settings resources authorization decisions are made against.
 ///
@@ -75,6 +76,16 @@ pub fn deny(resource: &ResourceType, err: &EnforcerError) -> DomainError {
     }
 }
 
+/// Why the enforcement point refused, as the `reason` label spells it. The
+/// match is exhaustive, like [`deny`]'s.
+fn refusal_reason(err: &EnforcerError) -> &'static str {
+    match err {
+        EnforcerError::Denied { .. } => labels::DENIED,
+        EnforcerError::EvaluationFailed { .. } => labels::AUTHZ_UNAVAILABLE,
+        EnforcerError::CompileFailed { .. } => labels::CONSTRAINTS,
+    }
+}
+
 /// The GTS type id a resource is known by, as a `'static` string.
 ///
 /// `ResourceType::name` borrows; the error variant holds `&'static str` so it
@@ -98,9 +109,10 @@ fn resource_kind(resource: &ResourceType) -> &'static str {
 /// [`DomainError::Unauthorized`] for every enforcement failure — see [`deny`].
 pub async fn access_scope(
     enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    metrics: &dyn SecurityMetrics,
     ctx: &toolkit_security::SecurityContext,
     resource: &ResourceType,
-    action: &str,
+    action: &'static str,
     resource_id: Option<uuid::Uuid>,
 ) -> Result<AccessScope, DomainError> {
     // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-3
@@ -142,13 +154,38 @@ pub async fn access_scope(
         .await
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-4
         // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-5
-        .map_err(|err| deny(resource, &err))?;
+        .map_err(|err| {
+            // @cpt-begin:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-10
+            // Counted before the refusal is collapsed into the one answer
+            // every shape gets: the reason is the operator's, never the
+            // caller's.
+            metrics.authz_denial(action, refusal_reason(&err));
+            // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-10
+            deny(resource, &err)
+        })?;
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-5
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-4
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-9
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-8
     // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-authz-stepup:p1:inst-gf-authz-3
     Ok(scope)
+}
+
+/// The same decision as [`access_scope`], for a probe whose refusal does not
+/// fail the request: the unmasked-read entitlement, answered by masking, and
+/// the category tallies, answered by omitting the counts. Nothing is counted.
+///
+/// # Errors
+///
+/// [`DomainError::Unauthorized`] for every enforcement failure — see [`deny`].
+pub async fn probe_scope(
+    enforcer: &authz_resolver_sdk::PolicyEnforcer,
+    ctx: &toolkit_security::SecurityContext,
+    resource: &ResourceType,
+    action: &'static str,
+    resource_id: Option<uuid::Uuid>,
+) -> Result<AccessScope, DomainError> {
+    access_scope(enforcer, &NoMetrics, ctx, resource, action, resource_id).await
 }
 
 #[cfg(test)]

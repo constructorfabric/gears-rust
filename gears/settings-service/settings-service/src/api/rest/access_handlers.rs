@@ -20,6 +20,7 @@ use crate::api::rest::setting_handlers::{TenantParam, may_read_pii};
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
 use crate::domain::category::domain_visibility;
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecurityMetrics;
 use crate::field;
 use crate::infra::storage::access_repo::AccessRepo;
 use crate::infra::storage::audit_store::AuditStore;
@@ -97,11 +98,16 @@ async fn with_etag(
 /// 400 for a malformed key or a missing `tenant`; 403 when the caller may not
 /// read or the target is outside its subtree or standalone; 404 when the
 /// declaration is absent or hidden from the caller.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn read_access(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<ConcreteAccessService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -111,7 +117,15 @@ pub async fn read_access(
     let target = parse_target(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-2
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
     let readout = service
@@ -136,6 +150,7 @@ pub async fn set_access(
     Extension(service): Extension<Arc<ConcreteAccessService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -152,7 +167,15 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        DELEGATE,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-3
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     let actor = actor(&ctx, &headers, &scope);
@@ -181,11 +204,16 @@ pub async fn set_access(
 ///
 /// # Errors
 /// As [`set_access`], without the access validation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one extractor per extension the handler reads"
+)]
 pub async fn clear_access(
     Extension(ctx): Extension<SecurityContext>,
     Extension(service): Extension<Arc<ConcreteAccessService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     Query(params): Query<TenantParam>,
     headers: HeaderMap,
@@ -195,7 +223,15 @@ pub async fn clear_access(
     let target = parse_target(params.tenant.as_deref())?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, DELEGATE, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        DELEGATE,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
     let actor = actor(&ctx, &headers, &scope);
     let if_match = if_match(&headers).map(str::to_owned);
@@ -229,6 +265,7 @@ pub async fn list_access(
     Extension(service): Extension<Arc<ConcreteAccessService>>,
     Extension(db): Extension<Arc<toolkit_db::DBProvider<toolkit_db::DbError>>>,
     Extension(enforcer): Extension<Arc<authz_resolver_sdk::PolicyEnforcer>>,
+    Extension(security): Extension<Arc<dyn SecurityMetrics>>,
     Path(key): Path<String>,
     headers: HeaderMap,
 ) -> ApiResult<impl IntoResponse> {
@@ -236,7 +273,15 @@ pub async fn list_access(
     let key = parse_key(&key)?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-1
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
-    let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
+    let scope = authz::access_scope(
+        &enforcer,
+        security.as_ref(),
+        &ctx,
+        &resource::VALUE,
+        READ,
+        None,
+    )
+    .await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
     let listing = service
