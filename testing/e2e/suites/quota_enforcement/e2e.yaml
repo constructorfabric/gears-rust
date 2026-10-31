@@ -1,0 +1,116 @@
+# Quota Enforcement profile.
+#
+# A focused suite: the shared `config/e2e-local.yaml` has no QE, so this
+# manifest adds the gear, its SQL storage plugin, the standalone cluster
+# profile, and the GTS catalog QE needs at bootstrap. The metric base is
+# deployment-owned (nothing registers it), so it is seeded here with one
+# metric, two subject projections, and the request/constraint contracts.
+# The QE bases and scope instances are registered by QE itself.
+#
+# Gated by E2E_QUOTA_ENFORCEMENT (the suite's conftest skips without it).
+# Run via: make e2e-local SUITE=quota-enforcement
+suite: quota-enforcement
+features:
+  - quota-enforcement
+  - static-tenants
+  - static-authn
+  - static-authz
+launcher: e2e-launcher
+config_gears:
+  - quota-enforcement
+  - quota-enforcement-storage-plugin
+  - cluster
+  - grpc-hub
+env:
+  E2E_QUOTA_ENFORCEMENT: "1"
+config_overrides:
+  gears:
+    types-registry:
+      config:
+        entities:
+          - $id: "gts://gts.cf.core.qe.metric_type.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E stand-in for the platform metric base."
+            type: "object"
+            properties:
+              id: { type: "string" }
+              type: { type: "string" }
+            required: ["id", "type"]
+          - id: "gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"
+            type: "gts.cf.core.qe.metric_type.v1~"
+            kind: "counter"
+            enforcement: "quota_gated"
+          - $id: "gts://gts.cf.core.qe.subj.v1~cf.e2e.qe.tenant.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E tenant-scope projection."
+            x-gts-traits:
+              scope: "gts.cf.core.qe.scope.v1~cf.core.qe.tenant.v1"
+              admitted_metrics: ["gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"]
+            type: "object"
+            allOf:
+              - $ref: "gts://gts.cf.core.qe.subj.v1~"
+          - $id: "gts://gts.cf.core.qe.subj.v1~cf.e2e.qe.user.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E user-scope projection."
+            x-gts-traits:
+              scope: "gts.cf.core.qe.scope.v1~cf.core.qe.user.v1"
+              admitted_metrics: ["gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"]
+            type: "object"
+            allOf:
+              - $ref: "gts://gts.cf.core.qe.subj.v1~"
+          - $id: "gts://gts.cf.core.qe.request.v1~cf.e2e.qe.tokens.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E request contract for the tokens metric."
+            x-gts-traits:
+              metric: "gts.cf.core.qe.metric_type.v1~cf.e2e.qe.tokens.v1"
+              constraint_contract: "gts.cf.core.qe.constraint.v1~cf.e2e.qe.tokens_constraint.v1~"
+            type: "object"
+            allOf:
+              - $ref: "gts://gts.cf.core.qe.request.v1~"
+              - type: "object"
+                properties:
+                  metadata:
+                    type: "object"
+                    additionalProperties: false
+                    properties:
+                      region: { type: "string" }
+                      model: { type: "string" }
+                    required: ["region"]
+          - $id: "gts://gts.cf.core.qe.constraint.v1~cf.e2e.qe.tokens_constraint.v1~"
+            $schema: "http://json-schema.org/draft-07/schema#"
+            description: "E2E constraint contract for the tokens metric."
+            type: "object"
+            allOf:
+              - $ref: "gts://gts.cf.core.qe.constraint.v1~"
+              - type: "object"
+                properties:
+                  metadata:
+                    type: "object"
+                    additionalProperties: false
+                    properties:
+                      regions: { type: "array", items: { type: "string" } }
+                      weight: { type: "number" }
+                    required: ["regions"]
+    quota-enforcement:
+      config:
+        storage_vendor: "constructorfabric"
+        election:
+          ttl_secs: 30
+          max_missed_renewals: 2
+        sweeper_stop_timeout_secs: 10
+        catalog:
+          subject_projections:
+            - "gts.cf.core.qe.subj.v1~cf.e2e.qe.tenant.v1~"
+            - "gts.cf.core.qe.subj.v1~cf.e2e.qe.user.v1~"
+    cluster:
+      config:
+        profiles:
+          quota-enforcement:
+            cache: { provider: standalone }
+    quota-enforcement-storage-plugin:
+      database:
+        server: "sqlite_users"
+        file: "quota_enforcement_e2e.db"
+      config:
+        vendor: "constructorfabric"
+        priority: 100

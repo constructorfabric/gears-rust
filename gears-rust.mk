@@ -459,7 +459,7 @@ test-eb-kafka: install-tools
 TOOLKIT_DB_LANES := toolkit-db-sqlite toolkit-db-pg toolkit-db-pgq toolkit-db-mysql
 INTEGRATION_LANES := $(TOOLKIT_DB_LANES) users-info-pg usage-collector-pg usage-collector-ch \
 	types-registry-db oagw-db oagw-cluster cluster-pg cluster-redis rg-pg settings-service-pg \
-	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db
+	pricing-pg coord-pg products-pg ledger-pg orders-pg eb-gear-db quota-enforcement-pg
 
 ## toolkit-db on SQLite; the examples must still build after the tests.
 lane_args_toolkit-db-sqlite = -p cf-gears-toolkit-db --features sqlite,integration
@@ -656,6 +656,11 @@ lane_args_ledger-pg = -p cf-gears-bss-ledger --run-ignored ignored-only -E 'not 
 ## that need no container (D-224).
 ## `--no-fail-fast` for the reason the pricing lane gives.
 lane_args_orders-pg = -p cf-gears-bss-orders --run-ignored ignored-only --no-fail-fast
+
+## The Quota Enforcement storage plugin's PostgreSQL suites (Docker required;
+## each test spins up its own postgres container via testcontainers): the row
+## locks, NOWAIT stripes and idempotency races SQLite cannot show.
+lane_args_quota-enforcement-pg = -p cf-gears-quota-enforcement-storage-plugin --features postgres
 
 # run_lane(lane): the lane's nextest run, then its post command if it has one.
 run_lane = $(call nextest_run,$(1),$(lane_args_$(1)),$(lane_env_$(1)))$(if $(lane_post_$(1)),$(newline)$(lane_post_$(1)))

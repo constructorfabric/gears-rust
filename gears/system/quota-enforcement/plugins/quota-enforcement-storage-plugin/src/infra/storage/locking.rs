@@ -130,6 +130,36 @@ impl ContentionBudget {
     }
 }
 
+/// A transaction error the stripe lock and the retry loop can work with.
+///
+/// Each store keeps its own transaction error; implementing this for it lets
+/// the store take a stripe and retry a refused lock without converting into
+/// another store's error type.
+pub(super) trait ContentionError: From<ScopeError> {
+    /// Whether this is a `NOWAIT` read that met a held row.
+    fn is_lock_not_available(&self) -> bool;
+    /// The contention budget ran out on refused locks.
+    fn contention_timeout() -> Self;
+    /// A stripe the migration did not create.
+    fn missing_stripe(stripe: i32) -> Self;
+}
+
+impl ContentionError for TxError {
+    fn is_lock_not_available(&self) -> bool {
+        is_lock_not_available(self)
+    }
+
+    fn contention_timeout() -> Self {
+        Self::Storage(StorageError::LeaseContentionTimeout)
+    }
+
+    fn missing_stripe(stripe: i32) -> Self {
+        Self::Storage(StorageError::Internal(format!(
+            "idempotency stripe {stripe} is missing"
+        )))
+    }
+}
+
 /// Run `attempt` — one whole transaction — until it no longer meets a held row
 /// or the budget is spent.
 ///
@@ -138,17 +168,30 @@ impl ContentionBudget {
 ///
 /// # Errors
 ///
-/// `LeaseContentionTimeout` once the budget is spent on refused locks, and any
+/// The contention timeout once the budget is spent on refused locks, and any
 /// other error of `attempt` unchanged.
-pub(super) async fn with_budget<T, F, Fut>(
+pub(super) async fn with_budget<T, E, F, Fut>(
     budget: ContentionBudget,
-    attempt: F,
-) -> Result<T, TxError>
+    mut attempt: F,
+) -> Result<T, E>
 where
+    E: ContentionError,
     F: FnMut() -> Fut,
-    Fut: Future<Output = Result<T, TxError>>,
+    Fut: Future<Output = Result<T, E>>,
 {
-    with_budget_within(budget, None, attempt).await
+    let mut backoff = FIRST_BACKOFF;
+    loop {
+        match attempt().await {
+            // The transaction has already rolled back, so the pause holds no
+            // row lock of ours.
+            Err(error) if error.is_lock_not_available() => {
+                if !budget.pause(&mut backoff, None).await {
+                    return Err(E::contention_timeout());
+                }
+            }
+            other => return other,
+        }
+    }
 }
 
 /// [`with_budget`] that also answers to a batch timer. Once an attempt has
@@ -191,11 +234,16 @@ where
 }
 
 /// Whether `error` is a `NOWAIT` read that met a held row.
+pub(super) fn is_lock_not_available(error: &TxError) -> bool {
+    matches!(error, TxError::Scope(scope) if scope_lock_not_available(scope))
+}
+
+/// Whether a scoped query met a held row under `NOWAIT`.
 ///
 /// The driver's SQLSTATE first, then the message for an error that was
 /// re-wrapped on the way here and lost its typed shape.
-pub(super) fn is_lock_not_available(error: &TxError) -> bool {
-    let TxError::Scope(ScopeError::Db(db_error)) = error else {
+pub(super) fn scope_lock_not_available(error: &ScopeError) -> bool {
+    let ScopeError::Db(db_error) = error else {
         return false;
     };
     if let DbErr::Exec(RuntimeErr::SqlxError(driver)) | DbErr::Query(RuntimeErr::SqlxError(driver)) =
@@ -216,10 +264,10 @@ pub(super) fn is_lock_not_available(error: &TxError) -> bool {
 ///
 /// The refused lock or any other database error; `Internal` for a stripe the
 /// migration did not create.
-pub(super) async fn lock_scopes(
+pub(super) async fn lock_scopes<E: ContentionError>(
     tx: &impl DBRunner,
     scopes: &[&IdempotencyScope],
-) -> Result<(), TxError> {
+) -> Result<(), E> {
     let mut stripes: Vec<i32> = scopes
         .iter()
         .map(|of| {
@@ -230,9 +278,7 @@ pub(super) async fn lock_scopes(
     stripes.dedup();
     for stripe in stripes {
         if !super::repo::idempotency_repo::lock_stripe(tx, stripe).await? {
-            return Err(TxError::Storage(StorageError::Internal(format!(
-                "idempotency stripe {stripe} is missing"
-            ))));
+            return Err(E::missing_stripe(stripe));
         }
     }
     Ok(())
@@ -246,22 +292,35 @@ impl SqlConsumptionStore {
         &self,
         metric: Option<&str>,
     ) -> Result<ContentionBudget, StorageError> {
-        let conn = self.db.conn().map_err(|error| {
-            super::consumption_store::unavailable("read contention timeout", "config", &error)
-        })?;
-        let configured = super::repo::config_repo::read_contention_timeout(
-            &conn,
-            metric.unwrap_or(crate::infra::storage::entity::DEFAULT_KEY),
-        )
-        .await
-        .map_err(|error| {
-            super::consumption_store::unavailable("read contention timeout", "config", &error)
-        })?;
-        let millis = u64::try_from(configured.unwrap_or(0)).unwrap_or(0);
-        Ok(ContentionBudget::starting_now(Duration::from_millis(
-            millis,
-        )))
+        contention_budget_of(&self.db, metric).await
     }
+}
+
+/// The contention budget configured for `metric` over `db`, starting now; the
+/// read every store with a stripe shares.
+///
+/// # Errors
+///
+/// `Unavailable` when the configuration cannot be read.
+pub(super) async fn contention_budget_of(
+    db: &toolkit_db::Db,
+    metric: Option<&str>,
+) -> Result<ContentionBudget, StorageError> {
+    let conn = db.conn().map_err(|error| {
+        super::consumption_store::unavailable("read contention timeout", "config", &error)
+    })?;
+    let configured = super::repo::config_repo::read_contention_timeout(
+        &conn,
+        metric.unwrap_or(crate::infra::storage::entity::DEFAULT_KEY),
+    )
+    .await
+    .map_err(|error| {
+        super::consumption_store::unavailable("read contention timeout", "config", &error)
+    })?;
+    let millis = u64::try_from(configured.unwrap_or(0)).unwrap_or(0);
+    Ok(ContentionBudget::starting_now(Duration::from_millis(
+        millis,
+    )))
 }
 
 #[cfg(test)]

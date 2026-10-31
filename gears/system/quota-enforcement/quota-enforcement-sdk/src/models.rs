@@ -564,9 +564,29 @@ pub enum OperationType {
     Release,
     /// Batch debit envelope.
     BatchDebit,
+    /// Bulk Quota create envelope.
+    BulkCreateQuotas,
+    /// Bulk Quota update envelope.
+    BulkUpdateQuotas,
+    /// Bulk Quota deactivate envelope.
+    BulkDeactivateQuotas,
 }
 
 impl OperationType {
+    /// Every operation type, for decoding the storage discriminator.
+    pub const ALL: [Self; 10] = [
+        Self::Debit,
+        Self::Credit,
+        Self::Rollback,
+        Self::Reserve,
+        Self::Commit,
+        Self::Release,
+        Self::BatchDebit,
+        Self::BulkCreateQuotas,
+        Self::BulkUpdateQuotas,
+        Self::BulkDeactivateQuotas,
+    ];
+
     /// Stable `snake_case` name, also used as the storage discriminator.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -578,6 +598,9 @@ impl OperationType {
             Self::Commit => "commit",
             Self::Release => "release",
             Self::BatchDebit => "batch_debit",
+            Self::BulkCreateQuotas => "bulk_create_quotas",
+            Self::BulkUpdateQuotas => "bulk_update_quotas",
+            Self::BulkDeactivateQuotas => "bulk_deactivate_quotas",
         }
     }
 }

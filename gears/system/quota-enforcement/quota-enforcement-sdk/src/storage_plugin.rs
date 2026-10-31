@@ -265,6 +265,29 @@ pub enum StorageError {
     /// Last-resort opaque failure.
     #[error("storage plugin internal error: {0}")]
     Internal(String),
+
+    // --- bulk envelopes ---
+    /// One item of a bulk envelope failed; the whole envelope rolled back.
+    /// Only item-specific failures are wrapped: a failure of the envelope as a
+    /// whole (the backend, a payload mismatch, contention) is raised as is.
+    #[error("bulk item {index}: {cause}")]
+    BulkItem {
+        /// Position of the failing item in the request.
+        index: usize,
+        /// What failed, as the single-item primitive reports it.
+        cause: Box<Self>,
+    },
+}
+
+impl StorageError {
+    /// `self` as the failure of the bulk envelope's item at `index`.
+    #[must_use]
+    pub fn at_item(self, index: usize) -> Self {
+        Self::BulkItem {
+            index,
+            cause: Box::new(self),
+        }
+    }
 }
 
 /// One mutation the plugin evaluates inside its own transaction.
@@ -512,6 +535,67 @@ pub trait QuotaEnforcementStoragePluginV1: Send + Sync + 'static {
         filter: QuotaFilter,
         page: PageRequest,
     ) -> Result<PageResult<Quota>, StorageError>;
+
+    // --- bulk quota CRUD ---
+
+    /// Create every draft of `envelope` in one transaction, or none (PRD
+    /// section 5.2). Each item has the effects of
+    /// [`QuotaEnforcementStoragePluginV1::create_quota`]; the envelope's
+    /// idempotency record, holding the returned outcome, commits with them. A
+    /// replay under the same scope and digest returns the stored outcome as
+    /// `NoOp` and writes nothing, once the envelope tenant is found inside
+    /// every item's current scope. The record expires after the longest
+    /// idempotency retention configured for any item's metric.
+    ///
+    /// # Errors
+    ///
+    /// - [`StorageError::BulkItem`] wrapping the single-item error of the
+    ///   first failing item in submission order.
+    /// - [`StorageError::IdempotencyPayloadMismatch`] for the key under a
+    ///   different payload (I2).
+    /// - [`StorageError::LeaseContentionTimeout`] when a concurrent writer of
+    ///   the envelope's scope holds it past the contention budget.
+    /// - [`StorageError::Unavailable`] when the backend cannot answer.
+    async fn bulk_create_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkCreateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkCreated>, StorageError>;
+
+    /// Apply every patch of `envelope` in one transaction, or none. Each item
+    /// has the effects and the under-lock guards of
+    /// [`QuotaEnforcementStoragePluginV1::update_quota`]. Every target row is
+    /// locked in ascending `quota_id` order before any item runs; items then
+    /// run in submission order. A Quota outside its item's scope or of another
+    /// tenant than the envelope's is not found. Replay as for
+    /// [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`], once every
+    /// target is visible under its item's current scope.
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`]; the wrapped
+    /// item errors are those of `update_quota`.
+    async fn bulk_update_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkUpdateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkUpdated>, StorageError>;
+
+    /// Deactivate every Quota of `envelope` in one transaction, or none,
+    /// resolving the active leases of each as
+    /// [`QuotaEnforcementStoragePluginV1::deactivate_quota`] does; every
+    /// lease-resolution event commits with the envelope. Locking, ordering and
+    /// replay as for [`QuotaEnforcementStoragePluginV1::bulk_update_quotas`].
+    ///
+    /// # Errors
+    ///
+    /// As [`QuotaEnforcementStoragePluginV1::bulk_create_quotas`]; the wrapped
+    /// item errors are those of `deactivate_quota`.
+    async fn bulk_deactivate_quotas(
+        &self,
+        ctx: &SecurityContext,
+        envelope: &crate::bulk::BulkDeactivateEnvelope,
+    ) -> Result<TransitionOutcome<crate::bulk::BulkDeactivated>, StorageError>;
 
     // --- counter mutation ---
 

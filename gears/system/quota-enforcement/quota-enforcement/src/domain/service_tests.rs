@@ -20,6 +20,7 @@ fn limits() -> QuotaLimits {
         metadata_max_bytes: 4096,
         list_max_limit: 500,
         list_max_ids: 100,
+        bulk_max_items: 50,
     }
 }
 

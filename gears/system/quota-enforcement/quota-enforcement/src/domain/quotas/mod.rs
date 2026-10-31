@@ -11,6 +11,7 @@
 //! - [`service`]: the component that orders the steps.
 //! - [`gauges`]: the leader-only refresh of the lifecycle gauges.
 
+pub mod bulk;
 pub mod events;
 pub mod gauges;
 pub mod metadata;
@@ -19,6 +20,10 @@ pub mod service;
 pub mod validation;
 pub mod window;
 
+pub use bulk::{
+    BULK_MAX_ITEMS_CEILING, BulkCreateItem, BulkCreateRequest, BulkDeactivateItem,
+    BulkDeactivateRequest, BulkUpdateItem, BulkUpdateRequest,
+};
 pub use events::ChangeKind;
 pub use gauges::{GaugeTiming, LifecycleGaugeRefresher, RefreshError};
 pub use request::{CreateQuotaRequest, ListQuotasRequest, Presence, UpdateQuotaRequest};

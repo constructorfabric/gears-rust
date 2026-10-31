@@ -100,6 +100,8 @@ pub const BATCH_TENANT_MIXED: &str = "BATCH_TENANT_MIXED";
 pub const BATCH_ITEM_KEY_DUPLICATE: &str = "BATCH_ITEM_KEY_DUPLICATE";
 /// A batch has more items than the configured maximum.
 pub const BULK_TOO_LARGE: &str = "BULK_TOO_LARGE";
+/// Two items of one bulk envelope name the same Quota.
+pub const BULK_QUOTA_DUPLICATE: &str = "BULK_QUOTA_DUPLICATE";
 /// A snapshot read names no subject.
 pub const SNAPSHOT_SUBJECTS_REQUIRED: &str = "SNAPSHOT_SUBJECTS_REQUIRED";
 /// A snapshot read names more subjects than the operator allows.
