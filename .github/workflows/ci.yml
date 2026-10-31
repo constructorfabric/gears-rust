@@ -1110,6 +1110,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # TEMPORARY diagnostic: the 80 GB runner disk filled during coverage.
+      - name: Disk usage sampler
+        if: runner.environment != 'github-hosted'
+        run: |
+          # shellcheck disable=SC2016  # the inner bash expands these
+          nohup bash -c 'while true; do
+            { date -u +%T; df -BG --output=used,avail / | tail -1
+              du -sx -BG "$GITHUB_WORKSPACE/target" "${SCCACHE_DIR:-$HOME/.cache/sccache}" "$HOME/.cargo" "$RUNNER_TEMP" 2>/dev/null
+              sudo du -sx -BG /var/lib/docker 2>/dev/null; } >> "$RUNNER_TEMP/disk.log"
+            sleep 30; done' >/dev/null 2>&1 &
+
       - name: Install protoc
         if: runner.environment == 'github-hosted'
         uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
@@ -1263,6 +1274,16 @@ jobs:
           files: lcov.info
           disable_search: true
           fail_ci_if_error: ${{ github.event_name != 'pull_request' }}
+
+      # TEMPORARY diagnostic: peak disk use and its largest parts.
+      - name: Disk usage report
+        if: always() && runner.environment != 'github-hosted'
+        run: |
+          echo "peak used: $(grep -oE '^ *[0-9]+G' "$RUNNER_TEMP/disk.log" | tr -d ' G' | sort -n | tail -1) GB"
+          cat "$RUNNER_TEMP/disk.log" | tail -60
+          df -h /
+          du -xh -d2 "$GITHUB_WORKSPACE/target" 2>/dev/null | sort -h | tail -15
+          sudo docker system df || true
 
   lint:
     name: Architecture Lints (cargo gears lint)
