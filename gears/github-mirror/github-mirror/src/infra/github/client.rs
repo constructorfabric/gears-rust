@@ -19,12 +19,12 @@ use crate::domain::ports::github::{
     PullListing, RateLimitQuota, RepoRef, SHARED_CACHE_PARTITION,
 };
 use crate::domain::repo::{
-    BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord, CommitFileRecord,
-    CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord, IssueEventRecord,
-    IssueReactionRecord, IssueRecord, IssueTimelineEventRecord, LabelRecord, MilestoneRecord,
-    PullRequestCommitRecord, PullRequestFileRecord, PullRequestRecord, ReleaseRecord, RepoRecord,
-    ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord, WorkflowJobRecord,
-    WorkflowRunRecord,
+    ArtifactRecord, BranchRecord, CheckRunRecord, CommentRecord, CommitCommentRecord,
+    CommitFileRecord, CommitRecord, CommitStatusRecord, ContributorRecord, DeploymentRecord,
+    IssueEventRecord, IssueReactionRecord, IssueRecord, IssueTimelineEventRecord, LabelRecord,
+    MilestoneRecord, PullRequestCommitRecord, PullRequestFileRecord, PullRequestRecord,
+    ReleaseRecord, RepoRecord, ReviewCommentRecord, ReviewRecord, ReviewThreadRecord, TagRecord,
+    WorkflowJobRecord, WorkflowRunRecord,
 };
 use crate::domain::scope::InlineCommentSnippets;
 use crate::domain::sync::telemetry::{GithubApi, RequestOutcome, SessionTelemetry, TelemetryEntry};
@@ -1774,6 +1774,30 @@ struct GhWorkflowRunsPage {
 }
 
 #[derive(Debug, Deserialize)]
+struct GhArtifactWorkflowRun {
+    id: Option<i64>,
+    head_branch: Option<String>,
+    head_sha: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhArtifact {
+    id: i64,
+    name: String,
+    size_in_bytes: i64,
+    expired: bool,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    expires_at: Option<String>,
+    workflow_run: Option<GhArtifactWorkflowRun>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhArtifactsPage {
+    artifacts: Vec<GhArtifact>,
+}
+
+#[derive(Debug, Deserialize)]
 struct GhPullFile {
     filename: String,
     /// The file's unified diff; GitHub omits it for very large diffs.
@@ -2417,6 +2441,23 @@ fn workflow_run_record(repo_id: i64, w: GhWorkflowRun) -> WorkflowRunRecord {
     }
 }
 
+fn artifact_record(repo_id: i64, a: GhArtifact) -> ArtifactRecord {
+    let run = a.workflow_run;
+    ArtifactRecord {
+        id: a.id,
+        repo_id,
+        name: a.name,
+        size_in_bytes: a.size_in_bytes,
+        expired: a.expired,
+        workflow_run_id: run.as_ref().and_then(|r| r.id),
+        head_branch: run.as_ref().and_then(|r| r.head_branch.clone()),
+        head_sha: run.and_then(|r| r.head_sha),
+        created_at: a.created_at,
+        updated_at: a.updated_at,
+        expires_at: a.expires_at,
+    }
+}
+
 fn pull_request_file_record(
     repo_id: i64,
     pull_number: i64,
@@ -2471,6 +2512,8 @@ const REVIEW_THREAD_PAGES: usize = 20;
 const MAX_REDIRECTS: usize = 10;
 
 const WORKFLOW_RUN_PAGES: usize = 10;
+
+const ARTIFACT_PAGES: usize = 10;
 
 fn review_threads_variables(
     owner: &str,
@@ -3407,7 +3450,7 @@ impl GithubPort for GithubClient {
         Ok(listing)
     }
 
-    /// Workflow runs and deployments; jobs are per run, see
+    /// Workflow runs, deployments and artifacts; jobs are per run, see
     /// [`Self::refine_workflow_run`].
     async fn list_actions(
         &self,
@@ -3437,6 +3480,14 @@ impl GithubPort for GithubClient {
                 options,
             )
             .await?;
+        let artifacts = self
+            .get_json_newest_wrapped(
+                &format!("/repos/{owner}/{name}/actions/artifacts?per_page={FIRST_PAGE_SIZE}"),
+                options,
+                ARTIFACT_PAGES,
+                |page: GhArtifactsPage| page.artifacts,
+            )
+            .await?;
 
         Ok(ActionsListing {
             workflow_runs: runs
@@ -3446,6 +3497,10 @@ impl GithubPort for GithubClient {
             deployments: deployments
                 .into_iter()
                 .map(|d| deployment_record(repo_id, d))
+                .collect(),
+            artifacts: artifacts
+                .into_iter()
+                .map(|a| artifact_record(repo_id, a))
                 .collect(),
         })
     }

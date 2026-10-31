@@ -909,12 +909,14 @@ impl MirrorWorker {
             .await?;
 
         let (runs, deployments) = (count(&listing.workflow_runs), count(&listing.deployments));
+        let artifacts = count(&listing.artifacts);
         self.writer
             .write_actions_listing(&run.scope, run.tenant_id, listing)
             .await?;
         run.tally(|s| {
             s.workflow_runs_synced += runs;
             s.deployments_synced += deployments;
+            s.artifacts_synced += artifacts;
         });
         Ok(())
     }

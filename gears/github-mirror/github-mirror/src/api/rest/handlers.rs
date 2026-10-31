@@ -10,6 +10,7 @@ use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, HeaderValue, header};
 use axum::{Json, extract::Extension};
 use chrono::{DateTime, Utc};
+use github_mirror_sdk::{Comment, WorkflowRun};
 use serde::Deserialize;
 use toolkit::api::canonical_prelude::*;
 use toolkit_odata::{ODataQuery, Page};
@@ -26,13 +27,14 @@ use crate::domain::scope::{CollectionMode, ScopeConfig, SyncScope};
 use crate::domain::validate::{validate_commit_sha, validate_repo_path};
 
 use super::dto::{
-    AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto, CheckRunsPageDto, CommentDto,
-    CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto, CommitStatusDto, ContributorDto,
-    DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto, IssueReactionDto,
-    IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto, PullRequestFileDto, ReleaseDto,
-    RepoDto, RepoSyncStatusDto, ResumeAcceptedDto, ResumeFailureDto, ReviewCommentDto, ReviewDto,
-    ReviewThreadDto, SyncAcceptedDto, SyncSessionDto, TagDto, WorkflowJobDto, WorkflowJobsPageDto,
-    WorkflowRunDto, WorkflowRunsPageDto,
+    ArtifactDto, ArtifactsPageDto, AuthenticatedUserDto, BranchDto, CacheClearedDto, CheckRunDto,
+    CheckRunsPageDto, CommentDto, CommitCommentDto, CommitDto, CommitFileDto, CommitStatsDto,
+    CommitStatusDto, ContributorDto, DeploymentDto, GithubMirrorHealthDto, IssueDto, IssueEventDto,
+    IssueReactionDto, IssueTimelineEventDto, LabelDto, MilestoneDto, PullRequestDto,
+    PullRequestFileDto, ReleaseDto, RepoDto, RepoSyncStatusDto, ResumeAcceptedDto,
+    ResumeFailureDto, ReviewCommentDto, ReviewDto, ReviewThreadDto, SyncAcceptedDto,
+    SyncSessionDto, TagDto, WorkflowDto, WorkflowJobDto, WorkflowJobsPageDto, WorkflowRunDto,
+    WorkflowRunsPageDto, WorkflowsPageDto,
 };
 
 const DEFAULT_PER_PAGE: u64 = 30;
@@ -207,6 +209,20 @@ impl GithubPageQuery {
             state: self.state_filter()?,
             sort: ListingSort::parse(self.sort.as_deref())?,
             direction: ListingDirection::parse(self.direction.as_deref())?,
+            since: self.since_filter()?,
+        })
+    }
+
+    fn repo_comments_filter(&self) -> Result<ListingFilter, DomainError> {
+        let direction = if self.sort.is_some() {
+            ListingDirection::parse(self.direction.as_deref())?
+        } else {
+            ListingDirection::Asc
+        };
+        Ok(ListingFilter {
+            state: None,
+            sort: ListingSort::parse(self.sort.as_deref())?,
+            direction,
             since: self.since_filter()?,
         })
     }
@@ -471,7 +487,36 @@ pub async fn list_comments(
         .await?
         .items;
     let path = format!("/repos/{owner}/{name}/issues/{number}/comments");
-    Ok(respond(&page, &path, GithubPage::convert(items)))
+    Ok(respond(&page, &path, comment_dtos(items, &owner, &name)))
+}
+
+pub async fn list_repo_comments(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<GithubPageQuery>,
+) -> GithubList<CommentDto> {
+    validate_repo_path(&owner, &name)?;
+    let page = query.normalized()?;
+    let items = svc
+        .list_repo_comments(
+            &ctx,
+            &owner,
+            &name,
+            page.window(),
+            query.repo_comments_filter()?,
+        )
+        .await?
+        .items;
+    let path = format!("/repos/{owner}/{name}/issues/comments");
+    Ok(respond(&page, &path, comment_dtos(items, &owner, &name)))
+}
+
+fn comment_dtos(items: Vec<Comment>, owner: &str, name: &str) -> Vec<CommentDto> {
+    items
+        .into_iter()
+        .map(|c| CommentDto::new(c, owner, name))
+        .collect()
 }
 
 /// Serves `GET /repos/{owner}/{name}/pulls` from the mirror with GitHub-style pagination and a `Link` header.
@@ -565,14 +610,13 @@ pub async fn list_commits(
             query.listing_filter()?.since,
         )
         .await?;
-    let items = items.items;
+    let items = items
+        .items
+        .into_iter()
+        .map(|c| CommitDto::new(c, &owner, &name))
+        .collect();
     let path = format!("/repos/{owner}/{name}/commits");
-    Ok(respond_counted(
-        &page,
-        &path,
-        GithubPage::convert(items),
-        total,
-    ))
+    Ok(respond_counted(&page, &path, items, total))
 }
 
 /// Serves `GET /repos/{owner}/{name}/branches` from the mirror with GitHub-style pagination and a `Link` header.
@@ -689,17 +733,89 @@ pub async fn list_workflow_runs(
     let (items, total) = svc
         .list_workflow_runs(&ctx, &owner, &name, page.window())
         .await?;
-    let runs: Vec<WorkflowRunDto> = GithubPage::convert(items.items);
     let path = format!("/repos/{owner}/{name}/actions/runs");
-    let headers = page.link_header_with_total(&path, runs.len(), Some(total));
+    Ok(workflow_runs_page(&page, &path, items.items, total))
+}
+
+pub async fn list_workflow_runs_of_workflow(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name, workflow_id)): Path<(String, String, i64)>,
+    Query(query): Query<GithubPageQuery>,
+) -> ApiResult<(HeaderMap, JsonBody<WorkflowRunsPageDto>)> {
+    validate_repo_path(&owner, &name)?;
+    let page = query.normalized()?;
+    let (items, total) = svc
+        .list_workflow_runs_of_workflow(&ctx, &owner, &name, workflow_id, page.window())
+        .await?;
+    let path = format!("/repos/{owner}/{name}/actions/workflows/{workflow_id}/runs");
+    Ok(workflow_runs_page(&page, &path, items.items, total))
+}
+
+fn workflow_runs_page(
+    page: &GithubPage,
+    path: &str,
+    items: Vec<WorkflowRun>,
+    total: u64,
+) -> (HeaderMap, JsonBody<WorkflowRunsPageDto>) {
+    let runs: Vec<WorkflowRunDto> = GithubPage::convert(items);
+    let headers = page.link_header_with_total(path, runs.len(), Some(total));
     // GitHub's `total_count` spans every page, so it is a count, not the
     // length of the slice being served.
     let total_count = i64::try_from(total).unwrap_or(i64::MAX);
-    Ok((
+    (
         headers,
         Json(WorkflowRunsPageDto {
             total_count,
             workflow_runs: runs,
+        }),
+    )
+}
+
+pub async fn list_workflows(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<GithubPageQuery>,
+) -> ApiResult<(HeaderMap, JsonBody<WorkflowsPageDto>)> {
+    validate_repo_path(&owner, &name)?;
+    let page = query.normalized()?;
+    let (items, total) = svc
+        .list_workflows(&ctx, &owner, &name, page.window())
+        .await?;
+    let workflows: Vec<WorkflowDto> = GithubPage::convert(items.items);
+    let path = format!("/repos/{owner}/{name}/actions/workflows");
+    let headers = page.link_header_with_total(&path, workflows.len(), Some(total));
+    let total_count = i64::try_from(total).unwrap_or(i64::MAX);
+    Ok((
+        headers,
+        Json(WorkflowsPageDto {
+            total_count,
+            workflows,
+        }),
+    ))
+}
+
+pub async fn list_artifacts(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteService>>,
+    Path((owner, name)): Path<(String, String)>,
+    Query(query): Query<GithubPageQuery>,
+) -> ApiResult<(HeaderMap, JsonBody<ArtifactsPageDto>)> {
+    validate_repo_path(&owner, &name)?;
+    let page = query.normalized()?;
+    let (items, total) = svc
+        .list_artifacts(&ctx, &owner, &name, page.window())
+        .await?;
+    let artifacts: Vec<ArtifactDto> = GithubPage::convert(items.items);
+    let path = format!("/repos/{owner}/{name}/actions/artifacts");
+    let headers = page.link_header_with_total(&path, artifacts.len(), Some(total));
+    let total_count = i64::try_from(total).unwrap_or(i64::MAX);
+    Ok((
+        headers,
+        Json(ArtifactsPageDto {
+            total_count,
+            artifacts,
         }),
     ))
 }
@@ -780,7 +896,7 @@ pub async fn get_commit(
         .await?
         .items;
 
-    let mut body = CommitDto::from(commit.clone());
+    let mut body = CommitDto::new(commit.clone(), &owner, &name);
     body.stats = Some(CommitStatsDto {
         additions: commit.additions,
         deletions: commit.deletions,
@@ -888,9 +1004,12 @@ pub async fn list_pull_request_commits(
     let items = svc
         .list_pull_request_commits(&ctx, &owner, &name, number, page.window())
         .await?
-        .items;
+        .items
+        .into_iter()
+        .map(|c| CommitDto::from_pull_request_commit(c, &owner, &name))
+        .collect();
     let path = format!("/repos/{owner}/{name}/pulls/{number}/commits");
-    Ok(respond(&page, &path, GithubPage::convert(items)))
+    Ok(respond(&page, &path, items))
 }
 
 /// Serves `GET /repos/{owner}/{name}/commits/{sha}/statuses` from the mirror with GitHub-style pagination and a `Link` header.
