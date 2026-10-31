@@ -4023,10 +4023,11 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-trait",
+ "aws-lc-rs",
  "axum",
  "base64 0.22.1",
  "cf-gears-authn-resolver-sdk",
@@ -4050,12 +4051,14 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "chrono",
  "futures-util",
+ "hex",
  "http",
  "inventory",
  "jsonschema 0.40.2",
  "opentelemetry",
  "opentelemetry_sdk",
  "regex",
+ "ryu",
  "sea-orm",
  "sea-orm-migration",
  "secrecy",
@@ -4073,6 +4076,7 @@ dependencies = [
  "tracing-subscriber",
  "utoipa",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

@@ -18,6 +18,7 @@ use super::{
     evict_access_change, may_restrict, restriction_tag, strictest,
 };
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
+use crate::domain::activation::KeyLocks;
 use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
@@ -65,6 +66,7 @@ pub struct AccessService<D, A, S> {
     hierarchy: Arc<dyn TenantHierarchy>,
     platform: Arc<dyn PlatformScope>,
     cache: Arc<EffectiveCache>,
+    locks: Option<Arc<dyn KeyLocks>>,
 }
 
 fn denied() -> DomainError {
@@ -126,7 +128,106 @@ where
             hierarchy,
             platform,
             cache,
+            locks: None,
         }
+    }
+
+    /// Take the setting key's mutation lock around every restriction change, as
+    /// a value write does, so a restriction and a write of one key are
+    /// serialized. Without one a change takes no lock, as on a build before
+    /// consumer activation.
+    #[must_use]
+    pub fn with_locks(mut self, locks: Arc<dyn KeyLocks>) -> Self {
+        self.locks = Some(locks);
+        self
+    }
+
+    /// The checks of a restriction change that refuse it without contending for
+    /// the key's lock: the target, the access asked for, the declaration's
+    /// visibility and its retirement — those of [`Self::set`], asked again
+    /// inside its transaction. Called by the surface before [`Self::locked`].
+    ///
+    /// # Errors
+    /// As [`Self::set`], up to its lock on the declaration.
+    pub async fn precheck_set<C: DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        target: Uuid,
+        access: TenantAccess,
+    ) -> Result<(), DomainError> {
+        if !may_restrict(
+            self.hierarchy.as_ref(),
+            actor.ctx.subject_tenant_id(),
+            target,
+        )
+        .await?
+        {
+            return Err(denied());
+        }
+        if access == TenantAccess::Overridable {
+            return Err(DomainError::Validation {
+                field: "access".to_owned(),
+                code: crate::field::VALIDATION,
+                message: "`overridable` is the absence of a row; express it with DELETE".to_owned(),
+            });
+        }
+        let declaration = self.visible_declaration(conn, actor, key).await?;
+        refuse_retired(&declaration)
+    }
+
+    /// The checks of clearing a restriction that refuse without contending for
+    /// the key's lock; see [`Self::precheck_set`].
+    ///
+    /// # Errors
+    /// As [`Self::clear`], up to its lock on the declaration.
+    pub async fn precheck_clear<C: DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        target: Uuid,
+    ) -> Result<(), DomainError> {
+        if !may_restrict(
+            self.hierarchy.as_ref(),
+            actor.ctx.subject_tenant_id(),
+            target,
+        )
+        .await?
+        {
+            return Err(denied());
+        }
+        let declaration = self.visible_declaration(conn, actor, key).await?;
+        refuse_retired(&declaration)
+    }
+
+    /// Run a restriction change's transaction under the key's mutation lock:
+    /// taken after the change's authorization, target and visibility checks and
+    /// before its transaction, released and the release awaited before the
+    /// change answers. A restriction change writes no activation state. A wait
+    /// that runs out answers `Unavailable` with nothing stored.
+    ///
+    /// # Errors
+    /// [`DomainError::Unavailable`] when the lock wait is exhausted; otherwise
+    /// what `run` returns.
+    pub async fn locked<T, F, Fut>(&self, key: &SettingKey, run: F) -> Result<T, DomainError>
+    where
+        F: FnOnce() -> Fut + Send,
+        Fut: std::future::Future<Output = Result<T, DomainError>> + Send,
+    {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-27
+        let Some(locks) = &self.locks else {
+            return run().await;
+        };
+        let held = locks.acquire(key.as_str(), None).await?;
+        let outcome = run().await;
+        held.release().await;
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-10
+        // The mutation's own result, the lock released and the release awaited.
+        outcome
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-10
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-27
     }
 
     /// The declaration at `key`, or absent when there is none, it lies outside

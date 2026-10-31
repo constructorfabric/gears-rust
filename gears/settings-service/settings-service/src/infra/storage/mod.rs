@@ -8,6 +8,7 @@
 //! pool.
 
 pub mod access_repo;
+pub mod activation_repo;
 pub mod audit_store;
 pub mod category_repo;
 pub mod clock;

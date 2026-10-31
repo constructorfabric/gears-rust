@@ -86,6 +86,8 @@ fn to_domain(model: audit_record::Model) -> Result<StoredAuditRecord, DomainErro
         change_set_id: model.change_set_id,
         occurred_at: model.occurred_at,
         retain_until: model.retain_until,
+        change_ref: model.change_ref,
+        detail: model.detail,
     })
 }
 
@@ -163,7 +165,7 @@ impl AuditSink for AuditStore {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-4
         let active = audit_record::ActiveModel {
-            id: Set(Uuid::new_v4()),
+            id: Set(record.record_id.unwrap_or_else(Uuid::new_v4)),
             resource: Set(record.resource),
             declaration_key: Set(record.declaration_key),
             tenant_id: Set(record.tenant_id),
@@ -175,6 +177,8 @@ impl AuditSink for AuditStore {
             outcome: Set(record.outcome.as_str().to_owned()),
             request_id: Set(record.request_id),
             change_set_id: Set(record.change_set_id),
+            change_ref: Set(record.change_ref),
+            detail: Set(record.detail),
             // The shared clock, aligned to what Postgres keeps: both backends
             // then hold the same instant, as for every other timestamp column,
             // and the history cursor minted from it means the same on either.

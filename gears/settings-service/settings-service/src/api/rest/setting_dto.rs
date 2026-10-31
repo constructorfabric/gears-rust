@@ -399,7 +399,7 @@ pub struct AuditRecordDto {
     /// setting's definition — the declaration created, changed, retired —
     /// which belongs to no tenant and appears in every scope's history.
     pub tenant_id: Option<Uuid>,
-    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.
+    /// `create`, `change`, `revert`, `remove`, `clone`, `secret_use`, `stage` or `activation`.
     pub operation: String,
     /// Who did it, masked when the identity is PII the caller may not see.
     pub actor: String,

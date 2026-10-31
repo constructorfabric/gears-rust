@@ -1736,6 +1736,12 @@ where
         if_match: Option<&str>,
         actor: &WriteActor,
     ) -> Result<(Declaration, bool), DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-28
+        // A declaration lifecycle change — retire, reactivate, evolve, update, or a
+        // reconcile pass of contributed declarations — takes no mutation lock: it
+        // changes no stored value, and nothing in this service holds the lock a
+        // value write takes.
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-28
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-4
         // @cpt-begin:cpt-cf-settings-service-flow-setting-declarations-retire:p1:inst-decl-retire-5
         // Retire drops a live setting out of resolution at once: gated like a

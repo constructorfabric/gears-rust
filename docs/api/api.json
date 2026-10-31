@@ -986,7 +986,7 @@
             "type": "string"
           },
           "operation": {
-            "description": "`create`, `change`, `revert`, `remove`, `clone`, `secret_use` or `stage`.",
+            "description": "`create`, `change`, `revert`, `remove`, `clone`, `secret_use`, `stage` or `activation`.",
             "type": "string"
           },
           "outcome": {

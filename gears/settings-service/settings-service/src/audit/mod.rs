@@ -86,6 +86,9 @@ pub enum AuditOperation {
     /// A secret was staged ahead of the batch that commits it: the entry is in
     /// the store, nothing live has changed yet.
     Stage,
+    /// A consumer reported what it applied for a change: the record names the
+    /// change by its `change_ref`.
+    Activation,
 }
 
 impl AuditOperation {
@@ -100,6 +103,7 @@ impl AuditOperation {
             Self::Clone => "clone",
             Self::SecretUse => "secret_use",
             Self::Stage => "stage",
+            Self::Activation => "activation",
         }
     }
 
@@ -114,6 +118,7 @@ impl AuditOperation {
             "clone" => Some(Self::Clone),
             "secret_use" => Some(Self::SecretUse),
             "stage" => Some(Self::Stage),
+            "activation" => Some(Self::Activation),
             _ => None,
         }
     }
@@ -285,6 +290,17 @@ pub struct AuditRecord {
         with = "time::serde::rfc3339::option"
     )]
     pub retain_until: Option<OffsetDateTime>,
+    /// The id the record is stored under, minted by the mutation before the
+    /// append when something else must name it — an activation state names
+    /// the change's record as its `change_ref`. Absent, the store mints one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_id: Option<Uuid>,
+    /// The change an `activation` record answers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl AuditRecord {
@@ -321,6 +337,9 @@ impl AuditRecord {
             request_id: request_id.into(),
             change_set_id: None,
             retain_until: None,
+            record_id: None,
+            change_ref: None,
+            detail: None,
         }
         // @cpt-end:cpt-cf-settings-service-algo-audit-store-append:p1:inst-as-append-2
     }
@@ -350,6 +369,27 @@ impl AuditRecord {
     #[must_use]
     pub fn with_change_set(mut self, change_set_id: Uuid) -> Self {
         self.change_set_id = Some(change_set_id);
+        self
+    }
+
+    /// Store the record under this id instead of a minted one.
+    #[must_use]
+    pub fn with_record_id(mut self, id: Uuid) -> Self {
+        self.record_id = Some(id);
+        self
+    }
+
+    /// Name the change an `activation` record answers.
+    #[must_use]
+    pub fn with_change_ref(mut self, change_ref: Uuid) -> Self {
+        self.change_ref = Some(change_ref);
+        self
+    }
+
+    /// Attach the consumer's failure detail.
+    #[must_use]
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
         self
     }
 
@@ -397,6 +437,10 @@ pub struct StoredAuditRecord {
     pub occurred_at: OffsetDateTime,
     /// The explicit retention horizon, when one was given.
     pub retain_until: Option<OffsetDateTime>,
+    /// The change an `activation` record answers.
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    pub detail: Option<String>,
 }
 
 impl StoredAuditRecord {

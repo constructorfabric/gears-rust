@@ -578,3 +578,47 @@ async fn a_retired_setting_refuses_a_restriction_change_with_410_and_keeps_its_r
     let (body, _) = read(&h, "proxy", a, root).await;
     assert_eq!(body["stored"]["access"], json!("read_only"), "{body}");
 }
+
+// ── The key's mutation lock ──────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_restriction_change_takes_the_keys_lock_and_a_held_one_answers_503_with_nothing_stored() {
+    let h = RestHarness::new().await;
+    h.inner.declare("strict", "cascading", json!(false)).await;
+    let (root, a) = (h.inner.tree.root, h.inner.tree.a);
+    let key = h.inner.key("strict");
+    let (_, tag) = read(&h, "strict", a, root).await;
+
+    let owner = h.activation.locks.hold(key.as_str());
+    assert_eq!(restrict(&h, "strict", a, "hidden", &tag, root).await, 503);
+    let uri = format!("{}?tenant={a}", permissions(&h, "strict"));
+    let cleared = h.send("DELETE", &uri, None, Some(&tag), root).await;
+    assert_eq!(cleared.status, 503, "{}", cleared.body);
+    let (body, still) = read(&h, "strict", a, root).await;
+    assert!(
+        body["stored"].is_null() || body.get("stored").is_none(),
+        "{body}"
+    );
+    assert_eq!(still, tag, "nothing was stored");
+
+    crate::domain::activation::HeldKey::release(Box::new(owner)).await;
+    assert_eq!(restrict(&h, "strict", a, "hidden", &tag, root).await, 200);
+    assert!(
+        !h.activation.locks.is_held(key.as_str()),
+        "released before the answer"
+    );
+    assert_eq!(h.activation.locks.asks_for(key.as_str()), 3);
+}
+
+#[tokio::test]
+async fn a_refused_restriction_change_never_contends_for_the_lock() {
+    let h = RestHarness::new().await;
+    h.inner.declare("strict", "cascading", json!(false)).await;
+    let (a, c) = (h.inner.tree.a, h.inner.tree.c);
+    let key = h.inner.key("strict");
+    let (_, tag) = read(&h, "strict", a, a).await;
+
+    // `a` may not restrict a sibling branch.
+    assert_eq!(restrict(&h, "strict", c, "hidden", &tag, a).await, 403);
+    assert_eq!(h.activation.locks.asks_for(key.as_str()), 0);
+}

@@ -52,6 +52,15 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
     crate::infra::storage::access_repo::AccessRepo,
 >;
 
+/// The subscription service over the concrete repositories: the server half of
+/// subscribing to a setting and retiring a subscription.
+pub type ConcreteSubscriptions = crate::infra::subscriptions::SubscriptionService<
+    crate::infra::storage::declaration_repo::DeclarationRepo,
+    crate::infra::storage::value_repo::ValueRepo,
+    crate::infra::storage::access_repo::AccessRepo,
+    crate::infra::storage::activation_repo::ActivationRepo,
+>;
+
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "settings-service",
@@ -88,6 +97,7 @@ pub struct SettingsService {
         OnceLock<Arc<crate::api::rest::declaration_handlers::ConcreteDeclarationAdmin>>,
     event_broker: OnceLock<Arc<crate::infra::event_broker::EventBrokerClient>>,
     cache: OnceLock<Arc<crate::domain::resolution::EffectiveCache>>,
+    subscriptions: OnceLock<Arc<ConcreteSubscriptions>>,
 }
 
 impl Default for SettingsService {
@@ -107,6 +117,7 @@ impl Default for SettingsService {
             declaration_admin: OnceLock::new(),
             event_broker: OnceLock::new(),
             cache: OnceLock::new(),
+            subscriptions: OnceLock::new(),
         }
     }
 }
@@ -585,6 +596,119 @@ impl SettingsService {
             .ok_or_else(|| anyhow::anyhow!("{} access not initialized", Self::MODULE_NAME))
     }
 
+    /// The subscription service — registering and retiring a subscription under
+    /// the key's mutation lock — once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn subscriptions(&self) -> anyhow::Result<Arc<ConcreteSubscriptions>> {
+        self.subscriptions
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} subscriptions not initialized", Self::MODULE_NAME))
+    }
+
+    /// Tenant access restrictions: set, clear, read and list, each mutation in
+    /// its own transaction with its record, evicting the restricted subtree, and
+    /// under the setting key's mutation lock.
+    fn bind_access(
+        &self,
+        hierarchy: &Arc<dyn crate::domain::resolution::TenantHierarchy>,
+        platform_scope: &Arc<dyn PlatformScope>,
+        cache: &Arc<crate::domain::resolution::EffectiveCache>,
+        locks: &Arc<dyn crate::domain::activation::KeyLocks>,
+    ) -> anyhow::Result<()> {
+        self.access
+            .set(Arc::new(
+                crate::domain::access::AccessService::new(
+                    crate::infra::storage::declaration_repo::DeclarationRepo,
+                    crate::infra::storage::access_repo::AccessRepo,
+                    crate::infra::storage::audit_store::AuditStore,
+                    Arc::clone(hierarchy),
+                    Arc::clone(platform_scope),
+                    Arc::clone(cache),
+                )
+                .with_locks(Arc::clone(locks)),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))
+    }
+
+    /// The key's mutation lock: one named advisory lock per setting key, taken by
+    /// every value change, restriction change, registration and retire of the
+    /// key, within `mutation_lock_wait_seconds`. The budget and the delivery
+    /// loop's interval are checked first: a zero of either fails init rather
+    /// than serving on a guess.
+    ///
+    /// On the single-process `SQLite` profile the lock markers a crash may have
+    /// left are removed here, before anything takes a lock; in every other
+    /// profile none is, since a marker there is a live holder's.
+    async fn bind_locks(
+        &self,
+        config: &SettingsServiceConfig,
+    ) -> anyhow::Result<Arc<dyn crate::domain::activation::KeyLocks>> {
+        if let Err(reason) = config.check_mutation_lock_wait() {
+            anyhow::bail!("{}: {reason}", Self::MODULE_NAME);
+        }
+        if let Err(reason) = config.check_redeliver_interval() {
+            anyhow::bail!("{}: {reason}", Self::MODULE_NAME);
+        }
+        self.clear_startup_lock_markers().await?;
+        Ok(Arc::new(crate::infra::mutation_lock::MutationLock::new(
+            self.db()?,
+            Duration::from_secs(config.mutation_lock_wait_seconds),
+            Arc::new(crate::infra::activation_metrics::OtelLockMetrics::new()),
+        )))
+    }
+
+    /// Consumer activation, state half: the subscription service, and what the
+    /// write path needs to record a change's activation states — the manager
+    /// that qualifies a key's subscriptions under the lock, the publisher that
+    /// writes the states in the change's transaction, the lock itself and the
+    /// plaintext fetch a secret's expectation is hashed from, under the
+    /// service's own identity and behind the same per-setting gate as the
+    /// machine path.
+    fn bind_activation(
+        &self,
+        resolver: &Arc<ConcreteResolver>,
+        secrets: &Arc<dyn crate::domain::ports::SecretManager>,
+        locks: &Arc<dyn crate::domain::activation::KeyLocks>,
+    ) -> anyhow::Result<crate::infra::value_writes::ActivationWiring> {
+        let manager = Arc::new(crate::domain::activation::SubscriptionManager::new(
+            Arc::clone(resolver),
+            crate::infra::storage::activation_repo::ActivationRepo,
+            Arc::new(crate::infra::subscriptions::PepReadGate::new(
+                self.enforcer()?,
+            )),
+        ));
+        let publisher = Arc::new(crate::domain::activation::ActivationPublisher::new(
+            Arc::clone(resolver),
+            crate::infra::storage::activation_repo::ActivationRepo,
+        ));
+        let plaintext: Arc<dyn crate::domain::activation::PlaintextFetcher> =
+            Arc::new(crate::infra::service_plaintext::ServicePlaintext::new(
+                Arc::clone(secrets),
+                Arc::new(crate::infra::secret_manager::PepSecretGate::new(
+                    self.enforcer()?,
+                )),
+                self.db()?,
+            ));
+        self.subscriptions
+            .set(Arc::new(
+                crate::infra::subscriptions::SubscriptionService::new(
+                    self.db()?,
+                    Arc::clone(&manager),
+                    Arc::clone(locks),
+                ),
+            ))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        Ok(crate::infra::value_writes::ActivationWiring {
+            manager,
+            publisher,
+            locks: Arc::clone(locks),
+            plaintext,
+        })
+    }
+
     /// The tenant hierarchy port, once initialized.
     ///
     /// # Errors
@@ -745,18 +869,8 @@ impl Gear for SettingsService {
         self.resolver
             .set(Arc::clone(&resolver))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-        // Tenant access restrictions: set, clear, read and list, each mutation in
-        // its own transaction with its record, evicting the restricted subtree.
-        self.access
-            .set(Arc::new(crate::domain::access::AccessService::new(
-                crate::infra::storage::declaration_repo::DeclarationRepo,
-                crate::infra::storage::access_repo::AccessRepo,
-                crate::infra::storage::audit_store::AuditStore,
-                Arc::clone(&hierarchy_for_access),
-                Arc::clone(&platform_scope),
-                Arc::clone(&cache),
-            )))
-            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        let locks = self.bind_locks(&config).await?;
+        self.bind_access(&hierarchy_for_access, &platform_scope, &cache, &locks)?;
 
         // The write path: the step-up verifier over the platform's AuthN
         // resolver, fetched from the hub at first use — never here, and the
@@ -796,10 +910,12 @@ impl Gear for SettingsService {
             Arc::new(crate::infra::write_metrics::LoggingPublisher),
             Arc::new(crate::infra::write_metrics::OtelWriteMetrics::new()),
         ));
+        let activation = self.bind_activation(&resolver, &secrets, &locks)?;
         self.writes
             .set(Arc::new(
                 crate::infra::value_writes::WriteCoordinator::new(self.db()?, writer)
-                    .with_coherence(Arc::clone(&coherence)),
+                    .with_coherence(Arc::clone(&coherence))
+                    .with_activation(activation),
             ))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
@@ -882,6 +998,33 @@ impl Gear for SettingsService {
         info!("Settings Service gear initialized");
         // @cpt-end:cpt-cf-settings-service-algo-gear-foundation-gear-init:p1:inst-gf-init-12
 
+        Ok(())
+    }
+}
+
+impl SettingsService {
+    /// Remove the stale lock markers on the single-process `SQLite` profile:
+    /// the scan lock's and the mutation lock of every declared key. A no-op on
+    /// every other backend, which reads no declaration at all.
+    async fn clear_startup_lock_markers(&self) -> anyhow::Result<()> {
+        use crate::domain::declaration::DeclarationRepository as _;
+        let db = self.db()?;
+        if db.db().backend() != sea_orm::DbBackend::Sqlite {
+            return Ok(());
+        }
+        let conn = db.conn()?;
+        let keys = crate::infra::storage::declaration_repo::DeclarationRepo
+            .find_by_key_prefix(&conn, &toolkit_security::AccessScope::allow_all(), "")
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: declared keys: {e}", Self::MODULE_NAME))?
+            .into_iter()
+            .map(|declaration| declaration.key);
+        let removed = crate::infra::mutation_lock::clear_startup_markers(&db, keys)
+            .await
+            .map_err(|e| anyhow::anyhow!("{}: stale lock markers: {e}", Self::MODULE_NAME))?;
+        if removed > 0 {
+            info!(removed, "stale lock markers removed at start-up");
+        }
         Ok(())
     }
 }

@@ -23,6 +23,9 @@ use uuid::Uuid;
 use super::{image_of, value_state_tag};
 use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue, ImageClass};
 use crate::domain::access::{AccessRepository, TenantAccess};
+use crate::domain::activation::{
+    ActivationInput, ActivationRepository, NoActivation, RecordedChange, SubscriberTenant,
+};
 use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
@@ -37,7 +40,7 @@ use crate::domain::stepup::{
     INTERACTIVE_SUBJECT_TYPES, StepUpSubject, StepUpVerifier, unverified_payload,
 };
 use crate::domain::validation::{FieldViolation, TypeValidator};
-use crate::domain::value::{ValueDraft, ValueRepository};
+use crate::domain::value::{StoredValue, ValueDraft, ValueRepository};
 use crate::log_text::LogSafe;
 
 /// Who is writing, with what proof.
@@ -814,6 +817,40 @@ where
         actor: &WriteActor,
         change_set_id: Uuid,
     ) -> Result<Committed, DomainError> {
+        self.commit_in_recording::<C, NoActivation>(
+            conn,
+            gated,
+            staged,
+            if_match,
+            actor,
+            change_set_id,
+            None,
+        )
+        .await
+        .map(|(committed, _)| committed)
+    }
+
+    /// [`Self::commit_in`] that also records the change's activation state in
+    /// the same transaction, when the subscriptions that qualified under the
+    /// key's mutation lock are handed in: the audit record is minted under the
+    /// id the states name as their `change_ref`, and `record_change` runs after
+    /// the value row and that record. Returns the pairs of subscriber and tenant
+    /// the change wrote states for.
+    ///
+    /// # Errors
+    /// As [`Self::commit_in`], and any failure of the recording, which rolls the
+    /// whole transaction back.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn commit_in_recording<C: DBRunner, R: ActivationRepository>(
+        &self,
+        conn: &C,
+        gated: &Gated,
+        staged: &Staged,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+        change_set_id: Uuid,
+        activation: Option<ActivationInput<'_, D, V, A, R>>,
+    ) -> Result<(Committed, Vec<SubscriberTenant>), DomainError> {
         let scope = AccessScope::allow_all();
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-2
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-3
@@ -1013,6 +1050,18 @@ where
             actor.request_id.clone(),
         )
         .with_change_set(change_set_id);
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-15
+        // The id the record is stored under is minted here, before the append,
+        // when subscriptions qualified: the activation states name it as their
+        // `change_ref`, and the append writes the record under it.
+        let change_ref = activation
+            .as_ref()
+            .is_some_and(|input| !input.qualified.is_empty())
+            .then(Uuid::new_v4);
+        if let Some(id) = change_ref {
+            record = record.with_record_id(id);
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-15
         if let Some(old) = &old_value {
             record = record.with_pre_image(AuditValue::record(
                 old.clone(),
@@ -1027,12 +1076,21 @@ where
         }
         self.sink.append(conn, &scope, record).await?;
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-6
+        let written = Self::record_activation(
+            conn,
+            declaration,
+            gated,
+            current.as_ref(),
+            change_ref,
+            activation,
+        )
+        .await?;
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-7
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-10
         // The caller commits; a failed commit is its unavailability, nothing
         // stored. What comes back is the old value, the new value, the scope
         // and the new tag.
-        Ok(Committed {
+        let committed = Committed {
             key: declaration.key.clone(),
             tenant_id: gated.tenant_id,
             scope: crate::domain::resolution::scope_path(gated.tenant_id, gated.root),
@@ -1044,13 +1102,48 @@ where
             operation,
             change_set_id,
             released_secret,
-        })
+        };
+        Ok((committed, written))
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-10
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-7
     }
 
-    /// What follows a durable commit, in this order: evict, then publish.
-    pub async fn after_commit(&self, committed: &Committed, actor: &WriteActor) {
+    /// The activation state of every subscription the change affects, in the
+    /// caller's transaction and under the key's lock the caller holds: it
+    /// commits with the value and its record, or not at all.
+    async fn record_activation<C: DBRunner, R: ActivationRepository>(
+        conn: &C,
+        declaration: &Declaration,
+        gated: &Gated,
+        pre_image: Option<&StoredValue>,
+        change_ref: Option<Uuid>,
+        activation: Option<ActivationInput<'_, D, V, A, R>>,
+    ) -> Result<Vec<SubscriberTenant>, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-17
+        let (Some(input), Some(change_ref)) = (activation, change_ref) else {
+            return Ok(Vec::new());
+        };
+        input
+            .publisher
+            .record_change(
+                conn,
+                &RecordedChange {
+                    declaration,
+                    written: gated.tenant_id,
+                    root: gated.root,
+                    pre_image,
+                    change_ref,
+                    qualified: input.qualified,
+                    plaintext: input.plaintext,
+                },
+            )
+            .await
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-record:p1:inst-ca-record-17
+    }
+
+    /// What follows a durable commit while the key's lock is still held: the
+    /// local cache eviction.
+    pub fn evict(&self, committed: &Committed) {
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-8
         self.resolver.cache().invalidate(
             &committed.key,
@@ -1058,6 +1151,12 @@ where
             Some(committed.tenant_id),
         );
         // @cpt-end:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-8
+    }
+
+    /// What follows the eviction once the key's lock is released: the change
+    /// event, and the release of the entry the change superseded. Neither
+    /// needs the lock, so neither lengthens its hold.
+    pub async fn publish_and_release(&self, committed: &Committed, actor: &WriteActor) {
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-commit:p1:inst-vw-commit-9
         self.publisher
             .publish(ValueEvent::Changed {

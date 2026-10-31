@@ -153,20 +153,33 @@ pub async fn set_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-2
     let actor = actor(&ctx, &headers, &scope);
     let if_match = if_match(&headers).map(str::to_owned);
-    let readout = {
-        let service = Arc::clone(&service);
-        let actor = actor.clone();
-        let key = key.clone();
-        db.db()
-            .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
-                Box::pin(async move {
-                    service
-                        .set(tx, &actor, &key, target, access, if_match.as_deref())
-                        .await
-                })
-            })
-            .await?
-    };
+    // The checks that refuse without contending come first; the key's lock is
+    // then taken around the transaction that stores the restriction.
+    {
+        let conn = db.conn().map_err(|e| conn_error(&e))?;
+        service
+            .precheck_set(&conn, &actor, &key, target, access)
+            .await?;
+    }
+    let readout = service
+        .locked(&key, || {
+            let service = Arc::clone(&service);
+            let actor = actor.clone();
+            let key = key.clone();
+            let db = Arc::clone(&db);
+            async move {
+                db.db()
+                    .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
+                        Box::pin(async move {
+                            service
+                                .set(tx, &actor, &key, target, access, if_match.as_deref())
+                                .await
+                        })
+                    })
+                    .await
+            }
+        })
+        .await?;
     service.evict(&key, target).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-13
     Ok(with_etag(&readout, &enforcer, &ctx).await)
@@ -195,20 +208,29 @@ pub async fn clear_access(
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-2
     let actor = actor(&ctx, &headers, &scope);
     let if_match = if_match(&headers).map(str::to_owned);
-    let readout = {
-        let service = Arc::clone(&service);
-        let actor = actor.clone();
-        let key = key.clone();
-        db.db()
-            .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
-                Box::pin(async move {
-                    service
-                        .clear(tx, &actor, &key, target, if_match.as_deref())
-                        .await
-                })
-            })
-            .await?
-    };
+    {
+        let conn = db.conn().map_err(|e| conn_error(&e))?;
+        service.precheck_clear(&conn, &actor, &key, target).await?;
+    }
+    let readout = service
+        .locked(&key, || {
+            let service = Arc::clone(&service);
+            let actor = actor.clone();
+            let key = key.clone();
+            let db = Arc::clone(&db);
+            async move {
+                db.db()
+                    .transaction_ref_mapped::<_, AccessReadout, DomainError>(move |tx| {
+                        Box::pin(async move {
+                            service
+                                .clear(tx, &actor, &key, target, if_match.as_deref())
+                                .await
+                        })
+                    })
+                    .await
+            }
+        })
+        .await?;
     service.evict(&key, target).await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-9
     Ok(with_etag(&readout, &enforcer, &ctx).await)

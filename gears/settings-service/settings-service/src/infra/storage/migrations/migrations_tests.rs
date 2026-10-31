@@ -40,6 +40,7 @@ fn the_harness_declares_its_migrations_in_order() {
             "m20260925_000002_audit_retention_policy".to_owned(),
             "m20260925_000003_audit_retention_policy_seed".to_owned(),
             "m20261014_000001_declaration_display_name".to_owned(),
+            "m20261031_000001_activation_state".to_owned(),
         ]
     );
 }
@@ -114,7 +115,7 @@ async fn the_display_name_column_is_added_nullable_and_old_rows_read_null() {
         .await
         .expect("in-memory sqlite connects");
     let total = u32::try_from(Migrator::migrations().len()).expect("a small list");
-    Migrator::up(&db, Some(total - 1))
+    Migrator::up(&db, Some(total - 2))
         .await
         .expect("everything before the display-name migration applies");
     assert!(
@@ -254,7 +255,9 @@ async fn rolling_the_display_name_migration_back_drops_the_column_and_keeps_the_
     .await
     .expect("a labelled row seeds");
 
-    Migrator::down(&db, Some(1)).await.expect("one step back");
+    // The display-name migration is the last but one: the activation migration
+    // was applied after it, so both go.
+    Migrator::down(&db, Some(2)).await.expect("two steps back");
 
     assert!(
         !declaration_columns(&db)

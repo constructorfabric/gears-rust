@@ -89,6 +89,67 @@ async fn appended_records_come_back_newest_first_for_their_pair_only() {
 }
 
 #[tokio::test]
+async fn a_record_stored_under_a_minted_id_carries_its_change_ref_and_detail() {
+    // An activation state names the change's record by the id the mutation
+    // minted before the append, and an `activation` record answers a change by
+    // its `change_ref` with the consumer's detail: both come back as written,
+    // and an ordinary record carries neither.
+    let db = db().await;
+    let tenant = Uuid::new_v4();
+    let (minted, change) = (Uuid::new_v4(), Uuid::new_v4());
+    let conn = db.conn().expect("connection");
+    AuditStore
+        .append(&conn, &AccessScope::allow_all(), record(tenant, "plain"))
+        .await
+        .expect("append");
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            record(tenant, "minted").with_record_id(minted),
+        )
+        .await
+        .expect("append");
+    AuditStore
+        .append(
+            &conn,
+            &AccessScope::allow_all(),
+            AuditRecord::new(
+                KEY,
+                Some(tenant),
+                "gear",
+                AuditOperation::Activation,
+                "report",
+            )
+            .by_module()
+            .failed()
+            .with_change_ref(change)
+            .with_detail("could not apply"),
+        )
+        .await
+        .expect("append");
+
+    let page = history(&db, tenant, None, None).await;
+    let by_request = |request: &str| {
+        page.items
+            .iter()
+            .find(|r| r.request_id == request)
+            .expect("the record is in the history")
+    };
+    assert_eq!(
+        by_request("minted").id,
+        minted,
+        "stored under the minted id"
+    );
+    assert_eq!(by_request("plain").change_ref, None);
+    assert_eq!(by_request("plain").detail, None);
+    let report = by_request("report");
+    assert_eq!(report.operation, AuditOperation::Activation);
+    assert_eq!(report.change_ref, Some(change));
+    assert_eq!(report.detail.as_deref(), Some("could not apply"));
+}
+
+#[tokio::test]
 async fn a_second_page_follows_the_cursor_without_duplicates() {
     let db = db().await;
     let tenant = Uuid::new_v4();
@@ -294,6 +355,8 @@ fn stored_row(
         outcome: "success".to_owned(),
         request_id: "req".to_owned(),
         change_set_id: None,
+        change_ref: None,
+        detail: None,
         occurred_at: OffsetDateTime::now_utc(),
         retain_until: None,
     }

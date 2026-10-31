@@ -44,6 +44,13 @@ pub struct Model {
     /// Id of the change set the record belongs to, when written as part of one.
     #[sea_orm(nullable)]
     pub change_set_id: Option<Uuid>,
+    /// The id of the change's audit record an `activation` record answers, and
+    /// the one an activation state names; absent on every other record.
+    #[sea_orm(nullable)]
+    pub change_ref: Option<Uuid>,
+    /// The consumer's failure detail on an `activation` record.
+    #[sea_orm(nullable)]
+    pub detail: Option<String>,
     /// When the operation happened.
     pub occurred_at: OffsetDateTime,
     /// Earliest time the record may be purged; absent means no retention deadline yet.

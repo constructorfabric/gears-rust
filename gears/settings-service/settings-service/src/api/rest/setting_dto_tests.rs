@@ -193,6 +193,8 @@ mod history {
             change_set_id: None,
             occurred_at: OffsetDateTime::UNIX_EPOCH,
             retain_until: None,
+            change_ref: None,
+            detail: None,
         }
     }
 

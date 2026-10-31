@@ -26,6 +26,8 @@
 
 // @cpt-dod:cpt-cf-settings-service-dod-replica-coherence-tests:p1
 
+mod support;
+
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -57,9 +59,6 @@ use tenant_resolver_sdk::{
     GetDescendantsResponse, GetTenantsOptions, IsAncestorOptions, TenantId, TenantInfo, TenantRef,
     TenantResolverClient, TenantResolverError, TenantStatus,
 };
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 use toolkit::contracts::RunnableCapability;
@@ -92,21 +91,8 @@ const JOIN_DEADLINE: Duration = Duration::from_secs(20);
 // ---------------------------------------------------------------------------
 
 struct PgFixture {
-    _container: ContainerAsync<Postgres>,
+    _container: support::Container,
     url: String,
-}
-
-/// Whether a missing or broken Docker must fail the run rather than skip it.
-fn require_docker() -> bool {
-    std::env::var_os("SETTINGS_SERVICE_PG_REQUIRE_DOCKER")
-        .is_some_and(|v| v != "0" && !v.is_empty())
-}
-
-/// Docker is not there: skip locally, fail where a skip would pass vacuously.
-fn skip<T>(why: &str) -> Option<T> {
-    assert!(!require_docker(), "PostgreSQL replica suite: {why}");
-    eprintln!("skipping -- PostgreSQL replica suite: {why}");
-    None
 }
 
 fn pool() -> ConnectOpts {
@@ -120,29 +106,8 @@ fn pool() -> ConnectOpts {
 /// A container with the gear's schema applied once, as a stand's first start
 /// applies it; both replicas then find nothing outstanding.
 async fn pg_fixture() -> Option<PgFixture> {
-    let request = test_containers::postgres()
-        .with_env_var("POSTGRES_PASSWORD", "pass")
-        .with_env_var("POSTGRES_USER", "user")
-        .with_env_var("POSTGRES_DB", "settings");
-    let container = match request.start().await {
-        Ok(container) => container,
-        Err(e) => {
-            return skip(&format!(
-                "could not start a PostgreSQL container via testcontainers ({e}); install or \
-                 start Docker to run this for real"
-            ));
-        }
-    };
-    let port = match container.get_host_port_ipv4(5432).await {
-        Ok(port) => port,
-        Err(e) => {
-            return skip(&format!(
-                "the container started but its port could not be resolved ({e}); is Docker \
-                 healthy?"
-            ));
-        }
-    };
-    let url = format!("postgres://user:pass@127.0.0.1:{port}/settings");
+    let container = support::start("replica").await?;
+    let url = container.url.clone();
     let db = connect_db(&url, pool())
         .await
         .expect("the toolkit connects to the container");

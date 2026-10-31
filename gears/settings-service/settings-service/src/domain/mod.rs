@@ -1,6 +1,7 @@
 //! Domain layer.
 
 pub mod access;
+pub mod activation;
 pub mod category;
 pub mod coherence;
 pub mod contribution;

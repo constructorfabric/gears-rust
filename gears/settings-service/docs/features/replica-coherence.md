@@ -134,7 +134,7 @@ Throughout, a tenant in a broadcast is a bare lowercase UUID string, and platfor
 - A key whose declaration is missing, retired or unreadable on this replica is evicted key-wide like any other, since the consume path reads no declaration
 
 **Steps**:
-1. [x] - `p1` - The Event Broker delivers an event of the cache topic to this replica's anonymous consumer group through the replica's single interest, and the consumer continues the publisher's trace from `trace_parent` when the event carries one - `inst-rc-consume-1`
+1. [x] - `p1` - The Event Broker delivers an event of the cache topic to this replica's anonymous consumer group through the replica's single interest, and the consumer continues the publisher's trace from `trace_parent` when the event carries one. The observation of `settings_notify_publish_to_deliver_seconds` at this receipt lands with entry 2.13 (`cpt-cf-settings-service-flow-consumer-activation-lifecycle`) - `inst-rc-consume-1`
 2. [x] - `p1` - **IF** the event's `type_id` is not the `cache_invalidate` type → ignore it and **RETURN** - `inst-rc-consume-2`
 3. [x] - `p1` - **IF** `data.tenant` is not a UUID, **OR** `data.changed_keys` is absent or not a list of strings → log at `warn` with the event's `id`, evict nothing, and **RETURN**; `cache_ttl_seconds` bounds what this replica serves meanwhile - `inst-rc-consume-3`
 4. [x] - `p1` - Ignore any attribute of `data` this version does not know, so an additive attribute of the same event type is harmless - `inst-rc-consume-4`

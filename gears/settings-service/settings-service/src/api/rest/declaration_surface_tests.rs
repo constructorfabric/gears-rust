@@ -1103,3 +1103,62 @@ async fn surrounding_whitespace_is_trimmed_before_the_control_check_and_a_format
         "a format character is not a control character"
     );
 }
+
+// ── No mutation lock ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn an_update_a_retire_and_a_revive_take_no_mutation_lock_even_with_the_key_held() {
+    // A declaration lifecycle change moves no stored value, so it never
+    // contends for the lock a value write, a restriction, a registration and a
+    // retire of the same key take.
+    let h = RestHarness::new().await;
+    let created = h
+        .send(
+            "POST",
+            DECLARATIONS,
+            Some(create_body(&h, "proxy_enabled")),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(created.status, 201, "{}", created.body);
+    let key = created.body["key"].as_str().expect("a key").to_owned();
+    let id = created.body["id"].as_str().expect("an id").to_owned();
+    let tag = created.etag.clone().expect("a tag");
+    let _owner = h.activation.locks.hold(&key);
+    let uri = format!("{DECLARATIONS}/{id}");
+
+    let updated = h
+        .send(
+            "PATCH",
+            &uri,
+            Some(json!({ "description": "changed while the key is held" })),
+            Some(&tag),
+            h.inner.tree.root,
+        )
+        .await;
+    assert_eq!(updated.status, 200, "{}", updated.body);
+    let tag = updated.etag.expect("a fresh tag");
+
+    let retired = h
+        .send("DELETE", &uri, None, Some(&tag), h.inner.tree.root)
+        .await;
+    assert!(retired.status.is_success(), "{}", retired.body);
+
+    let revived = h
+        .send(
+            "POST",
+            DECLARATIONS,
+            Some(create_body(&h, "proxy_enabled")),
+            None,
+            h.inner.tree.root,
+        )
+        .await;
+    assert!(revived.status.is_success(), "{}", revived.body);
+
+    assert_eq!(
+        h.activation.locks.asks_for(&key),
+        0,
+        "no lifecycle change asked for the key's lock"
+    );
+}

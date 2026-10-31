@@ -45,6 +45,12 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 365;
 const DEFAULT_PUBLISH_TIMEOUT_SECONDS: u64 = 2;
 /// The longest a deployment may make a request wait on the broker.
 pub const PUBLISH_TIMEOUT_CEILING_SECONDS: u64 = 10;
+/// How long a mutation waits for its key's mutation lock before it answers
+/// `Unavailable`.
+const DEFAULT_MUTATION_LOCK_WAIT_SECONDS: u64 = 10;
+/// How often the delivery loop ticks, and how long an `awaiting` activation
+/// state waits after its last notification before it is published again.
+const DEFAULT_REDELIVER_INTERVAL_SECONDS: u64 = 30;
 
 /// Bootstrap configuration, read once at gear init.
 ///
@@ -80,6 +86,30 @@ pub struct SettingsServiceConfig {
     /// remaining broadcasts are skipped.
     #[serde(default = "default_publish_timeout_seconds")]
     pub publish_timeout_seconds: u64,
+
+    /// The longest a mutation of one setting key — a value write, a restriction
+    /// change, a subscription registration or retire — waits for the key's
+    /// mutation lock, in seconds; a wait that runs out answers `Unavailable`
+    /// with nothing stored. In a batch the wait is further capped by the
+    /// remainder of the gateway's request deadline, which is the fixed 30 s of
+    /// `infra::value_writes::REQUEST_DEADLINE`: the gateway's own setting is
+    /// another gear's configuration and is not visible here.
+    ///
+    /// Defaults to 10; init refuses a zero, which would fail every mutation
+    /// that meets another. A budget above the platform's request deadline is
+    /// accepted and is a misconfiguration: the batch cap enforces the deadline
+    /// and a single-value request would be cut by its caller first.
+    #[serde(default = "default_mutation_lock_wait_seconds")]
+    pub mutation_lock_wait_seconds: u64,
+
+    /// How often the activation delivery loop ticks, in seconds, and how long an
+    /// `awaiting` activation state waits after its last notification before it
+    /// is published again.
+    ///
+    /// Defaults to 30; init refuses a zero, which would republish every state
+    /// on every tick without pause.
+    #[serde(default = "default_redeliver_interval_seconds")]
+    pub redeliver_interval_seconds: u64,
 
     /// How long an audit record without an explicit `retain_until` stays in the
     /// online window. Twelve months by default, and never configurable below
@@ -137,6 +167,47 @@ impl SettingsServiceConfig {
              the bound on how long a request waits for the broker to accept its cache broadcast",
             self.publish_timeout_seconds
         ))
+    }
+
+    /// Refuse a `mutation_lock_wait_seconds` of zero.
+    ///
+    /// # Errors
+    /// Names the field and the reason.
+    pub fn check_mutation_lock_wait(&self) -> Result<(), String> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-2
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
+        // A budget above the platform request deadline is accepted: the batch
+        // cap by the remainder of the deadline enforces the deadline.
+        if self.mutation_lock_wait_seconds >= 1 {
+            return Ok(());
+        }
+        Err(
+            "mutation_lock_wait_seconds is 0 but must be at least 1: it is how long a mutation \
+             waits for its key's lock, and a zero would fail every mutation that meets another"
+                .to_owned(),
+        )
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-2
+    }
+
+    /// Refuse a `redeliver_interval_seconds` of zero.
+    ///
+    /// # Errors
+    /// Names the field and the reason.
+    pub fn check_redeliver_interval(&self) -> Result<(), String> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-1
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
+        if self.redeliver_interval_seconds >= 1 {
+            return Ok(());
+        }
+        Err(
+            "redeliver_interval_seconds is 0 but must be at least 1: it is the delivery loop's \
+             tick and the wait before a state is published again, and a zero would republish \
+             without pause"
+                .to_owned(),
+        )
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-1
     }
 
     /// Refuse a remote binding for either of this gear's SDK traits.
@@ -218,6 +289,14 @@ const fn default_cache_ttl_seconds() -> u64 {
 
 const fn default_publish_timeout_seconds() -> u64 {
     DEFAULT_PUBLISH_TIMEOUT_SECONDS
+}
+
+const fn default_mutation_lock_wait_seconds() -> u64 {
+    DEFAULT_MUTATION_LOCK_WAIT_SECONDS
+}
+
+const fn default_redeliver_interval_seconds() -> u64 {
+    DEFAULT_REDELIVER_INTERVAL_SECONDS
 }
 
 const fn default_cache_max_entries() -> usize {

@@ -20,14 +20,13 @@
 //! cargo nextest run -p cf-gears-settings-service --features integration --test pg_migrations_test
 //! ```
 
+mod support;
+
 use std::collections::BTreeMap;
 
 use cf_gears_settings_service::infra::storage::migrations::Migrator;
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement};
 use sea_orm_migration::{MigrationTrait, MigratorTrait};
-use testcontainers::runners::AsyncRunner;
-use testcontainers::{ContainerAsync, ImageExt};
-use testcontainers_modules::postgres::Postgres;
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, Db, connect_db};
 use uuid::Uuid;
@@ -45,61 +44,24 @@ const NEW_BOOL: &str = "gts.cf.core.settings.type_bool_flag.v1~";
 /// connection for the rows the test writes and reads around the chain. Owned
 /// by the test, so the container goes when the test does.
 struct PgFixture {
-    _container: ContainerAsync<Postgres>,
+    _container: support::Container,
     db: Db,
     conn: DatabaseConnection,
-}
-
-/// Whether a missing or broken Docker must fail the run rather than skip it.
-/// CI sets `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1`; locally it is unset.
-fn require_docker() -> bool {
-    std::env::var_os("SETTINGS_SERVICE_PG_REQUIRE_DOCKER")
-        .is_some_and(|v| v != "0" && !v.is_empty())
-}
-
-/// Docker is not there: skip locally, fail where a skip would pass vacuously.
-fn skip<T>(why: &str) -> Option<T> {
-    assert!(!require_docker(), "PostgreSQL migration suite: {why}");
-    eprintln!("skipping -- PostgreSQL migration suite: {why}");
-    None
 }
 
 /// Bring up a `testcontainers` `PostgreSQL` and connect to it twice: once as
 /// the toolkit does, for the runner, and once plainly, for the rows.
 async fn pg_fixture() -> Option<PgFixture> {
-    let request = test_containers::postgres()
-        .with_env_var("POSTGRES_PASSWORD", "pass")
-        .with_env_var("POSTGRES_USER", "user")
-        .with_env_var("POSTGRES_DB", "settings");
-    let container = match request.start().await {
-        Ok(container) => container,
-        Err(e) => {
-            return skip(&format!(
-                "could not start a PostgreSQL container via testcontainers ({e}); install or \
-                 start Docker to run this for real"
-            ));
-        }
-    };
-    let port = match container.get_host_port_ipv4(5432).await {
-        Ok(port) => port,
-        Err(e) => {
-            return skip(&format!(
-                "the container started but its port could not be resolved ({e}); is Docker \
-                 healthy?"
-            ));
-        }
-    };
-
-    let url = format!("postgres://user:pass@127.0.0.1:{port}/settings");
+    let container = support::start("migration").await?;
     let opts = ConnectOpts {
         max_conns: Some(5),
         min_conns: Some(1),
         ..Default::default()
     };
-    let db = connect_db(&url, opts)
+    let db = connect_db(&container.url, opts)
         .await
         .expect("the toolkit connects to the container");
-    let conn = Database::connect(&url)
+    let conn = Database::connect(&container.url)
         .await
         .expect("a plain connection to the container");
     Some(PgFixture {
@@ -274,4 +236,154 @@ async fn the_display_name_column_and_its_trigram_index_exist_after_the_chain() {
         .await
         .expect("readable");
     assert_eq!(index.len(), 1, "the trigram index on display_name exists");
+}
+
+/// The activation migration on the backend it is written for: both tables,
+/// their unique constraints, the partial indexes, and the `audit_records`
+/// additions — the widened `operation` vocabulary and the two nullable columns.
+// @cpt-dod:cpt-cf-settings-service-dod-consumer-activation-schema:p1
+#[tokio::test]
+async fn the_activation_tables_indexes_and_audit_additions_exist_after_the_chain() {
+    let Some(fixture) = pg_fixture().await else {
+        return;
+    };
+    run_migrations_for_testing(&fixture.db, Migrator::migrations())
+        .await
+        .expect("the chain applies on an empty database");
+    let backend = fixture.conn.get_database_backend();
+
+    // The unique constraints.
+    for constraint in ["uq_sub_subscriber_key_tenant", "uq_activation_state"] {
+        let found = fixture
+            .conn
+            .query_all_raw(Statement::from_string(
+                backend,
+                format!(
+                    "SELECT conname FROM pg_constraint WHERE conname = '{constraint}' AND contype = 'u'"
+                ),
+            ))
+            .await
+            .expect("readable");
+        assert_eq!(found.len(), 1, "`{constraint}` exists");
+    }
+
+    // The indexes, and the two that are partial.
+    let indexes = fixture
+        .conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT indexname, indexdef FROM pg_indexes
+             WHERE indexname IN ('idx_sub_key', 'idx_activation_key_tenant',
+                                 'idx_activation_awaiting', 'idx_audit_change_ref')",
+        ))
+        .await
+        .expect("readable");
+    let defs: BTreeMap<String, String> = indexes
+        .iter()
+        .map(|row| {
+            (
+                row.try_get::<String>("", "indexname").expect("a name"),
+                row.try_get::<String>("", "indexdef").expect("a definition"),
+            )
+        })
+        .collect();
+    assert_eq!(defs.len(), 4, "{defs:?}");
+    assert!(
+        defs["idx_activation_awaiting"].contains("WHERE (status = 'awaiting'"),
+        "partial over the awaiting rows: {}",
+        defs["idx_activation_awaiting"]
+    );
+    assert!(
+        defs["idx_audit_change_ref"].contains("WHERE (change_ref IS NOT NULL)"),
+        "partial over the rows that carry a change_ref: {}",
+        defs["idx_audit_change_ref"]
+    );
+
+    // The audit additions: nullable columns, and `activation` accepted.
+    for (column, kind) in [("change_ref", "uuid"), ("detail", "text")] {
+        let found = fixture
+            .conn
+            .query_one_raw(Statement::from_string(
+                backend,
+                format!(
+                    "SELECT data_type, is_nullable FROM information_schema.columns
+                     WHERE table_name = 'audit_records' AND column_name = '{column}'"
+                ),
+            ))
+            .await
+            .expect("readable")
+            .unwrap_or_else(|| panic!("`audit_records.{column}` exists"));
+        assert_eq!(
+            found.try_get::<String>("", "data_type").expect("type"),
+            kind
+        );
+        assert_eq!(
+            found.try_get::<String>("", "is_nullable").expect("flag"),
+            "YES"
+        );
+    }
+    // One `CHECK` constrains `operation`, validated, found by definition.
+    let checks = fixture
+        .conn
+        .query_all_raw(Statement::from_string(
+            backend,
+            "SELECT convalidated FROM pg_constraint
+             WHERE conrelid = 'audit_records'::regclass AND contype = 'c'
+               AND pg_get_constraintdef(oid) ~ '\\yoperation\\y'",
+        ))
+        .await
+        .expect("readable");
+    assert_eq!(checks.len(), 1, "one CHECK on `operation`");
+    assert!(checks[0].try_get::<bool>("", "convalidated").expect("flag"));
+    let id = Uuid::new_v4();
+    exec(
+        &fixture.conn,
+        &format!(
+            "INSERT INTO audit_records
+               (id, resource, declaration_key, operation, actor, actor_classification,
+                outcome, request_id, change_ref, detail)
+             VALUES ('{id}', 'cf.settings:k@t', 'k', 'activation', 'gear', 'public',
+                     'failure', 'req', '{}', 'could not apply')",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    assert!(
+        fixture
+            .conn
+            .execute_unprepared(&format!(
+                "INSERT INTO audit_records
+                   (id, resource, declaration_key, operation, actor, actor_classification,
+                    outcome, request_id)
+                 VALUES ('{}', 'cf.settings:k@t', 'k', 'delete', 'gear', 'public', 'success', 'req')",
+                Uuid::new_v4()
+            ))
+            .await
+            .is_err(),
+        "an operation outside the vocabulary is still refused"
+    );
+
+    // A state's status is checked and defaults to `awaiting`.
+    exec(
+        &fixture.conn,
+        &format!(
+            "INSERT INTO activation_state (subscriber, key, tenant, change_ref, expected_value)
+             VALUES ('gear', 'k', 't', '{}', 'true')",
+            Uuid::new_v4()
+        ),
+    )
+    .await;
+    let status = fixture
+        .conn
+        .query_one_raw(Statement::from_string(
+            backend,
+            "SELECT status FROM activation_state WHERE subscriber = 'gear'",
+        ))
+        .await
+        .expect("readable")
+        .expect("the row");
+    assert_eq!(
+        status.try_get::<String>("", "status").expect("status"),
+        "awaiting"
+    );
 }

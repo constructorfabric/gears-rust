@@ -742,3 +742,169 @@ async fn a_restriction_change_evicts_locally_and_publishes_no_broadcast() {
     assert!(gateway.events().is_empty(), "nothing published");
     assert!(metrics.all().is_empty(), "nothing counted");
 }
+
+// ---------------------------------------------------------------------------
+// The key's mutation lock
+// ---------------------------------------------------------------------------
+
+mod locking {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::*;
+    use crate::domain::activation::testing::InProcessLocks;
+    use crate::domain::activation::{HeldKey, KeyLocks};
+
+    fn locked_service(h: Harness, locks: &Arc<InProcessLocks>) -> (Harness, Service) {
+        let service = AccessService::new(
+            DeclarationRepo,
+            AccessRepo,
+            Arc::clone(&h.audit),
+            Arc::clone(&h.base.hierarchy) as Arc<dyn crate::domain::resolution::TenantHierarchy>,
+            Arc::new(FixedScope(h.base.tree.root)),
+            Arc::clone(&h.base.cache),
+        )
+        .with_locks(Arc::clone(locks) as Arc<dyn KeyLocks>);
+        (h, service)
+    }
+
+    #[tokio::test]
+    async fn a_restriction_changes_under_the_keys_lock_and_releases_it_before_answering() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+        let seen_held = AtomicBool::new(false);
+
+        let outcome = service
+            .locked(&key, || async {
+                seen_held.store(locks.is_held(key.as_str()), Ordering::SeqCst);
+                Ok::<_, DomainError>(7)
+            })
+            .await;
+
+        assert_eq!(outcome.expect("ran"), 7);
+        assert!(
+            seen_held.load(Ordering::SeqCst),
+            "the change ran under the lock"
+        );
+        assert!(
+            !locks.is_held(key.as_str()),
+            "released and awaited before the answer"
+        );
+        assert_eq!(locks.released.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn the_lock_is_released_when_the_change_itself_fails() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+
+        let outcome: Result<(), DomainError> = service
+            .locked(&key, || async {
+                Err(DomainError::PreconditionFailed {
+                    detail: "stale".to_owned(),
+                })
+            })
+            .await;
+
+        assert!(matches!(
+            outcome,
+            Err(DomainError::PreconditionFailed { .. })
+        ));
+        assert!(!locks.is_held(key.as_str()));
+    }
+
+    #[tokio::test]
+    async fn a_wait_that_runs_out_answers_unavailable_and_never_runs_the_change() {
+        let locks = InProcessLocks::with_budget(Duration::from_millis(40));
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        let key = h.key("strict");
+        let owner = locks.hold(key.as_str());
+        let ran = AtomicBool::new(false);
+
+        let outcome = service
+            .locked(&key, || async {
+                ran.store(true, Ordering::SeqCst);
+                Ok::<_, DomainError>(())
+            })
+            .await;
+
+        assert!(
+            matches!(outcome, Err(DomainError::Unavailable { .. })),
+            "{outcome:?}"
+        );
+        assert!(!ran.load(Ordering::SeqCst), "nothing stored");
+        assert!(locks.is_held(key.as_str()), "still its owner's");
+        Box::new(owner).release().await;
+    }
+
+    #[tokio::test]
+    async fn the_precheck_refuses_without_contending_for_the_lock() {
+        let locks = InProcessLocks::generous();
+        let (h, service) = locked_service(Harness::new().await, &locks);
+        h.base
+            .declare("strict", scope_class::CASCADING, json!(false))
+            .await;
+        let t = &h.base.tree;
+        let conn = h.base.db.conn().expect("connection");
+
+        // A target outside the caller's reach, an `overridable` row, a key the
+        // caller cannot see: each is refused before any lock is asked for.
+        let denied = service
+            .precheck_set(
+                &conn,
+                &actor(t.a),
+                &h.key("strict"),
+                t.c,
+                TenantAccess::Hidden,
+            )
+            .await;
+        assert!(
+            matches!(denied, Err(DomainError::Unauthorized { .. })),
+            "{denied:?}"
+        );
+        let invalid = service
+            .precheck_set(
+                &conn,
+                &actor(t.root),
+                &h.key("strict"),
+                t.a,
+                TenantAccess::Overridable,
+            )
+            .await;
+        assert!(
+            matches!(invalid, Err(DomainError::Validation { .. })),
+            "{invalid:?}"
+        );
+        let absent = service
+            .precheck_clear(&conn, &actor(t.root), &h.key("undeclared"), t.a)
+            .await;
+        assert!(
+            matches!(absent, Err(DomainError::NotFound { .. })),
+            "{absent:?}"
+        );
+        service
+            .precheck_set(
+                &conn,
+                &actor(t.root),
+                &h.key("strict"),
+                t.a,
+                TenantAccess::Hidden,
+            )
+            .await
+            .expect("a change that may go ahead");
+
+        assert_eq!(locks.asked.lock().expect("asked").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn without_a_lock_bound_the_change_simply_runs() {
+        let h = Harness::new().await;
+        let outcome = h
+            .service
+            .locked(&h.key("strict"), || async { Ok::<_, DomainError>("ran") })
+            .await;
+        assert_eq!(outcome.expect("ran"), "ran");
+    }
+}

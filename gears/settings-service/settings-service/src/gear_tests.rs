@@ -452,6 +452,8 @@ async fn init_takes_the_design_fixed_defaults_when_nothing_is_configured() {
     assert_eq!(config.cache_ttl_seconds, 30);
     assert_eq!(config.cache_max_entries, 500_000);
     assert_eq!(config.publish_timeout_seconds, 2);
+    assert_eq!(config.mutation_lock_wait_seconds, 10);
+    assert_eq!(config.redeliver_interval_seconds, 30);
     assert_eq!(config.audit_retention_days, 365);
     assert_eq!(config.step_up.max_age_seconds, 300);
 }
@@ -1079,4 +1081,87 @@ async fn a_consumer_task_dropped_without_awaiting_is_aborted() {
         dropped.load(std::sync::atomic::Ordering::SeqCst),
         "the task was aborted by the guard's drop"
     );
+}
+
+#[tokio::test]
+async fn init_refuses_a_zero_lock_budget_or_redelivery_interval() {
+    // A zero budget would fail every mutation that meets another; a zero
+    // interval would republish without pause. Init refuses either, naming it.
+    for field in ["mutation_lock_wait_seconds", "redeliver_interval_seconds"] {
+        let ctx = context_with(json!({ field: 0 }), wired_hub()).await;
+        let err = SettingsService::default()
+            .init(&ctx)
+            .await
+            .expect_err("a zero is refused");
+        let message = err.to_string();
+        assert!(
+            message.contains(field) && message.contains("at least 1"),
+            "the message names the field: `{message}`"
+        );
+    }
+    let ctx = context_with(
+        json!({ "mutation_lock_wait_seconds": 1, "redeliver_interval_seconds": 1 }),
+        wired_hub(),
+    )
+    .await;
+    SettingsService::default()
+        .init(&ctx)
+        .await
+        .expect("one second is the floor");
+}
+
+#[tokio::test]
+async fn init_binds_the_subscription_service_and_the_write_path_to_the_activation_state() {
+    let ctx = default_context().await;
+    let gear = SettingsService::default();
+    assert!(gear.subscriptions().is_err(), "nothing before init");
+    gear.init(&ctx).await.expect("init");
+    assert!(gear.subscriptions().is_ok());
+}
+
+#[tokio::test]
+async fn init_removes_the_stale_lock_markers_of_the_scan_lock_and_every_declared_key_on_sqlite() {
+    use crate::domain::activation::KeyLocks;
+
+    // A migrated database already holding one declared key.
+    let harness = crate::test_support::ResolutionHarness::new().await;
+    harness
+        .declare(
+            "flag",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(false),
+        )
+        .await;
+    let key = harness.key("flag");
+    // A crash left the markers behind: the holders are gone.
+    let probe = crate::infra::mutation_lock::MutationLock::new(
+        std::sync::Arc::clone(&harness.db),
+        std::time::Duration::from_millis(30),
+        std::sync::Arc::new(crate::domain::activation::testing::RecordingLockMetrics::default()),
+    );
+    for stale in [key.as_str(), crate::infra::mutation_lock::SCAN_LOCK_KEY] {
+        std::mem::forget(probe.acquire(stale, None).await.expect("held, then lost"));
+    }
+    assert!(
+        probe.acquire(key.as_str(), None).await.is_err(),
+        "the marker blocks"
+    );
+
+    let ctx = GearCtx::new(
+        SettingsService::MODULE_NAME,
+        Uuid::new_v4(),
+        Arc::new(FixedConfig(json!({ "config": {} }))),
+        wired_hub(),
+        tokio_util::sync::CancellationToken::new(),
+    )
+    .with_db((*harness.db).clone());
+    SettingsService::default().init(&ctx).await.expect("init");
+
+    for key in [key.as_str(), crate::infra::mutation_lock::SCAN_LOCK_KEY] {
+        let held = probe
+            .acquire(key, None)
+            .await
+            .unwrap_or_else(|e| panic!("the marker of `{key}` was removed at init: {e:?}"));
+        held.release().await;
+    }
 }

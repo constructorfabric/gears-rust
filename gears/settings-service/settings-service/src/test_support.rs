@@ -991,6 +991,9 @@ impl crate::domain::stepup::StepUpVerifier for FixedStepUp {
     }
 }
 
+/// What [`RecordingSecrets::on_delete`] runs.
+pub type DeleteHook = Box<dyn Fn() + Send + Sync>;
+
 /// A Secret Manager that keeps plaintext in memory under deterministic
 /// references and remembers what it was asked to release.
 #[derive(Default)]
@@ -1002,6 +1005,9 @@ pub struct RecordingSecrets {
     /// The next store lands in the store and answers with a failure: the
     /// ambiguous outcome of a network that dropped the response.
     pub lose_next_answer: std::sync::atomic::AtomicBool,
+    /// Runs on every `delete_secret`, before it is recorded: what a test uses
+    /// to observe the state of the world at the moment an entry is released.
+    pub on_delete: Mutex<Option<DeleteHook>>,
 }
 
 impl RecordingSecrets {
@@ -1106,6 +1112,9 @@ impl crate::domain::ports::SecretManager for RecordingSecrets {
         secret_ref: &str,
     ) -> Result<(), DomainError> {
         self.check()?;
+        if let Some(hook) = self.on_delete.lock().expect("secrets lock").as_ref() {
+            hook();
+        }
         self.entries
             .lock()
             .expect("secrets lock")
@@ -1310,6 +1319,9 @@ pub struct RestHarness {
     pub published: Arc<RecordingPublisher>,
     /// The setting types the declaration admin registered.
     pub registrar: Arc<RecordingRegistrar>,
+    /// The activation state half every value and restriction change goes
+    /// through: the lock table a test holds a key in.
+    pub activation: ActivationRig,
     router: axum::Router,
 }
 
@@ -1419,14 +1431,26 @@ impl RestHarness {
             Arc::clone(&inner.db),
             Arc::clone(&enforcer),
         );
-        let access = Arc::new(crate::domain::access::AccessService::new(
-            crate::infra::storage::declaration_repo::DeclarationRepo,
-            crate::infra::storage::access_repo::AccessRepo,
-            crate::infra::storage::audit_store::AuditStore,
-            Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
-            Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
-            Arc::clone(&inner.cache),
-        ));
+        let secrets = Arc::new(RecordingSecrets::default());
+        let activation = activation_rig(
+            &inner,
+            &secrets,
+            Arc::new(AllowAllGate),
+            Duration::from_millis(80),
+        );
+        let access = Arc::new(
+            crate::domain::access::AccessService::new(
+                crate::infra::storage::declaration_repo::DeclarationRepo,
+                crate::infra::storage::access_repo::AccessRepo,
+                crate::infra::storage::audit_store::AuditStore,
+                Arc::clone(&inner.hierarchy) as Arc<dyn TenantHierarchy>,
+                Arc::new(FixedScope(inner.tree.root)) as Arc<dyn PlatformScope>,
+                Arc::clone(&inner.cache),
+            )
+            .with_locks(
+                Arc::clone(&activation.locks) as Arc<dyn crate::domain::activation::KeyLocks>
+            ),
+        );
         let router = crate::api::rest::access_routes::register_routes(
             router,
             &openapi,
@@ -1469,13 +1493,13 @@ impl RestHarness {
         // The write surface. Every port behind it is doubled except the
         // repositories and the audit store, which run for real against the
         // same database the reads use.
-        let secrets = Arc::new(RecordingSecrets::default());
         let published = Arc::new(RecordingPublisher::default());
-        let coordinator = write_coordinator(
+        let coordinator = write_coordinator_with(
             &inner,
             Arc::clone(&secrets),
             Arc::clone(&published),
             step_up_for_writes,
+            Some(activation.wiring.clone()),
         );
         let router = crate::api::rest::value_routes::register_routes(
             router,
@@ -1488,6 +1512,7 @@ impl RestHarness {
             secrets,
             published,
             registrar,
+            activation,
             router,
         }
     }
@@ -1689,6 +1714,17 @@ pub fn write_coordinator(
     published: Arc<RecordingPublisher>,
     step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
 ) -> Arc<crate::infra::value_writes::WriteCoordinator> {
+    write_coordinator_with(inner, secrets, published, step_up, None)
+}
+
+/// [`write_coordinator`] with consumer activation bound, when given.
+pub fn write_coordinator_with(
+    inner: &ResolutionHarness,
+    secrets: Arc<RecordingSecrets>,
+    published: Arc<RecordingPublisher>,
+    step_up: Arc<dyn crate::domain::stepup::StepUpVerifier>,
+    activation: Option<crate::infra::value_writes::ActivationWiring>,
+) -> Arc<crate::infra::value_writes::WriteCoordinator> {
     let writer = Arc::new(crate::domain::writes::ValueWriter::new(
         crate::infra::storage::value_repo::ValueRepo,
         Arc::clone(&inner.resolver),
@@ -1702,10 +1738,12 @@ pub fn write_coordinator(
         published as Arc<dyn crate::domain::ports::ChangePublisher>,
         Arc::new(crate::domain::ports::NoMetrics),
     ));
-    Arc::new(crate::infra::value_writes::WriteCoordinator::new(
-        Arc::clone(&inner.db),
-        writer,
-    ))
+    let coordinator =
+        crate::infra::value_writes::WriteCoordinator::new(Arc::clone(&inner.db), writer);
+    Arc::new(match activation {
+        Some(wiring) => coordinator.with_activation(wiring),
+        None => coordinator,
+    })
 }
 
 /// An interactive administrator of one tenant.
@@ -1731,4 +1769,110 @@ pub fn service_context_for(tenant: Uuid) -> SecurityContext {
         .subject_type("gts.cf.core.security.subject_service.v1~")
         .build()
         .expect("context")
+}
+
+// ---------------------------------------------------------------------------
+// Consumer activation
+// ---------------------------------------------------------------------------
+
+/// What the registration read decision answers.
+#[derive(Clone)]
+pub enum ReadAnswer {
+    /// Allowed, with the administrative domains this visibility names.
+    Allow(crate::domain::category::DomainVisibility),
+    /// A denial from the policy decision point.
+    Deny,
+    /// No decision could be had.
+    Down,
+}
+
+/// A registration read decision that answers what the test says.
+pub struct FakeReadGate {
+    answer: Mutex<ReadAnswer>,
+    /// How many times the decision was asked.
+    pub asked: std::sync::atomic::AtomicUsize,
+}
+
+impl FakeReadGate {
+    /// A gate that allows everything.
+    pub fn allowing() -> Arc<Self> {
+        Arc::new(Self {
+            answer: Mutex::new(ReadAnswer::Allow(
+                crate::domain::category::DomainVisibility::Unrestricted,
+            )),
+            asked: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Answer `answer` from now on.
+    pub fn answer(&self, answer: ReadAnswer) {
+        *self.answer.lock().expect("gate lock") = answer;
+    }
+}
+
+#[async_trait]
+impl crate::domain::activation::ReadGate for FakeReadGate {
+    async fn read_visibility(
+        &self,
+        _ctx: &SecurityContext,
+    ) -> Result<crate::domain::category::DomainVisibility, DomainError> {
+        self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        match self.answer.lock().expect("gate lock").clone() {
+            ReadAnswer::Allow(visibility) => Ok(visibility),
+            ReadAnswer::Deny => Err(DomainError::Unauthorized {
+                resource: settings_service_sdk::gts::VALUE_SCHEMA,
+            }),
+            ReadAnswer::Down => Err(DomainError::Unavailable {
+                detail: "the authorization service could not decide".to_owned(),
+            }),
+        }
+    }
+}
+
+/// The activation state half over a harness: the doubles a test reaches into
+/// and the wiring a coordinator takes.
+pub struct ActivationRig {
+    /// What the coordinator takes.
+    pub wiring: crate::infra::value_writes::ActivationWiring,
+    /// The in-process lock table.
+    pub locks: Arc<crate::domain::activation::testing::InProcessLocks>,
+    /// The registration read decision.
+    pub gate: Arc<FakeReadGate>,
+}
+
+/// The state half of consumer activation over a harness, with a lock table
+/// whose waits give up after `budget`.
+pub fn activation_rig(
+    inner: &ResolutionHarness,
+    secrets: &Arc<RecordingSecrets>,
+    secret_gate: Arc<dyn crate::domain::ports::SecretResolveGate>,
+    budget: Duration,
+) -> ActivationRig {
+    let locks = crate::domain::activation::testing::InProcessLocks::with_budget(budget);
+    let gate = FakeReadGate::allowing();
+    let manager = Arc::new(crate::domain::activation::SubscriptionManager::new(
+        Arc::clone(&inner.resolver),
+        crate::infra::storage::activation_repo::ActivationRepo,
+        Arc::clone(&gate) as Arc<dyn crate::domain::activation::ReadGate>,
+    ));
+    let publisher = Arc::new(crate::domain::activation::ActivationPublisher::new(
+        Arc::clone(&inner.resolver),
+        crate::infra::storage::activation_repo::ActivationRepo,
+    ));
+    let plaintext: Arc<dyn crate::domain::activation::PlaintextFetcher> =
+        Arc::new(crate::infra::service_plaintext::ServicePlaintext::new(
+            Arc::clone(secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            secret_gate,
+            Arc::clone(&inner.db),
+        ));
+    ActivationRig {
+        wiring: crate::infra::value_writes::ActivationWiring {
+            manager,
+            publisher,
+            locks: Arc::clone(&locks) as Arc<dyn crate::domain::activation::KeyLocks>,
+            plaintext,
+        },
+        locks,
+        gate,
+    }
 }

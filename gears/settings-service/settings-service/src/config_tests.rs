@@ -182,3 +182,50 @@ fn a_wrong_typed_publish_timeout_is_refused_rather_than_coerced() {
     assert!(parse(serde_json::json!({ "publish_timeout_seconds": "two" })).is_err());
     assert!(parse(serde_json::json!({ "publish_timeout_seconds": -1 })).is_err());
 }
+
+#[test]
+fn the_lock_budget_and_the_redelivery_interval_default_to_ten_and_thirty_seconds() {
+    let cfg = parse(serde_json::json!({})).expect("parses");
+    assert_eq!(cfg.mutation_lock_wait_seconds, 10);
+    assert_eq!(cfg.redeliver_interval_seconds, 30);
+    let cfg = parse(serde_json::json!({
+        "mutation_lock_wait_seconds": 3,
+        "redeliver_interval_seconds": 5,
+    }))
+    .expect("parses");
+    assert_eq!(cfg.mutation_lock_wait_seconds, 3);
+    assert_eq!(cfg.redeliver_interval_seconds, 5);
+    cfg.check_mutation_lock_wait().expect("3 s is fine");
+    cfg.check_redeliver_interval().expect("5 s is fine");
+}
+
+#[test]
+fn a_budget_above_the_request_deadline_is_accepted() {
+    // A misconfiguration the batch cap by the remaining deadline absorbs, not a
+    // refusal.
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 3600 })).expect("parses");
+    cfg.check_mutation_lock_wait()
+        .expect("accepted and documented as a misconfiguration");
+}
+
+#[test]
+fn a_zero_lock_budget_or_redelivery_interval_is_refused_naming_the_field() {
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 0 })).expect("parses");
+    let reason = cfg.check_mutation_lock_wait().expect_err("zero is refused");
+    assert!(reason.contains("mutation_lock_wait_seconds"), "{reason}");
+    assert!(
+        cfg.check_redeliver_interval().is_ok(),
+        "the other is its own check"
+    );
+
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": 0 })).expect("parses");
+    let reason = cfg.check_redeliver_interval().expect_err("zero is refused");
+    assert!(reason.contains("redeliver_interval_seconds"), "{reason}");
+    assert!(cfg.check_mutation_lock_wait().is_ok());
+}
+
+#[test]
+fn a_wrong_typed_lock_budget_or_interval_is_refused_rather_than_coerced() {
+    assert!(parse(serde_json::json!({ "mutation_lock_wait_seconds": "ten" })).is_err());
+    assert!(parse(serde_json::json!({ "redeliver_interval_seconds": -1 })).is_err());
+}

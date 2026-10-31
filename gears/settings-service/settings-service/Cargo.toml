@@ -1,7 +1,7 @@
 # Created: 2026-08-12 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service"
-version = "0.1.8"
+version = "0.1.9"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -85,6 +85,15 @@ toolkit-macros = { workspace = true }
 # continues it. The `otel` feature comes through `toolkit`.
 toolkit-trace-context = { workspace = true }
 toolkit-gts = { workspace = true }
+# The expected value of a secret is a salted SHA-256 over its canonical
+# encoding — from the FIPS-validated provider, as the platform's lints demand of
+# a cryptographic digest — and numbers are written as ECMAScript writes them
+# (RFC 8785): the shortest round-trip digits come from `ryu`.
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+ryu = { workspace = true }
+# The buffer a secret's plaintext is encoded into is wiped when it drops.
+zeroize = { workspace = true }
 
 [dev-dependencies]
 # Captures the consumer's `warn` lines in the coherence tests.
