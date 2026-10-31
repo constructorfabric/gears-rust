@@ -6,11 +6,11 @@ use std::sync::Arc;
 use axum::Router;
 use axum::http::Method;
 use sea_orm_migration::MigratorTrait;
+use tokio::sync::OnceCell;
 use toolkit::api::openapi_registry::OpenApiRegistryImpl;
 use toolkit::api::operation_builder::{OperationSpec, ParamLocation};
 use toolkit_db::migration_runner::run_migrations_for_testing;
 use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
-use uuid::Uuid;
 
 use super::{handlers, register_routes};
 use crate::domain::authz::{Authorizer, TenantOnlyAuthorizer};
@@ -25,10 +25,11 @@ use crate::infra::storage::migrations::Migrator;
 
 const BASE: &str = "/api/file-storage/v1";
 
-async fn build_db() -> Arc<DBProvider<DbError>> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-fs-routes-{}.db", Uuid::now_v7().simple()));
-    let dsn = format!("sqlite://{}?mode=rwc", path.display());
+async fn build_db(dir: &tempfile::TempDir) -> Arc<DBProvider<DbError>> {
+    let dsn = format!(
+        "sqlite://{}?mode=rwc",
+        dir.path().join("routes.db").display()
+    );
     let opts = ConnectOpts {
         max_conns: Some(1),
         min_conns: Some(1),
@@ -41,8 +42,15 @@ async fn build_db() -> Arc<DBProvider<DbError>> {
     Arc::new(DBProvider::new(db))
 }
 
-async fn registry_with_routes() -> OpenApiRegistryImpl {
-    let db = build_db().await;
+/// The route table is declared once; both tests inspect the same registry.
+async fn registry_with_routes() -> &'static OpenApiRegistryImpl {
+    static REGISTRY: OnceCell<OpenApiRegistryImpl> = OnceCell::const_new();
+    REGISTRY.get_or_init(build_registry).await
+}
+
+async fn build_registry() -> OpenApiRegistryImpl {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = build_db(&dir).await;
     let store = Store::new(db);
     let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
     let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
@@ -165,7 +173,7 @@ async fn listings_declare_page_parameters() {
         ("/storages", "id asc"),
     ];
     for (path, order) in listings {
-        let spec = lookup_spec(&registry, &Method::GET, path);
+        let spec = lookup_spec(registry, &Method::GET, path);
         for name in ["limit", "cursor"] {
             assert!(
                 spec.params

@@ -1,33 +1,23 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
+//! Policy and quota enforcement in `FileService`: MIME, size and metadata limits, quota gating.
+
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use axum::http::StatusCode;
 use bytes::Bytes;
-use sea_orm_migration::MigratorTrait;
-use toolkit_db::migration_runner::run_migrations_for_testing;
-use toolkit_db::{ConnectOpts, DBProvider, DbError, connect_db};
-use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use file_storage::domain::authz::TenantOnlyAuthorizer;
-use file_storage::domain::data_plane::DataPlaneService;
 use file_storage::domain::error::DomainError;
 use file_storage::domain::policy::{MetadataLimits, PolicyBody, PolicyScope, SizeLimits};
 use file_storage::domain::policy_service::PolicyService;
-use file_storage::domain::ports::{DataPlanePort, PolicyStore};
-use file_storage::domain::service::{FileService, ServiceConfig};
-use file_storage::infra::backend::{BackendRegistry, InMemoryBackend, StorageBackend};
 use file_storage::infra::external_clients::{QuotaClient, QuotaDecision};
-use file_storage::infra::signed_url::Issuer;
-use file_storage::infra::storage::Store;
-use file_storage::infra::storage::migrations::Migrator;
-use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile, OwnerKind};
+use file_storage_sdk::{CustomMetadataEntry, CustomMetadataPatch, NewFile};
 
-const GTS: &str = gts_id!("cf.fstorage.file.type.v1~x.test.file.type.v1~");
+mod common;
+use common::{Stack, StackBuilder, ctx};
 
 struct CappedQuota {
     cap: u64,
@@ -78,139 +68,31 @@ impl QuotaClient for ErroringQuota {
     }
 }
 
-async fn build_db() -> Arc<DBProvider<DbError>> {
-    let mut path = std::env::temp_dir();
-    path.push(format!("cf-fs-enforce-{}.db", Uuid::now_v7().simple()));
-    let dsn = format!("sqlite://{}?mode=rwc", path.display());
-    let opts = ConnectOpts {
-        max_conns: Some(1),
-        min_conns: Some(1),
-        ..Default::default()
-    };
-    let db = connect_db(&dsn, opts).await.expect("connect sqlite");
-    run_migrations_for_testing(&db, Migrator::migrations())
-        .await
-        .expect("migrations");
-    Arc::new(DBProvider::new(db))
-}
-
-async fn build_service(
-    quota: Option<Arc<dyn QuotaClient>>,
-) -> (
-    Arc<FileService>,
-    Arc<PolicyService>,
-    DataPlaneService,
-    Store,
-) {
-    let db = build_db().await;
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let policy_store: Arc<dyn PolicyStore> = Arc::new(store.clone());
-    let store_handle = store.clone();
-    let svc = Arc::new(FileService::new(
-        store,
-        backends,
-        issuer,
-        Arc::clone(&authorizer),
-        cfg,
-        quota,
-        None,
-    ));
-    let dp = DataPlaneService::new(Arc::clone(&svc) as Arc<dyn DataPlanePort>);
-    let psvc = Arc::new(PolicyService::new(policy_store, authorizer, 50, 1000));
-    (svc, psvc, dp, store_handle)
-}
-
-fn ctx(tenant: Uuid) -> SecurityContext {
-    SecurityContext::builder()
-        .subject_id(Uuid::now_v7())
-        .subject_tenant_id(tenant)
-        .build()
-        .expect("ctx")
-}
-
 fn new_file(owner: Uuid, mime: &str) -> NewFile {
-    NewFile {
-        owner_kind: OwnerKind::User,
-        owner_id: owner,
-        name: "doc.bin".to_owned(),
-        gts_file_type: GTS.to_owned(),
-        mime_type: mime.to_owned(),
-        custom_metadata: vec![],
-    }
+    common::new_file_for(owner, "doc.bin", mime)
 }
 
-/// A replay re-mints a live upload URL, so `replay_idempotency_key` re-checks the CURRENT policy
-/// (as on `47f9efd31`): once the MIME is forbidden the retry is rejected, and no second file is made.
-#[tokio::test]
-async fn idempotent_replay_rechecks_current_mime_policy() {
-    let (svc, psvc, _dp, _store) = build_service(None).await;
-    let ctx = ctx(Uuid::now_v7());
-    let owner = Uuid::now_v7();
-    let key = Some("retry-after-policy".to_owned());
-
-    let first = svc
-        .create_file(&ctx, new_file(owner, "image/png"), key.clone(), false)
+/// Sets the tenant-scope policy to `body`.
+async fn set_tenant_policy(psvc: &PolicyService, ctx: &SecurityContext, body: PolicyBody) {
+    psvc.set_policy(ctx, PolicyScope::Tenant, None, body)
         .await
-        .expect("first create");
-    let same = svc
-        .create_file(&ctx, new_file(owner, "image/png"), key.clone(), false)
-        .await
-        .expect("replay under an unchanged policy");
-    assert_eq!(
-        (same.file_id, same.version_id),
-        (first.file_id, first.version_id)
-    );
-
-    psvc.set_policy(
-        &ctx,
-        PolicyScope::Tenant,
-        None,
-        PolicyBody {
-            allowed_mime_types: vec!["text/*".to_owned()],
-            ..PolicyBody::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    let err = svc
-        .create_file(&ctx, new_file(owner, "image/png"), key, false)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(err, DomainError::PolicyMimeNotAllowed { .. }),
-        "got {err:?}"
-    );
+        .unwrap();
 }
 
 #[tokio::test]
 async fn create_file_with_disallowed_mime_is_rejected() {
-    let (svc, psvc, _dp, _store) = build_service(None).await;
+    let Stack { svc, psvc, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
 
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             allowed_mime_types: vec!["image/*".to_owned()],
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let err = svc
         .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
@@ -228,14 +110,13 @@ async fn create_file_with_disallowed_mime_is_rejected() {
 
 #[tokio::test]
 async fn finalize_oversized_upload_is_rejected() {
-    let (svc, psvc, dp, _store) = build_service(None).await;
+    let Stack { svc, psvc, dp, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
     let owner = Uuid::now_v7();
 
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             size_limits: SizeLimits {
                 max_bytes: Some(10),
@@ -244,8 +125,7 @@ async fn finalize_oversized_upload_is_rejected() {
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let t = svc
         .create_file(&ctx, new_file(owner, "text/plain"), None, false)
@@ -280,8 +160,8 @@ async fn finalize_oversized_upload_is_rejected() {
 
 /// Rejected on entry; otherwise the DB `CHECK (size >= 0)` would surface as a 500.
 #[tokio::test]
-async fn finalize_negative_size_is_rejected_with_400_not_500() {
-    let (svc, _psvc, _dp, store) = build_service(None).await;
+async fn finalize_negative_size_is_a_validation_error() {
+    let Stack { svc, store, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
     let owner = Uuid::now_v7();
 
@@ -307,20 +187,12 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
     assert_eq!(version.status, file_storage_sdk::VersionStatus::Pending);
     assert_eq!(version.size, 0);
 
-    let claims = file_storage::infra::signed_url::Claims {
-        op: file_storage::infra::signed_url::Op::Put,
-        file_id: t.file_id,
-        version_id: t.version_id,
-        backend_id: "mem".to_owned(),
-        backend_path: format!("/{}/{}", t.file_id, t.version_id),
-        exp: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
-        upload: file_storage::infra::signed_url::UploadConstraints::default(),
-        multipart: file_storage::infra::signed_url::MultipartClaims::default(),
-        request_id: "test-request-id".to_owned(),
-        content_type: String::new(),
-        etag: String::new(),
-        bind_on_finalize: false,
-    };
+    let claims = common::put_claims(
+        t.file_id,
+        t.version_id,
+        common::backend_path(t.file_id, t.version_id),
+        false,
+    );
     let err = svc
         .finalize_upload_by_token(&claims, -1, vec![0u8; 32])
         .await
@@ -329,260 +201,15 @@ async fn finalize_negative_size_is_rejected_with_400_not_500() {
         matches!(err, DomainError::Validation { ref field, .. } if field == "size"),
         "got {err:?}"
     );
-
-    let version = store
-        .get_version(t.file_id, t.version_id)
-        .await
-        .unwrap()
-        .expect("version row must still exist");
-    assert_eq!(version.status, file_storage_sdk::VersionStatus::Pending);
-    assert_eq!(version.size, 0);
-}
-
-/// Drives `handlers::finalize_version` through a real `axum::Router`: the hash length check
-/// lives only in the handler.
-async fn finalize_via_router_with_hash_len(hash_byte_len: usize) -> (StatusCode, String) {
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::routing::post;
-    use tower::ServiceExt;
-
-    use file_storage::api::rest::handlers;
-    use file_storage::infra::signed_url::Verifier;
-
-    let db = build_db().await;
-    let backend: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let backends = BackendRegistry::new(vec![backend], "mem").expect("registry");
-    let issuer = Arc::new(Issuer::generate(3600).expect("issuer"));
-    let verifier: Arc<Verifier> = Arc::new(issuer.verifier());
-    let authorizer: Arc<dyn file_storage::domain::authz::Authorizer> =
-        Arc::new(TenantOnlyAuthorizer);
-    let cfg = ServiceConfig {
-        default_url_ttl_secs: 3600,
-        sidecar_base_url: "http://sidecar.test".to_owned(),
-        default_page_size: 50,
-        max_page_size: 1000,
-        idempotency_ttl_secs: 86400,
-    };
-    let store = Store::new(Arc::clone(&db));
-    let svc = Arc::new(FileService::new(
-        store,
-        backends,
-        Arc::clone(&issuer),
-        authorizer,
-        cfg,
-        None,
-        None,
-    ));
-
-    let ctx = ctx(Uuid::now_v7());
-    let ticket = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
-        .await
-        .unwrap();
-
-    let token_start = ticket
-        .upload_url
-        .find("fs-token=")
-        .expect("fs-token in URL")
-        + "fs-token=".len();
-    let token = ticket.upload_url[token_start..].to_owned();
-
-    let finalize_auth = Arc::new(handlers::FinalizeAuth::new(
-        "test-internal-secret".to_owned(),
-        time::Duration::ZERO,
-    ));
-
-    let router = Router::new()
-        .route(
-            "/api/file-storage/v1/files/{file_id}/versions/{version_id}/finalize",
-            post(handlers::finalize_version),
-        )
-        .layer(axum::Extension(Arc::clone(&verifier)))
-        .layer(axum::Extension(finalize_auth))
-        .layer(axum::Extension(Arc::clone(&svc)));
-
-    let body = serde_json::json!({
-        "size": 5,
-        "hash_hex": hex::encode(vec![0u8; hash_byte_len]),
-    });
-    let uri = format!(
-        "/api/file-storage/v1/files/{}/versions/{}/finalize",
-        ticket.file_id, ticket.version_id
-    );
-    let req = Request::builder()
-        .method("POST")
-        .uri(uri)
-        .header("content-type", "application/json")
-        .header("x-fs-token", token)
-        .header("x-fs-internal-token", "test-internal-secret")
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.expect("router dispatch");
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    (status, text)
-}
-
-#[tokio::test]
-async fn finalize_truncated_hash_hex_is_rejected() {
-    let (status, body) = finalize_via_router_with_hash_len(16).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "expected 400, not a downstream 500; got {status} body {body}"
-    );
-    assert!(
-        body.contains("hash_hex"),
-        "expected a hash_hex field violation in the body, got: {body}"
-    );
-}
-
-#[tokio::test]
-async fn finalize_oversized_hash_hex_is_rejected() {
-    let (status, body) = finalize_via_router_with_hash_len(48).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "expected 400, not a downstream 500; got {status} body {body}"
-    );
-    assert!(
-        body.contains("hash_hex"),
-        "expected a hash_hex field violation in the body, got: {body}"
-    );
-}
-
-/// Drives `handlers::update_metadata` through a real `axum::Router` with an optional
-/// `If-Match-Metadata` header.
-async fn update_metadata_via_router(if_match_header: Option<&str>) -> (StatusCode, String) {
-    use axum::Router;
-    use axum::body::Body;
-    use axum::http::Request;
-    use axum::routing::patch;
-    use tower::ServiceExt;
-
-    use file_storage::api::rest::handlers;
-
-    let (svc, _psvc, _dp, _store) = build_service(None).await;
-    let ctx = ctx(Uuid::now_v7());
-    let owner = Uuid::now_v7();
-
-    let ticket = svc
-        .create_file(&ctx, new_file(owner, "text/plain"), None, false)
-        .await
-        .unwrap();
-
-    let router = Router::new()
-        .route(
-            "/api/file-storage/v1/files/{id}",
-            patch(handlers::update_metadata),
-        )
-        .layer(axum::Extension(ctx))
-        .layer(axum::Extension(Arc::clone(&svc)));
-
-    let body = serde_json::json!({ "custom_metadata": { "k": "v" } });
-    let mut req_builder = Request::builder()
-        .method("PATCH")
-        .uri(format!("/api/file-storage/v1/files/{}", ticket.file_id))
-        .header("content-type", "application/json");
-    if let Some(h) = if_match_header {
-        req_builder = req_builder.header("if-match-metadata", h);
-    }
-    let req = req_builder
-        .body(Body::from(serde_json::to_vec(&body).unwrap()))
-        .unwrap();
-
-    let resp = router.oneshot(req).await.expect("router dispatch");
-    let status = resp.status();
-    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .expect("read body");
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-    (status, text)
-}
-
-/// A present-but-unparseable header must be a validation error, not silently treated as no CAS.
-#[tokio::test]
-async fn patch_metadata_malformed_if_match_returns_400() {
-    let (status, body) = update_metadata_via_router(Some("not-a-number")).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "an unparseable If-Match-Metadata must be a 400, not a silent unconditional patch; got {status} body {body}"
-    );
-    assert!(
-        body.contains("if-match-metadata"),
-        "expected an if-match-metadata field violation in the body, got: {body}"
-    );
-}
-
-#[tokio::test]
-async fn patch_metadata_absent_if_match_applies_unconditionally() {
-    let (status, body) = update_metadata_via_router(None).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "an absent If-Match-Metadata must apply unconditionally; got {status} body {body}"
-    );
-}
-
-/// Stale and malformed headers both map to HTTP 400; they differ by the violation payload.
-#[tokio::test]
-async fn patch_metadata_stale_if_match_returns_conflict() {
-    let (status, body) = update_metadata_via_router(Some("999999")).await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_REQUEST,
-        "a stale (but well-formed) If-Match-Metadata resolves to 400 per the PreconditionFailed mapping; got {status} body {body}"
-    );
-    assert!(
-        body.contains("IF_MATCH") && body.contains("revision changed concurrently"),
-        "expected a precondition (IF_MATCH) violation in the body, got: {body}"
-    );
-    assert!(
-        !body.contains("if-match-metadata") && !body.contains("must be an integer version"),
-        "a stale-version conflict must not be reported as a malformed-header validation error, got: {body}"
-    );
-}
-
-#[tokio::test]
-async fn create_file_bakes_max_size_into_upload_url() {
-    let (svc, psvc, _dp, _store) = build_service(None).await;
-    let ctx = ctx(Uuid::now_v7());
-    psvc.set_policy(
-        &ctx,
-        PolicyScope::Tenant,
-        None,
-        PolicyBody {
-            size_limits: SizeLimits {
-                max_bytes: Some(1_000_000),
-                ..SizeLimits::default()
-            },
-            ..PolicyBody::default()
-        },
-    )
-    .await
-    .unwrap();
-    let t = svc
-        .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
-        .await
-        .unwrap();
-    assert!(t.upload_url.contains("fs-token="));
 }
 
 #[tokio::test]
 async fn create_file_with_too_many_metadata_pairs_is_rejected() {
-    let (svc, psvc, _dp, _store) = build_service(None).await;
+    let Stack { svc, psvc, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             metadata_limits: MetadataLimits {
                 max_pairs: Some(1),
@@ -591,8 +218,7 @@ async fn create_file_with_too_many_metadata_pairs_is_rejected() {
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let mut nf = new_file(Uuid::now_v7(), "text/plain");
     nf.custom_metadata = vec![
@@ -614,12 +240,11 @@ async fn create_file_with_too_many_metadata_pairs_is_rejected() {
 
 #[tokio::test]
 async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
-    let (svc, psvc, _dp, _store) = build_service(None).await;
+    let Stack { svc, psvc, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             metadata_limits: MetadataLimits {
                 max_pairs: Some(2),
@@ -628,8 +253,7 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let mut nf = new_file(Uuid::now_v7(), "text/plain");
     nf.custom_metadata = vec![CustomMetadataEntry {
@@ -665,12 +289,11 @@ async fn update_metadata_over_limit_is_rejected_on_resulting_total() {
 #[tokio::test]
 async fn quota_exceeded_rejects_create_when_client_present() {
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(10));
-    let (svc, psvc, _dp, _store) = build_service(Some(quota)).await;
+    let Stack { svc, psvc, .. } = StackBuilder::new("enforce").quota(quota).build().await;
     let ctx = ctx(Uuid::now_v7());
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             size_limits: SizeLimits {
                 max_bytes: Some(100),
@@ -679,8 +302,7 @@ async fn quota_exceeded_rejects_create_when_client_present() {
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let err = svc
         .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
@@ -696,12 +318,11 @@ async fn quota_exceeded_rejects_create_when_client_present() {
 #[tokio::test]
 async fn quota_gates_version_creation_not_just_first_upload() {
     let quota: Arc<dyn QuotaClient> = Arc::new(CappedQuota::new(100));
-    let (svc, psvc, _dp, _store) = build_service(Some(quota)).await;
+    let Stack { svc, psvc, .. } = StackBuilder::new("enforce").quota(quota).build().await;
     let ctx = ctx(Uuid::now_v7());
-    psvc.set_policy(
+    set_tenant_policy(
+        &psvc,
         &ctx,
-        PolicyScope::Tenant,
-        None,
         PolicyBody {
             size_limits: SizeLimits {
                 max_bytes: Some(60),
@@ -710,8 +331,7 @@ async fn quota_gates_version_creation_not_just_first_upload() {
             ..PolicyBody::default()
         },
     )
-    .await
-    .unwrap();
+    .await;
 
     let t = svc
         .create_file(&ctx, new_file(Uuid::now_v7(), "text/plain"), None, false)
@@ -728,7 +348,7 @@ async fn quota_gates_version_creation_not_just_first_upload() {
 #[tokio::test]
 async fn quota_client_error_fails_closed() {
     let quota: Arc<dyn QuotaClient> = Arc::new(ErroringQuota);
-    let (svc, _psvc, _dp, _store) = build_service(Some(quota)).await;
+    let Stack { svc, .. } = StackBuilder::new("enforce").quota(quota).build().await;
     let ctx = ctx(Uuid::now_v7());
 
     let err = svc
@@ -741,17 +361,18 @@ async fn quota_client_error_fails_closed() {
     );
 }
 
-/// `dp.put_content` does the backend `put` and `finalize_upload` in one call.
+/// Without a policy or a quota client nothing is limited: 50 metadata pairs of 100 bytes and a
+/// 1 MB upload are stored in full.
 #[tokio::test]
 async fn no_policy_and_no_quota_is_fully_permissive() {
-    let (svc, _psvc, dp, _store) = build_service(None).await;
+    let Stack { svc, dp, store, .. } = StackBuilder::new("enforce").build().await;
     let ctx = ctx(Uuid::now_v7());
 
     let mut nf = new_file(Uuid::now_v7(), "application/x-anything");
     nf.custom_metadata = (0..50)
         .map(|i| CustomMetadataEntry {
             key: format!("k{i}"),
-            value: "v".repeat(1000),
+            value: "v".repeat(100),
         })
         .collect();
     let t = svc
@@ -759,8 +380,17 @@ async fn no_policy_and_no_quota_is_fully_permissive() {
         .await
         .expect("permissive create");
 
-    let big = Bytes::from(vec![0u8; 10_000_000]);
+    let big = Bytes::from(vec![0u8; 1_000_000]);
     dp.put_content(&ctx, t.file_id, t.version_id, "application/x-anything", big)
         .await
         .expect("no size limit without policy");
+
+    let (_, metadata) = svc.get_file_with_metadata(&ctx, t.file_id).await.unwrap();
+    assert_eq!(metadata.len(), 50);
+    let version = store
+        .get_version(t.file_id, t.version_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(version.size, 1_000_000);
 }

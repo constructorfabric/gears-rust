@@ -25,20 +25,7 @@ async fn assert_get_stream_matches_get(backend: &dyn StorageBackend, path: &str,
     assert_eq!(streamed, expected);
 }
 
-/// Behavioral contract every `StorageBackend` implementation must satisfy.
-pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
-    backend
-        .put("contract/put-get", Bytes::from_static(b"hello, contract"))
-        .await
-        .unwrap();
-    assert_eq!(
-        backend.get("contract/put-get").await.unwrap(),
-        Bytes::from_static(b"hello, contract")
-    );
-    assert!(backend.exists("contract/put-get").await.unwrap());
-
-    assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
-
+async fn assert_get_range_contract(backend: &dyn StorageBackend) {
     backend
         .put("contract/range", Bytes::from_static(b"0123456789"))
         .await
@@ -53,6 +40,28 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
         .await
         .unwrap();
     assert_eq!(tail, Bytes::from_static(b"789"));
+    let open_ended = backend
+        .get_range("contract/range", ByteRange::OpenEnded { start: 7 })
+        .await
+        .unwrap();
+    assert_eq!(open_ended, Bytes::from_static(b"789"));
+}
+
+/// Behavioral contract every `StorageBackend` implementation must satisfy.
+pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
+    backend
+        .put("contract/put-get", Bytes::from_static(b"hello, contract"))
+        .await
+        .unwrap();
+    assert_eq!(
+        backend.get("contract/put-get").await.unwrap(),
+        Bytes::from_static(b"hello, contract")
+    );
+    assert!(backend.exists("contract/put-get").await.unwrap());
+
+    assert_get_stream_matches_get(backend, "contract/put-get", b"hello, contract").await;
+
+    assert_get_range_contract(backend).await;
 
     backend
         .put("contract/delete", Bytes::from_static(b"x"))
@@ -63,19 +72,62 @@ pub async fn assert_backend_contract(backend: &dyn StorageBackend) {
     assert!(!backend.exists("contract/delete").await.unwrap());
 
     assert!(!backend.exists("contract/never-existed").await.unwrap());
+    assert_missing_object_errors(backend, "contract/never-existed").await;
+}
+
+/// Reading an object that was never written is an error on every read path.
+async fn assert_missing_object_errors(backend: &dyn StorageBackend, path: &str) {
+    let err = backend
+        .get(path)
+        .await
+        .expect_err("get of a missing object");
+    assert!(matches!(err, DomainError::Backend { .. }), "{err:?}");
+    let err = backend
+        .get_stream(path)
+        .await
+        .err()
+        .expect("get_stream of a missing object");
+    assert!(matches!(err, DomainError::Backend { .. }), "{err:?}");
+}
+
+/// Fails if `dir` holds a leftover `.tmp.` file; a missing `dir` has none.
+async fn assert_no_tmp_files(dir: &std::path::Path) {
+    let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+        return;
+    };
+    while let Some(entry) = entries.next_entry().await.unwrap() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".tmp."), "found leftover tmp file: {name}");
+    }
+}
+
+/// A stream crossing `max_size` mid-way is rejected by `put_stream` and nothing is stored.
+pub async fn assert_put_stream_rejects_oversized_stream(
+    backend: &dyn StorageBackend,
+    path: &str,
+    max_size: u64,
+) {
+    // Three 10-byte chunks: the limit is crossed on the second chunk for any `max_size` < 20.
+    let chunks: Vec<std::io::Result<Bytes>> = (0..3)
+        .map(|_| Ok(Bytes::from_static(b"0123456789")))
+        .collect();
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let err = backend
+        .put_stream(path, stream, Some(max_size))
+        .await
+        .expect_err("put_stream must reject a stream exceeding max_size");
+    assert!(
+        matches!(err, DomainError::Validation { .. }),
+        "expected Validation, got {err:?}"
+    );
+    assert!(!backend.exists(path).await.unwrap());
 }
 
 #[tokio::test]
 async fn in_memory_satisfies_backend_contract() {
     let b = InMemoryBackend::new("mem");
     assert_backend_contract(&b).await;
-}
-
-#[tokio::test]
-async fn in_memory_get_missing_errors() {
-    let b = InMemoryBackend::new("mem");
-    assert!(b.get("nope").await.is_err());
-    assert!(!b.exists("nope").await.unwrap());
 }
 
 #[tokio::test]
@@ -87,19 +139,38 @@ async fn local_fs_satisfies_backend_contract() {
 }
 
 #[tokio::test]
-async fn local_fs_is_ready_self_tests_hard_links_and_leaves_no_probe_files() {
-    let root = unique_root();
-    tokio::fs::create_dir_all(&root).await.unwrap();
+async fn local_fs_is_ready_requires_a_directory_and_self_tests_hard_links() {
+    let parent = unique_root();
+    tokio::fs::create_dir_all(&parent).await.unwrap();
+    let root = parent.join("root");
     let b = LocalFsBackend::new("fs", &root);
+
+    b.is_ready().await.expect_err("a missing root is not ready");
+
+    tokio::fs::write(&root, b"x").await.unwrap();
+    let err = b
+        .is_ready()
+        .await
+        .expect_err("a regular file is not a root");
+    assert!(err.to_string().contains("not a directory"), "{err}");
+
+    // Failures are not remembered: once the root is a directory the backend is ready, and the
+    // self-test leaves no probe files behind.
+    tokio::fs::remove_file(&root).await.unwrap();
+    tokio::fs::create_dir(&root).await.unwrap();
     b.is_ready().await.expect("hard links work on a regular fs");
-    // Cached: a second call succeeds without touching the fs again.
+    // Cached: still ready when a read-only root makes a new probe impossible.
+    #[cfg(unix)]
+    set_mode(&root, 0o555).await;
     b.is_ready().await.expect("cached self-test result");
+    #[cfg(unix)]
+    set_mode(&root, 0o755).await;
     let mut entries = tokio::fs::read_dir(&root).await.unwrap();
     assert!(
         entries.next_entry().await.unwrap().is_none(),
         "probe files must be removed"
     );
-    drop(tokio::fs::remove_dir_all(&root).await);
+    drop(tokio::fs::remove_dir_all(&parent).await);
 }
 
 #[cfg(unix)]
@@ -108,49 +179,6 @@ async fn set_mode(path: &std::path::Path, mode: u32) {
     tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .await
         .unwrap();
-}
-
-/// A failed self-test is not remembered: once the root is writable again, `is_ready` passes; a
-/// success is cached even if the root turns read-only afterwards. No probe files are left.
-#[cfg(unix)]
-#[tokio::test]
-async fn local_fs_is_ready_caches_only_success() {
-    let root = unique_root();
-    tokio::fs::create_dir_all(&root).await.unwrap();
-    set_mode(&root, 0o555).await;
-    // Root (or a permissive fs) ignores the mode: nothing to test.
-    if tokio::fs::write(root.join(".writable-check"), b"x")
-        .await
-        .is_ok()
-    {
-        set_mode(&root, 0o755).await;
-        drop(tokio::fs::remove_dir_all(&root).await);
-        return;
-    }
-
-    let b = LocalFsBackend::new("fs", &root);
-    let err = b.is_ready().await.expect_err("read-only root must fail");
-    assert!(
-        err.to_string().contains("cannot write a probe file"),
-        "unexpected error: {err}"
-    );
-    b.is_ready().await.expect_err("the failure is retried");
-
-    set_mode(&root, 0o755).await;
-    b.is_ready()
-        .await
-        .expect("passes once the root is writable");
-
-    set_mode(&root, 0o555).await;
-    b.is_ready().await.expect("success is cached");
-    set_mode(&root, 0o755).await;
-
-    let mut entries = tokio::fs::read_dir(&root).await.unwrap();
-    assert!(
-        entries.next_entry().await.unwrap().is_none(),
-        "no probe files may remain"
-    );
-    drop(tokio::fs::remove_dir_all(&root).await);
 }
 
 #[test]
@@ -177,8 +205,12 @@ fn local_fs_io_errors_classify_transient_vs_permanent() {
 async fn local_fs_rejects_path_traversal() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
-    let res = b.put("../escape", Bytes::from_static(b"x")).await;
-    assert!(res.is_err(), "path traversal must be rejected");
+    let err = b
+        .put("../escape", Bytes::from_static(b"x"))
+        .await
+        .expect_err("path traversal must be rejected");
+    assert!(matches!(err, DomainError::Backend { .. }), "{err:?}");
+    assert!(!root.parent().unwrap().join("escape").exists());
 }
 
 #[tokio::test]
@@ -223,13 +255,7 @@ async fn local_fs_put_leaves_no_tmp_file_after_success() {
         .await
         .unwrap();
 
-    let parent = root.join("fid");
-    let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        assert!(!name.contains(".tmp."), "found leftover tmp file: {name}");
-    }
+    assert_no_tmp_files(&root.join("fid")).await;
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }
@@ -248,61 +274,27 @@ async fn local_fs_put_cleans_up_tmp_file_on_write_failure() {
     tokio::fs::create_dir_all(&parent).await.unwrap();
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
 
-    let result = b.put("fid/vid", Bytes::from_static(b"data")).await;
-    assert!(
-        result.is_err(),
-        "put must fail when the temp-file create fails"
-    );
-
-    let mut entries = tokio::fs::read_dir(&parent).await.unwrap();
-    let mut names = Vec::new();
-    while let Some(entry) = entries.next_entry().await.unwrap() {
-        names.push(entry.file_name().to_string_lossy().into_owned());
-    }
-    assert!(
-        !names.iter().any(|n| n.contains(".tmp.")),
-        "no orphaned tmp file should remain, found: {names:?}"
-    );
+    let err = b
+        .put("fid/vid", Bytes::from_static(b"data"))
+        .await
+        .expect_err("put must fail when the temp-file create fails");
+    assert!(matches!(err, DomainError::Backend { .. }), "{err:?}");
+    assert_no_tmp_files(&parent).await;
 
     // Restore permissions so temp-dir cleanup can remove it.
     std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
-/// A stream crossing `max_size` mid-way is rejected and leaves no file at the target.
+/// A stream crossing `max_size` mid-way is rejected and leaves no file or tmp file behind.
 #[tokio::test]
 async fn local_fs_put_stream_enforces_max_size_mid_stream() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);
 
-    // Three 10-byte chunks against max_size 15: the limit is crossed on the second chunk.
-    let chunks: Vec<std::io::Result<Bytes>> = vec![
-        Ok(Bytes::from_static(b"0123456789")),
-        Ok(Bytes::from_static(b"0123456789")),
-        Ok(Bytes::from_static(b"0123456789")),
-    ];
-    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+    assert_put_stream_rejects_oversized_stream(&b, "fid/vid", 15).await;
 
-    let result = b.put_stream("fid/vid", stream, Some(15)).await;
-    assert!(
-        result.is_err(),
-        "put_stream must reject a stream exceeding max_size"
-    );
-
-    let target = root.join("fid").join("vid");
-    assert!(
-        !target.exists(),
-        "no destination file should be left behind after a rejected stream"
-    );
-
-    let parent = root.join("fid");
-    if let Ok(mut entries) = tokio::fs::read_dir(&parent).await {
-        while let Some(entry) = entries.next_entry().await.unwrap() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            assert!(!name.contains(".tmp."), "found leftover tmp file: {name}");
-        }
-    }
+    assert_no_tmp_files(&root.join("fid")).await;
 
     drop(tokio::fs::remove_dir_all(&root).await);
 }
@@ -367,27 +359,220 @@ async fn local_fs_get_stream_reassembles_multi_chunk_blob() {
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
+/// A second `publish_exclusive` to one path reports `created: false` and keeps the first bytes.
+async fn assert_publish_exclusive_rejects_second_write(backend: &dyn StorageBackend) {
+    let stream1: BoxStream<'_, std::io::Result<Bytes>> =
+        Box::pin(stream::iter(vec![Ok(Bytes::from_static(b"first"))]));
+    let outcome1 = backend
+        .publish_exclusive("fid/vid", stream1, None)
+        .await
+        .expect("first publish_exclusive call must succeed");
+    assert!(
+        outcome1.created,
+        "first publish_exclusive call to a fresh path must create it"
+    );
+    assert_eq!(
+        backend.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first")
+    );
+
+    let stream2: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(vec![Ok(
+        Bytes::from_static(b"second-different-bytes"),
+    )]));
+    let outcome2 = backend
+        .publish_exclusive("fid/vid", stream2, None)
+        .await
+        .expect("second publish_exclusive call must not error, just report created=false");
+    assert!(
+        !outcome2.created,
+        "a second publish_exclusive call to an already-published path must not overwrite it"
+    );
+    // The rejected attempt's measured bytes/digest are still reported (for idempotency checks).
+    assert_eq!(
+        outcome2.bytes_written,
+        "second-different-bytes".len() as u64
+    );
+
+    assert_eq!(
+        backend.get("fid/vid").await.unwrap(),
+        Bytes::from_static(b"first"),
+        "an already-published blob must never be overwritten by publish_exclusive"
+    );
+}
+
 #[tokio::test]
-async fn local_fs_get_stream_missing_errors() {
+async fn local_fs_publish_exclusive_rejects_second_write_to_same_path() {
     let root = unique_root();
-    let b = LocalFsBackend::new("fs", &root);
-    assert!(b.get_stream("nope/nope").await.is_err());
+    assert_publish_exclusive_rejects_second_write(&LocalFsBackend::new("fs", &root)).await;
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+/// `InMemoryBackend` counterpart; its check-then-insert is atomic under one lock guard.
+#[tokio::test]
+async fn in_memory_publish_exclusive_rejects_second_write_to_same_path() {
+    assert_publish_exclusive_rejects_second_write(&InMemoryBackend::new("mem")).await;
+}
+
+/// Two barrier-released `publish_exclusive` racers on one path: exactly one `created: true`,
+/// and the stored object is one payload in full, never a torn mix. Repeated to hit the overlap.
+async fn assert_publish_exclusive_concurrent_racers_never_mix(
+    make_backend: impl Fn() -> Arc<dyn StorageBackend>,
+) {
+    const SIZE: usize = 64 * 1024;
+    const ITERATIONS: u32 = 20;
+
+    for iteration in 0..ITERATIONS {
+        let backend = make_backend();
+        let path = format!("fid/vid-{iteration}");
+
+        let payload_a = Bytes::from(vec![0xAAu8; SIZE]);
+        let payload_b = Bytes::from(vec![0xBBu8; SIZE]);
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let task = |payload: Bytes,
+                    backend: Arc<dyn StorageBackend>,
+                    path: String,
+                    barrier: Arc<tokio::sync::Barrier>| async move {
+            let len = payload.len() as u64;
+            let stream: BoxStream<'_, std::io::Result<Bytes>> =
+                Box::pin(stream::once(async move { Ok(payload) }));
+            // Rendezvous so both calls start as close to simultaneously as possible.
+            barrier.wait().await;
+            backend.publish_exclusive(&path, stream, Some(len)).await
+        };
+
+        let handle_a = tokio::spawn(task(
+            payload_a.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+        let handle_b = tokio::spawn(task(
+            payload_b.clone(),
+            Arc::clone(&backend),
+            path.clone(),
+            Arc::clone(&barrier),
+        ));
+
+        let outcome_a = handle_a
+            .await
+            .expect("racer A task must not panic")
+            .expect("racer A's publish_exclusive must not error");
+        let outcome_b = handle_b
+            .await
+            .expect("racer B task must not panic")
+            .expect("racer B's publish_exclusive must not error");
+
+        assert_ne!(
+            outcome_a.created, outcome_b.created,
+            "iteration {iteration}: exactly one racer must report created:true and the \
+             other created:false, got ({}, {})",
+            outcome_a.created, outcome_b.created
+        );
+
+        let got = backend.get(&path).await.unwrap();
+        assert!(
+            got == payload_a || got == payload_b,
+            "iteration {iteration}: the stored object must equal exactly one racer's full \
+             payload, never a mix of both"
+        );
+        if outcome_a.created {
+            assert_eq!(
+                got, payload_a,
+                "iteration {iteration}: racer A reported created:true but the stored \
+                 object does not match its payload"
+            );
+        } else {
+            assert_eq!(
+                got, payload_b,
+                "iteration {iteration}: racer B reported created:true but the stored \
+                 object does not match its payload"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn local_fs_publish_exclusive_concurrent_racers_never_mix() {
+    let root = unique_root();
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(LocalFsBackend::new("fs", &root)) as Arc<dyn StorageBackend>
+    })
+    .await;
     drop(tokio::fs::remove_dir_all(&root).await);
 }
 
 #[tokio::test]
-async fn registry_resolves_default_and_unknown() {
-    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    let reg = BackendRegistry::new(vec![mem], "mem").unwrap();
-    assert_eq!(reg.default_id(), "mem");
-    assert_eq!(reg.default_backend().id(), "mem");
-    assert!(reg.get("mem").is_ok());
-    assert!(reg.get("ghost").is_err());
-    assert_eq!(reg.list().len(), 1);
+async fn in_memory_publish_exclusive_concurrent_racers_never_mix() {
+    assert_publish_exclusive_concurrent_racers_never_mix(|| {
+        Arc::new(InMemoryBackend::new("mem")) as Arc<dyn StorageBackend>
+    })
+    .await;
+}
+
+/// A chunk-level I/O error surfaces as `DomainError::Backend` and nothing is published.
+#[tokio::test]
+async fn in_memory_publish_exclusive_propagates_chunk_error_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"good-chunk-1")),
+        Err(std::io::Error::other("simulated stream failure")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let Err(err) = b.publish_exclusive("fid/vid", stream, None).await else {
+        panic!("a stream that errors partway through must not be published");
+    };
+    assert!(
+        matches!(&err, DomainError::Backend { backend_id, .. } if backend_id == "mem"),
+        "expected a Backend error attributed to `mem`, got {err:?}"
+    );
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a publish_exclusive call whose stream errors must not leave a partial object behind"
+    );
+}
+
+/// `max_size` is enforced as chunks arrive: `DomainError::Validation` and nothing published.
+#[tokio::test]
+async fn in_memory_publish_exclusive_enforces_max_size_and_publishes_nothing() {
+    let b = InMemoryBackend::new("mem");
+
+    let chunks: Vec<std::io::Result<Bytes>> = vec![
+        Ok(Bytes::from_static(b"0123456789")),
+        Ok(Bytes::from_static(b"0123456789")),
+    ];
+    let stream: BoxStream<'_, std::io::Result<Bytes>> = Box::pin(stream::iter(chunks));
+
+    let Err(err) = b.publish_exclusive("fid/vid", stream, Some(15)).await else {
+        panic!("a stream exceeding max_size must be rejected, not published");
+    };
+    assert!(
+        matches!(&err, DomainError::Validation { field, .. } if field == "size"),
+        "expected a Validation error on `size`, got {err:?}"
+    );
+
+    assert!(
+        !b.exists("fid/vid").await.unwrap(),
+        "a rejected publish_exclusive must not leave a partial object behind"
+    );
 }
 
 #[test]
-fn registry_rejects_absent_default() {
-    let mem: Arc<dyn StorageBackend> = Arc::new(InMemoryBackend::new("mem"));
-    assert!(BackendRegistry::new(vec![mem], "other").is_err());
+fn registry_resolves_default_and_rejects_unknown_ids() {
+    let mem = || -> Arc<dyn StorageBackend> { Arc::new(InMemoryBackend::new("mem")) };
+    let reg = BackendRegistry::new(vec![mem()], "mem").unwrap();
+    assert_eq!(reg.default_id(), "mem");
+    assert_eq!(reg.default_backend().id(), "mem");
+    assert!(reg.get("mem").is_ok());
+    let err = reg.get("ghost").err().expect("unknown id");
+    assert!(matches!(err, DomainError::UnknownBackend { .. }), "{err:?}");
+    assert_eq!(reg.list().len(), 1);
+
+    let err = BackendRegistry::new(vec![mem()], "other")
+        .err()
+        .expect("absent default");
+    assert!(matches!(err, DomainError::Backend { .. }), "{err:?}");
 }

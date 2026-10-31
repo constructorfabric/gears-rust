@@ -456,45 +456,5 @@ fn round_up_to(value: u64, align: u64) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn round_up_to_does_not_overflow_on_max_input() {
-        assert_eq!(round_up_to(u64::MAX, DEFAULT_MIN_PART_SIZE), None);
-        assert_eq!(round_up_to(u64::MAX, u64::MAX), Some(u64::MAX));
-        assert_eq!(round_up_to(1, u64::MAX), Some(u64::MAX));
-        assert_eq!(round_up_to(7, 5), Some(10));
-        assert_eq!(round_up_to(10, 5), Some(10));
-    }
-
-    #[test]
-    fn replay_bind_state_auto_bind_without_bind_and_empty_pointer_is_manual() {
-        let (file_id, version_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
-        let (state, etag, current) = replay_bind_state(file_id, None, version_id, false, true);
-        assert_eq!(state, BindState::Manual);
-        assert_eq!(etag, None);
-        assert_eq!(current, None);
-
-        // Existing cases stay as they were.
-        let (state, etag, _) =
-            replay_bind_state(file_id, Some(version_id), version_id, false, true);
-        assert_eq!(state, BindState::Bound);
-        assert!(etag.is_some());
-        let (state, etag, current) =
-            replay_bind_state(file_id, Some(Uuid::from_u128(3)), version_id, false, true);
-        assert_eq!(state, BindState::Conflict);
-        assert_eq!(etag, None);
-        assert!(current.is_some());
-        let (state, _, _) = replay_bind_state(file_id, None, version_id, true, true);
-        assert_eq!(state, BindState::Bound);
-        let (state, _, _) = replay_bind_state(file_id, None, version_id, false, false);
-        assert_eq!(state, BindState::Manual);
-    }
-
-    #[test]
-    fn compute_plan_returns_validation_error_on_overflowing_preferred_part_size() {
-        let err = compute_plan(u64::MAX, Some(u64::MAX), None).unwrap_err();
-        assert!(matches!(err, DomainError::Validation { .. }));
-    }
-}
+#[path = "multipart_tests.rs"]
+mod multipart_tests;

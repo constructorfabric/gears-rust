@@ -1312,4 +1312,4 @@ async fn download_whole(
 
 #[cfg(test)]
 #[path = "sidecar_tests.rs"]
-mod tests;
+mod sidecar_tests;

@@ -27,183 +27,68 @@ fn sample_entries() -> Vec<ManifestEntry> {
     ]
 }
 
-/// Hand-written expected wire string for `sample_entries`, independent of `Manifest`,
-/// so the test cannot pass by tautology.
-fn expected_wire_string(entries: &[ManifestEntry]) -> String {
-    let mut s = String::from("v1");
-    for e in entries {
-        s.push(',');
-        s.push_str(&e.offset.to_string());
-        s.push(':');
-        s.push_str(&hex::encode(e.digest));
-    }
-    s
-}
-
 #[test]
-fn to_wire_string_matches_hand_written_expected_string_exactly() {
+fn manifest_wire_string_is_exact_and_round_trips() {
     let entries = sample_entries();
     let manifest = Manifest::new(entries.clone()).expect("valid manifest");
-    let expected = expected_wire_string(&entries);
-    assert_eq!(manifest.to_wire_string(), expected);
+    let [d0, d1, d2] = [0, 1, 2].map(|i| hex::encode(entries[i].digest));
+    let wire = format!("v1,0:{d0},8388608:{d1},16777216:{d2}");
+    assert_eq!(manifest.to_wire_string(), wire);
 
-    let d0 = hex::encode(entries[0].digest);
-    let d1 = hex::encode(entries[1].digest);
-    let d2 = hex::encode(entries[2].digest);
-    assert_eq!(
-        manifest.to_wire_string(),
-        format!("v1,0:{d0},8388608:{d1},16777216:{d2}")
-    );
-}
-
-#[test]
-fn to_wire_string_single_part_minimal_shape() {
-    let digest = digest_of(b"only-part");
-    let manifest = Manifest::new(vec![ManifestEntry { offset: 0, digest }]).unwrap();
-    assert_eq!(
-        manifest.to_wire_string(),
-        format!("v1,0:{}", hex::encode(digest))
-    );
-}
-
-#[test]
-fn root_matches_independently_computed_reference_sha256() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries.clone()).unwrap();
-    let wire = expected_wire_string(&entries);
-
-    // Reference hash computed with a fresh `Sha256`, not through `Manifest::root()`.
-    let reference_root: [u8; 32] = {
-        let mut hasher = Sha256::new();
-        hasher.update(wire.as_bytes());
-        hasher.finalize().into()
-    };
-
-    assert_eq!(manifest.root(), reference_root);
-}
-
-#[test]
-fn round_trip_encode_decode_reencode_is_byte_identical() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries).unwrap();
-    let wire = manifest.to_wire_string();
+    // The root is the SHA-256 of the wire string, computed here without `Manifest::root()`.
+    assert_eq!(manifest.root(), digest_of(wire.as_bytes()));
 
     let parsed = Manifest::from_wire_string(&wire).expect("valid wire string parses");
     assert_eq!(parsed, manifest);
-    assert_eq!(parsed.to_wire_string(), wire);
-    assert_eq!(parsed.root(), manifest.root());
-}
-
-#[test]
-fn from_wire_string_recovers_exact_entries() {
-    let entries = sample_entries();
-    let manifest = Manifest::new(entries.clone()).unwrap();
-    let wire = manifest.to_wire_string();
-    let parsed = Manifest::from_wire_string(&wire).unwrap();
     assert_eq!(parsed.entries(), entries.as_slice());
-    assert_eq!(parsed.len(), 3);
+    assert_eq!(parsed.to_wire_string(), wire);
 }
 
 #[test]
-fn rejects_bad_version_prefix() {
-    let digest = hex::encode(digest_of(b"x"));
-    let bad = format!("v2,0:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_uppercase_hex_digest() {
-    let digest = hex::encode(digest_of(b"x")).to_uppercase();
-    let bad = format!("v1,0:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_leading_zero_offset() {
-    let digest = hex::encode(digest_of(b"x"));
-    let bad = format!("v1,01:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_wrong_length_digest_too_short() {
-    let digest = &hex::encode(digest_of(b"x"))[..63];
-    let bad = format!("v1,0:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_wrong_length_digest_too_long() {
-    let digest = hex::encode(digest_of(b"x")) + "a";
-    let bad = format!("v1,0:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_non_ascending_offsets() {
-    let d1 = hex::encode(digest_of(b"a"));
-    let d2 = hex::encode(digest_of(b"b"));
-    let bad = format!("v1,0:{d1},0:{d2}"); // duplicate offset, not strictly ascending
-    assert!(Manifest::from_wire_string(&bad).is_err());
-
-    let bad2 = format!("v1,10:{d1},5:{d2}"); // descending
-    assert!(Manifest::from_wire_string(&bad2).is_err());
-}
-
-#[test]
-fn rejects_first_offset_not_zero() {
-    let digest = hex::encode(digest_of(b"x"));
-    let bad = format!("v1,5:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_empty_manifest_no_parts() {
-    assert!(Manifest::from_wire_string("v1").is_err());
-    assert!(Manifest::from_wire_string("").is_err());
-}
-
-#[test]
-fn rejects_missing_colon_delimiter() {
-    let digest = hex::encode(digest_of(b"x"));
-    let bad = format!("v1,0{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn rejects_non_decimal_offset() {
-    let digest = hex::encode(digest_of(b"x"));
-    let bad = format!("v1,abc:{digest}");
-    assert!(Manifest::from_wire_string(&bad).is_err());
-}
-
-#[test]
-fn manifest_new_rejects_empty_entries() {
-    assert!(Manifest::new(vec![]).is_err());
-}
-
-#[test]
-fn manifest_new_rejects_first_offset_nonzero() {
-    let entries = vec![ManifestEntry {
-        offset: 1,
-        digest: digest_of(b"x"),
-    }];
-    assert!(Manifest::new(entries).is_err());
-}
-
-#[test]
-fn manifest_new_rejects_non_ascending_offsets() {
-    let entries = vec![
-        ManifestEntry {
-            offset: 0,
-            digest: digest_of(b"a"),
-        },
-        ManifestEntry {
-            offset: 0,
-            digest: digest_of(b"b"),
-        },
+fn from_wire_string_rejects_malformed_input() {
+    let d = hex::encode(digest_of(b"x"));
+    let d2 = hex::encode(digest_of(b"y"));
+    let cases: Vec<(&str, String)> = vec![
+        ("bad version prefix", format!("v2,0:{d}")),
+        ("uppercase hex digest", format!("v1,0:{}", d.to_uppercase())),
+        ("leading-zero offset", format!("v1,01:{d}")),
+        ("digest too short", format!("v1,0:{}", &d[..63])),
+        ("digest too long", format!("v1,0:{d}a")),
+        ("duplicate offset", format!("v1,0:{d},0:{d2}")),
+        ("descending offsets", format!("v1,10:{d},5:{d2}")),
+        ("first offset not zero", format!("v1,5:{d}")),
+        ("no parts", "v1".to_owned()),
+        ("empty string", String::new()),
+        ("missing colon delimiter", format!("v1,0{d}")),
+        ("non-decimal offset", format!("v1,abc:{d}")),
     ];
-    assert!(Manifest::new(entries).is_err());
+    for (name, wire) in cases {
+        let err = Manifest::from_wire_string(&wire).expect_err(name);
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "{name}: expected Validation, got {err:?}"
+        );
+    }
+}
+
+#[test]
+fn manifest_new_rejects_invalid_entries() {
+    let entry = |offset: u64, seed: &[u8]| ManifestEntry {
+        offset,
+        digest: digest_of(seed),
+    };
+    let cases: Vec<(&str, Vec<ManifestEntry>)> = vec![
+        ("empty entries", vec![]),
+        ("first offset non-zero", vec![entry(1, b"x")]),
+        ("duplicate offsets", vec![entry(0, b"a"), entry(0, b"b")]),
+    ];
+    for (name, entries) in cases {
+        let err = Manifest::new(entries).expect_err(name);
+        assert!(
+            matches!(err, DomainError::Validation { .. }),
+            "{name}: expected Validation, got {err:?}"
+        );
+    }
 }
 
 #[test]
