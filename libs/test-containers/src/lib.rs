@@ -63,10 +63,20 @@
 //! # }
 //! ```
 
-use testcontainers::{ContainerRequest, GenericImage, ImageExt};
+use std::time::Duration;
+
+use testcontainers::{ContainerRequest, GenericImage, ImageExt, core::Mount};
 use testcontainers_modules::{
     kafka::apache::Kafka, mysql::Mysql, postgres::Postgres, redis::Redis,
 };
+
+/// A `PostgreSQL` request with its data directory on a tmpfs: a test database
+/// needs no durability (the module already sets `fsync=off`), and initdb and
+/// every write then skip the runner's disk. `/var/lib/postgresql` covers both
+/// the pre-18 `data` directory and 18's versioned `PGDATA`.
+fn postgres_in_memory(request: ContainerRequest<Postgres>) -> ContainerRequest<Postgres> {
+    request.with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
+}
 
 /// Tag of the official `postgres` image. The workspace floor.
 pub const POSTGRES_TAG: &str = "18-alpine";
@@ -224,9 +234,10 @@ pub fn kafka_tag() -> String {
 /// A `PostgreSQL` container request on the pinned tag.
 ///
 /// Chain `ImageExt` methods (`with_env_var`, `with_mount`, …) onto the result
-/// exactly as you would onto `Postgres::default()`.
+/// exactly as you would onto `Postgres::default()`; the data directory is
+/// already a tmpfs.
 pub fn postgres() -> ContainerRequest<Postgres> {
-    ContainerRequest::from(Postgres::default()).with_tag(postgres_tag())
+    postgres_in_memory(ContainerRequest::from(Postgres::default()).with_tag(postgres_tag()))
 }
 
 /// A `PostgreSQL` container request on the pinned tag, with a non-default
@@ -237,7 +248,9 @@ pub fn postgres() -> ContainerRequest<Postgres> {
 /// `ContainerRequest` — which is why this exists rather than callers chaining
 /// `with_db_name` onto [`postgres()`].
 pub fn postgres_named(db_name: &str) -> ContainerRequest<Postgres> {
-    ContainerRequest::from(Postgres::default().with_db_name(db_name)).with_tag(postgres_tag())
+    postgres_in_memory(
+        ContainerRequest::from(Postgres::default().with_db_name(db_name)).with_tag(postgres_tag()),
+    )
 }
 
 /// A `PostgreSQL` container request for a suite whose migrations need a higher
@@ -255,17 +268,30 @@ pub fn postgres_named(db_name: &str) -> ContainerRequest<Postgres> {
 /// that silently opts out of the override.
 pub fn postgres_tagged(fallback: &str) -> ContainerRequest<Postgres> {
     let tag = tag_from(env_override(ENV_POSTGRES_TAG), fallback);
-    ContainerRequest::from(Postgres::default()).with_tag(tag)
+    postgres_in_memory(ContainerRequest::from(Postgres::default()).with_tag(tag))
 }
 
 /// A `PostgreSQL` 19 beta container request; see [`POSTGRES_GRAPH_TAG`].
 pub fn postgres_graph() -> ContainerRequest<Postgres> {
-    ContainerRequest::from(Postgres::default()).with_tag(postgres_graph_tag())
+    postgres_in_memory(ContainerRequest::from(Postgres::default()).with_tag(postgres_graph_tag()))
 }
 
 /// A `MySQL` container request on the pinned tag.
+///
+/// The data directory is a tmpfs and `InnoDB` does not flush on commit: a test
+/// database needs no durability, and `MySQL`'s first-boot initialisation is
+/// otherwise bound by the runner's disk. `fsync` is the flush method because
+/// tmpfs has no `O_DIRECT`, the default since 8.4.
 pub fn mysql() -> ContainerRequest<Mysql> {
-    ContainerRequest::from(Mysql::default()).with_tag(mysql_tag())
+    ContainerRequest::from(Mysql::default())
+        .with_tag(mysql_tag())
+        .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
+        .with_cmd([
+            "--innodb-flush-method=fsync",
+            "--innodb-flush-log-at-trx-commit=0",
+            "--skip-log-bin",
+        ])
+        .with_startup_timeout(Duration::from_secs(180))
 }
 
 /// A single-node `KRaft` Kafka container request on the pinned tag, its

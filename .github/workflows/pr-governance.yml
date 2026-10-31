@@ -16,7 +16,7 @@ jobs:
   unanswered-review-check:
     # Disabled to stop automated unresolved-comment reminders and Telegram notifications.
     if: false
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small-vm' }}
 
     steps:
       - name: Scan unanswered review comments

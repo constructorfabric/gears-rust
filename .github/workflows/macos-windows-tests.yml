@@ -38,15 +38,14 @@ jobs:
     uses: ./.github/workflows/test-suite.yml
     with:
       os: ${{ matrix.os }}
-    secrets:
-      S3_ACCESS_KEY_ID: ${{ secrets.S3_ACCESS_KEY_ID }}
-      S3_SECRET_ACCESS_KEY: ${{ secrets.S3_SECRET_ACCESS_KEY }}
+    # test-suite.yml wires the shared build cache itself; see its header.
+    secrets: inherit
 
   issue:
     name: Update tracking issue
     needs: test
     if: ${{ !cancelled() && github.event_name == 'schedule' }}
-    runs-on: ubuntu-latest
+    runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-small' }}
     timeout-minutes: 10
     permissions:
       actions: read   # to read this run's jobs and reports
