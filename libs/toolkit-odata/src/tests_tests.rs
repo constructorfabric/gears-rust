@@ -420,3 +420,63 @@ fn test_validate_cursor_against_requires_the_cursor_filter() {
         );
     }
 }
+
+/// `check_cursor_filter` compares the cursor's recorded hash with the query's
+/// effective one: the stamped `filter_hash` first, the hash of `$filter` only
+/// when nothing was stamped. REST requests always carry the stamp, so the
+/// precedence cases are the ones that pin it.
+#[test]
+fn test_check_cursor_filter_takes_the_stamped_hash_before_the_computed_one() {
+    let filter = |text: &str| {
+        crate::parse_filter_string(text)
+            .expect("filter parses")
+            .into_expr()
+    };
+    let recorded = crate::short_filter_hash(Some(&filter("name eq 'x'")));
+    let other = crate::short_filter_hash(Some(&filter("name eq 'y'")));
+    let cursor = |f: Option<String>| CursorV1 {
+        k: vec!["v:x".to_owned()],
+        o: SortDir::Asc,
+        s: "+id".to_owned(),
+        f,
+        d: "fwd".to_owned(),
+    };
+    let query = |f: Option<String>, stamp: Option<String>, text: Option<&str>| {
+        let mut q = ODataQuery::new().with_cursor(cursor(f));
+        q.filter_hash = stamp;
+        if let Some(text) = text {
+            q = q.with_filter(filter(text));
+        }
+        q
+    };
+    let check = |q: &ODataQuery| crate::check_cursor_filter(q);
+    let refused = |q: &ODataQuery| matches!(check(q), Err(Error::FilterMismatch));
+
+    // The same filter continues, stamped (REST) or computed (in-process).
+    assert!(
+        check(&query(
+            recorded.clone(),
+            recorded.clone(),
+            Some("name eq 'x'")
+        ))
+        .is_ok()
+    );
+    assert!(check(&query(recorded.clone(), None, Some("name eq 'x'"))).is_ok());
+
+    // An omitted or different filter is refused.
+    assert!(refused(&query(recorded.clone(), None, None)));
+    assert!(refused(&query(recorded.clone(), None, Some("name eq 'y'"))));
+
+    // The stamp decides when there is one: a stamp that differs is refused even
+    // though `$filter` hashes to the recorded value, and the recorded stamp is
+    // accepted with no `$filter` at all.
+    assert!(refused(&query(
+        recorded.clone(),
+        other,
+        Some("name eq 'x'")
+    )));
+    assert!(check(&query(recorded.clone(), recorded, None)).is_ok());
+
+    // A cursor that recorded no hash has nothing to be checked against.
+    assert!(check(&query(None, None, Some("name eq 'x'"))).is_ok());
+}
