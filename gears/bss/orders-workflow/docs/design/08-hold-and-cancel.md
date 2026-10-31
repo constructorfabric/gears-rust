@@ -1,0 +1,1297 @@
+<!-- CONFLUENCE_TITLE: [BSS]: Orders Workflow — Hold and Resume, Dependency Resilience and Workflow-Mediated Cancel (Slice 8) -->
+<!-- Related: ../DESIGN.md, ../PRD.md, ./01-foundation.md, ./10-process-definition.md, ./03-approval-execution.md, ./05-provisioning-intents.md, ./06-saga-and-compensation.md, ./09-read-and-authz.md, ./README.md | Owners: BSS Orders team -->
+
+# DESIGN — Hold and Resume, Dependency Resilience and Workflow-Mediated Cancel (Slice 8)
+
+
+<!-- toc -->
+
+- [1. Architecture Overview](#1-architecture-overview)
+  - [1.1 Architectural Vision](#11-architectural-vision)
+  - [1.2 Architecture Drivers](#12-architecture-drivers)
+  - [1.3 Architecture Layers](#13-architecture-layers)
+- [2. Principles & Constraints](#2-principles--constraints)
+  - [2.1 Design Principles](#21-design-principles)
+  - [2.2 Constraints](#22-constraints)
+- [3. Technical Architecture](#3-technical-architecture)
+  - [3.1 Domain Model](#31-domain-model)
+  - [3.2 Component Model](#32-component-model)
+  - [3.3 API Contracts](#33-api-contracts)
+  - [3.4 Internal Dependencies](#34-internal-dependencies)
+  - [3.5 External Dependencies](#35-external-dependencies)
+  - [3.6 Interactions & Sequences](#36-interactions--sequences)
+  - [3.7 Database schemas & tables](#37-database-schemas--tables)
+  - [3.8 Deployment Topology](#38-deployment-topology)
+- [4. Additional context](#4-additional-context)
+  - [4.1 Keys and deduplication](#41-keys-and-deduplication)
+  - [4.2 Arrival order](#42-arrival-order)
+  - [4.3 The apply-time re-check](#43-the-apply-time-re-check)
+  - [4.4 Rebuild and fencing are referenced, never restated](#44-rebuild-and-fencing-are-referenced-never-restated)
+  - [4.5 The lifetime ceiling](#45-the-lifetime-ceiling)
+  - [4.6 Retired responsibilities](#46-retired-responsibilities)
+  - [4.7 Constraints this slice places on the definition](#47-constraints-this-slice-places-on-the-definition)
+  - [4.8 Cross-slice asks raised by this slice](#48-cross-slice-asks-raised-by-this-slice)
+- [5. Traceability](#5-traceability)
+
+<!-- /toc -->
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-design-hold-and-cancel`
+## 1. Architecture Overview
+
+### 1.1 Architectural Vision
+
+This slice provides three **step operations** and sequences none of them. `apply-hold` records
+that the process is suspended for an order after `OrderHeld`, pauses the approval-escalation
+windows of the gates the definition names through slice 03's gate-window port, which keeps the
+remaining window in Orders' record; `apply-resume` closes that suspension after `OrderResumed`,
+re-arms the same windows through the same port, applies the failure outcomes the hold deferred,
+and answers `due` against the re-based escalation deadline, the first answer of the definition's
+escalation re-check; `authorize-cancel` re-checks, at apply time, the authorization
+snapshot the control gateway recorded when a Seller Operator's cancel was accepted, and answers
+whether the cancel path may proceed into slice 06's fence. The order in which they run, the
+`listen` arms that deliver `OrderHeld`, `OrderResumed` and `cancel-requested`, the `PT5M`
+escalation tick a hold cancels and the re-check that follows a resume, and the branch each returned value selects are the
+definition fragments
+[`10 §3.6` (e) *Hold and resume*](./10-process-definition.md#e-hold-and-resume) and
+[`10 §3.6` (d) *Cancel*](./10-process-definition.md#d-cancel); the protected order they must keep
+is the *Hold* and *Unwind* rows of [`10 §4.1` *The fence*](./10-process-definition.md#41-the-fence).
+Each operation takes only references and reads what it decides on inside Orders under the PDP
+([`../ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)).
+
+The load-bearing asymmetry of the slice is unchanged: "suspend the process" and "pause every clock
+the order is subject to" are not the same claim. A hold stops this gear from issuing new work and
+pauses exactly one of this gear's clocks — the approval-escalation window, whose executor is the
+definition's `wait` and whose record is `owf_approval_gate` (slice 03). It does not pause the
+lifetime ceiling, the barrier, the overdue window or the reconciliation sweep, and it has no
+authority over the Subscriptions draft auto-void TTL, which keeps running through a hold; the
+consequence is handled by slice 05's draft-liveness re-read inside the wave-2 dispatch, never by
+an assumption that drafts survived.
+
+**After the spawn signal a hold is a two-part act** (Lifecycle D-198; decision D-243). Lifecycle
+does not commit `on_hold` for a spawned order, and emits no `OrderHeld`, until this gear has
+paused the order's dispatch generation at every receiver and handed back the receivers'
+evidence: an activation the receiver admitted is either confirmed active before the pause, or can
+no longer commit active once it lands. Lifecycle stages a **pause control** and delivers it to
+this gear through its internal coordination port; a further operation of this slice,
+`settle-receiver-pause`, pauses the receivers and reports the barrier, and only then does
+`OrderHeld` arrive for `apply-hold`. Before the spawn signal no receiver holds a generation, and a
+hold is committed and consumed exactly as before. A resume of a spawned order commits a successor
+grant in Lifecycle's resume transaction; `apply-resume` records it, and wave 2 dispatches the
+lines the pause fenced under that grant.
+
+Dependency resilience for Orders Lifecycle, Subscriptions and Payments is **no longer this
+slice's**. The retry loop, backoff and budget are the definition's task retry policy executed by
+the platform plugin, the circuit breaker is the rule every operation applies to its own outbound
+calls ([`01 §4.5`](./01-foundation.md#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol)),
+and exhaustion faults the invocation except on the failure routes the definition names
+(`10 §4.6`, D-114). What stays here is the principle
+that this path and slice 03's fail-closed verdict park are different mechanisms. The
+workflow-mediated cancel is the third concern: this slice owns only the authorization re-check at
+the head of the cancel path; the fence, the reverse walk and the Lifecycle `workflow-cancel`
+submission are slice 06's `run-cancellation-fence`, `compensate-order` and `report-outcome`, and
+this slice calls no Lifecycle endpoint.
+
+### 1.2 Architecture Drivers
+
+#### Functional Drivers
+
+| Requirement | Design Response |
+|-------------|------------------|
+| `cpt-cf-bss-orders-workflow-fr-owf-hold-resume` | The definition's hold arm (`10 §3.6` (e)) consumes `OrderHeld` and calls `apply-hold`, which records the suspension, sets the hold predicate the dispatch operations read, and pauses the named gates' escalation windows through slice 03's gate-window port; the resume arm consumes `OrderResumed` and calls `apply-resume`, which closes the suspension, re-arms the same windows through the port, and applies the outcomes the sweep deferred. The definition carries no remainder: `apply-resume`'s `due` is the first answer of the escalation re-check, then the gate loop's `PT30S` `waitProbe` tick resumes it (`10 §3.6` (e)). |
+| `cpt-cf-bss-orders-workflow-fr-owf-dependency-resilience` | **Moved out of this slice by ADR-0011.** Transient failures are the definition's task retry policy (`10 §2`) plus the per-dependency circuit breaker inside each operation (`01 §4.5`); exhaustion of a wave call marks the lines failed through the definition's failure route, whose partial-failure policy decides whether a manual task follows (`10 §3.6` (c)); exhaustion of any other step call faults the invocation, which the instance liveness pass raises as the `invocation-dead` task (`10 §4.6`, D-114). This slice keeps `cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`. |
+| `cpt-cf-bss-orders-workflow-fr-owf-compensation-execution` | The definition's cancel arm (`10 §3.6` (d)) calls `authorize-cancel` before `run-cancellation-fence`; a withdrawn authority refuses the request, audited, raises no task and leaves the phase unchanged (D-115); the `pre-compensation` re-check inside `compensate-order` raises the one `authority-withdrawn` task, which the unwind waits on. Fencing, compensation and the Lifecycle submission are slice 06's. |
+
+#### NFR Allocation
+
+| NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
+|--------|-------------|--------------|-----------------|----------------------|
+| `cpt-cf-bss-orders-workflow-nfr-owf-escalation-timer` | Approval escalation timers are configurable per gate, default **72 h**, accuracy within **± 5 min** — and a hold/resume cycle must neither silently extend that window nor misrepresent a foreign clock as paused | `apply-hold`, `apply-resume` (through slice 03's gate-window port) | The remainder is captured by the port against database time into `owf_approval_gate.window_remaining_ms`, the single authority for it (`03 §4.2`); the port re-bases the gate's escalation deadline from exactly that value and the definition carries none, so the 72 h window is consumed once across any number of cycles; the fire instant is the first `PT30S` re-check (or `apply-resume`'s `due`) past the re-based deadline, at most 30 s + 4 × 60 s = 4 min 30 s late: the rest of a fire, the probe or `record-decision`, the tick and the next fire, each under the 60-second `gate` timeout, with every return into the gate loop firing first (D-123, D-148); the draft auto-void TTL is never read, stored or paused by this gear | Cycle test asserting *n* hold/resume cycles on one gate still fire escalation within 72 h + 5 min of the gate opening; redelivery test asserting a second `apply-resume` under the same key returns the stored answer and re-arms nothing; code-boundary test asserting no local reference to a Subscriptions TTL value |
+| `cpt-cf-bss-orders-workflow-nfr-owf-availability` | **99.9 %** control-plane availability, with in-flight processes unaffected by control-plane restarts | the step envelope (`01 §3.2`) and the definition's retry policy; this slice's operations | Each operation is one unit of work that settles its idempotency record, its audit entry and its rows together, so a crash before commit replays under the same key and a crash after it is absorbed; the suspension survives restart because it is a row, not an engine flag | Restart test asserting a suspended instance, killed between `apply-hold` and the resume arm, resumes on `OrderResumed` with the recorded remainder; replay test asserting every operation is an absorbed duplicate under its key |
+
+#### Key ADRs
+
+| ADR ID | Decision Summary |
+|--------|-----------------|
+| `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` | The approval-verdict fail-closed park (slice 03) and the retry-then-failure-arm path for the other dependencies are structurally distinct mechanisms with distinct triggers and distinct effects on the Lifecycle `submitted` TTL, and must never be implemented as one path branching on dependency name. |
+| `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition` | Hold, resume and cancel are definition arms; this slice's operations record them. The pause table and the retry governor are retired. |
+| `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps` | `apply-hold`, `apply-resume` and `authorize-cancel` are `protected`; §4.7 lists the constraints the validation hook enforces for them. |
+| `cpt-cf-bss-orders-workflow-adr-references-not-payloads` | Inputs and outputs are event ids, row references and durations; the authorization snapshot and the approver identities never cross the engine boundary. |
+
+### 1.3 Architecture Layers
+
+```text
+Presentation   : none (hold and resume are Lifecycle events; cancel enters through
+                 09's control operation; escalations render through slice 07's queue)
+Application    : Suspension Controller (apply-hold), Resume Coordinator (apply-resume),
+                 Cancel Mediator (authorize-cancel, cancel-authority port),
+                 Receiver Pause Coordinator (control intake, settle-receiver-pause)
+Domain         : ProcessSuspension (read/write); ApprovalGate window columns (through
+                 slice 03's gate-window port); FulfillmentTask, ProvisioningIntent (read,
+                 deferred-outcome apply)
+Infrastructure : owf_process_suspension; owf_process_instance.suspended / phase (through
+                 the step envelope); PolicyEnforcer adapter (09) for the re-check
+```
+
+- [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-tech-hold-and-cancel-stack`
+
+| Layer | Responsibility | Technology |
+|-------|---------------|------------|
+| Presentation | None dedicated | n/a |
+| Application | Five step operations behind the internal step surface | `POST /bss-orders-workflow/v1/steps/{operation}` (`01 §3.3`), `OperationBuilder` |
+| Domain | `ProcessSuspension` entity; calls to slice 03's gate-window port and slice 07's manual-task creator in the same unit of work | GTS domain structs |
+| Infrastructure | Persistence; PDP re-check | PostgreSQL through `SecureConn`, shared `PolicyEnforcer` adapter |
+
+## 2. Principles & Constraints
+
+### 2.1 Design Principles
+
+#### A Hold Suspends Dispatch, Not Foreign Clocks
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-principle-hold-suspends-dispatch-only`
+
+Suspension is scoped to what this gear controls: while `owf_process_instance.suspended` is true
+the dispatch operations of slice 05 issue no intent the process had not already committed to
+issuing, and the approval-escalation windows of the open gates are paused, because a hold must
+not let this process's escalation clock burn against the order. It does not, and structurally
+cannot, pause the Subscriptions draft auto-void TTL — that TTL is owned and clocked by
+Subscriptions and continues through a hold exactly as it would with no hold at all. Nor does it
+pause the accepted-binding `activation_deadline` of the order version (Lifecycle D-152: a hold or
+resume changes no deadline): that clock is Pricing's and Subscriptions', and after a resume the
+first wave-2 dispatch re-runs its guard against it (`05 §3.6` `inst-pi-wave2-guard`, decision
+D-194), so an order held past its deadline goes to the unwind, never to a re-priced activation.
+It does not pause the lifetime ceiling, the barrier or the overdue window either: those are
+definition `wait` arms placed where no hold arm cancels them (§4.7). A hold does not reverse an
+activation that is already active: that subscription keeps its service, billing and capacity,
+because an order hold is not a subscription suspend. It does stop an activation that is admitted
+but not yet confirmed: after the spawn signal the receiver pause of
+`cpt-cf-bss-orders-workflow-constraint-receiver-pause-before-hold` fences it before the hold takes
+effect, so it cannot commit active under the paused generation, and it is sent again under the
+successor grant after resume (Lifecycle D-198; decision D-243). Late provisioning outcomes are
+still read and recorded, and cannot bypass the receiver fence. Draft-creates are untouched: an
+unactivated draft stays a draft, subject to its own TTL.
+This principle is why nothing in the resume path assumes wave-1 drafts survived: the only
+mechanism that detects a voided draft is slice 05's re-read inside the wave-2 dispatch, which runs
+whether or not a hold occurred.
+
+#### Retry-Then-Escalate Is Not the Same Mechanism as Fail-Closed Park
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`
+
+Transient unavailability of Orders Lifecycle, Subscriptions or Payments is a retry-then-failure
+concern: the operation answers `retryable-failure`, the definition's task retry policy re-issues
+the same key, and on exhaustion either the definition's named failure route marks the subject
+failed and hands it to the configured partial-failure policy — the wave calls — or the
+invocation faults and the instance liveness pass raises the `invocation-dead` task (`10 §4.6`,
+D-114). Unavailability of the approval policy adapter is not this
+path: slice 03's `obtain-verdict` answers `unobtainable`, the definition routes only to the park
+arm, the order stays `submitted`, the Lifecycle `submitted` TTL is not paused, and the park
+escalates before it elapses. The two are triggered by different answers, resolved by different
+definition arms, and have different effects on Lifecycle-owned clocks; a definition that routes
+an `unobtainable` verdict into a retry loop, or a `retry-budget-exhausted` into the park arm, is
+refused before publish (§4.7).
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`
+
+### 2.2 Constraints
+
+#### Timer Pause Preserves Remaining Window
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-timer-remaining-window`
+
+On `OrderHeld`, every open gate's approval-escalation window records its remaining window instead
+of being cancelled and forgotten; on `OrderResumed`, the window is re-armed at
+`resume_time + remaining_window`, never at `resume_time + full_window`. A hold must not consume
+the escalation window, and a resume must not grant a fresh full window the order never had.
+
+The mechanism is slice 03's gate-window port
+([`03 §3.2`](./03-approval-execution.md#32-component-model)): `apply-hold` calls
+`pause_windows(correlationId, gateRefs, hold)` and `apply-resume` calls
+`rearm_windows(correlationId, gateRefs, hold)` inside their own settlement transaction. The
+remainder is captured by the port into `owf_approval_gate.window_remaining_ms`, which is the
+**single** authority for it (`03 §4.2`); this slice stores no copy of it and returns none; `apply-resume`'s
+`due` is computed from the deadline the port re-bases from that column in the same transaction. Because the port counts pause
+causes, a hold that overlaps an approval-policy outage pause captures nothing a second time and a
+resume that leaves the outage cause open re-arms nothing (`03 §4.2`).
+
+#### Hold/Resume Cycles Do Not Extend a Bounded Lifetime Indefinitely
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-bounded-hold-resume-cycles`
+
+A single hold/resume cycle preserves the remaining window exactly. It is not enough on its own:
+repeated cycling can re-suspend a window with a small remainder just before it fires, deferring
+escalation indefinitely without consuming the window in any single hold. The backstop is **not**
+the overdue window (slice 07), which only runs once the order is in fulfillment, while the hazard
+is cycling in `pending_approval`.
+
+The backstop is the unconditional **`max_process_lifetime` of 90 days** (`DECISIONS.md` D-53,
+**Accepted**, as amended by D-210: a **mandatory human review every 90 days**, not a hard end of
+the process), which is now the literal `P90D` `wait` of the top-level
+`lifetimeCeiling` branch of
+[`10 §3.6` (a)](./10-process-definition.md#a-start-and-approval), outside every stage fork, so no
+hold arm can cancel it and no resume can re-arm it; on completion the definition enters the
+ceiling stage of [`10 §3.6` (d)](./10-process-definition.md#d-cancel), which calls
+`raise-overdue-escalation` with `escalationKind: lifetime-ceiling` and `park` with
+`parkReason: lifetime-ceiling` ([`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners)).
+After an operator unpark the process resumes the stage and checkpoint the ceiling interrupted
+under a fresh `P90D` ceiling of the re-entered `lifetime` fork: each unpark is the operator's
+recorded decision to continue, and it starts the next 90-day review round (D-121), so an order
+non-terminal for longer is reviewed by a person at least once per quarter rather than ended by a
+timer (D-210). A ceiling that fires during an
+unwind does not park (there is no `compensating → parked` edge, `01 §3.7`); the unwind continues
+under the fresh ceiling.
+There is deliberately **no cap on the number of hold/resume cycles** and no cap on total held
+time; those would refuse a legitimate commercial hold, whereas a lifetime ceiling only refuses an
+order that has been non-terminal for a quarter of a year. On expiry the order still reaches a
+decided outcome through a human, not through a timeout. The ceiling most often fires while the
+instance is `suspended`; the phase table of
+[`01 §3.7`](./01-foundation.md#table-owf_process_instance) permits `park` from `started` and, for
+`parkReason = lifetime-ceiling` only, from `suspended`, with the open suspension left open because
+the hold is still Lifecycle's fact, and its `unpark` restores `suspended` (decision D-82: the
+lifetime-ceiling park is permitted from `suspended` and leaves the suspension open). This slice writes nothing against the ceiling.
+
+#### One Open Suspension Per Order, Reconciled Regardless of Arrival Order
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-one-open-suspension`
+
+"At most one unsettled suspension per order" is carried by the **partial unique index**
+`UNIQUE (order_id) WHERE state IN ('open', 'resume_ahead')` on `owf_process_suspension` (§3.7),
+not by a read-then-insert. Event-id uniqueness is separate and weaker: `UNIQUE (order_id,
+triggering_event_id)` absorbs a redelivered `OrderHeld`, but two holds with different event ids
+would both satisfy it. The partial index arbitrates: the second hold loses the insert, is an
+absorbed duplicate in `owf_step_log`, pauses nothing a second time and leaves the open suspension
+untouched.
+
+**`OrderHeld` and `OrderResumed` are not assumed to arrive in order.** Broker delivery to a
+`listen` is at-least-once with no ordering guarantee, and the failure mode is not symmetric: a
+resume that arrives first and is discarded leaves the subsequent hold suspending the instance
+permanently. The operations therefore reconcile the pair by state:
+
+- `apply-resume` with an open suspension: closes it (`closed_reason = resumed`), re-arms its
+  windows, records `resume_event_id`.
+- `apply-resume` with **no** open suspension: inserts a `resume_ahead` row carrying
+  `resume_event_id` and answers `resume-ahead-recorded`; nothing is re-armed, because nothing was
+  paused, and the event is not discarded.
+- `apply-hold` while a `resume_ahead` row exists: consumes it (`closed_reason =
+  reconciled-out-of-order`, the hold recorded in `reconciled_by_event_id`, D-216), pauses no
+  window, leaves `suspended` false, and answers
+  `reconciled-out-of-order`, so the definition does not enter the resume wait.
+- A redelivered `OrderResumed` is an absorbed duplicate under its key and, below the key, under
+  `UNIQUE (order_id, resume_event_id)`.
+
+**A resume closes only a suspension Lifecycle no longer holds** (decision D-141). The pair cannot
+be matched by identity. `OrderHeld` carries the outgoing state and `OrderResumed` the restored
+state, each with its own event id, and neither names the hold it belongs to, a hold ordinal or
+`resume_count`
+([Lifecycle `01 §4.4`](../../../orders/docs/DESIGN.md#contract-01-4-4), *The event set*).
+Delivery is FIFO per order partition only during ordinary processing, and Lifecycle tells every
+consumer to check an event against its authoritative state before acting
+([Lifecycle `01 §2.2`](../../../orders/docs/DESIGN.md#contract-01-delivery-is-at-least-once-ordering-is-partition-scoped)). The
+pairing is therefore made against that state:
+
+- `apply-resume` on an `OrderResumed` reads the order before it closes or records anything. If
+  Lifecycle holds the order `on_hold`, a later hold has already overtaken this resume, so the
+  resume belongs to no suspension the instance may close. The operation answers `still-held`,
+  closes nothing and records no `resume_ahead` row. The open suspension now stands for the later
+  hold, and it closes on that hold's resume or by the poll's read. Without the read, delivering
+  H1, H2 and then R1 (Lifecycle's order was H1, R1, H2) let R1 close the only open suspension:
+  H2 was absorbed against it by the partial index, and Orders was left unsuspended while
+  Lifecycle held the order.
+- `apply-hold` that finds a `resume_ahead` row reads the order too. If Lifecycle holds it, the
+  early resume belonged to an earlier hold. The operation consumes the row
+  (`reconciled-out-of-order`) and still records this hold's suspension (`suspended`). Only when
+  Lifecycle no longer holds the order does the early resume cancel the hold, as above.
+
+This reconciliation needs the definition to consume a resume that arrives while no hold arm is
+waiting; that is the resume arm §4.7 item 3 requires in every stage fork that carries a hold arm.
+
+#### A Post-Spawn Hold Is Effective Only After the Receiver Pause
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-constraint-receiver-pause-before-hold`
+
+Once the spawn signal is recorded, a hold **MUST NOT** be treated as effective — no `OrderHeld`
+is expected and none is consumed as this hold's — until this gear has (i) stopped dispatch for the
+order version, (ii) paused the open grant's generation at **every** receiver of its roster, (iii)
+collected each receiver's attestation, and (iv) reported the assembled barrier evidence to
+Lifecycle, which re-checks it and commits `on_hold` in its final transaction (Lifecycle D-198,
+*Staged hold/cancel/failure without new public states*). The evidence names the control, the exact
+order, version, fulfillment attempt and generation, the roster digest, every receiver's durable
+fence identity and every target's outcome — active, draft, fenced-pending or none — and proves that
+no later active confirmation can come from the paused generation, while allowing the members that
+are already active. A partial set of attestations is not evidence; a remote read, a lease or a
+checkpoint of this gear is never a fence.
+
+While the pause control is open the dispatch operations defer as they do on a suspension
+(`05 §3.6` `inst-pi-held`), the reconciliation sweep keeps reading, and a failure it reads is
+deferred by the rule below once `apply-hold` has recorded the suspension. If Lifecycle refuses or
+abandons the control at its final check, the receivers **stay paused**: nothing in this gear
+reopens a generation, and new dispatch authority comes only from a grant Lifecycle commits
+(decision D-243). The recovery is a **fresh hold and a resume** (decision D-244): an operator with
+hold authority holds the order again, the new control's pause is answered at once because the
+receivers are already paused, Lifecycle commits `on_hold`, and the later resume issues the
+successor grant; `apply-hold` closes the `receiver-control-abandoned` task when it records that
+suspension. Cancelling the order stays available. Pre-spawn holds are unchanged: Lifecycle commits them at once, under the
+aggregate-lock race it already declares.
+
+#### A Hold Freezes Failure-Producing Transitions, Not Only Dispatch
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-hold-aware-sweep`
+
+The reconciliation sweep (slice 05, `reconcile-intent` and the `reconciliation-sweep` worker) is
+**hold-aware**. While `owf_process_instance.suspended` is true, it continues to *read* the
+terminal outcome of already-accepted intents and to record that outcome on
+`owf_provisioning_intent` — stopping it would lose confirmations that arrive during a long hold.
+What it **MUST NOT** do is act on a failure it read: while suspended it **MUST NOT** advance an
+`owf_fulfillment_task` to `failed`, **MUST NOT** answer the definition with a failure that enters
+the partial-failure arm, and **MUST NOT** create a manual task. A terminal failure observed during
+a hold is recorded on the intent as deferred. `apply-resume` applies the deferred outcomes, in
+observation order, in its own settlement transaction and returns the affected task references, so
+the definition enters the failure arm only after the hold is lifted.
+
+Without this rule a held order — one an operator or Lifecycle has deliberately frozen — could have
+a task advanced to `failed` underneath the freeze and the partial-failure policy fired on it,
+which is the one thing "the order is on hold" guarantees cannot happen. The sweep's ladder and
+cap are unaffected: the counterparty state at Subscriptions keeps moving whether this gear is
+suspended or not. The guard lives inside slice 05's operation; this slice states it and consumes
+its deferred rows (§4.8 item 3).
+
+#### Cancel Submission Follows Fencing, Never Precedes It
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-constraint-cancel-follows-fencing`
+
+The workflow-mediated cancel **MUST NOT** submit to Lifecycle, and **MUST NOT** report the order
+cancelled, while a compensating action is outstanding. In the definition this is the fence order
+`authorize-cancel` **<** `run-cancellation-fence` **<** `compensate-order` **<** `report-outcome`
+of `10 §4.1`, and `report-outcome` (slice 06) is the **only** caller of the Lifecycle
+`workflow-cancel` endpoint and the only emitter of `OrderFulfillmentAborted` on this path; it
+refuses while the fence row's `no_active_verified_at` is null. A `FulfillmentTask` remains
+unilaterally cancellable until its activation intent is accepted by Subscriptions; draft-create
+acceptance alone does not close that window (slice 06).
+
+**ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park`,
+`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`
+
+## 3. Technical Architecture
+
+### 3.1 Domain Model
+
+**Technology**: GTS, Rust structs
+
+**Location**: [`../DESIGN.md`](../DESIGN.md) §3.1 (gear-wide domain-model index); the entities
+below are normative in this slice, with their columns in §3.7.
+
+**Core Entities**:
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-entity-process-suspension`
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-entity-timer-pause-record`
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-entity-fulfillment-control`
+
+| Entity | Description | Schema |
+|--------|-------------|--------|
+| `ProcessSuspension` | Records that a process instance is suspended for an order following `OrderHeld`: suspension time, triggering event id, the gate references whose windows were paused, and how it closed | [owf_process_suspension](#table-owf_process_suspension) |
+| `FulfillmentControl` | A pause control Lifecycle staged for a post-spawn hold and delivered through its coordination port: the control identity, the generation it pauses, the receivers' attestations and the barrier report (D-243) | [owf_fulfillment_control](#table-owf_fulfillment_control) |
+| `TimerPauseRecord` | **Retired by ADR-0011; responsibility now**: the pause of an approval-escalation window is the `hold` member of `owf_approval_gate.pause_causes` with the remainder in `window_remaining_ms`, written through slice 03's gate-window port by `apply-hold`/`apply-resume` (`03 §4.2`); the fire instant is the definition's `wait` | columns of `owf_approval_gate`; no table |
+
+**Relationships**:
+- Order (process instance) → `ProcessSuspension`: at most one unsettled record per order, enforced
+  by the partial unique index of `cpt-cf-bss-orders-workflow-constraint-one-open-suspension`;
+  created by `apply-hold`, closed by `apply-resume` or, on an unwind taken from hold, by the
+  suspension closure port called from slice 06's `run-cancellation-fence`; a resume that precedes
+  its hold is held as a `resume_ahead` record under the same index.
+- `ProcessSuspension` → `owf_approval_gate` (slice 03): `paused_gate_refs` names the gates whose
+  windows `apply-hold` paused; `apply-resume` re-arms exactly those. Never a pause of the
+  lifetime, barrier or overdue waits, which have no Orders record to pause.
+- `ProcessSuspension` → `cpt-cf-bss-orders-workflow-entity-provisioning-intent` (slice 05): not
+  directly related — the dispatch operations read `owf_process_instance.suspended`, and the
+  deferred outcomes are flags on the intent that `apply-resume` applies.
+- `FulfillmentControl` → `ProcessSuspension`: a post-spawn hold has a settled control before its
+  suspension; `apply-hold` records the suspension when the `OrderHeld` that the control's
+  finalization emitted arrives, and `apply-resume` marks the control `resumed` when it records the
+  successor grant (slice 05's `owf_fulfillment_grant`).
+- `ProcessSuspension` → `cpt-cf-bss-orders-workflow-component-cancellation-fencer` (slice 06): a
+  Seller Operator may cancel while the order is held; the cancel path does not require the
+  suspension to be resumed first, and the fence closes it with `closed_reason =
+  cancelled-from-hold`.
+
+### 3.2 Component Model
+
+```mermaid
+graph LR
+    DEF[order-process definition, 10 §3.6 d/e] -->|apply-hold| SC[Suspension Controller]
+    DEF -->|apply-resume| RC[Resume Coordinator]
+    DEF -->|authorize-cancel| CM[Cancel Mediator]
+    DEF -->|settle-receiver-pause| RPC[Receiver Pause Coordinator]
+    OLP[Orders Lifecycle coordination port] -->|stage pause control| RPC
+    RPC --> FC[(owf_fulfillment_control)]
+    RPC -->|pause generation, read attestation| SUBR[Subscriptions receivers]
+    RPC -->|barrier evidence| OLP
+    RC -->|record successor grant| FG[(owf_fulfillment_grant, slice 05)]
+    SC --> PS[(owf_process_suspension)]
+    RC --> PS
+    SC -->|gate-window port: pause| AGM[cpt-cf-bss-orders-workflow-component-approval-gate-manager slice 03]
+    RC -->|gate-window port: rearm| AGM
+    RC -->|apply deferred outcomes| PI[(owf_provisioning_intent / owf_fulfillment_task, slice 05/04)]
+    CM -->|re-check| PDP[PolicyEnforcer adapter, slice 09]
+    CM -->|authority-withdrawn, pre-compensation only| MTC[cpt-cf-bss-orders-workflow-component-manual-task-creator slice 07]
+    CF[cpt-cf-bss-orders-workflow-component-cancellation-fencer slice 06] -->|suspension closure port| PS
+    CO[compensate-order, slice 06] -->|cancel-authority port, pre-compensation| CM
+```
+
+#### Suspension Controller
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-suspension-controller`
+
+##### Why this component exists
+
+`on_hold` changes what the process is permitted to do; without one component owning the record of
+that change, the hold predicate the dispatch operations read and the paused escalation windows
+could drift apart.
+
+##### Responsibility scope
+
+Owns `apply-hold` (§3.3). In one unit of work: inserts the `ProcessSuspension` under the partial
+unique index (a losing insert is an absorbed duplicate, never a second suspension) or consumes a
+`resume_ahead` row; sets `owf_process_instance.suspended` and moves the phase projection
+`started → suspended` through the envelope; calls the gate-window port's `pause_windows` for the
+`gateRefs` the definition passes and records them on the suspension; and returns `holdOutcome` and
+`suspensionRef`; the remainder the port captures stays on the gate. It pauses nothing else.
+
+**Intents are partitioned by three states, not two.** A hold reaches an outbound provisioning
+intent in one of three conditions; the behaviour is enforced by slice 05's dispatch operations
+reading the predicate this component sets:
+
+| Intent state at hold | Behaviour |
+|---|---|
+| Not yet submitted (`pending`) | The dispatch operation issues nothing (`deferReason = held`). The intent stays `pending` with its idempotency key unconsumed; it is dispatched after resume, or voided if the order is unwound. |
+| Submitted, outcome not yet known | The call **is completed**, not abandoned. A dispatch operation already running finishes its unit of work; if the hold cancels the definition task that issued it, the definition's re-issue after resume carries the same key and is either an absorbed duplicate or the same-key disambiguation of the caller-side duplicate protocol (`01 §4.5`). A same-key re-issue while suspended is permitted for exactly this reason: it can only return the recorded outcome or create the intent the process had already committed to. After the spawn signal an activation submit that reaches a receiver after its pause is refused by the receiver's fence, which `05 §3.6` `inst-pi-settle` records as a deferral, not a failure (D-243). |
+| Already accepted | A draft-create runs to its outcome. An activation confirmed active before the receiver pause stays active and is recorded `activated`; one admitted but not confirmed is fenced by the pause, which the receiver attests, and is recorded `fenced` — not a failure, no event — and sent again under the successor grant after resume (`05 §3.7`, D-243). Acting on a *failure* outcome is deferred per `cpt-cf-bss-orders-workflow-constraint-hold-aware-sweep`. |
+
+##### Responsibility boundaries
+
+Never voids wave-1 drafts and never reads, stores or pauses the Subscriptions draft auto-void TTL.
+Never pauses the lifetime ceiling, the overdue window, the barrier or the sweep — it has no record
+to pause them with, and the definition places them outside the hold arm. Never writes the gate
+window columns directly; only through the port. Never advances an `owf_fulfillment_task`, never
+enters the partial-failure policy, never decides remediation, compensation or cancellation.
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-resume-coordinator` — shares model with
+- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — calls (gate-window port, slice 03)
+- `cpt-cf-bss-orders-workflow-component-intent-dispatcher` — read by (slice 05 reads the hold predicate)
+- `cpt-cf-bss-orders-workflow-component-step-executor` — runs within (slice 01 envelope)
+
+#### Resume Coordinator
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-resume-coordinator`
+
+##### Why this component exists
+
+Resume is not a fresh start: it must restore exactly the window state the hold paused, apply what
+the hold deferred, and do so without assuming anything about drafts a foreign clock may have
+voided.
+
+##### Responsibility scope
+
+Owns `apply-resume` (§3.3). In one unit of work: closes the open `ProcessSuspension`
+(`closed_reason = resumed`) or, with none open, inserts a `resume_ahead` row — or, on
+`trigger: poll`, first reads the order through the Lifecycle PDP-authorized order read and closes
+the suspension (`closed_reason = resumed-by-read`) only once Lifecycle no longer holds the order,
+the stopgap for an `OrderResumed` lost between listens, called from the resume wait (decision
+D-130) and from every other wait of the definition that holds a recorded suspension (D-133); clears
+`owf_process_instance.suspended` and moves the phase projection `suspended → started`;
+records, through slice 05's grant port `record_grant`, the successor grant Lifecycle's resume
+transaction committed for a spawned order (read with the order, `source = resume`, D-243) and
+marks the settled pause control `resumed`; calls the
+gate-window port's `rearm_windows` for the suspension's `paused_gate_refs`; applies the
+failure outcomes slice 05 recorded as deferred during the hold, in observation order — taken and
+cleared through slice 05's **deferral port** and applied to the `owf_fulfillment_task` rows
+through slice 04's **transition function**, because neither table is this slice's
+(`DESIGN.md` §3.7 *sole writer*); and returns `due` against the re-based
+escalation deadline and the references of the tasks it failed.
+
+**Resume re-evaluates; it does not wait for a spent signal.** There is no one-shot barrier timer
+any more: the barrier is the definition's poll `wait` plus `evaluate-activation-eligibility`
+(slice 04), which answers `released: false` while `suspended` is true and is re-invoked on every
+poll. After `apply-resume` clears the predicate, the next evaluation of the barrier's conditions
+is by level, so an expected-fulfillment instant that passed during the hold releases wave 2 on
+the first evaluation after resume. This component writes none of the barrier's conditions.
+
+**Drafts are re-read by the wave-2 dispatch, not here.** The pre-activation draft-liveness re-read
+and the wave-1 rebuild are inside slice 05's wave-2 dispatch path (`10 §3.6` (b)), which every
+activation passes through whether or not a hold occurred; this component neither calls nor
+duplicates them.
+
+##### Responsibility boundaries
+
+Does not compute or store the Subscriptions draft auto-void TTL; does not maintain a parallel
+draft-liveness record; does not re-arm, fire or reset any barrier or lifetime `wait`; never grants
+a window a fresh full duration — it re-arms through the port, which re-arms only when the window's
+`pause_causes` becomes empty. Never enters the partial-failure policy itself; it returns the
+failed task references and the definition's failure arm does.
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-suspension-controller` — shares model with
+- `cpt-cf-bss-orders-workflow-component-approval-gate-manager` — calls (gate-window port, slice 03)
+- `cpt-cf-bss-orders-workflow-component-reconciliation-sweep` — consumes the deferred outcomes of (slice 05)
+- `cpt-cf-bss-orders-workflow-component-activation-barrier-timer-owner` — no longer related; retired in slice 05, the barrier's conditions are re-evaluated by `evaluate-activation-eligibility`
+
+#### Receiver Pause Coordinator
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-component-receiver-pause-coordinator`
+
+##### Why this component exists
+
+Lifecycle commits a post-spawn hold only on evidence that the receivers can no longer commit an
+activation under the paused generation (Lifecycle D-198), and the receivers, the roster and the
+provisioning legs are this gear's to drive. Without one owner of that fan-out the hold would
+either never become effective or become effective over a live admission.
+
+##### Responsibility scope
+
+Owns the **control intake** (`cpt-cf-bss-orders-workflow-interface-fulfillment-control-intake`,
+§3.3) and `settle-receiver-pause` (§3.3). The intake records the pause control Lifecycle's
+coordination port delivers — idempotent on `control_id` — in `owf_fulfillment_control`, and
+signals the running invocation `receiver-pause-requested`. `settle-receiver-pause`, called from
+the pause arm of every post-spawn stage fork, sends each receiver of the roster of the grant whose generation the control names its
+pause command for the control's generation, reads each receiver's attestation, records the
+generation `paused` on slice 05's grant through the grant port once every receiver has attested,
+records each attested fenced admission on its intent through slice 05's deferral port, and then
+reports the barrier evidence to Lifecycle. It answers `pending` until every receiver has
+attested, `reported` once Lifecycle accepted the evidence, and `abandoned` when Lifecycle refused
+or abandoned the control.
+
+##### Responsibility boundaries
+
+Never commits, assumes or emits a hold: `OrderHeld` is Lifecycle's, and `apply-hold` records it.
+Never pauses a generation the control does not name, never reopens one, never pauses a draft,
+never cancels or suspends an active subscription, and never treats a partial attestation set, a
+timeout or a remote read as a fence. Never calls Lifecycle's `hold` or `resume`. Writes neither
+`owf_provisioning_intent` nor `owf_fulfillment_grant` directly; only through slice 05's ports.
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-suspension-controller` — precedes (the control settles before `OrderHeld`)
+- `cpt-cf-bss-orders-workflow-component-spawn-signal-reporter` — reads the open grant of (slice 05)
+- `cpt-cf-bss-orders-workflow-component-intent-dispatcher` — defers while a control is open (slice 05)
+- `cpt-cf-bss-orders-workflow-component-step-executor` — runs within (slice 01 envelope)
+
+#### Dependency Retry Governor
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-dependency-retry-governor`
+
+**Retired by ADR-0011; responsibility now**: the retry loop, backoff, jitter and attempt budget are
+the definition's task retry policy executed by the platform plugin (`10 §2`, working baselines in
+[`01 §4.2`](./01-foundation.md#42-five-distinct-bounds-two-owners)); the per-dependency circuit
+breaker is applied by every operation to its own outbound calls
+([`01 §4.5`](./01-foundation.md#45-the-envelopes-bound-and-the-caller-side-duplicate-protocol));
+exhaustion is the definition's named failure route and the partial-failure policy where
+`10 §4.6` names one, and otherwise a fault of the invocation that the liveness pass raises
+(D-114). The
+per-dependency budget table formerly here is superseded by the definition's per-task retry policy,
+which **MAY** be tighter per task and **MUST** nest inside the task timeout (`10 §2.2` rule 4)
+(decision D-70: the per-dependency retry budgets of the former governor
+are superseded by the definition's task retry policy under the nesting rule). Slice 04's
+Lifecycle and Account Management reads, which the governor used to wrap, are covered by the same
+rule (`04 §3.2`); the Catalog topology read it also wrapped no longer exists (decision D-196).
+
+#### Cancel Mediator
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-component-cancel-mediator`
+
+##### Why this component exists
+
+An authorized cancellation can outlive its authority: the fence can take days when a compensating
+leg is blocked. Without one component re-asking the PDP at apply time, a revoked operator could
+drive destructive calls long after the grant behind them was withdrawn.
+
+##### Responsibility scope
+
+Owns `authorize-cancel` (§3.3) and the **cancel-authority port**
+`recheck_cancel_authority(correlationId, cancelRequestRef, point)`, `point` ∈ `pre-fence` ·
+`pre-compensation`, and writes nothing of slice 09's `owf_cancel_request` itself: the request's
+`delivery_state`, refusal and `last_recheck_point` are advanced only through slice 09's
+**request-delivery port**, in the caller's unit of work (`09 §3.7`). `authorize-cancel` runs the port at `pre-fence`; slice 06 runs it at
+`pre-compensation` inside `compensate-order` before the first compensating leg on the cancel
+trigger — the "first irreversible call" of
+[`09 §4.4`](./09-read-and-authz.md#44-authorized-invocation-resource-ownership-and-apply-time-re-check-normative).
+There is no `pre-submission` point: once the walk has verified that no active subscription
+remains, the `workflow-cancel` submission records that fact, and withholding it would leave
+Lifecycle asserting subscriptions that no longer exist (decision D-84 as amended).
+The port reads the **authorization snapshot** the control gateway recorded with the accepted
+cancel (`09 §4.4`; the request record `cancelRequestRef` names), rebuilds a `SecurityContext` from
+its four subject fields without a bearer token, and re-runs the snapshot's `(resource, action)`
+decision on the same target through the shared `PolicyEnforcer` adapter. On allow it answers
+`authorized`. On deny, or a fresh scope that matches zero rows, it raises **one** manual task with
+reason `authority-withdrawn` through slice 07's creator in the same unit of work — at
+`pre-compensation` only, where the claimed fence waits on it; at `pre-fence` it marks the request
+`refused` with `authority-withdrawn` and raises no task, because the process continues where the
+cancel was taken (D-115) — leaves the phase unchanged, and answers `withdrawn`. On a PDP outage it answers `retryable-failure` (canonical 503)
+and changes nothing.
+
+##### Responsibility boundaries
+
+Does not implement or sequence the five fencing steps, the two compensation legs or the Lifecycle
+submission — all slice 06. Never calls Lifecycle. Never enters `parked`: a withdrawn authority is
+not an unobtainable verdict (`09 §4.4`). Never re-authorizes: a new authorization is a new accepted
+command with its own snapshot, submitted by a human as a new cancel request.
+
+##### Related components (by ID)
+
+- `cpt-cf-bss-orders-workflow-component-cancellation-fencer` — precedes (slice 06; the fence runs only after `authorized`)
+- `cpt-cf-bss-orders-workflow-component-compensation-executor` — called by (slice 06, the `pre-compensation` re-check)
+- `cpt-cf-bss-orders-workflow-component-manual-task-creator` — calls (slice 07, `authority-withdrawn`)
+
+### 3.3 API Contracts
+
+#### Step operations
+
+The five operations below are registered against the operation registration boundary
+([`01 §3.2`](./01-foundation.md#32-component-model)) with the contract fields of
+[`01 §3.3` *The step-operation contract*](./01-foundation.md#the-step-operation-contract), are
+mirrored into `owf_step_operation`, and are reachable only as
+`POST /bss-orders-workflow/v1/steps/{operation}` by the serverless-runtime service principal under
+PDP resource `gts.cf.bss.orders_workflow.process_step.v1~` × `execute`. Every input carries the
+reference tuple of `10 §3.6` — `correlationId`, `orderId`, `orderVersion`, `resourceTenantId`,
+`invocationId`, `attemptId` — written **ref** below; every other member is an event id, a row
+reference or a small enum, and every output member is a reference, an enum or a duration. Every
+operation resolves `correlationId` to the instance, narrows every read and write to its
+`resource_tenant_id` and `seller_tenant_id`, and answers `permanent-failure` with
+`version-mismatch` once the instance is terminal. Input and output schemas are
+`gts.cf.bss.orders_workflow.step.<name>.input.v1~` / `….output.v1~`.
+
+| `name` | `protection` | `input` | `output` | `idempotency_key` | `declared_event` | `compensation` | `reasons` | `audit_kind` | `retry_class` | `deadline` |
+|--------|--------------|---------|----------|-------------------|------------------|----------------|-----------|--------------|---------------|------------|
+| `apply-hold` | `protected` | ref + `holdEventId`, `gateRefs[]` (the references `open-gates` last returned; empty outside the approval stage) | `holdOutcome` ∈ `suspended` · `reconciled-out-of-order` · `absorbed-duplicate` · `not-applicable`; `suspensionRef` (nullable); `abandonedControlClosed` (bool — `true` when this hold's suspension closed an open `receiver-control-abandoned` task, D-244). No remaining duration is returned: the remainder stays in `owf_approval_gate.window_remaining_ms` and the definition consumes none | instance-scoped `{tenant}:{correlationId}:apply-hold:{holdEventId}` | none (`OrderHeld` is Lifecycle's) | `apply-resume` (the paired close, like `park`/`unpark`; not a saga leg) | `version-mismatch`, `not-found` (a `gateRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `apply-resume` | `protected` | ref + `trigger` ∈ `event` · `poll` (default `event`); on `event`, `resumeEventId` and `suspensionRef` (nullable — null on the stage-level resume arm); on `poll`, `suspensionRef` and `round` (the read of the hold, from the resume wait, decision D-130, or from any other wait that holds a recorded suspension, D-133, or before `terminate-instance` on a rejection or a completion while a suspension is recorded, D-183; the round family is per suspension) | `resumeOutcome` ∈ `resumed` · `resume-ahead-recorded` · `absorbed-duplicate` · `resumed-by-read` · `still-held` (`resumed-by-read` on `poll` only; `still-held` on `poll` with `nextRound`, and on `event` without one when the order read finds the order `on_hold` again, decision D-141); `due: true\|false` — database time against the escalation deadline re-based from the stored `window_remaining_ms` (true when no remainder is left), the answer the resumed escalation re-check loop switches on first (`10 §3.6` (e)), after which the `PT30S` `waitProbe` tick resumes; `failedTaskRefs[]` (tasks advanced to `failed` from deferred outcomes: the opaque `owf_fulfillment_task` reference as `lineRef` plus the `reason` slice 05 recorded with the deferral, the shape of a wave's `failed[]`, so the definition can name each subject's reason to `create-manual-task`) | instance-scoped `{tenant}:{correlationId}:apply-resume:{resumeEventId}` on `event`; `{tenant}:{correlationId}:apply-resume:poll:{suspensionRef}:{round}` on `poll`, a re-invokable family (`01 §3.3` *Rounds and attempts*) | none (`OrderResumed` is Lifecycle's) | none | `version-mismatch`, `not-found` (a `suspensionRef` not of this instance), `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 5 s |
+| `authorize-cancel` | `protected` | ref + `cancelRequestRef` | `authorized` (bool); `preFulfillment` (bool — `true` with `authorized = false` when the order's fulfillment has not begun and Lifecycle does not hold it terminal, §3.6 `inst-ac-fulfillment`); no `taskRef`: a withdrawn authority at `pre-fence` raises no task (D-115) | instance-scoped `{tenant}:{correlationId}:authorize-cancel:{cancelRequestRef}` | none (`OrderFulfillmentAborted` is `report-outcome`'s, slice 06) | none | `authority-withdrawn` (recorded on the request as its refusal; the answer is the settled `authorized = false`), `not-found` (a request not of this instance), `version-mismatch`, `per-attempt-timeout`, `idempotency-key-conflict` | `step-completion` | `retryable-on: transient` | 10 s (one PDP decision) |
+| `settle-receiver-pause` | `protected` | ref + `controlRef` (from the `receiver-pause-requested` signal), `round` (0 on first entry, else the previous answer's `nextRound`) | `pauseOutcome` ∈ `pending` (a receiver has not attested, or attests a target still unresolved: a settled success of its round; the arm returns to the stage, whose dispatch defers, and calls again on its next tick under `nextRound`) · `reported` (Lifecycle accepted the evidence; the hold arm will receive `OrderHeld`) · `abandoned` (Lifecycle refused or abandoned the control; the receivers stay paused, and the definition opens the order-scope `receiver-control-abandoned` task in the failure stage under either policy) · `not-applicable` (the control names another version or the instance is `compensating`: the unwind's revoke supersedes it); `nextRound` | instance-scoped `{tenant}:{correlationId}:settle-receiver-pause:{controlRef}:{round}`; each receiver command `{tenant}:{orderId}:{orderVersion}:receiver-pause:{controlId}:{receiverRef}`; the Lifecycle report `{tenant}:{orderId}:{orderVersion}:control:{controlId}` | none (`OrderHeld` is Lifecycle's) | none — a paused generation is never reopened; a successor grant comes from Lifecycle's resume | `receiver-control-abandoned`, `version-mismatch`, `not-found` (a control not of this instance), `circuit-breaker-open`, `per-attempt-timeout`, `idempotency-key-conflict` | `phase-transition` | `retryable-on: transient` | 10 s per outbound call |
+| `request-prefulfillment-cancel` | `protected` | ref + `reason` (`payment-wait-expired`), `round` (0 on first entry, else the previous answer's `nextRound`) | `cancelOutcome` ∈ `requested` (Lifecycle accepted the request and arbitrates it against beginning fulfillment; its `OrderCancelled`, if it wins, reaches the eligibility fork's lifecycle arm) · `not-admissible` (fulfillment has begun, or the order is at another version or terminal — the next evaluation decides) · `unsupported` (Lifecycle offers no workflow-mediated pre-fulfillment cancel yet: the definition falls back to manual review); `nextRound` | lifecycle-transition `{tenant}:{orderId}:{orderVersion}:cancel-prefulfillment:{round}` | none — Lifecycle's `OrderCancelled` is the event | none — nothing was dispatched; the terminal-event path ends the instance with nothing to compensate | `version-mismatch`, `circuit-breaker-open`, `per-attempt-timeout` | `step-completion` | `retryable-on: transient` | 10 s |
+
+**`request-prefulfillment-cancel`** (decision D-228). Raised by the definition when the seller's
+payment-wait deadline elapses while financial readiness is still `pending` and the pinned expiry
+action is `request-cancel` (`04 §3.6`, `10 §3.6` (b)). It calls Lifecycle's workflow-mediated
+**pre-fulfillment** cancel for the order version with the reason `payment-wait-expired` — the ask
+`cpt-cf-bss-orders-workflow-upreq-prefulfillment-cancel-arbitration` (`UPSTREAM_REQS.md` §2.4):
+Lifecycle arbitrates the request against beginning fulfillment and against its own `approved`
+expiry, and it, not this gear, carries the accepted cancellation to Billing and Payments to stop or
+reconcile the original payment (`…-upreq-cancellation-reaches-payments`, §2.2). This gear calls
+nothing on Billing, records nothing about money, and ends the instance only through the
+terminal-event path when `OrderCancelled` arrives (`02 §3.6`): nothing was dispatched, so the
+unwind compensates nothing and `report-outcome` makes no call. A refusal because fulfillment has
+begun is answered `not-admissible` and the eligibility stage continues — the existing authorized
+cancellation path (`authorize-cancel`, D-109) is the only one from `in_fulfillment`. Until the
+Lifecycle ask lands the operation answers `unsupported` and the definition raises the
+`payment-wait-expired` review task instead; it never waits silently. A late readiness result after
+the instance ended is Billing's to recover and never restarts a cancelled order: `admit-trigger`
+ignores events for a terminal instance (`02 §3.6`).
+
+**What each answer means to the definition.** `suspended` enters the resume wait of `10 §3.6` (e)
+only in the approval stage, whose gate or outage loop pauses on a hold (`holdPauses`, D-80); in
+every other stage `suspended` returns to the stage, whose loop continues while the dispatch
+operations defer on `owf_process_instance.suspended`, so the barrier poll `10 §4.5` keeps running
+(item 3 below makes `suspended` necessary for the resume wait, not sufficient).
+`reconciled-out-of-order`, `absorbed-duplicate` and `not-applicable` are settled successes that
+return to the stage the hold arm interrupted. `still-held` on `poll` returns to the resume wait under the
+next round (before `terminate-instance` it cannot arise, because the order is `rejected` or `completed` at its own version, decision D-183); on `event` it closes nothing and returns to where the resume arm was taken — the
+resume wait, with the suspension still recorded, or the stage (decision D-141). `resumed`, `resumed-by-read` and `resume-ahead-recorded` return to the
+stage and loop the hold interrupted with `due` as the first answer of the escalation re-check
+loop, then the `PT30S` tick (a 1.0.0 `wait` takes no runtime expression, `10 §3.6` *Fixed waits and
+re-check loops*); a non-empty
+`failedTaskRefs[]` routes to the partial-failure arm of `10 §3.6` (c) first. `authorized = true`
+routes into `run-cancellation-fence`; `authorized = false` is a settled success that returns to
+where the cancel arm was taken (§4.7 item 5). A PDP outage is `retryable-failure` without a
+Workflow reason (canonical `ServiceUnavailable`, `01 §4.9`); its exhaustion faults the
+invocation (§4.7 item 6).
+
+`not-applicable` answers a hold consumed while `compensating` and records the event in
+`owf_step_log` without a suspension row: a hold does not interrupt an unwind already running. A
+hold consumed while `parked` — the park loop's record-only hold arm, `03 §4.5` item 6 — records the
+suspension and sets the `suspended` flag but leaves the phase `parked`: a parked instance
+dispatches nothing to suppress, and the flag is what makes `unpark` restore `suspended` and the
+reflection after it answer `held` rather than replay a Lifecycle refusal
+([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)).
+
+#### Hold and resume consumption
+
+- [ ] `p2` - **ID**: `cpt-cf-bss-orders-workflow-interface-hold-resume-consumer`
+
+- **Contracts**: `cpt-cf-bss-orders-workflow-contract-owf-lifecycle-transition`
+- **Technology**: definition `listen` arms of the running invocation (`10 §2`, `10 §3.6` (e)),
+  delivered by the platform from the broker; **this slice owns no subscription and no consumer**.
+- **Location**: the hold arm, the resume arm and the stage-level resume arm of `10 §3.6` (e);
+  admission per the trigger-to-outcome table of
+  [`02 §3.3`](./02-triggers-and-start.md#33-api-contracts) (`OrderHeld` → `apply-hold`,
+  `OrderResumed` → `apply-resume`).
+
+**Endpoints Overview**:
+
+| Method | Path | Description | Stability |
+|--------|------|--------------|-----------|
+| n/a (event) | `OrderHeld` | `listen` in every stage fork, correlated on `orderId`/`orderVersion`; the arm calls `apply-hold` keyed by the event id | unstable |
+| n/a (event) | `OrderResumed` | `listen` in the resume wait and in every stage fork carrying a hold arm; the arm calls `apply-resume` keyed by the event id | unstable |
+| n/a (signal) | `cancel-requested` | `:plugin-control` signal delivered by 09's control operation (`10 §3.3`); the cancel arm calls `authorize-cancel` | unstable |
+| `POST` | `/bss-orders-workflow/v1/steps/apply-hold` · `…/apply-resume` · `…/authorize-cancel` | The three step routes of the table above, callable only by the serverless-runtime service principal (`01 §3.3`) | unstable |
+
+The Lifecycle `workflow-cancel` endpoint is no longer listed here: its only caller is slice 06's
+`report-outcome`.
+
+#### Fulfillment control intake
+
+- [ ] `p1` - **ID**: `cpt-cf-bss-orders-workflow-interface-fulfillment-control-intake`
+
+- **Contracts**: `cpt-cf-bss-orders-workflow-contract-owf-lifecycle-transition`
+- **Technology**: an internal SDK operation of this gear, `OrdersWorkflowControlV1::stage_fulfillment_control`,
+  obtained through `ClientHub`, which Lifecycle's coordination port calls (Lifecycle D-198 narrowly
+  amends D-175's no Lifecycle-to-Workflow call rule for this protocol only); not a REST endpoint
+  and not a definition `listen` (decision D-243).
+- **Input**: `control_id`, `kind` (`pause`; the only kind Lifecycle stages towards this gear —
+  an ordinary cancel or failure is this gear's own unwind, which revokes first, slice 06),
+  `order_id`, `order_version`, `fulfillment_attempt_id`, `generation`, `roster_digest`,
+  `correlation_id`. **Output**: `accepted` (recorded now or before, same control) or a refusal:
+  `version-mismatch` (another version, or no recorded grant of this generation), `not-found` (no live
+  instance for the order), `idempotency-key-conflict` (the same `control_id` with another body).
+- **Authorization**: the caller is Lifecycle's configured engine service principal, under PDP
+  resource `gts.cf.bss.orders_workflow.fulfillment_control.v1~` × `stage`, scoped to the order's
+  resource tenant (`09 §4.8` ask of §4.8 item 6).
+- **Effect**: one unit of work inserts the `owf_fulfillment_control` row (`state = staged`) under
+  `UNIQUE (control_id)`, and enqueues the `receiver-pause-requested` `:plugin-control` signal for
+  the instance's invocation, delivered like `cancel-requested` (`10 §3.3`); a redelivery of the
+  same control is an absorbed duplicate and signals nothing new. Lifecycle's port retries until it
+  receives `accepted`, and recovers a lost answer under the same `control_id`.
+
+### 3.4 Internal Dependencies
+
+| Dependency Gear | Interface Used | Purpose |
+|-------------------|----------------|----------|
+| serverless-runtime | Running invocation's `listen` arms and `:plugin-control` signals (by reference, `10 §3.3`) | Delivers `OrderHeld`, `OrderResumed` and `cancel-requested` to the definition, which calls this slice's operations; **no code today** (`10 §1`) |
+| bss-orders-workflow (slice 03) | Gate-window port `pause_windows` / `rearm_windows` of `cpt-cf-bss-orders-workflow-component-approval-gate-manager` | The only way this slice pauses or re-arms an escalation window; the remainder's authority stays on `owf_approval_gate` |
+| bss-orders-workflow (slice 05) | Hold predicate read by the dispatch operations; deferred-outcome flags on `owf_provisioning_intent` | Dispatch suppression while suspended; the outcomes `apply-resume` applies |
+| bss-orders-workflow (slice 06) | Suspension closure port (this slice's, called by `run-cancellation-fence`); cancel-authority port (this slice's, called by `compensate-order` at `pre-compensation` only; `report-outcome` does not call it, D-84 as amended) | Close a suspension on an unwind taken from hold; re-check authority between legs |
+| bss-orders-workflow (slice 07) | `cpt-cf-bss-orders-workflow-component-manual-task-creator` | The `authority-withdrawn` task |
+| bss-orders-workflow (slice 09) | Authorization snapshot on the accepted cancel's request record; `PolicyEnforcer` adapter | The apply-time re-check |
+| bss-orders-workflow (slice 03) | `cpt-cf-bss-orders-workflow-actor-owf-generic-approval` fail-closed park (referenced, not called) | Boundary reference only, to keep the two resilience paths distinct |
+
+**Dependency Rules** (per project conventions):
+- No circular dependencies
+- Always use SDK modules for inter-gear communication
+- No cross-category sideways deps except through contracts
+- Only integration/adapter gears talk to external systems
+- `SecurityContext` must be propagated across all in-process calls
+
+### 3.5 External Dependencies
+
+#### Orders Lifecycle (BSS)
+
+- **Contract**: `cpt-cf-bss-orders-workflow-contract-owf-lifecycle-transition`
+
+| Dependency Gear | Interface Used | Purpose |
+|-------------------|---------------|----------|
+| bss-orders-lifecycle | `OrdersLifecycleWorkflowV1::get(order_id)` — the PDP-authorized current-order read ([Lifecycle `08 §4.2`](../../../orders/docs/DESIGN.md#contract-08-4-2); Lifecycle D-155, decision D-193), and nothing else: this slice never calls `hold` or `resume` (Lifecycle's hold is the operator's, consumed here as `OrderHeld` / `OrderResumed`) and never reads a version's commercial content | `apply-resume` reads whether Lifecycle still holds the order, on the poll (D-130) and on an `OrderResumed` (D-141); `apply-hold` reads it when a `resume_ahead` row exists (D-141). `OrderHeld` / `OrderResumed` arrive through the definition's `listen`; the `workflow-cancel` submission is slice 06's `report-outcome` |
+| bss-orders-lifecycle | The D-198 coordination port, both directions: it calls this gear's control intake (above), and `settle-receiver-pause` reports the barrier evidence back through `settle_fulfillment_control(control_id, evidence)`; the current grant (`grant_id`, `generation`, `predecessor_grant_id`, `roster_digest`) on the order read `apply-resume` already performs — asks `…-upreq-lifecycle-fulfillment-control-port` and `…-upreq-lifecycle-current-grant-read` (`UPSTREAM_REQS.md` §2.4, D-243) | The post-spawn hold barrier; the successor grant after resume |
+
+#### Subscriptions (BSS)
+
+- **Contract**: `cpt-cf-bss-orders-workflow-contract-owf-provisioning-intent`
+
+| Dependency Gear | Interface Used | Purpose |
+|-------------------|---------------|----------|
+| bss-subscriptions | Per-receiver attempt-ledger `pause` command for a generation and the receiver's attestation read (`…-upreq-receiver-attempt-ledger`, `UPSTREAM_REQS.md` §2.1, D-243) — `settle-receiver-pause` only | The receiver pause behind a post-spawn hold. Dispatch, re-read and reconcile stay slice 05's operations |
+
+#### Payments (BSS)
+
+| Dependency Gear | Interface Used | Purpose |
+|-------------------|---------------|----------|
+| bss-payments | none called by this slice | The authorization is slice 04's `evaluate-payment-auth-eligibility`; re-authorization arrives as the `reauthorize-requested` plugin-control signal that slice 04's arm consumes (`04 §3.3`), not through this slice |
+
+### 3.6 Interactions & Sequences
+
+#### Hold Then Resume with Remaining-Window Timer Preservation
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-hold-then-resume`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`
+
+The definition task → operation → record chain is fragment
+[`10 §3.6` (e)](./10-process-definition.md#e-hold-and-resume); the YAML is not repeated here.
+
+```mermaid
+sequenceDiagram
+    participant LC as Lifecycle
+    participant D as Definition (gateLoop fork)
+    participant H as apply-hold
+    participant R as apply-resume
+    participant G as gate-window port (03)
+    participant PS as owf_process_suspension
+    LC -->> D: OrderHeld (listen, hold arm wins; escalation wait cancelled)
+    D ->> H: ref + holdEventId, gateRefs
+    alt resume_ahead row exists
+        H ->> PS: close it (reconciled-out-of-order); pause nothing
+        H -->> D: reconciled-out-of-order → back to the stage
+    else no unsettled row
+        H ->> PS: insert open (partial unique index arbitrates), paused_gate_refs
+        H ->> G: pause_windows(gateRefs, hold) → remainder captured on the gate
+        H -->> D: suspended, suspensionRef
+    end
+    Note over D: resume wait: resume × amendment × cancel;<br/>lifetime wait (top level), barrier poll, overdue wait keep running;<br/>draft auto-void TTL untouched
+    LC -->> D: OrderResumed (listen)
+    D ->> R: ref + resumeEventId, suspensionRef
+    R ->> PS: close (resumed)
+    R ->> G: rearm_windows(paused_gate_refs, hold) → deadline re-based from the remainder
+    R ->> R: apply deferred failure outcomes in observation order
+    R -->> D: resumed, due, failedTaskRefs
+    D ->> D: failedTaskRefs non-empty → partial-failure arm (10 §3.6 c); else re-enter gateLoop: due → escalate-gate, else the PT30S tick
+```
+
+**Description**: Both events are keyed by their event id, and both have a durable dedup row below
+the key, so neither arrival order nor redelivery can leave the instance suspended with no resume
+able to release it. Only the escalation `wait` is cancelled by the hold arm; the barrier's
+conditions are re-evaluated by level after resume by `evaluate-activation-eligibility` (slice 04).
+
+**`apply-hold` — inside the operation**:
+
+1. [ ] - `p1` - Lock the `owf_process_instance` row; **IF** `phase` is `compensating` **RETURN** `holdOutcome = not-applicable` and record the event in `owf_step_log` - `inst-ah-phase`
+2. [ ] - `p1` - **IF** a `resume_ahead` row exists for the order: read the order through the Lifecycle PDP-authorized order read, and **IF** the read is unavailable answer `retryable-failure`; set the row `closed` with `closed_reason = reconciled-out-of-order`, `reconciled_by_event_id = holdEventId`, `closed_at = now()` — never `triggering_event_id`, which `UNIQUE (order_id, triggering_event_id)` reserves for the open row step 3 inserts under this same event (decision D-216); **IF** the order is not `on_hold`, **RETURN** `reconciled-out-of-order`; otherwise the early resume belonged to an earlier hold, so continue at step 3 and record this one (decision D-141) - `inst-ah-consume-ahead`
+3. [ ] - `p1` - Insert the `open` row with `triggering_event_id`, `suspended_at = now()` (database time) and `paused_gate_refs = gateRefs`; **IF** the partial unique index refuses it, **RETURN** `absorbed-duplicate` with the existing row's `suspensionRef` and change nothing - `inst-ah-insert`
+4. [ ] - `p1` - Set `owf_process_instance.suspended = true` and, **IF** `phase` is `started`, the phase projection `started → suspended` through the envelope; a `parked` phase stays `parked`, and its `unpark` restores `suspended` (`01 §3.7`) - `inst-ah-predicate`
+5. [ ] - `p1` - Call the gate-window port `pause_windows(correlationId, gateRefs, hold)`; the port captures each armed window's remainder into `owf_approval_gate.window_remaining_ms`. **IF** the instance has an `abandoned` pause control of this order version and its `receiver-control-abandoned` task is open, close the task through slice 07's closure port (`reason = receiver-control-abandoned`, `outcome = closed-by-progress`) and answer `abandonedControlClosed = true`: the hold the abandoned control could not finalize is now effective, and its resume will issue the grant (decision D-244) - `inst-ah-pause`
+6. [ ] - `p1` - **RETURN** `suspended` and `suspensionRef`; the envelope settles the key, writes `phase-transition` and commits once - `inst-ah-return`
+
+**`apply-resume` — inside the operation**:
+
+1. [ ] - `p1` - Lock the `owf_process_instance` row; resolve the open suspension (by `suspensionRef` if given, else the order's `open` row) - `inst-ar-resolve`
+2. [ ] - `p1` - **IF** `trigger = poll`: read the order through the Lifecycle PDP-authorized order read ([Lifecycle `08 §4.2`](../../../orders/docs/DESIGN.md#contract-08-4-2)); **IF** the read is unavailable answer `retryable-failure`; **IF** the order is `on_hold`, at a version other than the instance's, or terminal in a state other than `rejected` or `completed`: record nothing and **RETURN** `still-held` with `nextRound`, `due: false` and empty `failedTaskRefs` — a settled success of its round ([`01 §3.3` *Rounds and attempts*](./01-foundation.md#rounds-and-attempts-the-one-rule-for-re-invokable-operations)), because a cancelled, expired, failed or newer order is the lifecycle arm's to consume; a `rejected` or `completed` order at the instance's version is not held — Lifecycle reaches those states only through this gear's own reflection and completion report, from `pending_approval` and `in_fulfillment` ([Lifecycle `01 §4.3`](../../../orders/docs/features/01-foundation.md#contract-01-4-3) rows 10 and 13), so a Lifecycle resume came first and the read shows the hold over; it continues as below (decision D-183); **IF** no suspension is open, record nothing and **RETURN** `resumed-by-read` with `nextRound`, `due: false` and empty `failedTaskRefs`; otherwise continue at step 4 with `closed_reason = resumed-by-read` and no `resume_event_id`, and answer `resumed-by-read` with `nextRound` at step 8 (decision D-130). **IF** `trigger = event`: read the order the same way, and **IF** the read is unavailable answer `retryable-failure`; **IF** the order is `on_hold`, a later hold has overtaken this resume, so record nothing — close no row, insert no `resume_ahead` row — and **RETURN** `still-held` with no `nextRound`, `due: false` and empty `failedTaskRefs`; otherwise continue at step 3 (decision D-141) - `inst-ar-poll`
+3. [ ] - `p1` - **IF** none is open: **IF** the instance's latest closed suspension has `closed_reason = resumed-by-read` and no `resume_event_id`, set its `resume_event_id` and **RETURN** `absorbed-duplicate` — the event of a resume the poll already applied, never a resume ahead of the next hold; otherwise insert a `resume_ahead` row with `resume_event_id`; **IF** `UNIQUE (order_id, resume_event_id)` or the partial index refuses it, **RETURN** `absorbed-duplicate`; else **RETURN** `resume-ahead-recorded` with `due: false` and empty `failedTaskRefs` - `inst-ar-ahead`
+4. [ ] - `p1` - Close the row: `state = closed`, `closed_reason = resumed` (or `resumed-by-read` from step 2), `resume_event_id` (none from step 2), `resumed_at = closed_at = now()` - `inst-ar-close`
+5. [ ] - `p1` - Clear `owf_process_instance.suspended` and, **IF** `phase` is `suspended`, move the phase projection `suspended → started`; a `parked` phase stays `parked`, and its `unpark` then restores `started`. **IF** the order read of step 2 returned a grant of this order version newer than the open one recorded in `owf_fulfillment_grant`, record it through slice 05's grant port `record_grant` (`source = resume`) and set the instance's `reported` pause control `resumed`; a pre-spawn resume carries no grant and records none (Lifecycle D-198; decision D-243) - `inst-ar-predicate`
+6. [ ] - `p1` - Call the gate-window port `rearm_windows(correlationId, paused_gate_refs, hold)`; the port re-arms only windows whose `pause_causes` becomes empty, re-basing each one's escalation deadline from its stored remainder - `inst-ar-rearm`
+7. [ ] - `p1` - Apply every deferred failure outcome slice 05 recorded for the instance during the suspension, ordered by observation instant: take them through slice 05's deferral port `take_deferred_failures(correlationId)`, which returns them in that order, clears the deferral columns and marks each intent handed to the definition, in this unit of work ([`05 §3.7`](./05-provisioning-intents.md#37-database-schemas--tables)); advance each task to `failed` with the recorded reason through slice 04's transition function (`04 §3.7`). This slice writes neither table - `inst-ar-deferred`
+8. [ ] - `p1` - **RETURN** `resumed` (`resumed-by-read` with `nextRound` on `poll`), `due` (database time against the earliest re-based deadline; `false` when no window was re-armed) and the failed tasks as `failedTaskRefs` (`lineRef` + `reason`); one commit - `inst-ar-return`
+
+#### Post-Spawn Hold: Receiver Pause Before `OrderHeld`
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-post-spawn-hold-pause`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`
+
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant LC as Lifecycle
+    participant IN as Control intake
+    participant D as Definition (post-spawn stage fork)
+    participant P as settle-receiver-pause
+    participant SR as Subscriptions receivers
+    participant H as apply-hold
+    OP ->> LC: hold (post-spawn)
+    LC ->> LC: stage pause control; still-processing to the operator; no OrderHeld yet
+    LC ->> IN: stage_fulfillment_control(control_id, generation, roster digest)
+    IN -->> LC: accepted
+    IN -->> D: receiver-pause-requested (:plugin-control)
+    D ->> P: ref + controlRef, round
+    P ->> SR: pause(attempt, generation) per roster receiver
+    SR -->> P: attestation: fence id, each target active | draft | fenced-pending | none
+    alt every receiver attested, no target unresolved
+        P ->> LC: settle_fulfillment_control(control_id, barrier evidence)
+        LC ->> LC: final check; commit on_hold; emit OrderHeld
+        P -->> D: reported
+        LC -->> D: OrderHeld (hold arm)
+        D ->> H: ref + holdEventId → suspended
+    else not yet
+        P -->> D: pending, nextRound (the stage defers dispatch; the next tick calls again)
+    end
+```
+
+**Description**: The receivers' pause commit is where new receiver effects stop: an admission or
+confirmation that won the race belongs to the evidence as active, and one that lost is refused
+(Lifecycle D-198). The fenced admissions are recorded `fenced` on their intents in the
+settlement of the round that reported them. Resume is the existing path, plus one record: Lifecycle's
+resume transaction commits a successor grant before `OrderResumed`, and `apply-resume` records
+it from the order read it already makes, so wave 2 sends the fenced lines under the new
+generation once the barrier releases (`05 §3.6`). Lifecycle requires fresh commercial eligibility
+before any new activation; Subscriptions checks it at admission, and a refusal is an ordinary
+`wave2-activation-failed` (D-190 at Lifecycle).
+
+**`settle-receiver-pause` — inside the operation**:
+
+1. [ ] - `p1` - Lock the `owf_process_instance` row; resolve `controlRef` to the instance's `owf_fulfillment_control` row; **IF** `phase` is `compensating` or the control names another order version, mark the control `superseded` and **RETURN** `not-applicable` - `inst-rp-resolve`
+2. [ ] - `p1` - **IF** the control is `reported`, `abandoned` or `resumed`, **RETURN** its recorded outcome; otherwise set it `pausing` - `inst-rp-replay`
+3. [ ] - `p1` - Outside the lock, for each receiver of the roster of the grant whose generation the control names (slice 05; after an abandoned control that generation is already recorded `paused`, and its receivers answer the repeated pause at once, D-244) without a recorded attestation: send the pause command for the control's attempt and generation under its receiver key, then read its attestation; an unavailable receiver leaves its attestation absent - `inst-rp-fanout`
+4. [ ] - `p1` - **IF** any receiver has not attested, or an attested target is still unresolved: record the attestations received and **RETURN** `pending` with `nextRound` - `inst-rp-pending`
+5. [ ] - `p1` - In one unit of work: record every attestation; record each attested fenced admission `fenced` on its activation intent and the generation `paused` on the grant unless it is already recorded so, both through slice 05's ports; assemble the evidence (control, order, version, attempt, generation, roster digest, per-receiver fence identity, every target outcome) and store its digest on the control - `inst-rp-evidence`
+6. [ ] - `p1` - Call Lifecycle `settle_fulfillment_control` under the control key; on acceptance set the control `reported` and **RETURN** `reported`; on Lifecycle's terminal refusal or abandonment set it `abandoned` and **RETURN** `abandoned`, which the definition routes to the failure stage's `receiver-control-abandoned` task; on unavailability, a timeout or `still-processing` answer `retryable-failure` with the key left open — no success is inferred from a timeout - `inst-rp-report`
+
+#### Transient Outage: Retry-Then-Manual-Task
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-dependency-retry-escalate`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`, `cpt-cf-bss-orders-workflow-actor-owf-payments`, `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`
+
+**Retired as a slice-08 sequence by ADR-0011; the path now**: definition task → operation
+(`retryable-failure`, key left `open`, breaker refusal not counted as an attempt, `01 §4.5`) →
+plugin retry under the task's retry policy with the same key → on exhaustion of a wave call the
+stage's failure route → `create-manual-task` under `remediate`, or the unwind path under
+`fail-fast` ([`10 §3.6` (c)](./10-process-definition.md#c-partial-failure-manual-task-resume-or-compensate));
+on exhaustion of any other step call a fault of the invocation → the instance liveness pass's
+`invocation-dead` task, whose platform re-drive resumes at the faulted call
+([`10 §4.6`](./10-process-definition.md#46-protected-operations-are-never-inside-a-swallowing-catch), D-114).
+The step is marked failed exactly once, by the operation that owns it, and the partial-failure
+policy — never a retry component — decides whether a manual task follows.
+
+#### Approval Policy Park (Distinguished, Not This Slice's Path)
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-generic-approval-park-reference`
+
+**Use cases**: `cpt-cf-bss-orders-workflow-usecase-owf-approval-escalation`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-generic-approval`, `cpt-cf-bss-orders-workflow-actor-owf-fulfillment-operator`
+
+```mermaid
+sequenceDiagram
+    participant D as Definition
+    participant OV as obtain-verdict (03)
+    D ->> OV: ref
+    OV -->> D: unobtainable, nextRound (a settled round)
+    Note over D: park arm only (03 §4.5 item 2): park → arm-park-escalation → parkLoop;<br/>order remains submitted; Lifecycle submitted TTL NOT paused;<br/>the park loop's hold arm only records
+    D ->> D: every PT5M: arm-park-escalation until due → raise-overdue-escalation (park)
+```
+
+**Description**: Shown for boundary clarity only; the sequence is slice 03's and fragment
+`10 §3.6` (a). It is never entered from a retry-budget exhaustion, and a retry-budget exhaustion is
+never routed into it (§4.7 item 7).
+
+#### Workflow-Mediated Cancel with Compensation Evidence
+
+**ID**: `cpt-cf-bss-orders-workflow-seq-workflow-mediated-cancel`
+
+**Use cases**: `cpt-cf-bss-orders-workflow-usecase-owf-cancel-with-rollback`
+
+**Actors**: `cpt-cf-bss-orders-workflow-actor-owf-seller-operator`, `cpt-cf-bss-orders-workflow-actor-owf-orders-lifecycle`, `cpt-cf-bss-orders-workflow-actor-owf-subscriptions`
+
+The chain is fragment [`10 §3.6` (d)](./10-process-definition.md#d-cancel).
+
+```mermaid
+sequenceDiagram
+    participant SO as Seller Operator
+    participant GW as Control gateway (09)
+    participant D as Definition (cancel arm)
+    participant AC as authorize-cancel
+    participant F as run-cancellation-fence (06)
+    participant C as compensate-order (06)
+    participant O as report-outcome (06)
+    SO ->> GW: POST …/workflows/{orderId}/cancel
+    GW ->> GW: authorize, record request + authorization snapshot
+    GW -->> D: cancel-requested signal (:plugin-control)
+    D ->> AC: ref + cancelRequestRef
+    AC ->> AC: re-check snapshot at pre-fence
+    alt withdrawn
+        AC ->> AC: request refused authority-withdrawn, audited; no task (D-115); phase unchanged
+        AC -->> D: authorized = false → return to the arm's origin
+    else allowed
+        AC -->> D: authorized = true
+        D ->> F: fence (closes an open suspension: cancelled-from-hold)
+        D ->> C: reverse walk (re-check at pre-compensation)
+        D ->> O: outcome cancelled → Lifecycle workflow-cancel with evidence and the request's cancel reason
+    end
+```
+
+**Description**: No task on this path calls Lifecycle before `report-outcome`, and `report-outcome`
+refuses while any compensating action is outstanding. The **Seller Operator** is the only actor
+authorized to request this path (`09 §4.1`); a Fulfillment Operator who concludes an order must be
+cancelled uses the `escalate` task resolution, which routes the decision to a Seller Operator.
+
+**`authorize-cancel` — inside the operation**:
+
+1. [ ] - `p1` - Resolve `cancelRequestRef` to the accepted cancel's request record for this `correlationId`; **IF** absent or of another instance **RETURN** `permanent-failure` `not-found` - `inst-ac-resolve`
+2. [ ] - `p1` - **Fulfillment begun** (decision D-109). **IF** the plan row's `begin_fulfillment_committed_at` is null for the version: read the order through the Lifecycle PDP-authorized order read; **IF** it is not terminal: mark the request `refused`, create no task, **RETURN** `authorized = false` with `preFulfillment = true` — this gear has no seam to cancel an order before `in_fulfillment` ([Lifecycle `08 §4.3`](../../../orders/docs/DESIGN.md#contract-08-4-3): "via workflow-cancel only"), so the cancel is Lifecycle's ordinary cancel, whose `OrderCancelled` the definition's lifecycle arm consumes; **IF** the read is unavailable **RETURN** `retryable-failure`. A terminal order continues to step 3, and the run then reports no Lifecycle transition (`06 §3.6` `inst-ro-reauthorize`). Fulfillment never returns to `approved`, so a committed begin needs no read - `inst-ac-fulfillment`
+3. [ ] - `p1` - Run the cancel-authority port at `pre-fence`: rebuild the `SecurityContext` from the snapshot's subject fields (no bearer token) and request the snapshot's `(resource, action)` on the order with its current prefetched properties, constraints required - `inst-ac-decide`
+4. [ ] - `p1` - **IF** the PDP is unavailable **RETURN** `retryable-failure` (canonical 503) and write nothing but the envelope's step record - `inst-ac-outage`
+5. [ ] - `p1` - **IF** the PDP denies or the compiled scope matches zero rows: mark the request `refused` with `authority-withdrawn`, write the `step-completion` entry naming the refusal, create **no** manual task, leave `phase` unchanged, and **RETURN** `authorized = false` — nothing waits on a task here, because the definition returns to where the cancel was taken, and a Seller Operator who still means it submits a new cancel under a fresh authorization (decision D-115; the precedent is Lifecycle's late authorization conflict, a refusal with an audit entry and no automatic re-authorization, [Lifecycle `08 §4`](../../../orders/docs/features/08-read-and-authz.md) `08-read-and-authz.md:1286-1293`) - `inst-ac-withdrawn`
+6. [ ] - `p1` - **ELSE RETURN** `authorized = true`; the envelope settles the key and writes `step-completion` with the snapshot's subject as the recorded actor - `inst-ac-authorized`
+
+### 3.7 Database schemas & tables
+
+- [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-db-hold-and-cancel`
+
+#### Table: owf_process_suspension
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-owf-process-suspension`
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|--------------|
+| suspension_id | uuid | Primary key; the `suspensionRef` the definition carries |
+| order_id | uuid | Order under suspension |
+| order_version | bigint | Order version at suspension time |
+| resource_tenant_id | uuid | Resource recipient axis |
+| seller_tenant_id | uuid | Selling party axis; a suspension is visible on the seller-scoped operator surfaces |
+| state | enum | `open \| closed \| resume_ahead`. Transitions: `open → closed`, `resume_ahead → closed`. No other transition exists |
+| closed_reason | enum, nullable | `resumed` (by `apply-resume` on its event) · `resumed-by-read` (by `apply-resume` on `trigger: poll`, once the Lifecycle read shows the order no longer held; D-130) · `reconciled-out-of-order` (a `resume_ahead` row consumed by `apply-hold`) · `cancelled-from-hold` · `superseded-from-hold` · `terminated-from-hold` (through the suspension closure port, from `run-cancellation-fence`'s trigger). Null while `open` or `resume_ahead` |
+| triggering_event_id | uuid, nullable | `OrderHeld` event id of the suspension this row records; always null on a `resume_ahead` row, including after a hold consumes it (D-216) |
+| reconciled_by_event_id | uuid, nullable | The `OrderHeld` event id of the hold that consumed this `resume_ahead` row (`closed_reason = reconciled-out-of-order`); null otherwise. Kept apart from `triggering_event_id` so the open row that hold inserts in the same transaction is the only row carrying its id under `UNIQUE (order_id, triggering_event_id)` (D-216) |
+| resume_event_id | uuid, nullable | `OrderResumed` event id that closed (or pre-recorded) this row; on a `resumed-by-read` row null until that resume's event arrives and is attached to it (`inst-ar-ahead`) |
+| correlation_id | uuid | Process correlation id |
+| paused_gate_refs | uuid[], NOT NULL, DEFAULT `{}` | The `owf_approval_gate` rows whose windows `apply-hold` paused through the port; `apply-resume` re-arms exactly these. References only; the remainder is on the gate |
+| suspended_at | timestamptz, nullable | Suspension start (database time); null on a `resume_ahead` row |
+| resumed_at | timestamptz, nullable | Set only with `closed_reason` `resumed` or `resumed-by-read` |
+| closed_at | timestamptz, nullable | Set on every transition to `closed` |
+| attempt_id | text | Platform attempt identifier of the step call that last wrote the row (`01 §3.3` *Attempt identity*) |
+| created_at | timestamptz | Row creation instant; the retention index's column |
+
+**PK**: `suspension_id`
+
+**Constraints**: NOT NULL on `order_id`, `order_version`, `resource_tenant_id`,
+`seller_tenant_id`, `state`, `correlation_id`, `paused_gate_refs`, `attempt_id`, `created_at`;
+**`UNIQUE (order_id) WHERE state IN ('open', 'resume_ahead')`** — the rule "at most one unsettled
+suspension per order"; `UNIQUE (order_id, triggering_event_id) WHERE triggering_event_id IS NOT
+NULL`; `UNIQUE (order_id, resume_event_id) WHERE resume_event_id IS NOT NULL`; CHECK `state =
+'open'` implies `suspended_at IS NOT NULL AND triggering_event_id IS NOT NULL AND closed_at IS
+NULL`; CHECK `state = 'resume_ahead'` implies `resume_event_id IS NOT NULL AND suspended_at IS
+NULL AND triggering_event_id IS NULL`; CHECK `reconciled_by_event_id IS NOT NULL` implies
+`closed_reason = 'reconciled-out-of-order'` (D-216); CHECK `state = 'closed'` implies `closed_at IS NOT NULL AND closed_reason IS NOT NULL`;
+CHECK `(closed_reason IN ('resumed', 'resumed-by-read')) = (resumed_at IS NOT NULL)`.
+
+**Additional info**: **Ownership**: written only by `apply-hold` (insert of `open`, consumption of
+`resume_ahead`), `apply-resume` (close with `resumed` or `resumed-by-read`, insert of `resume_ahead`, attaching a late event to a `resumed-by-read` row) and the
+**suspension closure port** `close_suspension(correlationId, closedReason)` that
+`run-cancellation-fence` (slice 06) calls in fencing step 1 on an unwind entered while a row is
+`open` or `resume_ahead`. The port closes that row with `closedReason` and, in the same unit of
+work, clears `owf_process_instance.suspended`; on an instance with no such row it changes
+nothing. It clears the flag because an unwind is not paused by a hold (`06 §4.7` item 7): no
+compensating leg may see a hold predicate, and no `apply-resume` follows on the unwind path
+(decision D-180). **Mutability**: deliberately mutable (state and close columns).
+**Tenant axes**: `resource_tenant_id` (always) and `seller_tenant_id`. **Retention** ≥ 400 days —
+a suspension is audit evidence of who froze an order and for how long. Not partitioned
+(`01 §3.7`, D-104), so the one-open-suspension partial index and the event-id uniqueness hold across the
+whole table; purged row-wise through a `created_at` index. The event-id uniqueness constraints deduplicate redelivery below the idempotency
+key; they are deliberately **not** the at-most-one rule, which the partial index alone carries.
+The hold predicate the dispatch operations read is `owf_process_instance.suspended`
+([`01 §3.7`](./01-foundation.md#table-owf_process_instance)), set by `apply-hold` and cleared by
+`apply-resume`, each in the transaction that writes this table, and cleared by the suspension
+closure port in the fence's unit of work that closes the row; this table is the record, the
+column is the predicate.
+
+**Example**:
+
+| suspension_id | order_id | state | closed_reason |
+|---------------|----------|-------|---------------|
+| `a1b2...` | `ord-4471` | `open` | `NULL` |
+| `e5f6...` | `ord-4472` | `resume_ahead` | `NULL` |
+| `c9d0...` | `ord-4473` | `closed` | `cancelled-from-hold` |
+
+#### Table: owf_fulfillment_control
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-fulfillment-control`
+
+**Schema**:
+
+| Column | Type | Description |
+|--------|------|--------------|
+| control_ref | uuid | Primary key; the `controlRef` the signal and the definition carry |
+| control_id | uuid | Lifecycle's `orders_fulfillment_control.control_id`; the idempotency identity of the intake and of the evidence report |
+| kind | enum | `pause` (the only kind staged towards this gear, D-243) |
+| order_id | uuid | Order the control is for |
+| order_version | bigint | Committed order version |
+| correlation_id | uuid | The instance |
+| resource_tenant_id | uuid | Isolation column |
+| fulfillment_attempt_id | uuid | As Lifecycle staged it; equal to the grant's |
+| generation | integer | The generation to pause; equal to the open grant's at intake |
+| roster_digest | text | As staged; matched against the grant |
+| state | enum | `staged → pausing → reported → resumed`, `pausing → abandoned`, any non-terminal state `→ superseded` (an unwind's revoke took over). No other transition |
+| attestations | jsonb | Per receiver: fence identity, attested generation and each target's outcome; written as they arrive, never rewritten |
+| evidence_digest | text, nullable | Digest of the evidence reported; set with `reported` |
+| staged_at, reported_at, closed_at | timestamptz | Database time; the last on `resumed`, `abandoned` or `superseded` |
+| attempt_id | text | Platform attempt identifier of the call that last wrote the row |
+
+**PK**: `control_ref`
+
+**Constraints**: `UNIQUE (control_id)`; at most one row per order version in `staged`, `pausing`
+or `reported` (partial unique index), mirroring Lifecycle's one nonterminal control per order.
+
+**Additional info**: **Ownership**: inserted by the control intake; written by
+`settle-receiver-pause`, by `apply-resume` (`resumed`) and by slice 06's `run-cancellation-fence`
+(`superseded`, in fencing step 1). The dispatch operations of slice 05 read it (`inst-pi-held`).
+**Retention** ≥ 400 days, as the suspension: it is evidence of a hold's barrier. Not partitioned.
+
+#### Table: owf_timer_pause
+
+**ID**: `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause`
+
+**Retired by ADR-0011; responsibility now**: the pause of an escalation window is the `hold` member
+of `owf_approval_gate.pause_causes`, the remainder is `owf_approval_gate.window_remaining_ms`, and
+both are written only through slice 03's gate-window port
+([`03 §3.7`](./03-approval-execution.md#37-database-schemas--tables)); the once-only re-arm guard
+is the port's reference-counted `pause_causes` rule plus the idempotency key of `apply-resume`;
+the outage pause formerly stored here as `approval-outage` is `escalate-gate`'s in `probe` mode
+(`03 §4.2`). No other table restates the remainder.
+
+**Tables this slice loses**: `owf_timer_pause` (above). **Tables it keeps**:
+`owf_process_suspension`, with `closed_reason`, `closed_at`, `paused_gate_refs` and `attempt_id`
+added.
+
+### 3.8 Deployment Topology
+
+- [ ] `p3` - **ID**: `cpt-cf-bss-orders-workflow-topology-hold-and-cancel`
+
+No dedicated topology. The five operations are routes of the gear's internal step surface in the
+same process as every other slice's operations (`01 §3.8`); this slice runs no worker, owns no
+timer and subscribes to no topic.
+
+## 4. Additional context
+
+### 4.1 Keys and deduplication
+
+Every operation is keyed on the identifier of the fact it records — the `OrderHeld` event id, the
+`OrderResumed` event id, the cancel's request reference — so a replay by the plugin, a redelivery
+of the event to the `listen`, and an operator `retry` of the invocation all present the same key
+and are absorbed. Below the key, the event-id uniqueness constraints of §3.7 are the durable dedup
+store: a key that has been settled says an event was seen; the row says what it did, and only the
+second decides whether a second delivery with a *new* key (a key that aged out) may act.
+
+### 4.2 Arrival order
+
+The transport delivers at least once with no ordering guarantee. A duplicate hold is inert; a
+resume that overtakes its hold and is discarded leaves the order suspended forever.
+`cpt-cf-bss-orders-workflow-constraint-one-open-suspension` therefore reconciles by state — an
+early resume is a `resume_ahead` row, consumed by the hold that follows it — and §4.7 item 3
+requires the definition to consume that early resume. Because neither event names its hold, the
+two operations read the order before a resume closes a suspension or an early resume cancels a
+hold, and a resume that Lifecycle has already overtaken with a later hold closes nothing
+(decision D-141).
+
+### 4.3 The apply-time re-check
+
+`authorize-cancel` and the cancel-authority port implement the two re-check points of
+[`09 §4.4`](./09-read-and-authz.md#44-authorized-invocation-resource-ownership-and-apply-time-re-check-normative):
+before the fence and before the first compensating leg. The Lifecycle submission is not
+re-checked (D-84 as amended): after the walk it records a fact rather than performing a
+destructive act, and a refusal there would fault the invocation with every subscription already
+removed. A withdrawn authority at `pre-fence` refuses the request, audited, and raises no task:
+the process continues where the cancel was taken (decision D-115). At `pre-compensation` it
+raises exactly one `authority-withdrawn` manual task per request — created under the operation's
+key, so a replay does not create a second — because the claimed fence waits on it. Either way it
+leaves `owf_process_instance.phase` unchanged and **MUST NOT** enter `parked`. At `pre-compensation`
+the caller (slice 06) additionally marks the fence as awaiting
+re-authorization so no further leg dispatches; that column is slice 06's. A PDP outage is a
+retryable failure of the calling operation, never a default allow. The step-4 wording of
+`09 §4.4` ("retry the decision under the retry governor") is superseded by this rule, since the
+governor is retired (§3.2).
+
+### 4.4 Rebuild and fencing are referenced, never restated
+
+Rebuild of wave-1 drafts voided before the activation intent — by the auto-void TTL during a hold,
+during the date wait, or for any other cause — is slice 05's, inside the wave-2 dispatch path; after
+the spawn signal it obtains a replacement grant first (`replace-fulfillment-grant`, Lifecycle
+D-201). Cancellation fencing's five steps are slice 06's `run-cancellation-fence`, which revokes the
+receivers on a spawned order. This slice neither performs nor shadows either. The receiver pause
+of §2.2 is this slice's because it is the half of a hold that must happen before `OrderHeld`; the
+revoke is slice 06's because it is the first half of an unwind (decision D-243).
+
+### 4.5 The lifetime ceiling
+
+The bounded-lifetime hazard (§2.2) is backstopped by the 90-day top-level `wait` of `10 §3.6` (a),
+never by the overdue window, which cannot see an order cycled through hold and resume while still
+`pending_approval`. The value is a product decision carried openly (D-53); the mechanism does not
+depend on it: whatever ceiling is chosen, it is a literal of the definition version, is outside
+every hold arm, and parks the process for operator disposition rather than terminating it
+silently. After an unpark the process resumes its saved stage and checkpoint under a fresh `P90D`
+ceiling, and a second ceiling is a new round with its own escalation and task (D-121); a ceiling
+that fires anywhere inside an unwind does not park (no `compensating → parked` edge, `01 §3.7`)
+and the unwind continues, and one that fires in the verdict park loop does not park again
+(`10 §3.6` (a), (d)).
+
+### 4.6 Retired responsibilities
+
+- `cpt-cf-bss-orders-workflow-component-dependency-retry-governor` and its per-dependency budget
+  table — retired to the definition's task retry policy and 01's circuit-breaker rule (§3.2).
+- `cpt-cf-bss-orders-workflow-entity-timer-pause-record` and
+  `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause` — retired to slice 03's gate-window port
+  and `owf_approval_gate` (§3.7).
+- The Resume Coordinator's own barrier re-evaluation and its invocation of slice 05's dispatcher
+  — retired; the barrier is `evaluate-activation-eligibility` on the definition's poll arm.
+- The Cancel Mediator's construction of compensation evidence and its Lifecycle `workflow-cancel`
+  call — moved to slice 06's `report-outcome`.
+- The hold/resume event subscription — moved to the definition's `listen` arms.
+
+### 4.7 Constraints this slice places on the definition
+
+These are inputs to the validation rules of
+[`10 §2.2` *Validation before publish*](./10-process-definition.md#validation-before-publish) and
+the fence of [`10 §4.1`](./10-process-definition.md#41-the-fence)
+(`cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`).
+[`10 §4.7`](./10-process-definition.md#47-what-a-definition-change-may-and-may-not-do) *Slice constraints* maps each item below: an
+enforced item is refused through the rule or fence row it restates; every other item is
+canonical-definition guidance, which the canonical version carries and the behavioural gate of
+`10 §4.2` asserts for every candidate version (decision D-136).
+
+1. [ ] - `p1` - **Order in the hold arm.** In the arm that owns an escalation `wait`, `apply-hold` **<** `apply-resume`; after a resume the escalation re-check **MUST** take `apply-resume`'s `due` as its first answer and then return to the gate loop's fixed `PT30S` `waitProbe` tick followed by `escalate-gate` `mode: fire` (`03 §4.5` item 4); the definition **MUST NOT** carry a remaining duration or compute the deadline, and `apply-hold`'s answer carries none to consume - `inst-c8-hold-order`
+2. [ ] - `p1` - **Placement.** Every stage fork **MUST** carry a hold arm, except the ceiling wait (`awaitOperatorAfterPark`) and the unwind's forks, which carry none (`06 §4.7` item 7, `10 §3.6` (c), (d)), and the resume wait (`awaitResume`), which carries its resume `listen` instead because the hold it waits on is already recorded (`10 §2.2` rule 8, D-142); the park loop's hold arm only records (`holdPauses` false, `03 §4.5` item 6); the hold arm **MUST** be inside the competing fork whose escalation `wait` it pauses; the lifetime `wait` **MUST** be the top-level `lifetimeCeiling` branch outside every stage fork, and the overdue `wait` the top-level `overdueMonitor` branch; the barrier poll and the expected-fulfillment tick **MUST** be in branches a hold arm does not cancel (`10 §4.5`) - `inst-c8-placement`
+3. [ ] - `p1` - **Early resume.** Every stage fork that carries a hold arm **MUST** also carry a resume arm that calls `apply-resume` with a null `suspensionRef` and returns to the stage, so a resume delivered before its hold is recorded as `resume-ahead-recorded` and not lost; a resume answered `still-held` (Lifecycle holds the order again, decision D-141) **MUST** return to where the arm was taken — the stage, or the resume wait with `suspensionRef` kept — and close nothing; the definition **MUST** enter the resume wait only on `holdOutcome = suspended`. The arm covers a resume delivered before its hold's `listen`, not one delivered while the hold stage runs `admit-trigger` and `apply-hold` with no resume `listen` armed: that one depends on the platform retaining the event until the next matching `listen` (`10 §4.4` *Events delivered between listens*, D-124), and until then it is recovered by the poll of item 10 in whichever wait follows (D-130, D-133) - `inst-c8-early-resume`
+4. [ ] - `p1` - **References.** `apply-hold` **MUST** receive `holdEventId` and the `gateRefs` `open-gates` last returned (empty outside the approval stage); `apply-resume` **MUST** receive `resumeEventId` exported from the resume `listen` and the `suspensionRef` `apply-hold` returned, except on `trigger: poll` (item 10), which carries the `suspensionRef` and its round and no event; `authorize-cancel` **MUST** receive the `cancelRequestRef` of the `cancel-requested` signal. No other member is admitted (ADR-0013) - `inst-c8-refs`
+5. [ ] - `p1` - **Denied cancel.** On `authorized = false` — a withdrawn authority, or `preFulfillment` — the definition **MUST** return to the arm the cancel was taken from — the stage loop, or the resume wait when the cancel was taken from hold (the instance is still `suspended`) — and **MUST NOT** call `run-cancellation-fence`; `authorize-cancel` **MUST** precede `run-cancellation-fence` on every cancel path, including the one taken from the resume wait - `inst-c8-denied-cancel`
+6. [ ] - `p1` - **No swallowing.** `apply-hold`, `apply-resume` and `authorize-cancel` **MUST NOT** be inside a `catch` that continues the forward path (`10 §4.6`), and **MUST** carry a retry-only `catch`: a spent retry budget or timeout of any of them faults the invocation, which the instance liveness pass raises as the `invocation-dead` task, and **MUST NOT** proceed as though the hold, the resume or the authority had been recorded (decision D-114). The platform re-drive resumes at the faulted call under its still-open key; the task's fallback for a spent `authorize-cancel` is the cancel itself (`01 §4.16`) - `inst-c8-no-swallow`
+7. [ ] - `p1` - **Two resilience paths.** No arm **MAY** route an `unobtainable` verdict into a retry-then-failure arm, and no arm **MAY** route `retry-budget-exhausted` or a task timeout into the park arm (`cpt-cf-bss-orders-workflow-principle-resilience-distinct-from-park`) - `inst-c8-two-paths`
+8. [ ] - `p1` - **Deferred failures.** After `apply-resume`, a non-empty `failedTaskRefs[]` **MUST** route to the partial-failure arm of `10 §3.6` (c) before any dispatch operation is called. Before `begin-fulfillment` nothing is deferred, so the failure route **MUST** be decided on the interrupted stage first — none from the approval stage or the eligibility wait — and no walk from it **MAY** reach a dispatch operation without `begin-fulfillment` (`10 §4.1` Waves, decision D-143) - `inst-c8-deferred`
+9. [ ] - `p1` - **Signals handled.** This slice's operations are called from the `OrderHeld` and `OrderResumed` `listen`s, the `cancel-requested` signal and the poll of item 10 only; hold and resume **MUST NOT** be delivered as platform `suspend`/`resume` and cancel **MUST NOT** use the platform's generic `cancel` (`10 §4.4`) - `inst-c8-signals`
+10. [ ] - `p1` - **Resume poll.** The resume wait **MUST** carry a fixed `PT15M` `waitResumePoll` branch that calls `apply-resume` with `trigger: poll`, the `suspensionRef` and the round the previous poll of that suspension returned (`0` only for a suspension `apply-hold` has just answered anew, never merely on entering the wait, so a suspension already polled in another wait is not replayed from round 0 — decision D-150); `still-held` **MUST** return to the resume wait, and `resumed-by-read` **MUST** route as `resumed` does; the resume wait precedes `begin-fulfillment`, so its poll finds no deferred failure and carries no failure route (item 8, decision D-143). It is the stopgap for a resume lost between listens until the event-retention ask lands (`10 §4.4`, decisions D-124, D-130); it consumes no event, so no `admit-trigger` precedes it. **Every other wait that holds a recorded suspension** (decision D-133) **MUST** call the same poll while the definition holds a `suspensionRef`: the park loop, the held-reflection wait, the fulfillment waits (eligibility, expected time, barrier, held) and a wave deferral answered `deferReason = held`, on its own tick about every `PT15M`, and once on leaving the park loop. The definition **MUST** also call it once before `terminate-instance` after a rejection or a completion while it holds a `suspensionRef`, so a suspension a Lifecycle resume overtook is closed and the phase is `started` when `terminate-instance` runs (`01 §3.7`, decisions D-175, D-183). The call carries the same per-suspension round, and routes `failedTaskRefs[]` as item 8 does wherever `begin-fulfillment` has committed, except this pre-termination call, which routes none: after a rejection `begin-fulfillment` never ran, so nothing is deferred, and a completion means every line is activated, while a deferred failure stays on a task whose line is not, so its `failedTaskRefs[]` is empty (`10 §3.6` `pollBeforeReject`, `pollBeforeComplete`, decision D-183). A `resumed-by-read` answer **MUST** clear the definition's `suspensionRef`, so a closed suspension is not polled again. `gateLoop` and `outageArm` are exempt, because a hold there enters the resume wait - `inst-c8-resume-poll`
+
+11. [ ] - `p1` - **Receiver pause.** Every stage fork after the spawn signal — the wave and barrier waits, the held wait and the failure stage's waits — **MUST** carry the pause arm of `10 §3.6` (e), a `listen` on `receiver-pause-requested` whose route calls `settle-receiver-pause` and returns to the stage; `pending` **MUST** re-call under `nextRound` from the stage's own tick, `reported` and `not-applicable` return to the stage, and `abandoned` **MUST** route to the failure stage with an order-scope `receiver-control-abandoned` subject and `forceTask` set, so the task is opened under either policy. Its resolutions are a **fresh hold, then resume** at Lifecycle — the task wait keeps its hold and pause arms, so the new control and the `OrderHeld` it finalizes are consumed there, and `apply-hold` closes the task, after which the definition returns to the barrier loop, where dispatch defers until the resume records the successor grant — and **`cancel`** (the unwind, whose revoke supersedes the paused generation) (decision D-244). The arm **MUST NOT** be placed in the unwind's forks, where the revoke supersedes it, and `settle-receiver-pause` **MUST NOT** sit in a swallowing `catch` (item 6) (decision D-243) - `inst-c8-receiver-pause`
+
+`10 §3.6` (d) and (e) carry every item of this contract, including the stage-level resume arm (item 3),
+`resumeEventId` exported from the resume `listen` (item 4) and the return to the resume wait on a
+denied cancel taken from hold (item 5); `apply-resume` re-reads no drafts (the re-read is inside
+the wave-2 dispatch, §3.2) and the remainder is slice 03's gate-window port value, never
+returned to the definition. A 1.0.0 `wait` takes no runtime expression, so item 1's escalation
+re-check is the bounded loop of `10 §3.6` *Fixed waits and re-check loops*: `apply-resume`'s `due`
+first, then the `PT30S` tick.
+
+### 4.8 Cross-slice asks raised by this slice
+
+1. [ ] - `p2` - **01 §3.7** (now reflected there): a `suspended → parked` transition for `parkReason = lifetime-ceiling` with its `parked → suspended` unpark, and a `suspended → terminated` transition is not needed because every unwind from hold passes `compensating` (decision D-82) - `inst-x8-phase`
+2. [ ] - `p2` - **05**: the dispatch operations read `owf_process_instance.suspended` (not `owf_process_suspension`) and permit a same-key re-issue while suspended; `reconcile-intent` records a failure observed while suspended as deferred on `owf_provisioning_intent` with its observation instant - `inst-x8-05`
+3. [ ] - `p2` - **06**: `run-cancellation-fence` calls the suspension closure port in fencing step 1; `compensate-order` calls the cancel-authority port at `pre-compensation` on the cancel trigger and marks the fence awaiting re-authorization on `withdrawn`; `report-outcome` calls it at no point (D-84 as amended) - `inst-x8-06`
+4. [ ] - `p2` - **09**: the accepted cancel's request record, carrying the authorization snapshot, is declared as a table of 09 and is what `cancelRequestRef` names; `09 §4.4` step 4 is reworded per §4.3 - `inst-x8-09`
+5. [ ] - `p2` - **05** (now reflected there, D-243): the grant port `record_grant` and the closure write on `owf_fulfillment_grant`; the deferral port records an attested fenced admission `fenced`; the dispatch operations defer while an `owf_fulfillment_control` row is open - `inst-x8-05-grant`
+6. [ ] - `p2` - **09**: the PDP resource `gts.cf.bss.orders_workflow.fulfillment_control.v1~` × `stage` for Lifecycle's engine principal on the control intake, scoped to the order's resource tenant (D-243) - `inst-x8-09-control`
+
+**Platform capabilities assumed, as asks.** A `wait` whose duration is a runtime expression
+(Q-11 (i)); a `listen` inside a competing `fork` that does not lose an event delivered during
+cancellation (Q-11 (iv)); the `cancel-requested` plugin-control signal, its payload and its
+buffering until an arm consumes it (`10 §3.3`, `10 §4.4`); the platform `attempt_id` on the HTTP
+`call` (`01 §3.3`). None is asserted as a platform fact.
+
+## 5. Traceability
+
+- **PRD**: [PRD.md](../PRD.md) §6.3 Dependency Resilience, Process Suspension on Hold and Resume; §6.4 Compensation Execution on Permanent Failure (cancellation fencing, referenced)
+- **ADRs**: `cpt-cf-bss-orders-workflow-adr-fail-closed-verdict-park` (as amended by ADR-0011);
+  [`ADR/0011`](../ADR/0011-cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition.md)
+  `cpt-cf-bss-orders-workflow-adr-flow-as-platform-definition`;
+  [`ADR/0012`](../ADR/0012-cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps.md)
+  `cpt-cf-bss-orders-workflow-adr-definition-versioning-and-protected-steps`;
+  [`ADR/0013`](../ADR/0013-cpt-cf-bss-orders-workflow-adr-references-not-payloads.md)
+  `cpt-cf-bss-orders-workflow-adr-references-not-payloads`
+- **Definition**: [10-process-definition.md](./10-process-definition.md) §3.3 (signals), §3.6 (d)
+  `cpt-cf-bss-orders-workflow-seq-def-cancel` and (e) `cpt-cf-bss-orders-workflow-seq-def-hold-resume`
+  (the fragments that sequence these operations), §4.1 (the fence), §4.4 (signal semantics), §4.5
+  (the hold pattern and Q-11)
+- **Prior slices**: [01-foundation.md](./01-foundation.md) (envelope, phase projection, bounds,
+  circuit breaker, reason catalogue), [03-approval-execution.md](./03-approval-execution.md)
+  (gate-window port, `owf_approval_gate`), [04-fulfillment-plan.md](./04-fulfillment-plan.md)
+  (`evaluate-activation-eligibility`, `reauthorize-requested`),
+  [05-provisioning-intents.md](./05-provisioning-intents.md) (dispatch suppression, deferred
+  outcomes, draft re-read), [06-saga-and-compensation.md](./06-saga-and-compensation.md) (fence,
+  reverse walk, `report-outcome`), [07-manual-tasks.md](./07-manual-tasks.md) (manual-task
+  creator), [09-read-and-authz.md](./09-read-and-authz.md) (§4.4 authorized invocation and
+  apply-time re-check)
+- **Features**: none authored yet; feature decomposition follows this design set.
+- **Cross-gear reference**: [`06-workflow-seam.md`](../../../orders/docs/features/06-workflow-seam.md)
+  §3.3 (`workflow-cancel`, called by slice 06's `report-outcome`, not by this slice)
+- **Upstream asks**: `SUB-O11`–`SUB-O14` ([`../UPSTREAM_REQS.md`](../UPSTREAM_REQS.md) §2.1) no
+  longer apply to this slice directly; they are exercised by slice 05's and 06's operations. The
+  platform asks of §4.8 are registered in `UPSTREAM_REQS.md` §2.9.
+- **Retired here**: `cpt-cf-bss-orders-workflow-component-dependency-retry-governor`,
+  `cpt-cf-bss-orders-workflow-entity-timer-pause-record`,
+  `cpt-cf-bss-orders-workflow-dbtable-owf-timer-pause` (ADR-0011); the former dependency on
+  `cpt-cf-bss-orders-workflow-component-retry-backoff-controller` is retired with that component
+  (`01 §3.2`)
