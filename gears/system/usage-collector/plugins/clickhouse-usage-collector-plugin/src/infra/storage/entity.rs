@@ -1,5 +1,5 @@
 //! `ClickHouse` row structs mirroring `usage_records` and `usage_type_catalog`
-//! (see `migrations/0001_init.sql`).
+//! (see `migrator::m0001_init`).
 //!
 //! Column types match the DDL:
 //! - `UUID` → [`uuid::Uuid`] (see [`ch_uuid`])
@@ -276,7 +276,7 @@ impl TryFrom<HashMap<String, String>> for ValidatedMetadata {
     }
 }
 
-/// `Enum8('active' = 1, 'inactive' = 2)` — discriminants match `migrations/0001_init.sql`.
+/// `Enum8('active' = 1, 'inactive' = 2)` — discriminants match `usage_records.status` in `migrator::m0001_init`.
 ///
 /// Storage encoding only: the wire form is the lowercase string of
 /// [`UsageRecordStatus`]. Discriminants are permanent — never renumber or
@@ -419,7 +419,7 @@ impl From<(&UsageRecord, u64)> for UsageRecordRow {
     }
 }
 
-/// `Enum8('counter' = 1, 'gauge' = 2)` — discriminants match `migrations/0001_init.sql`.
+/// `Enum8('counter' = 1, 'gauge' = 2)` — discriminants match `usage_type_catalog.kind` in `migrator::m0001_init`.
 ///
 /// Storage encoding only: the wire form is the lowercase string of
 /// [`UsageKind`]. Discriminants are permanent — never renumber or reuse one;

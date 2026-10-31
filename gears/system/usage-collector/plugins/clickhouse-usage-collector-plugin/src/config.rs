@@ -4,6 +4,9 @@ use percent_encoding::percent_decode_str;
 use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 
+use crate::infra::storage::migrator::MIGRATIONS_TRACKER;
+use crate::infra::storage::topology::{CATALOG_TABLE, RECORDS_TABLE};
+
 /// Return `true` when `url` uses a plaintext `http` connection (no TLS).
 ///
 /// Used by [`ClickHousePluginConfig::validate`] to fail closed on an
@@ -177,6 +180,144 @@ pub struct ClickHousePluginConfig {
     pub vendor: String,
     /// Plugin priority (lower = higher priority).
     pub priority: i16,
+    /// Opt-in sharded cluster topology. `None` (the default) is the
+    /// single-node deployment: the plugin provisions and reconciles its own
+    /// schema. `Some` switches to the cluster schema — `Distributed` tables
+    /// named `usage_records` / `usage_type_catalog` over
+    /// `ReplicatedReplacingMergeTree` local tables — which the plugin
+    /// validates at startup. By default the operator provisions it (the DDL
+    /// is `migrator::render_ddl`, printed by the startup check when missing); with
+    /// [`ClickHouseClusterConfig::manage_schema`] the plugin runs the cluster
+    /// migrations itself.
+    pub cluster: Option<ClickHouseClusterConfig>,
+}
+
+/// Sharded-cluster topology for [`ClickHousePluginConfig::cluster`].
+///
+/// Every identifier here is interpolated into SQL (`ON CLUSTER <name>`,
+/// `ALTER TABLE <local> …`), so [`ClickHousePluginConfig::validate`] admits
+/// only plain `ClickHouse` identifiers.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClickHouseClusterConfig {
+    /// Cluster name as declared in the server's `remote_servers` config.
+    pub name: String,
+    /// Shard-local `ReplicatedReplacingMergeTree` table behind the
+    /// `usage_records` `Distributed` table. Must not be a name the plugin
+    /// creates itself (`usage_records`, `usage_type_catalog`,
+    /// `usage_collector_migrations`).
+    pub records_local_table: String,
+    /// Shard-local `ReplicatedReplacingMergeTree` table behind the
+    /// `usage_type_catalog` `Distributed` table. Same reserved names as
+    /// [`Self::records_local_table`].
+    pub catalog_local_table: String,
+    /// Optional `insert_quorum` sent with every insert: a replica count, or
+    /// `auto` (majority). Unset leaves the server default (no quorum), so an
+    /// insert is acknowledged once one replica of the target shard has it.
+    pub insert_quorum: Option<String>,
+    /// Run the cluster migrations (`ON CLUSTER` DDL) at startup instead of
+    /// expecting an operator-provisioned schema. Off by default: the plugin's
+    /// user then needs `CREATE` / `ALTER` and the `CLUSTER` privilege.
+    pub manage_schema: bool,
+    /// Budget for one cluster migration statement (the migrations and the TTL
+    /// reconciliation), in seconds. `ON CLUSTER` DDL waits for every host, so
+    /// it does not fit the request-path deadline. Sets the server-side
+    /// `send_timeout`, `receive_timeout` and `distributed_ddl_task_timeout`
+    /// (`migrator::migration_client`); the client-side deadline adds a grace.
+    pub migration_statement_timeout_secs: u64,
+}
+
+impl Default for ClickHouseClusterConfig {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            records_local_table: "usage_records_local".to_owned(),
+            catalog_local_table: "usage_type_catalog_local".to_owned(),
+            insert_quorum: None,
+            manage_schema: false,
+            migration_statement_timeout_secs: 3600,
+        }
+    }
+}
+
+/// Tables the plugin creates under fixed names, which a configured local
+/// table must not reuse.
+const RESERVED_TABLE_NAMES: [&str; 3] = [RECORDS_TABLE, CATALOG_TABLE, MIGRATIONS_TRACKER];
+
+/// Whether `s` is a plain `ClickHouse` identifier (`[A-Za-z_][A-Za-z0-9_]*`),
+/// safe to interpolate unquoted into SQL.
+pub(crate) fn is_plain_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+impl ClickHouseClusterConfig {
+    /// Client-side deadline for one cluster migration statement:
+    /// [`Self::migration_statement_timeout_secs`] plus the same grace
+    /// [`ClickHousePluginConfig::client_deadline`] adds, so the server's own
+    /// timeout fires first.
+    #[must_use]
+    pub fn migration_deadline(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.migration_statement_timeout_secs
+                .saturating_add(CLIENT_DEADLINE_GRACE_SECS),
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error string for an identifier that is not a plain
+    /// `ClickHouse` identifier, two local tables sharing a name, a local table
+    /// named after a table the plugin creates itself, an `insert_quorum` that is neither `auto` nor a positive integer, or a
+    /// zero migration statement timeout.
+    fn validate(&self) -> Result<(), String> {
+        for (field, value) in [
+            ("cluster.name", &self.name),
+            ("cluster.records_local_table", &self.records_local_table),
+            ("cluster.catalog_local_table", &self.catalog_local_table),
+        ] {
+            if !is_plain_identifier(value) {
+                return Err(format!(
+                    "{field} = `{value}` is not a plain ClickHouse identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*); it is interpolated into SQL"
+                ));
+            }
+        }
+        if self.records_local_table == self.catalog_local_table {
+            return Err(
+                "cluster.records_local_table and cluster.catalog_local_table must differ"
+                    .to_owned(),
+            );
+        }
+        // Exact match: `ClickHouse` table names are case-sensitive.
+        for (field, value) in [
+            ("cluster.records_local_table", &self.records_local_table),
+            ("cluster.catalog_local_table", &self.catalog_local_table),
+        ] {
+            if RESERVED_TABLE_NAMES.contains(&value.as_str()) {
+                return Err(format!(
+                    "{field} = `{value}` is reserved: the plugin creates a table of that name itself"
+                ));
+            }
+        }
+        if let Some(quorum) = &self.insert_quorum
+            && quorum != "auto"
+            && !quorum.parse::<u64>().is_ok_and(|n| n > 0)
+        {
+            return Err(format!(
+                "cluster.insert_quorum = `{quorum}` must be `auto` or a positive replica count"
+            ));
+        }
+        if self.migration_statement_timeout_secs == 0 {
+            return Err(
+                "cluster.migration_statement_timeout_secs must be greater than 0".to_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 impl Default for ClickHousePluginConfig {
@@ -197,6 +338,7 @@ impl Default for ClickHousePluginConfig {
             // registered under default config the choice is deterministic
             // rather than decided by types-registry iteration order.
             priority: 11,
+            cluster: None,
         }
     }
 }
@@ -347,6 +489,23 @@ impl ClickHousePluginConfig {
                  explicitly opt out for local development/test only"
                     .to_owned(),
             );
+        }
+        if let Some(cluster) = &self.cluster {
+            cluster.validate()?;
+            // An async insert into a `Distributed` table is buffered on the
+            // initiator, not on the shard that commits it, so neither the
+            // `wait_for_async_insert` durability ack nor the insert dedup
+            // token reaches the replicated table the way `async_insert`'s
+            // contract assumes. Refuse the combination rather than weaken it.
+            if self.async_insert {
+                return Err(
+                    "async_insert = true is not supported with a cluster topology: inserts go \
+                     through Distributed tables synchronously (distributed_foreground_insert = 1) \
+                     so the insert dedup token reaches the replicated shard table; set \
+                     async_insert = false"
+                        .to_owned(),
+                );
+            }
         }
         Ok(())
     }

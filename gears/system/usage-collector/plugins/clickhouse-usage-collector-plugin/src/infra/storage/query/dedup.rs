@@ -88,12 +88,10 @@ pub const LATEST_ONE: &str = " ORDER BY version DESC LIMIT 1";
 
 /// The `usage_records` sort key — the tuple `ReplacingMergeTree` collapses on.
 ///
-/// Kept beside the helpers so a call site cannot drift from
-/// `migrations/0001_init.sql`'s `ORDER BY (gts_id, tenant_id, created_at, id)`.
-///
-/// The *set* of columns is the row identity; their order is not. `LIMIT 1 BY`
-/// is order-insensitive, so this constant tracks the migration's column order
-/// for legibility rather than for correctness.
+/// The schema's `ORDER BY` is this constant (`migrator::m0001_init::RECORDS_ORDER_BY`), so
+/// the helpers here and the DDL cannot drift apart. The *set* of columns is
+/// the row identity; their order is not (`LIMIT 1 BY` is order-insensitive).
+/// The order is chosen for the primary index; see `migrator::m0001_init::RECORDS_ORDER_BY`.
 pub const RECORD_DEDUP_KEY: &[&str] = &["gts_id", "tenant_id", "created_at", "id"];
 
 /// The ids inside a scan's key range that carry a deactivation marker:

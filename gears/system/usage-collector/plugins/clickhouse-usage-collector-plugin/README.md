@@ -3,7 +3,7 @@
 ClickHouse storage-backend plugin that implements the Usage Collector `UsageCollectorPluginV1` SPI. It is the durable system of record for usage records and the usage-type catalog: the Usage Collector gateway gear discovers it via the types registry and dispatches all persistence to it. The plugin owns nothing of the host's domain logic — it is pure persistence over a ClickHouse columnar OLAP database, with no coordination backend: every write is a plain read-then-insert whose convergence rests on the engine's `insert_deduplication_token` window, `ReplacingMergeTree(version)` merges, and — on the hot `list`/`aggregate` reads — an anti-join against the deactivation-marker ids rather than read-time version resolution.
 
 ## Configuration
-
+P
 Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole seconds (repo convention).
 
 | Key | Default | Description |
@@ -12,9 +12,10 @@ Config maps to `ClickHousePluginConfig` (`src/config.rs`). Durations are whole s
 | `allow_insecure_http` | `false` | Explicit development/test opt-out that permits a plaintext `http://` `database_url`. Has no effect on a `https://` URL, and does not admit a non-HTTP scheme. **MUST NOT** be set in production. |
 | `request_timeout_secs` | `30` | Per-request timeout budget in seconds (reads and writes). Drives three mechanisms: the ClickHouse *server* settings `send_timeout`/`receive_timeout`; a *client-side* deadline 5s later on every individual ClickHouse await; and, while `async_insert` is on, the budget an `INSERT` has to absorb the server-side buffer flush (which is why startup validation requires ≥ 2s in that case). The client-side one is the backstop for a connection that is accepted and then never answered (or held open by an intermediary), which the server settings cannot bound because they never reach a server. Sized 5s apart so a responsive server's own timeout fires first and callers get its descriptive error. |
 | `async_insert` | `true` | Send single-row `usage_records` `INSERT`s with the ClickHouse settings `async_insert = 1` and `wait_for_async_insert = 1`, applied **per statement** so no `SELECT` is affected. The server buffers and coalesces concurrent inserts into shared parts instead of writing one small part per request, which is what keeps `ReplacingMergeTree` part count and merge pressure down under a request-shaped ingest stream — the write path is one `INSERT` per `create_usage_record`. `wait_for_async_insert = 1` is pinned, not separately configurable: without it an acknowledged record can be lost on a server restart, and `create_usage_record`'s dedup pre-read would stop seeing its own prior insert, so a retry would insert a second row under an idempotency key already in use. The flush wait is bounded by the server-side `async_insert_busy_timeout_ms` (adaptive 50-200ms on ClickHouse 24.x+) and is charged against `request_timeout_secs`, which must therefore be ≥ 2s while this is enabled (startup validation). The busy timeout itself is deliberately **not** exposed — it is a cluster-wide property the server adapts on its own; pin it in a ClickHouse settings profile for the plugin's DB user if you must. **Scope:** multi-row `INSERT`s (`create_usage_records` and the deactivation cascade) and all `usage_type_catalog` writes stay synchronous regardless of this setting — see [Asynchronous inserts](#asynchronous-inserts). **Dedup interaction:** every `usage_records` `INSERT` carries an `insert_deduplication_token`; ClickHouse enforces it on synchronous inserts, and on asynchronous inserts only for `Replicated*` tables, so with this on a racing duplicate single-record create is collapsed by `optimize_on_insert` when both land in one flush and by merge otherwise (visible twice to `list`/`aggregate` until then). Set to `false` for deterministic engine-side dedup of single creates at the cost of one part per request. |
-| `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; rows older than this are dropped via ClickHouse TTL. Must be in `(0, 100 years]`. Migration DDL defaults to 1 year; on every startup `ensure_retention_ttl` issues `ALTER TABLE … MODIFY TTL` when the live interval differs from this value — see [Retention window management](#retention-window-management). |
+| `retention_period_secs` | `31536000` (365d) | `usage_records` retention window; rows older than this are dropped via ClickHouse TTL. Must be in `(0, 100 years]`. Migration DDL creates the table with this value; on every startup `ensure_retention_ttl` issues `ALTER TABLE … MODIFY TTL` when the live interval differs from this value — see [Retention window management](#retention-window-management). |
 | `vendor` | `constructorfabric` | Vendor name for GTS instance registration. Must not be empty or blank; an empty value fails startup validation. |
 | `priority` | `11` | Plugin priority (lower = higher precedence when multiple plugins are registered). Defaults one below the TimescaleDB plugin's `10`, so with both registered under default config the TimescaleDB backend is selected deterministically; the host's selector breaks equal priorities by registration order, so give each instance a distinct value when overriding. |
+| `cluster` | _(unset)_ | Opt-in sharded cluster topology; unset means single node. When set, the plugin reads and writes through `Distributed` tables, which the operator provisions unless `manage_schema` is on: see [Sharded cluster deployment](#sharded-cluster-deployment). Sub-keys: `name` (required; the `remote_servers` cluster name), `records_local_table` (default `usage_records_local`), `catalog_local_table` (default `usage_type_catalog_local`), `insert_quorum` (optional; `auto` or a replica count), `manage_schema` (default `false`; run the cluster migrations at startup), `migration_statement_timeout_secs` (default `3600`; budget per cluster migration statement). All names must be plain identifiers, and the local tables must not be named `usage_records`, `usage_type_catalog` or `usage_collector_migrations`. Requires `async_insert = false`. |
 
 ```yaml
 gears:
@@ -42,10 +43,26 @@ The plugin's only gear dependency is `types-registry` (for the registration hand
 - Even with the override, `build_client` still emits a `tracing::warn!` on every plaintext connection so operators have a durable, per-startup signal that TLS is off.
 - The HTTPS transport is built from the rustls `CryptoProvider` the host process installed, not from the `clickhouse` crate's own connector (which hardcodes a non-FIPS `aws-lc-rs` provider). A server started with `--features fips` therefore gets FIPS-validated crypto on the ClickHouse path too, and this plugin needs no `fips` feature of its own. If no provider has been installed — i.e. `toolkit::bootstrap::init_crypto_provider` has not run — `build_client` fails rather than falling back.
 
+### Schema migrations
+
+The schema is managed by a versioned migration runner (`src/infra/storage/migrator.rs`), modelled on `sea-orm-migration`. sea-orm cannot run it, since neither `sea-query` nor `sea-orm-migration` has a ClickHouse backend. Each migration is a named step (`m0001_init`, `m0002_…`) with an `up`. The runner records the steps it applied in a tracking table and, on every start, runs only the steps that are not recorded yet.
+
+The DDL is built in Rust, with no SQL files, and one step list serves both topologies. Each step is a file under `src/infra/storage/migrator/` (`m0001_init.rs`, …) that declares logical tables once, with the design rationale for each column, key and setting. The migrator fills in the topology: plain `ReplacingMergeTree` tables on a single node; on a cluster, `ReplicatedReplacingMergeTree` local tables behind `Distributed` tables, all `ON CLUSTER`; plus the configured retention in the TTL. `src/infra/storage/ddl.rs` is the small `CREATE TABLE` builder behind it. sea-query cannot express `ENGINE`, `PARTITION BY`, `TTL`, `SETTINGS`, `ON CLUSTER` or skip indexes.
+
+| Topology | Steps | Tracking table |
+|---|---|---|
+| Single node | `m0001_init`, `m0002_insert_dedup_window` | `usage_collector_migrations` |
+| Cluster, with `cluster.manage_schema` | the same steps (`m0002_insert_dedup_window` is a no-op: replicated tables deduplicate on their own) | `usage_collector_migrations`, replicated to every host |
+
+- **Existing deployments.** A deployment from before the runner has its tables but no tracking table. Its first start runs every step as a no-op and records them.
+- **No lock.** ClickHouse has no advisory lock, so replicas that start together can run the same step concurrently. Every step must therefore be idempotent: `IF NOT EXISTS` DDL, read before alter, and guarded data movement. A duplicate record in the tracking table is harmless.
+- **Adding a step.** Add the next numbered file under `src/infra/storage/migrator/` (`m0003_….rs`), declare it in `migrator.rs`, and append it to the end of `migrations()` there. The same list serves both topologies. Never rename, reorder or remove a step that has shipped, because steps are matched by name. A one-time schema fix that a restart cannot apply today, such as the indexes below, belongs in a new step.
+- **Every start.** `ensure_retention_ttl` is not a step. It follows config, so it runs on every start, after the migrations.
+
 ### Retention window management
 
-- `migrations/0001_init.sql` creates `usage_records` with a fixed 1-year TTL default (`INTERVAL 31536000 SECOND`).
-- On every plugin `init`, after `apply_migrations`, `ensure_retention_ttl` reads the live TTL from `system.tables.create_table_query` and compares it to `retention_period_secs`. When missing or different, it runs:
+- `m0001_init` creates `usage_records` with a TTL of `retention_period_secs`.
+- On every plugin `init`, after the [schema migrations](#schema-migrations), `ensure_retention_ttl` reads the live TTL from `system.tables.create_table_query` and compares it to `retention_period_secs`. When missing or different, it runs:
 
       ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE
 
@@ -58,7 +75,7 @@ The plugin's only gear dependency is `types-registry` (for the registration hand
 
 Same class of gotcha for indexes (not TTL): everything in `CREATE TABLE IF NOT EXISTS` other than what `ensure_retention_ttl` and `ensure_insert_dedup_window` reconcile applies **only at first provisioning**.
 
-- `migrations/0001_init.sql` declares two `bloom_filter` data-skipping indexes on `usage_records` — `idx_records_id` on `id` and `idx_records_corrects_id` on `corrects_id` — so that `get_usage_record` (`WHERE id = ?`) and the deactivation cascade (`WHERE id = ? OR corrects_id = ?`) prune granules instead of scanning the table. The `ORDER BY` key is deliberately unchanged, since it is the dedup identity `ReplacingMergeTree` collapses on.
+- The schema declares two `bloom_filter` data-skipping indexes on `usage_records` — `idx_records_id` on `id` and `idx_records_corrects_id` on `corrects_id` — so that `get_usage_record` (`WHERE id = ?`) and the deactivation cascade (`WHERE id = ? OR corrects_id = ?`) prune granules instead of scanning the table. The `ORDER BY` key is deliberately unchanged, since it is the dedup identity `ReplacingMergeTree` collapses on.
 - A deployment provisioned **before** these indexes existed does not get them from a restart: the DDL re-runs as a no-op. Add them manually, then materialize them over the existing parts:
 
       ALTER TABLE usage_records ADD INDEX idx_records_id id TYPE bloom_filter GRANULARITY 1
@@ -70,12 +87,12 @@ Same class of gotcha for indexes (not TTL): everything in `CREATE TABLE IF NOT E
 
 ### Insert dedup window
 
-- `migrations/0001_init.sql` creates `usage_records` with `SETTINGS non_replicated_deduplication_window = 10000`. Every `usage_records` `INSERT` carries an `insert_deduplication_token` derived from its row ids, and the window is what lets ClickHouse drop a racing identical block instead of storing a duplicate row — `list` and `aggregate` no longer collapse duplicates at read time (see [Storage semantics](#storage-semantics)).
-- On every plugin `init`, after `ensure_retention_ttl`, `ensure_insert_dedup_window` reads the live setting from `system.tables.create_table_query` and, when it is missing or differs, runs:
+- The single-node schema creates `usage_records` with `SETTINGS non_replicated_deduplication_window = 10000`. Every `usage_records` `INSERT` carries an `insert_deduplication_token` derived from its row ids, and the window is what lets ClickHouse drop a racing identical block instead of storing a duplicate row — `list` and `aggregate` no longer collapse duplicates at read time (see [Storage semantics](#storage-semantics)).
+- The single-node migration step `m0002_insert_dedup_window` (`ensure_insert_dedup_window`) reads the live setting from `system.tables.create_table_query` and, when it is missing or differs, runs:
 
       ALTER TABLE usage_records MODIFY SETTING non_replicated_deduplication_window = 10000
 
-  `MODIFY SETTING` is metadata-only, so a deployment provisioned before the setting existed picks it up on its next restart with no manual step.
+  `MODIFY SETTING` is metadata-only, so a deployment provisioned before the setting existed picks it up on its next restart with no manual step. Like any step, it runs once and is then recorded, so a setting changed by hand later is not reverted.
 - On a table provisioned as `ReplicatedReplacingMergeTree` the setting is accepted but inert: `replicated_deduplication_window` governs, and asynchronous inserts are deduplicated by token too (`async_insert_deduplicate = 1` is already sent).
 - Verify the token is on the wire:
 
@@ -134,6 +151,57 @@ Same class of gotcha for indexes (not TTL): everything in `CREATE TABLE IF NOT E
   - For hard separation, run **two plugin instances** with distinct GTS priorities pointed at different endpoints (write primary vs. read replica). This is an operational workaround; the plugin does not split pools internally.
 - A future revision may split ingestion and query onto independently-pooled clients (additive, non-breaking to the SPI); until then this contention point is accepted and documented rather than assumed away.
 
+### Sharded cluster deployment
+
+Setting `cluster` switches the plugin from a self-provisioned single node to a sharded, replicated ClickHouse cluster. By default the schema belongs to the operator: the plugin creates and alters nothing and only checks the schema at startup. With `manage_schema: true` the plugin runs the cluster [schema migrations](#schema-migrations) itself and then applies the same check.
+
+```yaml
+gears:
+  clickhouse-usage-collector-plugin:
+    config:
+      database_url: "https://user:${CH_PASSWORD}@ch-node:8443/usage"
+      async_insert: false          # required in cluster mode
+      cluster:
+        name: "usage_cluster"      # from remote_servers
+        # insert_quorum: "auto"    # optional, see below
+        # manage_schema: true      # optional: the plugin runs the cluster DDL
+```
+
+**Layout.** `usage_records` and `usage_type_catalog` are `Distributed` tables. Behind them are shard-local `ReplicatedReplacingMergeTree` tables, `usage_records_local` and `usage_type_catalog_local`. `usage_records` is sharded by `cityHash64(tenant_id)` and `usage_type_catalog` by `cityHash64(gts_id)`. The tenant sharding key is required, not a tuning choice: a deactivation marker clones the row it marks, so the two always land on the same shard. That is what lets the plugin run the `id NOT IN (SELECT id … 'inactive')` anti-join of `list` and `aggregate` shard-locally (`distributed_product_mode = 'local'`).
+
+**Prerequisites (both modes).** On every node, configure the cluster in `remote_servers`, ClickHouse Keeper (`zookeeper`), and the `{shard}` / `{replica}` `macros`, then create the target database `ON CLUSTER`.
+
+**Provisioning by the operator (default).**
+1. Configure `cluster` and start the plugin. With the tables missing, startup fails, and the error ends with the cluster DDL for your configured cluster name, local table names and retention (`migrator::render_ddl`: every migration step's DDL, rendered for the cluster).
+2. Run that DDL once on any node in the target database (`clickhouse-client --database <db> --multiquery`). Its statements are `ON CLUSTER`, so this creates all four tables on every node.
+3. Start the plugin again.
+
+**Provisioning by the plugin (`manage_schema: true`).** Start the plugin. It runs the migration steps, which execute the same DDL, then reconciles the TTL `ON CLUSTER`. Each statement is bounded by `migration_statement_timeout_secs`, which also sets how long the server waits for every host to run an `ON CLUSTER` statement (`distributed_ddl_task_timeout`). The plugin's user then needs `CREATE TABLE`, `ALTER`, `INSERT` and `SELECT` on the plugin's tables and the `CLUSTER` privilege.
+
+The integration suite (`tests/cluster_integration_ch.rs`) covers both paths, and both use this same DDL.
+
+**Topology is fixed at first start.** A deployment runs on a single node or on a cluster from the start; the plugin does not migrate a single-node deployment's data to a cluster. If single-node `usage_records` / `usage_type_catalog` tables are found on a cluster, `CREATE TABLE IF NOT EXISTS` leaves them in place, and startup validation refuses to start because they are not `Distributed` tables.
+
+**Startup validation.** The plugin refuses to start, listing every problem, when:
+- the cluster is not declared in `system.clusters`;
+- any of the four tables is missing on any replica (checked through `clusterAllReplicas`, so an unreachable replica also fails startup);
+- a local table is not `ReplicatedReplacingMergeTree` or has a different `ORDER BY` or `PARTITION BY`;
+- a `Distributed` table targets another cluster, database or local table, or uses another sharding key.
+
+With an operator-provisioned schema, a `usage_records` TTL that differs from `retention_period_secs` only produces a warning; change it with `ALTER TABLE usage_records_local ON CLUSTER … MODIFY TTL`. With `manage_schema`, the plugin runs that `ALTER` itself. The single-node migration steps never run in cluster mode.
+
+**What the plugin sends.** Every request carries:
+- `distributed_product_mode = 'local'`;
+- `optimize_skip_unused_shards = 1`, so tenant-pinned reads touch one shard;
+- `distributed_foreground_insert = 1`, so an `INSERT` returns only after the owning shard committed it and the `insert_deduplication_token` is enforced by the replicated table's `replicated_deduplication_window`;
+- `insert_quorum`, when configured.
+
+`async_insert` must be `false`: an async insert is buffered on the initiator rather than on the shard that commits it, which bypasses that dedup and the durability ack.
+
+**Mutations.** `delete_usage_type` and its orphan sweep run `ALTER TABLE <local> ON CLUSTER <name> DELETE WHERE gts_id = ?` with `mutations_sync = 2`, waiting for every replica, because ClickHouse refuses mutations on a `Distributed` table. The plugin's database user therefore needs `ALTER DELETE` on the local tables and the `CLUSTER` privilege, besides `SELECT` and `INSERT` on all four tables.
+
+**Consistency.** A read through a `Distributed` table may be served by a replica that has not yet fetched a just-committed part, so read-your-writes across replicas is bounded by replication lag (ADR-0006 accepts this). That includes the dedup pre-read of a retried create. The insert dedup token still drops an exact retry, because dedup is coordinated through Keeper. Set `insert_quorum` (for example `auto`) to acknowledge an insert only once a quorum of the shard's replicas has it. This narrows the window at a write-latency cost.
+
 ## Storage semantics
 
 - **Deduplication** — application-level read-before-insert, then the engine's `insert_deduplication_token` window, then `ReplacingMergeTree(version)` merges as the backstop. Nothing serializes concurrent creates: two callers with the same dedup key can both pass the pre-read and both insert, and both get `Ok`. Because the record `id` is derived from the dedup tuple, both inserts carry the same token and — on a synchronous insert — the engine drops the second block (**first-writer-wins**, no `IdempotencyConflict`). With `async_insert` on (the default) the twins collapse through `optimize_on_insert` when they land in one flush and otherwise share a sort key until the merge; `get` resolves to the higher `version` either way, while `list`/`aggregate` see the twin twice until then. Once the earlier row is visible, a later create sees it and the usual absorb / conflict rules apply. See DESIGN.md §3.6.
@@ -142,10 +210,10 @@ Same class of gotcha for indexes (not TTL): everything in `CREATE TABLE IF NOT E
   For strict cross-replica read-your-writes, configure ClickHouse's native `insert_quorum` write-quorum setting on the server; this plugin does not enable it by default and enabling it incurs a proportional write-latency cost — see DESIGN.md §3.8.
 - **Workload isolation** — the ClickHouse client/pool is shared by both the ingestion and query paths (v1 design), so query bursts can degrade ingestion throughput; see [Workload isolation and pool contention](#workload-isolation-and-pool-contention).
 - **Referential integrity** — application-emulated on both sides, with a known gap on the delete side. Create side: `create_usage_record(s)` checks that every referenced `gts_id` exists in `usage_type_catalog` (an existence read, which needs no version resolution) and rejects absent ones with `UsageTypeNotFound`. Delete side: `delete_usage_type` runs an existence read, then a capped reference probe over `usage_records` (refusing with `UsageTypeReferenced` → HTTP 409 if any row references the type), then removes the catalog row with `ALTER TABLE … DELETE` under `mutations_sync = 1`, then re-probes and sweeps any record that landed in between. **This is not race-free.** ClickHouse has no foreign key, so an insert whose own catalog check passed before the catalog row was removed can commit after the sweep and orphan a row. The reference TimescaleDB plugin closes this window with a native `FOREIGN KEY … ON DELETE RESTRICT` on `usage_records.gts_id`, admitting no window in which a concurrent `create_usage_record` can reference a type being deleted; this plugin narrows that window instead of closing it. The window is bounded, not closed: the catalog row is deleted **before** the sweep on purpose, so from that moment the insert-time check refuses new records on its own. `async_insert` (the default) widens the window to the server-side flush interval. Watch `uc_clickhouse_orphaned_reference_detected_total` — a non-zero rate means deletes are being run against types with live ingest. Prefer deleting a type while no ingest for it is in flight. See DESIGN.md §3.6.
-- **Retention** — ClickHouse TTL clause on `usage_records`: fixed 1-year default in `CREATE TABLE`, then reconciled to `retention_period_secs` on every startup via `ensure_retention_ttl` (`ALTER TABLE … MODIFY TTL` when needed) — see [Retention window management](#retention-window-management).
+- **Retention** — ClickHouse TTL clause on `usage_records`: `retention_period_secs` in `CREATE TABLE`, then reconciled to `retention_period_secs` on every startup via `ensure_retention_ttl` (`ALTER TABLE … MODIFY TTL` when needed) — see [Retention window management](#retention-window-management).
 - **Error classification** — a failure is reported as retryable `Transient` when the client could not reach ClickHouse at all (network, timeout, compression), when the client-side deadline expires, or when ClickHouse itself answers with one of a fixed allowlist of overload/backpressure codes: `159` `TIMEOUT_EXCEEDED`, `202` `TOO_MANY_SIMULTANEOUS_QUERIES`, `203` `NO_FREE_CONNECTION`, `209` `SOCKET_TIMEOUT`, `210` `NETWORK_ERROR`, `252` `TOO_MANY_PARTS`, `279` `ALL_CONNECTION_TRIES_FAILED`, `285` `TOO_FEW_LIVE_REPLICAS`, `999` `KEEPER_EXCEPTION` — plus HTTP `502`/`503`/`504` when ClickHouse returned no readable body (typically an intermediary). Anything else, including `241` `MEMORY_LIMIT_EXCEEDED` (permanent for an over-large batch, so retrying it would loop) and `319` `UNKNOWN_STATUS_OF_INSERT`, is `Internal`. Only the unreachable-backend cases (and a client-side deadline expiry, which is classified the same way) clear the `uc_clickhouse_ready` gauge: a server that answers with backpressure is degraded, not down. The gauge is re-armed by the next successful request, so it recovers without a restart; alert on `uc_clickhouse_ready == 0` with a `for:` window so a single slow request does not page. It is never re-armed after the gear's cancellation token fires.
 - **Deactivation** — applied as a single multi-row `INSERT` of versioned marker rows (depth-1 only); no `UPDATE` or `ALTER TABLE … DELETE` is issued on the request path. A plain retry of a record that races its own deactivation and misses the original row at pre-read can re-insert it as active with a higher version (the gateway's caller-side active-target check protects compensations, not retries); see DESIGN.md §3.6.
-- **Schema** — provisioned idempotently at startup via `CREATE TABLE IF NOT EXISTS`; indexes still apply only at first provisioning (see [Data-skipping index management](#data-skipping-index-management)), while TTL is updated on startup when config differs.
+- **Schema** — single node: versioned, idempotent migration steps at startup (see [Schema migrations](#schema-migrations)); cluster: operator-provisioned, or plugin-managed with `manage_schema`, and validated either way (see [Sharded cluster deployment](#sharded-cluster-deployment)); indexes still apply only at first provisioning (see [Data-skipping index management](#data-skipping-index-management)), while TTL is updated on startup when config differs.
 
 ## SPI conformance
 
@@ -156,6 +224,8 @@ The crate implements `usage_collector_sdk::UsageCollectorPluginV1` (via `Storage
 The real-DB suites are gated behind the `clickhouse` feature and require Docker for a ClickHouse image:
 
     cargo test -p cf-gears-clickhouse-usage-collector-plugin --features clickhouse
+
+This includes `tests/cluster_integration_ch.rs`, which boots a two-shard cluster (two nodes plus embedded Keeper on a private Docker network) per test. Each test either provisions the cluster from the operator DDL (`migrator::render_ddl`) or leaves it bare for the managed migrations.
 
 Without the feature, only unit tests run (no Docker needed):
 

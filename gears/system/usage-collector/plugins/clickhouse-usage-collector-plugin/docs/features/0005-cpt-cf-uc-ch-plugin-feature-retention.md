@@ -33,7 +33,7 @@
 
 ### 1.1 Overview
 
-Own `usage_records` storage-growth bounding via ClickHouse's native `TTL` clause — both the `retention_period_secs` config field and the mechanism by which it takes effect at runtime. Foundation's Schema Migration creates `usage_records` with a fixed 1-year TTL default; on every `init`, `ensure_retention_ttl` compares the live TTL interval to `retention_period_secs` and issues `ALTER TABLE … MODIFY TTL` when they differ.
+Own `usage_records` storage-growth bounding via ClickHouse's native `TTL` clause — both the `retention_period_secs` config field and the mechanism by which it takes effect at runtime. Foundation's Schema Migration creates `usage_records` with a TTL of `retention_period_secs`; on every `init`, `ensure_retention_ttl` compares the live TTL interval to `retention_period_secs` and issues `ALTER TABLE … MODIFY TTL` when they differ.
 
 ### 1.2 Purpose
 
@@ -60,7 +60,7 @@ Data Retention owns the config field, its validation bounds, the semantics of th
 
 ### 1.5 Out of Scope
 
-- The DDL runner call site (`apply_migrations`) — Feature 1 (`cpt-cf-uc-ch-plugin-feature-foundation`); this feature owns `retention_period_secs` semantics and `ensure_retention_ttl`.
+- The migration runner call site (`run_migrations`) — Feature 1 (`cpt-cf-uc-ch-plugin-feature-foundation`); this feature owns `retention_period_secs` semantics and `ensure_retention_ttl`.
 - Per-row expiry timing and background merge scheduling — ClickHouse-internal; not a plugin-owned code path.
 - `usage_type_catalog` retention — this table is reference data and is never subject to TTL eviction.
 
@@ -74,7 +74,7 @@ Data Retention owns the config field, its validation bounds, the semantics of th
 
 **Success Scenarios**:
 
-- Valid `retention_period_secs` configured: after `apply_migrations`, `ensure_retention_ttl` reconciles the live TTL to the configured window; ClickHouse applies eviction in background merges.
+- Valid `retention_period_secs` configured: after `run_migrations`, `ensure_retention_ttl` reconciles the live TTL to the configured window; ClickHouse applies eviction in background merges.
 - Re-start with the same `retention_period_secs`: reconciliation is a no-op when the live interval already matches.
 - Re-start with a different `retention_period_secs`: `ALTER TABLE … MODIFY TTL` updates the live clause.
 
@@ -87,7 +87,7 @@ Data Retention owns the config field, its validation bounds, the semantics of th
 
 1. [ ] - `p2` - Operator sets `retention_period_secs` in the gear config YAML - `inst-ch-ret-1`
 2. [ ] - `p2` - `ClickHousePluginConfig::validate` checks the value is in `(0, MAX_RETENTION_SECS]`; on failure → **RETURN** config validation error, `init` fails fast - `inst-ch-ret-2`
-3. [ ] - `p2` - `apply_migrations` runs `CREATE TABLE IF NOT EXISTS usage_records … TTL … INTERVAL 31536000 SECOND` (fixed 1-year default) - `inst-ch-ret-3`
+3. [ ] - `p2` - migration step `m0001_init` runs `CREATE TABLE IF NOT EXISTS usage_records … TTL … INTERVAL <retention_period_secs> SECOND` - `inst-ch-ret-3`
 4. [ ] - `p2` - `ensure_retention_ttl` reads `create_table_query` from `system.tables` and parses the live TTL interval - `inst-ch-ret-4`
 5. [ ] - `p2` - **IF** TTL missing or parsed seconds ≠ `retention_period_secs` **OR** live clause still wraps `created_at` in `toDateTime` — issue `ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE` - `inst-ch-ret-5`
 6. [ ] - `p2` - ClickHouse applies the TTL eviction asynchronously in background merges — no request-path row deletion occurs - `inst-ch-ret-6`
@@ -137,7 +137,7 @@ The system **MUST** expose `retention_period_secs` as a required field in `Click
 
 - [x] `p2` - **ID**: `cpt-cf-uc-ch-plugin-dod-retention-ttl-reconciliation`
 
-The `migrations/0001_init.sql` DDL **MUST** bake a fixed 1-year TTL (`INTERVAL 31536000 SECOND`) into `CREATE TABLE IF NOT EXISTS usage_records`. After migration, `ensure_retention_ttl` **MUST** reconcile the live TTL to `retention_period_secs`, issuing `ALTER TABLE … MODIFY TTL` when the parsed interval differs or TTL is missing.
+The migration DDL (`m0001_init`) **MUST** bake the configured `retention_period_secs` as the TTL of `CREATE TABLE IF NOT EXISTS usage_records`. After migration, `ensure_retention_ttl` **MUST** reconcile the live TTL to `retention_period_secs`, issuing `ALTER TABLE … MODIFY TTL` when the parsed interval differs or TTL is missing.
 
 **Implements**: `cpt-cf-uc-ch-plugin-algo-retention-ttl-reconciliation`, `cpt-cf-uc-ch-plugin-flow-retention-ttl-provisioning`
 
@@ -161,7 +161,7 @@ The plugin README **MUST** document:
 ## 6. Acceptance Criteria
 
 - [x] `retention_period_secs` defaults to 31536000 (365 days) and is validated to `(0, MAX_RETENTION_SECS]`; zero or over-range returns a descriptive config validation error that prevents `init` from completing.
-- [x] `migrations/0001_init.sql` contains a literal 1-year TTL on `usage_records` (no `{retention_period_secs}` placeholder).
+- [x] `m0001_init` creates `usage_records` with a TTL of `retention_period_secs` on both topologies, reconciled to config on every later start.
 - [x] `ensure_retention_ttl` updates the live TTL when config differs and is a no-op when it already matches.
 - [x] `usage_type_catalog` has no TTL clause; it is never retention-bounded.
 - [x] The plugin README documents startup TTL reconciliation and async eviction.

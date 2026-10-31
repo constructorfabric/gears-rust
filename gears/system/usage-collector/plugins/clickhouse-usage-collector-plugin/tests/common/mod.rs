@@ -28,10 +28,12 @@ use usage_collector_sdk::{
 
 use clickhouse_usage_collector_plugin::infra::metrics::Metrics;
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
-use clickhouse_usage_collector_plugin::infra::storage::pool::{
-    apply_migrations, build_client, ensure_insert_dedup_window, ensure_retention_ttl,
+use clickhouse_usage_collector_plugin::infra::storage::migrator::{
+    MigrationOptions, run_migrations,
 };
+use clickhouse_usage_collector_plugin::infra::storage::pool::{build_client, ensure_retention_ttl};
 use clickhouse_usage_collector_plugin::infra::storage::record_store::ChRecordStore;
+use clickhouse_usage_collector_plugin::infra::storage::topology::Topology;
 
 /// Live harness: one test's own database on the shared `ClickHouse` server.
 pub struct ChHarness {
@@ -101,8 +103,11 @@ async fn bring_up_inner() -> anyhow::Result<ChHarness> {
 
     let mut last_err = None;
     for _ in 0..20u8 {
-        match apply_migrations(&client, TEST_REQUEST_TIMEOUT).await {
-            Ok(()) => {
+        let opts = MigrationOptions {
+            retention_period_secs: cfg.retention_period_secs,
+        };
+        match run_migrations(&client, &Topology::SingleNode, opts, TEST_REQUEST_TIMEOUT).await {
+            Ok(_) => {
                 last_err = None;
                 break;
             }
@@ -116,8 +121,13 @@ async fn bring_up_inner() -> anyhow::Result<ChHarness> {
         return Err(e);
     }
 
-    ensure_retention_ttl(&client, cfg.retention_period_secs, TEST_REQUEST_TIMEOUT).await?;
-    ensure_insert_dedup_window(&client, TEST_REQUEST_TIMEOUT).await?;
+    ensure_retention_ttl(
+        &client,
+        &Topology::SingleNode,
+        cfg.retention_period_secs,
+        TEST_REQUEST_TIMEOUT,
+    )
+    .await?;
 
     let cancel = CancellationToken::new();
     Ok(ChHarness {
@@ -262,7 +272,13 @@ pub fn catalog_store(h: &ChHarness) -> ChCatalogStore {
 /// (e.g. [`unreachable_client`]).
 #[must_use]
 pub fn catalog_store_over(h: &ChHarness, client: clickhouse::Client) -> ChCatalogStore {
-    ChCatalogStore::new(client, h.cancel.clone(), metrics(), TEST_REQUEST_TIMEOUT)
+    ChCatalogStore::new(
+        client,
+        h.cancel.clone(),
+        metrics(),
+        TEST_REQUEST_TIMEOUT,
+        Topology::SingleNode,
+    )
 }
 
 /// A client pointed at a port with nothing listening, so every statement fails

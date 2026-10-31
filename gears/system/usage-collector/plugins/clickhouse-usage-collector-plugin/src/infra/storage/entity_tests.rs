@@ -187,7 +187,7 @@ fn usage_record_status_round_trips_through_code_form() {
     }
 }
 
-// The discriminants are the on-disk `Enum8` values in `migrations/0001_init.sql`
+// The discriminants are the on-disk `Enum8` values in `migrator::m0001_init`'s column types
 // and must never change; the From/Into round-trips above would still pass if
 // they were swapped, so pin them directly.
 #[test]

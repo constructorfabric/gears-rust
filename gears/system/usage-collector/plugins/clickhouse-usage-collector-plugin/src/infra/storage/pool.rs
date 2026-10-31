@@ -1,17 +1,19 @@
 //! `ClickHouse` connection-pool bootstrap and schema migration.
 //!
-//! Exposes five entry points:
+//! Exposes six entry points:
 //! - [`build_client`] — constructs and configures the `clickhouse::Client`.
 //!   Its transport comes from `new_base_client`, the one place this plugin
 //!   chooses an HTTP stack (and therefore a crypto provider).
 //! - `configure_insert` — applies this plugin's per-`INSERT` timeouts and
 //!   settings (including the insert dedup token) to a freshly acquired
 //!   `Insert` handle.
-//! - [`apply_migrations`] — runs the embedded DDL against the connected
-//!   `ClickHouse` instance.
+//! - `exec_statement` — runs one migration DDL statement against the
+//!   connected `ClickHouse` instance under a deadline; `migrator` calls it.
 //! - [`ensure_retention_ttl`] — reconciles `usage_records` TTL with config.
 //! - [`ensure_insert_dedup_window`] — retrofits the `usage_records` insert
-//!   dedup window onto tables created before the migration carried it.
+//!   dedup window onto tables created before the migration carried it (the
+//!   body of the single-node `m0002_insert_dedup_window` step).
+//! - [`validate_cluster_schema`] — checks the cluster schema at startup.
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -22,6 +24,10 @@ use secrecy::{ExposeSecret, SecretString};
 use url::Url;
 
 use crate::config::{ClickHousePluginConfig, decode_userinfo, is_plaintext_url};
+use crate::infra::storage::migrator::{self, m0001_init, table};
+use crate::infra::storage::topology::{
+    CATALOG_SHARDING_KEY, CATALOG_TABLE, RECORDS_SHARDING_KEY, RECORDS_TABLE, Topology,
+};
 
 /// Endpoint components split out of a `database_url` for the `clickhouse`
 /// crate's connection-configuration methods.
@@ -107,13 +113,8 @@ fn parse_endpoint(database_url: &str) -> anyhow::Result<ParsedEndpoint> {
     })
 }
 
-/// Embedded schema migration SQL.
-///
-/// Relative path from this file (`src/infra/storage/pool.rs`) three levels
-/// up to the crate root, then into `migrations/`.
-pub(crate) const MIGRATION_SQL: &str = include_str!("../../../migrations/0001_init.sql");
-
-/// Default `usage_records` TTL baked into [`MIGRATION_SQL`] (1 year in seconds).
+/// Default `usage_records` TTL the single-node schema is created with (1 year
+/// in seconds); `ensure_retention_ttl` then reconciles it with config.
 pub(crate) const DEFAULT_RETENTION_SECS: u64 = 365 * 86_400;
 
 /// TCP keepalive applied to the `ClickHouse` HTTP connector.
@@ -264,6 +265,13 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::
         client = client.with_database(database);
     }
 
+    // Cluster topology only: the `Distributed`-table settings every request
+    // needs (see `Topology::client_settings`). Client-wide rather than per
+    // call site, so no query path can be left without them.
+    for (name, value) in Topology::from_config(cfg).client_settings() {
+        client = client.with_setting(name, value);
+    }
+
     Ok(client)
 }
 
@@ -326,165 +334,29 @@ pub(crate) fn configure_insert<T>(
     insert
 }
 
-/// Strip `--` SQL comments, returning only the executable source.
+/// Execute one migration DDL statement, bounded by `deadline`.
 ///
-/// Comments must be removed *before* splitting on `;`: this migration file's
-/// prose comments use semicolons as ordinary punctuation (e.g. "...has no
-/// `pg_advisory_lock` equivalent; unlike the reference plugin..."), and a
-/// naive `sql.split(';')` treats that mid-sentence semicolon as a statement
-/// boundary. The resulting fragment starts mid-comment *without* its `--`
-/// prefix (which was left behind in the previous split chunk), so a
-/// per-statement "is this comment-only?" check can't catch it — `ClickHouse`
-/// then rejects the fragment as a syntax error. Stripping every `--` comment
-/// first removes the semicolon from the executable text entirely, so it can
-/// never become a false statement boundary.
-///
-/// A `--` is also stripped when it trails executable text on the same line
-/// (`DDL -- trailing comment`), so a comment added that way to the migration
-/// file cannot smuggle a semicolon into the executable source. Quote state is
-/// tracked while scanning — `''` escapes included, matching
-/// [`split_sql_statements`] — so a `--` inside a `COMMENT '...'` column
-/// annotation is left untouched.
-///
-/// # Limitations
-///
-/// This is a deliberately minimal scanner for one known input
-/// (`migrations/0001_init.sql`), not a general SQL lexer. Only `--` line
-/// comments and single-quoted strings are recognized; `/* … */` block comments
-/// and backtick- or double-quoted identifiers are not. A semicolon inside
-/// either construct is therefore treated as executable text and can become a
-/// false statement boundary in [`split_sql_statements`]. Migration files must
-/// consequently stay within `--` comments and single-quoted strings; if a
-/// future migration needs block comments or quoted identifiers containing
-/// semicolons, move the statements into per-statement consts or files instead
-/// of extending this scanner.
-fn strip_line_comments(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len());
-    let mut in_string = false;
-    let mut chars = sql.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if in_string && chars.peek() == Some(&'\'') => {
-                out.push('\'');
-                if let Some(escaped) = chars.next() {
-                    out.push(escaped);
-                }
-            }
-            '\'' => {
-                in_string = !in_string;
-                out.push(c);
-            }
-            '-' if !in_string && chars.peek() == Some(&'-') => {
-                // Drop the comment body but keep the newline, so the remaining
-                // executable text stays on its original line.
-                while chars.peek().is_some_and(|&next| next != '\n') {
-                    chars.next();
-                }
-            }
-            _ => out.push(c),
-        }
-    }
-
-    out
-}
-
-/// Split (already comment-stripped) SQL into individual statements on `;`,
-/// ignoring semicolons inside single-quoted string literals.
-///
-/// This migration's `COMMENT '...'` column annotations are prose that itself
-/// uses semicolons as punctuation (e.g. `COMMENT 'Usage type; application-\
-/// enforced reference to usage_type_catalog (no FK in ClickHouse)'`) --  a
-/// plain `sql.split(';')` would cut statements apart mid-string-literal.
-/// A doubled `''` inside a string is treated as an escaped literal quote
-/// (standard SQL / `ClickHouse` string-escaping) rather than a string
-/// terminator, though this file does not currently use that form.
-///
-/// Shares the quote-tracking limits documented on [`strip_line_comments`]:
-/// `/* … */` block comments and backtick- or double-quoted identifiers are not
-/// recognized, so a semicolon inside one would split a statement.
-fn split_sql_statements(sql: &str) -> Vec<String> {
-    let mut statements = Vec::new();
-    let mut current = String::new();
-    let mut in_string = false;
-    let mut chars = sql.chars().peekable();
-
-    while let Some(c) = chars.next() {
-        match c {
-            '\'' if in_string && chars.peek() == Some(&'\'') => {
-                // Escaped `''` inside a string literal -- consume both quotes
-                // as literal content, stay inside the string.
-                current.push('\'');
-                if let Some(escaped) = chars.next() {
-                    current.push(escaped);
-                }
-            }
-            '\'' => {
-                in_string = !in_string;
-                current.push(c);
-            }
-            ';' if !in_string => {
-                let stmt = current.trim().to_owned();
-                if !stmt.is_empty() {
-                    statements.push(stmt);
-                }
-                current.clear();
-            }
-            _ => current.push(c),
-        }
-    }
-
-    let stmt = current.trim().to_owned();
-    if !stmt.is_empty() {
-        statements.push(stmt);
-    }
-
-    statements
-}
-
-/// Apply the embedded initial schema migration against the live `ClickHouse` instance.
-///
-/// Reads the embedded SQL from `migrations/0001_init.sql` (which bakes a fixed
-/// 1-year TTL default into `usage_records`), strips `--` comment lines (see
-/// [`strip_line_comments`]), splits the result into statements on `';'` while
-/// respecting single-quoted string literals (see [`split_sql_statements`]), and
-/// executes each one via the `clickhouse` crate's raw query path.
-///
-/// Every statement uses `CREATE TABLE IF NOT EXISTS`, making the migration
-/// idempotent and safe to re-run on concurrent replica startup. `ClickHouse`
-/// has no `pg_advisory_lock` equivalent; idempotent DDL alone is sufficient
-/// because `CREATE TABLE IF NOT EXISTS` is internally atomic in `ClickHouse`.
-///
-/// Config-driven retention is applied separately by [`ensure_retention_ttl`].
-///
-/// Each statement is bounded by `deadline` (the same client-side budget the
-/// request path uses, `ClickHousePluginConfig::client_deadline`). A hung `init`
-/// is worse than a failed one: it never surfaces as an error, and the gear's
-/// readiness gauge is already published as 0 by then.
+/// A hung `init` is worse than a failed one: it never surfaces as an error,
+/// and the gear's readiness gauge is already published as 0 by then.
 ///
 /// # Errors
 ///
-/// Returns an error if any DDL statement fails or exceeds `deadline`. The
-/// context message includes the failing statement text.
-pub async fn apply_migrations(
+/// Returns an error if the statement fails or exceeds `deadline`; the context
+/// message includes the statement text.
+pub(crate) async fn exec_statement(
     client: &clickhouse::Client,
+    stmt: &str,
     deadline: Duration,
 ) -> anyhow::Result<()> {
-    let sql = strip_line_comments(MIGRATION_SQL);
-
-    for stmt in split_sql_statements(&sql) {
-        tokio::time::timeout(deadline, client.query(&stmt).execute())
-            .await
-            .map_err(|_elapsed| {
-                anyhow::anyhow!(
-                    "migration DDL statement exceeded the {}s client-side deadline:\n{stmt}",
-                    deadline.as_secs()
-                )
-            })?
-            .with_context(|| format!("migration DDL statement failed:\n{stmt}"))?;
-    }
-
-    Ok(())
+    tokio::time::timeout(deadline, client.query(stmt).execute())
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!(
+                "migration DDL statement exceeded the {}s client-side deadline:\n{stmt}",
+                deadline.as_secs()
+            )
+        })?
+        .with_context(|| format!("migration DDL statement failed:\n{stmt}"))
 }
 
 /// Parse retention seconds from a `CREATE TABLE` / `create_table_query` string.
@@ -587,8 +459,12 @@ fn warn_on_short_retention(retention_period_secs: u64) {
 /// `toDateTime`, issues
 /// `ALTER TABLE usage_records MODIFY TTL created_at + INTERVAL <n> SECOND DELETE`.
 ///
+/// On a cluster (only reached when the plugin manages the cluster schema) the
+/// TTL lives on the shard-local table, so both the read and the `ALTER` target
+/// it, the latter `ON CLUSTER` ([`Topology::alter_target`]).
+///
 /// Both statements are bounded by `deadline`, for the same reason as
-/// [`apply_migrations`].
+/// [`exec_statement`].
 ///
 /// # Errors
 ///
@@ -596,10 +472,12 @@ fn warn_on_short_retention(retention_period_secs: u64) {
 /// exceeds `deadline`.
 pub async fn ensure_retention_ttl(
     client: &clickhouse::Client,
+    topology: &Topology,
     retention_period_secs: u64,
     deadline: Duration,
 ) -> anyhow::Result<()> {
-    let create_sql = read_records_create_sql(client, deadline).await?;
+    let (table, on_cluster) = topology.alter_target(RECORDS_TABLE);
+    let create_sql = read_create_sql(client, table, deadline).await?;
 
     warn_on_short_retention(retention_period_secs);
 
@@ -613,8 +491,8 @@ pub async fn ensure_retention_ttl(
     }
 
     let alter = format!(
-        "ALTER TABLE usage_records MODIFY TTL \
-         created_at + INTERVAL {retention_period_secs} SECOND DELETE"
+        "ALTER TABLE {table}{on_cluster} MODIFY TTL {}",
+        table::ttl_expr("created_at", retention_period_secs)
     );
     tracing::info!(
         previous = ?current,
@@ -641,15 +519,17 @@ pub async fn ensure_retention_ttl(
 /// statement is one block per `toYYYYMM` partition it touches. The window only
 /// has to outlast the race it guards — two retries of one write milliseconds
 /// apart — so 10 000 blocks is ample headroom rather than a retention horizon.
-/// The value in `migrations/0001_init.sql` must match; `pool_tests` pins it.
+/// `migrator::m0001_init` declares it on `usage_records` (single node only).
 pub(crate) const INSERT_DEDUP_WINDOW_BLOCKS: u64 = 10_000;
 
-/// Read the live `create_table_query` of `usage_records` from `system.tables`.
+/// Read the live `create_table_query` of `table` (`usage_records` or its
+/// shard-local table) from `system.tables`.
 ///
 /// Shared by [`ensure_retention_ttl`] and [`ensure_insert_dedup_window`], both
 /// of which reconcile a table-level setting by parsing this text.
-async fn read_records_create_sql(
+async fn read_create_sql(
     client: &clickhouse::Client,
+    table: &str,
     deadline: Duration,
 ) -> anyhow::Result<String> {
     tokio::time::timeout(
@@ -658,18 +538,19 @@ async fn read_records_create_sql(
             .query(
                 "SELECT create_table_query \
                  FROM system.tables \
-                 WHERE database = currentDatabase() AND name = 'usage_records'",
+                 WHERE database = currentDatabase() AND name = ?",
             )
+            .bind(table)
             .fetch_one::<String>(),
     )
     .await
     .map_err(|_elapsed| {
         anyhow::anyhow!(
-            "reading usage_records create_table_query exceeded the {}s client-side deadline",
+            "reading {table} create_table_query exceeded the {}s client-side deadline",
             deadline.as_secs()
         )
     })?
-    .context("failed to read usage_records create_table_query from system.tables")
+    .with_context(|| format!("failed to read {table} create_table_query from system.tables"))
 }
 
 /// Parse `non_replicated_deduplication_window` from a `CREATE TABLE` /
@@ -701,7 +582,7 @@ pub async fn ensure_insert_dedup_window(
     client: &clickhouse::Client,
     deadline: Duration,
 ) -> anyhow::Result<()> {
-    let create_sql = read_records_create_sql(client, deadline).await?;
+    let create_sql = read_create_sql(client, RECORDS_TABLE, deadline).await?;
     let current = parse_dedup_window(&create_sql);
     if current == Some(INSERT_DEDUP_WINDOW_BLOCKS) {
         tracing::debug!(
@@ -730,6 +611,340 @@ pub async fn ensure_insert_dedup_window(
         })?
         .with_context(|| format!("failed to apply insert dedup window:\n{alter}"))?;
 
+    Ok(())
+}
+
+// ── Cluster topology ──────────────────────────────────────────────────────────
+
+/// The `system.tables` columns [`check_cluster_schema`] inspects.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct SystemTableRow {
+    pub name: String,
+    pub engine: String,
+    pub engine_full: String,
+    pub sorting_key: String,
+    pub partition_key: String,
+    pub create_table_query: String,
+}
+
+/// Drop all whitespace so `ClickHouse`'s formatting of a key expression
+/// (`gts_id, tenant_id`) compares equal to the canonical form (`gts_id,tenant_id`).
+fn squash(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Top-level arguments of the first `<engine>(...)` call in `engine_full`,
+/// whitespace-squashed and with surrounding quotes removed; `None` when the
+/// text holds no well-formed call.
+pub(crate) fn engine_args(engine_full: &str, engine: &str) -> Option<Vec<String>> {
+    let head = format!("{engine}(");
+    let body = &engine_full[engine_full.find(&head)? + head.len()..];
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    for c in body.chars() {
+        match c {
+            '\'' => {
+                in_string = !in_string;
+                current.push(c);
+            }
+            '(' if !in_string => {
+                depth += 1;
+                current.push(c);
+            }
+            ')' if !in_string && depth == 0 => {
+                args.push(current);
+                return Some(
+                    args.iter()
+                        .map(|a| squash(a).trim_matches(['\'', '`', '"']).to_owned())
+                        .collect(),
+                );
+            }
+            ')' if !in_string => {
+                depth -= 1;
+                current.push(c);
+            }
+            ',' if !in_string && depth == 0 => args.push(std::mem::take(&mut current)),
+            _ => current.push(c),
+        }
+    }
+    None
+}
+
+/// Whether a `ReplacingMergeTree`-family `engine_full` names exactly the
+/// plugin's version column: `(version)` or, with Keeper arguments (which
+/// `ClickHouse` stores even when defaulted), `('path', 'replica', version)`.
+/// A missing version, another column, or an extra `is_deleted` argument fails.
+fn has_version_column(engine_full: &str, engine: &str) -> bool {
+    engine_args(engine_full, engine).is_some_and(
+        |args| matches!(args.as_slice(), [v] | [_, _, v] if v == m0001_init::VERSION_COLUMN),
+    )
+}
+
+/// Check the operator-provisioned cluster schema seen on the connected node.
+///
+/// `rows` are this database's `system.tables` rows for the four tables the
+/// topology names; `database` is the connected database. Returns one
+/// human-readable problem per deviation — empty when the schema is usable.
+/// Pure so the rules are unit-testable without a cluster.
+pub(crate) fn check_cluster_schema(
+    rows: &[SystemTableRow],
+    topology: &Topology,
+    database: &str,
+) -> Vec<String> {
+    let Topology::Cluster {
+        name: cluster,
+        records_local,
+        catalog_local,
+        ..
+    } = topology
+    else {
+        return Vec::new();
+    };
+    let find = |table: &str| rows.iter().find(|r| r.name == table);
+    let mut problems = Vec::new();
+
+    let local_engine = table::cluster_local_engine(None).name();
+    let records_key = m0001_init::RECORDS_ORDER_BY.join(",");
+    let catalog_key = m0001_init::CATALOG_ORDER_BY.join(",");
+    for (local, sorting_key, partition_key) in [
+        (
+            records_local.as_str(),
+            records_key.as_str(),
+            m0001_init::RECORDS_PARTITION_KEY,
+        ),
+        (catalog_local.as_str(), catalog_key.as_str(), ""),
+    ] {
+        let Some(row) = find(local) else {
+            problems.push(format!("local table `{local}` does not exist"));
+            continue;
+        };
+        if row.engine != local_engine {
+            problems.push(format!(
+                "local table `{local}` uses engine {}, expected {local_engine}",
+                row.engine
+            ));
+        } else if !has_version_column(&row.engine_full, local_engine) {
+            problems.push(format!(
+                "local table `{local}` is `{}`, expected {local_engine}(..., {version}): \
+                 without the version column merges keep the last insert instead of the \
+                 highest version",
+                row.engine_full,
+                version = m0001_init::VERSION_COLUMN,
+            ));
+        }
+        if squash(&row.sorting_key) != sorting_key {
+            problems.push(format!(
+                "local table `{local}` is ORDER BY ({}), expected ({sorting_key})",
+                row.sorting_key
+            ));
+        }
+        if squash(&row.partition_key) != partition_key {
+            problems.push(format!(
+                "local table `{local}` is PARTITION BY `{}`, expected `{partition_key}`",
+                row.partition_key
+            ));
+        }
+    }
+
+    for (logical, local, sharding_key) in [
+        (RECORDS_TABLE, records_local.as_str(), RECORDS_SHARDING_KEY),
+        (CATALOG_TABLE, catalog_local.as_str(), CATALOG_SHARDING_KEY),
+    ] {
+        let Some(row) = find(logical) else {
+            problems.push(format!("Distributed table `{logical}` does not exist"));
+            continue;
+        };
+        if row.engine != "Distributed" {
+            problems.push(format!(
+                "`{logical}` uses engine {}, expected Distributed over `{local}`",
+                row.engine
+            ));
+            continue;
+        }
+        let ok = engine_args(&row.engine_full, "Distributed").is_some_and(|args| {
+            matches!(
+                args.as_slice(),
+                [c, db, l, key, ..]
+                    if c == cluster
+                        && (db == database || db == "currentDatabase()")
+                        && l == local
+                        && key == sharding_key
+            )
+        });
+        if !ok {
+            problems.push(format!(
+                "`{logical}` is `{}`, expected Distributed('{cluster}', '{database}', \
+                 '{local}', {sharding_key})",
+                row.engine_full
+            ));
+        }
+    }
+    problems
+}
+
+/// Await one startup probe under `deadline`, naming it in both the timeout
+/// and the failure error.
+pub(crate) async fn timed<T>(
+    deadline: Duration,
+    what: &str,
+    fut: impl Future<Output = clickhouse::error::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::time::timeout(deadline, fut)
+        .await
+        .map_err(|_elapsed| {
+            anyhow::anyhow!(
+                "{what} exceeded the {}s client-side deadline",
+                deadline.as_secs()
+            )
+        })?
+        .with_context(|| format!("{what} failed"))
+}
+
+/// Validate the cluster schema at startup.
+///
+/// The schema comes from the operator (who runs `migrator::render_ddl`,
+/// which a failure here prints) or, with `cluster.manage_schema`, from the cluster
+/// migrations that run just before this; either way this never creates or
+/// alters anything. It fails init when:
+///
+/// * the cluster is not declared in `system.clusters`;
+/// * a table is missing or has the wrong engine, sort key, partition key, or
+///   `Distributed` target / sharding key, or a local table's engine lacks the
+///   `version` column ([`check_cluster_schema`]);
+/// * any replica of the cluster lacks one of the four tables — the plugin
+///   may be pointed at any node, and an `ON CLUSTER` mutation needs the local
+///   tables everywhere. An unreachable replica fails this probe too, which is
+///   the right default for a deployment check.
+///
+/// A `usage_records` TTL that differs from `retention_period_secs` is only
+/// warned about: reconciling it would be DDL (the managed path reconciles it
+/// with `ensure_retention_ttl` first).
+///
+/// # Errors
+///
+/// Returns an error listing every problem found, or when a probe fails or
+/// exceeds `deadline`.
+pub async fn validate_cluster_schema(
+    client: &clickhouse::Client,
+    topology: &Topology,
+    retention_period_secs: u64,
+    deadline: Duration,
+) -> anyhow::Result<()> {
+    let Topology::Cluster {
+        name: cluster,
+        records_local,
+        catalog_local,
+        ..
+    } = topology
+    else {
+        return Ok(());
+    };
+
+    let database: String = timed(
+        deadline,
+        "reading currentDatabase()",
+        client.query("SELECT currentDatabase()").fetch_one(),
+    )
+    .await?;
+
+    let replicas: u64 = timed(
+        deadline,
+        "reading system.clusters",
+        client
+            .query("SELECT count() FROM system.clusters WHERE cluster = ?")
+            .bind(cluster)
+            .fetch_one(),
+    )
+    .await?;
+    if replicas == 0 {
+        anyhow::bail!(
+            "cluster `{cluster}` is not declared in system.clusters on the connected node; \
+             check cluster.name against the server's remote_servers config"
+        );
+    }
+
+    let names = [
+        RECORDS_TABLE,
+        CATALOG_TABLE,
+        records_local.as_str(),
+        catalog_local.as_str(),
+    ];
+    let rows: Vec<SystemTableRow> = timed(
+        deadline,
+        "reading system.tables",
+        client
+            .query(
+                "SELECT name, engine, engine_full, sorting_key, partition_key, create_table_query \
+                 FROM system.tables WHERE database = ? AND name IN (?, ?, ?, ?)",
+            )
+            .bind(&database)
+            .bind(names[0])
+            .bind(names[1])
+            .bind(names[2])
+            .bind(names[3])
+            .fetch_all(),
+    )
+    .await?;
+
+    let mut problems = check_cluster_schema(&rows, topology, &database);
+
+    // `cluster` is a validated plain identifier (`ClickHouseClusterConfig::validate`),
+    // so interpolating it into the table-function argument is safe.
+    let present: u64 = timed(
+        deadline,
+        "reading system.tables across the cluster",
+        client
+            .query(&format!(
+                "SELECT count() FROM clusterAllReplicas('{cluster}', system.tables) \
+                 WHERE database = ? AND name IN (?, ?, ?, ?)"
+            ))
+            .bind(&database)
+            .bind(names[0])
+            .bind(names[1])
+            .bind(names[2])
+            .bind(names[3])
+            .fetch_one(),
+    )
+    .await?;
+    // Four tables (`names`) per replica.
+    let expected = replicas.saturating_mul(4);
+    if present != expected {
+        problems.push(format!(
+            "only {present} of {expected} expected tables exist across the {replicas} replicas \
+             of cluster `{cluster}`; create them with ON CLUSTER"
+        ));
+    }
+
+    if !problems.is_empty() {
+        let ddl = match migrator::render_ddl(topology, retention_period_secs).await {
+            Ok(stmts) => format!("{};", stmts.join(";\n\n")),
+            Err(e) => format!("(the DDL could not be rendered: {e:#})"),
+        };
+        anyhow::bail!(
+            "the cluster schema in database `{database}` is not usable (set \
+             cluster.manage_schema, or run the DDL below against database `{database}`):\n- {}\n\n{ddl}",
+            problems.join("\n- ")
+        );
+    }
+
+    warn_on_short_retention(retention_period_secs);
+    let live_ttl = rows
+        .iter()
+        .find(|r| &r.name == records_local)
+        .and_then(|r| parse_ttl_seconds(&r.create_table_query));
+    if live_ttl != Some(retention_period_secs) {
+        tracing::warn!(
+            live_ttl_secs = ?live_ttl,
+            retention_period_secs,
+            table = %records_local,
+            "cluster usage_records TTL does not match retention_period_secs; the plugin does \
+             not alter operator-provisioned tables, so run ALTER TABLE ... ON CLUSTER ... MODIFY TTL \
+             or set cluster.manage_schema"
+        );
+    }
     Ok(())
 }
 
