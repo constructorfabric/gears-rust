@@ -14,36 +14,17 @@ wording of a comment is governed by `docs/toolkit-pr-review/comment-style.md`.
 
 ## Severity
 
-- **CRITICAL** — can cause data corruption, a security issue, undefined behavior, deadlock, a
-  production outage, or incorrect behavior in a core path. For framework rules: breaks the security
-  model or an architecture invariant.
-- **HIGH** — significant correctness, maintainability, or operability risk; should usually be fixed
-  before merge. For framework rules: breaks gear architecture or an integration contract.
-- **MEDIUM** — meaningful improvement; fix if practical in this PR. For framework rules: a deviation
-  from a recommended ToolKit pattern.
-- **LOW** — minor issue or polish.
-
-Every rule carries its own `**Severity**:` line. Use that value; do not infer severity from the
-example in the Output Contract, which is illustrative only.
-
-**A criterion may override its rule.** When a criterion bullet begins with a bracketed level, that
-level is the finding's severity, and the rule's `**Severity**` line does not apply to it:
-
-```markdown
-### 12. RUST-SEC-001 — ...
-**Severity**: CRITICAL
-
-- Secrets, tokens and sensitive identifiers never logged or embedded in URLs
-- [MEDIUM] Dangerous defaults are not silently accepted
-```
-
-Here the first criterion is CRITICAL and the second is MEDIUM. A criterion with no marker inherits
-the rule's level, which is the common case.
-
-The override exists because severity is declared per rule while a rule covers a range: 22 criteria
-inherit CRITICAL from `RUST-SEC-001` alone, and that rule spans both a token written to a log and a
-config field with no length cap. Rank by what the definitions above actually say — what happens if
-this is not fixed — not by which rule the criterion happens to live under.
+Apply frozen policies/severity.md (consequences_v1 with boundary v3 calibration).
+Rule `**Severity**` lines and criterion markers such as `[MEDIUM]` are historical
+guides, never required values, floors, ceilings or a reason to override consequence
+evidence. All 52 rules and 312 criteria still apply. HIGH/CRITICAL needs substantial
+realistic impact; diagnostic loss alone cannot justify HIGH. MEDIUM requires meaningful
+behavior/contract failure or significant regression protection under realistic conditions.
+Optional improvements are LOW, kept in audit/local reports and excluded from publication.
+Assess tests by consequences, not test-only status. Compare changed behavior and real
+assertions before calling a coverage gap introduced; an old missing test is not proof
+of preexisting exposure. Confirmed portions constrain issue, evidence, impact and fix;
+unresolved/preexisting parts remain separately in diagnostic notes.
 
 ## Criterion markers
 

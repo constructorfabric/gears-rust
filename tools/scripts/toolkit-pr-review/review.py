@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """toolkit-pr-review: the deterministic half of the review skill.
 
-The orchestrator prompt decides whether a defect is real and how to word it. Everything
-that has one correct answer and comes before the agents lives here: resolving the target,
-parsing the diff, classifying files, snapshotting sources and estimating cost.
-
-Both harnesses call this same code. They previously carried two independent
-implementations of the same flow and had already drifted on five behaviours, each
-divergence meaning the same PR got a different review depending on who ran it.
+The invoking agent decides whether a defect is real and how to word it. This code pins
+sources, routes modules, validates two source passes and preserves immutable evidence
+through collect, history matching, formatting and controlled publication. All repository
+entrypoints share it. No command invokes a model.
 
 Usage:
     review.py prepare --pr 4777 [--repo owner/name]
@@ -35,8 +32,9 @@ import budget            # noqa: E402
 import classify          # noqa: E402
 import diffparse         # noqa: E402
 import ghsource          # noqa: E402
+import harness           # noqa: E402
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 def _snapshot_path(work: Path, path: str) -> Path:
@@ -60,16 +58,26 @@ ADVISORY_PAIR = ("deny.toml", ".cargo/audit.toml")
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
+    if args.work_dir:
+        with harness.lock(args.work_dir):
+            return _prepare(args)
+    return _prepare(args)
+
+
+def _prepare(args: argparse.Namespace) -> int:
     work = Path(args.work_dir) if args.work_dir else Path(
         tempfile.mkdtemp(prefix="toolkit-pr-review.")
     )
+    work = work.resolve()
+    if (work / "context.json").exists() or (work / "manifest.json").exists():
+        raise harness.Error("existing work directory is immutable; prepare a new directory (schema 4 is not upgraded)")
     (work / "files").mkdir(parents=True, exist_ok=True)
     (work / "out").mkdir(exist_ok=True)
 
     # --- resolve the target and get the diff -------------------------------------
     if args.from_diff:
-        diff_text = Path(args.from_diff).read_text(errors="replace")
-        meta = json.loads(Path(args.from_meta).read_text()) if args.from_meta else {}
+        diff_text = Path(args.from_diff).read_text(encoding="utf-8", errors="replace")
+        meta = json.loads(Path(args.from_meta).read_text(encoding="utf-8")) if args.from_meta else {}
         repo = meta.get("repo") or args.repo or "offline/fixture"
         mode = "pr" if meta.get("number") else "local"
         head_sha = meta.get("headRefOid", "")
@@ -80,7 +88,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         meta = ghsource.fetch_pr_meta(args.pr, repo)
         head_sha, base_sha = meta["headRefOid"], meta["baseRefOid"]
         pr_number, mode = args.pr, "pr"
-        diff_text = ghsource.pr_diff(args.pr, repo)
+        if not ghsource.ensure_objects(repo, pr_number, [head_sha, base_sha]):
+            raise harness.Error("pinned Git graph unavailable; cannot prove merge base")
+        base_sha = ghsource.run(["git", "merge-base", base_sha, head_sha]).strip()
+        diff_text = ghsource.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", base_sha, head_sha, "--"])
     else:
         repo = ghsource.resolve_repo(args.repo)
         branch = args.branch or ghsource.run(
@@ -92,13 +103,13 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         head_sha = ghsource.run(["git", "rev-parse", branch]).strip()
         pr_number, mode = None, "local"
         meta = {"branch": branch, "base": base_sha}
-        diff_text = ghsource.run(["git", "diff", f"{base_sha}...{branch}"])
+        diff_text = ghsource.run(["git", "diff", "--no-ext-diff", "--no-textconv", "--no-color", "--find-renames", base_sha, head_sha, "--"])
 
     # Every mode writes meta.json: the harnesses read the title, the branch and the SHAs
     # from it for the summary, and a mode-dependent file means each of them needs a
     # fallback path that only runs in local mode and therefore never gets exercised.
-    (work / "meta.json").write_text(json.dumps(meta, indent=2))
-    (work / "diff.patch").write_text(diff_text)
+    (work / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (work / "diff.patch").write_text(diff_text, encoding="utf-8")
     parsed = diffparse.parse(diff_text)
 
     # --- classify -----------------------------------------------------------------
@@ -190,8 +201,8 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     corpus_tokens = sum(files[p]["est_tokens"] for p in in_scope)
     diff_tokens = budget.est_tokens(len(diff_text.encode()))
-    costs = budget.agent_costs(corpus_tokens, diff_tokens) if has_rust else {}
-    cost = sum(costs.values())
+    costs, post_cost = budget.pipeline_costs(corpus_tokens, diff_tokens) if has_rust else ({}, 0)
+    cost = sum(costs.values()) + post_cost
     if cost > args.max_total_tokens:
         heavy = sorted(in_scope, key=lambda p: -files[p]["est_tokens"])[:5]
         print(
@@ -227,6 +238,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     ctx = {
         "schema_version": SCHEMA_VERSION,
         "mode": mode, "repo": repo, "pr_number": pr_number,
+        "branch": meta.get("branch", ""),
+        "source_repository": str(Path.cwd().resolve()),
+        "base_ref_sha": meta.get("baseRefOid", base_sha),
         "head_sha": head_sha, "base_sha": base_sha,
         "blob_source": blob_source,
         "work_dir": str(work),
@@ -236,9 +250,10 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "manifest_files": manifest_files,
         "agents": agents,
         "totals": {"files": len(in_scope), "skipped": len(skipped),
-                   "agents": len(agents), "est_tokens": cost},
+                   "agents": len(agents), "source_passes": 2 * len(agents),
+                   "post_est_tokens": post_cost, "est_tokens": cost},
     }
-    (work / "context.json").write_text(json.dumps(ctx, indent=2))
+    harness.freeze(work, ctx, args.source_root)
 
     print(f"{len(in_scope)} files in scope, {len(skipped)} skipped (not Rust or a manifest)")
     if not has_rust:
@@ -266,14 +281,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--work-dir", help="reuse a directory instead of creating one")
     p.add_argument("--from-diff", help="offline: read the diff from this file")
     p.add_argument("--from-meta", help="offline: read gh pr view JSON from this file")
+    p.add_argument("--source-root", help="offline only: fixture directory containing base/ and head/")
     p.add_argument("--max-total-tokens", type=int, default=budget.DEFAULT_MAX_TOTAL_TOKENS,
                    help="refuse the run above this estimate; context.json is not written")
     p.set_defaults(func=cmd_prepare)
+    harness.add_commands(sub)
 
     args = ap.parse_args(argv)
     try:
         return args.func(args)
-    except ghsource.SourceError as e:
+    except (ghsource.SourceError, harness.Error, KeyError, TypeError, ValueError, AttributeError, OSError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 

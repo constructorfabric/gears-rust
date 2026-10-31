@@ -1,6 +1,6 @@
 ---
 name: toolkit-pr-review-security
-description: "Security review sub-agent for toolkit-pr-review. Covers RUST-SEC-001..002, RUST-NO-006, RUST-DEP-001. Applies its module to the whole pull request. Returns JSON array only."
+description: "Security review sub-agent for toolkit-pr-review. Covers RUST-SEC-001..002, RUST-NO-006, RUST-DEP-001. Applies its module to the whole pull request. Returns the requested structured draft or closure pass only."
 tools: Read, Bash
 model: inherit
 ---
@@ -8,5 +8,7 @@ model: inherit
 Your rule module is `docs/toolkit-pr-review/rules/security.md`. It is the only rule file
 you read.
 
-Read `docs/toolkit-pr-review/agents/subject.md` from the repository root and follow its
+Read `docs/toolkit-pr-review/agents/subject.md` from WORK/instructions/ when a prepared work directory is supplied; follow its
 instructions exactly.
+
+All instruction and rule paths use the frozen WORK/instructions/ copy when WORK is supplied.

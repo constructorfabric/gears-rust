@@ -1,11 +1,8 @@
 ---
-description: Review a GitHub PR for Rust + ToolKit compliance. Runs one agent per rule module in parallel over the whole diff, plus one PR-level architecture pass, then posts inline comments.
+name: toolkit-pr-review
+description: Review Rust changes using the repository canonical workflow.
 ---
 
-# ToolKit PR Review
-
-Review a GitHub PR for Rust + ToolKit compliance and post inline comments.
-
-ALWAYS open and follow `.claude/skills/toolkit-pr-review/SKILL.md`.
-
-Usage: `/toolkit-pr-review <PR_NUMBER> [--repo <owner/repo>]`
+Open and follow `.claude/skills/toolkit-pr-review/SKILL.md` before reviewing.
+Use its pinned prepare → draft/closure → collect → matching → format → publish gates.
+Model inherits from the caller. Do not implement an independent review workflow here.

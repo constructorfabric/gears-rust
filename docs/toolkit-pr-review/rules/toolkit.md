@@ -20,8 +20,8 @@ half of `TOOLKIT-CORE-003` is answerable from paths alone.
 ## Check IDs to Apply
 
 You own **every** `TOOLKIT-*` rule.
-Each rule's `**Severity**` is the value to put in the finding; do not infer it from the example in
-the Output Contract.
+Rule `**Severity**` lines and criterion levels are historical guides, not assigned grades;
+apply policies/severity.md to actual consequences.
 
 ToolKit prioritizes gear isolation, transport-agnostic APIs, secure data access, explicit
 authorization, and compile-time safe REST wiring. Framework rules override convenience: flag a

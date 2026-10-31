@@ -11,8 +11,8 @@ Apply every rule in this module to every changed file in the PR.
 
 ## Check IDs to Apply
 
-Apply **only** these specific check IDs. Each rule's `**Severity**` is the value to put in the
-finding; do not infer it from the example in the Output Contract.
+Apply **only** these specific check IDs. Rule `**Severity**` lines and criterion levels
+are historical guides, not assigned grades; apply policies/severity.md to actual consequences.
 
 ### 1. RUST-ASYNC-001 — Async Code Is Runtime-Safe
 **Severity**: CRITICAL
@@ -61,8 +61,7 @@ shared state. Use it when writing the `fix` field.
 **Severity**: MEDIUM
 
 Restraint applies to this rule more than any other: do not micro-optimize blindly, report only clear
-and likely-relevant footguns, and prefer evidence-based comments. It is the lowest-severity rule
-here and the easiest to flood a review with.
+and likely-relevant footguns, and prefer evidence-based comments. The historical label is only a guide; grade each actual consequence independently.
 
 - **N+1 queries or repeated expensive work in a hot path** — a per-row database lookup inside a loop is the highest-value finding in this rule
 - **Data structures that do not fit the access pattern**, e.g. `Vec::contains` in a loop where a `HashSet` belongs
