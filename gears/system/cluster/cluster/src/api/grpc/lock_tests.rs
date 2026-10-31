@@ -435,6 +435,16 @@ async fn a_wire_ttl_beyond_the_ceiling_is_clamped() {
     harness.stop().await;
 }
 
+/// The SDK's remote guard clamps its deadline to `FENCE_RETENTION_DEFAULT` on the
+/// premise that this is the TTL the server grants; pin the two together.
+#[test]
+fn the_ttl_ceiling_is_the_one_the_remote_guard_assumes() {
+    assert_eq!(
+        crate::api::grpc::MAX_LEASE_TTL,
+        cluster_sdk::lease::FENCE_RETENTION_DEFAULT
+    );
+}
+
 /// M3, boundary values: the clamp is the identity below the ceiling and pins to
 /// it at and above. Covers `timeout_ms`, which cannot be observed end to end
 /// without waiting out the ceiling.
@@ -458,9 +468,103 @@ fn the_ttl_and_timeout_clamps_hold_at_the_boundary() {
     assert_eq!(super::checked_ttl(ceiling_ms + 1).unwrap(), ceiling);
     assert_eq!(super::checked_ttl(u64::MAX).unwrap(), ceiling);
 
-    let t_ceiling = super::MAX_LOCK_TIMEOUT;
+    let t_ceiling = super::MAX_LOCK_WAIT;
     let t_ceiling_ms = u64::try_from(t_ceiling.as_millis()).unwrap();
     assert_eq!(super::clamped_timeout(50), Duration::from_millis(50));
     assert_eq!(super::clamped_timeout(t_ceiling_ms), t_ceiling);
     assert_eq!(super::clamped_timeout(u64::MAX), t_ceiling);
+    // A wire waiter is sustained polling load, so its ceiling sits well below the
+    // fence-retention hour the TTL clamp uses (see `MAX_LOCK_WAIT`).
+    assert!(
+        t_ceiling < cluster_sdk::lease::FENCE_RETENTION_DEFAULT,
+        "the blocking-wait ceiling must be well below the fence-retention TTL ceiling"
+    );
+}
+
+fn blocking_lock(profile: &str, name: &str) -> stubs::LockRequest {
+    stubs::LockRequest {
+        profile: profile.to_owned(),
+        name: name.to_owned(),
+        ttl_ms: 30_000,
+        timeout_ms: 30_000,
+        client_request_id: None,
+    }
+}
+
+/// The per-profile concurrent-waiter cap: once a profile's
+/// [`MAX_CONCURRENT_LOCK_WAITERS`](super::MAX_CONCURRENT_LOCK_WAITERS) blocking waits
+/// are in flight, a further blocking `Lock` for that profile on a **contended** name
+/// is refused with `Provider{ResourceExhausted}` through the codec. A **free** name
+/// still acquires via its one non-blocking attempt, and a *different* profile is
+/// unaffected. Holding every permit of one profile's semaphore stands in for that
+/// many concurrent waiters.
+#[tokio::test]
+async fn a_blocking_lock_over_the_per_profile_waiter_cap_is_refused_but_other_profiles_are_not() {
+    let harness = Harness::wired(&["orders", "audit"]).await;
+    let service = DistributedLockService::new(harness.ctx.clone());
+
+    // `ledger` is held, so a blocking Lock on it would have to park and wait.
+    service
+        .try_lock(request(try_lock("orders", "ledger", 30_000)))
+        .await
+        .expect("the hot name is taken before the cap fills");
+
+    // Exhaust `orders`'s semaphore.
+    let orders_waiters = service.profile_waiters("orders");
+    let _all = orders_waiters
+        .try_acquire_many(u32::try_from(super::MAX_CONCURRENT_LOCK_WAITERS).unwrap())
+        .expect("all of `orders`'s permits are free on a fresh service");
+
+    let status = service
+        .lock(request(blocking_lock("orders", "ledger")))
+        .await
+        .expect_err("orders' waiter cap is full and `ledger` is held, so the Lock is refused");
+    assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+    // Through the codec (M9): a trailer-less `RESOURCE_EXHAUSTED` would decode as
+    // `Provider{ConnectionLost}`.
+    assert!(
+        matches!(
+            cluster_sdk::from_status(&status),
+            cluster_sdk::ClusterError::Provider {
+                kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                ..
+            }
+        ),
+        "the refusal must decode as Provider{{ResourceExhausted}}, got {:?}",
+        cluster_sdk::from_status(&status)
+    );
+
+    // tonic's per-connection clones share the per-profile map via the `Arc`; a
+    // per-clone map would hand this clone fresh permits.
+    let cloned = service.clone();
+    assert_eq!(
+        cloned
+            .lock(request(blocking_lock("orders", "ledger")))
+            .await
+            .expect_err("a clone shares the exhausted per-profile cap")
+            .code(),
+        tonic::Code::ResourceExhausted,
+    );
+
+    // A *free* sibling name in the saturated profile is not refused: its one
+    // non-blocking attempt succeeds, so it parks no poller and needs no permit.
+    service
+        .lock(request(blocking_lock("orders", "journal")))
+        .await
+        .expect("a free name in a saturated profile acquires rather than being refused");
+
+    // Per-profile isolation: a service-wide cap would have refused this.
+    service
+        .lock(request(blocking_lock("audit", "ledger")))
+        .await
+        .expect("a different profile's blocking Lock is unaffected by orders' full cap");
+
+    // `try_lock` parks no poller, so it never takes a permit.
+    service
+        .try_lock(request(try_lock("orders", "audit-trail", 30_000)))
+        .await
+        .expect("try_lock does not consume a blocking-waiter permit");
+
+    // `_all` releases the held permits when it drops at the end of scope.
+    harness.stop().await;
 }

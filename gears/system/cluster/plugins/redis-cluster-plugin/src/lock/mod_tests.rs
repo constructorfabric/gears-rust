@@ -83,12 +83,26 @@ fn the_release_pattern_covers_this_prefix_and_escapes_it() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn every_acquisition_mints_a_fresh_token() {
-    // The token is the entire fence behind `renew` and `release` (DESIGN.md
-    // §5.2). Two acquisitions sharing one would let a lapsed holder renew or
-    // release its successor's lease, which is the bug `RD-LOCK-006` exists for.
-    let tokens: HashSet<String> = (0..1_000).map(|_| Uuid::new_v4().to_string()).collect();
-    assert_eq!(tokens.len(), 1_000, "holder tokens must not repeat");
+fn every_acquisition_mints_a_fresh_fence() {
+    // Two acquisitions sharing a fence would let a lapsed holder renew or release
+    // its successor's lease (DESIGN.md §5.2, §5.8.1; `RD-LOCK-006`).
+    let fences: HashSet<u64> = (0..10_000).map(|_| fresh_fence()).collect();
+    assert_eq!(fences.len(), 10_000, "holder fences must not repeat");
+}
+
+#[test]
+fn the_holder_value_is_owner_and_fence_and_is_never_parsed() {
+    // Composed, never parsed back, so an owner carrying `:` is no hazard.
+    assert_eq!(holder_value("owner-a", 42), "owner-a:42");
+    assert_eq!(
+        holder_value("a:b:c", 7),
+        "a:b:c:7",
+        "an owner with colons is composed verbatim, not re-parsed"
+    );
+    // Rebuilt from the token's identity fields alone, so any replica fences on
+    // the same string (invariant I7).
+    let token = LeaseToken::new("ledger", "owner-a", 99);
+    assert_eq!(holder_value(&token.owner, token.fence), "owner-a:99");
 }
 
 // ---------------------------------------------------------------------------
@@ -312,6 +326,96 @@ async fn a_shutdown_blocking_lock_is_recorded_under_the_lock_op() {
         vec![("lock".to_owned(), "shutdown".to_owned())]
     );
     assert!(recorder.provider_error_kinds().is_empty());
+}
+
+/// The token-path counterpart of the two guard-path shutdown tests above: a
+/// drain-time `acquire`/`acquire_waiting`/`renew`/`release` must each answer
+/// `Shutdown`, record *its own* op under the `shutdown` result label, and never
+/// spike `cluster_provider_errors_total`. Each short-circuits on the cancelled
+/// token before reaching the pool, so this stays a Layer-1 test.
+#[tokio::test]
+async fn a_shutdown_token_path_is_recorded_as_shutdown_and_not_an_error() {
+    let (signals, recorder) = crate::test_support::recording_signals();
+    let shutdown = CancellationToken::new();
+    let lock = lock_backend(&shutdown, signals);
+    shutdown.cancel();
+    let token = LeaseToken::new("ledger", "owner-a", 1);
+
+    assert!(matches!(
+        lock.acquire("ledger", "owner-a", Duration::from_secs(10))
+            .await,
+        Err(ClusterError::Shutdown)
+    ));
+    assert!(matches!(
+        lock.acquire_waiting(
+            "ledger",
+            "owner-a",
+            Duration::from_secs(10),
+            Duration::from_secs(30)
+        )
+        .await,
+        Err(ClusterError::Shutdown)
+    ));
+    assert!(matches!(
+        lock.renew(&token, Duration::from_secs(10)).await,
+        Err(ClusterError::Shutdown)
+    ));
+    assert!(matches!(
+        lock.release(&token).await,
+        Err(ClusterError::Shutdown)
+    ));
+
+    assert_eq!(
+        recorder.lock_ops(),
+        vec![
+            ("acquire".to_owned(), "shutdown".to_owned()),
+            ("acquire_waiting".to_owned(), "shutdown".to_owned()),
+            ("token_renew".to_owned(), "shutdown".to_owned()),
+            ("token_release".to_owned(), "shutdown".to_owned()),
+        ],
+        "each token-path method records its own op under the shutdown result label"
+    );
+    assert!(
+        recorder.provider_error_kinds().is_empty(),
+        "a shutdown is an outcome, not a backend fault"
+    );
+}
+
+/// `guard_from`'s shutdown-race branch: when `stop()` wins between `acquire_lease`
+/// minting the lease and the guard hand-off, the lease is abandoned and the call
+/// answers `Shutdown`. The tests above cancel *before* the call, so
+/// `acquire_lease`'s top check answers and `guard_from` is never entered; this
+/// drives `guard_from` directly.
+///
+/// Layer-1 because the abandon never reaches the never-connecting pool: [`eval`]
+/// looks the script SHA up before issuing any command, and the empty
+/// [`ScriptCache`] fails fast with `Provider { Other }`, which is swallowed. That
+/// swallowed failure is what the `provider_error` assertion uses to pin that
+/// `abandon` ran. The outer timeout is a safety net in case the abandon ever
+/// reaches the pool.
+#[tokio::test]
+async fn guard_from_abandons_and_returns_shutdown_when_stop_raced_the_hand_off() {
+    let shutdown = CancellationToken::new();
+    let (signals, recorder) = crate::test_support::recording_signals();
+    let lock = lock_backend(&shutdown, signals);
+    shutdown.cancel();
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        lock.guard_from(LeaseToken::new("ledger", "owner-a", 1)),
+    )
+    .await
+    .expect("guard_from must resolve (its abandon fails fast at the empty script cache), not hang");
+    assert!(
+        matches!(outcome, Err(ClusterError::Shutdown)),
+        "a lease minted then raced by stop() is abandoned and the call answers Shutdown"
+    );
+    // Pins the "abandons" half: `abandon`'s `release_lease` failed at the empty
+    // script cache and emitted a provider-error; without the abandon this is empty.
+    assert!(
+        !recorder.provider_error_kinds().is_empty(),
+        "guard_from's shutdown branch must attempt the abandon release"
+    );
 }
 // ---------------------------------------------------------------------------
 // The third bound (DESIGN.md §5.3): the caller's `timeout` bounds the whole

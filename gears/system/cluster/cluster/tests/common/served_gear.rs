@@ -28,8 +28,8 @@ use cluster::api::grpc::{
     LeaderElectionService, ServiceContext,
 };
 use cluster::{ClusterConfig, ClusterHandle, ClusterWiring, ProfileRegistry, ProviderRegistry};
-use cluster_sdk::RemoteClusterClient;
 use cluster_sdk::grpc::stubs;
+use cluster_sdk::{ClusterLockProvider, RemoteClusterClient};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
@@ -96,6 +96,9 @@ pub struct Builder {
     /// no identity is stamped and every caller is `UNAUTHENTICATED_CALLER` — the
     /// pre-retrofit behaviour every existing test relies on.
     auth_layer: InternalAuthGrpcLayer,
+    /// A native lock provider to register beside the standalone cache provider,
+    /// for a config whose `lock:` binding names it.
+    lock_provider: Option<Arc<dyn ClusterLockProvider>>,
 }
 
 /// A running cluster gear on an ephemeral port.
@@ -126,6 +129,7 @@ pub fn served_gear() -> Builder {
         config_yaml: DEFAULT_CONFIG.to_owned(),
         services: Services::ALL,
         auth_layer: InternalAuthGrpcLayer::disabled(),
+        lock_provider: None,
     }
 }
 
@@ -157,11 +161,21 @@ impl Builder {
         self
     }
 
+    /// Register a native lock provider, for a config whose `lock:` binding names it.
+    #[must_use]
+    pub fn lock_provider(mut self, provider: Arc<dyn ClusterLockProvider>) -> Self {
+        self.lock_provider = Some(provider);
+        self
+    }
+
     /// Wire the gear, bind an ephemeral port and serve.
     pub async fn start(self) -> ServedGear {
         let cfg: ClusterConfig = serde_saphyr::from_str(&self.config_yaml).expect("config parses");
-        let providers = ProviderRegistry::new()
+        let mut providers = ProviderRegistry::new()
             .with_cache_provider(Arc::new(standalone_cluster_plugin::StandaloneCacheProvider));
+        if let Some(provider) = self.lock_provider {
+            providers = providers.with_lock_provider(provider);
+        }
         let (handle, bound) =
             ClusterWiring::from_config(Arc::new(ClientHub::new()), &cfg, &providers)
                 .await

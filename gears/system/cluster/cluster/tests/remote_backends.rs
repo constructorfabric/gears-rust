@@ -47,11 +47,13 @@
               events they exist to show; the `Debug` form is that evidence"
 )]
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use async_trait::async_trait;
 use cluster_sdk::cache::{CacheWatchEvent, PutRequest, Ttl};
 use cluster_sdk::dto;
 use cluster_sdk::grpc::stubs;
@@ -1791,4 +1793,563 @@ async fn a_taken_election_fences_its_stale_leader_local_and_remote() {
         successor.resign(&second).await.expect("resign");
     }
     fixture.stop().await;
+}
+
+// ---------------------------------------------------------------------------
+// Blocking `Lock` across a server-side wait clamp.
+//
+// The gear clamps each blocking wait (`MAX_LOCK_WAIT`, two minutes); the SDK client
+// re-issues `Lock` until the caller's own timeout (invariant I1). This fake server
+// clamps at `FAKE_WAIT_CLAMP` and, like the gear, answers a codec-encoded
+// `LockTimeout` once its clamped wait runs out.
+// ---------------------------------------------------------------------------
+
+/// The fake server's per-RPC wait clamp, standing in for the gear's two minutes.
+const FAKE_WAIT_CLAMP: Duration = Duration::from_millis(100);
+
+/// What the fake lock server does with each blocking `Lock`.
+#[derive(Clone, Copy)]
+enum LockMode {
+    /// Waits out its clamp and times out on the first `clamped` calls, then grants.
+    GrantAfter { clamped: u64 },
+    /// Always waits out its clamp and times out: the name never frees.
+    NeverFree,
+    /// Refuses at once with the waiter-cap backpressure error.
+    Saturated,
+}
+
+struct FakeLock {
+    mode: LockMode,
+    /// The `timeout_ms` of every `Lock` RPC received, in order.
+    asked: Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+#[tonic::async_trait]
+impl stubs::lock::distributed_lock_api_server::DistributedLockApi for FakeLock {
+    async fn try_lock(
+        &self,
+        _request: tonic::Request<stubs::lock::TryLockRequest>,
+    ) -> Result<tonic::Response<stubs::lock::LockAcquired>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+
+    async fn lock(
+        &self,
+        request: tonic::Request<stubs::lock::LockRequest>,
+    ) -> Result<tonic::Response<stubs::lock::LockAcquired>, tonic::Status> {
+        let req = request.into_inner();
+        let call = {
+            let mut asked = self.asked.lock().expect("asked");
+            asked.push(req.timeout_ms);
+            u64::try_from(asked.len()).expect("few calls")
+        };
+        let wait = Duration::from_millis(req.timeout_ms).min(FAKE_WAIT_CLAMP);
+        let timed_out = || {
+            cluster_sdk::to_status(ClusterError::LockTimeout {
+                name: req.name.clone(),
+                waited: wait,
+            })
+        };
+        match self.mode {
+            LockMode::Saturated => Err(cluster_sdk::to_status(ClusterError::Provider {
+                kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                message: "too many concurrent blocking Lock waiters".to_owned(),
+            })),
+            LockMode::GrantAfter { clamped } if call > clamped => Ok(tonic::Response::new(
+                stubs::lock::LockAcquired::from(dto::LockAcquired {
+                    token: dto::LeaseToken {
+                        name: req.name.clone(),
+                        owner: "unauthenticated".to_owned(),
+                        fence: 9,
+                    },
+                }),
+            )),
+            LockMode::GrantAfter { .. } | LockMode::NeverFree => {
+                tokio::time::sleep(wait).await;
+                Err(timed_out())
+            }
+        }
+    }
+
+    async fn renew(
+        &self,
+        _request: tonic::Request<stubs::lock::LeaseRef>,
+    ) -> Result<tonic::Response<stubs::lock::RenewResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+
+    async fn release(
+        &self,
+        _request: tonic::Request<stubs::lock::LeaseRef>,
+    ) -> Result<tonic::Response<stubs::lock::ReleaseResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not under test"))
+    }
+}
+
+async fn serve_fake_lock(
+    mode: LockMode,
+) -> (
+    Arc<std::sync::Mutex<Vec<u64>>>,
+    Arc<dyn cluster_sdk::DistributedLockBackend>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let service = FakeLock {
+        mode,
+        asked: Arc::clone(&asked),
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+    let addr = listener.local_addr().expect("has an address");
+    let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(
+                stubs::lock::distributed_lock_api_server::DistributedLockApiServer::new(service),
+            )
+            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                let _stopped = shutdown_rx.await;
+            })
+            .await
+            .expect("the fake server runs");
+    });
+    let lock = RemoteClusterClient::connect_lazy(&format!("http://{addr}"), None)
+        .expect("a valid endpoint")
+        .lock_backend(PROFILE)
+        .expect("a handle");
+    (asked, lock, shutdown)
+}
+
+#[tokio::test]
+async fn a_server_clamped_blocking_lock_is_reissued_until_it_is_granted() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::GrantAfter { clamped: 2 }).await;
+
+    let token = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), Duration::from_secs(5))
+        .await
+        .expect("two clamped waits are re-issued, and the third Lock is granted");
+    assert_eq!(token.name, "ledger");
+
+    let asked = asked.lock().expect("asked").clone();
+    assert_eq!(
+        asked.len(),
+        3,
+        "one Lock per clamped wait, plus the one that granted"
+    );
+    // Each re-issue asks only for the remaining budget, so the total wait cannot
+    // exceed the caller's timeout.
+    assert!(
+        asked[0] <= 5_000 && asked[0] > 4_900,
+        "first Lock asks for the whole budget: {asked:?}"
+    );
+    assert!(
+        asked.windows(2).all(|pair| pair[1] < pair[0]),
+        "each re-issue asks for strictly less than the last: {asked:?}"
+    );
+    let _stopped = shutdown.send(());
+}
+
+#[tokio::test]
+async fn a_blocking_lock_still_times_out_on_the_callers_own_deadline() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::NeverFree).await;
+    let timeout = Duration::from_millis(350);
+
+    let started = std::time::Instant::now();
+    let outcome = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), timeout)
+        .await;
+    let elapsed = started.elapsed();
+    let asked = asked.lock().expect("asked").clone();
+
+    // The server-measured waits, recomputed from what the client asked for. Pinned
+    // exactly, not against the wall clock: the gaps between RPCs come out of the
+    // caller's budget but no server measures them, so under load the sum falls short
+    // of `timeout` by an unbounded amount.
+    let server_measured: Duration = asked
+        .iter()
+        .map(|&ms| Duration::from_millis(ms).min(FAKE_WAIT_CLAMP))
+        .sum();
+    assert!(
+        matches!(
+            outcome,
+            Err(ClusterError::LockTimeout { ref name, waited })
+                if name == "ledger"
+                    && waited == server_measured
+                    && waited > FAKE_WAIT_CLAMP
+                    && waited <= timeout
+        ),
+        "the genuine timeout's `waited` is the sum of the server-measured waits \
+         ({server_measured:?} over {asked:?}), which covers every RPC and not one clamp, \
+         got {outcome:?}"
+    );
+    assert!(
+        elapsed >= timeout && elapsed < timeout + Duration::from_secs(1),
+        "the wait spans the caller's timeout, not one server clamp and not unbounded: {elapsed:?}"
+    );
+    let calls = asked.len();
+    assert!(
+        (3..=6).contains(&calls),
+        "a 350 ms budget over 100 ms clamps is about four Lock RPCs, not a busy loop: {calls}"
+    );
+    let _stopped = shutdown.send(());
+}
+
+#[tokio::test]
+async fn backpressure_ends_a_blocking_lock_without_a_reissue() {
+    let (asked, lock, shutdown) = serve_fake_lock(LockMode::Saturated).await;
+
+    let outcome = lock
+        .acquire_waiting("ledger", "", Duration::from_secs(5), Duration::from_secs(5))
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(ClusterError::Provider {
+                kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                ..
+            })
+        ),
+        "the waiter-cap refusal reaches the caller typed, got {outcome:?}"
+    );
+    assert_eq!(
+        asked.lock().expect("asked").len(),
+        1,
+        "only a clamped LockTimeout is re-issued; backpressure is the caller's to back off on"
+    );
+    let _stopped = shutdown.send(());
+}
+
+// ── The remote guard's own deadline ─────────────────────────────────────────
+
+/// A lock backend whose token `renew` checks only the holder, never a deadline.
+///
+/// The k8s plugin's `renew_holder` shape: Kubernetes never expires a `Lease`, so a
+/// lapsed but unstolen claim still names its holder and the renew succeeds.
+/// Stored-deadline backends refuse it themselves, so this isolates the client-side gate.
+#[derive(Default)]
+struct HolderOnlyLock {
+    held: std::sync::Mutex<HashMap<String, (String, u64)>>,
+    fences: AtomicU64,
+}
+
+#[async_trait]
+impl cluster_sdk::DistributedLockBackend for HolderOnlyLock {
+    fn features(&self) -> cluster_sdk::LockFeatures {
+        cluster_sdk::LockFeatures::new(true)
+    }
+
+    // The gRPC services serve only the token half; the guard half is never called.
+    async fn try_lock(
+        &self,
+        _name: &str,
+        _ttl: Duration,
+    ) -> Result<cluster_sdk::LockGuard, ClusterError> {
+        Err(ClusterError::Unsupported { feature: "guard" })
+    }
+
+    async fn lock(
+        &self,
+        _name: &str,
+        _ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<cluster_sdk::LockGuard, ClusterError> {
+        Err(ClusterError::Unsupported { feature: "guard" })
+    }
+
+    async fn acquire(
+        &self,
+        name: &str,
+        owner: &str,
+        _ttl: Duration,
+    ) -> Result<cluster_sdk::LeaseToken, ClusterError> {
+        let mut held = self.held.lock().unwrap();
+        if held.contains_key(name) {
+            return Err(ClusterError::LockContended {
+                name: name.to_owned(),
+            });
+        }
+        let fence = self.fences.fetch_add(1, Ordering::Relaxed) + 1;
+        held.insert(name.to_owned(), (owner.to_owned(), fence));
+        Ok(cluster_sdk::LeaseToken::new(name, owner, fence))
+    }
+
+    async fn acquire_waiting(
+        &self,
+        name: &str,
+        owner: &str,
+        ttl: Duration,
+        _timeout: Duration,
+    ) -> Result<cluster_sdk::LeaseToken, ClusterError> {
+        self.acquire(name, owner, ttl).await
+    }
+
+    async fn renew(
+        &self,
+        token: &cluster_sdk::LeaseToken,
+        _ttl: Duration,
+    ) -> Result<(), ClusterError> {
+        let held = self.held.lock().unwrap();
+        if held.get(&token.name) == Some(&(token.owner.clone(), token.fence)) {
+            Ok(())
+        } else {
+            Err(ClusterError::LockExpired {
+                name: token.name.clone(),
+            })
+        }
+    }
+
+    async fn release(&self, token: &cluster_sdk::LeaseToken) -> Result<(), ClusterError> {
+        let mut held = self.held.lock().unwrap();
+        if held.get(&token.name) == Some(&(token.owner.clone(), token.fence)) {
+            held.remove(&token.name);
+        }
+        Ok(())
+    }
+}
+
+struct HolderOnlyLockProvider;
+
+#[async_trait]
+impl cluster_sdk::ClusterLockProvider for HolderOnlyLockProvider {
+    fn provider(&self) -> &'static str {
+        "holder-only"
+    }
+
+    async fn build_lock(
+        &self,
+        _options: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<
+        (
+            Arc<dyn cluster_sdk::DistributedLockBackend>,
+            cluster_sdk::StopHook,
+        ),
+        ClusterError,
+    > {
+        Ok((
+            Arc::new(HolderOnlyLock::default()),
+            Box::new(|| Box::pin(async {})),
+        ))
+    }
+}
+
+const HOLDER_ONLY_CONFIG: &str = "profiles:\n  orders:\n    cache: { provider: standalone }\n    lock: { provider: holder-only }\n";
+
+#[tokio::test]
+async fn a_remote_guard_refuses_to_renew_past_its_own_deadline() {
+    // SC-LOCK-005 over the wire, on a backend that cannot refuse the renew itself.
+    let gear = served_gear()
+        .config_yaml(HOLDER_ONLY_CONFIG)
+        .lock_provider(Arc::new(HolderOnlyLockProvider))
+        .start()
+        .await;
+    let lock = gear.client().lock_backend(PROFILE).expect("a handle");
+    let ttl = Duration::from_millis(300);
+
+    let guard = lock
+        .try_lock("ledger", ttl)
+        .await
+        .expect("the lock is free");
+    tokio::time::sleep(ttl + Duration::from_millis(200)).await;
+
+    let err = guard
+        .renew(ttl)
+        .await
+        .expect_err("a guard past its deadline must not renew");
+    assert!(
+        matches!(err, ClusterError::LockExpired { ref name } if name == "ledger"),
+        "expected LockExpired, got: {err}"
+    );
+
+    gear.stop().await;
+}
+
+#[tokio::test]
+async fn a_remote_guard_renewed_in_time_outlives_its_first_ttl() {
+    // The deadline must re-arm on every renew, or a healthy holder loses its lock
+    // one TTL after acquiring it.
+    let gear = served_gear()
+        .config_yaml(HOLDER_ONLY_CONFIG)
+        .lock_provider(Arc::new(HolderOnlyLockProvider))
+        .start()
+        .await;
+    let lock = gear.client().lock_backend(PROFILE).expect("a handle");
+    let ttl = Duration::from_millis(1_200);
+
+    let guard = lock
+        .try_lock("ledger", ttl)
+        .await
+        .expect("the lock is free");
+    // Four renews a third of a TTL apart carry the guard past its first TTL,
+    // leaving each renew RPC ~800 ms of headroom.
+    for _ in 0..4 {
+        tokio::time::sleep(ttl / 3).await;
+        guard
+            .renew(ttl)
+            .await
+            .expect("a renew inside the deadline succeeds");
+    }
+    guard.release().await.expect("release");
+
+    gear.stop().await;
+}
+
+/// A TTL past the server's clamp must not panic the remote guard's deadline
+/// arithmetic (`Instant + Duration::MAX` overflows), and the guard stays usable.
+#[tokio::test]
+async fn a_remote_guard_survives_a_ttl_past_the_servers_clamp() {
+    let gear = served_gear().start().await;
+    let lock = gear.client().lock_backend(PROFILE).expect("a handle");
+    let guard = lock
+        .try_lock("huge", Duration::MAX)
+        .await
+        .expect("an over-long TTL is clamped, not refused");
+    guard
+        .renew(Duration::MAX)
+        .await
+        .expect("renew with an over-long TTL");
+    guard.release().await.expect("release");
+    gear.stop().await;
+}
+
+/// An unbounded wait (`Duration::MAX`) must not panic the remote `lock`'s deadline
+/// arithmetic; in-process backends accept it.
+#[tokio::test]
+async fn a_remote_lock_accepts_an_unbounded_timeout() {
+    let gear = served_gear().start().await;
+    let lock = gear.client().lock_backend(PROFILE).expect("a handle");
+    let guard = lock
+        .lock("free", Duration::from_secs(5), Duration::MAX)
+        .await
+        .expect("a free lock is granted");
+    guard.release().await.expect("release");
+    gear.stop().await;
+}
+
+/// An election TTL past the server's clamp must not panic the remote pump's
+/// deadline or renewal-timer arithmetic.
+#[tokio::test]
+async fn a_remote_election_survives_a_ttl_past_the_servers_clamp() {
+    let gear = served_gear().start().await;
+    let leader = gear
+        .client()
+        .leader_election_backend(PROFILE)
+        .expect("a handle");
+    let config = cluster_sdk::leader::ElectionConfig::new(Duration::MAX, 2).expect("valid");
+    let watch = leader
+        .elect_with_config("huge", config)
+        .await
+        .expect("an over-long TTL is clamped, not refused");
+    assert!(watch.is_leader(), "the sole candidate leads");
+    watch.resign().await.expect("resign");
+    gear.stop().await;
+}
+
+// ── The shared conformance suites, through the remote client ──────────────
+//
+// Every Profile-3 consumer reaches its backend through `RemoteClusterClient`.
+
+/// A served gear's lock backend, seen through the remote client, torn down with
+/// the gear.
+fn remote_lock(
+    gear: ServedGear,
+) -> cluster_conformance::ScenarioBackend<dyn cluster_sdk::DistributedLockBackend> {
+    let lock = gear.client().lock_backend(PROFILE).expect("a lock handle");
+    cluster_conformance::ScenarioBackend::with_teardown(lock, async move { gear.stop().await })
+}
+
+/// As [`remote_lock`], for leader election.
+fn remote_leader(
+    gear: ServedGear,
+) -> cluster_conformance::ScenarioBackend<dyn cluster_sdk::LeaderElectionBackend> {
+    let leader = gear
+        .client()
+        .leader_election_backend(PROFILE)
+        .expect("a leader handle");
+    cluster_conformance::ScenarioBackend::with_teardown(leader, async move { gear.stop().await })
+}
+
+#[tokio::test]
+async fn lock_conformance_through_the_remote_client() {
+    cluster_conformance::run_lock_conformance(
+        || async { remote_lock(served_gear().start().await) },
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn lock_token_conformance_through_the_remote_client() {
+    cluster_conformance::run_lock_token_conformance(
+        || async { remote_lock(served_gear().start().await) },
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+}
+
+/// The whole leader suite through the wire. `SC-LEAD-006` is skipped under
+/// `Real` by the runner itself; `SC-LEAD-004` holds here because its budget is
+/// the renewal interval a Profile-3 follower re-claims within.
+#[tokio::test]
+async fn leader_conformance_through_the_remote_client() {
+    cluster_conformance::run_leader_conformance(
+        || async { remote_leader(served_gear().start().await) },
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+}
+
+/// `SC-LEAD-004` on its own through the remote client, so the step-down bound is
+/// reported by name if it regresses.
+#[tokio::test]
+async fn sc_lead_004_through_the_remote_client() {
+    let b = remote_leader(served_gear().start().await);
+    cluster_conformance::leader::scenario_lead_004(Arc::clone(&b.backend)).await;
+    b.teardown.await;
+}
+
+#[tokio::test]
+async fn leader_token_conformance_through_the_remote_client() {
+    cluster_conformance::run_leader_token_conformance(
+        || async { remote_leader(served_gear().start().await) },
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+}
+
+/// `SC-LOCK-005` through the remote client against a holder-only backend: the
+/// shared-suite form of `a_remote_guard_refuses_to_renew_past_its_own_deadline`.
+#[tokio::test]
+async fn sc_lock_005_through_the_remote_client_on_a_holder_only_backend() {
+    let gear = served_gear()
+        .config_yaml(HOLDER_ONLY_CONFIG)
+        .lock_provider(Arc::new(HolderOnlyLockProvider))
+        .start()
+        .await;
+    let backend = remote_lock(gear);
+    cluster_conformance::lock::scenario_lock_005(
+        Arc::clone(&backend.backend),
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+    backend.teardown.await;
+}
+
+/// `SC-LTOK-LOCK-003` (token renew after a lapse) against the same holder-only backend.
+/// Expected to fail: the guard's deadline covers only the guard, and a raw token renew
+/// reaches a backend that cannot refuse it (DESIGN §3.19.1). Ignored to keep the gap
+/// visible without failing the build.
+#[tokio::test]
+#[ignore = "DESIGN §3.19.1: holder-only backends accept a token renew after a lapse"]
+async fn sc_ltok_lock_003_through_the_remote_client_on_a_holder_only_backend() {
+    let gear = served_gear()
+        .config_yaml(HOLDER_ONLY_CONFIG)
+        .lock_provider(Arc::new(HolderOnlyLockProvider))
+        .start()
+        .await;
+    let backend = remote_lock(gear);
+    cluster_conformance::lease_token::scenario_ltok_lock_003(
+        Arc::clone(&backend.backend),
+        cluster_conformance::TimeControl::Real,
+    )
+    .await;
+    backend.teardown.await;
 }

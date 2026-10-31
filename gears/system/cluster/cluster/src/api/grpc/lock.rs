@@ -35,35 +35,88 @@
 //! heartbeat — and a wait re-implemented here would not, so it would sleep past a
 //! lease it could have taken.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use cluster_sdk::dto;
 use cluster_sdk::grpc::stubs::lock as stubs;
 use cluster_sdk::lease::LeaseToken;
+use tokio::sync::Semaphore;
 use tonic::{Request, Response, Status};
 
 use super::{ServiceContext, checked_ttl, millis};
 
-/// The largest blocking-acquire wait this service honours from the wire (M3).
+/// The largest blocking-acquire wait this service honours from the wire.
 ///
-/// Same ceiling and reasoning as the shared lease-TTL clamp
-/// ([`checked_ttl`](super::checked_ttl)): a waiter parked longer
-/// than the longest a lease can live is waiting on a lease that must already have
-/// lapsed, so capping the wait frees a server task an unauthenticated caller
-/// could otherwise pin with an arbitrary `timeout_ms`.
-const MAX_LOCK_TIMEOUT: Duration = cluster_sdk::lease::FENCE_RETENTION_DEFAULT;
+/// Far below the one-hour fence-retention ceiling the TTL clamp
+/// ([`checked_ttl`](super::checked_ttl)) uses. A parked `Lock` waiter is not idle:
+/// the backend re-runs its acquire probe on a jittered delay capped at its heartbeat
+/// (the Redis lock polls `SET NX` + `PTTL` at ~4–8 round trips a second), so each
+/// waiter is sustained command-pool load for its whole wait. A caller that needs
+/// longer re-issues `Lock`, which also lets it observe a `stop()` or a deadline.
+/// `RemoteLockBackend::acquire_waiting` re-issues with the remaining budget, so the
+/// clamp never shortens a consumer's `lock()` (Profile-1/3 parity, invariant I1).
+/// This bounds each waiter's *duration*; [`MAX_CONCURRENT_LOCK_WAITERS`] bounds
+/// their *count*.
+///
+/// Tunable: a conservative default, not a tuned SLA. Size it against the
+/// deployment's Redis-pool headroom and lock-contention profile.
+const MAX_LOCK_WAIT: Duration = Duration::from_mins(2);
+
+/// The most concurrent blocking `Lock` waiters this service admits **per profile**.
+/// Beyond it, a `Lock` RPC for that profile gets one non-blocking attempt, and if
+/// that contends it is refused with `Provider{ResourceExhausted}` (gRPC
+/// `RESOURCE_EXHAUSTED` with a problem trailer, retryable with backoff) rather than
+/// parking another poller. That is backpressure: neither a lock outcome (contention
+/// or lapse) nor a transport failure (outage).
+///
+/// With [`MAX_LOCK_WAIT`] this bounds a profile's standing command-pool load
+/// (≈ this × the per-waiter poll rate) however contended its hot names become. Per
+/// profile, not service-wide, so one busy profile (tenant) cannot refuse another's
+/// `Lock` RPCs. Within a profile a *free* name is never starved, because it gets the
+/// non-blocking attempt; a per-name cap would additionally stop one hot name using
+/// up the permits other contended names wait on.
+///
+/// Tunable: a conservative default. Size it against the Redis command-pool capacity.
+const MAX_CONCURRENT_LOCK_WAITERS: usize = 256;
 
 /// The distributed-lock primitive, served over the wire.
 #[derive(Debug, Clone)]
 pub struct DistributedLockService {
     ctx: ServiceContext,
+    /// One [`Semaphore`] of [`MAX_CONCURRENT_LOCK_WAITERS`] permits **per profile**,
+    /// created on first blocking `Lock`. Shared across tonic's per-connection clones
+    /// via the `Arc`, so a profile's cap is gear-wide. Only *bound* profiles get keys
+    /// (`authorize` runs first). Entries are never reclaimed: the cap is per profile
+    /// *name*, so a re-bound profile shares its predecessor's semaphore and any of
+    /// its waiters still in flight.
+    waiters: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
 }
 
 impl DistributedLockService {
     /// Builds the service over the shared [`ServiceContext`].
     #[must_use]
     pub fn new(ctx: ServiceContext) -> Self {
-        Self { ctx }
+        Self {
+            ctx,
+            waiters: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The per-profile blocking-waiter [`Semaphore`], created on first use. The map
+    /// lock is held only to get-or-create the `Arc`, never across the acquire itself.
+    fn profile_waiters(&self, profile: &str) -> Arc<Semaphore> {
+        // Poison is recoverable: a plain map has no invariant a panic could break.
+        let mut map = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
+        // Look up before `entry` so the common case does not allocate an owned key.
+        if let Some(waiters) = map.get(profile) {
+            return Arc::clone(waiters);
+        }
+        Arc::clone(
+            map.entry(profile.to_owned())
+                .or_insert_with(|| Arc::new(Semaphore::new(MAX_CONCURRENT_LOCK_WAITERS))),
+        )
     }
 
     /// The acknowledgement a `renew` answers with — the registry generation,
@@ -113,6 +166,16 @@ impl stubs::distributed_lock_api_server::DistributedLockApi for DistributedLockS
         Ok(Response::new(acquired(token)))
     }
 
+    /// Blocking acquire off the wire. The wait itself is the backend's
+    /// ([`acquire_waiting`](cluster_sdk::DistributedLockBackend::acquire_waiting)).
+    ///
+    /// # Waiter load
+    ///
+    /// A blocked caller is a task polling the backing store, so its wait is clamped
+    /// to [`MAX_LOCK_WAIT`] and concurrent waiters are capped per profile at
+    /// [`MAX_CONCURRENT_LOCK_WAITERS`]; see those for the rationale and the refusal
+    /// path. The permit is held only for this call's wait and released on return,
+    /// success or failure.
     async fn lock(
         &self,
         request: Request<stubs::LockRequest>,
@@ -122,6 +185,48 @@ impl stubs::distributed_lock_api_server::DistributedLockApi for DistributedLockS
         // H8, as `try_lock`.
         cluster_sdk::validate_scoped_cluster_name(&req.name).map_err(cluster_sdk::to_status)?;
 
+        // Admit this waiter only if *this profile's* cap has room. Resolved after
+        // `authorize`, so the map only ever keys bound profiles.
+        let ttl = checked_ttl(req.ttl_ms)?;
+        let Ok(_permit) = self.profile_waiters(&req.profile).try_acquire_owned() else {
+            // The cap bounds *parked pollers*, not acquisitions: a free name parks
+            // nothing, so it gets one non-blocking attempt rather than being refused
+            // because waiters pile on a hot sibling. The extra round trip happens only
+            // while the profile is saturated.
+            return match bound
+                .lock
+                .acquire(&req.name, &caller.mint_owner(), ttl)
+                .await
+            {
+                Ok(token) => Ok(Response::new(acquired(token))),
+                Err(cluster_sdk::ClusterError::LockContended { .. }) => {
+                    // WARN so an operator sees a profile saturating its waiter cap;
+                    // callers back off on `ResourceExhausted`, so volume tracks genuine
+                    // saturation. `profile`/`name` are the low-cardinality attributes
+                    // the other lock signals carry.
+                    tracing::warn!(
+                        profile = %req.profile,
+                        lock = %req.name,
+                        cap = MAX_CONCURRENT_LOCK_WAITERS,
+                        "cluster.lock.waiters_exhausted: refusing a blocking Lock; this profile \
+                         is at its concurrent-waiter cap"
+                    );
+                    // Through the codec, not a bare `Status` (M9, one-codec invariant):
+                    // a trailer-less `RESOURCE_EXHAUSTED` decodes on the client as
+                    // `Provider{ConnectionLost}`, reporting backpressure as an outage.
+                    Err(cluster_sdk::to_status(
+                        cluster_sdk::ClusterError::Provider {
+                            kind: cluster_sdk::ProviderErrorKind::ResourceExhausted,
+                            message: "too many concurrent blocking Lock waiters for this profile; \
+                                  retry with backoff"
+                                .to_owned(),
+                        },
+                    ))
+                }
+                Err(other) => Err(cluster_sdk::to_status(other)),
+            };
+        };
+
         let token = bound
             .lock
             .acquire_waiting(
@@ -130,7 +235,7 @@ impl stubs::distributed_lock_api_server::DistributedLockApi for DistributedLockS
                 // M3: both durations clamped server-side so a wire caller cannot
                 // hold a lock, or park this task waiting for one, past any
                 // legitimate bound.
-                checked_ttl(req.ttl_ms)?,
+                ttl,
                 clamped_timeout(req.timeout_ms),
             )
             .await
@@ -204,9 +309,9 @@ impl stubs::distributed_lock_api_server::DistributedLockApi for DistributedLockS
     }
 }
 
-/// A blocking-acquire wait off the wire, clamped to [`MAX_LOCK_TIMEOUT`] (M3).
+/// A blocking-acquire wait off the wire, clamped to [`MAX_LOCK_WAIT`].
 fn clamped_timeout(timeout_ms: u64) -> Duration {
-    millis(timeout_ms).min(MAX_LOCK_TIMEOUT)
+    millis(timeout_ms).min(MAX_LOCK_WAIT)
 }
 
 /// The minted lease, on the wire.

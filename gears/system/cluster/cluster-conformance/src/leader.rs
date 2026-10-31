@@ -48,6 +48,17 @@ const SETTLE_YIELDS: usize = 64;
 /// renewal traffic the fast-forward already queued.
 const LOSS_SCAN_EVENTS: usize = 256;
 
+/// `SC-LEAD-004`'s election TTL: short, so its renewal interval (the bound a
+/// Profile-3 follower re-claims within) is 1 s, yet above every election-TTL
+/// floor the suites' fixtures configure.
+const STEP_DOWN_TTL: Duration = Duration::from_secs(3);
+
+/// Round-trip and scheduling slack on top of `SC-LEAD-004`'s renewal-interval
+/// bound. With the 1 s interval the total budget is 3 s, equal to the shared
+/// `DEFAULT_WAIT_BUDGET`, so no in-process backend is held to a tighter bound than
+/// the default; only the remote follower gains a stated one.
+const STEP_DOWN_SLACK: Duration = Duration::from_secs(2);
+
 /// Renewal intervals `SC-LEAD-003` holds leadership across; enough for the
 /// auto-renewal task to have fired repeatedly rather than once.
 const RENEWAL_INTERVALS: usize = 5;
@@ -146,9 +157,11 @@ pub async fn scenario_lead_007(_backend: Arc<dyn LeaderElectionBackend>) {
 /// action; the status stays `Leader` across multiple renewal intervals.
 pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>, time: TimeControl) {
     time.begin();
-    // Short TTL so renewals fire quickly under controlled time.
-    // max_missed_renewals=2 → renewal_interval = ttl / 3 ≈ 100 ms.
-    let config = ElectionConfig::new(Duration::from_millis(300), 2).expect("valid config");
+    // max_missed_renewals=2 → renewal_interval = ttl / 3 = 500 ms, `Real`'s elapse
+    // cap, so each step below is one whole interval. A renew may take ~1 s before
+    // the claim lapses; with 300 ms a single slow k3s write lost it.
+    let config = ElectionConfig::new(Duration::from_millis(1_500), 2).expect("valid config");
+    let interval = config.renewal_interval();
     let mut watch = backend.elect_with_config("e", config).await.expect("elect");
     // Wait until we hold leadership.
     assert!(
@@ -158,7 +171,7 @@ pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>, time: Ti
     // Elapse across 5 renewal intervals; the renewal task keeps the lease alive,
     // so a healthy backend (real or fixture) never loses leadership.
     for _ in 0..RENEWAL_INTERVALS {
-        time.elapse(Duration::from_millis(100)).await;
+        time.elapse(interval).await;
         assert!(
             watch.is_leader(),
             "SC-LEAD-003: auto-renewal must keep status Leader across renewal intervals"
@@ -168,19 +181,38 @@ pub async fn scenario_lead_003(backend: Arc<dyn LeaderElectionBackend>, time: Ti
 }
 
 /// SC-LEAD-004: graceful `resign()` releases the claim; a waiting follower is
-/// elected within a bounded number of events on the same backend.
+/// elected within one renewal interval (plus round-trip slack), never by waiting
+/// out a TTL.
+///
+/// The bound is `ElectionConfig::renewal_interval()` because both profiles deliver
+/// it: in-process the follower's cache watch re-claims at once; in Profile 3 the
+/// follower learns of the vacancy only on its next re-`join` (the remote pump's
+/// `tick` -> `claim`; the server pushes no vacancy, see the cluster gear's
+/// `api/grpc/leader.rs` module docs). On the default 30 s TTL that is up to 10 s,
+/// so the scenario pins a short config and derives its budget from it.
 pub async fn scenario_lead_004(backend: Arc<dyn LeaderElectionBackend>) {
-    let mut a = backend.elect("e").await.expect("elect a");
-    let mut b = backend.elect("e").await.expect("elect b");
+    let config = ElectionConfig::new(STEP_DOWN_TTL, 2).expect("valid config");
+    let mut a = backend
+        .elect_with_config("e", config)
+        .await
+        .expect("elect a");
+    let mut b = backend
+        .elect_with_config("e", config)
+        .await
+        .expect("elect b");
     // Drive A to Leader.
     assert!(
         wait_for_leader(&mut a).await,
         "SC-LEAD-004: the first contender must be elected leader"
     );
     a.resign().await.expect("SC-LEAD-004: resign must succeed");
+    let interval = config.renewal_interval();
     assert!(
-        wait_for_leader(&mut b).await,
-        "SC-LEAD-004: successor must be elected promptly after resign"
+        poll_watch(&mut b)
+            .upto(interval + STEP_DOWN_SLACK)
+            .until(|status| matches!(status, LeaderStatus::Leader))
+            .await,
+        "SC-LEAD-004: successor must be elected within one renewal interval ({interval:?}) plus {STEP_DOWN_SLACK:?} of slack after resign"
     );
 }
 
