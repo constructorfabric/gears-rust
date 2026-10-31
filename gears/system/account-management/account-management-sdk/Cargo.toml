@@ -89,6 +89,11 @@ toolkit = { workspace = true }
 toolkit-gts = { workspace = true }
 schemars = { workspace = true }
 
+# `ResourceGroupTypeV1` is the base the AM user / user-group RG types
+# derive from (`#[gts_type_schema(base = ...)]`). RG SDK does not depend
+# on this crate, so there is no cycle.
+resource-group-sdk = { workspace = true }
+
 # `time` carries `MetadataEntry::updated_at` in the metadata SDK
 # module. The workspace pin already enables `serde` / `formatting` /
 # `parsing`; we additionally request `serde-well-known` so the field

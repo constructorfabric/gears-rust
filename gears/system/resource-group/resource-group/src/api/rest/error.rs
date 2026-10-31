@@ -64,13 +64,6 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2b
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
-            DomainError::TypeAlreadyExists { code } => {
-                RgError::already_exists(format!("GTS type with code '{code}' already exists"))
-                    .with_resource(code)
-                    .create()
-            }
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2c
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
             DomainError::InvalidParentType { message } => RgError::invalid_argument()
                 .with_field_violation(
@@ -80,16 +73,6 @@ impl From<DomainError> for CanonicalError {
                 )
                 .create(),
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2d
-            // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
-            // ⚠ wire change accepted in the migration plan: 409 → 400.
-            DomainError::AllowedParentTypesViolation { message } => RgError::failed_precondition()
-                .with_precondition_violation(
-                    precondition::ALLOWED_PARENTS_SUBJECT,
-                    message,
-                    precondition::STATE_TYPE,
-                )
-                .create(),
-            // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2e
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2f
             // ⚠ wire change accepted in the migration plan: 409 → 400.
             DomainError::CycleDetected { message } => RgError::failed_precondition()
@@ -160,11 +143,23 @@ impl From<DomainError> for CanonicalError {
                     .create()
             }
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
-            // ServiceUnavailable: no dedicated variant — DB / infra failures
-            // fall through to the Database arm below and surface as a
-            // canonical Internal (HTTP 500). A genuine 503 (e.g. AuthZ
-            // Resolver unreachable) is produced by platform middleware
-            // upstream of this mapper, not here.
+            // The Types Registry being unreachable is the one infra failure
+            // with a dedicated 503. The raw registry error text stays in
+            // server logs only and is never put on the wire.
+            DomainError::TypesRegistryUnavailable { message } => {
+                tracing::warn!(reason = %message, "resource-group: types registry unavailable");
+                CanonicalError::service_unavailable()
+                    .with_retry_after_seconds(5)
+                    .create()
+            }
+            // A stored type UUID that TR no longer resolves is a server-side
+            // data inconsistency, not a caller error.
+            DomainError::UnresolvedGroupType { type_uuid } => CanonicalError::internal(format!(
+                "resource-group: group type {type_uuid} is not resolvable in the types registry"
+            ))
+            .create(),
+            // Other DB / infra failures fall through to the Database arm
+            // below and surface as a canonical Internal (HTTP 500).
             // @cpt-end:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2j
             // @cpt-begin:cpt-cf-resource-group-algo-sdk-foundation-map-domain-error:p1:inst-err-map-2k
             // Source description flows into the canonical's `ctx.description`

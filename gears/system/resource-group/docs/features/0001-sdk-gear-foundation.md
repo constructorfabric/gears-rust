@@ -113,9 +113,7 @@ Not applicable. This feature provides SDK contracts and gear infrastructure with
 2. [x] - `p1` - Match error variant to HTTP status and Problem fields - `inst-err-map-2`
    1. [x] - `p1` - `Validation` -> 400 Bad Request, type "validation", field-level details - `inst-err-map-2a`
    2. [x] - `p1` - `NotFound` -> 404 Not Found, type "not-found", entity identifier in detail - `inst-err-map-2b`
-   3. [x] - `p1` - `TypeAlreadyExists` -> 409 Conflict, type "type-already-exists", conflicting code in detail - `inst-err-map-2c`
    4. [x] - `p1` - `InvalidParentType` -> 409 Conflict, type "invalid-parent-type", type mismatch in detail - `inst-err-map-2d`
-   5. [x] - `p1` - `AllowedParentsViolation` -> 409 Conflict, type "allowed-parents-violation", violating groups in detail - `inst-err-map-2e`
    6. [x] - `p1` - `CycleDetected` -> 409 Conflict, type "cycle-detected", involved node IDs in detail - `inst-err-map-2f`
    7. [x] - `p1` - `ConflictActiveReferences` -> 409 Conflict, type "active-references", reference count in detail - `inst-err-map-2g`
    8. [x] - `p1` - `LimitViolation` -> 409 Conflict, type "limit-violation", limit name and values in detail - `inst-err-map-2h`
@@ -138,7 +136,6 @@ Not applicable. This feature defines SDK contracts, gear scaffold, and persisten
 The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs` that represent the public API surface for all RG domain entities and query constructs.
 
 **Required types**:
-- `ResourceGroupType` — type definition with `schema_id` (GtsTypePath), `allowed_parents` (Vec), `allowed_memberships` (Vec), `can_be_root` (bool), `metadata_schema` (Option)
 - `ResourceGroup` — group entity with `id` (Uuid), `type` (GtsTypePath), `name` (String), `metadata` (Option), `hierarchy` (ResourceGroupHierarchy with `parent_id`, `tenant_id`)
 - `ResourceGroupWithDepth` — extends ResourceGroup with `hierarchy.depth` (i32, relative distance)
 - `ResourceGroupMembership` — membership link with `group_id` (Uuid), `resource_type` (GtsTypePath), `resource_id` (String)
@@ -153,7 +150,7 @@ The system **MUST** define SDK model types in `resource-group-sdk/src/models.rs`
 **Constraints**: `cpt-cf-resource-group-constraint-surrogate-ids-internal`
 
 **Touches**:
-- Entities: `ResourceGroupType`, `ResourceGroup`, `ResourceGroupWithDepth`, `ResourceGroupMembership`, `GtsTypePath`, `Page`, `PageInfo`, `ListQuery`
+- Entities: `ResourceGroup`, `ResourceGroupWithDepth`, `ResourceGroupMembership`, `GtsTypePath`, `Page`, `PageInfo`, `ListQuery`
 
 ### SDK Trait Contracts
 
@@ -175,11 +172,11 @@ The system **MUST** define SDK trait contracts in `resource-group-sdk/src/api.rs
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-sdk-foundation-sdk-errors`
 
-The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories.
+The system **MUST** define `ResourceGroupError` enum in `resource-group-sdk/src/error.rs` covering all deterministic failure categories. The SDK has no type model and no type methods: group types are Types Registry entities (ADR-002); the SDK declares only the platform tenant type and `TENANT_RG_TYPE_PATH`.
 
-**Required variants**: `Validation`, `NotFound`, `TypeAlreadyExists`, `InvalidParentType`, `AllowedParentsViolation`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
+**Required variants**: `Validation`, `NotFound`, `InvalidParentType`, `CycleDetected`, `ConflictActiveReferences`, `LimitViolation`, `TenantIncompatibility`, `ServiceUnavailable`, `Internal`.
 
-Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting code for TypeAlreadyExists, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
+Each variant **MUST** carry structured context (field details for Validation, entity identifier for NotFound, conflicting identifier for duplicates, etc.) sufficient for the error mapping algorithm to produce informative Problem responses.
 
 **Implements**:
 - `cpt-cf-resource-group-algo-sdk-foundation-map-domain-error`
@@ -191,22 +188,19 @@ Each variant **MUST** carry structured context (field details for Validation, en
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-dod-sdk-foundation-persistence`
 
-The system **MUST** define SeaORM entity models and DB migration scripts for all 6 RG tables.
+The system **MUST** define SeaORM entity models and DB migration scripts for the 3 RG tables. Group types are not stored in RG; rows reference them by Types Registry Registry Reference (ADR-002).
 
-Each persistence adapter (type, group, closure, membership) **MUST** be defined as a trait first (e.g., `TypeRepositoryTrait`, `GroupRepositoryTrait`, `ClosureRepositoryTrait`, `MembershipRepositoryTrait`) and injected into domain services as `Arc<dyn Trait>`. This enables unit testing with in-memory trait implementations (`InMemoryTypeRepository`, etc.) without a database, and ensures a clean contract boundary between domain and infrastructure layers.
+Each persistence adapter (group, closure, membership) **MUST** be defined as a trait first (e.g., `GroupRepositoryTrait`, `ClosureRepositoryTrait`, `MembershipRepositoryTrait`) and injected into domain services as `Arc<dyn Trait>`. This enables unit testing with in-memory trait implementations without a database (types come from a mock Types Registry), and ensures a clean contract boundary between domain and infrastructure layers.
 
 **Required tables** (per DESIGN 3.7):
-- `gts_type` — SMALLINT PK (identity), `schema_id` (unique TEXT), `metadata_schema` (JSONB nullable), timestamps
-- `gts_type_allowed_parent` — composite PK `(type_id, parent_type_id)` with CASCADE FK
-- `gts_type_allowed_membership` — composite PK `(type_id, membership_type_id)` with CASCADE FK
-- `resource_group` — UUID PK, `parent_id` FK (self-referential), `gts_type_id` FK, `name`, `metadata` (JSONB nullable), `tenant_id`, timestamps. Indexes: `(parent_id)`, `(name)`, `(gts_type_id, id)`, `(tenant_id)`
-- `resource_group_membership` — unique `(group_id, gts_type_id, resource_id)`, FK group_id → resource_group, FK gts_type_id → gts_type, `created_at`. Index: `(gts_type_id, resource_id)`
+- `resource_group` — UUID PK, `parent_id` FK (self-referential), `gts_type_id` UUID (Registry Reference, no FK), `is_tenant` BOOLEAN, `name`, `metadata` (JSONB nullable), `tenant_id`, timestamps. Indexes: `(parent_id)`, `(name)`, `(gts_type_id, id)`, `(tenant_id)`, partial UNIQUE `(is_tenant)` WHERE `parent_id IS NULL AND is_tenant` (`uq_rg_tenant_root`)
+- `resource_group_membership` — unique `(group_id, gts_type_id, resource_id)`, `gts_type_id` UUID (Registry Reference, no FK), FK group_id → resource_group, `created_at`. Index: `(gts_type_id, resource_id)`
 - `resource_group_closure` — composite PK `(ancestor_id, descendant_id)`, `depth` INTEGER, FK both → resource_group. Indexes: `(descendant_id)`, `(ancestor_id, depth)`
 
 **Constraints**: `cpt-cf-resource-group-constraint-db-agnostic`, `cpt-cf-resource-group-constraint-surrogate-ids-internal`
 
 **Touches**:
-- DB: `gts_type`, `gts_type_allowed_parent`, `gts_type_allowed_membership`, `resource_group`, `resource_group_membership`, `resource_group_closure`
+- DB: `resource_group`, `resource_group_membership`, `resource_group_closure`
 
 ### Gear Scaffold and Initialization
 
@@ -235,17 +229,17 @@ The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that re
 The system **MUST** wire OperationBuilder-based REST API routing with OData `$filter` parsing and cursor-based pagination for all list endpoints.
 
 **Required infrastructure**:
-- OperationBuilder endpoint registration for types (under `/api/types-registry/v1/`), groups and memberships (under `/api/resource-group/v1/`)
+- OperationBuilder endpoint registration for groups and memberships (under `/api/resource-group/v1/`); RG has no type endpoints
 - OData `$filter` parser supporting field-specific operators: `eq`, `ne`, `in` for string/UUID fields; `eq`, `ne`, `gt`, `ge`, `lt`, `le` for integer fields; nested path syntax (`hierarchy/parent_id`, `hierarchy/depth`)
 - Cursor-based pagination: `limit` (1..200, default 25), `cursor` (opaque token). Ordering is undefined but consistent — no `$orderby` support.
 - DomainError → Problem (RFC-9457) error response mapping wired into all endpoint handlers via OperationBuilder error hooks
-- Path-based API versioning: `/api/resource-group/v1/` for groups and memberships, `/api/types-registry/v1/` for types
+- Path-based API versioning: `/api/resource-group/v1/` for groups and memberships
 
 **Implements**:
 - `cpt-cf-resource-group-algo-sdk-foundation-map-domain-error`
 
 **Touches**:
-- API: `GET/POST/PUT/DELETE /api/types-registry/v1/types*`, `GET/POST/PUT/DELETE /api/resource-group/v1/groups*`, `GET/POST/DELETE /api/resource-group/v1/memberships*`
+- API: `GET/POST/PUT/DELETE /api/resource-group/v1/groups*`, `GET/POST/DELETE /api/resource-group/v1/memberships*`
 
 ### E2E Test Suite
 
@@ -280,13 +274,13 @@ In-source `#[cfg(test)]` tests for filter field definitions and DTO conversions:
 
 - [x] SDK crate (`resource-group-sdk`) compiles with all model types, trait contracts, and error types defined
 - [x] `GtsTypePath::new("gts.cf.core.rg.type.v1~")` succeeds; `GtsTypePath::new("invalid")` returns validation error
-- [x] All 6 DB tables are created by migration scripts with correct constraints and indexes
+- [x] All 3 DB tables are created by migration scripts and no type tables exist with correct constraints and indexes
 - [x] SeaORM entities compile and map to the DB schema without runtime errors
 - [x] Gear registers `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub during Phase 1 init
 - [x] All `ResourceGroupError` variants map to correct HTTP status codes and RFC-9457 Problem responses
 - [x] OData `$filter` parser handles `eq`, `ne`, `in` operators and nested path syntax (`hierarchy/parent_id`)
 - [x] Cursor-based pagination returns correct `PageInfo` with cursor tokens
-- [x] No SMALLINT surrogate IDs appear in any SDK type, REST response schema, or trait method signature
+- [x] No Registry References (type UUIDs) appear in any SDK type, REST response schema, or trait method signature
 - [x] Gear does not contain any AuthZ decision logic, SQL filter generation, or policy evaluation code
 
 ---
@@ -385,11 +379,6 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 - `GtsTypePath::new("  gts.cf.SYSTEM.RG.TYPE.V1~  ")` → succeeds (trims + lowercases)
 - Document this inconsistency and verify behavior
 
-#### TC-SDK-14: SDK model camelCase serialization [P1]
-- **Covers**: G41
-- **Setup**: Serialize `ResourceGroupType` to JSON
-- **Assert**: Keys are camelCase (`canBeRoot`, `allowedParents`, `allowedMemberships`, `metadataSchema`)
-
 #### TC-SDK-15: SDK model `type` field rename [P1]
 - **Covers**: G41
 - **Setup**: Serialize `ResourceGroup` to JSON
@@ -410,14 +399,6 @@ Other gears (`nodes-registry`, `types-registry`) place pure-logic tests directly
 
 Other gears test DTO conversion correctness. `dto.rs` has 9 `From` impls and serde attributes with zero tests.
 
-#### TC-DTO-01: ResourceGroupType -> TypeDto preserves all fields [P2]
-- **Covers**: G39
-- **Assert**: code, can_be_root, allowed_parents, allowed_memberships, metadata_schema all match
-
-#### TC-DTO-02: CreateTypeDto -> CreateTypeRequest conversion [P2]
-- **Covers**: G39
-- **Assert**: All fields transferred
-
 #### TC-DTO-03: ResourceGroup -> GroupDto preserves hierarchy fields [P2]
 - **Covers**: G39
 - **Assert**: hierarchy.parent_id, hierarchy.tenant_id match
@@ -430,11 +411,6 @@ Other gears test DTO conversion correctness. `dto.rs` has 9 `From` impls and ser
 - **Covers**: G40
 - **Setup**: Deserialize `{"type": "gts...", "name": "X"}` into CreateGroupDto
 - **Assert**: `dto.type_path` populated correctly from `"type"` JSON key
-
-#### TC-DTO-06: CreateTypeDto default vectors [P2]
-- **Covers**: G40
-- **Setup**: Deserialize `{"code":"...", "can_be_root": true}` (no allowed_parents/memberships)
-- **Assert**: `allowed_parents == []`, `allowed_memberships == []` (via `#[serde(default)]`)
 
 #### TC-DTO-07: MembershipDto has no tenant_id field [P2]
 - **Covers**: G40, 0004-AC-12
@@ -514,7 +490,7 @@ HEAD /cf/resource-group/v1/groups               → not 404/405
 HEAD /cf/resource-group/v1/groups/{uuid}        → not 405 (404 ok — group doesn't exist)
 HEAD /cf/resource-group/v1/groups/{uuid}/hierarchy  → not 405
 HEAD /cf/resource-group/v1/memberships          → not 405
-POST /cf/types-registry/v1/types (empty body)   → not 404/405 (400 ok — validation)
+POST /cf/resource-group/v1/groups (empty body)  → not 404/405 (400 ok — validation)
 
 Verify: each returns a status code, meaning the route exists and the handler runs.
 No data setup needed. Fastest possible test.
@@ -524,10 +500,10 @@ No data setup needed. Fastest possible test.
 
 **Seam**: DTO serialization — JSON field names, types, and presence match OpenAPI contract over HTTP.
 
-**Why not in unit tests**: TC-DTO-01–07 and TC-SDK-14/15 test `From<Group> for GroupDto` (Rust struct conversion). They do NOT test the JSON wire format: `#[serde(rename = "type")]`, `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase conventions, timestamp format. A serde attribute typo passes unit tests but breaks clients.
+**Why not in unit tests**: TC-DTO-03–07 and TC-SDK-15 test `From<Group> for GroupDto` (Rust struct conversion). They do NOT test the JSON wire format: `#[serde(rename = "type")]`, `#[serde(skip_serializing_if = "Option::is_none")]`, camelCase conventions, timestamp format. A serde attribute typo passes unit tests but breaks clients.
 
 ```
-POST /types → create type
+(type registered in Types Registry beforehand)
 POST /groups → create group with metadata: {"self_managed": true}
 GET  /groups/{id} → 200
 
@@ -542,7 +518,7 @@ Assert JSON keys:
   "created_at" — string, ISO 8601
   "updated_at" — null or absent (fresh create)
 
-Assert NO unexpected keys leaking (like "gts_type_id" internal SMALLINT).
+Assert NO unexpected keys leaking (like "gts_type_id", the internal Registry Reference).
 ```
 
 ### S8: `test_error_response_rfc9457`

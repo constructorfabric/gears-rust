@@ -38,7 +38,6 @@ anyhow = { workspace = true }
 opentelemetry = { workspace = true, features = ["metrics"] }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-inventory = { workspace = true }
 
 # Serde and JSON schema
 serde = { workspace = true }
@@ -66,10 +65,10 @@ thiserror = { workspace = true }
 # AuthZ
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 
-# GTS type system — types registry for schema resolution
+# Types registry SDK — resource-group types are GTS Type Schemas read from it
 types-registry-sdk = { workspace = true }
+# Linked for the `deps = [..., types_registry]` gear declaration (the macro imports the crate)
 types-registry = { workspace = true }
-gts = { workspace = true }
 
 # Local dependencies
 toolkit = { workspace = true }

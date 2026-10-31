@@ -19,53 +19,27 @@ use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
 use resource_group::domain::read_service::RgReadService;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, ResourceGroupReadHierarchy, ResourceGroupType};
-use toolkit_gts::GTS_ID_PREFIX;
-
-/// Root type (`can_be_root = true`) that accepts the given membership types.
-async fn root_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
-    suffix: &str,
-    memberships: &[&str],
-) -> ResourceGroupType {
-    let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
-        suffix,
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code,
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
-            metadata_schema: None,
-        })
-        .await
-        .expect("create root type with memberships")
-}
+use resource_group_sdk::ResourceGroupReadHierarchy;
 
 /// `ResourceGroupReadHierarchy::get_group` resolves even when the underlying
 /// service is wired with a deny-all enforcer — proving it bypasses AuthZ.
 #[tokio::test]
 async fn read_service_get_group_bypasses_authz() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
 
     // Seed through allow-all services.
-    let group_svc = common::make_group_service(db.clone());
-    let root_type = common::create_root_type(&type_svc, "rsget").await;
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let root_type = common::create_root_type(&types, "rsget");
     let group = common::create_root_group(&group_svc, &ctx, &root_type.code, "RSGet", tenant).await;
 
     // Read through a service wired with a DENY-all enforcer: success proves the
     // read never went through the PolicyEnforcer.
     let read = RgReadService::new(
-        Arc::new(common::make_group_service_deny(db.clone())),
-        Arc::new(common::make_membership_service_deny(db.clone())),
+        Arc::new(common::make_group_service_deny(db.clone(), &types)),
+        Arc::new(common::make_membership_service_deny(db.clone(), &types)),
     );
 
     let loaded = read
@@ -81,25 +55,25 @@ async fn read_service_get_group_bypasses_authz() {
 #[tokio::test]
 async fn read_service_list_memberships_bypasses_authz() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
 
     // Seed through allow-all services.
-    let group_svc = common::make_group_service(db.clone());
-    let mbr_svc = common::make_membership_service(db.clone());
-    let member_type = common::create_root_type(&type_svc, "rsmbr").await;
-    let grp_type = root_type_with_memberships(&type_svc, "rsgrp", &[&member_type.code]).await;
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let mbr_svc = common::make_membership_service(db.clone(), &types);
+    let member_type = types.new_member_type("rsmbr");
+    let grp_type = common::create_root_type_with_memberships(&types, "rsgrp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "RSGrp", tenant).await;
     mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-rs")
+        .add_membership(&ctx, group.id, &member_type, "res-rs")
         .await
         .expect("add membership");
 
     // Read through a DENY-all-backed service: success proves the bypass.
     let read = RgReadService::new(
-        Arc::new(common::make_group_service_deny(db.clone())),
-        Arc::new(common::make_membership_service_deny(db.clone())),
+        Arc::new(common::make_group_service_deny(db.clone(), &types)),
+        Arc::new(common::make_membership_service_deny(db.clone(), &types)),
     );
 
     let page = read

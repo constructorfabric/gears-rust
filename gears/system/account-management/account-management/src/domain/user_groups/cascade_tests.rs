@@ -34,9 +34,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use async_trait::async_trait;
 use resource_group_sdk::odata::GroupFilterField;
 use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-    ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-    UpdateTypeRequest,
+    CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
+    ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
 };
 use toolkit_canonical_errors::{CanonicalError, resource_error};
 use toolkit_odata::filter::convert_expr_to_filter_node;
@@ -144,38 +143,6 @@ impl ResourceGroupClient for FakeCascadeRgClient {
     }
     async fn delete_group(&self, _ctx: &SecurityContext, _id: Uuid) -> Result<(), CanonicalError> {
         unreachable!("cascade hook only calls delete_group_cascade, not delete_group")
-    }
-    async fn create_type(
-        &self,
-        _ctx: &SecurityContext,
-        _request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn get_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn list_types(
-        &self,
-        _ctx: &SecurityContext,
-        _query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-        unreachable!()
-    }
-    async fn update_type(
-        &self,
-        _ctx: &SecurityContext,
-        _code: &str,
-        _request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        unreachable!()
-    }
-    async fn delete_type(&self, _ctx: &SecurityContext, _code: &str) -> Result<(), CanonicalError> {
-        unreachable!()
     }
     async fn create_group(
         &self,

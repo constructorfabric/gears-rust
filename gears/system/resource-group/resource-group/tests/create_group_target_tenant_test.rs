@@ -31,10 +31,6 @@
 //!   stopgap, even when the `AccessScope` would otherwise permit the
 //!   target tenant
 //!   (`explicit_id_with_foreign_tenant_id_returns_validation_error`)
-//! - `create_group_unscoped` (the seeding entry point): a `req.tenant_id`
-//!   that disagrees with the trusted `tenant_id` argument is a caller bug,
-//!   rejected loudly rather than silently resolved; an absent or agreeing
-//!   value keeps working exactly as seeding relies on.
 //!
 //! `tests/api_rest_test.rs` covers the HTTP-level wire shape (snake_case
 //! `tenant_id`, RFC-9457 problem shape on the negative paths) for the same
@@ -60,33 +56,21 @@ use toolkit_security::{PlatformSecurityContext, pep_properties};
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::infra::storage::group_repo::GroupRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateGroupRequest, CreateTypeRequest, TENANT_RG_TYPE_PATH};
+use resource_group_sdk::CreateGroupRequest;
 
 /// Build a `GroupService` wired with a caller-supplied enforcer, otherwise
 /// identical to `common::make_group_service`.
 fn make_group_service_with_enforcer(
     db: Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
+    types: &common::TestTypes,
     enforcer: PolicyEnforcer,
-) -> GroupService<GroupRepository, TypeRepository> {
+) -> GroupService<GroupRepository> {
     GroupService::new(
         db,
         QueryProfile::default(),
         enforcer,
         Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
-    )
-}
-
-/// Build a unique tenant-type code (mirrors
-/// `group_service_test.rs::unique_tenant_type_code`): a code starting with
-/// `TENANT_RG_TYPE_PATH` classifies the group as tenant-typed.
-fn unique_tenant_type_code() -> String {
-    format!(
-        "{}x.test.tn.i{}.v1~",
-        TENANT_RG_TYPE_PATH,
-        Uuid::now_v7().as_simple()
+        types.catalog(),
     )
 }
 
@@ -174,11 +158,11 @@ impl AuthZResolverApi for InTenantSubtreeOnlyAuthZ {
 #[tokio::test]
 async fn tenant_id_omitted_uses_caller_tenant() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
-    let root_type = common::create_root_type(&type_svc, "vhp2162a").await;
+    let root_type = common::create_root_type(&types, "vhp2162a");
 
     let group = group_svc
         .create_group(
@@ -198,16 +182,16 @@ async fn tenant_id_omitted_uses_caller_tenant() {
 #[tokio::test]
 async fn tenant_id_matches_caller_tenant_succeeds() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     // `common::make_group_service` wires `AllowAllAuthZ`, which clamps the
     // returned scope to the caller's own tenant -- if the extra
     // check ran here, it would still pass (target == caller), but this test
     // pins that the common "explicit but same tenant" case behaves
     // identically to omission, not merely that it happens to also pass.
-    let group_svc = common::make_group_service(db.clone());
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
-    let root_type = common::create_root_type(&type_svc, "vhp2162b").await;
+    let root_type = common::create_root_type(&types, "vhp2162b");
 
     let group = group_svc
         .create_group(
@@ -230,15 +214,16 @@ async fn tenant_id_matches_caller_tenant_succeeds() {
 #[tokio::test]
 async fn foreign_tenant_allowed_by_permissive_policy_succeeds() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let group_svc = make_group_service_with_enforcer(
         db.clone(),
+        &types,
         PolicyEnforcer::new(Arc::new(TargetTenantAllowAuthZ)),
     );
     let caller_tenant = Uuid::now_v7();
     let target_tenant = Uuid::now_v7();
     let ctx = common::make_ctx(caller_tenant);
-    let root_type = common::create_root_type(&type_svc, "vhp2162c").await;
+    let root_type = common::create_root_type(&types, "vhp2162c");
 
     let group = group_svc
         .create_group(
@@ -265,12 +250,12 @@ async fn foreign_tenant_allowed_by_permissive_policy_succeeds() {
 #[tokio::test]
 async fn foreign_tenant_denied_by_default_policy_returns_tenant_not_found() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let caller_tenant = Uuid::now_v7();
     let target_tenant = Uuid::now_v7();
     let ctx = common::make_ctx(caller_tenant);
-    let root_type = common::create_root_type(&type_svc, "vhp2162d").await;
+    let root_type = common::create_root_type(&types, "vhp2162d");
 
     let err = group_svc
         .create_group(
@@ -301,17 +286,18 @@ async fn foreign_tenant_denied_by_default_policy_returns_tenant_not_found() {
 #[tokio::test]
 async fn in_tenant_subtree_scope_is_denied_fail_closed() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let caller_tenant = Uuid::now_v7();
     let target_tenant = Uuid::now_v7();
     let group_svc = make_group_service_with_enforcer(
         db.clone(),
+        &types,
         PolicyEnforcer::new(Arc::new(InTenantSubtreeOnlyAuthZ {
             root_tenant_id: target_tenant,
         })),
     );
     let ctx = common::make_ctx(caller_tenant);
-    let root_type = common::create_root_type(&type_svc, "vhp2162e").await;
+    let root_type = common::create_root_type(&types, "vhp2162e");
 
     let err = group_svc
         .create_group(
@@ -346,18 +332,18 @@ async fn in_tenant_subtree_scope_is_denied_fail_closed() {
 #[tokio::test]
 async fn explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_error() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let group_svc = make_group_service_with_enforcer(
         db.clone(),
+        &types,
         PolicyEnforcer::new(Arc::new(TargetTenantAllowAuthZ)),
     );
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_a);
 
-    let root_type = common::create_root_type(&type_svc, "vhp2162f").await;
-    let child_type =
-        common::create_child_type(&type_svc, "vhp2162f-child", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "vhp2162f");
+    let child_type = common::create_child_type(&types, "vhp2162fchild", &[&root_type.code], &[]);
 
     // Root group lives in tenant_a (the `TargetTenantAllowAuthZ` mock
     // permits any tenant, so this create is unaffected by).
@@ -394,22 +380,13 @@ async fn explicit_tenant_id_conflicting_with_parent_tenant_returns_validation_er
 #[tokio::test]
 async fn tenant_typed_group_with_explicit_tenant_id_returns_validation_error() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let other_tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let tenant_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: unique_tenant_type_code(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create tenant type");
+    let tenant_type = common::create_tenant_type(&types);
 
     let err = group_svc
         .create_group(
@@ -434,15 +411,16 @@ async fn tenant_typed_group_with_explicit_tenant_id_returns_validation_error() {
 #[tokio::test]
 async fn explicit_id_with_foreign_tenant_id_returns_validation_error() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let group_svc = make_group_service_with_enforcer(
         db.clone(),
+        &types,
         PolicyEnforcer::new(Arc::new(TargetTenantAllowAuthZ)),
     );
     let caller_tenant = Uuid::now_v7();
     let target_tenant = Uuid::now_v7();
     let ctx = common::make_ctx(caller_tenant);
-    let root_type = common::create_root_type(&type_svc, "vhp2162g").await;
+    let root_type = common::create_root_type(&types, "vhp2162g");
 
     let err = group_svc
         .create_group(
@@ -466,11 +444,11 @@ async fn explicit_id_with_foreign_tenant_id_returns_validation_error() {
 #[tokio::test]
 async fn explicit_id_with_same_tenant_still_succeeds() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
-    let root_type = common::create_root_type(&type_svc, "vhp2162h").await;
+    let root_type = common::create_root_type(&types, "vhp2162h");
     let id = Uuid::now_v7();
 
     let group = group_svc
@@ -485,108 +463,4 @@ async fn explicit_id_with_same_tenant_still_succeeds() {
         .expect("id + same-tenant target must still succeed");
 
     assert_eq!(group.id, id);
-}
-
-/// Seeding always calls `create_group_unscoped` with `req.tenant_id: None`
-/// (see `seeding::seed_groups`) -- this pins that shape keeps working.
-#[tokio::test]
-async fn create_group_unscoped_none_tenant_id_still_works_like_seeding() {
-    let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let root_type = common::create_root_type(&type_svc, "vhp2162i").await;
-
-    let group = group_svc
-        .create_group_unscoped(
-            CreateGroupRequest::new(root_type.code, "SeedLikeUsual".to_owned()),
-            tenant_id,
-        )
-        .await
-        .expect("seeding-shaped call (req.tenant_id: None) must still work");
-
-    assert_eq!(group.hierarchy.tenant_id, tenant_id);
-}
-
-/// An `req.tenant_id` that *agrees* with the trusted `tenant_id` argument is
-/// accepted as a no-op -- not every non-`None` value is a bug, only a
-/// disagreeing one.
-#[tokio::test]
-async fn create_group_unscoped_agreeing_tenant_id_succeeds() {
-    let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-    let root_type = common::create_root_type(&type_svc, "vhp2162j").await;
-
-    let group = group_svc
-        .create_group_unscoped(
-            CreateGroupRequest::new(root_type.code, "SeedAgree".to_owned())
-                .with_tenant_id(Some(tenant_id)),
-            tenant_id,
-        )
-        .await
-        .expect("req.tenant_id agreeing with the trusted tenant_id argument must succeed");
-
-    assert_eq!(group.hierarchy.tenant_id, tenant_id);
-}
-
-/// A `req.tenant_id` that *disagrees* with the trusted `tenant_id` argument
-/// is a caller bug -- `create_group_unscoped` rejects it loudly rather than
-/// silently picking a winner (see its doc comment for the rationale).
-#[tokio::test]
-async fn create_group_unscoped_mismatched_tenant_id_returns_validation_error() {
-    let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let trusted_tenant = Uuid::now_v7();
-    let conflicting_tenant = Uuid::now_v7();
-    let root_type = common::create_root_type(&type_svc, "vhp2162k").await;
-
-    let err = group_svc
-        .create_group_unscoped(
-            CreateGroupRequest::new(root_type.code, "SeedMismatch".to_owned())
-                .with_tenant_id(Some(conflicting_tenant)),
-            trusted_tenant,
-        )
-        .await
-        .expect_err(
-            "req.tenant_id disagreeing with the trusted tenant_id argument must be rejected",
-        );
-
-    assert!(matches!(err, DomainError::Validation { .. }));
-}
-
-/// The tenant-typed contradiction check also applies to the unscoped
-/// (seeding) entry point, even when the conflicting value happens to be
-/// numerically equal to the trusted `tenant_id` argument -- `is_tenant`
-/// alone is sufficient to reject.
-#[tokio::test]
-async fn create_group_unscoped_tenant_typed_with_explicit_tenant_id_rejected() {
-    let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let tenant_id = Uuid::now_v7();
-
-    let tenant_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: unique_tenant_type_code(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create tenant type");
-
-    let err = group_svc
-        .create_group_unscoped(
-            CreateGroupRequest::new(tenant_type.code, "SeedTenantTypedConflict".to_owned())
-                .with_tenant_id(Some(tenant_id)),
-            tenant_id,
-        )
-        .await
-        .expect_err("tenant-typed unscoped create with an explicit tenant_id must be rejected");
-
-    assert!(matches!(err, DomainError::Validation { .. }));
 }

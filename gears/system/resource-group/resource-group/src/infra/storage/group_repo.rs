@@ -3,13 +3,13 @@
 // @cpt-begin:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
 //! Persistence layer for resource group entity management.
 //!
-//! All surrogate SMALLINT ID resolution happens here. The domain and API layers
-//! work exclusively with string GTS type paths and UUIDs.
+//! The repository knows only Registry References (UUIDs) of group types, never
+//! GTS type paths: resolving paths to UUIDs and back is the service's job,
+//! through the type catalog. Reads return entity models.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
-use resource_group_sdk::models::{
-    GroupHierarchy, GroupHierarchyWithDepth, ResourceGroup, ResourceGroupWithDepth,
-};
 use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField};
 use sea_orm::sea_query::{Alias, Expr, Query};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
@@ -21,15 +21,14 @@ use uuid::Uuid;
 
 use super::odata_filter::prepare_filter;
 use crate::domain::error::DomainError;
-use crate::domain::repo::GroupRepositoryTrait;
-use crate::infra::storage::FK_RESOURCE_GROUP_PARENT;
+use crate::domain::repo::{GroupRepositoryTrait, HierarchyRow, HierarchyTypeFilter};
 use crate::infra::storage::entity::{
-    gts_type::{self, Entity as GtsTypeEntity},
     resource_group::{self as rg_entity, Entity as ResourceGroupEntity},
     resource_group_closure::{self as closure_entity, Entity as ClosureEntity},
     resource_group_membership::{self as membership_entity, Entity as MembershipEntity},
 };
 use crate::infra::storage::odata_mapper::GroupODataMapper;
+use crate::infra::storage::{FK_RESOURCE_GROUP_PARENT, UQ_RG_TENANT_ROOT};
 
 /// Default `OData` pagination limits for groups.
 const GROUP_LIMIT_CFG: LimitCfg = LimitCfg {
@@ -49,34 +48,6 @@ pub struct GroupRepository;
 impl GroupRepository {
     // -- Private helper functions --
 
-    /// Resolve a SMALLINT type ID to its GTS type path string.
-    async fn resolve_type_path(db: &impl DBRunner, type_id: i16) -> Result<String, DomainError> {
-        let scope = system_scope();
-        let model = GtsTypeEntity::find()
-            .filter(gts_type::Column::Id.eq(type_id))
-            .secure()
-            .scope_with(&scope)
-            .one(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?
-            .ok_or_else(|| DomainError::database(format!("Type ID {type_id} not found")))?;
-        Ok(model.schema_id)
-    }
-
-    /// Convert a database model to the SDK `ResourceGroup` type.
-    fn model_to_resource_group(model: rg_entity::Model, type_path: String) -> ResourceGroup {
-        ResourceGroup {
-            id: model.id,
-            code: type_path,
-            name: model.name,
-            hierarchy: GroupHierarchy {
-                parent_id: model.parent_id,
-                tenant_id: model.tenant_id,
-            },
-            metadata: model.metadata,
-        }
-    }
-
     /// Encode an offset value into a `CursorV1`-compatible base64url token.
     ///
     /// The hierarchy endpoint uses offset-based pagination (not keyset) because
@@ -94,16 +65,17 @@ impl GroupRepository {
         cursor.encode().ok()
     }
 
-    /// Shared helper: given raw `(group_id, depth)` pairs, load groups, resolve
-    /// type paths, apply `OData` filters, paginate, and return a `Page`.
+    /// Shared helper: given raw `(group_id, depth)` pairs, load groups, apply
+    /// the depth and type filters, paginate, and return a `Page` of rows.
     async fn build_hierarchy_page(
         &self,
         db: &impl DBRunner,
         scope: &AccessScope,
         query: &ODataQuery,
         group_depths: Vec<(Uuid, i32)>,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        let (depth_filter, type_filter) = Self::parse_hierarchy_filter(query);
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError> {
+        let (depth_filter, _) = Self::parse_hierarchy_filter(query);
 
         let group_ids: Vec<Uuid> = group_depths.iter().map(|(id, _)| *id).collect();
         if group_ids.is_empty() {
@@ -130,8 +102,8 @@ impl GroupRepository {
         let id_budget = toolkit_db::secure::max_bind_params_for(db)
             .div_euclid(2)
             .max(1);
-        let mut group_map: std::collections::HashMap<Uuid, rg_entity::Model> =
-            std::collections::HashMap::with_capacity(group_ids.len());
+        let mut group_map: HashMap<Uuid, rg_entity::Model> =
+            HashMap::with_capacity(group_ids.len());
         for chunk in group_ids.chunks(id_budget) {
             let groups = ResourceGroupEntity::find()
                 .filter(rg_entity::Column::Id.is_in(chunk.to_vec()))
@@ -143,10 +115,7 @@ impl GroupRepository {
             group_map.extend(groups.into_iter().map(|g| (g.id, g)));
         }
 
-        let all_type_ids: Vec<i16> = group_map.values().map(|g| g.gts_type_id).collect();
-        let type_path_map = self.resolve_type_paths_batch(db, &all_type_ids).await?;
-
-        let mut results: Vec<ResourceGroupWithDepth> = Vec::new();
+        let mut results: Vec<HierarchyRow> = Vec::new();
         for (gid, depth) in &group_depths {
             if let Some(ref df) = depth_filter
                 && !df.matches(*depth)
@@ -154,34 +123,20 @@ impl GroupRepository {
                 continue;
             }
             if let Some(model) = group_map.get(gid) {
-                let type_path = type_path_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(ref tf) = type_filter
-                    && !tf.matches(&type_path)
-                {
+                if !type_filter.matches(model.gts_type_id) {
                     continue;
                 }
-                results.push(ResourceGroupWithDepth {
-                    id: model.id,
-                    code: type_path,
-                    name: model.name.clone(),
-                    hierarchy: GroupHierarchyWithDepth {
-                        parent_id: model.parent_id,
-                        tenant_id: model.tenant_id,
-                        depth: *depth,
-                    },
-                    metadata: model.metadata.clone(),
+                results.push(HierarchyRow {
+                    model: model.clone(),
+                    depth: *depth,
                 });
             }
         }
 
         results.sort_by(|a, b| {
-            a.hierarchy
-                .depth
-                .cmp(&b.hierarchy.depth)
-                .then_with(|| a.id.cmp(&b.id))
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.model.id.cmp(&b.model.id))
         });
 
         let offset = query
@@ -193,8 +148,7 @@ impl GroupRepository {
         let limit_val = query.limit.unwrap_or(25).min(200);
         let limit_usize = limit_val as usize;
         let total = results.len();
-        let items: Vec<ResourceGroupWithDepth> =
-            results.into_iter().skip(offset).take(limit_usize).collect();
+        let items: Vec<HierarchyRow> = results.into_iter().skip(offset).take(limit_usize).collect();
 
         let next_cursor = if offset + limit_usize < total {
             Self::encode_offset_cursor(offset + limit_usize, "fwd")
@@ -218,7 +172,7 @@ impl GroupRepository {
     }
 
     /// Parse and extract hierarchy filters from an `OData` query.
-    fn parse_hierarchy_filter(query: &ODataQuery) -> (Option<DepthFilter>, Option<TypeFilter>) {
+    fn parse_hierarchy_filter(query: &ODataQuery) -> (Option<DepthFilter>, Option<String>) {
         let Some(filter_expr) = query.filter() else {
             return (None, None);
         };
@@ -238,8 +192,8 @@ impl GroupRepository {
         };
 
         let depth = Self::extract_depth_from_node(&filter_node);
-        let type_f = Self::extract_type_from_hierarchy_node(&filter_node);
-        (depth, type_f)
+        let type_code = Self::extract_type_from_hierarchy_node(&filter_node);
+        (depth, type_code)
     }
 
     fn extract_depth_from_node(
@@ -286,7 +240,7 @@ impl GroupRepository {
 
     fn extract_type_from_hierarchy_node(
         node: &toolkit_odata::filter::FilterNode<HierarchyFilterField>,
-    ) -> Option<TypeFilter> {
+    ) -> Option<String> {
         use toolkit_odata::filter::{FilterNode, FilterOp};
 
         match node {
@@ -296,7 +250,7 @@ impl GroupRepository {
                 value,
             } => {
                 if let toolkit_odata::filter::ODataValue::String(s) = value {
-                    Some(TypeFilter::Eq(s.clone()))
+                    Some(s.clone())
                 } else {
                     None
                 }
@@ -317,34 +271,34 @@ impl GroupRepository {
     }
 }
 
+/// The type path the hierarchy `$filter` pins with `type eq '...'`, if any.
+///
+/// The service resolves it through the type catalog and hands the result
+/// back to the repository as a [`HierarchyTypeFilter`].
+pub(crate) fn hierarchy_type_code(query: &ODataQuery) -> Option<String> {
+    GroupRepository::parse_hierarchy_filter(query).1
+}
+
 #[async_trait]
 impl GroupRepositoryTrait for GroupRepository {
     // -- Read operations --
 
-    /// Find a resource group by its UUID, returning the SDK model with resolved type path.
+    /// Find a resource group by its UUID within the caller's scope.
     ///
     /// Uses the provided `AccessScope` for tenant-level filtering (`SecureORM`).
-    async fn find_by_id<C: DBRunner>(
+    async fn find_scoped_model<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         id: Uuid,
-    ) -> Result<Option<ResourceGroup>, DomainError> {
-        let model = ResourceGroupEntity::find()
+    ) -> Result<Option<rg_entity::Model>, DomainError> {
+        ResourceGroupEntity::find()
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
             .scope_with(scope)
             .one(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        match model {
-            Some(m) => {
-                let type_path = Self::resolve_type_path(db, m.gts_type_id).await?;
-                Ok(Some(Self::model_to_resource_group(m, type_path)))
-            }
-            None => Ok(None),
-        }
+            .map_err(|e| DomainError::database(e.to_string()))
     }
 
     /// Find the raw entity model by ID.
@@ -380,33 +334,20 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))
     }
 
-    /// Return the id of any existing root group (`parent_id IS NULL`) whose
-    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
-    /// such root exists. Used to enforce tenant-root uniqueness.
-    ///
-    /// Bypasses `SecureORM` because this check is a system invariant that
-    /// must see every tenant — the caller's `AccessScope` is irrelevant for
-    /// correctness here.
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
-        &self,
-        db: &C,
-        type_prefix: &str,
-    ) -> Result<Option<Uuid>, DomainError> {
-        use sea_orm::{JoinType, QuerySelect};
+    /// Return the id of any existing tenant root group
+    /// (`parent_id IS NULL AND is_tenant`), or `None` when there is none.
+    /// Used to enforce tenant-root uniqueness; `uq_rg_tenant_root` is the
+    /// race backstop.
+    async fn find_tenant_root_id<C: DBRunner>(&self, db: &C) -> Result<Option<Uuid>, DomainError> {
+        use sea_orm::QuerySelect;
 
-        // Bypass SecureORM: tenant-root uniqueness is a system invariant that
+        // System scope: tenant-root uniqueness is a system invariant that
         // must see every tenant, not only the caller's scope.
         let scope = system_scope();
         let model: Option<rg_entity::Model> = ResourceGroupEntity::find()
-            .join(
-                JoinType::InnerJoin,
-                rg_entity::Entity::belongs_to(GtsTypeEntity)
-                    .from(rg_entity::Column::GtsTypeId)
-                    .to(gts_type::Column::Id)
-                    .into(),
-            )
             .filter(rg_entity::Column::ParentId.is_null())
-            .filter(gts_type::Column::SchemaId.starts_with(type_prefix))
+            .filter(rg_entity::Column::IsTenant.eq(true))
+            .limit(1)
             .secure()
             .scope_with(&scope)
             .one(db)
@@ -419,9 +360,8 @@ impl GroupRepositoryTrait for GroupRepository {
     ///
     /// The `type` filter field accepts GTS type path strings from the API
     /// (e.g. `$filter=type eq 'gts.cf.core.rg.type.v1~x.test.org.v1~'`).
-    /// Before passing to `SeaORM`, string values for the `type` field are
-    /// resolved to SMALLINT surrogate IDs at the persistence boundary.
-    /// List groups with `OData` filtering and pagination.
+    /// `resolved` maps each such path to its Registry Reference (UUID), which
+    /// is what the column stores.
     ///
     /// Uses the provided `AccessScope` for tenant-level filtering (`SecureORM`).
     async fn list_groups<C: DBRunner>(
@@ -429,18 +369,17 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         scope: &AccessScope,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, DomainError> {
+        resolved: &HashMap<String, Uuid>,
+    ) -> Result<Page<rg_entity::Model>, DomainError> {
         let base_query = ResourceGroupEntity::find().secure().scope_with(scope);
-        let (base_query, query_no_filter) =
-            prepare_filter::<GroupFilterField, GroupODataMapper, _>(
-                db,
-                base_query,
-                query,
-                GroupFilterField::Type,
-            )
-            .await?;
+        let (base_query, query_no_filter) = prepare_filter::<GroupFilterField, GroupODataMapper, _>(
+            base_query,
+            query,
+            GroupFilterField::Type,
+            resolved,
+        )?;
 
-        let page = paginate_odata::<GroupFilterField, GroupODataMapper, _, _, _, _>(
+        paginate_odata::<GroupFilterField, GroupODataMapper, _, _, _, _>(
             base_query,
             db,
             &query_no_filter,
@@ -449,28 +388,7 @@ impl GroupRepositoryTrait for GroupRepository {
             |m: rg_entity::Model| m,
         )
         .await
-        .map_err(DomainError::from)?;
-
-        // Batch-resolve type paths for all groups in the page (single query)
-        let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();
-        let type_map = self.resolve_type_paths_batch(db, &type_ids).await?;
-
-        let groups = page
-            .items
-            .into_iter()
-            .map(|model| {
-                let type_path = type_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                Self::model_to_resource_group(model, type_path)
-            })
-            .collect();
-
-        Ok(Page {
-            items: groups,
-            page_info: page.page_info,
-        })
+        .map_err(DomainError::from)
     }
 
     /// Query hierarchy from a reference group, returning groups with relative depth.
@@ -482,7 +400,8 @@ impl GroupRepositoryTrait for GroupRepository {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError> {
         let (depth_filter, _) = Self::parse_hierarchy_filter(query);
         let sys = system_scope();
 
@@ -505,7 +424,7 @@ impl GroupRepositoryTrait for GroupRepository {
         let group_depths: Vec<(Uuid, i32)> =
             rows.iter().map(|r| (r.descendant_id, r.depth)).collect();
 
-        self.build_hierarchy_page(db, scope, query, group_depths)
+        self.build_hierarchy_page(db, scope, query, group_depths, type_filter)
             .await
     }
 
@@ -515,7 +434,8 @@ impl GroupRepositoryTrait for GroupRepository {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError> {
         let (depth_filter, _) = Self::parse_hierarchy_filter(query);
         let sys = system_scope();
 
@@ -553,7 +473,7 @@ impl GroupRepositoryTrait for GroupRepository {
             group_depths.push((row.ancestor_id, -row.depth));
         }
 
-        self.build_hierarchy_page(db, scope, query, group_depths)
+        self.build_hierarchy_page(db, scope, query, group_depths, type_filter)
             .await
     }
 
@@ -565,7 +485,8 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
+        is_tenant: bool,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -576,6 +497,7 @@ impl GroupRepositoryTrait for GroupRepository {
             id: Set(id),
             parent_id: Set(parent_id),
             gts_type_id: Set(gts_type_id),
+            is_tenant: Set(is_tenant),
             name: Set(name.to_owned()),
             metadata: Set(metadata.cloned()),
             tenant_id: Set(tenant_id),
@@ -606,7 +528,6 @@ impl GroupRepositoryTrait for GroupRepository {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError> {
@@ -626,7 +547,6 @@ impl GroupRepositoryTrait for GroupRepository {
             .filter(rg_entity::Column::Id.eq(id))
             .secure()
             .col_expr(rg_entity::Column::ParentId, Expr::value(parent_val))
-            .col_expr(rg_entity::Column::GtsTypeId, Expr::value(gts_type_id))
             .col_expr(rg_entity::Column::Name, Expr::value(name.to_owned()))
             .col_expr(rg_entity::Column::Metadata, Expr::value(metadata_val))
             .col_expr(
@@ -636,7 +556,7 @@ impl GroupRepositoryTrait for GroupRepository {
             .scope_with(&scope)
             .exec(db)
             .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
+            .map_err(|e| map_update_error(&e))?;
 
         Ok(res.rows_affected)
     }
@@ -1212,41 +1132,6 @@ impl GroupRepositoryTrait for GroupRepository {
             .map_err(|e| DomainError::database(e.to_string()))?;
         Ok(first.is_some())
     }
-
-    /// Delete all memberships for a group.
-    /// Batch-resolve SMALLINT type IDs to GTS type path strings.
-    ///
-    /// Issues a single `SELECT ... WHERE id IN (...)` query for all distinct type IDs,
-    /// returning a `HashMap` for O(1) lookup. Eliminates N+1 queries in list operations.
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError> {
-        use std::collections::HashMap;
-
-        if type_ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-
-        let unique_ids: Vec<i16> = {
-            let mut ids: Vec<i16> = type_ids.to_vec();
-            ids.sort_unstable();
-            ids.dedup();
-            ids
-        };
-
-        let scope = system_scope();
-        let models = GtsTypeEntity::find()
-            .filter(gts_type::Column::Id.is_in(unique_ids))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| DomainError::database(e.to_string()))?;
-
-        Ok(models.into_iter().map(|m| (m.id, m.schema_id)).collect())
-    }
 }
 
 /// Map a `secure_insert::<ResourceGroupEntity>` failure to the `DomainError`
@@ -1257,7 +1142,11 @@ impl GroupRepositoryTrait for GroupRepository {
 /// the foreign-key answer below).
 fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> DomainError {
     if e.is_unique_violation() {
-        DomainError::group_already_exists(id)
+        if is_tenant_root_violation(&e.to_string()) {
+            DomainError::conflict("tenant root already exists")
+        } else {
+            DomainError::group_already_exists(id)
+        }
     } else if e.is_foreign_key_violation() {
         // The parent this create read a moment ago is gone: a
         // concurrent non-force delete of it won the race, and
@@ -1273,17 +1162,11 @@ fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> Domain
         // no second serializable party to detect against and the
         // foreign key answers instead. Unmapped it was a 500.
         //
-        // Which foreign key, though: this table has two, and
-        // `fk_rg_gts_type` fails when a concurrent `delete_type`
-        // removes the type between this transaction resolving it
-        // and inserting. Answering *that* with "group not found,
-        // id = parent" would name the wrong resource and the wrong
-        // cause, so only the parent constraint maps. PostgreSQL
-        // puts the constraint name in the message; SQLite says
-        // only "FOREIGN KEY constraint failed", so there the
-        // answer stays a database error -- unhelpful, but not a
-        // confident lie, and the race needs concurrent writers
-        // SQLite does not have.
+        // PostgreSQL puts the constraint name in the message;
+        // SQLite says only "FOREIGN KEY constraint failed", so
+        // there the answer stays a database error -- unhelpful,
+        // but not a confident lie, and the race needs concurrent
+        // writers SQLite does not have.
         let msg = e.to_string();
         if msg.contains(FK_RESOURCE_GROUP_PARENT)
             && let Some(parent_id) = parent_id
@@ -1295,6 +1178,23 @@ fn map_insert_error(e: &ScopeError, id: Uuid, parent_id: Option<Uuid>) -> Domain
     } else {
         DomainError::database(e.to_string())
     }
+}
+
+/// Map a failed `UPDATE resource_group` to the `DomainError` it should surface
+/// as. The only constraint an update can trip is `uq_rg_tenant_root` (moving a
+/// tenant group to the root while another tenant root exists).
+fn map_update_error(e: &ScopeError) -> DomainError {
+    if e.is_unique_violation() && is_tenant_root_violation(&e.to_string()) {
+        DomainError::conflict("tenant root already exists")
+    } else {
+        DomainError::database(e.to_string())
+    }
+}
+
+/// Whether a unique-violation message names the tenant-root partial unique
+/// index: `PostgreSQL` carries the index name, `SQLite` the indexed column.
+fn is_tenant_root_violation(msg: &str) -> bool {
+    msg.contains(UQ_RG_TENANT_ROOT) || msg.contains("resource_group.is_tenant")
 }
 
 /// Depth filter for hierarchy queries.
@@ -1350,18 +1250,6 @@ impl DepthFilter {
     }
 }
 
-/// Type filter for hierarchy queries.
-enum TypeFilter {
-    Eq(String),
-}
-
-impl TypeFilter {
-    fn matches(&self, type_path: &str) -> bool {
-        match self {
-            Self::Eq(s) => type_path == s,
-        }
-    }
-}
 // @cpt-end:cpt-cf-resource-group-dod-entity-hier-hierarchy-engine:p1:inst-full
 
 #[cfg(test)]

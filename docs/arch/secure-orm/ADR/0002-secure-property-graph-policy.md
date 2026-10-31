@@ -246,8 +246,6 @@ resolvable scope dimension:
 | `tenant_closure` | [tenant_closure.rs:32](../../../../gears/system/account-management/account-management/src/infra/storage/entity/tenant_closure.rs#L32) | `no_tenant, no_resource, no_owner, no_type` |
 | `resource_group_closure` | [resource_group_closure.rs:9](../../../../gears/system/resource-group/resource-group/src/infra/storage/entity/resource_group_closure.rs#L9) | `no_tenant, no_resource, no_owner, no_type` |
 | `resource_group_membership` | [resource_group_membership.rs:10](../../../../gears/system/resource-group/resource-group/src/infra/storage/entity/resource_group_membership.rs#L10) | `no_tenant, no_resource, no_owner, no_type` |
-| `gts_type_allowed_parent` | `.../entity/gts_type_allowed_parent.rs` | `no_tenant, no_resource, no_owner, no_type` |
-| `gts_type_allowed_membership` | `.../entity/gts_type_allowed_membership.rs` | `no_tenant, no_resource, no_owner, no_type` |
 
 This is deliberate and correct for those tables — a closure row references *two* tenants, so
 there is no single row-owning tenant to filter on. But it means that used as a graph element

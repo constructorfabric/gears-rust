@@ -170,7 +170,7 @@ upstream PRD/DESIGN definition, with no broken references.
   - Creation of the initial Platform Administrator user identity — the Platform Admin is pre-provisioned in the IdP during infrastructure setup; AM does not create this user (covered by the `idp-user-operations-contract` feature for all other user operations).
   - Validation of IdP binding sufficiency or identifier equality between AM's tenant UUID and the IdP's internal identifiers — that is the IdP provider's responsibility.
   - Creation of any non-root tenant — child tenant creation belongs to `tenant-hierarchy-management`.
-  - Registration of GTS-backed types/schemas (tenant types, metadata schemas, user-group RG type) — those are performed by the respective functional features (`tenant-type-enforcement`, `tenant-metadata`, `user-groups`) during their own initialization paths; bootstrap's IdP wait does not gate them.
+  - Registration of GTS-backed types/schemas (tenant types, metadata schemas) and static declaration of the user-group RG type — those are performed by the respective functional features (`tenant-type-enforcement`, `tenant-metadata`, `user-groups`) during their own initialization paths; bootstrap's IdP wait does not gate them.
   - Error taxonomy and metrics definitions themselves — provided by the `errors-observability` foundation feature.
 
 - **Requirements Covered**:
@@ -499,19 +499,19 @@ upstream PRD/DESIGN definition, with no broken references.
 
 - [ ] `p1` - **ID**: `cpt-cf-account-management-feature-user-groups`
 
-- **Purpose**: Orchestrate user groups entirely through delegation to the Resource Group gear. Account Management registers the chained user-group type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during gear initialization, triggers cascade cleanup of user groups during tenant hard-deletion, and exposes AM's user-query surface so callers can combine user existence checks with Resource Group's membership operations. Account Management deliberately does not proxy CRUD or membership calls and owns no user-group tables — all group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are performed by Resource Group.
+- **Purpose**: Orchestrate user groups entirely through delegation to the Resource Group gear. Account Management declares the chained user-group type schema `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` statically in its SDK (served by Types Registry; no registration at gear initialization), triggers cascade cleanup of user groups during tenant hard-deletion, and exposes AM's user-query surface so callers can combine user existence checks with Resource Group's membership operations. Account Management deliberately does not proxy CRUD or membership calls and owns no user-group tables — all group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are performed by Resource Group.
 
 - **Depends On**: `cpt-cf-account-management-feature-tenant-hierarchy-management`, `cpt-cf-account-management-feature-idp-user-operations-contract`, `cpt-cf-account-management-feature-errors-observability`
 
 - **Scope**:
-  - Chained RG type-schema registration during AM gear init for `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`, with `allowed_memberships = [gts.cf.core.am.user.v1~]` and `allowed_parents` permitting self-nesting for nested user groups.
+  - Static declaration of the chained RG type schemas `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` in the AM SDK, with `allowed_membership_types = [gts.cf.core.rg.type.v1~cf.core.am.user.v1~]` and `allowed_parent_types` permitting self-nesting for nested user groups; no runtime registration.
   - Account-Management-side cascade cleanup trigger during tenant hard-deletion so Resource Group can remove the tenant's user-group subtree before the tenant row is deleted.
   - Exposure of AM's tenant-scoped user-query capability (from feature 5) as the valid user set that callers combine with Resource Group membership operations.
   - Documented delegation contract: consumers call `ResourceGroupClient` directly for group and membership operations; AM does not proxy.
 
 - **Out of scope**:
   - Resource Group storage: the `user_group_*` tables and any other user-group persistence are OWNED by the Resource Group gear, not by account-management.
-  - The Resource Group engine itself (generic RG CRUD, type registry machinery, RG cascade engine, forest invariants, cycle detection, tenant-scoped isolation enforcement) — account-management only DELEGATES to it.
+  - The Resource Group engine itself (generic RG CRUD, type resolution through Types Registry, RG cascade engine, forest invariants, cycle detection, tenant-scoped isolation enforcement) — account-management only DELEGATES to it.
   - REST endpoints for group create/update/delete, membership add/remove, or nested-group traversal — none live in the AM OpenAPI surface; callers use Resource Group's API directly.
   - User identity operations (provisioning, deprovisioning, existence checks) — owned by `idp-user-operations-contract`.
   - Tenant lifecycle, tenant hierarchy, and tenant-closure ownership — owned by `tenant-hierarchy-management`.
@@ -534,7 +534,7 @@ upstream PRD/DESIGN definition, with no broken references.
 - **Domain Model Entities**:
   - `UserGroup` (delegated view/adapter — delegated to Resource Group; not owned here)
   - `UserGroupMembership` (delegated adapter — delegated to Resource Group; not owned here)
-  - Chained type-schema reference `gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (registered by AM, schema body published for RG-side validation; AM stores no instance rows)
+  - Chained type-schema reference `gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` (declared statically by AM and served by Types Registry; AM stores no instance rows)
 
 - **Design Components**:
 
