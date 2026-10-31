@@ -107,7 +107,7 @@ use timescaledb_usage_collector_plugin as _;
 
 #[cfg(feature = "clickhouse-usage-collector")]
 use clickhouse_usage_collector_plugin as _;
-#[cfg(feature = "quota-enforcement")]
+#[cfg(any(feature = "quota-enforcement", feature = "bss-rating"))]
 use cluster as _;
 #[cfg(feature = "quota-enforcement")]
 use quota_enforcement as _;
@@ -139,3 +139,6 @@ use event_broker as _;
 use sqlite_event_broker_plugin as _;
 #[cfg(feature = "bss-orders")]
 use standalone_cluster_plugin as _;
+
+#[cfg(feature = "bss-rating")]
+use bss_rating as _;

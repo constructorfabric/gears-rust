@@ -1,0 +1,16 @@
+[package]
+name = "cf-gears-bss-rating-core"
+edition.workspace = true
+license.workspace = true
+description = "BSS Rating evaluation core: the pure, I/O-free evaluation steps, engine generations and exact arithmetic"
+
+[lib]
+name = "bss_rating_core"
+
+[lints]
+workspace = true
+
+# Purity rule (DESIGN §1.3): no tokio, sea-orm, http or ClientHub anywhere in the normal
+# dependency tree. `make check-pure-crates` enforces it in CI from `tools/scripts/pure_crates.toml`;
+# add a dependency here only if it keeps that check green.
+[dependencies]

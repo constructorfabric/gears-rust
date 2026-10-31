@@ -93,6 +93,10 @@ jobs:
               - 'deploy/components.yaml'
               - 'tools/scripts/resolve_release.py'
               - 'tools/scripts/tests/test_resolve_release.py'
+              # Input to `make check-pure-crates` in the repo-checks job: an edit to the checker
+              # or its crate list alone must still get the purity check run.
+              - 'tools/scripts/check_pure_crates.py'
+              - 'tools/scripts/pure_crates.toml'
               # Input to `e2e_sidecar_pins_the_same_timescaledb_image` in
               # libs/test-containers: a Python-only edit to the E2E sidecar must
               # still get the cross-lane TimescaleDB pin checked, or the guard
@@ -256,6 +260,12 @@ jobs:
 
       - name: Validate packaging metadata (readme/license-file paths)
         run: make check-packaging-metadata
+
+      # Pure crates (the BSS Rating evaluation core) must reach no tokio, sea-orm,
+      # http or ClientHub through their dependency tree (tools/scripts/pure_crates.toml).
+      - name: Pure crates stay free of I/O dependencies
+        if: runner.os == 'Linux'
+        run: make check-pure-crates
 
       - name: Validate release configuration (publish flags, release-plz.toml)
         run: make check-release-config
@@ -448,6 +458,12 @@ jobs:
       - name: Test bss-orders with Postgres (integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=orders-pg
+
+      # bss-rating's Postgres tier: the inbox, exception and release races of the
+      # foundation. Without this step the tier compiles here and runs nowhere.
+      - name: Test bss-rating with Postgres (integration)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=rating-pg
 
       - name: Test redis-cluster-plugin (redis integration)
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
