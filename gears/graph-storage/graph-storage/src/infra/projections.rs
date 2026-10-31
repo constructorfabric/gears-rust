@@ -14,7 +14,8 @@
 //! answers correctly — the regression is invisible without a test that reads
 //! the statement.
 
-use sea_orm::{QuerySelect, Select};
+use sea_orm::sea_query::Expr;
+use sea_orm::{EntityTrait, QuerySelect, Select};
 
 use crate::infra::storage::entity::{edge, gts_type, node};
 
@@ -190,14 +191,16 @@ pub fn endpoint_pair_columns(query: Select<edge::Entity>) -> Select<edge::Entity
 }
 
 /// What one hop needs of an edge: which edge, of which type, between which
-/// two nodes. Read per hop for every live incident edge, so its payload and
-/// audit columns were the widest thing on the traversal hot path.
+/// two nodes, and which of several same-typed relations it is (the
+/// discriminator). Read per hop for every live incident edge, so its payload
+/// and audit columns were the widest thing on the traversal hot path.
 #[derive(Debug, sea_orm::FromQueryResult)]
 pub struct EdgeHop {
     pub edge_key: String,
     pub gts_edge_type_id: i32,
     pub src_node_id: i64,
     pub dst_node_id: i64,
+    pub discriminator: Option<String>,
 }
 
 pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
@@ -207,6 +210,29 @@ pub fn edge_hop_columns(query: Select<edge::Entity>) -> Select<edge::Entity> {
         .column(edge::Column::GtsEdgeTypeId)
         .column(edge::Column::SrcNodeId)
         .column(edge::Column::DstNodeId)
+        .column(edge::Column::Discriminator)
+}
+
+/// The node select a listing starts from: every column `NodeRow` and the
+/// listing's cursor read, and not the two wide ones.
+///
+/// `embedding` (a 384-lane vector, ~1.5 KiB) and `search_text` are returned
+/// by no listing, and reading them for every row of every page was most of a
+/// page's bytes on the wire (gears-rust #5043). They are selected as a typed
+/// `NULL` and an empty string instead, so the row still decodes as a
+/// `node::Model` -- the platform pager needs the entity's model, and the
+/// listing's cursor and envelope are built from it -- while the values a
+/// listing never looks at are not read from the table.
+pub fn node_listing_select() -> Select<node::Entity> {
+    use sea_orm::Iterable as _;
+    node::Entity::find()
+        .select_only()
+        .columns(
+            node::Column::iter()
+                .filter(|c| !matches!(c, node::Column::Embedding | node::Column::SearchText)),
+        )
+        .column_as(Expr::cust("NULL::vector"), "embedding")
+        .column_as(Expr::val(""), "search_text")
 }
 
 #[cfg(test)]
@@ -215,9 +241,9 @@ mod tests {
 
     use super::{
         edge, edge_ends_columns, edge_hop_columns, edge_owner_columns, edge_state_columns,
-        endpoint_pair_columns, gts_type, node, node_ident_columns, node_state_columns,
-        node_typed_columns, type_id_columns, type_meta_columns, type_name_columns,
-        type_traits_columns,
+        endpoint_pair_columns, gts_type, node, node_ident_columns, node_listing_select,
+        node_state_columns, node_typed_columns, type_id_columns, type_meta_columns,
+        type_name_columns, type_traits_columns,
     };
 
     /// The columns no projection here may read, by entity. Each of them is
@@ -277,12 +303,29 @@ mod tests {
     }
 
     #[test]
-    fn an_edge_hop_reads_four_columns() {
+    fn an_edge_hop_reads_five_columns() {
         holds(
             &rendered(&edge_hop_columns(edge::Entity::find())),
             &WIDE_EDGE,
-            &["edge_key", "gts_edge_type_id", "src_node_id", "dst_node_id"],
+            &[
+                "edge_key",
+                "gts_edge_type_id",
+                "src_node_id",
+                "dst_node_id",
+                "discriminator",
+            ],
         );
+    }
+
+    #[test]
+    fn a_listing_reads_neither_the_vector_nor_the_search_text() {
+        let sql = rendered(&node_listing_select());
+        for wide in ["\"node\".\"embedding\"", "\"node\".\"search_text\""] {
+            assert!(!sql.contains(wide), "must not read {wide}: {sql}");
+        }
+        for want in ["node_key", "payload", "version", "updated_at"] {
+            assert!(sql.contains(want), "needs `{want}`: {sql}");
+        }
     }
 
     #[test]

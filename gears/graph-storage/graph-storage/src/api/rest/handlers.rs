@@ -363,6 +363,25 @@ pub async fn project_nodes(
     Ok(Json(page.map_items(dto::GraphNodeRowDto::from)))
 }
 
+/// How many nodes the projection lists for the same `type_pattern` and
+/// `$filter`. The same `OData` extractor binds the query, so a `$filter` means
+/// here what it means on the listing; the options a count has no use for are
+/// refused by the service.
+#[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
+pub async fn count_nodes(
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(services): Extension<Arc<GraphServices>>,
+    Query(params): Query<ProjectionTypeParams>,
+    OData(query): OData,
+) -> ApiResult<Json<dto::GraphNodeCountDto>> {
+    let patterns: Vec<String> = params
+        .type_pattern
+        .map(|raw| raw.split(',').map(|p| p.trim().to_owned()).collect())
+        .unwrap_or_default();
+    let count = services.count_nodes(&ctx, &patterns, query).await?;
+    Ok(Json(count.into()))
+}
+
 /// The type narrowing of a projection.
 ///
 /// A plain parameter rather than an `OData` option: a GTS pattern is not a
@@ -421,6 +440,16 @@ pub async fn search(
     Ok(Json(response.into()))
 }
 
+/// The SDK owns both directions of this spelling, as for the search mode.
+fn parse_direction(raw: Option<&str>) -> Result<Option<m::Direction>, DomainError> {
+    raw.map(|raw| {
+        raw.parse::<m::Direction>().map_err(|unknown| {
+            DomainError::invalid(format!("{unknown}; expected outgoing, incoming or either"))
+        })
+    })
+    .transpose()
+}
+
 #[tracing::instrument(skip_all, fields(user.id = %ctx.subject_id()))]
 pub async fn traverse(
     Extension(ctx): Extension<SecurityContext>,
@@ -436,6 +465,8 @@ pub async fn traverse(
                 edge_type_patterns: request.edge_type_patterns,
                 node_type_patterns: request.node_type_patterns,
                 max_nodes: request.max_nodes,
+                direction: parse_direction(request.direction.as_deref())?,
+                edge_discriminators: request.edge_discriminators,
             },
         )
         .await?;
@@ -456,6 +487,7 @@ pub async fn neighborhood(
                 depth: request.depth,
                 node_budget: request.node_budget,
                 include_phantoms: request.include_phantoms,
+                direction: parse_direction(request.direction.as_deref())?,
             },
         )
         .await?;

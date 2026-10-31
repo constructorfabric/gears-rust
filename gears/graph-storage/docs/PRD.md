@@ -574,7 +574,7 @@ Every compound read — hybrid search (multiple arms plus hydration), traversal 
 
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-fr-graph-traversal`
 
-The system **MUST** expand a subgraph from seed nodes — given as explicit node keys, as hybrid-search hits for a query, or both — by breadth-first traversal up to a requested depth bounded by a system maximum, treating edges as undirected for reachability, with optional per-hop edge-type restriction and node-type filtering of returned nodes. Responses **MUST** include the traversed nodes, edges, seeds, and truncation status; seeds always survive truncation. Because seeds are exempt from truncation, the seed set **MUST** be bounded before expansion: after authorization and deduplication, a request whose distinct authorized seeds exceed the effective node budget **MUST** be rejected rather than served beyond the budget, and seed ordering and admitted-seed metadata **MUST** be deterministic.
+The system **MUST** expand a subgraph from seed nodes — given as explicit node keys, as hybrid-search hits for a query, or both — by breadth-first traversal up to a requested depth bounded by a system maximum, following edges in a requested direction (outgoing, incoming, or either — undirected reachability, the default), with optional per-hop edge-type and discriminator restriction and node-type filtering of returned nodes. Responses **MUST** include the traversed nodes, edges, seeds, and truncation status; seeds always survive truncation. Because seeds are exempt from truncation, the seed set **MUST** be bounded before expansion: after authorization and deduplication, a request whose distinct authorized seeds exceed the effective node budget **MUST** be rejected rather than served beyond the budget, and seed ordering and admitted-seed metadata **MUST** be deterministic.
 
 > **Found while building the prototype.** Seeds are explicit node keys only; seeding from hybrid-search hits is not delivered (README § Known limitations), so "search then expand" is two calls.
 
@@ -594,7 +594,7 @@ The system **MUST** serve a UI-oriented neighborhood projection: given one entit
 
 - [x] `p1` - **ID**: `cpt-cf-graph-storage-fr-tabular-projection`
 
-The system **MUST** project nodes matching criteria into tabular results: selection by explicit node-key or identifier lists, by type family, by label, and by filters over indexed payload attributes. Filtering, ordering and pagination **MUST** use the platform OData binding — exactly the five accepted system query options (`$filter`, `$orderby`, `$select`, `$top`, `$skiptoken`, with `cursor` as the alias for `$skiptoken`) — and any other option **MUST** be rejected rather than ignored. `$filter` **MUST** be admitted only over payload paths the type declares in its `index` trait, addressed by the same path in OData syntax (`payload/severity`), and a filter over an undeclared path **MUST** be rejected with an error naming the path and the declared alternatives. Responses **MUST** return stable pages suitable for table rendering, with continuation tokens carried in the platform `CursorV1` rather than in a second token format.
+The system **MUST** project nodes matching criteria into tabular results: selection by explicit node-key or identifier lists, by type family, by label, and by filters over indexed payload attributes. Filtering, ordering and pagination **MUST** use the platform OData binding — exactly the five accepted system query options (`$filter`, `$orderby`, `$select`, `$top`, `$skiptoken`, with `cursor` as the alias for `$skiptoken`) — and any other option **MUST** be rejected rather than ignored. `$filter` **MUST** be admitted only over payload paths the type declares in its `index` trait, addressed by the same path in OData syntax (`payload/severity`), and a filter over an undeclared path **MUST** be rejected with an error naming the path and the declared alternatives. Responses **MUST** return stable pages suitable for table rendering, with continuation tokens carried in the platform `CursorV1` rather than in a second token format. The total a table shows beside its page **MUST** be available as a count of the same selection and filter, bounded by configuration so its cost does not grow with the tenant, and **MUST** say when it stopped at that bound rather than present the bound as exact.
 
 > **Found while building the prototype.** An earlier wording had the token be `CursorV1` *extended with the observed graph revision*. A gear cannot extend it: `CursorV1` has no revision member, and the platform page envelope carries only the items and the cursors. The revision rides on each row's audit envelope instead (`cpt-cf-graph-storage-fr-audit-envelope`, DESIGN § API element envelope): the platform wrapper constrains the *page*, not the *items*, and the items are this gear's own DTO. So this path reports `(source_epoch, graph_revision)` like every other one, per element rather than once per response — an earlier draft of this note concluded a platform slot was needed for it, and none is.
 
@@ -728,7 +728,7 @@ Every node and edge returned by any read surface **MUST** carry a gear-assigned 
 
 The system **MUST** ship a transport-agnostic SDK crate with a typed client trait covering type registration, ingest, search, traversal, projection, and metrics, registered in ClientHub for in-process consumption by other gears, with canonical platform error types. The in-process path **MUST** be subject to the same admission limits as the REST surface — resource bounds are enforced in the shared service layer, not at the HTTP edge only.
 
-> **Found while building the prototype.** Metrics are not part of the client (analytics moved out of this gear), and the trait is narrower than REST: no edge read, no compatibility dry run, no registration options or migrations, no source-namespace operations (README § Known limitations).
+> **Found while building the prototype.** Metrics are not part of the client (analytics moved out of this gear), and the trait is narrower than REST: no edge read and no source-namespace operations; registration takes the REST options, dry run and migrations included, through `register_types_with` (README § Known limitations).
 
 - **Rationale**: Producer and consumer gears integrate in-process; the SDK trait is the platform's inter-gear contract pattern.
 - **Actors**: `cpt-cf-graph-storage-actor-producer-gear`, `cpt-cf-graph-storage-actor-consumer-gear`
@@ -794,7 +794,7 @@ The system **MUST** ingest a batch of 10,000 nodes and 20,000 edges (validation 
 
 Hybrid search **MUST** answer within 500 ms at p95 (query embedding time excluded) on a tenant graph of 100,000 nodes and 500,000 edges with default limits.
 
-> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`, 100k nodes / 500k edges), which CI does not run. Pending a recorded run at that scale.
+> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`, 100k nodes / 500k edges), which CI does not run. Recorded at that scale on 2026-10-26 at the store level (hybrid p95 ≤ 54 ms; [docs/PERF.md](./PERF.md), gears-rust#5517); query embedding and the REST path are not in that number.
 
 - **Threshold**: p95 <= 500 ms, 100k nodes / 500k edges / 300k chunks, arm limit 50, warm indexes
 - **Rationale**: Search is interactive; it fronts every exploration scenario.
@@ -806,7 +806,7 @@ Hybrid search **MUST** answer within 500 ms at p95 (query embedding time exclude
 
 Depth-3 neighborhood projection **MUST** answer within 1 second at p95 on a tenant graph of 100,000 nodes and 500,000 edges with a 1,000-node budget.
 
-> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`), which CI does not run. Pending a recorded run at that scale.
+> **Found while building the prototype.** Not claimed as met: `tests/perf.rs` asserts this threshold only at full scale (`GEARS_GRAPH_PERF_SCALE=1.0`), which CI does not run. Recorded at that scale on 2026-10-26 at the engine and store level (neighbourhood p95 ≤ 192 ms, with degrees and hydration; [docs/PERF.md](./PERF.md), gears-rust#5517); ordering, serialization and the REST path are not in that number.
 
 - **Threshold**: p95 <= 1 s, depth 3, node budget 1,000, same reference graph as search latency
 - **Rationale**: The UI neighborhood scenario is interactive and hits dense regions of the graph.

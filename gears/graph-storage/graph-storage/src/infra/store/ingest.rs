@@ -895,7 +895,7 @@ async fn upsert_node(
         spec.payload.as_ref(),
         &info.full_text_search,
     );
-    let vector = plan_vector(existing.as_ref(), planned);
+    let mut vector = plan_vector(existing.as_ref(), planned);
     let now = OffsetDateTime::now_utc();
 
     // The ownership boundary, before either branch writes anything: a
@@ -916,7 +916,9 @@ async fn upsert_node(
         }
     };
 
-    let Some(current) = existing else {
+    let current = if let Some(current) = existing {
+        current
+    } else {
         // `expected_version` is a statement about a stored row. `Some(0)`
         // says "there must be none" -- the one conditional a caller can make
         // with no version to read back, since a stored version is 1 or more
@@ -938,9 +940,9 @@ async fn upsert_node(
             id: ActiveValue::NotSet,
             node_key: ActiveValue::Set(spec.node_key.clone()),
             gts_node_type_id: ActiveValue::Set(info.id),
-            name: ActiveValue::Set(name),
-            payload: ActiveValue::Set(payload),
-            search_text: ActiveValue::Set(search_text),
+            name: ActiveValue::Set(name.clone()),
+            payload: ActiveValue::Set(payload.clone()),
+            search_text: ActiveValue::Set(search_text.clone()),
             embedding: ActiveValue::Set(vector.embedding),
             embedding_epoch: ActiveValue::Set(vector.epoch),
             embedding_input_hash: ActiveValue::Set(vector.input_hash),
@@ -961,14 +963,12 @@ async fn upsert_node(
             deleted_by_subject_id: ActiveValue::Set(None),
             deleted_by_subject_type: ActiveValue::Set(None),
         };
-        let model = node::Entity::insert(active)
-            .secure()
-            .scope_unchecked(scope)
-            .map_err(map_scope_err)?
-            .exec_with_returning(tx)
-            .await
-            .map_err(map_scope_err)?;
-        return Ok((model.id, ItemOutcome::Inserted));
+        if let Some(id) = insert_node_row(scope, tx, active).await? {
+            return Ok((id, ItemOutcome::Inserted));
+        }
+        let settled = settle_lost_insert(scope, tx, spec).await?;
+        vector = plan_vector(Some(&settled), planned);
+        settled
     };
 
     // A tombstoned key is not reusable before purge.
@@ -1153,6 +1153,74 @@ async fn upsert_node(
     ))
 }
 
+/// Insert a new node row, or yield to a batch that inserted the same key
+/// first: `Some(id)` when this insert wrote the row, `None` when another one
+/// did.
+///
+/// Two batches that both found no row both insert, and the second used to
+/// lose a unique violation on `(tenant_id, node_key)` -- a conflict on the
+/// whole batch over a key both producers were entitled to write (gears-rust
+/// #5042). `DO NOTHING` lets it wait for the first and then find the row
+/// (`settle_lost_insert`), and a serial order in which the first inserted and
+/// this one then updated is exactly what the caller's update branch writes.
+/// The same shape as `insert_phantom`, including how the elided insert is
+/// reported.
+async fn insert_node_row(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    active: node::ActiveModel,
+) -> Result<Option<i64>, GraphStoreError> {
+    let inserted = node::Entity::insert(active)
+        .secure()
+        .scope_unchecked(scope)
+        .map_err(map_scope_err)?
+        .on_conflict_raw(
+            OnConflict::columns([node::Column::TenantId, node::Column::NodeKey])
+                .do_nothing()
+                .to_owned(),
+        )
+        .exec_with_returning(tx)
+        .await;
+    match inserted {
+        Ok(model) => Ok(Some(model.id)),
+        Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => Ok(None),
+        Err(error) => Err(map_scope_err(error)),
+    }
+}
+
+/// The row another batch inserted under this key while this one was about
+/// to, read so this write can land on it as an update.
+async fn settle_lost_insert(
+    scope: &AccessScope,
+    tx: &impl DBRunner,
+    spec: &NodeSpec,
+) -> Result<node::Model, GraphStoreError> {
+    // "There must be none" was true when this batch looked and is not now:
+    // that is the claim `Some(0)` exists to lose.
+    if spec.expected_version == Some(0) {
+        return Err(GraphStoreError::Conflict {
+            reason: format!(
+                "expected no node under key `{}`, but another batch created it first",
+                spec.node_key
+            ),
+        });
+    }
+    node::Entity::find()
+        .secure()
+        .scope_with(scope)
+        .filter(Condition::all().add(node::Column::NodeKey.eq(spec.node_key.clone())))
+        .one(tx)
+        .await
+        .map_err(map_scope_err)?
+        .ok_or_else(|| GraphStoreError::Conflict {
+            reason: format!(
+                "node `{}` was created and removed while this write was being prepared; the \
+                 key is free again, so re-ingest it",
+                spec.node_key
+            ),
+        })
+}
+
 async fn is_phantom_type(
     scope: &AccessScope,
     tx: &impl DBRunner,
@@ -1310,16 +1378,18 @@ async fn upsert_edge(
         .await
         .map_err(map_scope_err)?;
 
-    let Some(current) = existing else {
+    let current = if let Some(current) = existing {
+        current
+    } else {
         let active = edge::ActiveModel {
             tenant_id: ActiveValue::Set(tenant),
             id: ActiveValue::NotSet,
-            edge_key: ActiveValue::Set(edge_key),
+            edge_key: ActiveValue::Set(edge_key.clone()),
             gts_edge_type_id: ActiveValue::Set(info.id),
             src_node_id: ActiveValue::Set(src),
             dst_node_id: ActiveValue::Set(dst),
             discriminator: ActiveValue::Set(spec.discriminator.clone()),
-            payload: ActiveValue::Set(payload),
+            payload: ActiveValue::Set(payload.clone()),
             created_at: ActiveValue::Set(now),
             updated_at: ActiveValue::Set(now),
             deleted_at: ActiveValue::Set(None),
@@ -1332,14 +1402,41 @@ async fn upsert_edge(
             deleted_by_subject_id: ActiveValue::Set(None),
             deleted_by_subject_type: ActiveValue::Set(None),
         };
-        edge::Entity::insert(active)
+        // Two batches declaring one new edge both found no row, and the
+        // second lost a unique violation on `(tenant_id, edge_key)` -- the
+        // edge half of what `insert_node_row` settles for nodes (gears-rust
+        // #5042). `DO NOTHING` waits for the first; this write then lands on
+        // its row through the update below, which also decides ownership
+        // between two declaring scopes exactly as for an edge that existed.
+        let inserted = edge::Entity::insert(active)
             .secure()
             .scope_unchecked(scope)
             .map_err(map_scope_err)?
-            .exec(tx)
+            .on_conflict_raw(
+                OnConflict::columns([edge::Column::TenantId, edge::Column::EdgeKey])
+                    .do_nothing()
+                    .to_owned(),
+            )
+            .exec_with_returning(tx)
+            .await;
+        match inserted {
+            Ok(_) => return Ok(ItemOutcome::Inserted),
+            Err(toolkit_db::secure::ScopeError::Db(sea_orm::DbErr::RecordNotFound(_))) => {}
+            Err(error) => return Err(map_scope_err(error)),
+        }
+        edge::Entity::find()
+            .secure()
+            .scope_with(scope)
+            .filter(Condition::all().add(edge::Column::EdgeKey.eq(edge_key.clone())))
+            .one(tx)
             .await
-            .map_err(map_scope_err)?;
-        return Ok(ItemOutcome::Inserted);
+            .map_err(map_scope_err)?
+            .ok_or_else(|| GraphStoreError::Conflict {
+                reason: format!(
+                    "edge `{edge_key}` was created and removed while this write was being \
+                     prepared; the key is free again, so re-ingest it"
+                ),
+            })?
     };
 
     // Ownership is bookkeeping about who declared the edge, not content a
@@ -1980,8 +2077,38 @@ pub const fn migrated_embedding_dimension() -> u32 {
     crate::infra::storage::migrations::m0001_initial_schema::EMBEDDING_DIMENSION
 }
 
-/// Upsert every node of the batch, recording its id and how it landed.
-/// Returns whether any stored state changed.
+/// One step of the node phase: a node the batch carries, or an edge endpoint
+/// it names without carrying (`edge` is the first edge that names it).
+enum NodeStep<'a> {
+    Node(usize),
+    Endpoint { key: &'a str, edge: usize },
+}
+
+impl NodeStep<'_> {
+    fn key<'r>(&'r self, request: &'r IngestRequest) -> &'r str {
+        match self {
+            NodeStep::Node(index) => &request.nodes[*index].node_key,
+            NodeStep::Endpoint { key, .. } => key,
+        }
+    }
+}
+
+/// Upsert every node of the batch and resolve every edge endpoint it names
+/// but does not carry, recording each id. Returns whether any stored state
+/// changed.
+///
+/// **In key order, nodes and endpoints together, not in request order.**
+/// Every step here can take a row lock on a `node` row or on its unique key
+/// -- an upsert, a phantom insert, an insert that waits on another batch's
+/// insert of the same key -- and two batches that take the same locks in
+/// different orders deadlock (gears-rust #5042: most of the overlapping
+/// batches on the Studio stand were killed as `40P01`). Sorting by key gives
+/// every batch the same order. Nodes and endpoints share one order because
+/// they share one key space: a phantom of `k2` after a node of `k5` in one
+/// batch, and the reverse in another, is the same cycle.
+///
+/// The per-item report is still in request order: outcomes are collected by
+/// index and handed to the tally afterwards.
 async fn write_nodes(
     w: Writer<'_>,
     tx: &impl DBRunner,
@@ -1991,13 +2118,51 @@ async fn write_nodes(
     tally: &mut IngestTally,
     embedding: &EmbeddingPlan,
 ) -> Result<bool, GraphStoreError> {
+    let create_phantoms = request.options.create_phantoms.unwrap_or(true);
+    let carried: std::collections::BTreeSet<&str> = request
+        .nodes
+        .iter()
+        .map(|spec| spec.node_key.as_str())
+        .collect();
+    let mut steps: Vec<NodeStep<'_>> = (0..request.nodes.len()).map(NodeStep::Node).collect();
+    let mut named = std::collections::BTreeSet::new();
+    for (edge, spec) in request.edges.iter().enumerate() {
+        for key in [spec.src_node_key.as_str(), spec.dst_node_key.as_str()] {
+            if !carried.contains(key) && named.insert(key) {
+                steps.push(NodeStep::Endpoint { key, edge });
+            }
+        }
+    }
+    // Stable, so a key the batch carries twice is written in request order.
+    steps.sort_by(|a, b| a.key(request).cmp(b.key(request)));
+
     let mut changed = false;
-    for (index, spec) in request.nodes.iter().enumerate() {
+    let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; request.nodes.len()];
+    for step in steps {
         // Between items, not inside one: an item half written is not a state
         // this store has, and the transaction is what guarantees that.
         if w.budget.is_exhausted() {
             return Err(GraphStoreError::Deadline);
         }
+        let index = match step {
+            NodeStep::Node(index) => index,
+            NodeStep::Endpoint { key, edge } => {
+                changed |= resolve_endpoint(
+                    w,
+                    tx,
+                    key,
+                    edge,
+                    &request.edges[edge].type_id,
+                    types,
+                    node_ids,
+                    create_phantoms,
+                    tally,
+                )
+                .await?;
+                continue;
+            }
+        };
+        let spec = &request.nodes[index];
         let info = types.get(&spec.type_id).ok_or_else(|| {
             item_error(
                 index,
@@ -2035,7 +2200,10 @@ async fn write_nodes(
                 type_id: info.id,
             },
         );
-        changed |= tally.node(&write);
+        outcomes[index] = Some(write);
+    }
+    for outcome in outcomes.into_iter().flatten() {
+        changed |= tally.node(&outcome);
     }
     Ok(changed)
 }
@@ -2122,7 +2290,28 @@ async fn write_edges(
     let create_phantoms = request.options.create_phantoms.unwrap_or(true);
     let mut changed = false;
 
-    for (index, spec) in request.edges.iter().enumerate() {
+    // In edge-key order, for the reason `write_nodes` writes in node-key
+    // order: two batches upserting the same edges must lock them in one
+    // order. The key is the stored one, derived from type, endpoints and
+    // discriminator; an edge of an unregistered type sorts first and is
+    // refused below.
+    let mut order: Vec<(String, usize)> = request
+        .edges
+        .iter()
+        .enumerate()
+        .map(|(index, spec)| {
+            let key = types
+                .get(&spec.type_id)
+                .map(|info| identity::derive_edge_key(info.uuid, spec))
+                .unwrap_or_default();
+            (key, index)
+        })
+        .collect();
+    order.sort();
+    let mut outcomes: Vec<Option<ItemOutcome>> = vec![None; request.edges.len()];
+
+    for (_, index) in order {
+        let spec = &request.edges[index];
         if w.budget.is_exhausted() {
             return Err(GraphStoreError::Deadline);
         }
@@ -2182,8 +2371,8 @@ async fn write_edges(
             }
         }
 
-        changed |= tally.edge(
-            &upsert_edge(
+        outcomes[index] = Some(
+            upsert_edge(
                 w,
                 tx,
                 spec,
@@ -2197,6 +2386,9 @@ async fn write_edges(
             )
             .await?,
         );
+    }
+    for outcome in outcomes.into_iter().flatten() {
+        changed |= tally.edge(&outcome);
     }
     Ok(changed)
 }

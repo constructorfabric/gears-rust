@@ -297,6 +297,39 @@ fn read_routes(router: Router, openapi: &dyn OpenApiRegistry) -> Router {
         .error_503(openapi)
         .register(router, openapi);
 
+    let router = OperationBuilder::get(format!("{BASE}/nodes/count"))
+        .operation_id("graph_storage.count_nodes")
+        .summary("Count a listing")
+        .description(
+            "How many nodes `GET /nodes` lists for the same `type_pattern` and \
+             `$filter`, across all its pages. Exact up to the deployment's \
+             `projection_count_max`; past it the answer is that ceiling with \
+             `capped: true`. A count has no pages, so `$orderby`, `$top`, \
+             `cursor` and `$select` are refused. A node whose key is `count` \
+             is read through the listing, not `GET /nodes/{node_key}`",
+        )
+        .tag(API_TAG)
+        .authenticated()
+        .require_license_features::<License>([])
+        .query_param(
+            "type_pattern",
+            false,
+            "Comma-separated GTS identifier patterns narrowing the count",
+        )
+        .handler(handlers::count_nodes)
+        .json_response_with_schema::<dto::GraphNodeCountDto>(
+            openapi,
+            http::StatusCode::OK,
+            "The count",
+        )
+        .with_odata_filter::<graph_storage_sdk::models::NodeFilterField>()
+        .error_400(openapi)
+        .error_401(openapi)
+        .error_403(openapi)
+        .error_500(openapi)
+        .error_503(openapi)
+        .register(router, openapi);
+
     let router = OperationBuilder::get(format!("{BASE}/nodes"))
         .operation_id("graph_storage.project_nodes")
         .summary("Tabular projection")

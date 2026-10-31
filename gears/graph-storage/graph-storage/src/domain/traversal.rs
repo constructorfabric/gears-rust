@@ -2,9 +2,10 @@
 //!
 //! The engine never expands beyond one hop; this loop owns the visited set,
 //! the per-hop dedup, and the budgets, so authorization and budgets are
-//! re-evaluated between hops rather than inside an opaque traversal. Edges
-//! are treated as undirected for reachability (`Direction::Either` — the
-//! union of two directed scans, never the undirected pattern).
+//! re-evaluated between hops rather than inside an opaque traversal. Every
+//! hop follows the plan's direction; `Direction::Either` -- the default --
+//! treats edges as undirected for reachability (the union of two directed
+//! scans, never the undirected pattern).
 
 use std::collections::{BTreeMap, BTreeSet};
 use toolkit_macros::domain_model;
@@ -47,6 +48,10 @@ pub struct WalkPlan {
     pub max_frontier: u32,
     pub max_edges_scanned: u64,
     pub edge_types: Option<TypeIdSet>,
+    /// Which way every hop follows an edge from the frontier.
+    pub direction: Direction,
+    /// Per-hop discriminator restriction; `None` follows every edge.
+    pub discriminators: Option<Vec<String>>,
     pub retention: Retention,
 }
 
@@ -111,8 +116,9 @@ pub async fn walk(
                 ctx,
                 ExpandRequest {
                     frontier: frontier.clone(),
-                    direction: Direction::Either,
+                    direction: plan.direction,
                     edge_types: plan.edge_types.clone(),
+                    discriminators: plan.discriminators.clone(),
                     labels: None,
                     budget: HopBudget {
                         max_frontier: plan.max_frontier,
@@ -311,6 +317,8 @@ mod tests {
             max_frontier: 100,
             max_edges_scanned: 1_000,
             edge_types: None,
+            direction: Direction::Either,
+            discriminators: None,
             retention: Retention::Reached,
         };
         let result = walk(&engine, &ctx, vec![seed], &plan)

@@ -79,6 +79,14 @@ on server-wide state — so it runs at a bounded concurrency
 in-process runner). More than that on an ordinary machine and the connection
 pools start timing out, which reads as a flaky gear and is a busy host.
 
+The latency benchmark is a third, opt-in lane (`GEARS_GRAPH_PERF=1`, `tests/perf.rs`):
+it seeds the PRD's reference graph (100k nodes / 500k edges) and times search,
+projection and traversal, optionally behind an added round-trip time.
+[docs/PERF.md](../docs/PERF.md) has the method, the command and where results
+are posted. A deployment whose database is not on the same host should set
+`test_before_acquire: false` in its pool configuration: the default pings
+before every acquire, which doubles the round trips of every read.
+
 A case that panics can leave its container behind — the removal is
 asynchronous, and nothing awaits it — so after a failed run
 `docker ps --filter ancestor=pgvector/pgvector:0.8.7-pg18` is worth a glance; a
@@ -111,9 +119,12 @@ Each is the shipped behaviour, with the contract that fixes it.
   conflict otherwise, including when no node is stored under the key.
   `Some(0)` means "there must be none": two writers claiming one key with it
   get exactly one success, which is how a version number is claimed across
-  replicas without a lock. No read returns the version yet (README § Known
-  limitations), so a read-then-update is last-writer-wins until it does. Edges
-  carry no version: their identity is derived from their endpoints.
+  replicas without a lock. Every node read returns it as `envelope.version`
+  (the node read, the projection row, traversal and neighbourhood
+  hydration), so read → change → write with `expected_version` set to what
+  was read is a compare-and-set that refuses a write someone made in
+  between. Edges carry no version (`envelope.version` is absent): their
+  identity is derived from their endpoints.
 - **Scope replacement removes what carries the scope.** `replace_scope:
   {attribute, value, generation}` removes, after the batch's own writes, the
   nodes of `scope_managed` types whose payload field `attribute` equals
@@ -147,8 +158,13 @@ Each is the shipped behaviour, with the contract that fixes it.
   unindexed, which is a scan of the type's rows; `contains` is a `LIKE` and
   scans too. A page carries no total and there is no offset: the platform
   pages by cursor and refuses `$count` and `$skip` by design
-  (`toolkit::api::odata`), so a listing that needs either walks the pages
-  (#5108 records what a consumer asked for beyond this).
+  (`toolkit::api::odata`). The total is a call of its own: `GET
+  /nodes/count` (`count_nodes` in process) takes the listing's
+  `type_pattern` and `$filter` and answers how many rows all its pages hold,
+  exactly up to `projection_count_max` (10 000 by default) and as that
+  ceiling with `capped: true` past it -- it reads the matching ids, so its
+  cost is bounded by the ceiling, not by the tenant. It refuses `$orderby`,
+  `$top`, `cursor` and `$select`. There is no offset in any form (#5108).
   A type that declares no `index` paths can be filtered by `node_key`, `name`,
   `created_at` and `updated_at` only, which is a scan of the tenant. The audit
   envelope's `updated_at` is when the gear last wrote the row, not when the
@@ -192,6 +208,10 @@ Each is the shipped behaviour, with the contract that fixes it.
 What the documents require and this iteration does not yet deliver, so a
 reader is not left to discover it. Each is marked in the documents where it
 bites ("Found while building the prototype").
+
+- *A node keyed `count` cannot be read by `GET /nodes/{node_key}`*: the
+  static route `GET /nodes/count` answers that path. It is read through the
+  listing (`$filter=node_key eq 'count'`) or in process.
 
 **Deferred features** (the API and schema leave room; nothing is built): content
 chunking and heavy-content offload; labels; change events; the admission layer
@@ -251,9 +271,11 @@ independently developed implementation can reach the service yet; #4873).
 - *Reason codes for `not_found`, `unimplemented`, `deadline_exceeded`,
   `cancelled`, `unavailable`, `data_loss` and `unknown` are not on the wire*:
   the platform's builders for those categories carry no reason slot.
-- *The in-process `GraphStorageClientV1` is narrower than REST*: no edge read,
-  no compatibility dry run, no registration options or migrations, no
-  source-namespace operations. Widening it is a `ClientV2` question.
+- *The in-process `GraphStorageClientV1` is narrower than REST*: no edge read
+  and no source-namespace operations. Registration takes the REST options
+  through `register_types_with` (`on_existing`, `revalidate`, `dry_run`,
+  migrations), so a compatibility dry run is that call with `dry_run` set.
+  The rest comes with the contract migration (#5021).
 - *Readiness does not state the active provider identity and dimension*, and
   five matrix rows report `not_implemented`.
 - *The `source_epoch` is minted once and never rotates*; the snapshot-identity

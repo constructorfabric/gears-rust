@@ -1113,6 +1113,7 @@ The public surfaces are defined in the PRD as `cpt-cf-graph-storage-interface-re
 | `GET` | `/api/graph-storage/v1/revision` | The tenant's current `(source_epoch, graph_revision)` — the cache-invalidation signal (`fr-revision-signal`) | p1 |
 | `GET` | `/api/graph-storage/v1/nodes/{node_key}` | Node with payload, chunk inventory and bounded adjacency | p1 |
 | `GET` | `/api/graph-storage/v1/nodes` | Tabular projection (OData) | p1 |
+| `GET` | `/api/graph-storage/v1/nodes/count` | How many nodes the projection lists for the same `type_pattern` and `$filter`; exact up to `projection_count_max`, `capped` past it | p1 |
 | `DELETE` | `/api/graph-storage/v1/nodes/{node_key}` | Soft-delete a node and its incident edges | p1 |
 | `GET` | `/api/graph-storage/v1/edges/{edge_key}` | One edge with its payload and audit envelope | p1 |
 | `DELETE` | `/api/graph-storage/v1/edges/{edge_key}` | Soft-delete one edge | p1 |
@@ -1233,6 +1234,7 @@ rejected, so that a document read from the API can be sent back unchanged.
 | `created_at` / `created_by` | yes | yes | first write |
 | `updated_at` / `updated_by` | yes | yes | most recent write |
 | `deleted_at` / `deleted_by` | yes | yes | soft delete; absent on live elements |
+| `version` | yes | absent | the node's stored version, the target of `expected_version` on ingest |
 | `graph_revision` | yes | yes | the revision the read observed |
 
 `created_by`, `updated_by` and `deleted_by` are **subjects**, not users:
@@ -1258,8 +1260,12 @@ element: `GET /edges/{edge_key}`, above. Without it the edge columns were
 written by every ingest path and read by nothing, so a path that forgot one
 would have broken no test — a requirement nothing can observe is a requirement
 nothing checks. Topology references stay what they are: `EdgeRef` in a
-traversal and `AdjacencyEntry` in a node read carry a key, a type and two
-endpoints, and the key is the one the edge read accepts.
+traversal and `AdjacencyEntry` in a node read carry a key, a type, two
+endpoints and the discriminator, and the key is the one the edge read
+accepts. The discriminator is on the reference because the key is opaque: a
+consumer that stores several relations under one edge type (one verb, told
+apart by discriminator) otherwise learns which relation an edge is only by
+reading every edge.
 
 **A search hit is a reference too, by the same rule.** `SearchHit` carries a
 key, a type, a name, the fused score and each arm's rank — what a ranking is
@@ -1543,6 +1549,7 @@ pub struct ExpandRequest {
     pub frontier: Vec<NodeId>,
     pub direction: Direction,          // explicit; there is no "undirected" shorthand
     pub edge_types: Option<TypeIdSet>, // per-hop restriction
+    pub discriminators: Option<Vec<String>>, // per-hop restriction; never matches NULL
     pub labels: Option<LabelFilter>,   // per-hop restriction
     pub budget: HopBudget,             // frontier cap and edges scanned
     pub with_degrees: bool,            // fill `degrees` below; costs a second scoped read
@@ -2269,6 +2276,8 @@ The key is optional on the wire and the gear does not supply one. An ingest with
 
 **4. Source ordering (fencing).** Lock order is arrival order, not source order: a stalled generation 10 can acquire the lock after generation 11 committed and overwrite fresh state with stale state, legally. Therefore: every replacement snapshot carries a monotonic source generation; the scope registry stores the highest accepted generation, compared-and-updated atomically under the scope lock. Older generations are rejected with a stale-generation error; an equal generation with an identical request hash replays the recorded outcome; an equal generation with different content is a conflict.
 
+**5. Overlapping batches (lock order).** Two batches that upsert overlapping keys take row locks on the same `node` and `edge` rows, and in request order they take them in different orders and deadlock; on the Studio stand most such batches were killed as `40P01` (gears-rust #5042). Therefore: a batch writes its nodes and the edge endpoints it names but does not carry in one key order — nodes and phantoms together, since they share one key space — then its edges in edge-key order, and bumps the revision last, so every batch takes the locks it shares with another in the same order. Two batches inserting the same new node key, or declaring the same new edge, converge instead of colliding: the second waits for the first (`ON CONFLICT DO NOTHING`), reads its row and writes over it as an update — for an edge, through the same ownership check an existing edge gets — exactly as if the two had run one after the other; an `expected_version: 0` claim on a node is the one that loses. The per-item report stays in request order. A batch can still wait behind another's locks; it is no longer aborted by them.
+
 Conflict and stale-generation rejections are canonical problem types distinct from validation errors and from resource exhaustion, so producers can implement the correct reaction (re-read and rebase, drop the stale run, or back off) mechanically.
 
 ### Soft Delete Contract
@@ -2867,6 +2876,7 @@ Every bound the gear enforces is a named configuration key with a safe default a
 | Traversal edges scanned | `traversal_max_edges_scanned` | 100,000 | 1 – 10,000,000 | Engine, **per hop** (see below) |
 | Search arm limit | `search_max_arm_limit` | 50 | 1 – 500 | Admission |
 | Projection page size | `projection_max_page` | 200 | 1 – 1,000 | Admission |
+| Rows a listing count counts exactly | `projection_count_max` | 10,000 | 1 – 1,000,000 | Store; past it the count is the ceiling with `capped` |
 | Interactive statement deadline | `deadline_interactive` | 10 s | 1 – 60 s | DB `statement_timeout` + cancellation token |
 | Per-tenant concurrent ingest batches | `tenant_max_ingest` | 4 | 1 – 64 | Admission |
 | Per-tenant concurrent queries | `tenant_max_queries` | 32 | 1 – 1,024 | Admission |

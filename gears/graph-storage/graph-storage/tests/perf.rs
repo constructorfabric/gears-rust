@@ -25,6 +25,20 @@
 //! nodes / 500k edges). A smaller scale reports honestly that it ran
 //! smaller: a latency at 10k nodes is not evidence about 100k, and at any
 //! scale but 1.0 no threshold is asserted at all.
+//!
+//! Two more knobs turn one run into a benchmark worth comparing with the
+//! next (method and reporting: `docs/PERF.md`):
+//!
+//! - `GEARS_GRAPH_PERF_REPEAT` (default 1) times every scenario that many
+//!   times on the one seeded graph, so a run reports its own spread.
+//! - `GEARS_GRAPH_PERF_RTT_MS` (default `0`), a comma list of milliseconds
+//!   added to every round trip to the database with `netem`, applied from a
+//!   `nicolaka/netshoot` container in the database container's network
+//!   namespace. How p50 grows with it says how many sequential round trips a
+//!   request makes, which a localhost run cannot show.
+//!
+//! Every timing is printed as one `RESULT` line, which
+//! `scripts/perf_summary.py` turns into the tables the method describes.
 
 /// The suite's fixtures: the same ontology and context helpers, so the graph
 /// this lane times is the graph the conformance cases describe. Only part of
@@ -44,7 +58,7 @@ use graph_storage_sdk::models::{
     RemainingBudget, SearchMode, SearchRequest,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreV1, StoreCtx, VectorArm,
+    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
 };
 use sea_orm_migration::MigratorTrait;
 use testcontainers::runners::AsyncRunner as _;
@@ -59,6 +73,8 @@ use uuid::Uuid;
 struct Stand {
     store: Arc<PgGraphStore>,
     engine: PgGraphEngine,
+    /// Where `netem` is applied when a round-trip time is added.
+    container_id: String,
     _container: ContainerAsync<Postgres>,
 }
 
@@ -71,17 +87,13 @@ struct Shape {
 
 impl Shape {
     fn from_env() -> Self {
-        let scale = std::env::var("GEARS_GRAPH_PERF_SCALE")
-            .ok()
-            .and_then(|raw| raw.parse::<f64>().ok())
-            .unwrap_or(1.0)
-            .clamp(0.001, 10.0);
+        let scale = setting("GEARS_GRAPH_PERF_SCALE", 1.0, 0.001..=10.0);
         #[expect(
             clippy::cast_possible_truncation,
             clippy::cast_sign_loss,
-            reason = "the scale is clamped to 0.001..=10 above, so both products lie in \
+            reason = "`setting` admits only 0.001..=10, so both products lie in \
                       100..=1_000_000 and are positive -- the cast is lossless over \
-                      exactly the range the clamp allows"
+                      exactly the range it admits"
         )]
         Self {
             nodes: (100_000.0 * scale) as usize,
@@ -156,9 +168,11 @@ async fn stand() -> Option<Stand> {
             .expect("the perf configuration is valid"),
     ));
     let engine = PgGraphEngine::new(Arc::clone(&store));
+    let container_id = container.id().to_owned();
     Some(Stand {
         store,
         engine,
+        container_id,
         _container: container,
     })
 }
@@ -222,6 +236,138 @@ where
         worst: *samples.last().expect("at least one run"),
         runs,
     }
+}
+
+/// One timing as one line: a run is read by `scripts/perf_summary.py`, and a
+/// table someone retypes from a log is a table with typos in it.
+/// `backend` is `-` for a scenario that runs no hop.
+fn report(repeat: usize, rtt_ms: f64, backend: &str, scenario: &str, measured: &Measured) {
+    println!(
+        "RESULT rep={repeat} rtt_ms={rtt_ms} backend={backend} scenario=\"{scenario}\" \
+         p50_ms={:.2} p95_ms={:.2} max_ms={:.2} runs={}",
+        measured.p50.as_secs_f64() * 1000.0,
+        measured.p95.as_secs_f64() * 1000.0,
+        measured.worst.as_secs_f64() * 1000.0,
+        measured.runs
+    );
+}
+
+/// A numeric setting from the environment: absent is `default`, anything else
+/// must parse and lie in `range`, or the run stops before it seeds.
+///
+/// Refused rather than replaced by the default, because a typo that fell back
+/// silently would run -- and report -- a matrix nobody asked for, after a
+/// seed that takes a quarter of an hour.
+fn setting<T>(name: &str, default: T, range: std::ops::RangeInclusive<T>) -> T
+where
+    T: std::str::FromStr + PartialOrd + std::fmt::Display,
+{
+    let Ok(raw) = std::env::var(name) else {
+        return default;
+    };
+    raw.trim()
+        .parse::<T>()
+        .ok()
+        .filter(|value| range.contains(value))
+        .unwrap_or_else(|| {
+            panic!(
+                "{name}: `{raw}` is not a number in {}..={}",
+                range.start(),
+                range.end()
+            )
+        })
+}
+
+fn repeats() -> usize {
+    setting("GEARS_GRAPH_PERF_REPEAT", 1, 1..=20)
+}
+
+/// `GEARS_GRAPH_PERF_RTT_MS`: the round-trip times to add, in milliseconds.
+///
+/// A list that names none (empty, or commas only) is refused: it would seed
+/// the graph, time nothing and pass without a single `RESULT` line.
+fn rtts() -> Vec<f64> {
+    const NAME: &str = "GEARS_GRAPH_PERF_RTT_MS";
+    let Ok(raw) = std::env::var(NAME) else {
+        return vec![0.0];
+    };
+    let rtts: Vec<f64> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| {
+            item.parse::<f64>()
+                .ok()
+                .filter(|ms| (0.0..=100.0).contains(ms))
+                .unwrap_or_else(|| panic!("{NAME}: `{item}` is not 0..=100 ms"))
+        })
+        .collect();
+    assert!(
+        !rtts.is_empty(),
+        "{NAME}: `{raw}` names no round-trip time; unset it, or list at least one (e.g. `0`)"
+    );
+    rtts
+}
+
+/// Delay every packet the database container sends by `ms`, which adds `ms`
+/// to each round trip the gear makes; `0` removes the delay.
+///
+/// The `tc` runs in a helper container joined to the database container's
+/// network namespace, so the host needs Docker and nothing else: no root, no
+/// `iproute2` in the database image. A delay that does not apply fails the
+/// run -- a column labelled "+2 ms" measured at +0 is worse than no column.
+fn set_rtt(container_id: &str, ms: f64) {
+    if ms > 0.0 {
+        let delay = format!("{ms}ms");
+        let out = tc(
+            container_id,
+            &["replace", "dev", "eth0", "root", "netem", "delay", &delay],
+        );
+        assert!(
+            out.status.success(),
+            "netem did not apply: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    // Deleting a qdisc that is not there fails, and that is the state wanted,
+    // so a failed delete alone proves nothing either way. What decides is
+    // whether a delay is still installed: a "+0 ms" column measured over a
+    // leftover delay is the baseline every other column is read against.
+    if tc(container_id, &["del", "dev", "eth0", "root"])
+        .status
+        .success()
+    {
+        return;
+    }
+    let shown = tc(container_id, &["show", "dev", "eth0"]);
+    let qdiscs = String::from_utf8_lossy(&shown.stdout);
+    assert!(
+        shown.status.success() && !qdiscs.contains("netem"),
+        "netem could not be removed: {qdiscs}{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+}
+
+/// `tc qdisc <args>` in a helper container joined to the database
+/// container's network namespace.
+fn tc(container_id: &str, args: &[&str]) -> std::process::Output {
+    let netns = format!("container:{container_id}");
+    std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "--net",
+            &netns,
+            "--cap-add",
+            "NET_ADMIN",
+            "nicolaka/netshoot",
+            "tc",
+            "qdisc",
+        ])
+        .args(args)
+        .output()
+        .expect("docker runs")
 }
 
 // ---------------------------------------------------------------------------
@@ -451,7 +597,11 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
     let Some(stand) = stand().await else {
         return;
     };
+    // Every setting is read before the seed, which is most of the run's
+    // wall clock: a bad one costs seconds, not a quarter of an hour.
     let shape = Shape::from_env();
+    let rtts = rtts();
+    let repeats = repeats();
     let tenant = Uuid::now_v7();
     let scope = AccessScope::for_tenant(tenant);
     let ctx = conformance::ctx(tenant, &scope, None);
@@ -468,8 +618,6 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
 
     let ctx = fresh(&ctx);
 
-    // --- scenario 1: hybrid narrowing ------------------------------------
-    //
     // The query text is embedded once, outside the loop: `nfr-search-latency`
     // excludes query embedding, and including it would report the fake
     // provider's speed as this gear's.
@@ -482,58 +630,14 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         )
         .await
         .expect("the query embeds");
-    let hybrid = measure(40, |_| {
-        let vector = vector.clone();
-        async {
-            let hits = store
-                .search(
-                    &ctx,
-                    SearchRequest {
-                        mode: SearchMode::Hybrid,
-                        query: Some(query.to_owned()),
-                        arm_limit: 50,
-                        limit: 50,
-                        type_patterns: Vec::new(),
-                    },
-                    Some(VectorArm {
-                        query_vector: vector,
-                        epoch: conformance::EPOCH,
-                    }),
-                )
-                .await
-                .expect("hybrid search answers");
-            assert!(!hits.hits.is_empty(), "the query must retrieve something");
-        }
-    })
-    .await;
-    println!("hybrid search (arm limit 50)      {hybrid}");
-
-    // --- scenario 2: the criteria table ----------------------------------
     // Filtered on a declared payload path and ordered, which is the shape
-    // the scenario describes -- an unfiltered first page would measure the
-    // table's ceiling, not the query behind it.
+    // the criteria table describes -- an unfiltered first page would measure
+    // the table's ceiling, not the query behind it.
     let table_request = conformance::projection(
         &[conformance::OWNED],
         "payload/severity eq 'critical'",
         &[("node_key", toolkit_odata::SortDir::Asc)],
     );
-    let table = measure(40, |_| {
-        let request = ProjectionRequest {
-            type_set: table_request.type_set.clone(),
-            query: table_request.query.clone(),
-        };
-        async {
-            let page = store
-                .project_table(&ctx, request)
-                .await
-                .expect("the projection answers");
-            assert!(!page.items.is_empty(), "the filter must match something");
-        }
-    })
-    .await;
-    println!("criteria table (filter + page 50) {table}");
-
-    // --- scenarios 3 and 4: the two-query hop ---------------------------
     let seeds: Vec<String> = (0..8).map(|i| format!("perf-{}", i * 977)).collect();
     let seed_ids: Vec<graph_storage_sdk::models::NodeId> = store
         .resolve_node_ids(&ctx, &seeds)
@@ -554,35 +658,136 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         .first()
         .expect("the root exists")
         .1;
-    let (traversal, neighborhood) =
-        time_hops(&stand.engine, store, &ctx, &seed_ids, &type_set, root).await;
-    println!("depth-3 typed traversal            {traversal}");
-    println!("depth-3 neighborhood (budget 1k)   {neighborhood}");
-    println!();
 
-    // The thresholds, asserted only at full scale: a latency measured on a
-    // tenth of the graph is not evidence about the graph the criteria name,
-    // and asserting it there would be a green light nobody earned.
-    if (shape.scale - 1.0).abs() < f64::EPSILON {
-        assert!(
-            hybrid.p95 <= Duration::from_millis(500),
-            "nfr-search-latency: hybrid p95 {hybrid}"
-        );
-        assert!(
-            neighborhood.p95 <= Duration::from_secs(1),
-            "nfr-traversal-latency: neighborhood p95 {neighborhood}"
-        );
-        assert!(
-            traversal.p95 <= Duration::from_secs(1),
-            "typed traversal: p95 {traversal}"
-        );
+    let shaped = rtts.iter().any(|ms| *ms > 0.0);
+    for repeat in 0..repeats {
+        for &rtt in &rtts {
+            if shaped {
+                set_rtt(&stand.container_id, rtt);
+            }
+            let ctx = fresh(&ctx);
+
+            // --- control: one statement, one round trip -----------------
+            // What the stand and the pool cost before the gear does any
+            // work; it also calibrates the added round-trip time.
+            let probe = measure(40, |_| async {
+                store.revision(&ctx).await.expect("the revision reads");
+            })
+            .await;
+            report(repeat, rtt, "-", "one round trip (revision read)", &probe);
+
+            // --- scenario 1: hybrid narrowing ---------------------------
+            let hybrid = measure(40, |_| {
+                let vector = vector.clone();
+                async {
+                    let hits = store
+                        .search(
+                            &ctx,
+                            SearchRequest {
+                                mode: SearchMode::Hybrid,
+                                query: Some(query.to_owned()),
+                                arm_limit: 50,
+                                limit: 50,
+                                type_patterns: Vec::new(),
+                            },
+                            Some(VectorArm {
+                                query_vector: vector,
+                                epoch: conformance::EPOCH,
+                            }),
+                        )
+                        .await
+                        .expect("hybrid search answers");
+                    assert!(!hits.hits.is_empty(), "the query must retrieve something");
+                }
+            })
+            .await;
+            report(repeat, rtt, "-", "hybrid search (arm limit 50)", &hybrid);
+
+            // --- scenario 2: the criteria table -------------------------
+            let table = measure(40, |_| {
+                let request = ProjectionRequest {
+                    type_set: table_request.type_set.clone(),
+                    query: table_request.query.clone(),
+                };
+                async {
+                    let page = store
+                        .project_table(&ctx, request)
+                        .await
+                        .expect("the projection answers");
+                    assert!(!page.items.is_empty(), "the filter must match something");
+                }
+            })
+            .await;
+            report(
+                repeat,
+                rtt,
+                "-",
+                "criteria table (filter + page 50)",
+                &table,
+            );
+
+            // --- scenarios 3 and 4: the hop -----------------------------
+            let (traversal, neighborhood, ranked) =
+                time_hops(&stand.engine, store, &ctx, &seed_ids, &type_set, root).await;
+            report(
+                repeat,
+                rtt,
+                "two_query",
+                "depth-3 typed traversal, 8 seeds",
+                &traversal,
+            );
+            report(
+                repeat,
+                rtt,
+                "two_query",
+                "depth-3 neighborhood + hydrate",
+                &neighborhood,
+            );
+            report(
+                repeat,
+                rtt,
+                "two_query",
+                "depth-3 neighborhood + degrees + hydrate",
+                &ranked,
+            );
+
+            // The thresholds, asserted only at full scale and with no added
+            // round trip: a latency measured on a tenth of the graph is not
+            // evidence about the graph the criteria name, and one measured
+            // behind an artificial delay is a question about the network,
+            // not a criterion the gear failed.
+            if rtt <= 0.0 && (shape.scale - 1.0).abs() < f64::EPSILON {
+                assert!(
+                    hybrid.p95 <= Duration::from_millis(500),
+                    "nfr-search-latency: hybrid p95 {hybrid}"
+                );
+                assert!(
+                    neighborhood.p95 <= Duration::from_secs(1),
+                    "nfr-traversal-latency: neighborhood p95 {neighborhood}"
+                );
+                assert!(
+                    ranked.p95 <= Duration::from_secs(1),
+                    "nfr-traversal-latency: ranked neighborhood p95 {ranked}"
+                );
+                assert!(
+                    traversal.p95 <= Duration::from_secs(1),
+                    "typed traversal: p95 {traversal}"
+                );
+            }
+        }
     }
+    if shaped {
+        set_rtt(&stand.container_id, 0.0);
+    }
+    println!();
 }
 
 /// Scenarios 3 and 4 against one engine: the depth-3 typed traversal, and
 /// the depth-3 UI neighborhood with the hydration the UI needs, which is
 /// what `nfr-traversal-latency` actually budgets -- a neighborhood nobody can
-/// render is not the scenario.
+/// render is not the scenario. The neighborhood is timed twice, without and
+/// with each reached node's degree: the degree is what ranks a hub's
+/// neighbours under the node budget, and it is a read of its own per hop.
 async fn time_hops(
     engine: &PgGraphEngine,
     store: &PgGraphStore,
@@ -590,7 +795,7 @@ async fn time_hops(
     seed_ids: &[graph_storage_sdk::models::NodeId],
     type_set: &graph_storage_sdk::models::TypeIdSet,
     root: graph_storage_sdk::models::NodeId,
-) -> (Measured, Measured) {
+) -> (Measured, Measured, Measured) {
     let traversal = measure(30, |_| {
         let frontier = seed_ids.to_vec();
         let edge_types = Some(type_set.clone());
@@ -610,6 +815,7 @@ async fn time_hops(
                                 max_edges_scanned: 50_000,
                             },
                             with_degrees: false,
+                            discriminators: None,
                         },
                     )
                     .await
@@ -626,45 +832,49 @@ async fn time_hops(
     })
     .await;
 
-    let neighborhood = measure(30, |_| async {
-        let mut frontier = vec![root];
-        let mut visited = vec![root];
-        for _ in 0..3 {
-            let response = engine
-                .expand(
-                    reader,
-                    ExpandRequest {
-                        frontier: frontier.clone(),
-                        direction: Direction::Either,
-                        edge_types: None,
-                        labels: None,
-                        budget: HopBudget {
-                            max_frontier: 1_000,
-                            max_edges_scanned: 50_000,
+    let neighborhood = |with_degrees: bool| {
+        measure(30, move |_| async move {
+            let mut frontier = vec![root];
+            let mut visited = vec![root];
+            for _ in 0..3 {
+                let response = engine
+                    .expand(
+                        reader,
+                        ExpandRequest {
+                            frontier: frontier.clone(),
+                            direction: Direction::Either,
+                            edge_types: None,
+                            labels: None,
+                            budget: HopBudget {
+                                max_frontier: 1_000,
+                                max_edges_scanned: 50_000,
+                            },
+                            with_degrees,
+                            discriminators: None,
                         },
-                        with_degrees: false,
-                    },
-                )
-                .await
-                .expect("the hop runs");
-            frontier = response.reached;
-            frontier.sort_unstable();
-            frontier.dedup();
-            frontier.retain(|id| !visited.contains(id));
-            visited.extend(frontier.iter().copied());
-            visited.truncate(1_000);
-            if frontier.is_empty() || visited.len() >= 1_000 {
-                break;
+                    )
+                    .await
+                    .expect("the hop runs");
+                frontier = response.reached;
+                frontier.sort_unstable();
+                frontier.dedup();
+                frontier.retain(|id| !visited.contains(id));
+                visited.extend(frontier.iter().copied());
+                visited.truncate(1_000);
+                if frontier.is_empty() || visited.len() >= 1_000 {
+                    break;
+                }
             }
-        }
-        let hydrated = store
-            .hydrate_nodes(reader, &visited)
-            .await
-            .expect("the neighborhood hydrates");
-        assert!(!hydrated.is_empty(), "a neighborhood must have nodes in it");
-    })
-    .await;
-    (traversal, neighborhood)
+            let hydrated = store
+                .hydrate_nodes(reader, &visited)
+                .await
+                .expect("the neighborhood hydrates");
+            assert!(!hydrated.is_empty(), "a neighborhood must have nodes in it");
+        })
+    };
+    let plain = neighborhood(false).await;
+    let ranked = neighborhood(true).await;
+    (traversal, plain, ranked)
 }
 
 /// `nfr-ingest-throughput`: 10,000 nodes and 20,000 edges, embedding
@@ -697,4 +907,143 @@ async fn a_producer_sized_batch_lands_inside_its_budget() {
         "nfr-ingest-throughput: 10k nodes + 20k edges took {:.1} s",
         elapsed.as_secs_f64()
     );
+}
+
+/// Overlapping ingest batches, the shape of gears-rust #5042: writers that
+/// upsert random subsets of one shared key pool, with edges between the keys
+/// each names, all at once. Two shapes, the two the issue measured on the
+/// Studio stand.
+///
+/// Every batch's outcome is counted -- committed, `Serialization` (a
+/// deadlock or a lock timeout the server broke), another conflict, the
+/// deadline -- and the latency of every attempt is timed, committed or not.
+/// One `RESULT` line per shape for the latency and one `CONTENTION` line for
+/// the counts. Asserts nothing: a regression here is a number against the
+/// previous run (gears-rust #5517), and the conformance case
+/// `overlapping_batches_all_land` is what holds the contract.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn overlapping_ingest_batches() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let repeats = repeats();
+
+    // (keys in the pool, nodes per batch, writers, batches per writer)
+    for (pool, per_batch, writers, rounds) in [(200, 50, 8, 10), (60, 40, 16, 6)] {
+        for repeat in 0..repeats {
+            // A tenant of its own per repeat, so every repeat starts with no
+            // key of the pool stored: the first batches then race to create
+            // keys, the later ones to update them, in every repeat alike.
+            let tenant = Uuid::now_v7();
+            let scope = AccessScope::for_tenant(tenant);
+            let ctx = conformance::ctx(tenant, &scope, None);
+            graph_storage::infra::store::ingest::ensure_meta(stand.store.as_ref(), tenant, &scope)
+                .await
+                .expect("meta rows exist");
+            let mut types = conformance::ontology_batch();
+            types.retain(|registration| registration.type_id != conformance::OWNED);
+            types.push(seeded_type());
+            stand
+                .store
+                .register_types(&ctx, types)
+                .await
+                .expect("the ontology registers");
+            let scenario =
+                format!("overlapping ingest: {writers} writers x {per_batch} of {pool} keys");
+            let started = Instant::now();
+            let tasks: Vec<_> = (0..writers)
+                .map(|writer| {
+                    let store = Arc::clone(&stand.store);
+                    tokio::spawn(async move {
+                        let scope = AccessScope::for_tenant(tenant);
+                        let base = conformance::ctx(tenant, &scope, None);
+                        let coordinator = conformance::coordinator();
+                        let mut attempts = Vec::with_capacity(rounds);
+                        for round in 0..rounds {
+                            let seed = (repeat * 1_000 + writer) * 1_000 + round;
+                            let mut keys: Vec<usize> = (0..pool).collect();
+                            for i in (1..keys.len()).rev() {
+                                keys.swap(i, mix(seed * 131 + i) % (i + 1));
+                            }
+                            keys.truncate(per_batch);
+                            let edges = keys
+                                .windows(2)
+                                .map(|pair| EdgeSpec {
+                                    type_id: conformance::LINK.to_owned(),
+                                    src_node_key: format!("perf-{}", pair[0]),
+                                    dst_node_key: format!("perf-{}", pair[1]),
+                                    ..EdgeSpec::default()
+                                })
+                                .collect();
+                            let request = IngestRequest {
+                                nodes: keys.iter().map(|&k| seeded_node(k)).collect(),
+                                edges,
+                                options: IngestOptions {
+                                    embed: Some(false),
+                                    ..IngestOptions::default()
+                                },
+                                replace_scope: None,
+                                idempotency_key: None,
+                            };
+                            // The interactive deadline a REST caller gets.
+                            let ctx = StoreCtx {
+                                budget: RemainingBudget::starting_now(Duration::from_secs(10)),
+                                ..fresh(&base)
+                            };
+                            let plan = plan_for(store.as_ref(), &ctx, &request, &coordinator).await;
+                            let attempt = Instant::now();
+                            let outcome = store.ingest(&ctx, request, plan).await;
+                            attempts.push((attempt.elapsed(), outcome.err()));
+                        }
+                        attempts
+                    })
+                })
+                .collect();
+
+            let (mut committed, mut serialization, mut conflict, mut deadline, mut other) =
+                (0usize, 0usize, 0usize, 0usize, 0usize);
+            let mut samples = Vec::new();
+            let mut reasons = std::collections::BTreeMap::new();
+            for task in tasks {
+                for (elapsed, error) in task.await.expect("the writer does not panic") {
+                    samples.push(elapsed);
+                    match error {
+                        None => committed += 1,
+                        Some(GraphStoreError::Serialization) => serialization += 1,
+                        Some(GraphStoreError::Conflict { reason }) => {
+                            conflict += 1;
+                            *reasons.entry(reason).or_insert(0usize) += 1;
+                        }
+                        Some(GraphStoreError::Deadline) => deadline += 1,
+                        Some(error) => {
+                            other += 1;
+                            eprintln!("{scenario}: {error}");
+                        }
+                    }
+                }
+            }
+            let wall = started.elapsed();
+            let runs = samples.len();
+            let measured = Measured {
+                p50: percentile(&mut samples, 0.50),
+                p95: percentile(&mut samples, 0.95),
+                worst: *samples.last().expect("at least one batch"),
+                runs,
+            };
+            report(repeat, 0.0, "-", &scenario, &measured);
+            for (reason, times) in &reasons {
+                println!(
+                    "CONFLICT rep={repeat} scenario=\"{scenario}\" times={times} reason=\"{reason}\""
+                );
+            }
+            println!(
+                "CONTENTION rep={repeat} scenario=\"{scenario}\" committed={committed} \
+                 serialization={serialization} conflict={conflict} deadline={deadline} \
+                 other={other} wall_s={:.1} committed_nodes_per_s={:.0}",
+                wall.as_secs_f64(),
+                u32::try_from(committed * per_batch).map_or(f64::NAN, f64::from)
+                    / wall.as_secs_f64()
+            );
+        }
+    }
 }

@@ -338,6 +338,8 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -372,6 +374,8 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -391,6 +395,7 @@ async fn a_traversal_walks_hops_and_a_neighborhood_answers_from_a_root() {
                 depth: 1,
                 node_budget: Some(10),
                 include_phantoms: false,
+                direction: None,
             },
         )
         .await
@@ -418,6 +423,8 @@ async fn a_traversal_outside_its_bounds_is_refused() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: None,
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
             "a traversal with no seed",
         ),
@@ -428,6 +435,8 @@ async fn a_traversal_outside_its_bounds_is_refused() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: None,
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
             "a depth above the ceiling",
         ),
@@ -897,6 +906,8 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
                     edge_type_patterns: Vec::new(),
                     node_type_patterns: Vec::new(),
                     max_nodes: Some(10),
+                    direction: None,
+                    edge_discriminators: Vec::new(),
                 },
             )
             .await
@@ -914,6 +925,7 @@ async fn the_local_client_answers_like_the_service_and_is_bounded_like_it() {
                     depth: 1,
                     node_budget: Some(10),
                     include_phantoms: false,
+                    direction: None,
                 },
             )
             .await
@@ -1026,6 +1038,8 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1090,6 +1104,7 @@ async fn no_new_work_starts_after_the_budget_is_spent() {
                         depth: 1,
                         node_budget: Some(10),
                         include_phantoms: false,
+                        direction: None,
                     },
                 )
                 .await
@@ -1154,6 +1169,8 @@ async fn a_store_without_snapshots_is_not_asked_for_one() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1197,6 +1214,8 @@ async fn a_walk_that_spans_a_commit_is_reported_as_inconsistent() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1259,6 +1278,8 @@ async fn a_traversal_stops_at_the_byte_budget_and_reports_it() {
                 node_type_patterns: Vec::new(),
                 // Well inside the node budget: the count is not what stops it.
                 max_nodes: Some(100),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1445,6 +1466,8 @@ async fn the_byte_budget_charges_the_edges_too() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(100),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1521,6 +1544,8 @@ async fn seeds_that_cannot_fit_the_budget_are_refused() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(10),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1584,6 +1609,8 @@ async fn a_seed_is_not_evicted_by_its_own_bytes_counted_twice() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(100),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1664,6 +1691,8 @@ async fn a_traversal_reads_what_its_budget_can_hold_and_not_the_whole_walk() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(1_000),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1744,6 +1773,8 @@ async fn a_seed_set_over_the_budget_is_refused_before_it_is_read_in_full() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: Vec::new(),
                 max_nodes: Some(1_000),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1827,6 +1858,8 @@ async fn a_filtered_walk_near_its_budget_does_not_hydrate_row_by_row() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: vec![conformance::OWNED.to_owned()],
                 max_nodes: Some(1_000),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1896,6 +1929,8 @@ async fn a_type_filter_drops_the_edges_of_the_nodes_it_filters() {
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: vec![conformance::OWNED.to_owned()],
                 max_nodes: Some(1_000),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -1965,6 +2000,8 @@ async fn a_filtered_walk_survives_a_store_without_node_types_and_not_one_that_fa
                     edge_type_patterns: Vec::new(),
                     node_type_patterns: vec![conformance::OWNED.to_owned()],
                     max_nodes: Some(1_000),
+                    direction: None,
+                    edge_discriminators: Vec::new(),
                 },
             )
             .await?;
@@ -2038,6 +2075,8 @@ async fn a_store_that_inherits_the_default_node_types_is_hydrated_and_filtered()
                 edge_type_patterns: Vec::new(),
                 node_type_patterns: vec![conformance::OWNED.to_owned()],
                 max_nodes: Some(1_000),
+                direction: None,
+                edge_discriminators: Vec::new(),
             },
         )
         .await
@@ -2095,6 +2134,7 @@ async fn a_store_that_inherits_the_default_node_types_still_excludes_phantoms() 
                 depth: 1,
                 node_budget: None,
                 include_phantoms: false,
+                direction: None,
             },
         )
         .await
@@ -2255,6 +2295,23 @@ async fn the_caller_controlled_strings_are_bounded() {
         .expect_err("an oversized idempotency_key is refused");
     assert!(matches!(refused, DomainError::LimitExceeded { .. }));
 
+    // A discriminator filter is held to the bound ingest holds a
+    // discriminator to: a longer value can match no stored edge.
+    let refused = harness
+        .services
+        .traverse(
+            &ctx,
+            TraverseRequest {
+                seeds: vec!["fine".to_owned()],
+                depth: 1,
+                edge_discriminators: vec![long.clone()],
+                ..TraverseRequest::default()
+            },
+        )
+        .await
+        .expect_err("an oversized edge discriminator is refused");
+    assert!(matches!(refused, DomainError::LimitExceeded { .. }));
+
     // The catalogue page bound is enforced in the same place, which is what
     // makes it enforced for every caller: REST passes its `limit` query
     // parameter straight through, so a guard at the edge would be a guard the
@@ -2371,6 +2428,7 @@ async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
                 depth: 1,
                 node_budget: Some(4),
                 include_phantoms: false,
+                direction: None,
             },
         )
         .await
@@ -2404,6 +2462,7 @@ async fn a_budgeted_neighborhood_keeps_the_best_connected_neighbours() {
                 depth: 1,
                 node_budget: Some(50),
                 include_phantoms: false,
+                direction: None,
             },
         )
         .await
@@ -2442,12 +2501,15 @@ async fn every_caller_supplied_identifier_is_bounded_before_it_reaches_the_store
             vec![node.to_owned()]
         },
         max_nodes: Some(10),
+        direction: None,
+        edge_discriminators: Vec::new(),
     };
     let neighborhood = |root: &str| NeighborhoodRequest {
         root: root.to_owned(),
         depth: 1,
         node_budget: Some(10),
         include_phantoms: false,
+        direction: None,
     };
     let search = |pattern: &str| SearchRequest {
         mode: SearchMode::Lexical,
@@ -2853,4 +2915,98 @@ async fn a_nul_is_refused_at_admission_and_named_where_it_is() {
         "a search query",
         "query",
     );
+}
+
+/// The in-process client takes the registration options REST takes, so a
+/// type registered before its consumer knew which paths it filters on can
+/// declare them without being recreated (gears-rust #5021, #5529 item 1).
+/// The same widened schema without the options is the conflict it always was.
+#[tokio::test]
+async fn the_local_client_declares_an_index_path_on_a_registered_type() {
+    use graph_storage::domain::local_client::GraphStorageLocalClient;
+    use graph_storage_sdk::GraphStorageClientV1;
+    use graph_storage_sdk::models::TypeOutcome;
+
+    let harness = Harness::allowed();
+    let ctx = harness.ctx();
+    let client = GraphStorageLocalClient::new(std::sync::Arc::clone(&harness.services));
+    let mut types = conformance::ontology_batch();
+    types.push(conformance::requirement_v1());
+    client
+        .register_types(&ctx, types)
+        .await
+        .expect("the ontology registers in-process");
+    client
+        .ingest(
+            &ctx,
+            conformance::batch(
+                vec![
+                    conformance::requirement("r0", "proposed"),
+                    conformance::requirement("r1", "approved"),
+                ],
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("the requirements commit");
+
+    let by_priority = || {
+        conformance::projection(
+            &[conformance::EVOLVING],
+            "payload/priority eq 'normal'",
+            &[("node_key", toolkit_odata::SortDir::Asc)],
+        )
+        .query
+    };
+    let patterns = [conformance::EVOLVING.to_owned()];
+    client
+        .project_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect_err("an undeclared path is refused before the update");
+
+    let widened = || {
+        conformance::requirement_revision(
+            &conformance::requirement_properties(&["proposed", "approved"], false, false),
+            &["key", "statement"],
+            &["/payload/status", "/payload/priority"],
+        )
+    };
+    let conflict = client
+        .register_types(&ctx, vec![widened()])
+        .await
+        .expect_err("without options a changed schema is still a conflict");
+    assert_eq!(
+        conflict.status_code(),
+        409,
+        "the default stays a conflict: {conflict}"
+    );
+
+    let registered = client
+        .register_types_with(&ctx, vec![widened()], conformance::update_options())
+        .await
+        .expect("declaring another index path is admitted in-process");
+    let updated = registered
+        .iter()
+        .find(|item| item.record.type_id == conformance::EVOLVING)
+        .expect("the type is reported");
+    assert_eq!(updated.outcome, TypeOutcome::Updated);
+
+    let page = client
+        .project_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect("the newly declared path filters at once");
+    assert_eq!(page.items.len(), 2, "both requirements match");
+
+    // And the same filter has a total, in-process as over REST.
+    let mut unordered = by_priority();
+    unordered.order = toolkit_odata::ODataOrderBy(Vec::new());
+    let counted = client
+        .count_nodes(&ctx, &patterns, unordered)
+        .await
+        .expect("the count answers in-process");
+    assert_eq!((counted.count, counted.capped), (2, false));
+    client
+        .count_nodes(&ctx, &patterns, by_priority())
+        .await
+        .expect_err("a count refuses an ordering it cannot apply");
 }

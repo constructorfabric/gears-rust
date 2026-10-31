@@ -671,6 +671,12 @@ pub struct ElementEnvelope {
     /// Soft-delete tombstone; absent on a live element.
     pub deleted_at: Option<OffsetDateTime>,
     pub deleted_by: Option<Subject>,
+    /// The node's stored version: 1 on insert, advanced by every update. It
+    /// is the value `NodeSpec::expected_version` compares against, so a
+    /// producer can read a node, change it and write it back on the condition
+    /// that nobody wrote it in between. Absent on an edge, which carries no
+    /// version (its identity is derived from its endpoints).
+    pub version: Option<i64>,
     /// The revision the read that produced this element observed.
     ///
     /// Per element rather than per response because the tabular projection
@@ -870,6 +876,8 @@ pub struct AdjacencyEntry {
     pub side: AdjacencySide,
     pub neighbor_key: NodeKey,
     pub neighbor_type_id: GtsTypeId,
+    /// The edge's discriminator, as on `EdgeRef`.
+    pub discriminator: Option<String>,
 }
 
 /// A node as read paths return it.
@@ -903,6 +911,20 @@ pub struct EdgeView {
     pub payload: Option<serde_json::Value>,
     /// Gear-assigned audit envelope (`fr-audit-envelope`).
     pub envelope: ElementEnvelope,
+}
+
+/// How many nodes a listing matches: the answer to the projection's
+/// `type_patterns` and `$filter` without its pages.
+///
+/// Exact up to the deployment's `projection_count_max`. Past it `count` is
+/// that ceiling and `capped` is set, so a caller can render "10 000+" rather
+/// than a number the gear did not count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NodeCount {
+    pub count: u64,
+    pub capped: bool,
+    /// The revision the count observed, as on every projection row.
+    pub revision: GraphRevision,
 }
 
 /// One row of the tabular projection.
@@ -1103,6 +1125,11 @@ pub struct EdgeRef {
     pub edge_type_id: GtsTypeId,
     pub src: NodeKey,
     pub dst: NodeKey,
+    /// The discriminator the edge was ingested with, which tells parallel
+    /// edges of one type between one endpoint pair apart. The edge key is
+    /// derived from it but is opaque, so this is the only way a traversal
+    /// caller learns which of several same-typed relations an edge is.
+    pub discriminator: Option<String>,
 }
 
 /// Label filter placeholder (labels are not shipped in this iteration; the
@@ -1122,15 +1149,30 @@ pub struct TraverseRequest {
     /// Node-type filter applied to the output set (seeds always survive).
     pub node_type_patterns: Vec<String>,
     pub max_nodes: Option<u32>,
+    /// Which way every hop follows an edge, from the node it stands on:
+    /// `Outgoing` from source to destination, `Incoming` back, `Either` both.
+    /// `None` is `Either`.
+    pub direction: Option<Direction>,
+    /// Per-hop discriminator restriction: only edges whose discriminator is
+    /// one of these values are followed. Empty follows every edge; an edge
+    /// ingested without a discriminator never matches a non-empty list.
+    ///
+    /// Applied in the edge scan, so the edges it excludes spend neither the
+    /// hop's edge budget nor the walk's node budget. At most 1 000 values;
+    /// a longer list is refused as `limit_exceeded`.
+    pub edge_discriminators: Vec<String>,
 }
 
 /// Bounded neighborhood projection request.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct NeighborhoodRequest {
     pub root: NodeKey,
     pub depth: u8,
     pub node_budget: Option<u32>,
     pub include_phantoms: bool,
+    /// Which way every hop follows an edge; `None` is `Either`
+    /// (see `TraverseRequest::direction`).
+    pub direction: Option<Direction>,
 }
 
 /// Traversal / neighborhood response.
