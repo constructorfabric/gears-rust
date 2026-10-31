@@ -47,7 +47,8 @@ pub struct BillingDerivationInput {
     pub error_code: Option<String>,
     /// `true` when the provider reported a `Usage` object with at least one
     /// non-zero field (`input_tokens > 0 || output_tokens > 0`).
-    /// A zero-valued or missing usage object is "usage unknown".
+    /// A zero-valued or missing usage object is "usage unknown", for every
+    /// terminal state: settling it as actual would charge nothing.
     pub has_usage: bool,
 }
 
@@ -63,7 +64,11 @@ pub fn derive_billing_outcome(input: &BillingDerivationInput) -> BillingDerivati
     match input.terminal_state {
         TurnState::Completed => BillingDerivation {
             outcome: BillingOutcome::Completed,
-            settlement_method: SettlementMethod::Actual,
+            settlement_method: if input.has_usage {
+                SettlementMethod::Actual
+            } else {
+                SettlementMethod::Estimated
+            },
             unknown_error_code: false,
         },
 
@@ -169,6 +174,14 @@ mod tests {
         let r = derive_billing_outcome(&input(TurnState::Completed, None, true));
         assert_eq!(r.outcome, BillingOutcome::Completed);
         assert_eq!(r.settlement_method, SettlementMethod::Actual);
+        assert!(!r.unknown_error_code);
+    }
+
+    #[test]
+    fn completed_without_usage_derives_completed_estimated() {
+        let r = derive_billing_outcome(&input(TurnState::Completed, None, false));
+        assert_eq!(r.outcome, BillingOutcome::Completed);
+        assert_eq!(r.settlement_method, SettlementMethod::Estimated);
         assert!(!r.unknown_error_code);
     }
 

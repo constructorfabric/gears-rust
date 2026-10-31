@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 use tracing::{Instrument, debug, info, warn};
 
-use crate::domain::llm::ToolPhase;
+use crate::domain::llm::{ToolPhase, Usage};
 use crate::domain::ports::knowledge_retriever::{
     KnowledgeRetriever, RetrievalRequest, RetrievedChunk,
 };
@@ -150,6 +150,9 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
         // raw_input_items grows with each search_knowledge call/output pair.
         let mut raw_input_items: Vec<serde_json::Value> = Vec::new();
         let mut knowledge_call_count: u32 = 0;
+        // Usage of the provider calls that ended in a tool call. The turn is
+        // billed for these plus its final call.
+        let mut tool_use_usage = Usage::default();
 
         // Hard cap on agentic-loop iterations. Without it, a model that keeps
         // emitting `search_knowledge` after the soft per-message limit fires
@@ -183,10 +186,11 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     .to_owned();
                 if let Some(ref fctx) = fin_ctx {
                     let elapsed = stream_start.elapsed();
+                    // Every call so far ended in a tool call and reported usage.
                     let finput = fctx.to_finalization_input(
                         TurnState::Failed,
                         &accumulated_text,
-                        None,
+                        Some(tool_use_usage),
                         Some(code.clone()),
                         None,
                         None,
@@ -239,7 +243,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 return StreamOutcome {
                     terminal: StreamTerminal::Failed,
                     accumulated_text,
-                    usage: None,
+                    usage: Some(tool_use_usage),
                     effective_model: model,
                     error_code: Some(code),
                     provider_response_id: None,
@@ -852,6 +856,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 response_id,
                 ..
             } => {
+                let usage = tool_use_usage + usage;
                 let elapsed = stream_start.elapsed();
                 info!(
                     terminal = "completed",
@@ -974,6 +979,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 };
             }
             TerminalOutcome::Incomplete { usage, reason, .. } => {
+                let usage = tool_use_usage + usage;
                 let elapsed = stream_start.elapsed();
                 warn!(
                     terminal = "incomplete",
@@ -1071,6 +1077,9 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 };
             }
             TerminalOutcome::Failed { error, usage, .. } => {
+                // Without usage for the failed call the turn's usage is
+                // unknown, and it settles estimated.
+                let usage = usage.map(|u| tool_use_usage + u);
                 let raw_detail = error.raw_detail().map(ToOwned::to_owned);
                 let (code, message) = normalize_error(&error);
                 let elapsed = stream_start.elapsed();
@@ -1147,7 +1156,9 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 tool_use_id,
                 name,
                 input,
+                usage,
             } => {
+                tool_use_usage += usage;
                 if name == "search_knowledge"
                     && let Some(ref ks) = knowledge_search
                 {
@@ -1299,7 +1310,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                     let finput = fctx.to_finalization_input(
                         TurnState::Failed,
                         &accumulated_text,
-                        None,
+                        Some(tool_use_usage),
                         Some(code.clone()),
                         None,
                         None,
@@ -1349,7 +1360,7 @@ pub(super) fn spawn_provider_task<TR: TurnRepository + 'static, MR: MessageRepos
                 return StreamOutcome {
                     terminal: StreamTerminal::Failed,
                     accumulated_text,
-                    usage: None,
+                    usage: Some(tool_use_usage),
                     effective_model: model,
                     error_code: Some(code),
                     provider_response_id: None,

@@ -112,5 +112,7 @@ k8s-openapi = { workspace = true, features = ["latest"], optional = true }
 chrono = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+# `start_paused` for the usage-handler timeout test.
+tokio = { workspace = true, features = ["test-util"] }
 
 

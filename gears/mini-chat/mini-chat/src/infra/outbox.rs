@@ -343,9 +343,33 @@ impl PolicyPluginProvider for crate::infra::model_policy::ModelPolicyGateway {
 /// - `PublishError::Permanent` → `Reject` (dead-letter for manual inspection)
 /// - Deserialization failure → `Reject` (corrupt payload, permanent)
 /// - Plugin resolution failure → `Retry` (transient - plugin may not be ready yet)
+/// - Resolution and publication together taking longer than
+///   [`USAGE_PLUGIN_TIMEOUT`] → `Retry`
+/// - A `Retry` on the last of `max_attempts` attempts → `Reject`
+///   (dead-letter), so one event that keeps failing does not block the
+///   usage events of every tenant in its partition
+///
+/// Every `Reject` is logged at `error` and counted in
+/// `mini_chat_outbox_dead_total{queue="usage",reason}`.
 pub struct UsageEventHandler {
     pub(crate) plugin_provider: Arc<dyn PolicyPluginProvider>,
+    pub(crate) metrics: Arc<dyn MiniChatMetricsPort>,
+    /// Delivery attempts per event before it is dead-lettered;
+    /// [`USAGE_MAX_ATTEMPTS`] in production.
+    pub(crate) max_attempts: u32,
 }
+
+/// Delivery attempts per usage event before it is dead-lettered. With the
+/// default processor backoff (1 s doubling to 60 s) this is about two hours
+/// of retries.
+pub const USAGE_MAX_ATTEMPTS: u32 = 120;
+
+/// Budget for resolving the plugin and publishing one usage event. It is
+/// below the 28 s handler budget of the default 30 s lease, so a stalled
+/// plugin ends in `retry_or_dead_letter` and counts toward
+/// [`USAGE_MAX_ATTEMPTS`]; a handler dropped at the lease deadline never
+/// gets to dead-letter the event.
+const USAGE_PLUGIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[async_trait]
 impl toolkit_db::outbox::LeasedMessageHandler for UsageEventHandler {
@@ -362,6 +386,10 @@ impl toolkit_db::outbox::LeasedMessageHandler for UsageEventHandler {
                     seq = msg.seq,
                     payload_len = msg.payload.len(),
                     "usage event deserialization failed: {e}"
+                );
+                self.metrics.record_outbox_dead(
+                    metric_labels::outbox_queue::USAGE,
+                    metric_labels::outbox_dead_reason::INVALID_PAYLOAD,
                 );
                 return toolkit_db::outbox::MessageResult::Reject(format!(
                     "deserialization failed: {e}"
@@ -383,29 +411,41 @@ impl toolkit_db::outbox::LeasedMessageHandler for UsageEventHandler {
             "publishing usage event to plugin"
         );
 
-        let plugin = match self.plugin_provider.get_plugin().await {
+        let deadline = tokio::time::Instant::now() + USAGE_PLUGIN_TIMEOUT;
+        let Ok(resolved) =
+            tokio::time::timeout_at(deadline, self.plugin_provider.get_plugin()).await
+        else {
+            return self.timed_out(msg, "policy plugin resolution");
+        };
+        let plugin = match resolved {
             Ok(p) => p,
             Err(e) => {
                 warn!(
                     partition_id = msg.partition_id,
                     seq = msg.seq,
+                    attempts = msg.attempts,
                     error = %e,
                     "failed to resolve policy plugin - will retry"
                 );
-                return toolkit_db::outbox::MessageResult::Retry;
+                return self.retry_or_dead_letter(msg, "policy plugin resolution failed");
             }
         };
 
-        match plugin.publish_usage(event).await {
+        let Ok(published) = tokio::time::timeout_at(deadline, plugin.publish_usage(event)).await
+        else {
+            return self.timed_out(msg, "publish_usage");
+        };
+        match published {
             Ok(()) => toolkit_db::outbox::MessageResult::Ok,
             Err(PublishError::Transient(reason)) => {
                 warn!(
                     partition_id = msg.partition_id,
                     seq = msg.seq,
+                    attempts = msg.attempts,
                     %reason,
                     "publish_usage transient failure - will retry"
                 );
-                toolkit_db::outbox::MessageResult::Retry
+                self.retry_or_dead_letter(msg, "publish_usage transient failure")
             }
             Err(PublishError::Permanent(reason)) => {
                 tracing::error!(
@@ -414,9 +454,56 @@ impl toolkit_db::outbox::LeasedMessageHandler for UsageEventHandler {
                     %reason,
                     "publish_usage permanent failure - dead-lettering"
                 );
+                self.metrics.record_outbox_dead(
+                    metric_labels::outbox_queue::USAGE,
+                    metric_labels::outbox_dead_reason::PERMANENT,
+                );
                 toolkit_db::outbox::MessageResult::Reject(reason)
             }
         }
+    }
+}
+
+impl UsageEventHandler {
+    fn timed_out(
+        &self,
+        msg: &toolkit_db::outbox::OutboxMessage,
+        what: &str,
+    ) -> toolkit_db::outbox::MessageResult {
+        warn!(
+            partition_id = msg.partition_id,
+            seq = msg.seq,
+            attempts = msg.attempts,
+            timeout = ?USAGE_PLUGIN_TIMEOUT,
+            "{what} timed out - will retry"
+        );
+        self.retry_or_dead_letter(msg, &format!("{what} timed out"))
+    }
+
+    /// `Retry`, or `Reject` once this is the last of `max_attempts`.
+    fn retry_or_dead_letter(
+        &self,
+        msg: &toolkit_db::outbox::OutboxMessage,
+        what: &str,
+    ) -> toolkit_db::outbox::MessageResult {
+        let this_attempt = u32::try_from(msg.attempts).unwrap_or(0).saturating_add(1);
+        if this_attempt < self.max_attempts {
+            return toolkit_db::outbox::MessageResult::Retry;
+        }
+        tracing::error!(
+            partition_id = msg.partition_id,
+            seq = msg.seq,
+            attempts = this_attempt,
+            "{what}: max attempts reached - dead-lettering usage event"
+        );
+        self.metrics.record_outbox_dead(
+            metric_labels::outbox_queue::USAGE,
+            metric_labels::outbox_dead_reason::MAX_ATTEMPTS,
+        );
+        toolkit_db::outbox::MessageResult::Reject(format!(
+            "{what}: max attempts ({}) reached",
+            self.max_attempts
+        ))
     }
 }
 
@@ -652,6 +739,8 @@ mod tests {
     /// Mock plugin that records `publish_usage` calls and returns a configurable result.
     struct MockPlugin {
         result: std::sync::Mutex<Result<(), PublishError>>,
+        /// `publish_usage` never completes.
+        stall: bool,
         call_count: AtomicU32,
         notifier: tokio::sync::Notify,
     }
@@ -660,6 +749,7 @@ mod tests {
         fn ok() -> Arc<Self> {
             Arc::new(Self {
                 result: std::sync::Mutex::new(Ok(())),
+                stall: false,
                 call_count: AtomicU32::new(0),
                 notifier: tokio::sync::Notify::new(),
             })
@@ -668,6 +758,7 @@ mod tests {
         fn transient(reason: &str) -> Arc<Self> {
             Arc::new(Self {
                 result: std::sync::Mutex::new(Err(PublishError::Transient(reason.to_owned()))),
+                stall: false,
                 call_count: AtomicU32::new(0),
                 notifier: tokio::sync::Notify::new(),
             })
@@ -676,6 +767,16 @@ mod tests {
         fn permanent(reason: &str) -> Arc<Self> {
             Arc::new(Self {
                 result: std::sync::Mutex::new(Err(PublishError::Permanent(reason.to_owned()))),
+                stall: false,
+                call_count: AtomicU32::new(0),
+                notifier: tokio::sync::Notify::new(),
+            })
+        }
+
+        fn stalled() -> Arc<Self> {
+            Arc::new(Self {
+                result: std::sync::Mutex::new(Ok(())),
+                stall: true,
                 call_count: AtomicU32::new(0),
                 notifier: tokio::sync::Notify::new(),
             })
@@ -720,6 +821,9 @@ mod tests {
 
         async fn publish_usage(&self, _payload: UsageEvent) -> Result<(), PublishError> {
             self.call_count.fetch_add(1, Ordering::SeqCst);
+            if self.stall {
+                std::future::pending::<()>().await;
+            }
             let result = {
                 let guard = self.result.lock().unwrap();
                 match &*guard {
@@ -753,6 +857,8 @@ mod tests {
             plugin_provider: Arc::new(MockProvider {
                 plugin: plugin.clone(),
             }),
+            metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+            max_attempts: USAGE_MAX_ATTEMPTS,
         }
     }
 
@@ -855,6 +961,155 @@ mod tests {
             MessageResult::Retry => panic!("expected Reject, got Retry"),
         }
         assert_eq!(plugin.calls(), 1);
+    }
+
+    // ── UsageEventHandler: retries are bounded ──
+
+    /// A provider whose plugin never resolves.
+    struct UnavailableProvider;
+
+    #[async_trait]
+    impl PolicyPluginProvider for UnavailableProvider {
+        async fn get_plugin(
+            &self,
+        ) -> Result<Arc<dyn MiniChatModelPolicyPluginClientV1>, crate::domain::error::DomainError>
+        {
+            Err(crate::domain::error::DomainError::internal(
+                "plugin not registered",
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_handler_dead_letters_on_last_attempt() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+        let payload = serde_json::to_vec(&make_usage_event()).unwrap();
+        let mut msg = make_outbox_message(payload);
+
+        let transient = UsageEventHandler {
+            plugin_provider: Arc::new(MockProvider {
+                plugin: MockPlugin::transient("network blip"),
+            }),
+            metrics: Arc::clone(&metrics) as _,
+            max_attempts: USAGE_MAX_ATTEMPTS,
+        };
+        let unresolved = UsageEventHandler {
+            plugin_provider: Arc::new(UnavailableProvider),
+            metrics: Arc::clone(&metrics) as _,
+            max_attempts: USAGE_MAX_ATTEMPTS,
+        };
+
+        msg.attempts = i16::try_from(USAGE_MAX_ATTEMPTS - 2).unwrap();
+        for handler in [&transient, &unresolved] {
+            assert!(matches!(
+                LeasedMessageHandler::handle(handler, &msg).await,
+                MessageResult::Retry
+            ));
+        }
+        assert!(metrics.outbox_dead.lock().unwrap().is_empty());
+
+        msg.attempts += 1;
+        for handler in [&transient, &unresolved] {
+            match LeasedMessageHandler::handle(handler, &msg).await {
+                MessageResult::Reject(reason) => {
+                    assert!(reason.contains("max attempts"), "{reason}");
+                }
+                other => panic!("expected Reject, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            *metrics.outbox_dead.lock().unwrap(),
+            vec![("usage".to_owned(), "max_attempts".to_owned()); 2]
+        );
+    }
+
+    /// A provider whose plugin resolution never completes.
+    struct StalledProvider;
+
+    #[async_trait]
+    impl PolicyPluginProvider for StalledProvider {
+        async fn get_plugin(
+            &self,
+        ) -> Result<Arc<dyn MiniChatModelPolicyPluginClientV1>, crate::domain::error::DomainError>
+        {
+            std::future::pending().await
+        }
+    }
+
+    // A stalled plugin must time out inside the handler: if the lease
+    // cancelled the handler instead, the event would never be dead-lettered.
+    #[tokio::test(start_paused = true)]
+    async fn usage_handler_times_out_a_stalled_plugin() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+        let payload = serde_json::to_vec(&make_usage_event()).unwrap();
+        let mut msg = make_outbox_message(payload);
+
+        let stalled_publish = UsageEventHandler {
+            plugin_provider: Arc::new(MockProvider {
+                plugin: MockPlugin::stalled(),
+            }),
+            metrics: Arc::clone(&metrics) as _,
+            max_attempts: USAGE_MAX_ATTEMPTS,
+        };
+        let stalled_resolution = UsageEventHandler {
+            plugin_provider: Arc::new(StalledProvider),
+            metrics: Arc::clone(&metrics) as _,
+            max_attempts: USAGE_MAX_ATTEMPTS,
+        };
+
+        msg.attempts = i16::try_from(USAGE_MAX_ATTEMPTS - 2).unwrap();
+        for handler in [&stalled_publish, &stalled_resolution] {
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                LeasedMessageHandler::handle(handler, &msg).await,
+                MessageResult::Retry
+            ));
+            assert_eq!(started.elapsed(), USAGE_PLUGIN_TIMEOUT);
+        }
+        assert!(metrics.outbox_dead.lock().unwrap().is_empty());
+
+        msg.attempts += 1;
+        for handler in [&stalled_publish, &stalled_resolution] {
+            match LeasedMessageHandler::handle(handler, &msg).await {
+                MessageResult::Reject(reason) => {
+                    assert!(reason.contains("timed out"), "{reason}");
+                    assert!(reason.contains("max attempts"), "{reason}");
+                }
+                other => panic!("expected Reject, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            *metrics.outbox_dead.lock().unwrap(),
+            vec![("usage".to_owned(), "max_attempts".to_owned()); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_handler_counts_immediate_dead_letters() {
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+        let handler = UsageEventHandler {
+            plugin_provider: Arc::new(MockProvider {
+                plugin: MockPlugin::permanent("schema mismatch"),
+            }),
+            metrics: Arc::clone(&metrics) as _,
+            max_attempts: USAGE_MAX_ATTEMPTS,
+        };
+
+        let invalid = make_outbox_message(b"not json".to_vec());
+        let valid = make_outbox_message(serde_json::to_vec(&make_usage_event()).unwrap());
+        for msg in [&invalid, &valid] {
+            assert!(matches!(
+                LeasedMessageHandler::handle(&handler, msg).await,
+                MessageResult::Reject(_)
+            ));
+        }
+        assert_eq!(
+            *metrics.outbox_dead.lock().unwrap(),
+            vec![
+                ("usage".to_owned(), "invalid_payload".to_owned()),
+                ("usage".to_owned(), "permanent".to_owned()),
+            ]
+        );
     }
 
     // ── AuditEventHandler unit tests ──
@@ -1320,6 +1575,8 @@ mod tests {
                 plugin_provider: Arc::new(MockProvider {
                     plugin: plugin.clone(),
                 }),
+                metrics: Arc::new(crate::domain::ports::metrics::NoopMetrics),
+                max_attempts: USAGE_MAX_ATTEMPTS,
             })
             .start()
             .await
@@ -1353,6 +1610,153 @@ mod tests {
             1,
             "publish_usage should have been called once"
         );
+
+        handle.stop().await;
+    }
+
+    /// Fails transiently for one request and accepts every other one.
+    struct PoisonPlugin {
+        poisoned: Uuid,
+        delivered: std::sync::Mutex<Vec<Uuid>>,
+    }
+
+    #[async_trait]
+    impl MiniChatModelPolicyPluginClientV1 for PoisonPlugin {
+        async fn get_current_policy_version(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<PolicyVersionInfo, MiniChatModelPolicyPluginError> {
+            unimplemented!("not needed in outbox tests")
+        }
+
+        async fn get_policy_snapshot(
+            &self,
+            _user_id: Uuid,
+            _policy_version: u64,
+        ) -> Result<PolicySnapshot, MiniChatModelPolicyPluginError> {
+            unimplemented!("not needed in outbox tests")
+        }
+
+        async fn get_user_limits(
+            &self,
+            _user_id: Uuid,
+            _policy_version: u64,
+        ) -> Result<UserLimits, MiniChatModelPolicyPluginError> {
+            unimplemented!("not needed in outbox tests")
+        }
+
+        async fn check_user_license(
+            &self,
+            _user_id: Uuid,
+        ) -> Result<mini_chat_sdk::UserLicenseStatus, MiniChatModelPolicyPluginError> {
+            unimplemented!("not needed in outbox tests")
+        }
+
+        async fn publish_usage(&self, payload: UsageEvent) -> Result<(), PublishError> {
+            if payload.request_id == self.poisoned {
+                return Err(PublishError::Transient("always failing".to_owned()));
+            }
+            self.delivered.lock().unwrap().push(payload.request_id);
+            Ok(())
+        }
+    }
+
+    // A usage event that keeps failing is dead-lettered after the attempt
+    // limit, and the next event in its partition is delivered.
+    #[tokio::test]
+    async fn poisoned_usage_event_does_not_block_its_partition() {
+        use std::time::Duration;
+        use toolkit_db::outbox::{
+            DeadLetterFilter, DeadLetterScope, Outbox, Partitions, WorkerTuning,
+        };
+        use toolkit_db::{ConnectOpts, connect_db, migration_runner::run_migrations_for_testing};
+
+        let poisoned = make_usage_event();
+        let next = make_usage_event();
+        let plugin = Arc::new(PoisonPlugin {
+            poisoned: poisoned.request_id,
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let metrics = Arc::new(crate::domain::service::test_helpers::TestMetrics::new());
+
+        let db = connect_db(
+            "sqlite:file:outbox_usage_poison?mode=memory&cache=shared",
+            ConnectOpts {
+                max_conns: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("connect");
+        run_migrations_for_testing(&db, toolkit_db::outbox::outbox_migrations())
+            .await
+            .expect("outbox migrations");
+
+        let handle = Outbox::builder(db.clone())
+            .processor_tuning(
+                WorkerTuning::processor_low_latency()
+                    .retry_base(Duration::from_millis(10))
+                    .retry_max(Duration::from_millis(20)),
+            )
+            .queue("test.usage", Partitions::of(1))
+            .leased(UsageEventHandler {
+                plugin_provider: Arc::new(MockProvider {
+                    plugin: plugin.clone(),
+                }),
+                metrics: Arc::clone(&metrics) as _,
+                max_attempts: 3,
+            })
+            .start()
+            .await
+            .expect("outbox start");
+
+        let enqueuer = InfraOutboxEnqueuer::new(
+            "test.usage".to_owned(),
+            "test.cleanup".to_owned(),
+            "test.chat_cleanup".to_owned(),
+            "test.thread_summary".to_owned(),
+            "test.audit".to_owned(),
+            1u32,
+        );
+        enqueuer.set_outbox(Arc::clone(handle.outbox()));
+        let conn = db.conn().expect("conn");
+        for event in [poisoned.clone(), next.clone()] {
+            enqueuer
+                .enqueue_usage_event(&conn, event)
+                .await
+                .expect("enqueue")
+                .fire();
+        }
+
+        // `next` can be delivered in the same batch as the rejection, before
+        // the ack that writes the dead letter commits; wait for both.
+        let dead_letters =
+            DeadLetterFilter::from_scope(DeadLetterScope::default().queue("test.usage"));
+        let dead = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if plugin.delivered.lock().unwrap().contains(&next.request_id) {
+                    let dead = handle
+                        .outbox()
+                        .dead_letter_list(&conn, &dead_letters)
+                        .await
+                        .expect("dead letters");
+                    if !dead.is_empty() {
+                        return dead;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the poisoned event should be dead-lettered and the next one delivered");
+        assert_eq!(dead.len(), 1);
+        let dead_event: UsageEvent = serde_json::from_slice(&dead[0].payload).unwrap();
+        assert_eq!(dead_event.request_id, poisoned.request_id);
+        assert_eq!(
+            *metrics.outbox_dead.lock().unwrap(),
+            vec![("usage".to_owned(), "max_attempts".to_owned())]
+        );
+        assert_eq!(*plugin.delivered.lock().unwrap(), vec![next.request_id]);
 
         handle.stop().await;
     }

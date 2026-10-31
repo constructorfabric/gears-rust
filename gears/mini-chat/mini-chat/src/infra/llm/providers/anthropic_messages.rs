@@ -517,6 +517,7 @@ fn translate_anthropic_event(
                         tool_use_id: state.tool_use_id.clone(),
                         name: state.tool_name.clone(),
                         input,
+                        usage,
                     })
                 }
                 "max_tokens" => TranslatedEvent::Terminal(TerminalOutcome::Incomplete {
@@ -1709,10 +1710,13 @@ mod tests {
                 tool_use_id,
                 name,
                 input,
+                usage,
             }) => {
                 assert_eq!(tool_use_id, "toolu_123");
                 assert_eq!(name, "search_knowledge");
                 assert_eq!(input["query"], "test");
+                assert_eq!(usage.input_tokens, 20);
+                assert_eq!(usage.output_tokens, 8);
             }
             other => panic!("expected ToolUse, got {other:?}"),
         }
