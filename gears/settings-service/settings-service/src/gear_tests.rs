@@ -9,6 +9,7 @@
 //! `make` targets run) and may flake under plain `cargo test`.
 
 use super::SettingsService;
+use crate::domain::error::DomainError;
 
 #[test]
 fn an_uninitialized_gear_refuses_to_hand_out_config() {
@@ -159,7 +160,96 @@ fn gear_with_writes(
     let config = gear.config().expect("set above");
     gear.bind_notifications(&config)
         .expect("the notification half binds");
+    // ... and the activation client, whose stop the lifecycle awaits: over a
+    // service that answers nothing, with no broker in its hub.
+    gear.activations
+        .set(std::sync::Arc::new(
+            crate::infra::activation_client::ActivationClient::new(
+                crate::infra::activation_client::ConsumerDeps {
+                    backend: std::sync::Arc::new(NoService),
+                    reader: std::sync::Arc::new(NoService),
+                    metrics: gear.notify_metrics().expect("bound above"),
+                    hub: std::sync::Arc::new(toolkit::ClientHub::new()),
+                    timing: crate::infra::activation_client::ClientTiming::standard(),
+                },
+            ),
+        ))
+        .map_err(|_| "already set")
+        .expect("a fresh gear");
     std::sync::Arc::new(gear)
+}
+
+/// The service behind the activation client of the lifecycle tests: nothing
+/// subscribes through it, so it only refuses.
+struct NoService;
+
+fn unavailable() -> DomainError {
+    DomainError::Unavailable {
+        detail: "no service in this test".to_owned(),
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::infra::activation_client::ActivationBackend for NoService {
+    async fn register(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: &settings_service_sdk::SettingKey,
+        _: uuid::Uuid,
+    ) -> Result<(), crate::infra::activation_client::RegisterError> {
+        Err(crate::infra::activation_client::RegisterError::Unavailable(
+            "internal".to_owned(),
+        ))
+    }
+
+    async fn retire(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: &settings_service_sdk::SettingKey,
+        _: uuid::Uuid,
+    ) -> Result<(), crate::infra::activation_client::RetireFailure> {
+        Err(crate::infra::activation_client::RetireFailure::Unavailable)
+    }
+
+    async fn report(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: crate::domain::activation::BackResponse,
+    ) -> Result<crate::domain::activation::ReportResult, DomainError> {
+        Err(unavailable())
+    }
+}
+
+#[async_trait::async_trait]
+impl settings_service_sdk::api::SettingsReaderClient for NoService {
+    async fn get_effective(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: settings_service_sdk::models::GetEffectiveRequest,
+    ) -> Result<
+        settings_service_sdk::models::EffectiveValueResponse,
+        toolkit_canonical_errors::CanonicalError,
+    > {
+        Err(unavailable().into())
+    }
+
+    async fn get_effective_bulk(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: settings_service_sdk::api::BulkSelector,
+        _: String,
+    ) -> Result<Vec<settings_service_sdk::api::BulkOutcome>, toolkit_canonical_errors::CanonicalError>
+    {
+        Err(unavailable().into())
+    }
+
+    async fn resolve_secret(
+        &self,
+        _: &toolkit_security::SecurityContext,
+        _: settings_service_sdk::SecretHandle,
+    ) -> Result<secrecy::SecretString, toolkit_canonical_errors::CanonicalError> {
+        Err(unavailable().into())
+    }
 }
 
 /// A registry the lifecycle tests never reach: no broker is in their hub.

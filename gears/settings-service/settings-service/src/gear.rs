@@ -2,12 +2,12 @@
 //!
 //! `init` validates the deployment configuration fail-closed, acquires the
 //! database, registers the setting-type base with the types registry, builds
-//! every service, and registers `SettingsReaderClient` and
-//! `SettingsContributionClient` into `ClientHub` for the gears that consume
-//! them. No `@cpt-dod` marker for `dod-gear-foundation-gear-scaffold` yet:
-//! that definition of done also asks for the remaining GTS control-plane
-//! schemas and the category seed at init, which are still open. The marker
-//! lands with the tick.
+//! every service, and registers `SettingsReaderClient`,
+//! `SettingsContributionClient` and `SettingsActivationClient` into `ClientHub`
+//! for the gears that consume them. No `@cpt-dod` marker for
+//! `dod-gear-foundation-gear-scaffold` yet: that definition of done also asks
+//! for the remaining GTS control-plane schemas and the category seed at init,
+//! which are still open. The marker lands with the tick.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -25,6 +25,7 @@ use types_registry_sdk::TypesRegistryClient;
 
 use crate::domain::platform_scope::PlatformScope;
 use crate::domain::validation::TypeValidator;
+use settings_service_sdk::SettingsActivationClient;
 use settings_service_sdk::api::{SettingsContributionClient, SettingsReaderClient};
 
 use crate::config::SettingsServiceConfig;
@@ -108,6 +109,7 @@ pub struct SettingsService {
     notifier: OnceLock<Arc<crate::domain::activation::ActivationNotifier>>,
     recorder: OnceLock<Arc<ConcreteRecorder>>,
     notify_metrics: OnceLock<Arc<dyn crate::domain::activation::NotifyMetrics>>,
+    activations: OnceLock<Arc<crate::infra::activation_client::ActivationClient>>,
 }
 
 impl Default for SettingsService {
@@ -131,6 +133,7 @@ impl Default for SettingsService {
             notifier: OnceLock::new(),
             recorder: OnceLock::new(),
             notify_metrics: OnceLock::new(),
+            activations: OnceLock::new(),
         }
     }
 }
@@ -171,15 +174,16 @@ const PRUNE_BATCHES: PruneBatches = PruneBatches {
 const REVIEW_TICK: Duration = Duration::from_mins(1);
 
 /// How long the stop waits for the background tasks together — the cache
-/// invalidation consumer and the activation delivery loop, awaited under this
-/// one deadline, not one each: the consumer's own cleanup deadline (10 s) with
-/// room to spare, inside the lifecycle's 30 s `stop_timeout`.
+/// invalidation consumer, the activation delivery loop and the activation
+/// client's group cleanup, awaited under this one deadline, not one each: the
+/// consumer's own cleanup deadline (10 s) with room to spare, inside the
+/// lifecycle's 30 s `stop_timeout`.
 const CONSUMER_STOP_BOUND: Duration = Duration::from_secs(15);
 
 /// A running background task of the gear — the cache invalidation consumer, the
-/// activation delivery loop: dropping it without joining it (the lifecycle
-/// future dropped, an early return) aborts the task, so it never outlives the
-/// gear.
+/// activation delivery loop, the activation client's stop: dropping it without
+/// joining it (the lifecycle future dropped, an early return) aborts the task,
+/// so it never outlives the gear.
 struct ConsumerTask {
     name: &'static str,
     handle: Option<tokio::task::JoinHandle<()>>,
@@ -222,6 +226,7 @@ impl SettingsService {
         // Spawned before readiness so an uninitialized gear refuses to start.
         let consuming = self.spawn_consumer(&cancel)?;
         let delivering = self.spawn_delivery(&cancel)?;
+        let subscribing = self.spawn_activation_stop(&cancel)?;
         ready.notify();
         info!(
             tick_secs = SWEEP_TICK.as_secs(),
@@ -229,7 +234,11 @@ impl SettingsService {
         );
         let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
         Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
-        Self::await_tasks(vec![consuming, delivering], CONSUMER_STOP_BOUND).await;
+        Self::await_tasks(
+            vec![consuming, delivering, subscribing],
+            CONSUMER_STOP_BOUND,
+        )
+        .await;
         info!("pending-secret sweep and audit retention stopped");
         Ok(())
     }
@@ -268,6 +277,22 @@ impl SettingsService {
             }),
         ))
         // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-6
+    }
+
+    /// Hold the activation client's stop beside the other background tasks: when
+    /// the token fires it leaves and deletes the process's consumer groups,
+    /// best-effort, within the client's cleanup deadline, so the stop awaits it
+    /// with the consumer and the delivery loop under one deadline.
+    fn spawn_activation_stop(&self, cancel: &CancellationToken) -> anyhow::Result<ConsumerTask> {
+        let client = self.activations()?;
+        let cancel = cancel.clone();
+        Ok(ConsumerTask::new(
+            "activation client",
+            tokio::spawn(async move {
+                cancel.cancelled().await;
+                client.stop().await;
+            }),
+        ))
     }
 
     /// The stop waits for the background tasks to leave — the consumer to
@@ -677,6 +702,20 @@ impl SettingsService {
             .ok_or_else(|| anyhow::anyhow!("{} recorder not initialized", Self::MODULE_NAME))
     }
 
+    /// The in-process activation client — the consumer SDK's `subscribe`,
+    /// `retire()` and `report_outcome` — once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn activations(
+        &self,
+    ) -> anyhow::Result<Arc<crate::infra::activation_client::ActivationClient>> {
+        self.activations
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} activations not initialized", Self::MODULE_NAME))
+    }
+
     /// The notification half of the Activation Publisher, once initialized.
     fn notifier(&self) -> anyhow::Result<Arc<crate::domain::activation::ActivationNotifier>> {
         self.notifier
@@ -737,6 +776,36 @@ impl SettingsService {
         Ok(notifier)
     }
 
+    /// The consumer SDK, in process: the `SettingsActivationClient` beside the
+    /// reader in the `ClientHub`. Over the subscription service and the Recorder,
+    /// the reader its fresh re-reads go through, and the hub the Event Broker is
+    /// looked up in when a handle first needs it — never here, and never waited
+    /// for.
+    fn bind_activation_client(
+        &self,
+        ctx: &GearCtx,
+        reader: Arc<dyn SettingsReaderClient>,
+    ) -> anyhow::Result<()> {
+        let client = Arc::new(crate::infra::activation_client::ActivationClient::new(
+            crate::infra::activation_client::ConsumerDeps {
+                backend: Arc::new(crate::infra::activation_client::ServiceBackend::new(
+                    self.subscriptions()?,
+                    self.recorder()?,
+                )),
+                reader,
+                metrics: self.notify_metrics()?,
+                hub: ctx.client_hub(),
+                timing: crate::infra::activation_client::ClientTiming::standard(),
+            },
+        ));
+        self.activations
+            .set(Arc::clone(&client))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        ctx.client_hub()
+            .register::<dyn SettingsActivationClient>(client);
+        Ok(())
+    }
+
     /// Tenant access restrictions: set, clear, read and list, each mutation in
     /// its own transaction with its record, evicting the restricted subtree, and
     /// under the setting key's mutation lock.
@@ -765,8 +834,8 @@ impl SettingsService {
     /// The key's mutation lock: one named advisory lock per setting key, taken by
     /// every value change, restriction change, registration and retire of the
     /// key, within `mutation_lock_wait_seconds`. The budget and the delivery
-    /// loop's interval are checked first: a zero or an over-ceiling value of either fails init rather
-    /// than serving on a guess.
+    /// loop's interval are checked first: a zero or an over-ceiling value of
+    /// either fails init rather than serving on a guess.
     ///
     /// On the single-process `SQLite` profile the lock markers a crash may have
     /// left are removed here, before anything takes a lock; in every other
@@ -1070,7 +1139,8 @@ impl Gear for SettingsService {
                 secret_resolver,
             ));
         ctx.client_hub()
-            .register::<dyn SettingsReaderClient>(reader);
+            .register::<dyn SettingsReaderClient>(Arc::clone(&reader));
+        self.bind_activation_client(ctx, reader)?;
 
         let contributions = Arc::new(crate::domain::contribution::ContributionService::new(
             crate::infra::storage::declaration_repo::DeclarationRepo,

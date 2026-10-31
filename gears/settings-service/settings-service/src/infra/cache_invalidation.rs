@@ -34,22 +34,22 @@ use crate::infra::event_broker::{Backoff, EventBrokerClient, or_cancelled};
 
 /// How long stop spends leaving and deleting the group: under the gear
 /// lifecycle's `stop_timeout` of 30 s, so a slow broker never costs the stop.
-const CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
+pub(crate) const CLEANUP_DEADLINE: Duration = Duration::from_secs(10);
 
 /// The share of the cleanup deadline `leave` may spend; the group deletion gets
 /// what remains, even when `leave` timed out.
-const LEAVE_SHARE: u32 = 3;
+pub(crate) const LEAVE_SHARE: u32 = 3;
 
 /// How often a quiet stream is interrupted to look the broker up again; the
 /// broker's own heartbeat cadence is of this order.
-const LIVENESS_PERIOD: Duration = Duration::from_secs(5);
+pub(crate) const LIVENESS_PERIOD: Duration = Duration::from_secs(5);
 
 /// How long a stream stays open before it counts as healthy even with no frame
 /// on it: a quiet topic is not a failing broker.
-const HEALTHY_STREAM: Duration = Duration::from_secs(5);
+pub(crate) const HEALTHY_STREAM: Duration = Duration::from_secs(5);
 
 /// The session timeout the join asks for.
-const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Why the replica stopped holding a group.
 enum Ended {
@@ -91,7 +91,7 @@ async fn step<T, E: std::fmt::Display>(
 }
 
 /// The stream has proved healthy: the backoff starts over, once per stream.
-fn prove(pause: &mut Backoff, proven: &mut bool) {
+pub(crate) fn prove(pause: &mut Backoff, proven: &mut bool) {
     if !*proven {
         pause.reset();
         *proven = true;
@@ -527,7 +527,7 @@ impl CacheInvalidationConsumer {
 }
 
 /// One cleanup call within `limit`: a refusal and a timeout are each a warning.
-async fn bounded<E: std::fmt::Display>(
+pub(crate) async fn bounded<E: std::fmt::Display>(
     limit: Duration,
     failed: &str,
     why: &str,

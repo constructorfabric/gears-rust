@@ -302,3 +302,61 @@ async fn a_secret_change_without_its_plaintext_is_refused_not_hashed_from_nothin
     );
     assert!(f.state("gear", "pw", root).await.is_none());
 }
+
+#[tokio::test]
+async fn a_subscription_to_a_retired_key_gets_its_state_from_the_first_change_after_reactivation() {
+    // A retired key registers (the subscription is kept, its value absent for
+    // the consumer); once the declaration is reactivated, the key's next change
+    // writes the subscription's state like any other.
+    use crate::domain::declaration::DeclarationStatus;
+    let f = Fixture::new().await;
+    let root = f.base.tree.root;
+    let id = f
+        .base
+        .declare("flag", scope_class::CASCADING, json!(false))
+        .await;
+    {
+        let conn = f.base.db.conn().expect("connection");
+        DeclarationRepo
+            .set_status(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                DeclarationStatus::Retired,
+                None,
+            )
+            .await
+            .expect("retired");
+    }
+    f.subscribe("gear", "flag", root).await;
+    assert!(
+        f.state("gear", "flag", root).await.is_none(),
+        "nothing to await while retired"
+    );
+    {
+        let conn = f.base.db.conn().expect("connection");
+        DeclarationRepo
+            .set_status(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                DeclarationStatus::Active,
+                None,
+            )
+            .await
+            .expect("reactivated");
+    }
+    let declaration = f.declaration("flag").await;
+    let qualified = f.qualify(&declaration, root).await;
+    f.base.set(id, root, json!(true)).await;
+
+    f.record(&declaration, root, None, &qualified, None)
+        .await
+        .expect("recorded");
+
+    let state = f
+        .state("gear", "flag", root)
+        .await
+        .expect("the first change after reactivation writes the state");
+    assert_eq!(state.expected_value, "true");
+}

@@ -3,6 +3,11 @@
 //! three identifiers (`ACTIVATION_SUBJECT_TYPE`, `CACHE_TOPIC_ID`,
 //! `CACHE_INVALIDATE_EVENT_TYPE`) are part of the SDK, in `settings_service_sdk::gts`.
 //!
+//! The `change_notification` body is not defined here: it is the SDK's
+//! (`settings_service_sdk::activation::ChangeNotification`), re-exported below
+//! so the publisher and the consuming client read and write one definition;
+//! only its event-type schema is built here.
+//!
 //! Every replica of the gear publishes one [`CacheInvalidation`] per tenant a
 //! request touched on the cache topic and consumes the ones its peers publish.
 //! The body is a thin event (ADR-003): it names *what* changed, never *to
@@ -88,39 +93,9 @@ pub fn cache_topic_instance() -> Value {
     })
 }
 
-/// One key of a [`ChangeNotification`], with the change that owes a report.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NotifiedKey {
-    /// The setting key.
-    pub key: String,
-    /// The change the consumer reports on: the id of the change's audit record.
-    pub change_ref: Uuid,
-}
-
-/// The `data` of a `change_notification` event.
-///
-/// **Identifiers only.** The tenant, the subscriber and the keys with their
-/// `change_ref`; there is no field for a value, an expected value, a hash, a
-/// secret or an actor, and none may be added: the consumer re-reads under its
-/// own identity and reports what it applied. Unknown attributes are ignored on
-/// receipt.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ChangeNotification {
-    /// The subscription tenant, a bare lowercase UUID string; the root tenant's
-    /// id for a platform-wide subscription.
-    pub tenant: String,
-    /// The subscriber the notification is for: the broker delivers by topic,
-    /// type and tenant only, so a consumer drops what names another.
-    pub subscriber: String,
-    /// The subscriber's `awaiting` keys at that tenant, in key order.
-    pub changes: Vec<NotifiedKey>,
-    /// The subject's type, for a subject-scoped change. Absent in v1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_type: Option<String>,
-    /// The subject's runtime id, for a subject-scoped change. Absent in v1.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subject_id: Option<String>,
-}
+// The body is the SDK's: the publishing service and the consuming SDK read and
+// write one definition (`settings_service_sdk::activation`), identifiers only.
+pub use settings_service_sdk::activation::{ChangeNotification, NotifiedKey};
 
 /// The `data` schema of [`ChangeNotification`]. Unknown properties are allowed
 /// so attributes can be added within a major version.

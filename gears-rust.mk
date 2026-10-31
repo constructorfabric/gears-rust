@@ -499,7 +499,7 @@ lane_args_rg-pg = -p cf-gears-resource-group --features integration
 ## suites beside the gear's migrations run on SQLite, where a statement
 ## PostgreSQL refuses can still pass; this lane runs the chain a stand's startup
 ## runs, on the backend it runs it on.
-lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_replica_coherence_test --test pg_activation_state_test --test pg_activation_delivery_test
+lane_args_settings-service-pg = -p cf-gears-settings-service --features integration --test pg_migrations_test --test pg_replica_coherence_test --test pg_activation_state_test --test pg_activation_delivery_test --test pg_activation_e2e_test
 
 ## bss-pricing's Postgres tier (Docker required; each suite spins up its own
 ## postgres container via testcontainers).

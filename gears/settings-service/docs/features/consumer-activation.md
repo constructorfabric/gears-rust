@@ -133,7 +133,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Subscribe to Settings
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-subscribe`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-subscribe`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -149,14 +149,14 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - A key refused `NotFound` before the lock, a lock wait exhausted, the authorization service unavailable, a database error before the commit, a fresh read failing after the commit, or a missing broker grant: that key `pending`, retried while the handle is live, a warning each minute
 
 **Steps**:
-1. [ ] - `p1` - The consuming gear calls the SDK's `subscribe` with `keys`, a `tenant` and a handler, under its own security context - `inst-ca-subscribe-1`
-2. [ ] - `p1` - **IF** `keys` is empty **OR** `tenant` is not a UUID → **RETURN** an invalid-input error, with nothing registered and no handle - `inst-ca-subscribe-2`
+1. [x] - `p1` - The consuming gear calls the SDK's `subscribe` with `keys`, a `tenant` and a handler, under its own security context - `inst-ca-subscribe-1`
+2. [x] - `p1` - **IF** `keys` is empty **OR** `tenant` is not a UUID → **RETURN** an invalid-input error, with nothing registered and no handle - `inst-ca-subscribe-2`
 3. [x] - `p1` - Normalise `tenant` to a bare lowercase UUID string and take the subscriber from the caller's security context - `inst-ca-subscribe-3`
-4. [ ] - `p1` - **IF** the gear's consumer group in this process holds no interest for `tenant` **AND** already holds 64 tenant interests → **RETURN** the handle with every key `refused` and nothing registered, logged at `warn` - `inst-ca-subscribe-4`
-5. [ ] - `p1` - Hand the caller the handle at once, with every key `pending` - `inst-ca-subscribe-5`
-6. [ ] - `p1` - Run the steps below in the background for as long as the handle is live - `inst-ca-subscribe-6`
-7. [ ] - `p1` - Move each key's state as the per-key state rules say (`cpt-cf-settings-service-algo-consumer-activation-subscribe-state`) - `inst-ca-subscribe-7`
-8. [ ] - `p1` - **FOR EACH** key on the handle, in order and one at a time - `inst-ca-subscribe-8`
+4. [x] - `p1` - **IF** the gear's consumer group in this process holds no interest for `tenant` **AND** already holds 64 tenant interests → **RETURN** the handle with every key `refused` and nothing registered, logged at `warn` - `inst-ca-subscribe-4`
+5. [x] - `p1` - Hand the caller the handle at once, with every key `pending` - `inst-ca-subscribe-5`
+6. [x] - `p1` - Run the steps below in the background for as long as the handle is live - `inst-ca-subscribe-6`
+7. [x] - `p1` - Move each key's state as the per-key state rules say (`cpt-cf-settings-service-algo-consumer-activation-subscribe-state`) - `inst-ca-subscribe-7`
+8. [x] - `p1` - **FOR EACH** key on the handle, in order and one at a time - `inst-ca-subscribe-8`
    1. [x] - `p1` - Take the registration read decision — `read` on the key at `tenant` through the `PolicyEnforcer` — before any lock is taken - `inst-ca-subscribe-9`
    2. [x] - `p1` - **IF** the decision is a denial → mark the key `refused`, log at `warn`, and take no further step for it - `inst-ca-subscribe-10`
    3. [x] - `p1` - **IF** the decision cannot be obtained → leave the key `pending` for a retry and take no further step for it now - `inst-ca-subscribe-11`
@@ -169,17 +169,17 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
    10. [x] - `p1` - Release the lock and await the release, whether the transaction committed or failed - `inst-ca-subscribe-31`
    11. [x] - `p1` - **IF** the insert or the commit failed → nothing is registered and the key stays `pending`; take no further step for it now - `inst-ca-subscribe-18`
    12. [x] - `p1` - Log the registration at `info` with the subscriber, the key and the tenant - `inst-ca-subscribe-19`
-   13. [ ] - `p1` - After the commit, read the key at `tenant` through the fresh read (`cpt-cf-settings-service-algo-consumer-activation-fresh-read`) - `inst-ca-subscribe-20`
-   14. [ ] - `p1` - **IF** the read returns a value → mark the key `registered` with that value, a `SecretHandle` for a `secret`-trait key; **IF** it returns `Retired` → mark it `registered` with the value absent - `inst-ca-subscribe-21`
-   15. [ ] - `p1` - **IF** the read fails → keep the registration and leave the key `pending`, its retry resuming at the fresh read - `inst-ca-subscribe-22`
-9. [ ] - `p1` - Ensure the gear's one anonymous consumer group in this process on the activation topic, created under the subscriber's identity with the broker's `define` grant and shared by every handle of the gear, keeping offsets in memory from the latest position - `inst-ca-subscribe-23`
-10. [ ] - `p1` - Join that group with one interest for `tenant` unless it holds one — the `change_notification` type with `tenant_id` exactly `tenant`, since the broker matches interests by exact tenant - `inst-ca-subscribe-24`
-11. [ ] - `p1` - **IF** no broker is resolvable → the registered keys stay `registered`, and the group and the join are retried with backoff; the delivery loop catches up from the `awaiting` states once they succeed - `inst-ca-subscribe-25`
-12. [ ] - `p1` - **IF** the broker refuses the group or the join for a missing `define` or `consume` grant → move the handle's registered keys to `pending` with their subscriptions kept, log at `warn`, and retry the join with backoff against the same group until an operator grants, the keys returning to `registered` once it succeeds - `inst-ca-subscribe-26`
-13. [ ] - `p1` - **WHILE** the handle is live **AND** a key is `pending` → retry that key's outstanding step with backoff, and log at `warn` once each minute it stays `pending`, naming the key and the reason - `inst-ca-subscribe-27`
-14. [ ] - `p1` - **IF** a retry commits a pending registration → read the key fresh as in `inst-ca-subscribe-20`, mark it `registered`, and invoke the handler with the fresh values as a bundle without `change_ref`, which owes no report - `inst-ca-subscribe-28`
-15. [ ] - `p1` - **IF** the caller drops the handle → the handle is no longer live: stop its pending retries and retire nothing; a `subscribe` the caller repeats returns a new handle over the same subscriptions - `inst-ca-subscribe-29`
-16. [ ] - `p1` - **IF** the handle was the gear's last live handle in the process, whether dropped or retired → leave the gear's consumer group and delete it best-effort, as the retire flow does (`inst-ca-retire-11`) - `inst-ca-subscribe-30`
+   13. [x] - `p1` - After the commit, read the key at `tenant` through the fresh read (`cpt-cf-settings-service-algo-consumer-activation-fresh-read`) - `inst-ca-subscribe-20`
+   14. [x] - `p1` - **IF** the read returns a value → mark the key `registered` with that value, a `SecretHandle` for a `secret`-trait key; **IF** it returns `Retired` → mark it `registered` with the value absent - `inst-ca-subscribe-21`
+   15. [x] - `p1` - **IF** the read fails → keep the registration and leave the key `pending`, its retry resuming at the fresh read - `inst-ca-subscribe-22`
+9. [x] - `p1` - Ensure the gear's one anonymous consumer group in this process on the activation topic, created under the subscriber's identity with the broker's `define` grant and shared by every handle of the gear, keeping offsets in memory from the latest position - `inst-ca-subscribe-23`
+10. [x] - `p1` - Join that group with one interest for `tenant` unless it holds one — the `change_notification` type with `tenant_id` exactly `tenant`, since the broker matches interests by exact tenant - `inst-ca-subscribe-24`
+11. [x] - `p1` - **IF** no broker is resolvable → the registered keys stay `registered`, and the group and the join are retried with backoff; the delivery loop catches up from the `awaiting` states once they succeed - `inst-ca-subscribe-25`
+12. [x] - `p1` - **IF** the broker refuses the group or the join for a missing `define` or `consume` grant → move the handle's registered keys to `pending` with their subscriptions kept, log at `warn`, and retry the join with backoff against the same group until an operator grants, the keys returning to `registered` once it succeeds - `inst-ca-subscribe-26`
+13. [x] - `p1` - **WHILE** the handle is live **AND** a key is `pending` → retry that key's outstanding step with backoff, and log at `warn` once each minute it stays `pending`, naming the key and the reason - `inst-ca-subscribe-27`
+14. [x] - `p1` - **IF** a retry commits a pending registration → read the key fresh as in `inst-ca-subscribe-20`, mark it `registered`, and invoke the handler with the fresh values as a bundle without `change_ref`, which owes no report - `inst-ca-subscribe-28`
+15. [x] - `p1` - **IF** the caller drops the handle → the handle is no longer live: stop its pending retries and retire nothing; a `subscribe` the caller repeats returns a new handle over the same subscriptions - `inst-ca-subscribe-29`
+16. [x] - `p1` - **IF** the handle was the gear's last live handle in the process, whether dropped or retired → leave the gear's consumer group and delete it best-effort, as the retire flow does (`inst-ca-retire-11`) - `inst-ca-subscribe-30`
 
 ### Record the Activation State with a Change
 
@@ -296,7 +296,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### React to a Notification
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-react`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-react`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -310,24 +310,24 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - A notified key whose fresh re-read fails, or answers `Retired` or `NotFound`, is left out of the handler's bundle and reports nothing; its state stays `awaiting`, delivered again, until the next change of the key or a retire
 
 **Steps**:
-1. [ ] - `p1` - The Event Broker delivers an event of the activation topic to the gear's consumer group in this process through one of its tenant interests - `inst-ca-react-1`
-2. [ ] - `p1` - Continue the publisher's trace from `trace_parent` when the event carries one - `inst-ca-react-14`
-3. [ ] - `p1` - At receipt, before the malformed and foreign-subscriber drops below, observe `settings_notify_publish_to_deliver_seconds` with `event` `change_notification` from the envelope's `occurred_at` to the delivery, so a dropped delivery is observed too - `inst-ca-react-2`
-4. [ ] - `p1` - **IF** the event's `type_id` is not the `change_notification` type, **OR** `data.tenant` is not a UUID, **OR** `data.subscriber` is absent, **OR** `data.changes` is not a list of `key` and `change_ref` pairs → log at `warn` with the event's `id`, drop the delivery and **RETURN** - `inst-ca-react-3`
-5. [ ] - `p1` - **IF** `data.subscriber` is not this gear's subscriber → drop the delivery without a log line and **RETURN**, since every process with an interest in a tenant receives that tenant's notifications for its other subscribers - `inst-ca-react-4`
-6. [ ] - `p1` - Ignore any attribute of `data` this version does not know, and the optional subject pair, absent in v1 - `inst-ca-react-5`
-7. [ ] - `p1` - **FOR EACH** notified key that a live handle of the gear for `data.tenant` holds → re-read it at `data.tenant` through the fresh read (`cpt-cf-settings-service-algo-consumer-activation-fresh-read`), one store read per key - `inst-ca-react-6`
-   1. [ ] - `p1` - **IF** the re-read fails, **OR** it answers `Retired` or `NotFound` → treat it as a failed re-read: leave the key out of the bundle and report nothing for it; the state stays `awaiting`, delivered again, until the next change of the key or a retire - `inst-ca-react-7`
-8. [ ] - `p1` - A notified key that no live handle of the gear for `data.tenant` holds is outside that loop: it is not re-read, owes nothing until a handle for it exists, and its state stays `awaiting` - `inst-ca-react-8`
-9. [ ] - `p1` - Invoke the handler with the bundle — `data.tenant` and each re-read key with its `change_ref` — and the fresh values, a `SecretHandle` for a `secret`-trait key - `inst-ca-react-9`
-10. [ ] - `p1` - **FOR EACH** outcome the handler returns → report it through `cpt-cf-settings-service-flow-consumer-activation-report`, which encodes its applied value - `inst-ca-react-10`
-11. [ ] - `p1` - A key the handler returns no outcome for is reported later by the consumer through `report_outcome`, still naming the `change_ref` it was notified with - `inst-ca-react-11`
-12. [ ] - `p1` - A repeat of a notification already handled takes the same path — re-read, re-apply, re-report — and is never suppressed - `inst-ca-react-12`
-13. [ ] - `p1` - **RETURN** completed: the group's offset advances in memory and nothing is acknowledged to the broker - `inst-ca-react-13`
+1. [x] - `p1` - The Event Broker delivers an event of the activation topic to the gear's consumer group in this process through one of its tenant interests - `inst-ca-react-1`
+2. [x] - `p1` - Continue the publisher's trace from `trace_parent` when the event carries one - `inst-ca-react-14`
+3. [x] - `p1` - At receipt, before the malformed and foreign-subscriber drops below, observe `settings_notify_publish_to_deliver_seconds` with `event` `change_notification` from the envelope's `occurred_at` to the delivery, so a dropped delivery is observed too - `inst-ca-react-2`
+4. [x] - `p1` - **IF** the event's `type_id` is not the `change_notification` type, **OR** `data.tenant` is not a UUID, **OR** `data.subscriber` is absent, **OR** `data.changes` is not a list of `key` and `change_ref` pairs → log at `warn` with the event's `id`, drop the delivery and **RETURN** - `inst-ca-react-3`
+5. [x] - `p1` - **IF** `data.subscriber` is not this gear's subscriber → drop the delivery without a log line and **RETURN**, since every process with an interest in a tenant receives that tenant's notifications for its other subscribers - `inst-ca-react-4`
+6. [x] - `p1` - Ignore any attribute of `data` this version does not know, and the optional subject pair, absent in v1 - `inst-ca-react-5`
+7. [x] - `p1` - **FOR EACH** notified key that a live handle of the gear for `data.tenant` holds → re-read it at `data.tenant` through the fresh read (`cpt-cf-settings-service-algo-consumer-activation-fresh-read`), one store read per key - `inst-ca-react-6`
+   1. [x] - `p1` - **IF** the re-read fails, **OR** it answers `Retired` or `NotFound` → treat it as a failed re-read: leave the key out of the bundle and report nothing for it; the state stays `awaiting`, delivered again, until the next change of the key or a retire - `inst-ca-react-7`
+8. [x] - `p1` - A notified key that no live handle of the gear for `data.tenant` holds is outside that loop: it is not re-read, owes nothing until a handle for it exists, and its state stays `awaiting` - `inst-ca-react-8`
+9. [x] - `p1` - Invoke the handler with the bundle — `data.tenant` and each re-read key with its `change_ref` — and the fresh values, a `SecretHandle` for a `secret`-trait key - `inst-ca-react-9`
+10. [x] - `p1` - **FOR EACH** outcome the handler returns → report it through `cpt-cf-settings-service-flow-consumer-activation-report`, which encodes its applied value - `inst-ca-react-10`
+11. [x] - `p1` - A key the handler returns no outcome for is reported later by the consumer through `report_outcome`, still naming the `change_ref` it was notified with - `inst-ca-react-11`
+12. [x] - `p1` - A repeat of a notification already handled takes the same path — re-read, re-apply, re-report — and is never suppressed - `inst-ca-react-12`
+13. [x] - `p1` - **RETURN** completed: the group's offset advances in memory and nothing is acknowledged to the broker - `inst-ca-react-13`
 
 ### Report an Outcome
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-report`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-report`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -340,9 +340,9 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - Malformed input — a tenant or a `change_ref` that is not a UUID, a status that is neither `success` nor `failed`, a `key` holding a NUL byte or longer than 1 KiB, or a `detail` or `applied_value` holding a NUL byte: an invalid-argument error, nothing changed
 
 **Steps**:
-1. [ ] - `p1` - The consuming gear calls `report_outcome` with `change_ref`, `tenant`, `key`, `status`, `applied_value` and an optional `detail` — directly, or through the outcomes its handler returned (`inst-ca-react-10`) - `inst-ca-report-1`
-2. [ ] - `p1` - On both entry paths, before calling the Recorder, the SDK encodes `applied_value` as the expected-value algorithm does (`cpt-cf-settings-service-algo-consumer-activation-expected`): RFC 8785 canonical JSON, or the secret-value hash computed in the consumer's process for a `secret`-trait key - `inst-ca-report-2`
-3. [ ] - `p1` - The SDK reaches the Activation Outcome Recorder's `receive_response` by a direct call in process, and through its remote binding under the out-of-process profiles (DESIGN §4.5) — never a REST route or a broker event - `inst-ca-report-3`
+1. [x] - `p1` - The consuming gear calls `report_outcome` with `change_ref`, `tenant`, `key`, `status`, `applied_value` and an optional `detail` — directly, or through the outcomes its handler returned (`inst-ca-react-10`) - `inst-ca-report-1`
+2. [x] - `p1` - On both entry paths, before calling the Recorder, the SDK encodes `applied_value` as the expected-value algorithm does (`cpt-cf-settings-service-algo-consumer-activation-expected`): RFC 8785 canonical JSON, or the secret-value hash computed in the consumer's process for a `secret`-trait key - `inst-ca-report-2`
+3. [x] - `p1` - The SDK reaches the Activation Outcome Recorder's `receive_response` by a direct call in process, and through its remote binding under the out-of-process profiles (DESIGN §4.5) — never a REST route or a broker event - `inst-ca-report-3`
 4. [x] - `p1` - Take the subscriber from the caller's security context - `inst-ca-report-4`
 5. [x] - `p1` - **IF** `tenant` or `change_ref` is not a UUID, **OR** `status` is neither `success` nor `failed`, **OR** `key` holds a NUL byte or exceeds 1 KiB, **OR** `detail` or `applied_value` holds a NUL byte → **RETURN** an invalid-argument error with nothing changed, counted on no metric of this flow - `inst-ca-report-5`
 6. [x] - `p1` - Normalise `tenant` to a bare lowercase UUID string, truncate `detail` to 1 KiB, and treat an `applied_value` above the value size cap as a value that does not match, storing none - `inst-ca-report-6`
@@ -363,7 +363,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Retire a Subscription
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-retire`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-retire`
 
 **Actor**: `cpt-cf-settings-service-actor-internal-caller`
 
@@ -378,8 +378,8 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - The group cannot be deleted: logged at `warn`, the group stays in the broker as a crashed process's does
 
 **Steps**:
-1. [ ] - `p1` - The consuming gear calls `retire()` on a handle explicitly; dropping a handle never retires anything - `inst-ca-retire-1`
-2. [ ] - `p1` - Stop the pending retries only of the keys whose retire below answers `retired` or `404`, each as it is answered; a key answered `Unavailable` keeps its state on the handle and its pending retries - `inst-ca-retire-2`
+1. [x] - `p1` - The consuming gear calls `retire()` on a handle explicitly; dropping a handle never retires anything - `inst-ca-retire-1`
+2. [x] - `p1` - Stop the pending retries only of the keys whose retire below answers `retired` or `404`, each as it is answered; a key answered `Unavailable` keeps its state on the handle and its pending retries - `inst-ca-retire-2`
 3. [x] - `p1` - **FOR EACH** key of the handle → invoke `retire_subscription` with the subscriber from the SDK `Context`, the key and the handle's tenant - `inst-ca-retire-3`
    1. [x] - `p1` - Take the key's mutation lock (`cpt-cf-settings-service-algo-consumer-activation-lock`) - `inst-ca-retire-4`
    2. [x] - `p1` - **IF** the wait is exhausted → answer `Unavailable` for the key with nothing deleted, the key staying subscribed, and continue with the next key - `inst-ca-retire-5`
@@ -389,10 +389,10 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
    6. [x] - `p1` - Release the lock and await the release - `inst-ca-retire-15`
    7. [x] - `p1` - Log the retire at `info` with the subscriber, the key and the tenant - `inst-ca-retire-16`
    8. [x] - `p1` - Answer `retired` for the key - `inst-ca-retire-9`
-4. [ ] - `p1` - **IF** every key was answered `retired` or `404` → the handle is retired and no longer live; otherwise the handle stays live for each key answered `Unavailable`, which keeps its state and its pending retries, so the caller may call `retire()` again - `inst-ca-retire-10`
-5. [ ] - `p1` - **IF** no live handle of the gear remains in the process — every handle it was given has been dropped or retired → leave the gear's consumer group and delete it best-effort; until then the group keeps every tenant interest it joined - `inst-ca-retire-11`
-6. [ ] - `p1` - On the gear's `stop`, leave and delete the group best-effort within the runtime's shutdown deadline - `inst-ca-retire-12`
-7. [ ] - `p1` - **IF** the leave or the deletion fails, or the deadline passes → log at `warn`; the group stays in the broker exactly as a crashed process's does, holding no delivery a live process needs - `inst-ca-retire-13`
+4. [x] - `p1` - **IF** every key was answered `retired` or `404` → the handle is retired and no longer live; otherwise the handle stays live for each key answered `Unavailable`, which keeps its state and its pending retries, so the caller may call `retire()` again - `inst-ca-retire-10`
+5. [x] - `p1` - **IF** no live handle of the gear remains in the process — every handle it was given has been dropped or retired → leave the gear's consumer group and delete it best-effort; until then the group keeps every tenant interest it joined - `inst-ca-retire-11`
+6. [x] - `p1` - On the gear's `stop`, leave and delete the group best-effort within the runtime's shutdown deadline - `inst-ca-retire-12`
+7. [x] - `p1` - **IF** the leave or the deletion fails, or the deadline passes → log at `warn`; the group stays in the broker exactly as a crashed process's does, holding no delivery a live process needs - `inst-ca-retire-13`
 8. [x] - `p1` - **RETURN** per key `retired`, `404` or `Unavailable`; the SDK retries none of them - `inst-ca-retire-14`
 
 ### Run the Activation Half of the Broker Lifecycle
@@ -478,7 +478,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Expected Value Encoding
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-expected`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-expected`
 
 **Input**: The effective value at a subscription's tenant after the change — for a `secret`-trait key the plaintext the change holds — the key, the subscription's tenant and whether the key has the `secret` trait
 
@@ -491,7 +491,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 4. [x] - `p1` - **IF** the key has the `secret` trait → build the array of the literal `cf.settings.activation.secret.v1`, the key, the subscription's tenant as a bare lowercase UUID string and the plaintext value, encode it as RFC 8785 canonical JSON, and take its SHA-256 as lowercase hex - `inst-ca-expected-4`
    1. [x] - `p1` - Salt with the key and the tenant only, never with anything of the change, so one value hashes equal across the changes that replace one another on a row - `inst-ca-expected-5`
    2. [x] - `p1` - Take the plaintext from the request for an inline secret `set`, from the fetch for an inherited fallback or an adopted staged entry, or the default's value when the fallback is not a stored secret - `inst-ca-expected-6`
-5. [ ] - `p1` - The SDK applies this same encoding and hash to `applied_value` in the consumer's process; agreement of the two canonicalizers on a shared corpus is a conformance requirement - `inst-ca-expected-7`
+5. [x] - `p1` - The SDK applies this same encoding and hash to `applied_value` in the consumer's process; agreement of the two canonicalizers on a shared corpus is a conformance requirement - `inst-ca-expected-7`
 6. [x] - `p1` - **RETURN** the encoded text - `inst-ca-expected-8`
 
 ### Outcome Rules
@@ -526,44 +526,44 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Subscribe Per-Key State
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-subscribe-state`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-subscribe-state`
 
 **Input**: The outcome of a `subscribe` call, or of one step of one key's registration on a handle
 
 **Output**: The key's state on the handle and whether the SDK retries it
 
 **Steps**:
-1. [ ] - `p1` - **MATCH** the outcome of a `subscribe` call or of one key's registration step - `inst-ca-substate-1`
-   - [ ] - `p1` - **CASE** empty `keys` or a malformed tenant: an error for the call, no handle, nothing registered, no retry - `inst-ca-substate-2`
-   - [ ] - `p1` - **CASE** the registration committed and the fresh read returned a value: `registered` with that value, no retry - `inst-ca-substate-3`
-   - [ ] - `p1` - **CASE** the registration committed and the fresh read returned `Retired`: `registered` with the value absent, no retry; a reactivation re-arms the next change - `inst-ca-substate-4`
-   - [ ] - `p1` - **CASE** the registration committed and no broker is resolvable: `registered`; the SDK retries joining the activation topic and the delivery loop catches up - `inst-ca-substate-5`
-   - [ ] - `p1` - **CASE** the key refused `NotFound` before the lock — undeclared, hidden, or a tenant outside the subscriber's subtree: `pending`, retried with backoff while the handle is live - `inst-ca-substate-6`
-   - [ ] - `p1` - **CASE** the lock wait exhausted, the authorization service unavailable, or a database error before the commit: `pending`, nothing registered, retried - `inst-ca-substate-7`
-   - [ ] - `p1` - **CASE** the fresh read failed after the commit: `pending` with the registration kept, retried from the read - `inst-ca-substate-8`
-   - [ ] - `p1` - **CASE** a broker grant missing (`consume` or `define`): `pending` with the registration kept, the join retried until an operator grants - `inst-ca-substate-9`
-   - [ ] - `p1` - **CASE** the join retried after a missing grant succeeds: `registered` again, the subscription kept, no retry - `inst-ca-substate-10`
-   - [ ] - `p1` - **CASE** a `403` registration read decision: `refused`, terminal, nothing registered - `inst-ca-substate-11`
-   - [ ] - `p1` - **CASE** a 65th tenant interest of the gear in the process: `refused` for every key of the call, terminal, nothing registered - `inst-ca-substate-12`
-2. [ ] - `p1` - A multi-key `subscribe` registers each key under its own lock in its own transaction; the handle reports each key's state, and the call is not atomic across keys - `inst-ca-substate-13`
-3. [ ] - `p1` - A `pending` key logs a `warn` once each minute it stays `pending`; dropping the handle stops its retries and retires nothing - `inst-ca-substate-14`
-4. [ ] - `p1` - **RETURN** the key's state and whether the SDK retries it - `inst-ca-substate-15`
+1. [x] - `p1` - **MATCH** the outcome of a `subscribe` call or of one key's registration step - `inst-ca-substate-1`
+   - [x] - `p1` - **CASE** empty `keys` or a malformed tenant: an error for the call, no handle, nothing registered, no retry; once the gear has stopped, `Unavailable` for the call, the one other error - `inst-ca-substate-2`
+   - [x] - `p1` - **CASE** the registration committed and the fresh read returned a value: `registered` with that value, no retry - `inst-ca-substate-3`
+   - [x] - `p1` - **CASE** the registration committed and the fresh read returned `Retired`: `registered` with the value absent, no retry; a reactivation re-arms the next change - `inst-ca-substate-4`
+   - [x] - `p1` - **CASE** the registration committed and no broker is resolvable: `registered`; the SDK retries joining the activation topic and the delivery loop catches up - `inst-ca-substate-5`
+   - [x] - `p1` - **CASE** the key refused `NotFound` before the lock — undeclared, hidden, or a tenant outside the subscriber's subtree: `pending`, retried with backoff while the handle is live - `inst-ca-substate-6`
+   - [x] - `p1` - **CASE** the lock wait exhausted, the authorization service unavailable, or a database error before the commit: `pending`, nothing registered, retried - `inst-ca-substate-7`
+   - [x] - `p1` - **CASE** the fresh read failed after the commit: `pending` with the registration kept, retried from the read - `inst-ca-substate-8`
+   - [x] - `p1` - **CASE** a broker grant missing (`consume` or `define`): `pending` with the registration kept, the join retried until an operator grants - `inst-ca-substate-9`
+   - [x] - `p1` - **CASE** the join retried after a missing grant succeeds: `registered` again, the subscription kept, no retry - `inst-ca-substate-10`
+   - [x] - `p1` - **CASE** a `403` registration read decision: `refused`, terminal, nothing registered - `inst-ca-substate-11`
+   - [x] - `p1` - **CASE** a 65th tenant interest of the gear in the process: `refused` for every key of the call, terminal, nothing registered - `inst-ca-substate-12`
+2. [x] - `p1` - A multi-key `subscribe` registers each key under its own lock in its own transaction; the handle reports each key's state, and the call is not atomic across keys - `inst-ca-substate-13`
+3. [x] - `p1` - A `pending` key logs a `warn` once each minute it stays `pending`; dropping the handle stops its retries and retires nothing - `inst-ca-substate-14`
+4. [x] - `p1` - **RETURN** the key's state and whether the SDK retries it - `inst-ca-substate-15`
 
 ### Fresh Read
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-fresh-read`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-fresh-read`
 
 **Input**: A setting key, a tenant and the caller's security context — a reader call of `get_effective` with the freshness option set
 
 **Output**: The effective value at the tenant as `get_effective` returns it — a `SecretHandle` for a `secret`-trait key, or `Retired` or `NotFound` as any read answers — or the reader's error
 
 **Steps**:
-1. [ ] - `p1` - Take the read as an ordinary `get_effective` of the key at the tenant under the caller's identity, with the same authorization, visibility and retirement rules as any read of that key at that scope - `inst-ca-fresh-1`
-2. [ ] - `p1` - Bypass the effective-value cache on the replica that serves the read: no cached entry is consulted - `inst-ca-fresh-2`
-3. [ ] - `p1` - Resolve the effective value from the store over the requested tenant's ancestor chain, as the Value Resolver's freshness form resolves it (DESIGN §4.5, §4.2 *Value Resolver*) - `inst-ca-fresh-3`
-4. [ ] - `p1` - Leave the cache unpopulated: the result is not stored, so the read leaves the cache as it found it, as both uncached forms of `resolve` do (DESIGN.md §4.2 *Value Resolver*, §4.5 `get_effective`) - `inst-ca-fresh-4`
-5. [ ] - `p1` - Make one store read per key; the bulk read has no freshness option and is never used for a fresh read - `inst-ca-fresh-5`
-6. [ ] - `p1` - **RETURN** the result as `get_effective` returns it - `inst-ca-fresh-6`
+1. [x] - `p1` - Take the read as an ordinary `get_effective` of the key at the tenant under the caller's identity, with the same authorization, visibility and retirement rules as any read of that key at that scope - `inst-ca-fresh-1`
+2. [x] - `p1` - Bypass the effective-value cache on the replica that serves the read: no cached entry is consulted - `inst-ca-fresh-2`
+3. [x] - `p1` - Resolve the effective value from the store over the requested tenant's ancestor chain, as the Value Resolver's freshness form resolves it (DESIGN §4.5, §4.2 *Value Resolver*) - `inst-ca-fresh-3`
+4. [x] - `p1` - Leave the cache unpopulated: the result is not stored, so the read leaves the cache as it found it, as both uncached forms of `resolve` do (DESIGN.md §4.2 *Value Resolver*, §4.5 `get_effective`) - `inst-ca-fresh-4`
+5. [x] - `p1` - Make one store read per key; the bulk read has no freshness option and is never used for a fresh read - `inst-ca-fresh-5`
+6. [x] - `p1` - **RETURN** the result as `get_effective` returns it - `inst-ca-fresh-6`
 
 ## 4. States (CDSL)
 
@@ -587,7 +587,7 @@ No transition happens on a timer: a state stays `awaiting` until a report or a l
 
 ### Subscription Key State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-state-consumer-activation-handle-key`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-state-consumer-activation-handle-key`
 
 **States**: `pending`, `registered`, `refused`
 
@@ -596,13 +596,13 @@ No transition happens on a timer: a state stays `awaiting` until a report or a l
 **End States**: `refused` is terminal; a `registered` or `pending` key leaves the handle when `retire()` answers it `retired` or `404` — gone from the handle, which is not a state, and neither is retired
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** `pending` **TO** `registered` **WHEN** the key's registration committed and its fresh read returned a value or `Retired` - `inst-ca-hk-1`
-2. [ ] - `p1` - **FROM** `pending` **TO** `pending` **WHEN** a retryable outcome repeats; the SDK retries with backoff and logs once each minute - `inst-ca-hk-2`
-3. [ ] - `p1` - **FROM** `pending` **TO** `refused` **WHEN** the registration read decision is a `403` - `inst-ca-hk-3`
-4. [ ] - `p1` - **FROM** `registered` **TO** `pending` **WHEN** the broker refuses the gear's group or join for a missing `define` or `consume` grant, the subscription kept - `inst-ca-hk-4`
-5. [ ] - `p1` - **FROM** `pending` **TO** `registered` **WHEN** the join retried after a missing `define` or `consume` grant succeeds, the subscription kept - `inst-ca-hk-5`
-6. [ ] - `p1` - **FROM** `registered` **TO** gone from the handle **WHEN** `retire()` deleted the key's subscription - `inst-ca-hk-6`
-7. [ ] - `p1` - **FROM** `pending` **TO** gone from the handle **WHEN** `retire()` deleted the key's subscription or answered `404` for it - `inst-ca-hk-7`
+1. [x] - `p1` - **FROM** `pending` **TO** `registered` **WHEN** the key's registration committed and its fresh read returned a value or `Retired` - `inst-ca-hk-1`
+2. [x] - `p1` - **FROM** `pending` **TO** `pending` **WHEN** a retryable outcome repeats; the SDK retries with backoff and logs once each minute - `inst-ca-hk-2`
+3. [x] - `p1` - **FROM** `pending` **TO** `refused` **WHEN** the registration read decision is a `403` - `inst-ca-hk-3`
+4. [x] - `p1` - **FROM** `registered` **TO** `pending` **WHEN** the broker refuses the gear's group or join for a missing `define` or `consume` grant, the subscription kept - `inst-ca-hk-4`
+5. [x] - `p1` - **FROM** `pending` **TO** `registered` **WHEN** the join retried after a missing `define` or `consume` grant succeeds, the subscription kept - `inst-ca-hk-5`
+6. [x] - `p1` - **FROM** `registered` **TO** gone from the handle **WHEN** `retire()` deleted the key's subscription - `inst-ca-hk-6`
+7. [x] - `p1` - **FROM** `pending` **TO** gone from the handle **WHEN** `retire()` deleted the key's subscription or answered `404` for it - `inst-ca-hk-7`
 
 A `Subscription` has no state machine: it exists, or it does not. Dropping a handle ends its keys' states in the process without touching any subscription. The answers of `retire()` and `report_outcome` belong to their flows, `cpt-cf-settings-service-flow-consumer-activation-retire` and `cpt-cf-settings-service-flow-consumer-activation-report`.
 
@@ -700,7 +700,7 @@ Every committed value change **MUST** write, in its own transaction and under th
 
 ### Canonical Encoding in the SDK
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-canonical-sdk`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-canonical-sdk`
 
 The SDK's encoder of the consumer's `applied_value` **MUST** apply the same RFC 8785 encoding and, for a `secret`-trait row, the same secret hash as the service, and the service-side and SDK-side canonicalizers **MUST** produce identical bytes for a shared corpus of values — member order, whitespace, number formatting and Unicode escaping varied — and for the secret hashes of that corpus.
 
@@ -753,7 +753,7 @@ The Activation Outcome Recorder's `receive_response` **MUST** answer `ignored` f
 
 ### Consumer Activation SDK
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-sdk`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-sdk`
 
 `settings-service-sdk` **MUST** replace its consumer activation contract with `subscribe(keys, tenant, handler)`, the handle's explicit `retire()` and `report_outcome(change_ref, tenant, key, status, applied_value, detail?)`. `subscribe` **MUST** return an error only for invalid input and otherwise a handle at once, with the per-key states `registered` (with the fresh value read after the registration committed), `pending` (retried with backoff while the handle is live, a `warn` each minute) and `refused` (terminal: a `403`, or a 65th tenant interest checked before registering); a repeated `subscribe` **MUST** return a new handle, and dropping a handle **MUST** stop its retries and retire nothing. The SDK **MUST** keep one anonymous consumer group per subscribing gear per process, with one interest per subscription tenant, offsets in memory from the latest position, left and deleted best-effort with the gear's last handle or on `stop`. It **MUST** drop notifications for another subscriber; re-read each notified key through the fresh read (`cpt-cf-settings-service-algo-consumer-activation-fresh-read`) — `get_effective` with the freshness option, which bypasses the effective-value cache on the serving replica and does not populate it, and is otherwise an ordinary read of the key at the scope under the caller's identity; invoke the handler with the bundle and the fresh values; report its outcomes with `applied_value` encoded before the call, on both entry paths, as the service encodes `expected_value`; re-apply and re-report a repeat; and hand the handler a bundle without `change_ref`, owing no report, when a pending registration commits. `report_outcome` **MUST** answer `applied` or `ignored`, and the SDK **MUST NOT** retry it. `SettingsReaderClient.get_effective` **MUST** take the optional freshness option. A subscribing gear's deployment **MUST** hold `consume` on the activation topic, the `change_notification` type and the activation subject type for its subscription tenants, and `define` for its own group; a missing grant **MUST** leave the gear up, its keys `pending` and their states `awaiting`, logged at `warn` and retried.
 
@@ -794,7 +794,7 @@ The system **MUST** expose the metrics of DESIGN-activation §7 that the service
 
 ### Activation Is Observable in the SDK
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-observability-sdk`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-observability-sdk`
 
 The SDK **MUST** observe `settings_notify_publish_to_deliver_seconds` with `event` `change_notification` at receipt, from the envelope's `occurred_at`, before any malformed or foreign-subscriber drop, so that a dropped delivery is observed too. It **MUST** log at `warn` a refused group or join, a malformed delivery, and each minute a key stays `pending`, naming the key and the reason. No log line, metric label or span attribute of the SDK **MUST** carry a value, a hash or a secret.
 
@@ -810,7 +810,7 @@ The SDK **MUST** observe `settings_notify_publish_to_deliver_seconds` with `even
 
 ### Activation Tests
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-tests`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-tests`
 
 The feature **MUST** ship with these tests, each implementing a row of DESIGN-activation §7 or DESIGN §7, or a rule of DESIGN-activation §4.2 or of this document where no row exists. The publish-to-deliver p95 and response p95 targets of DESIGN-activation §7 are observed through `settings_notify_publish_to_deliver_seconds` and `settings_notify_response_latency_seconds` only, and no test asserts them:
 
@@ -844,7 +844,7 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 
 ## 6. Acceptance Criteria
 
-- [ ] On PostgreSQL and on SQLite the migration creates `subscriptions` with the unique `uq_sub_subscriber_key_tenant` and `idx_sub_key`, and `activation_state` with the unique `uq_activation_state`, the `status` check to `awaiting`, `succeeded` and `failed`, `idx_activation_key_tenant` and the partial `idx_activation_awaiting` over the `awaiting` rows, and adds to `audit_records` the `activation` value of `operation`, the nullable `change_ref` and `detail` columns and the partial `idx_audit_change_ref` over the rows carrying a `change_ref`; a second subscription or activation state for one subscriber, key and tenant and a `status` outside the three values are refused; and an `activation` record in a setting's history is listed as an ordinary record under the canonical resource id `cf.settings:{key}@{tenant}` until entry 2.14 attaches it to its change (integration)
+- [x] On PostgreSQL and on SQLite the migration creates `subscriptions` with the unique `uq_sub_subscriber_key_tenant` and `idx_sub_key`, and `activation_state` with the unique `uq_activation_state`, the `status` check to `awaiting`, `succeeded` and `failed`, `idx_activation_key_tenant` and the partial `idx_activation_awaiting` over the `awaiting` rows, and adds to `audit_records` the `activation` value of `operation`, the nullable `change_ref` and `detail` columns and the partial `idx_audit_change_ref` over the rows carrying a `change_ref`; a second subscription or activation state for one subscriber, key and tenant and a `status` outside the three values are refused; and an `activation` record in a setting's history is listed as an ordinary record under the canonical resource id `cf.settings:{key}@{tenant}` until entry 2.14 attaches it to its change (integration)
 - [x] A `set` at `X` of a `cascading` key with subscriptions at `X`, at a descendant `D` and at a descendant `E` shadowed by its own override writes, in the change's transaction, one `awaiting` state for `X` and one for `D`, each with the expected value at its tenant and the change's audit record id as `change_ref`, and none for `E` (unit)
 - [x] A write of an identical value writes no activation state, while every write of a `secret`-trait key writes one per qualified subscription; a `local` key affects only the subscription at the written tenant and a `global` key every subscription of the key (unit)
 - [x] A later change to the same key and tenant resets a `succeeded`, `failed` or `awaiting` state to `awaiting` with the new expected value and `change_ref`, clearing `applied_value`, `detail`, `reported_at` and `last_notified_at`; within one request the last change to a key at a tenant wins (unit)
@@ -853,9 +853,9 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 - [x] With the key's lock held and a short injected budget, a single write answers `503` `Unavailable` with nothing stored and the lock still held by its owner; in a batch that item alone answers `Unavailable` and the changes before and after it commit (integration)
 - [x] The lock's retry schedule starts at tens of milliseconds, doubles, is capped at one second with jitter and stops at the budget, and the schedule and the budget are injectable in tests (unit)
 - [x] After a change whose transaction rolled back on a stale tag, the next mutation of the key acquires its lock without waiting (integration)
-- [ ] With the per-key bound of subscriptions (DESIGN-activation §7 *Fan-out bounds*), the time a change holds the key's lock is measured through `settings_mutation_lock_wait_seconds` of a mutation waiting on it and reported; the publish-to-deliver and response p95 targets are observed through their metrics and asserted by no test (integration)
+- [x] With the per-key bound of subscriptions (DESIGN-activation §7 *Fan-out bounds*), the time a change holds the key's lock is measured through `settings_mutation_lock_wait_seconds` of a mutation waiting on it and reported; the publish-to-deliver and response p95 targets are observed through their metrics and asserted by no test (integration)
 - [x] A declaration retire, reactivate, evolve, update or reconcile pass takes no mutation lock (unit)
-- [ ] A registration and a retire issued while a write of the key is in flight wait for its commit: the registration's fresh read returns the committed value and the next write writes its state; the retire deletes the subscription with the state the write committed, and the write's publish delivers nothing for it (integration)
+- [x] A registration and a retire issued while a write of the key is in flight wait for its commit: the registration's fresh read returns the committed value and the next write writes its state; the retire deletes the subscription with the state the write committed, and the write's publish delivers nothing for it (integration)
 - [x] A restriction change racing a write of the key takes the same lock: the write commits before the restriction, or sees it and is refused (integration)
 - [x] A `revert` of a secret override with subscribers inheriting the fallback fetches the fallback plaintext once, under the lock and before the transaction, writes exactly one `secret_use` record attributed to the service's identity, records per state the hash salted by that state's tenant, and the `secret_use` record stays when the change's transaction rolls back (unit, integration)
 - [x] A batch `set` adopting a staged secret with subscribers fetches the staged plaintext once by its reference, under the lock and before the transaction, writes exactly one `secret_use` record attributed to the service's identity, and records per state the hash salted by that state's tenant (unit, integration)
@@ -881,28 +881,28 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 - [x] A report for no state or for a terminal state answers `ignored`; a duplicate report makes one transition and one audit record (unit, integration)
 - [x] Each transition appends exactly one `activation` audit record — `resource` the key at the state's tenant, `declaration_key`, `tenant_id`, `actor` the subscriber with `actor_classification` `public`, `outcome`, `detail` truncated to 1 KiB on failure, a minted `request_id`, `change_ref`, no pre-value or post-value — in the update's transaction; ignored and repeated reports append none (unit)
 - [x] A report and a newer change on one state at once: the report applies only against the expectation it answered, a report on the replaced expectation answers `ignored` with no audit record, and the state ends naming the newer change (integration)
-- [ ] A `report_outcome` answering an error is not retried by the SDK, and the consumer's repeat of the same report applies once (unit)
+- [x] A `report_outcome` answering an error is not retried by the SDK, and the consumer's repeat of the same report applies once (unit)
 - [x] A `report_outcome` with a tenant or a `change_ref` that is not a UUID, or a status other than `success` or `failed`, answers an invalid-argument error, and one whose audit append or commit fails answers an error; in both cases the state, the audit table and `settings_notify_reports_total` are unchanged (unit)
-- [ ] A secret hash is the lowercase hex SHA-256 over the canonical array of `cf.settings.activation.secret.v1`, key, tenant and value; the same value under another key or tenant hashes differently and under the same key and tenant equally across changes, and it matches a known answer computed outside the crate (unit)
-- [ ] The service and the SDK canonicalizers agree on a shared corpus of re-serialized values and on the secret hashes of that corpus (unit; `cpt-cf-settings-service-dod-consumer-activation-canonical-sdk`)
+- [x] A secret hash is the lowercase hex SHA-256 over the canonical array of `cf.settings.activation.secret.v1`, key, tenant and value; the same value under another key or tenant hashes differently and under the same key and tenant equally across changes, and it matches a known answer computed outside the crate (unit)
+- [x] The service and the SDK canonicalizers agree on a shared corpus of re-serialized values and on the secret hashes of that corpus (unit; `cpt-cf-settings-service-dod-consumer-activation-canonical-sdk`)
 - [x] A value with an integer beyond 2^53 in magnitude, or a decimal with more precision than binary64 resolves, is rejected on write and never canonicalized, and a `file-reference` value is encoded and compared as an ordinary object with no hash (unit)
-- [ ] `subscribe` with empty keys or a malformed tenant answers an error with nothing registered; a key refused `NotFound` is `pending` without contending for the lock, and once declared its registration commits and the handler receives a bundle without `change_ref` that owes no report; a `403` key is `refused`; a 65th tenant interest refuses every key with nothing registered; dropping a handle stops its retries and retires nothing (unit)
-- [ ] A `subscribe` to a retired key registers it and reports it `registered` with the value absent, and after a reactivation the key's next change writes the subscription's state (unit)
-- [ ] A `subscribe` key whose registration meets an exhausted lock wait, an unavailable authorization service or a database error before the commit is `pending` with nothing registered, a key whose fresh read fails after the commit is `pending` with its registration kept, and each becomes `registered` once its retry succeeds (unit)
-- [ ] A group or a join refused for a missing `consume` or `define` grant of the subscribing gear moves the handle's `registered` keys to `pending` with their subscriptions kept and logs a `warn`, and once the retried join succeeds the keys are `registered` again (unit)
-- [ ] With no broker resolvable at `subscribe`, the registered keys stay `registered` while the group creation and the join are retried, and the join succeeds once a broker resolves (unit)
-- [ ] A `pending` key's retries wait exponentially from 1 s to a 30 s cap with jitter, and a `warn` naming the key and the reason is logged once each minute the key stays `pending`, not more often (unit)
-- [ ] Registering the same subscriber, key and tenant twice keeps one `subscriptions` row through `uq_sub_subscriber_key_tenant`, and a repeated `subscribe` returns a new handle over it (integration)
-- [ ] `retire()` answers `404` for a key whose subscription at the handle's tenant is another subscriber's, deleting nothing of it, and `Unavailable` with nothing deleted while the key's lock is held past the budget; the SDK retries neither, and a second `retire()` deletes the subscription once the lock is free (unit, integration)
-- [ ] One consumer group serves every handle of a gear in a process and is deleted when the last handle goes; a notification whose `subscriber` is another gear's is never handed to the handler (unit)
-- [ ] When the gear's consumer group cannot be left or deleted, after its last handle goes or on `stop`, a `warn` is logged and nothing else changes: no subscription, state or handle is touched (unit)
-- [ ] A delivery whose `type_id` is not the `change_notification` type, whose `data.tenant` is not a UUID, whose `data.subscriber` is absent or whose `data.changes` is malformed is dropped with a `warn` naming the event's `id`, the handler is not invoked, and `settings_notify_publish_to_deliver_seconds` still observes it (unit)
-- [ ] A notified key is re-read with the freshness option, bypassing a cache that still holds the previous value and leaving the cache unpopulated, and the report of the committed value settles the state `succeeded` (unit)
-- [ ] A notified key whose fresh re-read fails, or answers `Retired` or `NotFound`, is left out of the handler's bundle and nothing is reported for it, its state staying `awaiting`, while the other keys of the notification are handled (unit)
-- [ ] A repeated `change_notification` for a key the consumer already handled is re-read, re-applied and re-reported, and the state ends as it did after the first report — the repeat's report answers `ignored` once the first settled the state — with no second audit record (unit)
+- [x] `subscribe` with empty keys or a malformed tenant answers an error with nothing registered; a key refused `NotFound` is `pending` without contending for the lock, and once declared its registration commits and the handler receives a bundle without `change_ref` that owes no report; a `403` key is `refused`; a 65th tenant interest refuses every key with nothing registered; dropping a handle stops its retries and retires nothing (unit)
+- [x] A `subscribe` to a retired key registers it and reports it `registered` with the value absent, and after a reactivation the key's next change writes the subscription's state (unit)
+- [x] A `subscribe` key whose registration meets an exhausted lock wait, an unavailable authorization service or a database error before the commit is `pending` with nothing registered, a key whose fresh read fails after the commit is `pending` with its registration kept, and each becomes `registered` once its retry succeeds (unit)
+- [x] A group or a join refused for a missing `consume` or `define` grant of the subscribing gear moves the handle's `registered` keys to `pending` with their subscriptions kept and logs a `warn`, and once the retried join succeeds the keys are `registered` again (unit)
+- [x] With no broker resolvable at `subscribe`, the registered keys stay `registered` while the group creation and the join are retried, and the join succeeds once a broker resolves (unit)
+- [x] A `pending` key's retries wait exponentially from 1 s to a 30 s cap with jitter, and a `warn` naming the key and the reason is logged once each minute the key stays `pending`, not more often (unit)
+- [x] Registering the same subscriber, key and tenant twice keeps one `subscriptions` row through `uq_sub_subscriber_key_tenant`, and a repeated `subscribe` returns a new handle over it (integration)
+- [x] `retire()` answers `404` for a key whose subscription at the handle's tenant is another subscriber's, deleting nothing of it, and `Unavailable` with nothing deleted while the key's lock is held past the budget; the SDK retries neither, and a second `retire()` deletes the subscription once the lock is free (unit, integration)
+- [x] One consumer group serves every handle of a gear in a process and is deleted when the last handle goes; a notification whose `subscriber` is another gear's is never handed to the handler (unit)
+- [x] When the gear's consumer group cannot be left or deleted, after its last handle goes or on `stop`, a `warn` is logged and nothing else changes: no subscription, state or handle is touched (unit)
+- [x] A delivery whose `type_id` is not the `change_notification` type, whose `data.tenant` is not a UUID, whose `data.subscriber` is absent or whose `data.changes` is malformed is dropped with a `warn` naming the event's `id`, the handler is not invoked, and `settings_notify_publish_to_deliver_seconds` still observes it (unit)
+- [x] A notified key is re-read with the freshness option, bypassing a cache that still holds the previous value and leaving the cache unpopulated, and the report of the committed value settles the state `succeeded` (unit)
+- [x] A notified key whose fresh re-read fails, or answers `Retired` or `NotFound`, is left out of the handler's bundle and nothing is reported for it, its state staying `awaiting`, while the other keys of the notification are handled (unit)
+- [x] A repeated `change_notification` for a key the consumer already handled is re-read, re-applied and re-reported, and the state ends as it did after the first report — the repeat's report answers `ignored` once the first settled the state — with no second audit record (unit)
 - [x] With no broker resolvable, a write commits and answers as with one, its states stay `awaiting`, the delivery loop idles, `settings_activation_awaiting` counts them, and once the broker resolves the loop registers the activation types and delivers them (unit, integration)
 - [x] `settings_mutation_lock_total` counts `acquired`, `exhausted` and `error` for an acquisition, an exhausted wait and an injected failing unlock, `settings_mutation_lock_wait_seconds` observes each wait, `settings_notify_reports_total` counts every `applied` and `ignored` answer and no error, and `settings_notify_reactions_total`, `settings_notify_response_latency_seconds`, `settings_notify_redeliveries_total` and `settings_notify_subscriptions` move as their flows state (unit, integration)
-- [ ] No log line, metric label or span attribute of this feature carries a setting value, an expected or applied value, a hash or a secret (unit)
-- [ ] A set, its notification, the consumer's fresh re-read and its report end with the state `succeeded` and one `activation` record under the change, over real PostgreSQL with the delivering broker double and an in-process SDK consumer; the failed, stale-ignored, retire, redelivery-after-restart and no-broker-then-resume paths reach the outcomes their flows state (integration)
+- [x] No log line, metric label or span attribute of this feature carries a setting value, an expected or applied value, a hash or a secret (unit)
+- [x] A set, its notification, the consumer's fresh re-read and its report end with the state `succeeded` and one `activation` record under the change, over real PostgreSQL with the delivering broker double and an in-process SDK consumer; the failed, stale-ignored, retire, redelivery-after-restart and no-broker-then-resume paths reach the outcomes their flows state (integration)
 - [ ] In an environment that runs a broker and a sample consumer gear, the DESIGN-activation §7 Level 4 rows pass for what this feature owns: *Full loop* through its write side — set, `change_notification`, fresh re-read, `report_outcome`, state `succeeded` — *Consumer isolation*, *Value mismatch → failed* through the state `failed` and its `activation` audit record, *Restart re-publish* and *No secret in stream*; the activation read and the history assertions of those rows are entry 2.14's (E2E)
-- [ ] `cfs validate --artifact` reports zero errors on this document, and every `@cpt-*` marker the implementation adds resolves to an id defined here (gate)
+- [x] `cfs validate --artifact` reports zero errors on this document, and every `@cpt-*` marker the implementation adds resolves to an id defined here (gate)

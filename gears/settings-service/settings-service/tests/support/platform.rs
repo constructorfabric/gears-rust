@@ -264,9 +264,27 @@ impl PgFixture {
 
 pub type FrameResult = Result<WireFrame, EventBrokerError>;
 
-/// One joined subscription: where its deliveries go and the tenant it asked for.
-pub struct Joined {
+/// One interest of a joined subscription: the tenant it asked for, exactly, and
+/// the event types it matches (none matches every type), as the broker matches.
+pub struct Interest {
     pub tenant: Uuid,
+    pub types: Vec<String>,
+}
+
+impl Interest {
+    fn wants(&self, event: &Event) -> bool {
+        self.tenant == event.tenant_id
+            && (self.types.is_empty()
+                || self
+                    .types
+                    .iter()
+                    .any(|t| t == event.type_id.as_ref() as &str))
+    }
+}
+
+/// One joined subscription: where its deliveries go and what it asked for.
+pub struct Joined {
+    pub interests: Vec<Interest>,
     pub deliveries: UnboundedSender<FrameResult>,
 }
 
@@ -493,7 +511,11 @@ impl EventBrokerApi for DeliveringBroker {
         let sequence = i64::try_from(state.published.len()).unwrap_or(i64::MAX);
         let mut delivered = 0;
         for joined in state.subscriptions.values() {
-            if joined.tenant != event.tenant_id {
+            if !joined
+                .interests
+                .iter()
+                .any(|interest| interest.wants(event))
+            {
                 continue;
             }
             let frame = WireFrame::Event(WireEvent {
@@ -593,10 +615,23 @@ impl EventBrokerApi for DeliveringBroker {
         _: &SecurityContext,
         req: JoinRequest,
     ) -> Result<SubscriptionAssignment, EventBrokerError> {
-        let interest = req
+        let first = req
             .interests
             .first()
             .ok_or_else(|| EventBrokerError::Internal("a join names no interest".to_owned()))?;
+        let topic = first.topic().clone();
+        let interests: Vec<Interest> = req
+            .interests
+            .iter()
+            .map(|interest| Interest {
+                tenant: interest.tenant_id(),
+                types: interest
+                    .types()
+                    .iter()
+                    .map(|t| t.as_ref().to_owned())
+                    .collect(),
+            })
+            .collect();
         let (tx, rx) = unbounded_channel();
         let subscription_id = SubscriptionId(Uuid::new_v4());
         let mut state = self.state.lock().unwrap();
@@ -604,7 +639,7 @@ impl EventBrokerApi for DeliveringBroker {
         state.subscriptions.insert(
             subscription_id,
             Joined {
-                tenant: interest.tenant_id(),
+                interests,
                 deliveries: tx,
             },
         );
@@ -613,7 +648,7 @@ impl EventBrokerApi for DeliveringBroker {
             subscription_id,
             topology_version: 1,
             assigned: vec![AssignedPartition {
-                topic: interest.topic().clone(),
+                topic,
                 partition: 0,
             }],
         })
@@ -1005,6 +1040,20 @@ pub struct Replica {
 impl Replica {
     /// `init` over the shared database with `config` as the gear's section.
     pub async fn init(pg: &PgFixture, platform: &Platform, config: Value) -> Self {
+        let replica = Self::init_without_broker(pg, platform, config).await;
+        replica.plug_broker(platform);
+        replica
+    }
+
+    /// The Event Broker appears in this replica's hub: what a deployment that
+    /// starts its broker later looks like.
+    pub fn plug_broker(&self, platform: &Platform) {
+        self.hub
+            .register::<dyn EventBrokerApi>(Arc::clone(&platform.broker) as Arc<dyn EventBrokerApi>);
+    }
+
+    /// `init` as `init` does, with no Event Broker in the hub.
+    pub async fn init_without_broker(pg: &PgFixture, platform: &Platform, config: Value) -> Self {
         let hub = Arc::new(ClientHub::new());
         hub.register::<dyn TypesRegistryClient>(
             Arc::clone(&platform.registry) as Arc<dyn TypesRegistryClient>
@@ -1014,7 +1063,6 @@ impl Replica {
         ));
         hub.register::<dyn TenantResolverClient>(Arc::new(TwoLevelTree));
         hub.register::<dyn authz_resolver_sdk::AuthZResolverApi>(Arc::new(AllowAll));
-        hub.register::<dyn EventBrokerApi>(Arc::clone(&platform.broker) as Arc<dyn EventBrokerApi>);
         let db = connect_db(&pg.url, pool())
             .await
             .expect("the replica connects to the container");
@@ -1177,6 +1225,7 @@ impl Replica {
                 GetEffectiveRequest {
                     key: key.clone(),
                     scope,
+                    freshness: settings_service_sdk::models::Freshness::default(),
                 },
             )
             .await

@@ -85,6 +85,12 @@ const SECRET_TYPE: &str = "gts.cf.core.settings.type_secret_string.v1~";
 const ROOT: Uuid = Uuid::from_u128(0xa0);
 const CHILD: Uuid = Uuid::from_u128(0xc1);
 const GRAND: Uuid = Uuid::from_u128(0xc2);
+/// The tenants of the per-key bound test: this many children of the root, each
+/// `BOUND_TENANT_BASE + n`.
+const BOUND_TENANTS: u128 = 50;
+const BOUND_TENANT_BASE: u128 = 0xe000;
+/// The subscribers of the per-key bound test.
+const BOUND_SUBSCRIBERS: u128 = 20;
 
 /// How long the test waits for something that must happen: far beyond any real
 /// wait, so only a hang can exhaust it.
@@ -411,6 +417,13 @@ impl ThreeLevelTree {
             ROOT => Ok(None),
             CHILD => Ok(Some(ROOT)),
             GRAND => Ok(Some(CHILD)),
+            // The fan-out family of the per-key bound test: children of the root.
+            other
+                if (BOUND_TENANT_BASE..BOUND_TENANT_BASE + BOUND_TENANTS)
+                    .contains(&other.as_u128()) =>
+            {
+                Ok(Some(ROOT))
+            }
             other => Err(TenantResolverError::TenantNotFound {
                 tenant_id: TenantId(other),
             }),
@@ -1859,4 +1872,193 @@ async fn start_up_removes_no_lock_marker_on_postgresql() {
         "the live holder's lock is untouched"
     );
     held.release().await;
+}
+
+/// *Lock hold time at the per-key bound* (NFR verification mapping, DESIGN
+/// Concurrency Testing): the key has the design's bound of subscriptions —
+/// 20 subscribers × 50 tenants, 1,000 in all — and a cascading write at the root
+/// affects every one. The write is held in flight at the pause point, a mutation
+/// of its own queues on the key's lock, and once the write goes on, the wait that
+/// mutation observed through its lock metrics (the instrument behind
+/// `settings_mutation_lock_wait_seconds`) says how long the change held the key.
+/// The time is reported; the assertions are on outcomes — every subscription got
+/// its state, and the wait ended within the budget.
+#[tokio::test]
+async fn a_change_at_the_per_key_bound_holds_its_lock_for_a_measured_time() {
+    let Some(pg) = pg_fixture().await else { return };
+    let platform = platform();
+    let a = Replica::init(&pg, &platform, json!({ "mutation_lock_wait_seconds": 60 })).await;
+    let key = setting("bound");
+    a.declare_plain(&key, ScopeClass::Cascading).await;
+    let deadlocks = pg.deadlocks().await;
+    // 20 subscribers × 50 tenants, seeded the way registration would write them.
+    let seeded = pg
+        .exec(
+            "INSERT INTO subscriptions (id, subscriber, key, tenant)
+             SELECT gen_random_uuid(), 'subscriber-' || s, $1,
+                    '00000000-0000-0000-0000-' || lpad(to_hex($2::bigint + t), 12, '0')
+               FROM generate_series(1, $3::bigint) AS s, generate_series(0, $4::bigint - 1) AS t",
+            vec![
+                key.as_str().into(),
+                i64::try_from(BOUND_TENANT_BASE).unwrap().into(),
+                i64::try_from(BOUND_SUBSCRIBERS).unwrap().into(),
+                i64::try_from(BOUND_TENANTS).unwrap().into(),
+            ],
+        )
+        .await;
+    assert_eq!(seeded, 1000, "the per-key bound of subscriptions");
+
+    let pause = a.pause_on(&key);
+    let write = {
+        let a = Replica {
+            gear: Arc::clone(&a.gear),
+            hub: Arc::clone(&a.hub),
+            db: Arc::clone(&a.db),
+        };
+        let key = key.clone();
+        tokio::spawn(async move { a.set(&key, ROOT, "bound", Some("absent")).await })
+    };
+    pause.reached().await;
+
+    // Another mutation of the key queues on the lock and counts its wait.
+    let metrics = Arc::new(CountingMetrics::default());
+    let contender_db = connect_db(&pg.url, pool())
+        .await
+        .expect("another session connects");
+    let contender = MutationLock::new(
+        Arc::new(DBProvider::new(contender_db)),
+        Duration::from_secs(60),
+        Arc::clone(&metrics) as Arc<dyn LockMetrics>,
+    );
+    let queued = std::time::Instant::now();
+    let name = key.as_str().to_owned();
+    let mut waiting = tokio::spawn(async move {
+        let held = contender
+            .acquire(&name, None)
+            .await
+            .expect("the lock frees");
+        held.release().await;
+    });
+    still_waiting(&mut waiting).await;
+    let before_release = queued.elapsed();
+
+    pause.release();
+    finished(write)
+        .await
+        .expect("the change at the bound commits");
+    finished(waiting).await;
+
+    let waits = metrics.acquired.lock().unwrap().clone();
+    assert_eq!(waits.len(), 1, "the queued mutation acquired the lock once");
+    let waited = waits[0];
+    // No lower bound against `before_release`: that was measured from before the
+    // contender's `acquire` started, the wait from inside it, so the two clocks
+    // do not compare.
+    let hold_after_pause = waited.saturating_sub(before_release);
+    eprintln!(
+        "per-key bound: 1000 subscriptions; the change held the key {} ms after its pause point \
+         (queued wait {} ms in all)",
+        hold_after_pause.as_millis(),
+        waited.as_millis()
+    );
+    assert!(
+        waited < Duration::from_secs(60),
+        "the wait ended within the budget: {waited:?}"
+    );
+    assert_eq!(
+        pg.states(&key).await.len(),
+        1000,
+        "every subscription of the key got its state in the one transaction"
+    );
+    assert_eq!(pg.deadlocks().await, deadlocks, "no deadlock");
+}
+
+/// *Subscribe during a write*, through the SDK: the registration waits for the
+/// write's commit, and the fresh read the client makes after it returns the
+/// committed value — the one the consumer materializes from — while the next
+/// write writes the subscription's state.
+#[tokio::test]
+async fn a_subscribe_during_a_write_reads_the_committed_value_fresh() {
+    use settings_service_sdk::{
+        ActivationOutcome, ChangeBundle, KeyState, SettingChangeHandler, SettingsActivationClient,
+    };
+
+    struct Quiet;
+    #[async_trait]
+    impl SettingChangeHandler for Quiet {
+        async fn on_change(&self, _: ChangeBundle) -> Vec<(SettingKey, ActivationOutcome)> {
+            Vec::new()
+        }
+    }
+
+    let Some(pg) = pg_fixture().await else { return };
+    let platform = platform();
+    let a = Replica::init(&pg, &platform, json!({})).await;
+    let b = Replica::init(&pg, &platform, json!({})).await;
+    let key = setting("sdk_subscribe");
+    a.declare_plain(&key, ScopeClass::Cascading).await;
+    let gear = subscriber();
+    let client = b
+        .hub
+        .get::<dyn SettingsActivationClient>()
+        .expect("the client is bound beside the reader");
+
+    let pause = a.pause_on(&key);
+    let write = {
+        let a = Replica {
+            gear: Arc::clone(&a.gear),
+            hub: Arc::clone(&a.hub),
+            db: Arc::clone(&a.db),
+        };
+        let key = key.clone();
+        tokio::spawn(async move { a.set(&key, ROOT, "one", Some("absent")).await })
+    };
+    pause.reached().await;
+    let handle = client
+        .subscribe(
+            &gear,
+            vec![key.clone()],
+            ROOT.to_string(),
+            Arc::new(Quiet) as Arc<dyn SettingChangeHandler>,
+        )
+        .await
+        .expect("a handle at once");
+    tokio::time::sleep(STILL_WAITING).await;
+    assert!(
+        matches!(handle.states()[&key], KeyState::Pending { .. }),
+        "the registration waits for the write: the key is not registered yet"
+    );
+    assert_eq!(pg.subscriptions(&key).await, 0);
+
+    pause.release();
+    let committed = finished(write).await.expect("the write commits");
+    tokio::time::timeout(MUST_HAPPEN, async {
+        while !matches!(handle.states()[&key], KeyState::Registered { .. }) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the key registers once the write is over");
+    let KeyState::Registered { value: Some(value) } = handle.states()[&key].clone() else {
+        panic!("registered with its fresh value");
+    };
+    assert_eq!(
+        value.value,
+        json!("one"),
+        "the fresh read after the registration returns the committed value"
+    );
+    assert!(
+        pg.states(&key).await.is_empty(),
+        "no state for a change that preceded it"
+    );
+
+    a.set(&key, ROOT, "two", Some(&committed.etag))
+        .await
+        .expect("the next write");
+    assert_eq!(
+        pg.states(&key).await.len(),
+        1,
+        "it writes the subscription's state"
+    );
+    drop(handle);
 }

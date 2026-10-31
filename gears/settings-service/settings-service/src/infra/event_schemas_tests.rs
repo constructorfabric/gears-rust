@@ -16,7 +16,7 @@ use settings_service_sdk::gts::{
 use super::{
     CacheInvalidation, ChangeNotification, NotifiedKey, activation_subject_type_schema,
     activation_topic_instance, cache_invalidate_event_type_schema, cache_topic_instance,
-    change_notification_event_type_schema,
+    change_notification_data_schema, change_notification_event_type_schema,
 };
 
 fn body() -> CacheInvalidation {
@@ -209,6 +209,32 @@ fn the_notification_body_holds_identifiers_only() {
         .collect();
     entry_names.sort_unstable();
     assert_eq!(entry_names, ["change_ref", "key"]);
+}
+
+#[test]
+fn the_published_notification_satisfies_its_data_schema() {
+    let validator =
+        jsonschema::validator_for(&change_notification_data_schema()).expect("a valid schema");
+    let wire = serde_json::to_value(notification()).expect("serializes");
+    assert!(
+        validator.is_valid(&wire),
+        "the serialized body must satisfy the schema the event type registers"
+    );
+    // The optional subject pair, when set, is admitted too.
+    let mut scoped = notification();
+    scoped.subject_type = Some("user".to_owned());
+    scoped.subject_id = Some("u-1".to_owned());
+    assert!(validator.is_valid(&serde_json::to_value(scoped).expect("serializes")));
+    // And the schema still rejects a body without its required identifiers.
+    let mut missing = wire.clone();
+    missing
+        .as_object_mut()
+        .expect("an object")
+        .remove("subscriber");
+    assert!(!validator.is_valid(&missing), "`subscriber` is required");
+    let mut bad_ref = wire;
+    bad_ref["changes"][0]["change_ref"] = json!(7);
+    assert!(!validator.is_valid(&bad_ref), "`change_ref` is a string");
 }
 
 #[test]

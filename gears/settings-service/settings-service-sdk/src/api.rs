@@ -14,9 +14,9 @@
 //!
 //! Change notification is not a reader-trait method. A consumer that must
 //! actively re-apply a setting -- a connection pool, a listening socket --
-//! subscribes through [`crate::activation`]: `subscribe(keys, handler)` plus
-//! `report_outcome(...)`, specified by DESIGN-activation §4.5 *In-Process SDK —
-//! Consumer Activation*. An earlier draft listed a `watch` change stream on this
+//! subscribes through [`crate::activation`]: `subscribe(keys, tenant, handler)`
+//! plus `report_outcome(...)`, specified by DESIGN-activation §4.5 *In-Process
+//! SDK — Consumer Activation*. An earlier draft listed a `watch` change stream on this
 //! trait; it named the same capability twice, and its shape could not carry the
 //! per-setting acknowledgement the activation contract requires.
 
@@ -80,6 +80,11 @@ pub trait SettingsReaderClient: Send + Sync {
     /// **not** substitute that default — it lives in the same database and is
     /// equally unreachable — so the caller receives a distinguishable error and
     /// owns its own degradation posture.
+    ///
+    /// The request's [`crate::Freshness`] chooses between the cache-first read
+    /// and one resolved from the store on the serving replica, which bypasses the
+    /// cache and leaves it as it found it — what a consumer re-reading a setting
+    /// it was just notified about asks for.
     ///
     /// See [`crate::SettingsError`] for typed dispatch over the failure cases.
     async fn get_effective(

@@ -1,0 +1,92 @@
+{
+  "values": [
+    {
+      "name": "member order and whitespace",
+      "input": "{ \"c\" : 1.50 , \"a\" : { \"x\" : null , \"y\" : true } ,\n \"b\" : [ 1 , 2.0 , \"\\u00e9\" ] }",
+      "canonical": "{\"a\":{\"x\":null,\"y\":true},\"b\":[1,2,\"é\"],\"c\":1.5}"
+    },
+    {
+      "name": "the same value serialized otherwise",
+      "input": "{\"b\":[1.0,2e0,\"\\u00e9\"],\"a\":{\"y\":true,\"x\":null},\"c\":1.5}",
+      "canonical": "{\"a\":{\"x\":null,\"y\":true},\"b\":[1,2,\"é\"],\"c\":1.5}"
+    },
+    {
+      "name": "RFC 8785 section 3.2.2",
+      "input": "{ \"numbers\": [333333333.33333329, 1E30, 4.50, 2e-3, 0.000000000000000000000000001], \"string\": \"\\u20ac$\\u000F\\u000aA'\\u0042\\u0022\\u005c\\\\\\\"\\/\", \"literals\": [null, true, false] }",
+      "canonical": "{\"literals\":[null,true,false],\"numbers\":[333333333.3333333,1e+30,4.5,0.002,1e-27],\"string\":\"€$\\u000f\\nA'B\\\"\\\\\\\\\\\"/\"}"
+    },
+    {
+      "name": "number spelling",
+      "input": "[0, -0, 0.0, 1e2, 1E+2, 100.0, 0.1, 1.10, 5e-324, 1e21, 123456789012345680000, 0.000001, 1e-7, 9007199254740992, -9007199254740992]",
+      "canonical": "[0,0,0,100,100,100,0.1,1.1,5e-324,1e+21,123456789012345680000,0.000001,1e-7,9007199254740992,-9007199254740992]"
+    },
+    {
+      "name": "unicode escaping",
+      "input": "\"\\u0001\\b\\t\\n\\f\\r\\u001f \\u007f / \\u00e9 \\ud83d\\ude00\"",
+      "canonical": "\"\\u0001\\b\\t\\n\\f\\r\\u001f  / é 😀\""
+    },
+    {
+      "name": "member order by UTF-16 code units",
+      "input": "{\"\\ufb33\":1,\"\\ud83d\\ude00\":2,\"\\u20ac\":3,\"\\u00f6\":4,\"1\":5,\"\\r\":6}",
+      "canonical": "{\"\\r\":6,\"1\":5,\"ö\":4,\"€\":3,\"😀\":2,\"דּ\":1}"
+    },
+    {
+      "name": "a file reference is an ordinary object",
+      "input": "{\"version\":3,\"name\":\"ca.pem\",\"file_id\":\"f-1\"}",
+      "canonical": "{\"file_id\":\"f-1\",\"name\":\"ca.pem\",\"version\":3}"
+    },
+    {
+      "name": "scalars and empty containers",
+      "input": "{\"s\":\"\",\"a\":[],\"o\":{},\"t\":true,\"f\":false,\"n\":null}",
+      "canonical": "{\"a\":[],\"f\":false,\"n\":null,\"o\":{},\"s\":\"\",\"t\":true}"
+    }
+  ],
+  "rejected": [
+    {
+      "name": "an integer one beyond 2^53",
+      "input": "9007199254740993"
+    },
+    {
+      "name": "a negative integer beyond 2^53",
+      "input": "-9007199254740993"
+    },
+    {
+      "name": "a large integer",
+      "input": "18446744073709551615"
+    },
+    {
+      "name": "inside a structure",
+      "input": "{\"a\":[1,9007199254740993]}"
+    }
+  ],
+  "secrets": [
+    {
+      "name": "known answer",
+      "key": "k",
+      "tenant": "t",
+      "plaintext": "hunter2",
+      "hash": "db8d227c5d9e88a8401002a0ea32eea050b860f27113f2f0f9223ea99d668bd0"
+    },
+    {
+      "name": "escapes and non-BMP plaintext",
+      "key": "key-a",
+      "tenant": "11111111-1111-1111-1111-111111111111",
+      "plaintext": "p\"a\\ssé\n\u001f😀 word",
+      "hash": "928e53d3331da2fab57b4287663b45c8bc1d9cc570e6d86a898a546d0a2a928a"
+    },
+    {
+      "name": "empty plaintext, a GTS key",
+      "key": "gts.cf.core.settings.setting_type.v1~acme.net.proxy.password.v1~",
+      "tenant": "a0a0a0a0-0000-0000-0000-0000000000a0",
+      "plaintext": "",
+      "hash": "82e510104a9e4b1dff08294ef7dd195855a1b3a569d314efe121332ff474527e"
+    },
+    {
+      "name": "the same plaintext at another tenant",
+      "key": "key-a",
+      "tenant": "22222222-2222-2222-2222-222222222222",
+      "plaintext": "p\"a\\ssé\n\u001f😀 word",
+      "hash": "ffaccd738b19628bb652f917e4fa42bf0e318d0adef70446d6d2f72c70f71d95"
+    }
+  ]
+}

@@ -185,6 +185,7 @@ impl TenantDefaults for SettingsServiceDefaults {
         let request = GetEffectiveRequest {
             key: self.key.clone(),
             scope: format!("/tenants/{tenant_id}"),
+            freshness: settings_service_sdk::models::Freshness::default(),
         };
         let Ok(resolved) =
             tokio::time::timeout(self.read_timeout, reader.get_effective(ctx, request)).await

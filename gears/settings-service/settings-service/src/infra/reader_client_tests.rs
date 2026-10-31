@@ -63,6 +63,7 @@ async fn a_consumer_gets_value_source_traits_and_a_trail_without_setter_identity
             GetEffectiveRequest {
                 key: h.key("strict"),
                 scope: scope_of(h.tree.b),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -106,6 +107,7 @@ async fn the_platform_scope_is_the_root_and_a_bad_scope_is_refused() {
             GetEffectiveRequest {
                 key: h.key("flag"),
                 scope: "/".to_owned(),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -121,6 +123,7 @@ async fn the_platform_scope_is_the_root_and_a_bad_scope_is_refused() {
             GetEffectiveRequest {
                 key: h.key("flag"),
                 scope: "tenant-a".to_owned(),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -154,6 +157,7 @@ async fn outcomes_project_to_the_typed_errors_and_never_to_a_default() {
             GetEffectiveRequest {
                 key: h.key("ghost"),
                 scope: scope_of(h.tree.b),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -169,6 +173,7 @@ async fn outcomes_project_to_the_typed_errors_and_never_to_a_default() {
             GetEffectiveRequest {
                 key: h.key("retired"),
                 scope: scope_of(h.tree.b),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -185,6 +190,7 @@ async fn outcomes_project_to_the_typed_errors_and_never_to_a_default() {
             GetEffectiveRequest {
                 key: h.key("down"),
                 scope: scope_of(h.tree.b),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -430,6 +436,7 @@ async fn a_secret_setting_reads_as_an_opaque_handle_that_resolves_only_through_t
             GetEffectiveRequest {
                 key: key.clone(),
                 scope: scope.clone(),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -463,6 +470,7 @@ async fn a_secret_setting_reads_as_an_opaque_handle_that_resolves_only_through_t
             GetEffectiveRequest {
                 key: key.clone(),
                 scope: scope.clone(),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -526,6 +534,7 @@ async fn a_handle_issued_before_the_secret_was_configured_resolves_to_whatever_i
             GetEffectiveRequest {
                 key: key.clone(),
                 scope: scope_of(h.tree.b),
+                freshness: settings_service_sdk::models::Freshness::default(),
             },
         )
         .await
@@ -558,4 +567,145 @@ async fn a_handle_issued_before_the_secret_was_configured_resolves_to_whatever_i
         .await
         .expect("resolved");
     assert_eq!(plaintext.expose_secret(), "s3cret");
+}
+
+// ---------------------------------------------------------------------------
+// The freshness option
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_fresh_read_bypasses_a_cache_holding_the_previous_value_and_leaves_it_as_found() {
+    let h = ResolutionHarness::new().await;
+    let d = h
+        .declare("flag", scope_class::CASCADING, json!("old"))
+        .await;
+    let r = reader(&h);
+    let ctx = SecurityContext::anonymous();
+    let request = || GetEffectiveRequest::new(h.key("flag"), scope_of(h.tree.a));
+
+    // An ordinary read fills the cache with `old`, the declaration's default.
+    let first = r.get_effective(&ctx, request()).await.expect("resolves");
+    assert_eq!(first.value, json!("old"));
+    // The row changes behind the cache's back, as it does on a replica that has
+    // not yet seen the `cache_invalidate`.
+    h.set(d, h.tree.root, json!("new")).await;
+    let cached = r.get_effective(&ctx, request()).await.expect("resolves");
+    assert_eq!(
+        cached.value,
+        json!("old"),
+        "the cache still serves the previous value"
+    );
+
+    let fresh = r
+        .get_effective(&ctx, request().fresh())
+        .await
+        .expect("resolves");
+    assert_eq!(
+        fresh.value,
+        json!("new"),
+        "the fresh read resolved from the store"
+    );
+
+    let after = r.get_effective(&ctx, request()).await.expect("resolves");
+    assert_eq!(
+        after.value,
+        json!("old"),
+        "the fresh read did not populate the cache: it holds what it held"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_read_into_an_empty_cache_leaves_it_empty() {
+    let h = ResolutionHarness::new().await;
+    let d = h
+        .declare("flag", scope_class::CASCADING, json!("old"))
+        .await;
+    let r = reader(&h);
+    let ctx = SecurityContext::anonymous();
+
+    r.get_effective(&ctx, GetEffectiveRequest::new(h.key("flag"), "/").fresh())
+        .await
+        .expect("resolves");
+    h.set(d, h.tree.root, json!("new")).await;
+
+    // Had the fresh read stored its answer, this ordinary read would be `old`.
+    let ordinary = r
+        .get_effective(&ctx, GetEffectiveRequest::new(h.key("flag"), "/"))
+        .await
+        .expect("resolves");
+    assert_eq!(ordinary.value, json!("new"));
+}
+
+#[tokio::test]
+async fn a_fresh_read_follows_the_rules_of_an_ordinary_read() {
+    let h = ResolutionHarness::new().await;
+    let ctx = SecurityContext::anonymous();
+    // A key nobody declared, a scope that is not a path, a retired key and a
+    // secret: each answers as the cached read answers it.
+    let missing = reader(&h)
+        .get_effective(&ctx, GetEffectiveRequest::new(h.key("ghost"), "/").fresh())
+        .await
+        .expect_err("undeclared");
+    assert!(matches!(
+        missing,
+        toolkit_canonical_errors::CanonicalError::NotFound { .. }
+    ));
+    let d = h.declare("flag", scope_class::GLOBAL, json!(false)).await;
+    h.set(d, h.tree.root, json!(true)).await;
+    let bad_scope = reader(&h)
+        .get_effective(
+            &ctx,
+            GetEffectiveRequest::new(h.key("flag"), "tenant-a").fresh(),
+        )
+        .await
+        .expect_err("a scope that is not a path");
+    assert!(matches!(
+        bad_scope,
+        toolkit_canonical_errors::CanonicalError::InvalidArgument { .. }
+    ));
+    h.retire(d).await;
+    let retired = reader(&h)
+        .get_effective(&ctx, GetEffectiveRequest::new(h.key("flag"), "/").fresh())
+        .await
+        .expect_err("retired");
+    assert!(matches!(
+        SettingsError::from(retired),
+        SettingsError::Retired { .. }
+    ));
+}
+
+#[tokio::test]
+async fn a_fresh_read_of_a_secret_is_the_opaque_handle_never_the_plaintext() {
+    let h = ResolutionHarness::new().await;
+    let d = h
+        .declare_typed(
+            "password",
+            scope_class::CASCADING,
+            json!("placeholder"),
+            SECRET,
+            "secret",
+        )
+        .await;
+    h.set_secret(d, h.tree.root, "ref-1").await;
+    let ctx = SecurityContext::anonymous();
+
+    let fresh = reader(&h)
+        .get_effective(
+            &ctx,
+            GetEffectiveRequest::new(h.key("password"), scope_of(h.tree.a)).fresh(),
+        )
+        .await
+        .expect("resolves");
+    let ordinary = reader(&h)
+        .get_effective(
+            &ctx,
+            GetEffectiveRequest::new(h.key("password"), scope_of(h.tree.a)),
+        )
+        .await
+        .expect("resolves");
+    assert_eq!(fresh.value, ordinary.value, "the same handle either way");
+    assert!(
+        !fresh.value.to_string().contains("ref-1"),
+        "no store reference leaks"
+    );
 }

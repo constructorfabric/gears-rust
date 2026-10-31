@@ -1,7 +1,7 @@
 # Created: 2026-08-11 by Virtuozzo International GmbH
 [package]
 name = "cf-gears-settings-service-sdk"
-version = "0.2.1"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -34,6 +34,17 @@ toolkit-security = { workspace = true }
 # The plaintext a secret resolves to is handed over wrapped, never as a bare string.
 secrecy = { workspace = true }
 uuid = { workspace = true }
+# The consumer's `applied_value` and the service's expected value share one RFC
+# 8785 encoder (`canonical`): numbers are written as ECMAScript writes them
+# (shortest round-trip digits from `ryu`), a secret is hashed with SHA-256 from
+# the FIPS-validated provider the platform's lints demand, and the buffer its
+# plaintext is encoded into is wiped when it drops.
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+ryu = { workspace = true }
+zeroize = { workspace = true }
+# A subscription handle announces a change of a key's state through a watch.
+tokio = { workspace = true, features = ["sync"] }
 
 [dev-dependencies]
 jsonschema = { workspace = true }

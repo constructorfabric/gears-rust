@@ -171,3 +171,35 @@ fn a_contributed_display_name_round_trips_and_is_omitted_when_none() {
     let back: ContributedDeclaration = serde_json::from_value(wire).expect("round-trips");
     assert_eq!(back.display_name.as_deref(), Some("Proxy enabled"));
 }
+
+#[test]
+fn a_read_is_cached_unless_it_asks_for_freshness() {
+    use super::{Freshness, GetEffectiveRequest};
+    let key = crate::SettingKey::parse(
+        "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~",
+    )
+    .expect("key");
+    let ordinary = GetEffectiveRequest::new(key, "/");
+    assert_eq!(ordinary.freshness, Freshness::Cached);
+    let fresh = ordinary.clone().fresh();
+    assert_eq!(fresh.freshness, Freshness::Fresh);
+    assert_ne!(ordinary, fresh);
+}
+
+#[test]
+fn freshness_is_additive_on_the_wire() {
+    // A request written before the option existed still reads, as the cached
+    // read; and the cached read is written without the field, so an older
+    // service that does not know it sees what it always saw.
+    use super::{Freshness, GetEffectiveRequest};
+    let key = "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~";
+    let old: GetEffectiveRequest =
+        serde_json::from_value(serde_json::json!({ "key": key, "scope": "/" })).expect("reads");
+    assert_eq!(old.freshness, Freshness::Cached);
+    let quiet = serde_json::to_value(&old).expect("serializes");
+    assert!(quiet.get("freshness").is_none(), "{quiet}");
+    let loud = serde_json::to_value(old.fresh()).expect("serializes");
+    assert_eq!(loud["freshness"], "fresh");
+    let back: GetEffectiveRequest = serde_json::from_value(loud).expect("round-trips");
+    assert_eq!(back.freshness, Freshness::Fresh);
+}

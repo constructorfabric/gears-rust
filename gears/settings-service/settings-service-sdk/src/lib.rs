@@ -6,6 +6,8 @@
 //! - the opaque [`SecretHandle`] and the [`EffectiveSource`] vocabulary
 //! - [`SettingsReaderClient`] and [`SettingsContributionClient`], whose every
 //!   fallible method returns the platform-wide `CanonicalError`
+//! - [`SettingsActivationClient`], for a consumer that must actively re-apply a
+//!   setting: per-key subscription states, fresh re-reads, reported outcomes
 //! - [`SettingsError`], the opt-in typed projection over that canonical error
 //!
 //! # Setting key shape
@@ -33,6 +35,7 @@
 
 pub mod activation;
 pub mod api;
+pub mod canonical;
 pub mod catalogue;
 pub mod error;
 pub mod gts;
@@ -42,13 +45,14 @@ pub mod odata;
 pub mod precondition;
 
 pub use activation::{
-    ActivationOutcome, SettingChangeHandler, SettingChangeNotification, SettingsActivationClient,
-    SubscriptionHandle,
+    ActivationOutcome, BundledKey, ChangeBundle, ChangeNotification, EncodedOutcome, KeyState,
+    NotifiedKey, PendingReason, RefusedReason, ReportResult, ReportStatus, RetireResult,
+    SettingChangeHandler, SettingsActivationClient, SubscriptionControl, SubscriptionHandle,
 };
 pub use api::{BulkOutcome, BulkSelector, SettingsContributionClient, SettingsReaderClient};
 pub use error::SettingsError;
 pub use key::{SettingKey, SettingKeyError};
-pub use models::{EffectiveSource, SecretHandle, TrailEntry};
+pub use models::{EffectiveSource, Freshness, SecretHandle, TrailEntry};
 // The wrapper `resolve_secret` returns, re-exported so a consumer reads the
 // plaintext with the same `secrecy` this crate compiled against.
 pub use secrecy::{ExposeSecret, SecretString};

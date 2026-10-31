@@ -4023,7 +4023,7 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4081,22 +4081,26 @@ dependencies = [
 
 [[package]]
 name = "cf-gears-settings-service-sdk"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "async-trait",
+ "aws-lc-rs",
  "cf-gears-toolkit-canonical-errors",
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-odata",
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts-id",
+ "hex",
  "jsonschema 0.40.2",
+ "ryu",
  "secrecy",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

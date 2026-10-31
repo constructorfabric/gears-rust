@@ -816,10 +816,19 @@ where
     ) -> Result<Arc<EffectiveValue>, DomainError> {
         let root = self.platform.root_tenant().await?;
         let mut ancestry = Ancestry::new(root, target);
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-2
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-3
+        // No `EffectiveCache` is consulted: the declaration and the rows are
+        // read from the store over the requested tenant's chain.
         let declaration = self.declaration(conn, key).await?;
-        Ok(Arc::new(
-            self.assemble(conn, &declaration, &mut ancestry).await?,
-        ))
+        let assembled = self.assemble(conn, &declaration, &mut ancestry).await?;
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-3
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-2
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-4
+        // Never stored: the result goes to the caller and nowhere else, so the
+        // read leaves the cache as it found it.
+        Ok(Arc::new(assembled))
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-4
     }
 
     /// The rows an effective value at `tenant` is selected from, read through

@@ -12,7 +12,9 @@ use async_trait::async_trait;
 use secrecy::SecretString;
 use serde_json::Value;
 use settings_service_sdk::api::{BULK_LIMIT, BulkOutcome, BulkSelector, SettingsReaderClient};
-use settings_service_sdk::models::{EffectiveValueResponse, GetEffectiveRequest, TrailEntry};
+use settings_service_sdk::models::{
+    EffectiveValueResponse, Freshness, GetEffectiveRequest, TrailEntry,
+};
 use settings_service_sdk::{SecretHandle, SettingKey};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::{DBProvider, DbError};
@@ -113,8 +115,18 @@ where
     ) -> Result<EffectiveValueResponse, CanonicalError> {
         let target = ScopeTarget::parse(&req.scope)?;
         let conn = self.db.conn().map_err(|e| conn_error(&e))?;
-        let resolved = self.resolver.resolve(&conn, &req.key, target).await?;
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-1
+        // The freshness option changes where the value comes from and nothing
+        // else: the same target parse, the same projection — a `SecretHandle`
+        // for a `secret`-trait value — and the same errors as an ordinary read.
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-1
+        let resolved = match req.freshness {
+            Freshness::Cached => self.resolver.resolve(&conn, &req.key, target).await?,
+            Freshness::Fresh => self.resolver.resolve_fresh(&conn, &req.key, target).await?,
+        };
+        // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-6
         project(req.scope, &resolved)
+        // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-fresh-read:p1:inst-ca-fresh-6
     }
 
     async fn get_effective_bulk(

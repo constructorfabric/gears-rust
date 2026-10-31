@@ -27,6 +27,10 @@ use crate::log_text::LogSafe;
 /// The gear name the locks are namespaced under.
 pub const LOCK_GEAR: &str = "settings-service";
 
+/// The `detail` of the `Unavailable` a lock wait that ran out answers with; the
+/// activation client's warning classifies a failure by it.
+pub const LOCK_EXHAUSTED_DETAIL: &str = "the setting is being changed by another request; retry";
+
 /// The name of the delivery loop's scan lock, which the SQLite start-up
 /// removes the stale marker of along with the keys'.
 pub const SCAN_LOCK_KEY: &str = "activation-delivery-scan";
@@ -190,7 +194,7 @@ impl KeyLocks for MutationLock {
                 self.metrics.exhausted(started.elapsed());
                 // @cpt-begin:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-11
                 Err(DomainError::Unavailable {
-                    detail: "the setting is being changed by another request; retry".to_owned(),
+                    detail: LOCK_EXHAUSTED_DETAIL.to_owned(),
                 })
                 // @cpt-end:cpt-cf-settings-service-algo-consumer-activation-lock:p1:inst-ca-lock-11
             }

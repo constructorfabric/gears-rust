@@ -137,7 +137,10 @@ impl From<gts_id::GtsIdError> for SettingKeyError {
 ///
 /// Holds the key verbatim: parsing never trims, lowercases, or otherwise
 /// normalizes, so a stored key and a supplied key compare byte-identically.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+///
+/// Ordered by the key's text (the other fields derive from it), so a collection
+/// of keys iterates in key order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SettingKey {
     raw: String,
     /// Byte index of the `~` that terminates the base-type segment.
