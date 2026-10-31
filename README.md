@@ -49,6 +49,14 @@ See also [REPO_PLAYBOOK](docs/REPO_PLAYBOOK.md) with the registry of repository-
 
 See [SETUP.md](SETUP.md) for clean-install and run instructions for macOS, Linux, and Windows. It covers Rust and Cargo through rustup, native build prerequisites, `make setup`, and optional Constructor Studio installation.
 
+Run `git submodule update --init --recursive` (or `make ensure-submodules` to just check)
+right after cloning. Constructor Studio (`cfs init`, `cfs generate-agents`, etc.) loads every
+kit's resources eagerly and fails outright if one points inside an unfetched submodule — the
+gears kit's own `guidelines/DNA` resource is pointed at the submodule root specifically so
+that can't happen here, but its *content* (Rust/REST conventions the kit's rules cite) is
+still absent until the submodule is actually fetched, so do this before relying on it either
+way.
+
 A MariaDB, PostgreSQL, SQLite, or in-memory database is required for the corresponding runtime configuration.
 
 ### CI/Development Commands
@@ -153,6 +161,16 @@ Individual gears live under `gears/<name>/`, usually with a gear crate and an SD
 - **[Gears](docs/GEARS.md)** - List of all gears and their roles
 - **[TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT_PLUGINS.md](docs/TOOLKIT_PLUGINS.md)** - how to add new gears.
 - **[Contributing](CONTRIBUTING.md)** - Development workflow and coding standards
+
+## Constructor Studio Kit (`studio-kit-gears`)
+
+[`studio-kit-gears`](studio-kit-gears/README.md) is a [Constructor Studio](https://github.com/constructorfabric/studio)
+kit: it turns this repo's own SDLC conventions - what a PRD/DESIGN/ADR must contain, which
+house docs apply to what, which `make` targets gate what - into something an AI agent (or a
+human) actually follows consistently, instead of re-deriving it from memory every time. It's
+also installable standalone (`cfs kit install constructorfabric/gears-rust`) into any other
+project, Gears-based or not. See [`studio-kit-gears/README.md`](studio-kit-gears/README.md#why-use-this-kit)
+for what it actually does and why you'd want it.
 
 ## Security
 
