@@ -3,7 +3,7 @@ use std::{
     ops::Deref,
     sync::{Arc, Weak},
 };
-use testcontainers::{ContainerAsync, ImageExt, core::Mount, runners::AsyncRunner};
+use testcontainers::{ContainerAsync, runners::AsyncRunner};
 use testcontainers_modules::postgres::Postgres;
 
 struct Server {
@@ -40,9 +40,6 @@ pub async fn database() -> Database {
         server
     } else {
         let container = test_containers::postgres()
-            .with_mount(
-                Mount::tmpfs_mount("/var/lib/postgresql").with_size_bytes(512 * 1024 * 1024),
-            )
             .start()
             .await
             .expect("integration tests require Docker and pinned PostgreSQL");
