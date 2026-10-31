@@ -1114,11 +1114,12 @@ jobs:
       - name: Disk usage sampler
         if: runner.environment != 'github-hosted'
         run: |
+          echo "at job start:"; df -h /
           # shellcheck disable=SC2016  # the inner bash expands these
           nohup bash -c 'while true; do
             { date -u +%T; df -BG --output=used,avail / | tail -1
-              du -sx -BG "$GITHUB_WORKSPACE/target" "${SCCACHE_DIR:-$HOME/.cache/sccache}" "$HOME/.cargo" "$RUNNER_TEMP" 2>/dev/null
-              sudo du -sx -BG /var/lib/docker 2>/dev/null; } >> "$RUNNER_TEMP/disk.log"
+              du -sx -BG "$GITHUB_WORKSPACE/target" "$GITHUB_WORKSPACE/llvm-cov-target" "$GITHUB_WORKSPACE/llvm-cov-build" "${SCCACHE_DIR:-$HOME/.cache/sccache}" "$HOME/.cargo" "$RUNNER_TEMP" /tmp 2>/dev/null
+              sudo du -sx -BG /var/lib/docker /var/lib/containerd 2>/dev/null; } >> "$RUNNER_TEMP/disk.log"
             sleep 30; done' >/dev/null 2>&1 &
 
       - name: Install protoc
@@ -1280,9 +1281,12 @@ jobs:
         if: always() && runner.environment != 'github-hosted'
         run: |
           echo "peak used: $(grep -oE '^ *[0-9]+G' "$RUNNER_TEMP/disk.log" | tr -d ' G' | sort -n | tail -1) GB"
-          cat "$RUNNER_TEMP/disk.log" | tail -60
+          echo "--- first samples"; head -24 "$RUNNER_TEMP/disk.log"
+          echo "--- last samples"; tail -24 "$RUNNER_TEMP/disk.log"
           df -h /
-          du -xh -d2 "$GITHUB_WORKSPACE/target" 2>/dev/null | sort -h | tail -15
+          echo "--- largest directories on /"
+          sudo du -xh -d3 / 2>/dev/null | sort -h | tail -30
+          du -xh -d2 "$GITHUB_WORKSPACE/llvm-cov-target" 2>/dev/null | sort -h | tail -10
           sudo docker system df || true
 
   lint:
