@@ -9,12 +9,14 @@ use serde_json::json;
 use uuid::Uuid;
 
 use settings_service_sdk::gts::{
-    ACTIVATION_SUBJECT_TYPE, CACHE_INVALIDATE_EVENT_TYPE, CACHE_TOPIC_ID,
+    ACTIVATION_SUBJECT_TYPE, ACTIVATION_TOPIC_ID, CACHE_INVALIDATE_EVENT_TYPE, CACHE_TOPIC_ID,
+    CHANGE_NOTIFICATION_EVENT_TYPE,
 };
 
 use super::{
-    CacheInvalidation, activation_subject_type_schema, cache_invalidate_event_type_schema,
-    cache_topic_instance,
+    CacheInvalidation, ChangeNotification, NotifiedKey, activation_subject_type_schema,
+    activation_topic_instance, cache_invalidate_event_type_schema, cache_topic_instance,
+    change_notification_event_type_schema,
 };
 
 fn body() -> CacheInvalidation {
@@ -147,4 +149,87 @@ fn the_activation_subject_type_is_in_the_link_time_inventory() {
         schemas.iter().any(|s| s["$id"] == wanted),
         "{ACTIVATION_SUBJECT_TYPE} is not in the link-time inventory"
     );
+}
+
+// ---------------------------------------------------------------------------
+// change_notification
+// ---------------------------------------------------------------------------
+
+fn notification() -> ChangeNotification {
+    ChangeNotification {
+        tenant: "00000000-0000-0000-0000-0000000000aa".to_owned(),
+        subscriber: "gear-x".to_owned(),
+        changes: vec![NotifiedKey {
+            key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~".to_owned(),
+            change_ref: Uuid::from_u128(0xc0de),
+        }],
+        subject_type: None,
+        subject_id: None,
+    }
+}
+
+#[test]
+fn the_activation_ids_are_the_ones_the_designs_fix() {
+    assert_eq!(
+        ACTIVATION_TOPIC_ID,
+        "gts.cf.core.events.topic.v1~cf.core.settings.activation.v1"
+    );
+    assert_eq!(
+        CHANGE_NOTIFICATION_EVENT_TYPE,
+        "gts.cf.core.events.event.v1~cf.core.settings.change_notification.v1~"
+    );
+}
+
+#[test]
+fn the_notification_body_round_trips() {
+    let wire = serde_json::to_value(notification()).expect("serializes");
+    let back: ChangeNotification = serde_json::from_value(wire).expect("deserializes");
+    assert_eq!(back, notification());
+}
+
+#[test]
+fn the_notification_body_holds_identifiers_only() {
+    // The whole attribute set of the v1 body, the absent subject pair omitted:
+    // a value-bearing field cannot be added without this test naming it.
+    let wire = serde_json::to_value(notification()).expect("serializes");
+    let mut names: Vec<&str> = wire
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["changes", "subscriber", "tenant"]);
+    let entry = &wire["changes"][0];
+    let mut entry_names: Vec<&str> = entry
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    entry_names.sort_unstable();
+    assert_eq!(entry_names, ["change_ref", "key"]);
+}
+
+#[test]
+fn unknown_attributes_of_a_notification_are_ignored_on_receipt() {
+    let mut wire = serde_json::to_value(notification()).expect("serializes");
+    wire["a_later_attribute"] = json!(true);
+    let back: ChangeNotification = serde_json::from_value(wire).expect("deserializes");
+    assert_eq!(back, notification());
+}
+
+#[test]
+fn the_notification_type_is_derived_on_the_activation_topic_with_the_subject_type() {
+    let schema = change_notification_event_type_schema().to_string();
+    assert!(schema.contains(CHANGE_NOTIFICATION_EVENT_TYPE), "{schema}");
+    assert!(schema.contains(ACTIVATION_TOPIC_ID), "{schema}");
+    assert!(schema.contains(ACTIVATION_SUBJECT_TYPE), "{schema}");
+    assert!(schema.contains("change_ref"), "{schema}");
+    assert!(schema.contains("subscriber"), "{schema}");
+}
+
+#[test]
+fn the_activation_topic_instance_is_named_by_its_id() {
+    assert_eq!(activation_topic_instance()["id"], ACTIVATION_TOPIC_ID);
 }

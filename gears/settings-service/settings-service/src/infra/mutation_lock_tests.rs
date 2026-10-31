@@ -11,9 +11,9 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use uuid::Uuid;
 
-use super::{Held, LockSchedule, MutationLock, Releaser, clear_startup_markers};
+use super::{DeliveryScanLock, Held, LockSchedule, MutationLock, Releaser, clear_startup_markers};
 use crate::domain::activation::testing::RecordingLockMetrics;
-use crate::domain::activation::{HeldKey, KeyLocks};
+use crate::domain::activation::{HeldKey, KeyLocks, ScanLock};
 use crate::domain::error::DomainError;
 use crate::test_support::sqlite_provider;
 
@@ -254,4 +254,34 @@ async fn start_up_removes_the_stale_markers_of_the_scan_lock_and_every_declared_
             .release()
             .await;
     }
+}
+
+#[test]
+fn the_scan_lock_is_one_attempt_with_no_retry_and_no_wait() {
+    let config = DeliveryScanLock::config();
+    assert_eq!(config.max_retries, Some(0));
+    assert_eq!(config.max_wait, None);
+}
+
+#[tokio::test]
+async fn a_held_scan_lock_answers_none_at_once_and_a_release_frees_it() {
+    let db = sqlite_provider().await;
+    let key = unique_key();
+    let one = DeliveryScanLock::named(Arc::clone(&db), key.clone());
+    let other = DeliveryScanLock::named(db, key);
+
+    let held = one.try_acquire().await.expect("attempted").expect("free");
+    let started = Instant::now();
+    assert!(
+        other.try_acquire().await.expect("attempted").is_none(),
+        "another replica's single attempt fails while the lock is held"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "the attempt did not wait"
+    );
+    held.release().await;
+    let again = other.try_acquire().await.expect("attempted");
+    assert!(again.is_some(), "a released scan lock is free again");
+    again.expect("held").release().await;
 }

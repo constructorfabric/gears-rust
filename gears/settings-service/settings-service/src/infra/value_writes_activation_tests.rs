@@ -23,6 +23,7 @@ use crate::domain::activation::subscriptions::ActivationRepository;
 use crate::domain::activation::{
     ActivationState, ActivationStatus, ExpectedValue, plaintext_text, secret_hash,
 };
+use crate::domain::coherence::CoherencePublisher;
 use crate::domain::declaration::DeclarationRepository;
 use crate::domain::error::DomainError;
 use crate::domain::ports::NoMetrics;
@@ -101,7 +102,38 @@ impl Rig {
             &Arc<crate::domain::activation::testing::InProcessLocks>,
         ) -> Arc<dyn crate::domain::ports::ChangePublisher>,
     ) -> Self {
+        Self::over(
+            ResolutionHarness::new().await,
+            secret_gate,
+            budget,
+            shape,
+            publisher,
+        )
+    }
+
+    /// A rig whose coordinator ends each request through `hook`, built over
+    /// the rig's own database.
+    async fn with_hook(make: impl FnOnce(&Arc<Db>) -> Arc<CoherencePublisher>) -> Self {
         let base = ResolutionHarness::new().await;
+        let hook = make(&base.db);
+        Self::over(
+            base,
+            Arc::new(AllowAllGate),
+            Duration::from_millis(60),
+            |coordinator| coordinator.with_coherence(hook),
+            |_| Arc::new(RecordingPublisher::default()),
+        )
+    }
+
+    fn over(
+        base: ResolutionHarness,
+        secret_gate: Arc<dyn crate::domain::ports::SecretResolveGate>,
+        budget: Duration,
+        shape: impl FnOnce(WriteCoordinator) -> WriteCoordinator,
+        publisher: impl FnOnce(
+            &Arc<crate::domain::activation::testing::InProcessLocks>,
+        ) -> Arc<dyn crate::domain::ports::ChangePublisher>,
+    ) -> Self {
         let secrets = Arc::new(RecordingSecrets::default());
         let activation = activation_rig(&base, &secrets, secret_gate, budget);
         let writer = Arc::new(ValueWriter::new(
@@ -1337,4 +1369,148 @@ async fn the_read_gate_answers_are_the_managers_alone() {
             .load(std::sync::atomic::Ordering::SeqCst),
         0
     );
+}
+
+// ---------------------------------------------------------------------------
+// The end-of-request notification
+// ---------------------------------------------------------------------------
+
+mod notifying {
+    use std::sync::Arc;
+
+    use super::{Rig, actor, text};
+    use crate::domain::activation::testing::{
+        FakeNotifications, FakeScanLock, RecordingNotifyMetrics,
+    };
+    use crate::domain::activation::{
+        ActivationNotifier, NotificationGateway, NotificationStore, NotifyMetrics, ScanLock,
+    };
+    use crate::domain::coherence::testing::{RecordingGateway, publisher as coherence_double};
+    use crate::domain::coherence::{BroadcastGateway, BroadcastMetrics, CoherencePublisher};
+    use crate::domain::resolution::scope_class;
+    use crate::infra::storage::notification_store::DbNotificationStore;
+
+    struct Wired {
+        rig: Rig,
+        broadcast: Arc<RecordingGateway>,
+        notifications: Arc<FakeNotifications>,
+    }
+
+    async fn wired() -> Wired {
+        let broadcast = Arc::new(RecordingGateway::ready(uuid::Uuid::from_u128(0xa0)));
+        let notifications = FakeNotifications::ready();
+        let rig = {
+            let broadcast = Arc::clone(&broadcast);
+            let notifications = Arc::clone(&notifications);
+            Rig::with_hook(move |db| {
+                let notifier = Arc::new(ActivationNotifier::new(
+                    Arc::new(DbNotificationStore::new(Arc::clone(db)))
+                        as Arc<dyn NotificationStore>,
+                    notifications as Arc<dyn NotificationGateway>,
+                    Arc::new(FakeScanLock::default()) as Arc<dyn ScanLock>,
+                    Arc::new(RecordingNotifyMetrics::default()) as Arc<dyn NotifyMetrics>,
+                    std::time::Duration::from_secs(30),
+                ));
+                let (_, metrics) = coherence_double(&broadcast);
+                Arc::new(
+                    CoherencePublisher::new(
+                        broadcast as Arc<dyn BroadcastGateway>,
+                        metrics as Arc<dyn BroadcastMetrics>,
+                    )
+                    .with_notifier(notifier),
+                )
+            })
+            .await
+        };
+        Wired {
+            rig,
+            broadcast,
+            notifications,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_that_wrote_states_publishes_the_pairs_notification_after_its_broadcast() {
+        let w = wired().await;
+        w.rig.declare("flag", scope_class::CASCADING).await;
+        let (root, a) = (w.rig.base.tree.root, w.rig.base.tree.a);
+        w.rig.subscribe("gear", "flag", root).await;
+        w.rig.subscribe("gear", "flag", a).await;
+        w.rig.subscribe("other-gear", "flag", a).await;
+
+        let committed = w
+            .rig
+            .set(
+                &actor(root),
+                "flag",
+                None,
+                serde_json::json!(true),
+                Some("absent"),
+            )
+            .await
+            .expect("the set commits");
+        assert_eq!(committed.key, w.rig.key("flag").as_str());
+
+        // The broadcast is the hook's first publish; the three pairs the change
+        // wrote follow, one `change_notification` each.
+        let events = w.broadcast.events();
+        assert_eq!(
+            events[0].type_id.as_ref() as &str,
+            settings_service_sdk::gts::CACHE_INVALIDATE_EVENT_TYPE
+        );
+        let notified: Vec<(String, String)> = events[1..]
+            .iter()
+            .map(|e| {
+                let data = e.data.clone().expect("a body");
+                (
+                    data["subscriber"].as_str().unwrap().to_owned(),
+                    data["tenant"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        let mut expected = vec![
+            ("gear".to_owned(), text(a)),
+            ("gear".to_owned(), text(root)),
+            ("other-gear".to_owned(), text(a)),
+        ];
+        expected.sort();
+        let mut sorted = notified.clone();
+        sorted.sort();
+        assert_eq!(
+            sorted, expected,
+            "one notification per pair the change wrote a state for"
+        );
+        assert_eq!(notified.len(), 3);
+        // The accepted publish stamped every state.
+        for (subscriber, tenant) in [("gear", root), ("gear", a), ("other-gear", a)] {
+            let state = w
+                .rig
+                .state(subscriber, "flag", tenant)
+                .await
+                .expect("state");
+            assert!(state.last_notified_at.is_some(), "{subscriber} at {tenant}");
+        }
+        assert!(
+            w.notifications.events().is_empty(),
+            "the loop's session is not used"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_change_that_affects_no_subscription_publishes_no_notification() {
+        let w = wired().await;
+        w.rig.declare("flag", scope_class::CASCADING).await;
+        let root = w.rig.base.tree.root;
+        w.rig
+            .set(
+                &actor(root),
+                "flag",
+                None,
+                serde_json::json!(true),
+                Some("absent"),
+            )
+            .await
+            .expect("the set commits");
+        assert_eq!(w.broadcast.events().len(), 1, "the broadcast only");
+    }
 }

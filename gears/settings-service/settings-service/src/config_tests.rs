@@ -225,6 +225,34 @@ fn a_zero_lock_budget_or_redelivery_interval_is_refused_naming_the_field() {
 }
 
 #[test]
+fn a_lock_budget_above_an_hour_or_an_interval_above_a_day_is_refused() {
+    let cfg = parse(serde_json::json!({ "mutation_lock_wait_seconds": 3601 })).expect("parses");
+    let reason = cfg
+        .check_mutation_lock_wait()
+        .expect_err("above the ceiling");
+    assert!(
+        reason.contains("mutation_lock_wait_seconds") && reason.contains("3600"),
+        "{reason}"
+    );
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": 86_401 })).expect("parses");
+    let reason = cfg
+        .check_redeliver_interval()
+        .expect_err("above the ceiling");
+    assert!(
+        reason.contains("redeliver_interval_seconds") && reason.contains("86400"),
+        "{reason}"
+    );
+    let cfg = parse(serde_json::json!({
+        "mutation_lock_wait_seconds": 3600,
+        "redeliver_interval_seconds": 86_400,
+    }))
+    .expect("parses");
+    assert!(cfg.check_mutation_lock_wait().is_ok() && cfg.check_redeliver_interval().is_ok());
+    let cfg = parse(serde_json::json!({ "redeliver_interval_seconds": u64::MAX })).expect("parses");
+    assert!(cfg.check_redeliver_interval().is_err());
+}
+
+#[test]
 fn a_wrong_typed_lock_budget_or_interval_is_refused_rather_than_coerced() {
     assert!(parse(serde_json::json!({ "mutation_lock_wait_seconds": "ten" })).is_err());
     assert!(parse(serde_json::json!({ "redeliver_interval_seconds": -1 })).is_err());

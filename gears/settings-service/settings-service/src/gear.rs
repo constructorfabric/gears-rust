@@ -52,6 +52,13 @@ pub type ConcreteResolver = crate::domain::resolution::ValueResolver<
     crate::infra::storage::access_repo::AccessRepo,
 >;
 
+/// The Activation Outcome Recorder over the concrete repository and audit
+/// sink: the server half of the SDK's `report_outcome`.
+pub type ConcreteRecorder = crate::domain::activation::ActivationRecorder<
+    crate::infra::storage::activation_repo::ActivationRepo,
+    crate::infra::storage::audit_store::AuditStore,
+>;
+
 /// The subscription service over the concrete repositories: the server half of
 /// subscribing to a setting and retiring a subscription.
 pub type ConcreteSubscriptions = crate::infra::subscriptions::SubscriptionService<
@@ -98,6 +105,9 @@ pub struct SettingsService {
     event_broker: OnceLock<Arc<crate::infra::event_broker::EventBrokerClient>>,
     cache: OnceLock<Arc<crate::domain::resolution::EffectiveCache>>,
     subscriptions: OnceLock<Arc<ConcreteSubscriptions>>,
+    notifier: OnceLock<Arc<crate::domain::activation::ActivationNotifier>>,
+    recorder: OnceLock<Arc<ConcreteRecorder>>,
+    notify_metrics: OnceLock<Arc<dyn crate::domain::activation::NotifyMetrics>>,
 }
 
 impl Default for SettingsService {
@@ -118,6 +128,9 @@ impl Default for SettingsService {
             event_broker: OnceLock::new(),
             cache: OnceLock::new(),
             subscriptions: OnceLock::new(),
+            notifier: OnceLock::new(),
+            recorder: OnceLock::new(),
+            notify_metrics: OnceLock::new(),
         }
     }
 }
@@ -157,19 +170,33 @@ const PRUNE_BATCHES: PruneBatches = PruneBatches {
 /// indexed counts, cheap enough for a minute's resolution on a dashboard.
 const REVIEW_TICK: Duration = Duration::from_mins(1);
 
-/// How long the stop waits for the cache invalidation consumer: its own
-/// cleanup deadline (10 s) with room to spare, inside the lifecycle's 30 s
-/// `stop_timeout`.
+/// How long the stop waits for the background tasks together — the cache
+/// invalidation consumer and the activation delivery loop, awaited under this
+/// one deadline, not one each: the consumer's own cleanup deadline (10 s) with
+/// room to spare, inside the lifecycle's 30 s `stop_timeout`.
 const CONSUMER_STOP_BOUND: Duration = Duration::from_secs(15);
 
-/// The running cache invalidation consumer: dropping it without joining it
-/// (the lifecycle future dropped, an early return) aborts the task, so it never
-/// outlives the gear.
-struct ConsumerTask(Option<tokio::task::JoinHandle<()>>);
+/// A running background task of the gear — the cache invalidation consumer, the
+/// activation delivery loop: dropping it without joining it (the lifecycle
+/// future dropped, an early return) aborts the task, so it never outlives the
+/// gear.
+struct ConsumerTask {
+    name: &'static str,
+    handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ConsumerTask {
+    const fn new(name: &'static str, handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            name,
+            handle: Some(handle),
+        }
+    }
+}
 
 impl Drop for ConsumerTask {
     fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
+        if let Some(handle) = self.handle.take() {
             handle.abort();
         }
     }
@@ -194,6 +221,7 @@ impl SettingsService {
         let retention = Duration::from_hours(u64::from(self.config()?.audit_retention_days) * 24);
         // Spawned before readiness so an uninitialized gear refuses to start.
         let consuming = self.spawn_consumer(&cancel)?;
+        let delivering = self.spawn_delivery(&cancel)?;
         ready.notify();
         info!(
             tick_secs = SWEEP_TICK.as_secs(),
@@ -201,7 +229,7 @@ impl SettingsService {
         );
         let metrics = crate::infra::lifecycle_metrics::OtelLifecycleMetrics::new();
         Self::tick_until_cancelled(&writes, &db, retention, &metrics, &cancel).await;
-        Self::await_consumer(consuming, CONSUMER_STOP_BOUND).await;
+        Self::await_tasks(vec![consuming, delivering], CONSUMER_STOP_BOUND).await;
         info!("pending-secret sweep and audit retention stopped");
         Ok(())
     }
@@ -214,37 +242,66 @@ impl SettingsService {
         let consumer = crate::infra::cache_invalidation::CacheInvalidationConsumer::new(
             self.event_broker()?,
             self.cache()?,
-        );
+        )
+        .with_metrics(self.notify_metrics()?);
         let cancel = cancel.clone();
-        Ok(ConsumerTask(Some(tokio::spawn(async move {
-            consumer.run(cancel).await;
-        }))))
+        Ok(ConsumerTask::new(
+            "cache invalidation consumer",
+            tokio::spawn(async move {
+                consumer.run(cancel).await;
+            }),
+        ))
         // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-2
     }
 
-    /// The stop waits for the consumer to leave and delete its group, which is
-    /// bounded by its own deadline inside the lifecycle's stop timeout. A
-    /// consumer still running when `bound` has passed is aborted, so a broker
-    /// call that never answers cannot hold the lifecycle past its stop.
-    async fn await_consumer(mut consuming: ConsumerTask, bound: Duration) {
-        let Some(handle) = consuming.0.as_mut() else {
-            return;
-        };
-        match tokio::time::timeout(bound, &mut *handle).await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "cache invalidation consumer ended abnormally");
-            }
-            Err(_elapsed) => {
-                handle.abort();
-                tracing::warn!(
-                    bound_secs = bound.as_secs(),
-                    "cache invalidation consumer outlived the shutdown bound; aborted"
-                );
+    /// Start the replica's activation delivery loop beside the cache consumer,
+    /// under the same token. It owns its tick and looks the broker up on it, so
+    /// a missing broker never delays or fails the start.
+    fn spawn_delivery(&self, cancel: &CancellationToken) -> anyhow::Result<ConsumerTask> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-6
+        let delivery = crate::infra::activation_delivery::ActivationDelivery::new(self.notifier()?);
+        let cancel = cancel.clone();
+        Ok(ConsumerTask::new(
+            "activation delivery loop",
+            tokio::spawn(async move {
+                delivery.run(cancel).await;
+            }),
+        ))
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-6
+    }
+
+    /// The stop waits for the background tasks to leave — the consumer to
+    /// leave and delete its group, the delivery loop to finish or abandon its
+    /// pass — under **one** deadline, the tasks joined together. Any still
+    /// running when `bound` has passed is aborted, so a broker call that never
+    /// answers cannot hold the lifecycle past its stop, whichever task is
+    /// stalled or whether both are.
+    async fn await_tasks(mut tasks: Vec<ConsumerTask>, bound: Duration) {
+        let joined = futures_util::future::join_all(tasks.iter_mut().map(Self::join_task));
+        if tokio::time::timeout(bound, joined).await.is_err() {
+            for task in &mut tasks {
+                if let Some(handle) = task.handle.take() {
+                    handle.abort();
+                    tracing::warn!(
+                        bound_secs = bound.as_secs(),
+                        task = task.name,
+                        "background task outlived the shutdown bound; aborted"
+                    );
+                }
             }
         }
-        // Joined or aborted: nothing is left for the guard to abort.
-        consuming.0 = None;
+    }
+
+    /// Join one task; a task joined leaves nothing for its guard to abort.
+    async fn join_task(task: &mut ConsumerTask) {
+        let Some(handle) = task.handle.as_mut() else {
+            return;
+        };
+        let joined = handle.await;
+        task.handle = None;
+        if let Err(error) = joined {
+            tracing::warn!(%error, task = task.name, "background task ended abnormally");
+        }
     }
 
     /// The periodic passes, until the lifecycle is cancelled.
@@ -608,6 +665,78 @@ impl SettingsService {
             .ok_or_else(|| anyhow::anyhow!("{} subscriptions not initialized", Self::MODULE_NAME))
     }
 
+    /// The Activation Outcome Recorder — the server half of the SDK's
+    /// `report_outcome` — once initialized.
+    ///
+    /// # Errors
+    /// If called before `init` completed.
+    pub fn recorder(&self) -> anyhow::Result<Arc<ConcreteRecorder>> {
+        self.recorder
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} recorder not initialized", Self::MODULE_NAME))
+    }
+
+    /// The notification half of the Activation Publisher, once initialized.
+    fn notifier(&self) -> anyhow::Result<Arc<crate::domain::activation::ActivationNotifier>> {
+        self.notifier
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} notifier not initialized", Self::MODULE_NAME))
+    }
+
+    /// The notification instruments, once initialized.
+    fn notify_metrics(&self) -> anyhow::Result<Arc<dyn crate::domain::activation::NotifyMetrics>> {
+        self.notify_metrics
+            .get()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("{} metrics not initialized", Self::MODULE_NAME))
+    }
+
+    /// Consumer activation, delivery half: the notifier — the end-of-request
+    /// notifications and the delivery loop's pass over the awaiting states —
+    /// and the Recorder that settles them against the consumer's report.
+    ///
+    /// Neither resolves the broker here nor waits for it, and the broker is
+    /// never in the gear's `deps`: the delivery loop looks it up on its own
+    /// tick.
+    fn bind_notifications(
+        &self,
+        config: &SettingsServiceConfig,
+    ) -> anyhow::Result<Arc<crate::domain::activation::ActivationNotifier>> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-5
+        let metrics: Arc<dyn crate::domain::activation::NotifyMetrics> =
+            Arc::new(crate::infra::activation_metrics::OtelNotifyMetrics::new());
+        let notifier = Arc::new(crate::domain::activation::ActivationNotifier::new(
+            Arc::new(
+                crate::infra::storage::notification_store::DbNotificationStore::new(self.db()?),
+            ),
+            self.event_broker()?,
+            Arc::new(crate::infra::mutation_lock::DeliveryScanLock::new(
+                self.db()?,
+            )),
+            Arc::clone(&metrics),
+            Duration::from_secs(config.redeliver_interval_seconds),
+        ));
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-5
+        let recorder = Arc::new(crate::domain::activation::ActivationRecorder::new(
+            self.db()?,
+            crate::infra::storage::activation_repo::ActivationRepo,
+            crate::infra::storage::audit_store::AuditStore,
+            Arc::clone(&metrics),
+        ));
+        self.notify_metrics
+            .set(metrics)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.notifier
+            .set(Arc::clone(&notifier))
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        self.recorder
+            .set(recorder)
+            .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
+        Ok(notifier)
+    }
+
     /// Tenant access restrictions: set, clear, read and list, each mutation in
     /// its own transaction with its record, evicting the restricted subtree, and
     /// under the setting key's mutation lock.
@@ -636,7 +765,7 @@ impl SettingsService {
     /// The key's mutation lock: one named advisory lock per setting key, taken by
     /// every value change, restriction change, registration and retire of the
     /// key, within `mutation_lock_wait_seconds`. The budget and the delivery
-    /// loop's interval are checked first: a zero of either fails init rather
+    /// loop's interval are checked first: a zero or an over-ceiling value of either fails init rather
     /// than serving on a guess.
     ///
     /// On the single-process `SQLite` profile the lock markers a crash may have
@@ -870,6 +999,7 @@ impl Gear for SettingsService {
             .set(Arc::clone(&resolver))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
         let locks = self.bind_locks(&config).await?;
+        let notifier = self.bind_notifications(&config)?;
         self.bind_access(&hierarchy_for_access, &platform_scope, &cache, &locks)?;
 
         // The write path: the step-up verifier over the platform's AuthN
@@ -895,10 +1025,13 @@ impl Gear for SettingsService {
         // The end-of-request publish hook every writing path calls once its
         // request ends. It reads the broker client's cached state; nothing
         // here resolves the broker.
-        let coherence = Arc::new(crate::domain::coherence::CoherencePublisher::new(
-            self.event_broker()?,
-            Arc::new(crate::infra::coherence_metrics::OtelBroadcastMetrics::new()),
-        ));
+        let coherence = Arc::new(
+            crate::domain::coherence::CoherencePublisher::new(
+                self.event_broker()?,
+                Arc::new(crate::infra::coherence_metrics::OtelBroadcastMetrics::new()),
+            )
+            .with_notifier(notifier),
+        );
         let writer = Arc::new(crate::domain::writes::ValueWriter::new(
             crate::infra::storage::value_repo::ValueRepo,
             Arc::clone(&resolver),

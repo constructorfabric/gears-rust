@@ -12,6 +12,8 @@ use event_broker_sdk::Event;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
 
+use crate::domain::activation::{ActivationNotifier, ActivationPairs};
+
 use super::{
     BroadcastContext, BroadcastMetrics, BroadcastResult, BroadcastSink, BroadcastState,
     ChangeOutcome, RequestBroadcast, TenantKeys, TouchedTenants,
@@ -80,13 +82,28 @@ pub fn correlation_id(request_id: &str) -> Uuid {
 pub struct CoherencePublisher {
     gateway: Arc<dyn BroadcastGateway>,
     metrics: Arc<dyn BroadcastMetrics>,
+    notifier: Option<Arc<ActivationNotifier>>,
 }
 
 impl CoherencePublisher {
     /// A hook over the broker client's view and the broadcast counter.
     #[must_use]
     pub fn new(gateway: Arc<dyn BroadcastGateway>, metrics: Arc<dyn BroadcastMetrics>) -> Self {
-        Self { gateway, metrics }
+        Self {
+            gateway,
+            metrics,
+            notifier: None,
+        }
+    }
+
+    /// Run the notification half of the hook — one `change_notification` per
+    /// pair of subscriber and tenant a request wrote activation states for —
+    /// after the broadcasts, on the same session. Without it a request
+    /// publishes broadcasts only, and the delivery loop covers the states.
+    #[must_use]
+    pub fn with_notifier(mut self, notifier: Arc<ActivationNotifier>) -> Self {
+        self.notifier = Some(notifier);
+        self
     }
 
     /// The end of a value-writing request, run inside the request's span: the
@@ -96,6 +113,7 @@ impl CoherencePublisher {
         &self,
         outcomes: impl IntoIterator<Item = ChangeOutcome>,
         change_set_id: Uuid,
+        pairs: &ActivationPairs,
     ) {
         // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-1
         // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-2
@@ -104,6 +122,7 @@ impl CoherencePublisher {
         // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-2
         self.publish_request(
             &touched,
+            pairs,
             change_set_id,
             toolkit_trace_context::current_traceparent(),
         )
@@ -130,6 +149,7 @@ impl CoherencePublisher {
         );
         self.publish_request(
             &touched,
+            &ActivationPairs::new(),
             change_set_id,
             toolkit_trace_context::current_traceparent(),
         )
@@ -138,22 +158,26 @@ impl CoherencePublisher {
     }
 
     /// Publish what `touched` gathered, once per tenant touched, under
-    /// `change_set_id`. Returns when every publish has been counted; the
-    /// request's own answer never depends on it.
+    /// `change_set_id`, and then — the notification half — one
+    /// `change_notification` per pair in `pairs`, on the same session and under
+    /// the same skip-after-first-failure rule. Returns when every publish has
+    /// been counted; the request's own answer never depends on it.
     pub async fn publish_request(
         &self,
         touched: &TouchedTenants,
+        pairs: &ActivationPairs,
         change_set_id: Uuid,
         trace_parent: Option<String>,
     ) {
         // A request that committed nothing publishes nothing and counts nothing.
-        if touched.is_empty() {
+        if touched.is_empty() && pairs.is_empty() {
             return;
         }
         // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-5
         let state = self.gateway.state();
         let Some(root) = self.gateway.root_tenant() else {
-            // Nothing is built: the root tenant's id is the envelope's tenant.
+            // Nothing is built: the root tenant's id is the envelope's tenant,
+            // and the notifications' publish needs it known as well.
             RequestBroadcast::new(None, self.metrics.as_ref(), state, change_set_id)
                 .skip(touched.touched_count());
             log_skipped(change_set_id, touched.touched_count(), state);
@@ -166,29 +190,41 @@ impl CoherencePublisher {
             self.metrics.as_ref(),
             state,
             change_set_id,
-        );
+        )
+        .with_notifications(self.notifier.as_ref().is_some_and(|n| n.registered()));
         // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-5
         let ctx = BroadcastContext {
             root_tenant: root,
             change_set_id,
             trace_parent,
         };
-        // One body per tenant touched, in first-touch order, wrapped in the
-        // broker-native envelope and split where a key set would not fit. The
-        // events are built whatever the broker's state: with no broker or the
-        // types unregistered each is counted `skipped` by the outcome.
-        let events = self.gateway.broadcasts(&touched.resolve(root), &ctx);
-        let built = events.len();
-        // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-6
-        let results = request.publish_all(events).await;
-        // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-6
-        // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-8
-        log_results(change_set_id, built, &results);
-        // The request answers its caller with its own outcomes, whatever the
-        // broadcasts' were; this hook returns nothing to it.
-        // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-8
+        if !touched.is_empty() {
+            // One body per tenant touched, in first-touch order, wrapped in the
+            // broker-native envelope and split where a key set would not fit.
+            // The events are built whatever the broker's state: with no broker
+            // or the types unregistered each is counted `skipped` by the outcome.
+            let events = self.gateway.broadcasts(&touched.resolve(root), &ctx);
+            let built = events.len();
+            // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-6
+            let results = request.publish_all(events).await;
+            // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-6
+            // @cpt-begin:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-8
+            log_results(change_set_id, built, &results);
+            // The request answers its caller with its own outcomes, whatever the
+            // broadcasts' were; this hook returns nothing to it.
+            // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-publish:p1:inst-rc-publish-8
+        }
+        if let Some(notifier) = &self.notifier {
+            notifier
+                .publish_request(&mut request, pairs, ctx.trace_parent.as_deref())
+                .await;
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "notification_hook_tests.rs"]
+mod notification_hook_tests;
 
 #[cfg(test)]
 #[path = "publisher_tests.rs"]

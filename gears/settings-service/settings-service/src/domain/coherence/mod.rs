@@ -16,6 +16,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::domain::activation::NotificationPublisher;
+pub use crate::domain::broker_sink::{BroadcastSink, NotificationResult, PublishError};
 use crate::domain::resolution::{EffectiveCache, scope_class};
 use toolkit_macros::domain_model;
 
@@ -229,33 +231,6 @@ pub struct BroadcastContext {
 // The broadcast outcome
 // ---------------------------------------------------------------------------
 
-/// Why a publish did not complete.
-#[domain_model]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PublishError {
-    /// The broker refused it, a missing `produce` grant included.
-    Refused(String),
-    /// The broker did not accept it within `publish_timeout_seconds`.
-    TimedOut,
-}
-
-impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Refused(reason) => write!(f, "refused: {reason}"),
-            Self::TimedOut => f.write_str("not accepted within the publish timeout"),
-        }
-    }
-}
-
-/// The publishing end of the broker client: hands the broker one event and
-/// waits at most `publish_timeout_seconds` for its acceptance.
-#[async_trait]
-pub trait BroadcastSink: Send + Sync {
-    /// Publish `event` under the publishing identity.
-    async fn publish(&self, event: Event) -> Result<(), PublishError>;
-}
-
 /// The result of one broadcast.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,7 +279,26 @@ pub struct RequestBroadcast<'a> {
     metrics: &'a dyn BroadcastMetrics,
     state: BroadcastState,
     change_set_id: Uuid,
+    notifications_registered: bool,
     failed: bool,
+}
+
+/// The request's session as the activation notifier publishes through it: the
+/// notifier names only [`NotificationPublisher`], and this is the one place the
+/// two halves meet.
+#[async_trait]
+impl NotificationPublisher for RequestBroadcast<'_> {
+    fn can_notify(&self) -> bool {
+        RequestBroadcast::can_notify(self)
+    }
+
+    fn has_failed(&self) -> bool {
+        RequestBroadcast::has_failed(self)
+    }
+
+    async fn publish_notification(&mut self, event: Event) -> NotificationResult {
+        RequestBroadcast::publish_notification(self, event).await
+    }
 }
 
 impl<'a> RequestBroadcast<'a> {
@@ -321,7 +315,52 @@ impl<'a> RequestBroadcast<'a> {
             metrics,
             state,
             change_set_id,
+            notifications_registered: false,
             failed: false,
+        }
+    }
+
+    /// Say whether the activation topic and the `change_notification` type are
+    /// registered: until they are, the request's notifications are not
+    /// published.
+    #[must_use]
+    pub const fn with_notifications(mut self, registered: bool) -> Self {
+        self.notifications_registered = registered;
+        self
+    }
+
+    /// Whether the request can publish a notification at all: a broker
+    /// resolved, the activation types registered and the root tenant's id
+    /// known.
+    #[must_use]
+    pub const fn can_notify(&self) -> bool {
+        self.sink.is_some() && self.notifications_registered && self.state.root_tenant_known
+    }
+
+    /// Publish one `change_notification` of the request, under the same skip
+    /// rule as the broadcasts: nothing is attempted once a publish of the
+    /// request — a `cache_invalidate` broadcast included — has failed, so the
+    /// request pays at most one `publish_timeout_seconds`.
+    pub async fn publish_notification(&mut self, event: Event) -> NotificationResult {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-3
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-4
+        let Some(sink) = self.sink.filter(|_| self.can_notify()) else {
+            return NotificationResult::Skipped;
+        };
+        if self.failed {
+            return NotificationResult::Skipped;
+        }
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-4
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-3
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-9
+        let published = sink.publish(event).await;
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-9
+        match published {
+            Ok(()) => NotificationResult::Accepted,
+            Err(reason) => {
+                self.failed = true;
+                NotificationResult::Failed(reason)
+            }
         }
     }
 

@@ -22,6 +22,7 @@ use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
 use super::publisher::{Qualified, StateWrite};
+use super::recorder::Transition;
 use super::{ActivationState, SubscriberTenant, Subscription, tenant_text};
 use crate::domain::access::AccessRepository;
 use crate::domain::category::{DomainVisibility, is_visible};
@@ -106,6 +107,21 @@ pub trait ActivationRepository: Send + Sync {
         key: &str,
         tenant: &str,
     ) -> Result<Option<ActivationState>, DomainError>;
+
+    /// Settle the state a report decided on: set `status`, `applied_value`,
+    /// `detail`, `reported_at` now and `updated_at` now, guarded on the row
+    /// still naming the transition's `change_ref` and still being `awaiting`.
+    /// Returns the stamp written, or `None` when the guard matched no row —
+    /// a concurrent report settled it, or a concurrent change replaced its
+    /// expectation.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the statement fails.
+    async fn report<C: DBRunner>(
+        &self,
+        conn: &C,
+        transition: &Transition,
+    ) -> Result<Option<time::OffsetDateTime>, DomainError>;
 }
 
 /// The repository of a writer that records no activation state: it holds
@@ -172,6 +188,14 @@ impl ActivationRepository for NoActivation {
         _key: &str,
         _tenant: &str,
     ) -> Result<Option<ActivationState>, DomainError> {
+        Ok(None)
+    }
+
+    async fn report<C: DBRunner>(
+        &self,
+        _conn: &C,
+        _transition: &Transition,
+    ) -> Result<Option<time::OffsetDateTime>, DomainError> {
         Ok(None)
     }
 }

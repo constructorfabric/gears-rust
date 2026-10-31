@@ -27,6 +27,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit_security::SecurityContext;
 use tracing::{debug, info, info_span, warn};
 
+use crate::domain::activation::{NoNotifyMetrics, NotifyMetrics};
 use crate::domain::coherence::consume_cache_invalidation;
 use crate::domain::resolution::EffectiveCache;
 use crate::infra::event_broker::{Backoff, EventBrokerClient, or_cancelled};
@@ -112,6 +113,7 @@ struct Held {
 pub struct CacheInvalidationConsumer {
     client: Arc<EventBrokerClient>,
     cache: Arc<EffectiveCache>,
+    metrics: Arc<dyn NotifyMetrics>,
     cleanup_deadline: Duration,
     liveness: Duration,
     healthy: Duration,
@@ -120,14 +122,23 @@ pub struct CacheInvalidationConsumer {
 impl CacheInvalidationConsumer {
     /// A consumer evicting from `cache` on what `client`'s broker delivers.
     #[must_use]
-    pub const fn new(client: Arc<EventBrokerClient>, cache: Arc<EffectiveCache>) -> Self {
+    pub fn new(client: Arc<EventBrokerClient>, cache: Arc<EffectiveCache>) -> Self {
         Self {
             client,
             cache,
+            metrics: Arc::new(NoNotifyMetrics),
             cleanup_deadline: CLEANUP_DEADLINE,
             liveness: LIVENESS_PERIOD,
             healthy: HEALTHY_STREAM,
         }
+    }
+
+    /// Observe `settings_notify_publish_to_deliver_seconds` for each delivery
+    /// through `metrics`.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn NotifyMetrics>) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Replace the stop deadline, the liveness period and the healthy-stream
@@ -456,6 +467,16 @@ impl CacheInvalidationConsumer {
             return;
         }
         // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-consume:p1:inst-rc-consume-2
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-17
+        // At receipt, before the malformed drop: from the envelope's
+        // `occurred_at` to now, so a dropped delivery is observed too.
+        self.metrics.publish_to_deliver(
+            "cache_invalidate",
+            (chrono::Utc::now() - event.occurred_at)
+                .to_std()
+                .unwrap_or(Duration::ZERO),
+        );
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-17
         let span = info_span!(
             "cache_invalidate.consume",
             change_set_id = tracing::field::Empty,

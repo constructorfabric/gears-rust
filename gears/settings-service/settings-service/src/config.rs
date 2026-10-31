@@ -45,6 +45,12 @@ const DEFAULT_AUDIT_RETENTION_DAYS: u32 = 365;
 const DEFAULT_PUBLISH_TIMEOUT_SECONDS: u64 = 2;
 /// The longest a deployment may make a request wait on the broker.
 pub const PUBLISH_TIMEOUT_CEILING_SECONDS: u64 = 10;
+
+/// The ceiling of `mutation_lock_wait_seconds`: one hour.
+pub const MUTATION_LOCK_WAIT_CEILING_SECONDS: u64 = 3_600;
+
+/// The ceiling of `redeliver_interval_seconds`: one day.
+pub const REDELIVER_INTERVAL_CEILING_SECONDS: u64 = 86_400;
 /// How long a mutation waits for its key's mutation lock before it answers
 /// `Unavailable`.
 const DEFAULT_MUTATION_LOCK_WAIT_SECONDS: u64 = 10;
@@ -96,9 +102,10 @@ pub struct SettingsServiceConfig {
     /// another gear's configuration and is not visible here.
     ///
     /// Defaults to 10; init refuses a zero, which would fail every mutation
-    /// that meets another. A budget above the platform's request deadline is
-    /// accepted and is a misconfiguration: the batch cap enforces the deadline
-    /// and a single-value request would be cut by its caller first.
+    /// that meets another, and a value above 3600 (an hour). A budget above
+    /// the platform's request deadline is accepted and is a misconfiguration:
+    /// the batch cap enforces the deadline and a single-value request would be
+    /// cut by its caller first.
     #[serde(default = "default_mutation_lock_wait_seconds")]
     pub mutation_lock_wait_seconds: u64,
 
@@ -107,7 +114,8 @@ pub struct SettingsServiceConfig {
     /// is published again.
     ///
     /// Defaults to 30; init refuses a zero, which would republish every state
-    /// on every tick without pause.
+    /// on every tick without pause, and a value above 86400 (a day). The first
+    /// pass runs at start, then one every interval.
     #[serde(default = "default_redeliver_interval_seconds")]
     pub redeliver_interval_seconds: u64,
 
@@ -169,7 +177,7 @@ impl SettingsServiceConfig {
         ))
     }
 
-    /// Refuse a `mutation_lock_wait_seconds` of zero.
+    /// Refuse a `mutation_lock_wait_seconds` outside `1..=3600`.
     ///
     /// # Errors
     /// Names the field and the reason.
@@ -178,34 +186,37 @@ impl SettingsServiceConfig {
         // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
         // A budget above the platform request deadline is accepted: the batch
         // cap by the remainder of the deadline enforces the deadline.
-        if self.mutation_lock_wait_seconds >= 1 {
+        if (1..=MUTATION_LOCK_WAIT_CEILING_SECONDS).contains(&self.mutation_lock_wait_seconds) {
             return Ok(());
         }
-        Err(
-            "mutation_lock_wait_seconds is 0 but must be at least 1: it is how long a mutation \
-             waits for its key's lock, and a zero would fail every mutation that meets another"
-                .to_owned(),
-        )
+        Err(format!(
+            "mutation_lock_wait_seconds is {} but must be between 1 and \
+             {MUTATION_LOCK_WAIT_CEILING_SECONDS}: it is how long a mutation waits for its key's \
+             lock, a zero would fail every mutation that meets another and a value above the \
+             ceiling is no bound at all",
+            self.mutation_lock_wait_seconds
+        ))
         // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
         // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-2
     }
 
-    /// Refuse a `redeliver_interval_seconds` of zero.
+    /// Refuse a `redeliver_interval_seconds` outside `1..=86400`.
     ///
     /// # Errors
     /// Names the field and the reason.
     pub fn check_redeliver_interval(&self) -> Result<(), String> {
         // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-1
         // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
-        if self.redeliver_interval_seconds >= 1 {
+        if (1..=REDELIVER_INTERVAL_CEILING_SECONDS).contains(&self.redeliver_interval_seconds) {
             return Ok(());
         }
-        Err(
-            "redeliver_interval_seconds is 0 but must be at least 1: it is the delivery loop's \
-             tick and the wait before a state is published again, and a zero would republish \
-             without pause"
-                .to_owned(),
-        )
+        Err(format!(
+            "redeliver_interval_seconds is {} but must be between 1 and \
+             {REDELIVER_INTERVAL_CEILING_SECONDS}: it is the delivery loop's tick and the wait \
+             before a state is published again, a zero would republish without pause and a value \
+             above the ceiling would leave a state undelivered for longer than a day",
+            self.redeliver_interval_seconds
+        ))
         // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-3
         // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-1
     }

@@ -338,14 +338,9 @@ impl WriteCoordinator {
                     .iter()
                     .map(|c| ChangeOutcome::value_write(&c.key, c.tenant_id, &c.scope_class, true)),
                 change_set_id,
+                pairs,
             )
             .await;
-        }
-        if !pairs.is_empty() {
-            tracing::debug!(
-                pairs = pairs.pairs().len(),
-                "activation states written; the notification half of the end-of-request hook delivers them"
-            );
         }
     }
 

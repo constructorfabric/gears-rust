@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use toolkit_db::{DBProvider, DbError, LockConfig};
 
-use crate::domain::activation::{HeldKey, KeyLocks, LockMetrics};
+use crate::domain::activation::{HeldKey, KeyLocks, LockMetrics, ScanLock};
 use crate::domain::error::DomainError;
 use crate::log_text::LogSafe;
 
@@ -203,6 +203,63 @@ impl KeyLocks for MutationLock {
                 ))
             }
         }
+    }
+}
+
+/// The delivery loop's scan lock: the same facility as the key's lock, named
+/// [`SCAN_LOCK_KEY`], attempted exactly once and never waited for — a replica
+/// that does not get it skips the tick, so exactly one replica scans per tick.
+pub struct DeliveryScanLock {
+    db: Arc<DBProvider<DbError>>,
+    key: String,
+}
+
+impl DeliveryScanLock {
+    /// Over this database, under the name every replica uses.
+    #[must_use]
+    pub fn new(db: Arc<DBProvider<DbError>>) -> Self {
+        Self::named(db, SCAN_LOCK_KEY)
+    }
+
+    /// Under another name: what a test uses so that its lock is its own on the
+    /// file-marker backend, whose markers every test process shares.
+    #[must_use]
+    pub fn named(db: Arc<DBProvider<DbError>>, key: impl Into<String>) -> Self {
+        Self {
+            db,
+            key: key.into(),
+        }
+    }
+
+    /// The `toolkit-db` configuration of the one attempt: no retry, no wait.
+    #[must_use]
+    pub fn config() -> LockConfig {
+        LockConfig {
+            max_wait: None,
+            max_retries: Some(0),
+            ..LockConfig::default()
+        }
+    }
+}
+
+#[async_trait]
+impl ScanLock for DeliveryScanLock {
+    async fn try_acquire(&self) -> Result<Option<Box<dyn HeldKey>>, DomainError> {
+        let attempt = self
+            .db
+            .db()
+            .try_lock(LOCK_GEAR, &self.key, Self::config())
+            .await
+            .map_err(|err| {
+                DomainError::dependency_unavailable("lock service", "attempt the scan lock", err)
+            })?;
+        Ok(attempt.map(|guard| {
+            Box::new(Held {
+                key: self.key.clone(),
+                guard: Box::new(guard) as Box<dyn Releaser>,
+                metrics: Arc::new(crate::domain::activation::NoLockMetrics) as Arc<dyn LockMetrics>,
+            }) as Box<dyn HeldKey>
+        }))
     }
 }
 

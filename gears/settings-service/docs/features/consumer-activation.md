@@ -49,6 +49,7 @@ description: "Feature specification of the Settings Service gear's consumer acti
   - [Outcome Recording](#outcome-recording)
   - [Consumer Activation SDK](#consumer-activation-sdk)
   - [Activation Is Observable](#activation-is-observable)
+  - [Activation Is Observable in the SDK](#activation-is-observable-in-the-sdk)
   - [Activation Tests](#activation-tests)
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 
@@ -231,7 +232,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Publish Notifications at the End of a Request
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-publish`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-publish`
 
 **Actor**: `cpt-cf-settings-service-actor-event-broker`
 
@@ -245,22 +246,22 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - A publish refused — a missing `produce` grant included — or not accepted within `publish_timeout_seconds`: it is dropped, logged at `warn`, the request's remaining publishes are skipped, and the states stay `awaiting` for the delivery loop
 
 **Steps**:
-1. [ ] - `p1` - The Value Writer's end-of-request publish hook reaches this flow after every change of the request committed or was refused, and after the replica coherence publish (`cpt-cf-settings-service-flow-replica-coherence-publish`) handed its broadcasts to the broker - `inst-ca-publish-1`
-2. [ ] - `p1` - **IF** the request remembered no pair of subscriber and tenant → **RETURN** with nothing published - `inst-ca-publish-2`
-3. [ ] - `p1` - **IF** the hook resolved no broker for the request, **OR** the activation topic and the `change_notification` type are not yet registered (`cpt-cf-settings-service-flow-consumer-activation-lifecycle`), **OR** the root tenant's id is not yet known → publish nothing and **RETURN**; the states stay `awaiting` for the delivery loop - `inst-ca-publish-3`
-4. [ ] - `p1` - **IF** an earlier publish of the same request — a `cache_invalidate` broadcast included — was refused or timed out → publish nothing and **RETURN**, so the request pays at most one `publish_timeout_seconds` - `inst-ca-publish-4`
-5. [ ] - `p1` - **FOR EACH** remembered pair, in the order the request first touched it - `inst-ca-publish-5`
-   1. [ ] - `p1` - DB: SELECT the pair's `activation_state` rows with status `awaiting` through `idx_activation_awaiting` — every awaiting key of the pair, not only those this request changed - `inst-ca-publish-6`
-   2. [ ] - `p1` - Build the pair's notifications (`cpt-cf-settings-service-algo-consumer-activation-bundle`) - `inst-ca-publish-7`
-   3. [ ] - `p1` - Wrap each in the broker-native envelope: `type_id` the `change_notification` type, `tenant_id` the subscription's tenant, `subject` that tenant, `subject_type` the activation subject type, `source` the gear name `settings-service`, an `id` unique to the event, `occurred_at` the time of publishing, `trace_parent` from the current span when one is present, and the body as `data` - `inst-ca-publish-8`
-   4. [ ] - `p1` - Publish each through `publish_notification` under the publishing identity of entry 2.12, waiting at most `publish_timeout_seconds` for the broker to accept it - `inst-ca-publish-9`
-   5. [ ] - `p1` - **IF** the broker accepted it → DB: UPDATE `activation_state` setting `last_notified_at` now on each bundled row that still names the `change_ref` it was bundled with, so a row a later change overwrote meanwhile stays unstamped - `inst-ca-publish-10`
-   6. [ ] - `p1` - **ELSE** → drop the publish, log at `warn` with the subscriber, the tenant and the broker's reason, and skip the request's remaining publishes; the rows stay `awaiting` - `inst-ca-publish-11`
-6. [ ] - `p1` - **RETURN** to the request, which answers its caller with the outcomes of its changes whatever the notifications' outcomes - `inst-ca-publish-12`
+1. [x] - `p1` - The Value Writer's end-of-request publish hook reaches this flow after every change of the request committed or was refused, and after the replica coherence publish (`cpt-cf-settings-service-flow-replica-coherence-publish`) handed its broadcasts to the broker - `inst-ca-publish-1`
+2. [x] - `p1` - **IF** the request remembered no pair of subscriber and tenant → **RETURN** with nothing published - `inst-ca-publish-2`
+3. [x] - `p1` - **IF** the hook resolved no broker for the request, **OR** the activation topic and the `change_notification` type are not yet registered (`cpt-cf-settings-service-flow-consumer-activation-lifecycle`), **OR** the root tenant's id is not yet known → publish nothing and **RETURN**; the states stay `awaiting` for the delivery loop - `inst-ca-publish-3`
+4. [x] - `p1` - **IF** an earlier publish of the same request — a `cache_invalidate` broadcast included — was refused or timed out → publish nothing and **RETURN**, so the request pays at most one `publish_timeout_seconds` - `inst-ca-publish-4`
+5. [x] - `p1` - **FOR EACH** remembered pair, in the order the request first touched it - `inst-ca-publish-5`
+   1. [x] - `p1` - DB: SELECT the pair's `activation_state` rows with status `awaiting` through `idx_activation_awaiting` — every awaiting key of the pair, not only those this request changed - `inst-ca-publish-6`
+   2. [x] - `p1` - Build the pair's notifications (`cpt-cf-settings-service-algo-consumer-activation-bundle`) - `inst-ca-publish-7`
+   3. [x] - `p1` - Wrap each in the broker-native envelope: `type_id` the `change_notification` type, `tenant_id` the subscription's tenant, `subject` that tenant, `subject_type` the activation subject type, `source` the gear name `settings-service`, an `id` unique to the event, `occurred_at` the time of publishing, `trace_parent` from the current span when one is present, and the body as `data` - `inst-ca-publish-8`
+   4. [x] - `p1` - Publish each through `publish_notification` under the publishing identity of entry 2.12, waiting at most `publish_timeout_seconds` for the broker to accept it - `inst-ca-publish-9`
+   5. [x] - `p1` - **IF** the broker accepted it → DB: UPDATE `activation_state` setting `last_notified_at` now on each bundled row that still names the `change_ref` it was bundled with, so a row a later change overwrote meanwhile stays unstamped - `inst-ca-publish-10`
+   6. [x] - `p1` - **ELSE** → drop the publish, log at `warn` with the subscriber, the tenant and the broker's reason, and skip the request's remaining publishes; the rows stay `awaiting` - `inst-ca-publish-11`
+6. [x] - `p1` - **RETURN** to the request, which answers its caller with the outcomes of its changes whatever the notifications' outcomes - `inst-ca-publish-12`
 
 ### Deliver the Awaiting States
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-deliver`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-deliver`
 
 **Actor**: `cpt-cf-settings-service-actor-event-broker`
 
@@ -276,22 +277,22 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - `stop` during a pass: the pass finishes or is abandoned within the shutdown deadline, and every `awaiting` state is kept
 
 **Steps**:
-1. [ ] - `p1` - The delivery loop (`cpt-cf-settings-service-flow-consumer-activation-lifecycle`) starts one pass on a tick on which the broker resolved, the root tenant's id is known and the activation topic and the `change_notification` type are registered - `inst-ca-deliver-1`
-2. [ ] - `p1` - Make one non-blocking `try_lock` on the gear's scan lock through `toolkit-db`'s `LockManager` - `inst-ca-deliver-2`
-3. [ ] - `p1` - **IF** the scan lock is not acquired → **RETURN** from the pass without waiting: another replica scans this tick - `inst-ca-deliver-3`
-4. [ ] - `p1` - DB: DELETE in one conditional statement every `activation_state` row whose subscription no longer exists, whatever its status, leaving every row whose subscription exists untouched - `inst-ca-deliver-4`
-5. [ ] - `p1` - DB: SELECT the `activation_state` rows with status `awaiting` that are due — `last_notified_at` absent or older than `redeliver_interval_seconds` — through `idx_activation_awaiting`, grouped per pair of subscriber and tenant - `inst-ca-deliver-5`
-6. [ ] - `p1` - **FOR EACH** pair - `inst-ca-deliver-6`
-   1. [ ] - `p1` - Build the pair's notifications (`cpt-cf-settings-service-algo-consumer-activation-bundle`) - `inst-ca-deliver-7`
-   2. [ ] - `p1` - Wrap each in the envelope of `inst-ca-publish-8` - `inst-ca-deliver-8`
-   3. [ ] - `p1` - Publish each through `publish_notification` under the publishing identity of entry 2.12, waiting at most `publish_timeout_seconds` for the broker to accept it - `inst-ca-deliver-9`
-   4. [ ] - `p1` - **IF** the broker accepted it → DB: UPDATE `last_notified_at` to now on each bundled row that still names the `change_ref` the scan read, so a row overwritten during the scan keeps it absent - `inst-ca-deliver-10`
-   5. [ ] - `p1` - **IF** the broker accepted it → count one on `settings_notify_redeliveries_total` for the notification - `inst-ca-deliver-16`
-   6. [ ] - `p1` - **ELSE** → log at `warn` with the subscriber, the tenant and the broker's reason, and leave the rows `awaiting` until the next due tick - `inst-ca-deliver-11`
-   7. [ ] - `p1` - **IF** the broker is lost during the pass — a publish fails because the broker is gone → abandon the rest of the pass, release the scan lock, and **RETURN** reporting the broker lost - `inst-ca-deliver-12`
-   8. [ ] - `p1` - **IF** the cancellation token fires during the pass → finish the publish in flight or abandon it within the runtime's shutdown deadline, keep every `awaiting` state, release the scan lock, and **RETURN** - `inst-ca-deliver-13`
-7. [ ] - `p1` - Release the scan lock and await the release - `inst-ca-deliver-14`
-8. [ ] - `p1` - **RETURN** with the pass complete - `inst-ca-deliver-15`
+1. [x] - `p1` - The delivery loop (`cpt-cf-settings-service-flow-consumer-activation-lifecycle`) starts one pass on a tick on which the broker resolved, the root tenant's id is known and the activation topic and the `change_notification` type are registered - `inst-ca-deliver-1`
+2. [x] - `p1` - Make one non-blocking `try_lock` on the gear's scan lock through `toolkit-db`'s `LockManager` - `inst-ca-deliver-2`
+3. [x] - `p1` - **IF** the scan lock is not acquired → **RETURN** from the pass without waiting: another replica scans this tick - `inst-ca-deliver-3`
+4. [x] - `p1` - DB: DELETE in one conditional statement every `activation_state` row whose subscription no longer exists, whatever its status, leaving every row whose subscription exists untouched - `inst-ca-deliver-4`
+5. [x] - `p1` - DB: SELECT the `activation_state` rows with status `awaiting` that are due — `last_notified_at` absent or older than `redeliver_interval_seconds` — through `idx_activation_awaiting`, grouped per pair of subscriber and tenant - `inst-ca-deliver-5`
+6. [x] - `p1` - **FOR EACH** pair - `inst-ca-deliver-6`
+   1. [x] - `p1` - Build the pair's notifications (`cpt-cf-settings-service-algo-consumer-activation-bundle`) - `inst-ca-deliver-7`
+   2. [x] - `p1` - Wrap each in the envelope of `inst-ca-publish-8` - `inst-ca-deliver-8`
+   3. [x] - `p1` - Publish each through `publish_notification` under the publishing identity of entry 2.12, waiting at most `publish_timeout_seconds` for the broker to accept it - `inst-ca-deliver-9`
+   4. [x] - `p1` - **IF** the broker accepted it → DB: UPDATE `last_notified_at` to now on each bundled row that still names the `change_ref` the scan read, so a row overwritten during the scan keeps it absent - `inst-ca-deliver-10`
+   5. [x] - `p1` - **IF** the broker accepted it → count one on `settings_notify_redeliveries_total` for the notification - `inst-ca-deliver-16`
+   6. [x] - `p1` - **ELSE** → log at `warn` with the subscriber, the tenant and the broker's reason (the first refusal of the pass; later ones at `debug`), and leave the rows `awaiting` until the next due tick; a publish that timed out, or the third refusal in a row, ends the pass as in the broker-lost step but reporting the broker stalled - `inst-ca-deliver-11`
+   7. [x] - `p1` - **IF** the broker is lost during the pass — a publish fails because the broker is gone → abandon the rest of the pass, release the scan lock, and **RETURN** reporting the broker lost - `inst-ca-deliver-12`
+   8. [x] - `p1` - **IF** the cancellation token fires during the pass → finish the publish in flight or abandon it within the runtime's shutdown deadline, keep every `awaiting` state, release the scan lock, and **RETURN** - `inst-ca-deliver-13`
+7. [x] - `p1` - Release the scan lock and await the release - `inst-ca-deliver-14`
+8. [x] - `p1` - **RETURN** with the pass complete - `inst-ca-deliver-15`
 
 ### React to a Notification
 
@@ -336,29 +337,29 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 **Error Scenarios**:
 - The audit append or the commit fails: the transaction rolls back, nothing changes, and the call answers an error; the consumer may repeat it, since a report is idempotent per subscriber, key, tenant and `change_ref`, and the SDK never retries it
-- Malformed input — a tenant or a `change_ref` that is not a UUID, or a status that is neither `success` nor `failed`: an invalid-argument error, nothing changed
+- Malformed input — a tenant or a `change_ref` that is not a UUID, a status that is neither `success` nor `failed`, a `key` holding a NUL byte or longer than 1 KiB, or a `detail` or `applied_value` holding a NUL byte: an invalid-argument error, nothing changed
 
 **Steps**:
 1. [ ] - `p1` - The consuming gear calls `report_outcome` with `change_ref`, `tenant`, `key`, `status`, `applied_value` and an optional `detail` — directly, or through the outcomes its handler returned (`inst-ca-react-10`) - `inst-ca-report-1`
 2. [ ] - `p1` - On both entry paths, before calling the Recorder, the SDK encodes `applied_value` as the expected-value algorithm does (`cpt-cf-settings-service-algo-consumer-activation-expected`): RFC 8785 canonical JSON, or the secret-value hash computed in the consumer's process for a `secret`-trait key - `inst-ca-report-2`
 3. [ ] - `p1` - The SDK reaches the Activation Outcome Recorder's `receive_response` by a direct call in process, and through its remote binding under the out-of-process profiles (DESIGN §4.5) — never a REST route or a broker event - `inst-ca-report-3`
-4. [ ] - `p1` - Take the subscriber from the caller's security context - `inst-ca-report-4`
-5. [ ] - `p1` - **IF** `tenant` or `change_ref` is not a UUID, **OR** `status` is neither `success` nor `failed` → **RETURN** an invalid-argument error with nothing changed, counted on no metric of this flow - `inst-ca-report-5`
-6. [ ] - `p1` - Normalise `tenant` to a bare lowercase UUID string, and truncate `detail` to 1 KiB - `inst-ca-report-6`
-7. [ ] - `p1` - Open one transaction at read committed; DB: SELECT the `activation_state` row of the subscriber, `key` and `tenant`; every `ignored` return below ends this transaction with nothing written - `inst-ca-report-7`
-8. [ ] - `p1` - **IF** no row exists → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored`: the subscription was retired, or never registered - `inst-ca-report-8`
-9. [ ] - `p1` - **IF** the row is `succeeded` or `failed` → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored`: a report never moves a terminal row, and only the next change resets it - `inst-ca-report-9`
-10. [ ] - `p1` - Apply the outcome rules (`cpt-cf-settings-service-algo-consumer-activation-outcome`) to the `awaiting` row; **IF** they answer `ignored` → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored` - `inst-ca-report-10`
-11. [ ] - `p1` - DB: UPDATE the row's `status`, `applied_value`, `detail`, `reported_at` now and `updated_at` now, guarded on the row still naming the `change_ref` the decision read and still being `awaiting` - `inst-ca-report-11`
-12. [ ] - `p1` - **IF** the update matched no row → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored` with no audit record: a concurrent report settled the row, or a concurrent change replaced its expectation and its own notification follows - `inst-ca-report-12`
-13. [ ] - `p1` - Append one `activation` audit record through `cpt-cf-settings-service-algo-audit-store-append` in the same transaction: `resource` the key at the row's tenant from the shared formatter, `declaration_key` the key, `tenant_id` the row's tenant as a UUID, `actor` the subscriber with `actor_classification` `public`, `outcome` `success` or `failure` matching the new status, `detail` the truncated consumer detail on failure, a freshly minted `request_id`, `change_ref` the row's, and no pre-value or post-value - `inst-ca-report-13`
-14. [ ] - `p1` - **IF** the append fails → roll back and **RETURN** an `Unavailable` error with nothing changed, counted on no metric of this flow - `inst-ca-report-14`
-15. [ ] - `p1` - Commit the transaction - `inst-ca-report-15`
-16. [ ] - `p1` - **IF** the commit fails → **RETURN** an `Unavailable` error with nothing changed, counted on no metric of this flow - `inst-ca-report-16`
-17. [ ] - `p1` - Count `settings_notify_reactions_total` with the new status as `outcome` - `inst-ca-report-17`
-18. [ ] - `p1` - Observe `settings_notify_response_latency_seconds` from the row's `updated_at` as the change wrote it - `inst-ca-report-20`
-19. [ ] - `p1` - Count `applied` on `settings_notify_reports_total` - `inst-ca-report-18`
-20. [ ] - `p1` - **RETURN** `applied` - `inst-ca-report-19`
+4. [x] - `p1` - Take the subscriber from the caller's security context - `inst-ca-report-4`
+5. [x] - `p1` - **IF** `tenant` or `change_ref` is not a UUID, **OR** `status` is neither `success` nor `failed`, **OR** `key` holds a NUL byte or exceeds 1 KiB, **OR** `detail` or `applied_value` holds a NUL byte → **RETURN** an invalid-argument error with nothing changed, counted on no metric of this flow - `inst-ca-report-5`
+6. [x] - `p1` - Normalise `tenant` to a bare lowercase UUID string, truncate `detail` to 1 KiB, and treat an `applied_value` above the value size cap as a value that does not match, storing none - `inst-ca-report-6`
+7. [x] - `p1` - Open one transaction at read committed; DB: SELECT the `activation_state` row of the subscriber, `key` and `tenant`; every `ignored` return below ends this transaction with nothing written - `inst-ca-report-7`
+8. [x] - `p1` - **IF** no row exists → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored`: the subscription was retired, or never registered - `inst-ca-report-8`
+9. [x] - `p1` - **IF** the row is `succeeded` or `failed` → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored`: a report never moves a terminal row, and only the next change resets it - `inst-ca-report-9`
+10. [x] - `p1` - Apply the outcome rules (`cpt-cf-settings-service-algo-consumer-activation-outcome`) to the `awaiting` row; **IF** they answer `ignored` → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored` - `inst-ca-report-10`
+11. [x] - `p1` - DB: UPDATE the row's `status`, `applied_value`, `detail`, `reported_at` now and `updated_at` now, guarded on the row still naming the `change_ref` the decision read and still being `awaiting` - `inst-ca-report-11`
+12. [x] - `p1` - **IF** the update matched no row → count `ignored` on `settings_notify_reports_total` and **RETURN** `ignored` with no audit record: a concurrent report settled the row, or a concurrent change replaced its expectation and its own notification follows - `inst-ca-report-12`
+13. [x] - `p1` - Append one `activation` audit record through `cpt-cf-settings-service-algo-audit-store-append` in the same transaction: `resource` the key at the row's tenant from the shared formatter, `declaration_key` the key, `tenant_id` the row's tenant as a UUID, `actor` the subscriber with `actor_classification` `public`, `outcome` `success` or `failure` matching the new status, `detail` the truncated consumer detail on failure, a freshly minted `request_id`, `change_ref` the row's, and no pre-value or post-value - `inst-ca-report-13`
+14. [x] - `p1` - **IF** the append fails → roll back and **RETURN** an `Unavailable` error with nothing changed, counted on no metric of this flow - `inst-ca-report-14`
+15. [x] - `p1` - Commit the transaction - `inst-ca-report-15`
+16. [x] - `p1` - **IF** the commit fails → **RETURN** an `Unavailable` error with nothing changed, counted on no metric of this flow - `inst-ca-report-16`
+17. [x] - `p1` - Count `settings_notify_reactions_total` with the new status as `outcome` - `inst-ca-report-17`
+18. [x] - `p1` - Observe `settings_notify_response_latency_seconds` from the row's `updated_at` as the change wrote it - `inst-ca-report-20`
+19. [x] - `p1` - Count `applied` on `settings_notify_reports_total` - `inst-ca-report-18`
+20. [x] - `p1` - **RETURN** `applied` - `inst-ca-report-19`
 
 ### Retire a Subscription
 
@@ -396,7 +397,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Run the Activation Half of the Broker Lifecycle
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-lifecycle`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-flow-consumer-activation-lifecycle`
 
 **Actor**: `cpt-cf-settings-service-actor-event-broker`
 
@@ -405,7 +406,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 - A broker that appears later, or returns after a loss, is picked up on a later tick, and delivery catches up from the `awaiting` states
 
 **Error Scenarios**:
-- A `redeliver_interval_seconds` or a `mutation_lock_wait_seconds` of `0`: gear init refuses the configuration
+- A `redeliver_interval_seconds` or a `mutation_lock_wait_seconds` of `0` or above its ceiling (86400 and 3600): gear init refuses the configuration
 - No broker resolvable, or the root tenant's id unknown: the tick idles after refreshing the gauges; writes commit and their states stay `awaiting`
 - The registration refused: logged at `warn` and retried on the next tick; publishes and the scan stay off meanwhile
 - The gear's `produce` grant missing: each publish is refused and logged at `warn`, the states stay `awaiting`, and the gear keeps serving
@@ -413,25 +414,25 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 **Steps**: steps 9 and 10 (`inst-ca-lifecycle-16`, `inst-ca-lifecycle-17`) are standing rules — for every publish of this feature and for the consumer of entry 2.12 — not actions of this loop's pass. Every publish of this feature runs under the publishing identity of entry 2.12, which holds the `produce` grants this feature adds on the activation topic.
 
-1. [x] - `p1` - At gear init, read `redeliver_interval_seconds`, a whole number of seconds from `1` up, default `30` - `inst-ca-lifecycle-1`
-2. [x] - `p1` - Read `mutation_lock_wait_seconds`, a whole number of seconds from `1` up, default `10`; a budget above the platform request deadline is accepted and documented as a misconfiguration, since the batch cap by the remainder of the request deadline enforces the deadline - `inst-ca-lifecycle-2`
-3. [x] - `p1` - **IF** either is `0` → refuse the configuration and fail init; the shared `publish_timeout_seconds` is read and validated by entry 2.12 (`inst-rc-lifecycle-1`) - `inst-ca-lifecycle-3`
+1. [x] - `p1` - At gear init, read `redeliver_interval_seconds`, a whole number of seconds from `1` to `86400` (one day), default `30` - `inst-ca-lifecycle-1`
+2. [x] - `p1` - Read `mutation_lock_wait_seconds`, a whole number of seconds from `1` to `3600` (one hour), default `10`; a budget above the platform request deadline is accepted and documented as a misconfiguration, since the batch cap by the remainder of the request deadline enforces the deadline - `inst-ca-lifecycle-2`
+3. [x] - `p1` - **IF** either is `0` or above its ceiling → refuse the configuration and fail init; the shared `publish_timeout_seconds` is read and validated by entry 2.12 (`inst-rc-lifecycle-1`) - `inst-ca-lifecycle-3`
 4. [x] - `p1` - **IF** the gear runs the single-process SQLite profile → at init remove the lock markers a crash may have left, through `remove_lock_marker_at_startup`, for the scan lock and for the mutation lock of every declared key; in every other profile never - `inst-ca-lifecycle-4`
-5. [ ] - `p1` - Init neither resolves the broker nor waits for it, and the broker is never in the gear's `deps` - `inst-ca-lifecycle-5`
-6. [ ] - `p1` - On `start`, run the delivery loop on every replica as a `stateful` background task of the gear's lifecycle under the runtime's cancellation token, and log its start at `info` - `inst-ca-lifecycle-6`
-7. [ ] - `p1` - **WHILE** the cancellation token has not fired, once every `redeliver_interval_seconds` — this loop owns the tick, and its retries ride on it - `inst-ca-lifecycle-7`
-   1. [ ] - `p1` - DB: count the `subscriptions` rows and the `activation_state` rows with status `awaiting`, and set `settings_notify_subscriptions` and `settings_activation_awaiting` from them, whether or not a broker resolves - `inst-ca-lifecycle-8`
-   2. [ ] - `p1` - Resolve `EventBrokerApi` from the `ClientHub` with a lookup that answers "none" rather than failing; **IF** none → idle: end this tick; the next tick starts after the interval - `inst-ca-lifecycle-9`
-   3. [ ] - `p1` - Read the root tenant's id from the cache the replica's consumer task fills (`inst-rc-lifecycle-4`); **IF** it is not yet known → idle: end this tick; the next tick starts after the interval; the delivery loop never resolves the root tenant itself - `inst-ca-lifecycle-10`
-   4. [ ] - `p1` - **IF** the activation topic and the `change_notification` type are not yet registered → register the topic, and the type as a derived event schema of the broker's event base that names the activation subject type as its allowed subject type and keeps the default partition key `tenant_id`, idempotently - `inst-ca-lifecycle-11`
-   5. [ ] - `p1` - **IF** the registration is refused or fails → log at `warn` and end this tick; the next tick starts after the interval and registers again - `inst-ca-lifecycle-12`
-   6. [ ] - `p1` - **IF** the registration succeeds → record it, so the publish and the scan stop skipping for that reason; a publish refused within the broker's specification-refresh interval after the first registration is retried like any refusal - `inst-ca-lifecycle-19`
-   7. [ ] - `p1` - Run one pass of `cpt-cf-settings-service-flow-consumer-activation-deliver` - `inst-ca-lifecycle-13`
-   8. [ ] - `p1` - **IF** the pass reports the broker lost → log at `warn`, keep every `awaiting` state, and end this tick; the next tick starts after the interval and resolves the broker again - `inst-ca-lifecycle-14`
-8. [ ] - `p1` - On `stop`, the token having fired, let the pass in flight finish or abandon it within the runtime's shutdown deadline (`inst-ca-deliver-13`), keeping every `awaiting` state - `inst-ca-lifecycle-15`
-9. [ ] - `p1` - Standing rule for every publish of this feature: it runs under the publishing identity of entry 2.12, to which this feature adds the grants needed on the activation topic — `produce` on the activation topic, the `change_notification` type and the activation subject type for events of every tenant; a missing grant refuses each publish, logged at `warn`, leaving the gear up and the states `awaiting` - `inst-ca-lifecycle-16`
-10. [ ] - `p1` - Standing rule for the consumer of entry 2.12 (`cpt-cf-settings-service-flow-replica-coherence-consume`, at `inst-rc-consume-1`): on each `cache_invalidate` delivery it observes `settings_notify_publish_to_deliver_seconds` with `event` `cache_invalidate` from the envelope's `occurred_at` to the delivery, at receipt and before its malformed drop, the one addition this feature makes to that flow - `inst-ca-lifecycle-17`
-11. [ ] - `p1` - **RETURN** with the loop stopped, logged at `info` - `inst-ca-lifecycle-18`
+5. [x] - `p1` - Init neither resolves the broker nor waits for it, and the broker is never in the gear's `deps` - `inst-ca-lifecycle-5`
+6. [x] - `p1` - On `start`, run the delivery loop on every replica as a `stateful` background task of the gear's lifecycle under the runtime's cancellation token, and log its start at `info` - `inst-ca-lifecycle-6`
+7. [x] - `p1` - **WHILE** the cancellation token has not fired, run a pass at start and then once every `redeliver_interval_seconds` — this loop owns the tick, and its retries ride on it - `inst-ca-lifecycle-7`
+   1. [x] - `p1` - DB: count the `subscriptions` rows and the `activation_state` rows with status `awaiting`, and set `settings_notify_subscriptions` and `settings_activation_awaiting` from them, whether or not a broker resolves - `inst-ca-lifecycle-8`
+   2. [x] - `p1` - Resolve `EventBrokerApi` from the `ClientHub` with a lookup that answers "none" rather than failing; **IF** none → idle: end this tick; the next tick starts after the interval - `inst-ca-lifecycle-9`
+   3. [x] - `p1` - Read the root tenant's id from the cache the replica's consumer task fills (`inst-rc-lifecycle-4`); **IF** it is not yet known → idle: end this tick; the next tick starts after the interval; the delivery loop never resolves the root tenant itself - `inst-ca-lifecycle-10`
+   4. [x] - `p1` - **IF** the activation topic and the `change_notification` type are not yet registered → register the topic, and the type as a derived event schema of the broker's event base that names the activation subject type as its allowed subject type and keeps the default partition key `tenant_id`, idempotently - `inst-ca-lifecycle-11`
+   5. [x] - `p1` - **IF** the registration is refused or fails → log at `warn` and end this tick; the next tick starts after the interval and registers again - `inst-ca-lifecycle-12`
+   6. [x] - `p1` - **IF** the registration succeeds → record it, so the publish and the scan stop skipping for that reason; a publish refused within the broker's specification-refresh interval after the first registration is retried like any refusal - `inst-ca-lifecycle-19`
+   7. [x] - `p1` - Run one pass of `cpt-cf-settings-service-flow-consumer-activation-deliver` - `inst-ca-lifecycle-13`
+   8. [x] - `p1` - **IF** the pass reports the broker lost → log at `warn`, keep every `awaiting` state, and end this tick; the next tick starts after the interval and resolves the broker again - `inst-ca-lifecycle-14`
+8. [x] - `p1` - On `stop`, the token having fired, let the pass in flight finish or abandon it within the runtime's shutdown deadline (`inst-ca-deliver-13`), keeping every `awaiting` state - `inst-ca-lifecycle-15`
+9. [x] - `p1` - Standing rule for every publish of this feature: it runs under the publishing identity of entry 2.12, to which this feature adds the grants needed on the activation topic — `produce` on the activation topic, the `change_notification` type and the activation subject type for events of every tenant; a missing grant refuses each publish, logged at `warn`, leaving the gear up and the states `awaiting` - `inst-ca-lifecycle-16`
+10. [x] - `p1` - Standing rule for the consumer of entry 2.12 (`cpt-cf-settings-service-flow-replica-coherence-consume`, at `inst-rc-consume-1`): on each `cache_invalidate` delivery it observes `settings_notify_publish_to_deliver_seconds` with `event` `cache_invalidate` from the envelope's `occurred_at` to the delivery, at receipt and before its malformed drop, the one addition this feature makes to that flow - `inst-ca-lifecycle-17`
+11. [x] - `p1` - **RETURN** with the loop stopped, logged at `info` - `inst-ca-lifecycle-18`
 
 ## 3. Processes / Business Logic (CDSL)
 
@@ -495,33 +496,33 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Outcome Rules
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-outcome`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-outcome`
 
 **Input**: An `awaiting` activation state — its `change_ref`, `expected_value` and whether its key has the `secret` trait — and a report's `change_ref`, `status`, `applied_value` and `detail`
 
 **Output**: `succeeded`, `failed` or `ignored`, and for a transition the fields it writes
 
 **Steps**:
-1. [ ] - `p1` - Treat `applied_value` as matching only when it is present, well formed — valid RFC 8785 canonical JSON, or 64 lowercase hex characters for a `secret`-trait row — and byte-equal to `expected_value` - `inst-ca-outcome-1`
-2. [ ] - `p1` - **IF** `status` is `success` **AND** the value matches → **RETURN** `succeeded`, whatever `change_ref` the report names: the consumer runs the value currently expected - `inst-ca-outcome-2`
-3. [ ] - `p1` - **IF** `status` is `success` **AND** the value is different, missing or malformed → **RETURN** `failed` when the report names the row's `change_ref`, `ignored` as stale when it names another - `inst-ca-outcome-3`
-4. [ ] - `p1` - **IF** `status` is `failed` → **RETURN** `failed` when the report names the row's `change_ref`, `ignored` when it names another - `inst-ca-outcome-4`
-5. [ ] - `p1` - A transition writes only `status`, `applied_value` as reported (absent when the report carried none), `detail` (the consumer's detail on a `failed` status, absent otherwise), `reported_at` and `updated_at`; `expected_value` and `change_ref` are never touched by a report - `inst-ca-outcome-5`
+1. [x] - `p1` - Treat `applied_value` as matching only when it is present, well formed — valid RFC 8785 canonical JSON, or 64 lowercase hex characters for a `secret`-trait row — and byte-equal to `expected_value` - `inst-ca-outcome-1`
+2. [x] - `p1` - **IF** `status` is `success` **AND** the value matches → **RETURN** `succeeded`, whatever `change_ref` the report names: the consumer runs the value currently expected - `inst-ca-outcome-2`
+3. [x] - `p1` - **IF** `status` is `success` **AND** the value is different, missing or malformed → **RETURN** `failed` when the report names the row's `change_ref`, `ignored` as stale when it names another - `inst-ca-outcome-3`
+4. [x] - `p1` - **IF** `status` is `failed` → **RETURN** `failed` when the report names the row's `change_ref`, `ignored` when it names another - `inst-ca-outcome-4`
+5. [x] - `p1` - A transition writes only `status`, `applied_value` as reported (absent when the report carried none), `detail` (the consumer's detail on a `failed` status, absent otherwise), `reported_at` and `updated_at`; `expected_value` and `change_ref` are never touched by a report - `inst-ca-outcome-5`
 
 ### Notification Bundle
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-bundle`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-algo-consumer-activation-bundle`
 
 **Input**: One pair of subscriber and tenant and its `awaiting` rows, each with its key and `change_ref`
 
 **Output**: One `ChangeNotification` body, or several when one would exceed the broker's event size limit
 
 **Steps**:
-1. [ ] - `p1` - Build one body: `tenant` the pair's tenant (the root tenant's id for a platform-wide subscription), `subscriber` the pair's subscriber, and `changes`, the list of every row's `key` with its `change_ref`, in key order - `inst-ca-bundle-1`
-2. [ ] - `p1` - Carry identifiers only: no value, no expected value, no hash, no actor, and no key outside the pair's `awaiting` rows - `inst-ca-bundle-2`
-3. [ ] - `p1` - Leave the optional `subject_type` and `subject_id` absent in v1 - `inst-ca-bundle-3`
-4. [ ] - `p1` - **IF** the serialised event, envelope included, would exceed the broker's 64 KiB event size limit (`cpt-cf-evbk-nfr-event-size`) → split `changes` across several bodies, packing entries in order until the next would exceed the limit, each body with the same `tenant` and `subscriber` and an event `id` of its own, each entry kept whole, together carrying every entry once - `inst-ca-bundle-4`
-5. [ ] - `p1` - **RETURN** the bodies in order - `inst-ca-bundle-5`
+1. [x] - `p1` - Build one body: `tenant` the pair's tenant (the root tenant's id for a platform-wide subscription), `subscriber` the pair's subscriber, and `changes`, the list of every row's `key` with its `change_ref`, in key order - `inst-ca-bundle-1`
+2. [x] - `p1` - Carry identifiers only: no value, no expected value, no hash, no actor, and no key outside the pair's `awaiting` rows - `inst-ca-bundle-2`
+3. [x] - `p1` - Leave the optional `subject_type` and `subject_id` absent in v1 - `inst-ca-bundle-3`
+4. [x] - `p1` - **IF** the serialised event, envelope included, would exceed the broker's 64 KiB event size limit (`cpt-cf-evbk-nfr-event-size`) → split `changes` across several bodies, packing entries in order until the next would exceed the limit, each body with the same `tenant` and `subscriber` and an event `id` of its own, each entry kept whole, together carrying every entry once - `inst-ca-bundle-4`
+5. [x] - `p1` - **RETURN** the bodies in order - `inst-ca-bundle-5`
 
 ### Subscribe Per-Key State
 
@@ -568,7 +569,7 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 ### Activation State Machine
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-state-consumer-activation-row`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-state-consumer-activation-row`
 
 **States**: `awaiting`, `succeeded`, `failed`
 
@@ -576,11 +577,11 @@ Throughout, a tenant is a bare lowercase UUID string, and platform scope is the 
 
 **Transitions**:
 1. [x] - `p1` - **FROM** no row **TO** `awaiting` **WHEN** a committed change affects the subscription (`cpt-cf-settings-service-flow-consumer-activation-record`) - `inst-ca-row-1`
-2. [ ] - `p1` - **FROM** `awaiting` **TO** `succeeded` **WHEN** a `success` report carries the expected value, whatever `change_ref` it names - `inst-ca-row-2`
-3. [ ] - `p1` - **FROM** `awaiting` **TO** `failed` **WHEN** a report naming the row's `change_ref` is `failed`, or is a `success` whose value differs, is missing or is malformed - `inst-ca-row-3`
+2. [x] - `p1` - **FROM** `awaiting` **TO** `succeeded` **WHEN** a `success` report carries the expected value, whatever `change_ref` it names - `inst-ca-row-2`
+3. [x] - `p1` - **FROM** `awaiting` **TO** `failed` **WHEN** a report naming the row's `change_ref` is `failed`, or is a `success` whose value differs, is missing or is malformed - `inst-ca-row-3`
 4. [x] - `p1` - **FROM** `awaiting` **TO** `awaiting` **WHEN** a later committed change affects the subscription, replacing `expected_value` and `change_ref` and clearing `last_notified_at` - `inst-ca-row-4`
 5. [x] - `p1` - **FROM** `succeeded` or `failed` **TO** `awaiting` **WHEN** a later committed change affects the subscription, clearing `applied_value`, `detail`, `reported_at` and `last_notified_at` - `inst-ca-row-5`
-6. [ ] - `p1` - **FROM** any state **TO** deleted **WHEN** the subscription is retired, or the delivery loop's sweep finds its subscription gone - `inst-ca-row-6`
+6. [x] - `p1` - **FROM** any state **TO** deleted **WHEN** the subscription is retired, or the delivery loop's sweep finds its subscription gone - `inst-ca-row-6`
 
 No transition happens on a timer: a state stays `awaiting` until a report or a later change, and a report never moves a terminal state.
 
@@ -647,7 +648,7 @@ The Subscription Manager **MUST** register a subscription per subscriber, exact 
 
 - [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-mutation-lock`
 
-Every value change (`set`, `revert`, `remove_value`, `clone`, each change of a batch), every restriction change (`set_restriction`, `clear_restriction`) and every subscription registration and retire **MUST** take the key's mutation lock — a named advisory lock through `toolkit-db`'s `LockManager`, keyed on the gear and the setting key — after its authorization and validation, waiting through `try_lock` on the lock's own retry schedule — a first wait of tens of milliseconds, doubling, capped at one second, with jitter — within `mutation_lock_wait_seconds` (default `10`, refused at init when `0`), in a batch further capped by the remainder of the request deadline, the schedule and the budget injectable in tests. An exhausted wait **MUST** answer `Unavailable` with nothing stored — `503` on the single-value and restriction routes, per item in `SetResult[]`, with the batch's later changes still attempted — and **MUST** leave the lock to its owner. A value change **MUST** hold the lock from before its candidate step until its transaction rolled back, or committed and the local cache is evicted, then release it and await the release before answering, so the next mutation of the key acquires it without waiting after a rollback; a restriction change, a registration and a retire **MUST** hold it around their transactions. Declaration lifecycle changes **MUST NOT** take it, and no mutation **MUST** hold two keys' locks at once. Acquisitions **MUST** be counted `acquired`, `exhausted` or `error` and their waits observed; a failed unlock (`NotHeld`, a database error) **MUST** be logged at `warn` and counted `error`; a lost lock session is silent to the holder (`toolkit-db` reports it as already released) — the residual DESIGN-activation §6 records. In the single-process SQLite profile the gear **MUST** remove the lock markers at init for the scan lock and every declared key's lock, and in no other profile. The settings database **MUST** be reached through session pooling or a direct connection; a transaction-pooling proxy voids the lock and is not supported.
+Every value change (`set`, `revert`, `remove_value`, `clone`, each change of a batch), every restriction change (`set_restriction`, `clear_restriction`) and every subscription registration and retire **MUST** take the key's mutation lock — a named advisory lock through `toolkit-db`'s `LockManager`, keyed on the gear and the setting key — after its authorization and validation, waiting through `try_lock` on the lock's own retry schedule — a first wait of tens of milliseconds, doubling, capped at one second, with jitter — within `mutation_lock_wait_seconds` (default `10`, refused at init when `0` or above `3600`), in a batch further capped by the remainder of the request deadline, the schedule and the budget injectable in tests. An exhausted wait **MUST** answer `Unavailable` with nothing stored — `503` on the single-value and restriction routes, per item in `SetResult[]`, with the batch's later changes still attempted — and **MUST** leave the lock to its owner. A value change **MUST** hold the lock from before its candidate step until its transaction rolled back, or committed and the local cache is evicted, then release it and await the release before answering, so the next mutation of the key acquires it without waiting after a rollback; a restriction change, a registration and a retire **MUST** hold it around their transactions. Declaration lifecycle changes **MUST NOT** take it, and no mutation **MUST** hold two keys' locks at once. Acquisitions **MUST** be counted `acquired`, `exhausted` or `error` and their waits observed; a failed unlock (`NotHeld`, a database error) **MUST** be logged at `warn` and counted `error`; a lost lock session is silent to the holder (`toolkit-db` reports it as already released) — the residual DESIGN-activation §6 records. In the single-process SQLite profile the gear **MUST** remove the lock markers at init for the scan lock and every declared key's lock, and in no other profile. The settings database **MUST** be reached through session pooling or a direct connection; a transaction-pooling proxy voids the lock and is not supported.
 
 **Implements**:
 - `cpt-cf-settings-service-algo-consumer-activation-lock`
@@ -713,7 +714,7 @@ The SDK's encoder of the consumer's `applied_value` **MUST** apply the same RFC 
 
 ### Notification Delivery
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-delivery`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-delivery`
 
 At the end of every request that wrote activation states, after its `cache_invalidate` broadcasts, the end-of-request hook **MUST** publish, per pair of subscriber and tenant it touched, the pair's `awaiting` keys with their `change_ref` as `change_notification` on the activation topic, with envelope `tenant_id` and `subject` the subscription's tenant, `subject_type` the activation subject type, `source` `settings-service` and `trace_parent` from the current span; a bundle over 64 KiB **MUST** be split with keys kept whole; each publish **MUST** be bounded by `publish_timeout_seconds`, the request's remaining publishes skipped after the first refusal or timeout of either signal, and an accepted publish **MUST** stamp `last_notified_at` on the rows still naming the bundled `change_ref`. Without a broker, before the activation types are registered or before the root tenant's id is known, nothing **MUST** be published and the write **MUST** commit. Every replica **MUST** run the delivery loop as one control loop ticking every `redeliver_interval_seconds` (default `30`, refused at init when `0`): each tick refreshes the activation gauges whether or not a broker resolves, and a tick on which the broker resolves, the root tenant's id is known and the activation types are registered runs one pass — one non-blocking attempt on the scan lock, the pass skipped when another replica holds it, an orphan sweep in one conditional delete, a re-publish of the due `awaiting` rows only, a stamp guarded by the row's `change_ref`, the rest of the pass abandoned when the broker is lost, and on `stop` the pass finished or abandoned within the shutdown deadline with every `awaiting` state kept. The activation topic and the `change_notification` type **MUST** be registered by the delivery loop's own task once the broker resolves, idempotently, and retried on the next tick after a refusal. The deployment **MUST** grant the publishing identity of entry 2.12 `produce` on the activation topic, the `change_notification` type and the activation subject type for events of every tenant; a missing grant **MUST** leave the gear up and the states `awaiting`, each refused publish logged at `warn` and retried by a later pass.
 
@@ -734,7 +735,7 @@ At the end of every request that wrote activation states, after its `cache_inval
 
 ### Outcome Recording
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-outcomes`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-outcomes`
 
 The Activation Outcome Recorder's `receive_response` **MUST** answer `ignored` for no state and for a terminal one; for an `awaiting` state it **MUST** settle `succeeded` a `success` whose value matches the expected value whatever `change_ref` it names, settle `failed` a `success` with a different, missing or malformed value or a `failed` status when the report names the state's `change_ref`, and answer `ignored` for either when it names another. A transition **MUST** write only `status`, `applied_value`, `detail`, `reported_at` and `updated_at`, guarded on the state still naming the decided `change_ref` and still `awaiting`, a guard matching no row answering `ignored` with nothing written; it **MUST** append, in the same transaction, exactly one `activation` audit record with the key's canonical resource, `declaration_key`, the state's tenant, the subscriber as `actor` with `actor_classification` `public`, `outcome`, the consumer's `detail` truncated to 1 KiB on failure, a minted `request_id`, `change_ref` and no pre-value or post-value. A failed append or commit **MUST** roll back and answer an error; a report **MUST** be idempotent per subscriber, key, tenant and `change_ref`, so a repeated report reaches the same end state as the first; late reports **MUST** be accepted while the state is `awaiting`.
 
@@ -776,16 +777,31 @@ The Activation Outcome Recorder's `receive_response` **MUST** answer `ignored` f
 
 ### Activation Is Observable
 
-- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-observability`
+- [x] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-observability`
 
-The system **MUST** expose the nine metrics of DESIGN-activation §7: `settings_notify_publish_to_deliver_seconds{event}` observed at receipt from the envelope's `occurred_at`, before any drop, for `change_notification` in the SDK and for `cache_invalidate` in the replica's consumer of entry 2.12; `settings_notify_response_latency_seconds` from the state's `updated_at` to the report that settles it; `settings_notify_redeliveries_total` per notification the scan publishes; `settings_activation_awaiting` and `settings_notify_subscriptions`, refreshed by the delivery loop on every tick of every replica, broker or not; `settings_notify_reactions_total{outcome}`; `settings_notify_reports_total{result}`, counting every `applied` and every `ignored` answer and no error; `settings_mutation_lock_wait_seconds`; and `settings_mutation_lock_total{result}`. It **MUST** log at `info` a subscription registered or retired and the delivery loop's start and stop, and at `warn` a refused publish, a refused registration of the activation types, a refused registration read decision, a refused group or join, a lock error, a malformed delivery, a lost broker, and each minute a key stays `pending`. Every notification **MUST** carry `trace_parent` from the publishing span when one is present. No log line, metric label or span attribute **MUST** carry a value, a hash or a secret.
+The system **MUST** expose the metrics of DESIGN-activation §7 that the service itself observes: `settings_notify_publish_to_deliver_seconds{event}` observed at receipt from the envelope's `occurred_at`, before any drop, for `cache_invalidate` in the replica's consumer of entry 2.12 (the `change_notification` observation is the SDK's, `cpt-cf-settings-service-dod-consumer-activation-observability-sdk`); `settings_notify_response_latency_seconds` from the state's `updated_at` to the report that settles it; `settings_notify_redeliveries_total` per notification the scan publishes; `settings_activation_awaiting` and `settings_notify_subscriptions`, refreshed by the delivery loop on every tick of every replica, broker or not; `settings_notify_reactions_total{outcome}`; `settings_notify_reports_total{result}`, counting every `applied` and every `ignored` answer and no error; `settings_mutation_lock_wait_seconds`; and `settings_mutation_lock_total{result}`. It **MUST** log at `info` a subscription registered or retired and the delivery loop's start and stop, and at `warn` a refused publish, a refused registration of the activation types, a refused registration read decision, a lock error and a lost broker. Every notification **MUST** carry `trace_parent` from the publishing span when one is present. No log line, metric label or span attribute of the service **MUST** carry a value, a hash or a secret.
 
 **Implements**:
 - `cpt-cf-settings-service-flow-consumer-activation-deliver`
-- `cpt-cf-settings-service-flow-consumer-activation-react`
 - `cpt-cf-settings-service-flow-consumer-activation-report`
 - `cpt-cf-settings-service-flow-consumer-activation-lifecycle`
 - `cpt-cf-settings-service-algo-consumer-activation-lock`
+
+**Constraints**: `cpt-cf-settings-service-constraint-activation-identifiers-only-payload`
+
+**Touches**:
+- Entities: metrics, logs, spans
+
+### Activation Is Observable in the SDK
+
+- [ ] `p1` - **ID**: `cpt-cf-settings-service-dod-consumer-activation-observability-sdk`
+
+The SDK **MUST** observe `settings_notify_publish_to_deliver_seconds` with `event` `change_notification` at receipt, from the envelope's `occurred_at`, before any malformed or foreign-subscriber drop, so that a dropped delivery is observed too. It **MUST** log at `warn` a refused group or join, a malformed delivery, and each minute a key stays `pending`, naming the key and the reason. No log line, metric label or span attribute of the SDK **MUST** carry a value, a hash or a secret.
+
+**Implements**:
+- `cpt-cf-settings-service-flow-consumer-activation-react`
+- `cpt-cf-settings-service-flow-consumer-activation-subscribe`
+- `cpt-cf-settings-service-component-consumer-activation-sdk`
 
 **Constraints**: `cpt-cf-settings-service-constraint-activation-identifiers-only-payload`
 
@@ -832,7 +848,7 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 - [x] A `set` at `X` of a `cascading` key with subscriptions at `X`, at a descendant `D` and at a descendant `E` shadowed by its own override writes, in the change's transaction, one `awaiting` state for `X` and one for `D`, each with the expected value at its tenant and the change's audit record id as `change_ref`, and none for `E` (unit)
 - [x] A write of an identical value writes no activation state, while every write of a `secret`-trait key writes one per qualified subscription; a `local` key affects only the subscription at the written tenant and a `global` key every subscription of the key (unit)
 - [x] A later change to the same key and tenant resets a `succeeded`, `failed` or `awaiting` state to `awaiting` with the new expected value and `change_ref`, clearing `applied_value`, `detail`, `reported_at` and `last_notified_at`; within one request the last change to a key at a tenant wins (unit)
-- [ ] A transaction aborted after the value write stores no value, no audit record and no activation state; a crash after a change commits and before the end of its request leaves its states `awaiting`, which the delivery loop publishes (integration)
+- [x] A transaction aborted after the value write stores no value, no audit record and no activation state; a crash after a change commits and before the end of its request leaves its states `awaiting`, which the delivery loop publishes (integration)
 - [x] Two concurrent writes of one key commit one after the other and the later one's expected value equals the value in force at its commit; two writes of different keys do not wait for each other; `pg_stat_database.deadlocks` is unchanged (integration)
 - [x] With the key's lock held and a short injected budget, a single write answers `503` `Unavailable` with nothing stored and the lock still held by its owner; in a batch that item alone answers `Unavailable` and the changes before and after it commit (integration)
 - [x] The lock's retry schedule starts at tens of milliseconds, doubles, is capped at one second with jitter and stops at the budget, and the schedule and the budget are injectable in tests (unit)
@@ -846,27 +862,27 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 - [x] A fallback or staged plaintext fetch whose per-setting authorization decision for the service's identity is denied or cannot be obtained, whose store read fails, or whose `secret_use` record cannot be written refuses the change `503` with nothing of it stored and the key's lock released (unit)
 - [x] A `cascading` write whose subscription tenants' chains the Tenant Resolver cannot answer fails closed with nothing stored (unit)
 - [x] A subscription of the change's read set deleted before the state write gets no state, while the other affected subscriptions get theirs (integration)
-- [ ] A `change_notification` carries `tenant`, `subscriber` and `changes` of `key` and `change_ref` only — no value, hash, secret or actor — and only the pair's `awaiting` keys, never another subscriber's or tenant's (unit)
-- [ ] A `change_notification` is published under `tenant_id` the subscription's tenant, with `subject` that tenant, `subject_type` `gts.cf.core.settings.activation.v1~` and `source` `settings-service`, after the request's `cache_invalidate` broadcasts (unit)
-- [ ] A bundle whose serialised event exceeds 64 KiB is published as several notifications, each under the limit, together carrying every `awaiting` key once with its `change_ref` (unit)
-- [ ] An accepted end-of-request publish stamps `last_notified_at` on the bundled rows; a publish stalled past `publish_timeout_seconds` is dropped, the request's remaining publishes are skipped, the request pays one timeout, and the delivery loop publishes the rows later (unit)
-- [ ] The delivery loop re-publishes an `awaiting` row once `redeliver_interval_seconds` has passed since `last_notified_at` and not before, publishes a row with no stamp at the next tick, and never re-publishes a terminal row (unit, integration)
-- [ ] Two delivery loops attempting the same tick never both scan: one acquires the scan lock, the other's single attempt fails and it skips the pass without waiting (integration)
-- [ ] The scan deletes, in one conditional statement, every state whose subscription no longer exists, `awaiting` or terminal, and leaves every state whose subscription exists untouched (unit)
-- [ ] A change overwriting a row while the scan publishes it leaves `last_notified_at` absent after the scan's stamp (integration)
-- [x] Gear init refuses a `redeliver_interval_seconds` or a `mutation_lock_wait_seconds` of `0` (unit)
+- [x] A `change_notification` carries `tenant`, `subscriber` and `changes` of `key` and `change_ref` only — no value, hash, secret or actor — and only the pair's `awaiting` keys, never another subscriber's or tenant's (unit)
+- [x] A `change_notification` is published under `tenant_id` the subscription's tenant, with `subject` that tenant, `subject_type` `gts.cf.core.settings.activation.v1~` and `source` `settings-service`, after the request's `cache_invalidate` broadcasts (unit)
+- [x] A bundle whose serialised event exceeds 64 KiB is published as several notifications, each under the limit, together carrying every `awaiting` key once with its `change_ref` (unit)
+- [x] An accepted end-of-request publish stamps `last_notified_at` on the bundled rows; a publish stalled past `publish_timeout_seconds` is dropped, the request's remaining publishes are skipped, the request pays one timeout, and the delivery loop publishes the rows later (unit)
+- [x] The delivery loop re-publishes an `awaiting` row once `redeliver_interval_seconds` has passed since `last_notified_at` and not before, publishes a row with no stamp at the next tick, and never re-publishes a terminal row (unit, integration)
+- [x] Two delivery loops attempting the same tick never both scan: one acquires the scan lock, the other's single attempt fails and it skips the pass without waiting (integration)
+- [x] The scan deletes, in one conditional statement, every state whose subscription no longer exists, `awaiting` or terminal, and leaves every state whose subscription exists untouched (unit)
+- [x] A change overwriting a row while the scan publishes it leaves `last_notified_at` absent after the scan's stamp (integration)
+- [x] Gear init refuses a `redeliver_interval_seconds` or a `mutation_lock_wait_seconds` of `0` or above its ceiling (86400 and 3600) (unit)
 - [x] In the single-process SQLite profile gear init removes the lock markers of the scan lock and of every declared key's mutation lock, and in every other profile it removes none (unit)
-- [ ] With the activation topic or the `change_notification` type refused by the Types Registry, the refusal is logged at `warn` and retried on the next tick, and meanwhile no notification is published and no scan runs, the states staying `awaiting` (unit)
-- [ ] While the root tenant's id is not yet known, the delivery loop runs no pass and publishes nothing, the gauges are still refreshed on every tick, and the states stay `awaiting` (unit)
-- [ ] With the `produce` grant withheld, each notification publish is refused and logged at `warn`, the states stay `awaiting`, and the gear keeps serving reads and writes (unit)
-- [ ] A broker lost during a pass abandons the rest of the pass, releases the scan lock and keeps every `awaiting` state, and the next tick on which a broker resolves delivers them (unit)
-- [ ] `stop` during a pass finishes or abandons it within the shutdown deadline, releases the scan lock, keeps every `awaiting` state, and the loop's stop is logged at `info` (unit)
-- [ ] A `success` report whose value equals the expected value settles `succeeded` whether it names the state's `change_ref` or an earlier one; a `success` naming the state's `change_ref` with a different, missing or non-canonical value settles `failed`; the same reports naming an earlier `change_ref`, and a `failed` naming one, answer `ignored` and leave the state `awaiting` (unit)
-- [ ] A report for no state or for a terminal state answers `ignored`; a duplicate report makes one transition and one audit record (unit, integration)
-- [ ] Each transition appends exactly one `activation` audit record — `resource` the key at the state's tenant, `declaration_key`, `tenant_id`, `actor` the subscriber with `actor_classification` `public`, `outcome`, `detail` truncated to 1 KiB on failure, a minted `request_id`, `change_ref`, no pre-value or post-value — in the update's transaction; ignored and repeated reports append none (unit)
-- [ ] A report and a newer change on one state at once: the report applies only against the expectation it answered, a report on the replaced expectation answers `ignored` with no audit record, and the state ends naming the newer change (integration)
+- [x] With the activation topic or the `change_notification` type refused by the Types Registry, the refusal is logged at `warn` and retried on the next tick, and meanwhile no notification is published and no scan runs, the states staying `awaiting` (unit)
+- [x] While the root tenant's id is not yet known, the delivery loop runs no pass and publishes nothing, the gauges are still refreshed on every tick, and the states stay `awaiting` (unit)
+- [x] With the `produce` grant withheld, each notification publish is refused and logged at `warn`, the states stay `awaiting`, and the gear keeps serving reads and writes (unit)
+- [x] A broker lost during a pass abandons the rest of the pass, releases the scan lock and keeps every `awaiting` state, and the next tick on which a broker resolves delivers them (unit)
+- [x] `stop` during a pass finishes or abandons it within the shutdown deadline, releases the scan lock, keeps every `awaiting` state, and the loop's stop is logged at `info` (unit)
+- [x] A `success` report whose value equals the expected value settles `succeeded` whether it names the state's `change_ref` or an earlier one; a `success` naming the state's `change_ref` with a different, missing or non-canonical value settles `failed`; the same reports naming an earlier `change_ref`, and a `failed` naming one, answer `ignored` and leave the state `awaiting` (unit)
+- [x] A report for no state or for a terminal state answers `ignored`; a duplicate report makes one transition and one audit record (unit, integration)
+- [x] Each transition appends exactly one `activation` audit record — `resource` the key at the state's tenant, `declaration_key`, `tenant_id`, `actor` the subscriber with `actor_classification` `public`, `outcome`, `detail` truncated to 1 KiB on failure, a minted `request_id`, `change_ref`, no pre-value or post-value — in the update's transaction; ignored and repeated reports append none (unit)
+- [x] A report and a newer change on one state at once: the report applies only against the expectation it answered, a report on the replaced expectation answers `ignored` with no audit record, and the state ends naming the newer change (integration)
 - [ ] A `report_outcome` answering an error is not retried by the SDK, and the consumer's repeat of the same report applies once (unit)
-- [ ] A `report_outcome` with a tenant or a `change_ref` that is not a UUID, or a status other than `success` or `failed`, answers an invalid-argument error, and one whose audit append or commit fails answers an error; in both cases the state, the audit table and `settings_notify_reports_total` are unchanged (unit)
+- [x] A `report_outcome` with a tenant or a `change_ref` that is not a UUID, or a status other than `success` or `failed`, answers an invalid-argument error, and one whose audit append or commit fails answers an error; in both cases the state, the audit table and `settings_notify_reports_total` are unchanged (unit)
 - [ ] A secret hash is the lowercase hex SHA-256 over the canonical array of `cf.settings.activation.secret.v1`, key, tenant and value; the same value under another key or tenant hashes differently and under the same key and tenant equally across changes, and it matches a known answer computed outside the crate (unit)
 - [ ] The service and the SDK canonicalizers agree on a shared corpus of re-serialized values and on the secret hashes of that corpus (unit; `cpt-cf-settings-service-dod-consumer-activation-canonical-sdk`)
 - [x] A value with an integer beyond 2^53 in magnitude, or a decimal with more precision than binary64 resolves, is rejected on write and never canonicalized, and a `file-reference` value is encoded and compared as an ordinary object with no hash (unit)
@@ -884,8 +900,8 @@ The feature **MUST** ship with these tests, each implementing a row of DESIGN-ac
 - [ ] A notified key is re-read with the freshness option, bypassing a cache that still holds the previous value and leaving the cache unpopulated, and the report of the committed value settles the state `succeeded` (unit)
 - [ ] A notified key whose fresh re-read fails, or answers `Retired` or `NotFound`, is left out of the handler's bundle and nothing is reported for it, its state staying `awaiting`, while the other keys of the notification are handled (unit)
 - [ ] A repeated `change_notification` for a key the consumer already handled is re-read, re-applied and re-reported, and the state ends as it did after the first report — the repeat's report answers `ignored` once the first settled the state — with no second audit record (unit)
-- [ ] With no broker resolvable, a write commits and answers as with one, its states stay `awaiting`, the delivery loop idles, `settings_activation_awaiting` counts them, and once the broker resolves the loop registers the activation types and delivers them (unit, integration)
-- [ ] `settings_mutation_lock_total` counts `acquired`, `exhausted` and `error` for an acquisition, an exhausted wait and an injected failing unlock, `settings_mutation_lock_wait_seconds` observes each wait, `settings_notify_reports_total` counts every `applied` and `ignored` answer and no error, and `settings_notify_reactions_total`, `settings_notify_response_latency_seconds`, `settings_notify_redeliveries_total` and `settings_notify_subscriptions` move as their flows state (unit, integration)
+- [x] With no broker resolvable, a write commits and answers as with one, its states stay `awaiting`, the delivery loop idles, `settings_activation_awaiting` counts them, and once the broker resolves the loop registers the activation types and delivers them (unit, integration)
+- [x] `settings_mutation_lock_total` counts `acquired`, `exhausted` and `error` for an acquisition, an exhausted wait and an injected failing unlock, `settings_mutation_lock_wait_seconds` observes each wait, `settings_notify_reports_total` counts every `applied` and `ignored` answer and no error, and `settings_notify_reactions_total`, `settings_notify_response_latency_seconds`, `settings_notify_redeliveries_total` and `settings_notify_subscriptions` move as their flows state (unit, integration)
 - [ ] No log line, metric label or span attribute of this feature carries a setting value, an expected or applied value, a hash or a secret (unit)
 - [ ] A set, its notification, the consumer's fresh re-read and its report end with the state `succeeded` and one `activation` record under the change, over real PostgreSQL with the delivering broker double and an in-process SDK consumer; the failed, stale-ignored, retire, redelivery-after-restart and no-broker-then-resume paths reach the outcomes their flows state (integration)
 - [ ] In an environment that runs a broker and a sample consumer gear, the DESIGN-activation §7 Level 4 rows pass for what this feature owns: *Full loop* through its write side — set, `change_notification`, fresh re-read, `report_outcome`, state `succeeded` — *Consumer isolation*, *Value mismatch → failed* through the state `failed` and its `activation` audit record, *Restart re-publish* and *No secret in stream*; the activation read and the history assertions of those rows are entry 2.14's (E2E)

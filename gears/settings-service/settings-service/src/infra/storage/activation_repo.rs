@@ -11,14 +11,16 @@ use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, EntityTrait, ExprTrait as _, QueryFilter, QueryOrder,
 };
 use time::OffsetDateTime;
-use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt};
+use toolkit_db::secure::{DBRunner, SecureDeleteExt, SecureEntityExt, SecureUpdateExt};
 use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use crate::domain::activation::publisher::{StateRow, StateWrite};
+use crate::domain::activation::recorder::Transition;
 use crate::domain::activation::subscriptions::ActivationRepository;
 use crate::domain::activation::{
-    ActivationState, ActivationStatus, SubscriberTenant, Subscription,
+    ActivationCounts, ActivationState, ActivationStatus, DueRow, NotifiedChange, SubscriberTenant,
+    Subscription,
 };
 use crate::domain::error::DomainError;
 use crate::infra::storage::clock::now;
@@ -122,6 +124,189 @@ fn source(write: &StateWrite, at: OffsetDateTime) -> SelectStatement {
         .from(SubscriptionEntity)
         .and_where(Expr::col((SubscriptionEntity, subscription::Column::Id)).is_in(ids))
         .to_owned()
+}
+
+/// How many rows one stamp statement names: two bound values each, well under
+/// every backend's bind limit.
+const STAMP_CHUNK: usize = 400;
+
+impl ActivationRepo {
+    /// Every `awaiting` state of the pair, in key order, through
+    /// `idx_activation_awaiting`.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn awaiting_of<C: DBRunner>(
+        &self,
+        conn: &C,
+        pair: &SubscriberTenant,
+    ) -> Result<Vec<NotifiedChange>, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-6
+        let rows = StateEntity::find()
+            .filter(activation_state::Column::Subscriber.eq(pair.subscriber.as_str()))
+            .filter(activation_state::Column::Tenant.eq(pair.tenant.as_str()))
+            .filter(activation_state::Column::Status.eq(ActivationStatus::Awaiting.as_str()))
+            .order_by_asc(activation_state::Column::Key)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| NotifiedChange {
+                key: row.key,
+                change_ref: row.change_ref,
+            })
+            .collect())
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-publish:p1:inst-ca-publish-6
+    }
+
+    /// Stamp `last_notified_at` on the pair's states in `changes` that still
+    /// name their `change_ref` and are still `awaiting`: a row a later change
+    /// overwrote meanwhile keeps the stamp absent. Returns how many rows were
+    /// stamped.
+    ///
+    /// # Errors
+    /// [`DomainError`] when a statement fails.
+    pub async fn stamp<C: DBRunner>(
+        &self,
+        conn: &C,
+        pair: &SubscriberTenant,
+        changes: &[NotifiedChange],
+        at: OffsetDateTime,
+    ) -> Result<u64, DomainError> {
+        let scope = AccessScope::allow_all();
+        let mut stamped = 0;
+        for chunk in changes.chunks(STAMP_CHUNK) {
+            let mut named = Condition::any();
+            for change in chunk {
+                named = named.add(
+                    Condition::all()
+                        .add(activation_state::Column::Key.eq(change.key.as_str()))
+                        .add(activation_state::Column::ChangeRef.eq(change.change_ref)),
+                );
+            }
+            stamped += StateEntity::update_many()
+                .col_expr(activation_state::Column::LastNotifiedAt, Expr::value(at))
+                .filter(activation_state::Column::Subscriber.eq(pair.subscriber.as_str()))
+                .filter(activation_state::Column::Tenant.eq(pair.tenant.as_str()))
+                .filter(activation_state::Column::Status.eq(ActivationStatus::Awaiting.as_str()))
+                .filter(named)
+                .secure()
+                .scope_with(&scope)
+                .exec(conn)
+                .await
+                .map_err(db_error)?
+                .rows_affected;
+        }
+        Ok(stamped)
+    }
+
+    /// The `awaiting` states never published or last published before
+    /// `cutoff`, ordered by subscriber, tenant and key, through
+    /// `idx_activation_awaiting`.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    pub async fn due<C: DBRunner>(
+        &self,
+        conn: &C,
+        cutoff: OffsetDateTime,
+    ) -> Result<Vec<DueRow>, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-deliver:p1:inst-ca-deliver-5
+        let rows = StateEntity::find()
+            .filter(activation_state::Column::Status.eq(ActivationStatus::Awaiting.as_str()))
+            .filter(
+                Condition::any()
+                    .add(activation_state::Column::LastNotifiedAt.is_null())
+                    .add(activation_state::Column::LastNotifiedAt.lt(cutoff)),
+            )
+            .order_by_asc(activation_state::Column::Subscriber)
+            .order_by_asc(activation_state::Column::Tenant)
+            .order_by_asc(activation_state::Column::Key)
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| DueRow {
+                pair: SubscriberTenant {
+                    subscriber: row.subscriber,
+                    tenant: row.tenant,
+                },
+                change: NotifiedChange {
+                    key: row.key,
+                    change_ref: row.change_ref,
+                },
+            })
+            .collect())
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-deliver:p1:inst-ca-deliver-5
+    }
+
+    /// Delete, in one conditional statement, every state whose subscription no
+    /// longer exists, whatever its status; a state whose subscription exists is
+    /// untouched. Returns how many were deleted.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the statement fails.
+    pub async fn sweep_orphans<C: DBRunner>(&self, conn: &C) -> Result<u64, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-deliver:p1:inst-ca-deliver-4
+        let subscribed = Query::select()
+            .expr(Expr::val(1))
+            .from(SubscriptionEntity)
+            .and_where(
+                Expr::col((SubscriptionEntity, subscription::Column::Subscriber))
+                    .equals((StateEntity, activation_state::Column::Subscriber)),
+            )
+            .and_where(
+                Expr::col((SubscriptionEntity, subscription::Column::Key))
+                    .equals((StateEntity, activation_state::Column::Key)),
+            )
+            .and_where(
+                Expr::col((SubscriptionEntity, subscription::Column::Tenant))
+                    .equals((StateEntity, activation_state::Column::Tenant)),
+            )
+            .to_owned();
+        Ok(StateEntity::delete_many()
+            .filter(Expr::exists(subscribed).not())
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_error)?
+            .rows_affected)
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-deliver:p1:inst-ca-deliver-4
+    }
+
+    /// The subscriptions and the `awaiting` states, for the gauges.
+    ///
+    /// # Errors
+    /// [`DomainError`] when a count fails.
+    pub async fn counts<C: DBRunner>(&self, conn: &C) -> Result<ActivationCounts, DomainError> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-8
+        let scope = AccessScope::allow_all();
+        let subscriptions = SubscriptionEntity::find()
+            .secure()
+            .scope_with(&scope)
+            .count(conn)
+            .await
+            .map_err(db_error)?;
+        let awaiting = StateEntity::find()
+            .filter(activation_state::Column::Status.eq(ActivationStatus::Awaiting.as_str()))
+            .secure()
+            .scope_with(&scope)
+            .count(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(ActivationCounts {
+            subscriptions,
+            awaiting,
+        })
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-8
+    }
 }
 
 #[async_trait]
@@ -361,4 +546,50 @@ impl ActivationRepository for ActivationRepo {
             .map_err(db_error)?;
         row.map(state_of).transpose()
     }
+
+    async fn report<C: DBRunner>(
+        &self,
+        conn: &C,
+        transition: &Transition,
+    ) -> Result<Option<OffsetDateTime>, DomainError> {
+        let at = now();
+        let updated = StateEntity::update_many()
+            .col_expr(
+                activation_state::Column::Status,
+                Expr::value(transition.status.as_str()),
+            )
+            .col_expr(
+                activation_state::Column::AppliedValue,
+                Expr::value(transition.applied_value.clone()),
+            )
+            .col_expr(
+                activation_state::Column::Detail,
+                Expr::value(transition.detail.clone()),
+            )
+            .col_expr(activation_state::Column::ReportedAt, Expr::value(at))
+            .col_expr(activation_state::Column::UpdatedAt, Expr::value(at))
+            .filter(triple::<StateEntity>(
+                &transition.subscriber,
+                &transition.key,
+                &transition.tenant,
+                (
+                    activation_state::Column::Subscriber,
+                    activation_state::Column::Key,
+                    activation_state::Column::Tenant,
+                ),
+            ))
+            // The row guard: the `change_ref` the decision read, still awaiting.
+            .filter(activation_state::Column::ChangeRef.eq(transition.change_ref))
+            .filter(activation_state::Column::Status.eq(ActivationStatus::Awaiting.as_str()))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .exec(conn)
+            .await
+            .map_err(db_error)?;
+        Ok((updated.rows_affected > 0).then_some(at))
+    }
 }
+
+#[cfg(test)]
+#[path = "activation_repo_tests.rs"]
+mod activation_repo_tests;

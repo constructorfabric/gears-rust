@@ -19,7 +19,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use settings_service_sdk::gts::{
-    ACTIVATION_SUBJECT_TYPE, CACHE_INVALIDATE_EVENT_TYPE, CACHE_TOPIC_ID,
+    ACTIVATION_SUBJECT_TYPE, ACTIVATION_TOPIC_ID, CACHE_INVALIDATE_EVENT_TYPE, CACHE_TOPIC_ID,
+    CHANGE_NOTIFICATION_EVENT_TYPE,
 };
 
 /// The `data` of a `cache_invalidate` event.
@@ -84,6 +85,90 @@ pub fn cache_topic_instance() -> Value {
     json!({
         "id": CACHE_TOPIC_ID,
         "description": "Settings Service replica cache coherence: cache_invalidate broadcasts between the service's own replicas",
+    })
+}
+
+/// One key of a [`ChangeNotification`], with the change that owes a report.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifiedKey {
+    /// The setting key.
+    pub key: String,
+    /// The change the consumer reports on: the id of the change's audit record.
+    pub change_ref: Uuid,
+}
+
+/// The `data` of a `change_notification` event.
+///
+/// **Identifiers only.** The tenant, the subscriber and the keys with their
+/// `change_ref`; there is no field for a value, an expected value, a hash, a
+/// secret or an actor, and none may be added: the consumer re-reads under its
+/// own identity and reports what it applied. Unknown attributes are ignored on
+/// receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChangeNotification {
+    /// The subscription tenant, a bare lowercase UUID string; the root tenant's
+    /// id for a platform-wide subscription.
+    pub tenant: String,
+    /// The subscriber the notification is for: the broker delivers by topic,
+    /// type and tenant only, so a consumer drops what names another.
+    pub subscriber: String,
+    /// The subscriber's `awaiting` keys at that tenant, in key order.
+    pub changes: Vec<NotifiedKey>,
+    /// The subject's type, for a subject-scoped change. Absent in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_type: Option<String>,
+    /// The subject's runtime id, for a subject-scoped change. Absent in v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_id: Option<String>,
+}
+
+/// The `data` schema of [`ChangeNotification`]. Unknown properties are allowed
+/// so attributes can be added within a major version.
+fn change_notification_data_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "tenant": { "type": "string" },
+            "subscriber": { "type": "string" },
+            "changes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "change_ref": { "type": "string", "format": "uuid" }
+                    },
+                    "required": ["key", "change_ref"]
+                }
+            },
+            "subject_type": { "type": "string" },
+            "subject_id": { "type": "string" }
+        },
+        "required": ["tenant", "subscriber", "changes"]
+    })
+}
+
+/// The derived event-type schema of [`CHANGE_NOTIFICATION_EVENT_TYPE`] on
+/// [`ACTIVATION_TOPIC_ID`]. It keeps the broker's default partition key
+/// (`/tenant_id`) and names [`ACTIVATION_SUBJECT_TYPE`] as its only allowed
+/// subject type.
+#[must_use]
+pub fn change_notification_event_type_schema() -> Value {
+    event_broker_sdk::gts::derived_event_type_schema(
+        CHANGE_NOTIFICATION_EVENT_TYPE,
+        ACTIVATION_TOPIC_ID,
+        change_notification_data_schema(),
+        &[ACTIVATION_SUBJECT_TYPE],
+    )
+}
+
+/// The activation topic as an instance of the broker's topic base, ready to
+/// register. Retention is left to the broker's configured default.
+#[must_use]
+pub fn activation_topic_instance() -> Value {
+    json!({
+        "id": ACTIVATION_TOPIC_ID,
+        "description": "Settings Service consumer activation: filtered change_notification events for the gears that subscribed to a setting",
     })
 }
 

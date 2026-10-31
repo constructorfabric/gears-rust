@@ -4,6 +4,9 @@
 //! so its happy path belongs to the integration suite. What is pinned here is
 //! the part that must hold before any of that: the gear must not hand out
 //! resources it has not acquired.
+//!
+//! Log-capture assertions assume one process per test (nextest, as the gear's
+//! `make` targets run) and may flake under plain `cargo test`.
 
 use super::SettingsService;
 
@@ -152,6 +155,10 @@ fn gear_with_writes(
         ))
         .map_err(|_| "already set")
         .expect("a fresh gear");
+    // ... and the activation delivery loop, which idles without a broker.
+    let config = gear.config().expect("set above");
+    gear.bind_notifications(&config)
+        .expect("the notification half binds");
     std::sync::Arc::new(gear)
 }
 
@@ -1033,8 +1040,8 @@ async fn a_consumer_that_outlives_the_shutdown_bound_is_aborted() {
         std::future::pending::<()>().await;
     });
     let started = std::time::Instant::now();
-    SettingsService::await_consumer(
-        super::ConsumerTask(Some(stuck)),
+    SettingsService::await_tasks(
+        vec![super::ConsumerTask::new("test", stuck)],
         std::time::Duration::from_millis(50),
     )
     .await;
@@ -1051,11 +1058,68 @@ async fn a_consumer_that_outlives_the_shutdown_bound_is_aborted() {
 #[tokio::test]
 async fn a_consumer_that_ends_in_time_is_awaited_without_abort() {
     let quick = tokio::spawn(async {});
-    SettingsService::await_consumer(
-        super::ConsumerTask(Some(quick)),
+    SettingsService::await_tasks(
+        vec![super::ConsumerTask::new("test", quick)],
         std::time::Duration::from_secs(5),
     )
     .await;
+}
+
+#[tokio::test]
+async fn two_stalled_background_tasks_share_one_stop_deadline_and_are_both_aborted() {
+    struct Dropped(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for Dropped {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let flags: Vec<_> = (0..2)
+        .map(|_| std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)))
+        .collect();
+    let tasks: Vec<_> = flags
+        .iter()
+        .map(|flag| {
+            let guard = Dropped(std::sync::Arc::clone(flag));
+            super::ConsumerTask::new(
+                "stalled",
+                tokio::spawn(async move {
+                    let _held = guard;
+                    std::future::pending::<()>().await;
+                }),
+            )
+        })
+        .collect();
+    let bound = std::time::Duration::from_millis(200);
+    let started = std::time::Instant::now();
+    SettingsService::await_tasks(tasks, bound).await;
+    let waited = started.elapsed();
+    assert!(
+        waited >= bound && waited < bound * 2,
+        "one shared deadline, not one each: {waited:?}"
+    );
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    for flag in &flags {
+        assert!(flag.load(std::sync::atomic::Ordering::SeqCst), "aborted");
+    }
+}
+
+#[tokio::test]
+async fn a_task_that_ends_in_time_is_joined_while_its_stalled_neighbour_is_aborted() {
+    let quick = tokio::spawn(async {});
+    let stuck = tokio::spawn(std::future::pending::<()>());
+    let aborted = stuck.abort_handle();
+    SettingsService::await_tasks(
+        vec![
+            super::ConsumerTask::new("quick", quick),
+            super::ConsumerTask::new("stuck", stuck),
+        ],
+        std::time::Duration::from_millis(50),
+    )
+    .await;
+    tokio::task::yield_now().await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    assert!(aborted.is_finished());
 }
 
 #[tokio::test]
@@ -1074,7 +1138,7 @@ async fn a_consumer_task_dropped_without_awaiting_is_aborted() {
     });
     // Let the task start so the abort has a poll point to land on.
     tokio::task::yield_now().await;
-    drop(super::ConsumerTask(Some(stuck)));
+    drop(super::ConsumerTask::new("test", stuck));
     tokio::task::yield_now().await;
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     assert!(
@@ -1084,19 +1148,25 @@ async fn a_consumer_task_dropped_without_awaiting_is_aborted() {
 }
 
 #[tokio::test]
-async fn init_refuses_a_zero_lock_budget_or_redelivery_interval() {
+async fn init_refuses_a_zero_or_oversized_lock_budget_or_redelivery_interval() {
     // A zero budget would fail every mutation that meets another; a zero
-    // interval would republish without pause. Init refuses either, naming it.
-    for field in ["mutation_lock_wait_seconds", "redeliver_interval_seconds"] {
-        let ctx = context_with(json!({ field: 0 }), wired_hub()).await;
+    // interval would republish without pause; a value above the ceiling — an
+    // hour, a day — is no bound at all. Init refuses each, naming the field.
+    for (field, value) in [
+        ("mutation_lock_wait_seconds", 0),
+        ("redeliver_interval_seconds", 0),
+        ("mutation_lock_wait_seconds", 3_601),
+        ("redeliver_interval_seconds", 86_401),
+    ] {
+        let ctx = context_with(json!({ field: value }), wired_hub()).await;
         let err = SettingsService::default()
             .init(&ctx)
             .await
-            .expect_err("a zero is refused");
+            .expect_err("out of bounds is refused");
         let message = err.to_string();
         assert!(
-            message.contains(field) && message.contains("at least 1"),
-            "the message names the field: `{message}`"
+            message.contains(field) && message.contains("between 1 and"),
+            "the message names the field and the bounds: `{message}`"
         );
     }
     let ctx = context_with(
@@ -1164,4 +1234,57 @@ async fn init_removes_the_stale_lock_markers_of_the_scan_lock_and_every_declared
             .unwrap_or_else(|e| panic!("the marker of `{key}` was removed at init: {e:?}"));
         held.release().await;
     }
+}
+
+#[tokio::test]
+async fn init_binds_the_notifier_and_the_recorder_and_refuses_them_before() {
+    let ctx = default_context().await;
+    let gear = SettingsService::default();
+    assert!(gear.recorder().is_err(), "nothing before init");
+    assert!(gear.notifier().is_err());
+    gear.init(&ctx).await.expect("init");
+    assert!(gear.recorder().is_ok());
+    assert!(gear.notifier().is_ok());
+    assert!(gear.notify_metrics().is_ok());
+    // The delivery loop's interval is the configured `redeliver_interval_seconds`.
+    assert_eq!(
+        gear.notifier().expect("bound").interval(),
+        std::time::Duration::from_secs(30)
+    );
+}
+
+#[tokio::test]
+async fn the_managed_lifecycle_runs_the_delivery_loop_beside_the_consumer_and_stops_it() {
+    let inner = crate::test_support::ResolutionHarness::new().await;
+    let secrets = std::sync::Arc::new(crate::test_support::RecordingSecrets::default());
+    let gear = gear_with_writes(&inner, &secrets);
+    let (buf, _guard) = crate::domain::activation::testing::capture();
+
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(SettingsService::serve(
+        std::sync::Arc::clone(&gear),
+        cancel.clone(),
+        toolkit::lifecycle::ReadySignal::from_sender(tx),
+    ));
+    rx.await.expect("readiness is announced");
+    cancel.cancel();
+    serving
+        .await
+        .expect("the task joins")
+        .expect("and returns cleanly");
+
+    let log = crate::domain::activation::testing::logged(&buf);
+    assert!(log.contains("activation delivery loop started"), "{log}");
+    assert!(log.contains("activation delivery loop stopped"), "{log}");
+}
+
+#[tokio::test]
+async fn an_uninitialized_gear_refuses_to_start_the_delivery_loop() {
+    let gear = SettingsService::default();
+    let refusal = gear
+        .spawn_delivery(&tokio_util::sync::CancellationToken::new())
+        .err()
+        .expect("nothing to deliver with");
+    assert!(refusal.to_string().contains("not initialized"));
 }

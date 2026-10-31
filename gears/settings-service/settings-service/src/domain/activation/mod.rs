@@ -10,7 +10,9 @@
 //! Delivery and the consumer's report are other halves of the feature.
 
 pub mod canonical;
+pub mod notifier;
 pub mod publisher;
+pub mod recorder;
 pub mod subscriptions;
 
 use std::time::Duration;
@@ -26,7 +28,12 @@ use crate::domain::error::DomainError;
 pub use canonical::{
     CanonicalError, ExpectedValue, SECRET_HASH_DOMAIN, canonical_json, plaintext_text, secret_hash,
 };
+pub use notifier::{
+    ActivationCounts, ActivationNotifier, BuiltNotification, DueRow, NotificationGateway,
+    NotificationPublisher, NotificationStore, NotifiedChange, ScanLock, Tick,
+};
 pub use publisher::{ActivationInput, ActivationPublisher, Qualified, RecordedChange};
+pub use recorder::{ActivationRecorder, BackResponse, ReportResult};
 pub use subscriptions::{
     ActivationRepository, Admission, NoActivation, ReadGate, SubscriptionManager,
 };
@@ -195,6 +202,44 @@ impl LockMetrics for NoLockMetrics {
     fn acquired(&self, _wait: Duration) {}
     fn exhausted(&self, _wait: Duration) {}
     fn error(&self) {}
+}
+
+/// The activation instruments beyond the lock's: the delivery, the reports and
+/// the two gauges the delivery loop refreshes. No label carries a key, a
+/// tenant, a value or a hash.
+pub trait NotifyMetrics: Send + Sync {
+    /// `settings_notify_publish_to_deliver_seconds{event}`: from an event's
+    /// `occurred_at` to its receipt, `event` being `cache_invalidate` or
+    /// `change_notification`.
+    fn publish_to_deliver(&self, event: &'static str, elapsed: Duration);
+    /// `settings_notify_response_latency_seconds`: from the state's
+    /// `updated_at` to the report that settled it.
+    fn response_latency(&self, elapsed: Duration);
+    /// `settings_notify_redeliveries_total`: one per notification the delivery
+    /// loop's scan published and the broker accepted.
+    fn redelivery(&self);
+    /// `settings_activation_awaiting`: the `awaiting` states.
+    fn awaiting(&self, count: u64);
+    /// `settings_notify_subscriptions`: the registered subscriptions.
+    fn subscriptions(&self, count: u64);
+    /// `settings_notify_reactions_total{outcome}`: the status a report settled.
+    fn reaction(&self, outcome: &'static str);
+    /// `settings_notify_reports_total{result}`: `applied` or `ignored`.
+    fn report(&self, result: &'static str);
+}
+
+/// Counts nothing; the test binding.
+#[domain_model]
+pub struct NoNotifyMetrics;
+
+impl NotifyMetrics for NoNotifyMetrics {
+    fn publish_to_deliver(&self, _event: &'static str, _elapsed: Duration) {}
+    fn response_latency(&self, _elapsed: Duration) {}
+    fn redelivery(&self) {}
+    fn awaiting(&self, _count: u64) {}
+    fn subscriptions(&self, _count: u64) {}
+    fn reaction(&self, _outcome: &'static str) {}
+    fn report(&self, _result: &'static str) {}
 }
 
 /// A lock held on one key.

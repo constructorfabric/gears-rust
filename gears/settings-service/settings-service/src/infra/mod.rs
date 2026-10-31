@@ -1,5 +1,6 @@
 //! Adapters to the outside world.
 
+pub mod activation_delivery;
 pub mod activation_metrics;
 pub mod broadcast;
 pub mod cache_invalidation;

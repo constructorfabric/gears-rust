@@ -5,7 +5,10 @@ use serde_json::json;
 use settings_service_sdk::gts::{ACTIVATION_SUBJECT_TYPE, CACHE_INVALIDATE_EVENT_TYPE};
 use uuid::Uuid;
 
-use super::{BROKER_EVENT_LIMIT_BYTES, HEADROOM, build_broadcasts, serialised_len};
+use super::{
+    BROKER_EVENT_LIMIT_BYTES, HEADROOM, build_broadcasts, build_notifications, serialised_len,
+};
+use crate::domain::activation::{NotifiedChange, SubscriberTenant};
 use crate::domain::coherence::{BroadcastContext, TenantKeys};
 
 fn id(n: u128) -> Uuid {
@@ -159,4 +162,131 @@ fn a_single_key_over_the_limit_still_travels_alone() {
     assert_eq!(events.len(), 2, "no key is dropped, none is split");
     assert_eq!(keys_of(&events[0]), [huge]);
     assert_eq!(keys_of(&events[1]), ["after"]);
+}
+
+// ---------------------------------------------------------------------------
+// change_notification
+// ---------------------------------------------------------------------------
+
+fn pair() -> SubscriberTenant {
+    SubscriberTenant {
+        subscriber: "gear-x".to_owned(),
+        tenant: id(0xc1).to_string(),
+    }
+}
+
+fn changes(n: usize, key_len: usize) -> Vec<NotifiedChange> {
+    (0..n)
+        .map(|i| NotifiedChange {
+            key: format!("{i:04}{}", "x".repeat(key_len.saturating_sub(4))),
+            change_ref: id(i as u128 + 1),
+        })
+        .collect()
+}
+
+#[test]
+fn a_notification_is_enveloped_for_the_subscription_tenant() {
+    let built = build_notifications(&pair(), &changes(2, 20), Some("00-trace-span-01"));
+    assert_eq!(built.len(), 1);
+    let event = &built[0].event;
+    assert_eq!(
+        event.type_id.as_ref() as &str,
+        settings_service_sdk::gts::CHANGE_NOTIFICATION_EVENT_TYPE
+    );
+    assert_eq!(
+        event.tenant_id,
+        id(0xc1),
+        "the subscription's tenant, not the root"
+    );
+    assert_eq!(event.subject, id(0xc1).to_string());
+    assert_eq!(event.subject_type.as_ref() as &str, ACTIVATION_SUBJECT_TYPE);
+    assert_eq!(event.source, "settings-service");
+    assert_eq!(event.trace_parent.as_deref(), Some("00-trace-span-01"));
+    assert_eq!(built[0].changes.len(), 2);
+    let data = event.data.as_ref().unwrap();
+    assert_eq!(data["tenant"], id(0xc1).to_string());
+    assert_eq!(data["subscriber"], "gear-x");
+    assert!(data.get("subject_type").is_none() && data.get("subject_id").is_none());
+}
+
+#[test]
+fn a_notification_names_each_key_with_its_change_ref_and_nothing_else() {
+    let built = build_notifications(&pair(), &changes(3, 20), None);
+    let data = built[0].event.data.clone().unwrap();
+    let entries = data["changes"].as_array().unwrap();
+    assert_eq!(entries.len(), 3);
+    for (i, entry) in entries.iter().enumerate() {
+        let mut names: Vec<_> = entry.as_object().unwrap().keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, ["change_ref", "key"]);
+        assert_eq!(entry["change_ref"], id(i as u128 + 1).to_string());
+    }
+}
+
+#[test]
+fn a_pair_with_no_awaiting_key_builds_nothing() {
+    assert!(build_notifications(&pair(), &[], None).is_empty());
+}
+
+#[test]
+fn a_pair_whose_tenant_is_not_a_uuid_builds_nothing() {
+    let broken = SubscriberTenant {
+        subscriber: "gear-x".to_owned(),
+        tenant: "not-a-uuid".to_owned(),
+    };
+    assert!(build_notifications(&broken, &changes(1, 20), None).is_empty());
+}
+
+#[test]
+fn a_bundle_over_the_limit_splits_with_entries_whole_and_each_part_under_it() {
+    let all = changes(300, 1024);
+    let built = build_notifications(&pair(), &all, None);
+    assert!(built.len() > 1, "the bundle splits");
+    let mut carried = Vec::new();
+    let mut ids = std::collections::HashSet::new();
+    for part in &built {
+        assert!(
+            serialised_len(&part.event) < BROKER_EVENT_LIMIT_BYTES - HEADROOM + 1,
+            "{} bytes",
+            serialised_len(&part.event)
+        );
+        assert!(ids.insert(part.event.id), "an id of its own");
+        let data = part.event.data.clone().unwrap();
+        assert_eq!(data["tenant"], id(0xc1).to_string());
+        assert_eq!(data["subscriber"], "gear-x");
+        let named: Vec<String> = data["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["key"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            named,
+            part.changes
+                .iter()
+                .map(|c| c.key.clone())
+                .collect::<Vec<_>>(),
+            "the states a part reports are the ones its body names"
+        );
+        carried.extend(part.changes.clone());
+    }
+    assert_eq!(carried, all, "every entry once, in order");
+}
+
+#[test]
+fn an_entry_larger_than_the_budget_travels_alone_rather_than_being_lost() {
+    let huge = vec![
+        NotifiedChange {
+            key: "x".repeat(BROKER_EVENT_LIMIT_BYTES),
+            change_ref: id(1),
+        },
+        NotifiedChange {
+            key: "small".to_owned(),
+            change_ref: id(2),
+        },
+    ];
+    let built = build_notifications(&pair(), &huge, None);
+    assert_eq!(built.len(), 2);
+    assert_eq!(built[0].changes.len(), 1);
+    assert_eq!(built[1].changes.len(), 1);
 }

@@ -68,6 +68,18 @@ pub const CACHE_TOPIC_ID: &str =
 pub const CACHE_INVALIDATE_EVENT_TYPE: &str =
     toolkit_gts::gts_id!("cf.core.events.event.v1~cf.core.settings.cache_invalidate.v1~");
 
+/// The topic the filtered `change_notification` of consumer activation travels
+/// on: an instance of the broker's topic base. A consuming gear joins it with
+/// one interest per subscription tenant.
+pub const ACTIVATION_TOPIC_ID: &str =
+    toolkit_gts::gts_id!("cf.core.events.topic.v1~cf.core.settings.activation.v1");
+
+/// The event type of the filtered `change_notification`: a derived schema of
+/// the broker's event base. It names the tenant, the subscriber and the keys
+/// with their `change_ref`, never a value.
+pub const CHANGE_NOTIFICATION_EVENT_TYPE: &str =
+    toolkit_gts::gts_id!("cf.core.events.event.v1~cf.core.settings.change_notification.v1~");
+
 pub const DECLARATION_SCHEMA: &str = toolkit_gts::gts_id!("cf.core.settings.declaration.v1~");
 
 /// A stored setting value at some scope — what a setting currently *holds*.

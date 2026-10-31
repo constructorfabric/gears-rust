@@ -20,6 +20,7 @@ pub(crate) mod listing;
 // entity reachable from outside would be a second, unguarded path.
 pub(crate) mod entity;
 pub mod migrations;
+pub mod notification_store;
 pub mod odata_mapper;
 pub mod pending_secret_repo;
 pub mod search_repo;

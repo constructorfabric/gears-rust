@@ -231,6 +231,22 @@ pub async fn sqlite_provider() -> Arc<DBProvider<DbError>> {
     migrated(db).await
 }
 
+/// As [`sqlite_provider`], with a pool that gives up on a busy connection after
+/// `wait`: a transaction that begins while another holds the one connection
+/// fails to begin, as an exhausted pool does.
+pub async fn sqlite_provider_acquiring_within(wait: Duration) -> Arc<DBProvider<DbError>> {
+    let db = connect_db(
+        "sqlite::memory:",
+        ConnectOpts {
+            acquire_timeout: Some(wait),
+            ..sqlite_opts()
+        },
+    )
+    .await
+    .expect("in-memory sqlite connects");
+    migrated(db).await
+}
+
 /// As [`sqlite_provider`], with every statement recorded: for a test that
 /// pins how many round trips an operation takes, which no timing assertion
 /// could do without flaking. The recorder attaches before the connection is

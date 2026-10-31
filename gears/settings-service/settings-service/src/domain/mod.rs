@@ -2,6 +2,7 @@
 
 pub mod access;
 pub mod activation;
+pub mod broker_sink;
 pub mod category;
 pub mod coherence;
 pub mod contribution;

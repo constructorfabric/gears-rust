@@ -28,6 +28,8 @@ use types_registry_sdk::RegisterResult;
 use uuid::Uuid;
 
 use super::CacheInvalidationConsumer;
+use crate::domain::activation::NotifyMetrics;
+use crate::domain::activation::testing::RecordingNotifyMetrics;
 use crate::domain::platform_scope::PlatformScope;
 use crate::domain::resolution::EffectiveCache;
 use crate::domain::resolution::cache::tests_entry;
@@ -833,6 +835,43 @@ fn a_delivery_without_a_traceparent_opens_a_fresh_root_and_still_evicts() {
         "a root span"
     );
     assert!(f.cache.get("k.one", tenant(2)).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// publish-to-deliver
+// ---------------------------------------------------------------------------
+
+#[test]
+fn every_cache_invalidate_delivery_observes_publish_to_deliver_even_a_malformed_one() {
+    let f = fixture(false, true);
+    let metrics = Arc::new(RecordingNotifyMetrics::default());
+    let consumer = CacheInvalidationConsumer::new(f.client.clone(), f.cache)
+        .with_metrics(Arc::clone(&metrics) as Arc<dyn NotifyMetrics>);
+    for data in [invalidation(&["k.one"]), json!({ "tenant": "not-a-uuid" })] {
+        let WireFrame::Event(mut event) = wire(CACHE_INVALIDATE_EVENT_TYPE, data) else {
+            unreachable!("wire builds an event frame");
+        };
+        event.occurred_at = Utc::now() - chrono::Duration::seconds(3);
+        consumer.deliver(&event);
+    }
+    // Another type is not a cache_invalidate delivery and is not observed.
+    let WireFrame::Event(other) = wire(
+        "gts.cf.core.events.event.v1~cf.core.other.thing.v1~",
+        invalidation(&["k.one"]),
+    ) else {
+        unreachable!("wire builds an event frame");
+    };
+    consumer.deliver(&other);
+
+    let observed = metrics.delivered.lock().unwrap().clone();
+    assert_eq!(observed.len(), 2, "the malformed delivery is observed too");
+    for (event, elapsed) in observed {
+        assert_eq!(event, "cache_invalidate");
+        assert!(
+            elapsed >= Duration::from_secs(3) && elapsed < Duration::from_secs(60),
+            "{elapsed:?} runs from occurred_at to receipt"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

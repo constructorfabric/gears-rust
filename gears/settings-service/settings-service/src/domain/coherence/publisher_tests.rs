@@ -1,9 +1,13 @@
 //! The end-of-request publish hook over the broker client's view.
+//!
+//! Log-capture assertions assume one process per test (nextest, as the gear's
+//! `make` targets run) and may flake under plain `cargo test`.
 
 use std::sync::Arc;
 
 use uuid::Uuid;
 
+use crate::domain::activation::ActivationPairs;
 use crate::domain::coherence::testing::{RecordingGateway, publisher};
 use crate::domain::coherence::{BroadcastContext, ChangeOutcome, TouchedTenants};
 use crate::domain::resolution::scope_class;
@@ -26,6 +30,7 @@ async fn types_not_registered_counts_one_skipped_per_built_event_and_publishes_n
             write("a", Uuid::from_u128(2)),
         ],
         Uuid::new_v4(),
+        &ActivationPairs::new(),
     )
     .await;
     assert_eq!(metrics.all(), ["skipped", "skipped"]);
@@ -44,7 +49,8 @@ async fn an_unknown_root_tenant_builds_nothing_and_counts_one_skipped_per_tenant
         .map(|i| write(&format!("{i:04}{}", "x".repeat(1018)), Uuid::from_u128(1)))
         .collect();
     outcomes.push(write("b", Uuid::from_u128(2)));
-    hook.publish_value_writes(outcomes, Uuid::new_v4()).await;
+    hook.publish_value_writes(outcomes, Uuid::new_v4(), &ActivationPairs::new())
+        .await;
     assert_eq!(metrics.all(), ["skipped", "skipped"]);
     assert!(gateway.events().is_empty());
 }
@@ -74,7 +80,8 @@ async fn without_a_broker_a_key_set_over_the_limit_counts_one_skipped_per_part()
     )
     .len();
     assert!(parts > 1, "the key set splits");
-    hook.publish_request(&touched, Uuid::new_v4(), None).await;
+    hook.publish_request(&touched, &ActivationPairs::new(), Uuid::new_v4(), None)
+        .await;
     assert_eq!(metrics.all(), vec!["skipped"; parts]);
     assert!(gateway.events().is_empty());
 }
@@ -83,8 +90,13 @@ async fn without_a_broker_a_key_set_over_the_limit_counts_one_skipped_per_part()
 async fn an_empty_request_publishes_nothing_and_counts_nothing() {
     let gateway = Arc::new(RecordingGateway::without_broker());
     let (hook, metrics) = publisher(&gateway);
-    hook.publish_request(&TouchedTenants::new(), Uuid::new_v4(), None)
-        .await;
+    hook.publish_request(
+        &TouchedTenants::new(),
+        &ActivationPairs::new(),
+        Uuid::new_v4(),
+        None,
+    )
+    .await;
     hook.publish_declaration_changes(Vec::new(), Uuid::new_v4())
         .await;
     assert!(metrics.all().is_empty());
@@ -102,6 +114,7 @@ async fn a_named_tenant_that_is_the_root_merges_with_a_root_change_in_one_broadc
             ChangeOutcome::value_write("wide", Uuid::new_v4(), scope_class::GLOBAL, true),
         ],
         change_set,
+        &ActivationPairs::new(),
     )
     .await;
     let events = gateway.events();
@@ -118,8 +131,12 @@ async fn a_named_tenant_that_is_the_root_merges_with_a_root_change_in_one_broadc
 async fn a_publish_carries_identifiers_only() {
     let gateway = Arc::new(RecordingGateway::ready(Uuid::new_v4()));
     let (hook, _) = publisher(&gateway);
-    hook.publish_value_writes([write("k", Uuid::from_u128(7))], Uuid::new_v4())
-        .await;
+    hook.publish_value_writes(
+        [write("k", Uuid::from_u128(7))],
+        Uuid::new_v4(),
+        &ActivationPairs::new(),
+    )
+    .await;
     let body = gateway.events()[0].data.clone().expect("body");
     let mut names: Vec<_> = body
         .as_object()
@@ -146,9 +163,13 @@ async fn a_publish_inside_a_request_span_carries_that_span_as_trace_parent() {
     let _guard = tracing::subscriber::set_default(subscriber);
     let span = tracing::info_span!("request");
     let span_trace = span.in_scope(toolkit_trace_context::current_trace_id);
-    hook.publish_value_writes([write("a", Uuid::from_u128(1))], Uuid::new_v4())
-        .instrument(span.clone())
-        .await;
+    hook.publish_value_writes(
+        [write("a", Uuid::from_u128(1))],
+        Uuid::new_v4(),
+        &ActivationPairs::new(),
+    )
+    .instrument(span.clone())
+    .await;
     hook.publish_declaration_changes(["k".to_owned()], Uuid::new_v4())
         .instrument(span)
         .await;
@@ -215,6 +236,7 @@ async fn one_refused_publish_is_one_warn_and_the_skipped_rest_say_nothing_loud()
             write("b", Uuid::from_u128(2)),
         ],
         Uuid::new_v4(),
+        &ActivationPairs::new(),
     )
     .await;
     assert_eq!(metrics.all(), ["failed", "skipped"]);
@@ -238,8 +260,12 @@ async fn a_request_that_sent_nothing_is_not_an_info_line() {
             .with_max_level(tracing::Level::DEBUG)
             .finish(),
     );
-    hook.publish_value_writes([write("a", Uuid::from_u128(1))], Uuid::new_v4())
-        .await;
+    hook.publish_value_writes(
+        [write("a", Uuid::from_u128(1))],
+        Uuid::new_v4(),
+        &ActivationPairs::new(),
+    )
+    .await;
     let log = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
     assert!(!log.contains("INFO") && !log.contains("WARN"), "{log}");
     assert!(log.contains("DEBUG"), "{log}");

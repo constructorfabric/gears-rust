@@ -22,12 +22,18 @@ use tracing::{debug, warn};
 use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 use uuid::Uuid;
 
+use crate::domain::activation::{
+    BuiltNotification, NotificationGateway, NotifiedChange, SubscriberTenant,
+};
 use crate::domain::coherence::{
     BroadcastContext, BroadcastGateway, BroadcastSink, BroadcastState, PublishError, TenantKeys,
 };
 use crate::domain::platform_scope::PlatformScope;
-use crate::infra::broadcast::build_broadcasts;
-use crate::infra::event_schemas::{cache_invalidate_event_type_schema, cache_topic_instance};
+use crate::infra::broadcast::{build_broadcasts, build_notifications};
+use crate::infra::event_schemas::{
+    activation_topic_instance, cache_invalidate_event_type_schema, cache_topic_instance,
+    change_notification_event_type_schema,
+};
 use crate::infra::service_identity::service_context;
 
 /// The first wait of every backoff in the broker flows.
@@ -111,17 +117,19 @@ pub(crate) async fn or_cancelled<T>(
     }
 }
 
-/// The Types Registry as the client needs it: register the cache topic and the
-/// `cache_invalidate` type, each as one document with one per-item result.
+/// The Types Registry as the client needs it: register a topic instance and an
+/// event type schema — the cache topic and the `cache_invalidate` type, the
+/// activation topic and the `change_notification` type — each as one document
+/// with one per-item result.
 #[async_trait]
 pub trait CacheSchemaRegistry: Send + Sync {
-    /// Register the cache topic instance.
+    /// Register a topic instance.
     ///
     /// # Errors
     /// The registry's own, when the call itself fails.
     async fn register_topic(&self, topic: Value) -> Result<Vec<RegisterResult>, CanonicalError>;
 
-    /// Register the `cache_invalidate` event type schema.
+    /// Register an event type schema.
     ///
     /// # Errors
     /// The registry's own, when the call itself fails.
@@ -180,6 +188,8 @@ pub struct EventBrokerClient {
     group_alias: String,
     topic_registered: AtomicBool,
     type_registered: AtomicBool,
+    activation_topic_registered: AtomicBool,
+    activation_type_registered: AtomicBool,
     root: OnceLock<Uuid>,
 }
 
@@ -206,6 +216,8 @@ impl EventBrokerClient {
             group_alias: format!("settings-service:{instance_id}"),
             topic_registered: AtomicBool::new(false),
             type_registered: AtomicBool::new(false),
+            activation_topic_registered: AtomicBool::new(false),
+            activation_type_registered: AtomicBool::new(false),
             root: OnceLock::new(),
         }
     }
@@ -250,8 +262,15 @@ impl EventBrokerClient {
     // @cpt-dod:cpt-cf-settings-service-dod-replica-coherence-identity:p1
     #[must_use]
     pub fn publishing_context(&self) -> Option<SecurityContext> {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-16
+        // Every publish of the activation feature — the end of a request and the
+        // delivery loop — is made under this one identity, which holds the
+        // `produce` grants of the activation topic, the `change_notification`
+        // type and the activation subject type; a missing grant refuses each
+        // publish, logged at `warn` by its caller, leaving the gear up.
         let root = self.root_tenant()?;
         service_context(root).ok()
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-16
     }
 
     /// The alias of this replica's anonymous consumer group:
@@ -304,52 +323,98 @@ impl EventBrokerClient {
         // @cpt-end:cpt-cf-settings-service-flow-replica-coherence-lifecycle:p1:inst-rc-lifecycle-5
     }
 
-    async fn register_topic_once(&self, cancel: &CancellationToken) -> bool {
-        if self.topic_registered.load(Ordering::Acquire) {
+    /// Register one document unless `registered` already says it is: the
+    /// registry call is cut short by `cancel`, a refusal is logged at `warn` and
+    /// answered `false`.
+    async fn register_document(
+        cancel: &CancellationToken,
+        registered_flag: &AtomicBool,
+        what: &'static str,
+        call: impl Future<Output = Result<Vec<RegisterResult>, CanonicalError>>,
+    ) -> bool {
+        if registered_flag.load(Ordering::Acquire) {
             return true;
         }
-        let Some(answer) =
-            or_cancelled(cancel, self.registry.register_topic(cache_topic_instance())).await
-        else {
-            debug!("cache topic registration cancelled");
+        let Some(answer) = or_cancelled(cancel, call).await else {
+            debug!(what, "registration cancelled");
             return false;
         };
-        match registered("cache topic", answer) {
+        match registered(what, answer) {
             Ok(()) => {
-                self.topic_registered.store(true, Ordering::Release);
+                registered_flag.store(true, Ordering::Release);
                 true
             }
             Err(reason) => {
-                warn!(%reason, "cache topic not registered; retrying");
+                warn!(%reason, what, "not registered; retrying");
                 false
             }
         }
     }
 
-    async fn register_type_once(&self, cancel: &CancellationToken) -> bool {
-        if self.type_registered.load(Ordering::Acquire) {
-            return true;
-        }
-        let Some(answer) = or_cancelled(
+    async fn register_topic_once(&self, cancel: &CancellationToken) -> bool {
+        Self::register_document(
             cancel,
+            &self.topic_registered,
+            "cache topic",
+            self.registry.register_topic(cache_topic_instance()),
+        )
+        .await
+    }
+
+    async fn register_type_once(&self, cancel: &CancellationToken) -> bool {
+        Self::register_document(
+            cancel,
+            &self.type_registered,
+            "cache_invalidate type",
             self.registry
                 .register_event_type(cache_invalidate_event_type_schema()),
         )
         .await
-        else {
-            debug!("cache_invalidate type registration cancelled");
-            return false;
-        };
-        match registered("cache_invalidate type", answer) {
-            Ok(()) => {
-                self.type_registered.store(true, Ordering::Release);
-                true
-            }
-            Err(reason) => {
-                warn!(%reason, "cache_invalidate type not registered; retrying");
-                false
-            }
-        }
+    }
+
+    /// Whether the activation topic and the `change_notification` type are
+    /// registered: until they are, no notification is published and no scan
+    /// runs.
+    #[must_use]
+    pub fn notifications_registered(&self) -> bool {
+        self.activation_topic_registered.load(Ordering::Acquire)
+            && self.activation_type_registered.load(Ordering::Acquire)
+    }
+
+    /// One registration step of the activation half, run by the delivery loop
+    /// on its tick once the broker resolves: the activation topic, then the
+    /// `change_notification` type as a derived event schema that names the
+    /// activation subject type and keeps the default partition key, each once
+    /// and idempotently. `true` when both are registered; a refusal is logged
+    /// at `warn` and answered `false`, and the next tick registers again.
+    pub async fn register_notifications_once(&self, cancel: &CancellationToken) -> bool {
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-11
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-12
+        let topic = Self::register_document(
+            cancel,
+            &self.activation_topic_registered,
+            "activation topic",
+            self.registry.register_topic(activation_topic_instance()),
+        )
+        .await;
+        let registered = topic
+            && Self::register_document(
+                cancel,
+                &self.activation_type_registered,
+                "change_notification type",
+                self.registry
+                    .register_event_type(change_notification_event_type_schema()),
+            )
+            .await;
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-12
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-11
+        // @cpt-begin:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-19
+        // Recorded in the flags above: the publish and the scan stop skipping
+        // for that reason. A publish the broker refuses within its
+        // specification-refresh interval after the first registration is
+        // retried like any refusal, at the next due tick.
+        // @cpt-end:cpt-cf-settings-service-flow-consumer-activation-lifecycle:p1:inst-ca-lifecycle-19
+        registered
     }
 
     /// One wait of a background task: the next backoff delay, cut short by
@@ -408,14 +473,46 @@ impl BroadcastSink for PublishSession {
                 // The broker's error names the refusal, never the event body.
                 // The outcome of the publish logs it once, at `warn`.
                 let reason = error.to_string();
-                debug!(%reason, "cache_invalidate refused by the broker");
+                debug!(%reason, "event refused by the broker");
                 Err(PublishError::Refused(reason))
             }
             Err(_elapsed) => {
-                debug!("cache_invalidate not accepted within the publish timeout");
+                debug!("event not accepted within the publish timeout");
                 Err(PublishError::TimedOut)
             }
         }
+    }
+}
+
+#[async_trait]
+impl NotificationGateway for EventBrokerClient {
+    fn broker_present(&self) -> bool {
+        self.broker().is_some()
+    }
+
+    fn root_tenant(&self) -> Option<Uuid> {
+        Self::root_tenant(self)
+    }
+
+    fn registered(&self) -> bool {
+        self.notifications_registered()
+    }
+
+    async fn register(&self, cancel: &CancellationToken) -> bool {
+        self.register_notifications_once(cancel).await
+    }
+
+    fn session(&self) -> Option<Box<dyn BroadcastSink>> {
+        Self::session(self).map(|session| Box::new(session) as Box<dyn BroadcastSink>)
+    }
+
+    fn notifications(
+        &self,
+        pair: &SubscriberTenant,
+        changes: &[NotifiedChange],
+        trace_parent: Option<String>,
+    ) -> Vec<BuiltNotification> {
+        build_notifications(pair, changes, trace_parent.as_deref())
     }
 }
 

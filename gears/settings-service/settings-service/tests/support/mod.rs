@@ -7,6 +7,8 @@
 //! `SETTINGS_SERVICE_PG_REQUIRE_DOCKER=1` turns the skip into a failure, as CI
 //! sets it.
 
+pub mod platform;
+
 use testcontainers::ContainerAsync;
 use testcontainers::ImageExt;
 use testcontainers::runners::AsyncRunner;
