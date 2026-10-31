@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-github-mirror-sdk"
-version = "0.2.2"
+version = "0.2.3"
 publish = true
 edition.workspace = true
 license.workspace = true
