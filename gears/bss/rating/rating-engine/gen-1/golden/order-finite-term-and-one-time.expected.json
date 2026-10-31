@@ -1,0 +1,181 @@
+{
+  "order": {
+    "assessment_id": "00000000-0000-0000-0000-00000000a55e",
+    "currency": "EUR",
+    "currency_scale": 2,
+    "lines": [
+      {
+        "line_id": "00000000-0000-0000-0000-00000000a001",
+        "items": [
+          {
+            "item_id": "00000000-0000-0000-0000-000000010001",
+            "price_id": "00000000-0000-0000-0000-000000030001",
+            "charge_kind": "recurring",
+            "cycle": "month",
+            "rated": {
+              "exact": "10",
+              "display": "10"
+            },
+            "minimum_fee": null,
+            "minimum_fee_applied": false,
+            "gross": {
+              "exact": "10",
+              "display": "10"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "10",
+              "display": "10"
+            },
+            "usage_rates": null
+          },
+          {
+            "item_id": "00000000-0000-0000-0000-000000010002",
+            "price_id": "00000000-0000-0000-0000-000000030002",
+            "charge_kind": "one_time",
+            "cycle": null,
+            "rated": {
+              "exact": "5",
+              "display": "5"
+            },
+            "minimum_fee": null,
+            "minimum_fee_applied": false,
+            "gross": {
+              "exact": "5",
+              "display": "5"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "5",
+              "display": "5"
+            },
+            "usage_rates": null
+          }
+        ],
+        "rows": [
+          {
+            "charge_kind": "recurring",
+            "amount_status": "committed",
+            "gross": {
+              "exact": "60",
+              "display": "60"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "60",
+              "display": "60"
+            },
+            "amount_basis": "finite_term",
+            "recurring_by_cycle": [
+              {
+                "cycle": "month",
+                "gross": {
+                  "exact": "10",
+                  "display": "10"
+                },
+                "net": {
+                  "exact": "10",
+                  "display": "10"
+                }
+              }
+            ]
+          },
+          {
+            "charge_kind": "one_time",
+            "amount_status": "committed",
+            "gross": {
+              "exact": "5",
+              "display": "5"
+            },
+            "discount_status": "unavailable",
+            "net": {
+              "exact": "5",
+              "display": "5"
+            },
+            "amount_basis": null,
+            "recurring_by_cycle": []
+          }
+        ],
+        "horizon": {
+          "term": {
+            "kind": "fixed_periods",
+            "count": 6
+          },
+          "cycle": "month",
+          "periods": 6,
+          "basis": "finite_term"
+        }
+      }
+    ],
+    "order": [
+      {
+        "charge_kind": "recurring",
+        "amount_status": "committed",
+        "gross": {
+          "exact": "60",
+          "display": "60"
+        },
+        "discount_status": "unavailable",
+        "net": {
+          "exact": "60",
+          "display": "60"
+        },
+        "amount_basis": "finite_term",
+        "recurring_by_cycle": [
+          {
+            "cycle": "month",
+            "gross": {
+              "exact": "10",
+              "display": "10"
+            },
+            "net": {
+              "exact": "10",
+              "display": "10"
+            }
+          }
+        ]
+      },
+      {
+        "charge_kind": "one_time",
+        "amount_status": "committed",
+        "gross": {
+          "exact": "5",
+          "display": "5"
+        },
+        "discount_status": "unavailable",
+        "net": {
+          "exact": "5",
+          "display": "5"
+        },
+        "amount_basis": null,
+        "recurring_by_cycle": []
+      }
+    ],
+    "tcv": {
+      "amount": {
+        "exact": "65",
+        "display": "65"
+      },
+      "basis": "finite_term",
+      "evidence": [
+        {
+          "line_id": "00000000-0000-0000-0000-00000000a001",
+          "horizon": {
+            "term": {
+              "kind": "fixed_periods",
+              "count": 6
+            },
+            "cycle": "month",
+            "periods": 6,
+            "basis": "finite_term"
+          }
+        }
+      ]
+    },
+    "tcv_withheld": [],
+    "engine": {
+      "engine_generation": 1,
+      "engine_digest": "<engine_digest>"
+    }
+  }
+}

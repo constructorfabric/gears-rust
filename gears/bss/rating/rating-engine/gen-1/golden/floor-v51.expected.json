@@ -1,0 +1,34 @@
+{
+  "floor": [
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered_seconds": 1814400,
+      "period_seconds": 2678400,
+      "rated": {
+        "numerator": "2503",
+        "denominator": "500",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "floor": {
+        "numerator": "630",
+        "denominator": "31",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "topup": {
+        "numerator": "237407",
+        "denominator": "15500",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    }
+  ]
+}

@@ -68,22 +68,28 @@ Chosen option: **retained frozen engine generations** (DECISIONS T-D-65, refinin
   bit for bit.
 - **External code is vendored.** Every external crate whose code runs inside evaluation is vendored
   into the generation's frozen tree when the generation is released, as a renamed path crate: the
-  `bss_products_sdk::derived` evaluator, `bss_money` (its exact and money modules), and the registry
-  crates they compute with (`rust_decimal`, `bigdecimal`, `num-bigint`, `num-integer`, `num-traits`,
-  `arrayvec`, `libm`, as resolved). A registry copy is taken from the release
+  `bss_products_sdk::derived` evaluator and the registry crates the evaluation computes with
+  (`rust_decimal`, `bigdecimal`, `num-bigint`, `num-integer`, `num-traits`, `arrayvec`, `libm`, as
+  resolved). A registry copy is taken from the release
   whose `Cargo.lock` checksum the workspace recorded. Pinning by version or by `Cargo.lock` does not
   work: Cargo records no checksum for path crates such as `cf-gears-bss-products-sdk` and
   `cf-gears-bss-money`, so a change to `derived.rs` never shows in the lockfile; and Cargo refuses
   two semver-compatible versions of `rust_decimal` as renamed dependencies, so an old version could
   not link beside a new one. Renamed path crates are distinct crates and do link side by side.
+  **Amended 2026-10-30 (DECISIONS T-D-84):** `bss_money` is the exception. Money ADR rule 2 allows
+  one money crate and no Rating copy, so a generation depends on the shared crate in place and
+  records the SHA-256 of its library sources in `vendor/LOCK.toml`, which the digest covers. CI
+  fails when those sources change until the generation is re-locked, and every retained
+  generation's golden corpus guards its outcomes. How a released generation holds the crate is
+  settled before generation 1 is frozen.
 - **Isolation.** Each generation is its own crate (`cf-gears-bss-rating-engine-gen-<n>`). A CI check
-  fails it if it depends on anything but its vendored copies and allowlisted non-numeric crates
+  fails it if it depends on anything but its vendored copies, `bss_money` and allowlisted non-numeric crates
   (`serde`, `uuid`, `time`, `thiserror`); the vendored set is the full transitive closure of the
   numeric code (including `bigdecimal`, `num-bigint`, `num-integer`, `num-traits`, `arrayvec` and `libm`). The generation
   crate defines its own frozen input and output types; `rating-core` depends on it, never the
   reverse, and maps values into those types, numbers as canonical text.
 - **Digest.** `engine_digest` is SHA-256 over the generation's frozen source tree, including the
-  vendored copies, and its golden-vector outputs. The releasing migration
+  vendored copies and `vendor/LOCK.toml`, and its golden-vector outputs. The releasing migration
   records it in `bss_rating__engine_generation`. At start-up each instance verifies that every
   generation referenced by a retained result is compiled in with a matching digest; otherwise it
   does not start the rater.
@@ -101,9 +107,10 @@ Chosen option: **retained frozen engine generations** (DECISIONS T-D-65, refinin
 
 * The binary grows with every generation, and old generations must keep compiling with the current
   toolchain.
-* An upgrade of `bss-products-sdk`, `bss-money` or `rust_decimal` in the workspace changes no
-  released generation. Adopting it in evaluation is a Rating release with a new generation and new
-  vendored copies.
+* An upgrade of `bss-products-sdk` or `rust_decimal` in the workspace changes no released
+  generation. Adopting it in evaluation is a Rating release with a new generation and new vendored
+  copies. A change to `bss-money` fails `make check-engine-generations` until the generations that
+  use it are re-locked, and must keep their golden corpora (T-D-84).
 * Each generation carries copies of third-party code with their licences, and a Products fix must
   be ported by vendoring it into a new generation.
 * A Products evaluator fix does not reach finalized results until an administrative re-rate.
@@ -116,7 +123,7 @@ Chosen option: **retained frozen engine generations** (DECISIONS T-D-65, refinin
 * A cross-upgrade replay test: results produced by generation `n` re-execute identically in a build
   whose current generation is `n + 1`.
 * A dependency check (`cargo tree`) fails CI when a generation crate depends on anything outside its
-  vendored copies and the allowlist.
+  vendored copies, `bss_money` and the allowlist.
 * A test edits a vendored file and shows that the generation's digest no longer matches.
 * Start-up tests: a missing generation or a wrong digest keeps the rater stopped; a replay of a
   result whose generation is absent returns `engine_unavailable`.

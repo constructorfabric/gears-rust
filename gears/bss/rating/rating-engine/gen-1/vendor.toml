@@ -1,0 +1,42 @@
+# What engine generation 1 vendors (rating ADR-0006, DESIGN §4.1).
+#
+# `tools/scripts/vendor_engine_generation.py vendor gears/bss/rating/rating-engine/gen-1` copies the
+# first-party sources below byte for byte into `vendor/<to>/` and records them, with the library
+# sources of the shared crates and the registry crates of the numeric closure, in
+# `vendor/LOCK.toml`; `... lock ...` re-records without copying, and `... check ...` fails CI when
+# any of them drifts. The vendored crate's `Cargo.toml` and the `derived` wrapper `src/lib.rs` are
+# written by hand: a renamed path crate needs its own manifest, and the copied files stay verbatim.
+#
+# Until generation 1 is frozen, the registry crates are pinned by version and `Cargo.lock` checksum
+# instead of copied. Freezing copies them here as renamed path crates too, so that a later workspace
+# upgrade cannot reach this generation.
+
+generation = 1
+package = "cf-gears-bss-rating-engine-gen-1"
+
+# `bss_money`: exact fractions, their canonical text, `CurrencySpec` and the canonical decimal text.
+# Used in place, never copied (money ADR rule 2: one crate, no Rating copy; DECISIONS T-D-84): its
+# library sources are recorded in `vendor/LOCK.toml`, so a change to them fails `check` until the
+# generation is re-locked, and every golden vector still has to pass.
+[[shared]]
+package = "cf-gears-bss-money"
+from = "gears/bss/libs/money"
+
+# `bss_products_sdk::derived`: the derived-meter evaluator (formula, granule rounding, overflow).
+[[copy]]
+from = "gears/bss/products/products-sdk"
+to = "derived"
+files = ["src/derived.rs", "src/derived_tests.rs"]
+
+# The registry crates the vendored code computes with, as `cargo metadata` resolves them for this
+# generation. Each is recorded with the version and checksum `Cargo.lock` holds.
+[registry]
+crates = [
+  "rust_decimal",
+  "bigdecimal",
+  "num-bigint",
+  "num-integer",
+  "num-traits",
+  "arrayvec",
+  "libm",
+]

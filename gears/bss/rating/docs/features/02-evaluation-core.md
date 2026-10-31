@@ -91,7 +91,7 @@ build step 1).
 
 ### 2.1 Evaluate one child input
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-core-evaluate`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-flow-core-evaluate`
 
 **Actor**: `cpt-cf-bss-rating-actor-rating` (the rater, inside its transaction)
 
@@ -100,17 +100,17 @@ build step 1).
 **Error Scenarios**: the generation is not retained (`engine_unavailable`); an input defect returns a typed `EvaluationError` from the closed taxonomy (`price_uncovered`, `binding_mismatch`, `unsupported_input_fold`, `non_injective_mapping`, …); a missing derived declaration never reaches the core — the pipeline keeps the child `pending(derived_declaration_unavailable)`; a bound is exceeded (`precision_overflow`, `quantity_out_of_range`).
 
 **Steps**:
-1. [ ] - `p1` - Resolve the evaluator with `EngineRegistry::get(engine_generation)`; **IF** absent, return `engine_unavailable` and never substitute another generation - `inst-ev-registry`
-2. [ ] - `p1` - Validate the input for presence and consistency (fact, `PricingInput` with its resolves and `binding_of_record`, the derived declaration for a usage child, per-slice, per-granule and per-input quantities with `q_version`, layout version, group context when grouped) - `inst-ev-validate`
-3. [ ] - `p1` - Run the step order in the compiled order over every slice or line of the child (§3.1) - `inst-ev-steps`
-4. [ ] - `p1` - Compose the snapshot body per line and the lineage; the pipeline computes `input_digest` from the canonical serialization (DESIGN 14 §4.3) - `inst-ev-snapshot`
-5. [ ] - `p1` - **RETURN** the outcome, or the first typed error; nothing is persisted by the core - `inst-ev-return`
+1. [x] - `p1` - Resolve the evaluator with `EngineRegistry::get(engine_generation)`; **IF** absent, return `engine_unavailable` and never substitute another generation - `inst-ev-registry`
+2. [x] - `p1` - Validate the input for presence and consistency (fact, `PricingInput` with its resolves and `binding_of_record`, the derived declaration for a usage child, per-slice, per-granule and per-input quantities with `q_version`, layout version, group context when grouped) - `inst-ev-validate`
+3. [x] - `p1` - Run the step order in the compiled order over every slice or line of the child (§3.1) - `inst-ev-steps`
+4. [x] - `p1` - Compose the snapshot body per line and the lineage; the pipeline computes `input_digest` from the canonical serialization (DESIGN 14 §4.3) - `inst-ev-snapshot`
+5. [x] - `p1` - **RETURN** the outcome, or the first typed error; nothing is persisted by the core - `inst-ev-return`
 
 The rater half of this flow — locking, assembling the input and persisting the outcome — is `cpt-cf-bss-rating-seq-evaluate-tariff` in [Child Evaluation](07-child-evaluation.md).
 
 ### 2.2 Check the rules that remain at evaluation
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-flow-core-rule-verdicts`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-flow-core-rule-verdicts`
 
 **Actor**: `cpt-cf-bss-rating-actor-rating` (at evaluation)
 
@@ -119,9 +119,9 @@ The rater half of this flow — locking, assembling the input and persisting the
 **Error Scenarios**: a failed check returns `non_injective_mapping` (`rating-val-02`); the child fails and no charge is produced.
 
 **Steps**:
-1. [ ] - `p1` - There is no publish-time registration: approval is the shared `bss-approval` engine, Rating is not one of its sources, and Pricing runs its own publish checks (`METER_DUPLICATE`, `ITEM_UNCOVERED`, `FREQUENCY_MIXED`; R-12 closed). The former `rating-val-01` (overlay precedence) and `rating-val-03` (overlay chain cap) have no input because `PriceOverlay` was removed from Pricing - `inst-rv-target`
-2. [ ] - `p1` - At evaluation, check that no two cells of one line resolve to the same derived meter and dimension value (`rating-val-02`, defensive; it mirrors Pricing's `METER_DUPLICATE`) - `inst-rv-interim`
-3. [ ] - `p1` - **RETURN** `non_injective_mapping` on a failing check; the former `rating-val-04` (contract dimensions) is deferred with price adjustments (T-D-81) and raises no error of its own: a contract input fails `adjustment_unsupported` - `inst-rv-return`
+1. [x] - `p1` - There is no publish-time registration: approval is the shared `bss-approval` engine, Rating is not one of its sources, and Pricing runs its own publish checks (`METER_DUPLICATE`, `ITEM_UNCOVERED`, `FREQUENCY_MIXED`; R-12 closed). The former `rating-val-01` (overlay precedence) and `rating-val-03` (overlay chain cap) have no input because `PriceOverlay` was removed from Pricing - `inst-rv-target`
+2. [x] - `p1` - At evaluation, check that no two cells of one line resolve to the same derived meter and dimension value (`rating-val-02`, defensive; it mirrors Pricing's `METER_DUPLICATE`) - `inst-rv-interim`
+3. [x] - `p1` - **RETURN** `non_injective_mapping` on a failing check; the former `rating-val-04` (contract dimensions) is deferred with price adjustments (T-D-81) and raises no error of its own: a contract input fails `adjustment_unsupported` - `inst-rv-return`
 
 <a id="register-flows"></a>
 
@@ -166,111 +166,111 @@ The flows of the former slice documents that this feature implements are defined
 
 ### 3.1 Run the fixed step pipeline
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-step-pipeline`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-step-pipeline`
 
 **Input**: a validated `EvaluationInput`.
 
 **Output**: per-slice `RatedLine`s, or an `EvaluationError`.
 
-1. [ ] - `p1` - Lay out lines by child kind: per slice of `quantities.per_slice` for `usage_window`; per slice of the period for `period_line`; one line for `one_time` (only if R-19 is accepted) (DESIGN §3.1). There is no `usage_event` kind: Pricing offers no per-event window (T-D-75) - `inst-sp-layout`
-2. [ ] - `p1` - Bind: take the line's `AcceptedBinding` from `PricingInput` and, for period-start slices, cross-check it against the fact's accepted price binding (an `ends_on` successor is not compared, §3.2) - `inst-sp-select`
-3. [ ] - `p1` - Meter and model: for a usage line, evaluate the derived usage type per granule (`DerivedMeterEvaluator`, T-D-76), (no quantity round-up exists on `main`; Products' declared per-granule rounding is the only quantity rounding, DESIGN [03 §4.4](../DESIGN.md#contract-03-4-4)), then apply the binding's `PriceModel` formula with the band offset carried across the child's slices (§3.3) - `inst-sp-model`
-4. [ ] - `p1` - Guards (step 5 of the order; the floor, step 4, runs at roll-up): guard 0 first — an input naming a contract override, commitment pool, reservation, coupon or promotion fails `adjustment_unsupported`, and a billing currency other than the binding's fails `fx_not_supported` (price adjustments are deferred, DECOMPOSITION §2.3) — then the emission guards in order, then lineage and snapshot body ([01 §4.4](../DESIGN.md#contract-01-4-4)); the minimum-fee floor is applied at parent roll-up, not here (T-D-78) - `inst-sp-guards`
-5. [ ] - `p1` - **RETURN** the lines; no configuration reorders any step - `inst-sp-return`
+1. [x] - `p1` - Lay out lines by child kind: per slice of `quantities.per_slice` for `usage_window`; per slice of the period for `period_line`; one line for `one_time` (only if R-19 is accepted) (DESIGN §3.1). There is no `usage_event` kind: Pricing offers no per-event window (T-D-75) - `inst-sp-layout`
+2. [x] - `p1` - Bind: take the line's `AcceptedBinding` from `PricingInput` and, for period-start slices, cross-check it against the fact's accepted price binding (an `ends_on` successor is not compared, §3.2) - `inst-sp-select`
+3. [x] - `p1` - Meter and model: for a usage line, evaluate the derived usage type per granule (`DerivedMeterEvaluator`, T-D-76), (no quantity round-up exists on `main`; Products' declared per-granule rounding is the only quantity rounding, DESIGN [03 §4.4](../DESIGN.md#contract-03-4-4)), then apply the binding's `PriceModel` formula with the band offset carried across the child's slices (§3.3) - `inst-sp-model`
+4. [x] - `p1` - Guards (step 5 of the order; the floor, step 4, runs at roll-up): guard 0 first — an input naming a contract override, commitment pool, reservation, coupon or promotion fails `adjustment_unsupported`, and a billing currency other than the binding's fails `fx_not_supported` (price adjustments are deferred, DECOMPOSITION §2.3) — then the emission guards in order, then lineage and snapshot body ([01 §4.4](../DESIGN.md#contract-01-4-4)); the minimum-fee floor is applied at parent roll-up, not here (T-D-78) - `inst-sp-guards`
+5. [x] - `p1` - **RETURN** the lines; no configuration reorders any step - `inst-sp-return`
 
 ### 3.2 Take the bound price and check the binding
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-selection`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-selection`
 
 **Input**: the line's item, dimension value and slice; `PricingInput {plan_id, revision_id, pins, binding_of_record, resolves: [{resolve_date, binding_digest, cells}]}` (DESIGN [01 §3.1](../DESIGN.md#contract-01-3-1)); the fact's accepted price binding (its pins).
 
 **Output**: exactly one `AcceptedBinding` for the line, or an error.
 
-1. [ ] - `p1` - Find the rated cell: the `(item_id, dimension_value)` whose value equals the value the fact's accepted binding names for the item (the null value if it names none; DESIGN [03 §4.2](../DESIGN.md#contract-03-4-2)); the other cells `resolve` returned are stored and never rated; more than one accepted value for one item is `unsupported_primitive` (V56). Take that cell from the bindings that cover the slice; a slice after a binding's `ends_on` uses the binding of the second resolve at that date (pricing D-425) - `inst-sel-phase`
-2. [ ] - `p1` - **IF** the cell has no binding (pricing answered *uncovered*), return `price_uncovered`; uncovered is never free (pricing D-420) - `inst-sel-candidates`
-3. [ ] - `p1` - **IF** the binding's `price.state` is not `Approved`, return `price_uncovered` - `inst-sel-assert`
-4. [ ] - `p1` - **IF** the slice is bound by the period-start resolve and its `price_id` differs from the price the fact's accepted binding names for that item and value, return `binding_mismatch`; a slice after an `ends_on` (the successor of the re-resolve) is never compared with the accepted binding - `inst-sel-binding`
-5. [ ] - `p1` - **RETURN** the binding with `price_id`, `price_book_entry_id`, `money_digest`, `sku_id`, `sku_version` and `binding_digest` in lineage - `inst-sel-return`
+1. [x] - `p1` - Find the rated cell: the `(item_id, dimension_value)` whose value equals the value the fact's accepted binding names for the item (the null value if it names none; DESIGN [03 §4.2](../DESIGN.md#contract-03-4-2)); the other cells `resolve` returned are stored and never rated; more than one accepted value for one item is `unsupported_primitive` (V56). Take that cell from the bindings that cover the slice; a slice after a binding's `ends_on` uses the binding of the second resolve at that date (pricing D-425) - `inst-sel-phase`
+2. [x] - `p1` - **IF** the cell has no binding (pricing answered *uncovered*), return `price_uncovered`; uncovered is never free (pricing D-420) - `inst-sel-candidates`
+3. [x] - `p1` - **IF** the binding's `price.state` is not `Approved`, return `price_uncovered` - `inst-sel-assert`
+4. [x] - `p1` - **IF** the slice is bound by the period-start resolve and its `price_id` differs from the price the fact's accepted binding names for that item and value, return `binding_mismatch`; a slice after an `ends_on` (the successor of the re-resolve) is never compared with the accepted binding - `inst-sel-binding`
+5. [x] - `p1` - **RETURN** the binding with `price_id`, `price_book_entry_id`, `money_digest`, `sku_id`, `sku_version` and `binding_digest` in lineage - `inst-sel-return`
 
 Rating selects nothing: there is no scope key, cohort, phase, eligibility class, price window or overlay to match. Pricing's `resolve` binds the price in force for a signup and walks `all` successors for a renewal, stopping before the first `new` one (pricing D-420); `eligibility: all|new` is an input to that walk, not to Rating (T-D-73).
 
 ### 3.3 Price a line by its model
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-model`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-model`
 
 **Input**: the binding (its `PriceModel` and `usage_rating_policy`), the line's slice quantities (per granule and input for a usage line), the derived declaration, the running band offset of the child (and the group context's prefix when grouped).
 
 **Output**: a model line outcome per slice.
 
-1. [ ] - `p1` - **IF** the derived declaration has a `Peak` or `TimeWeighted` input, return `unsupported_input_fold` (R-06) - `inst-mod-sum`
-2. [ ] - `p1` - Rate the item's one rated cell, the `dimension_value` the fact's accepted binding names (bound at sale, R-16; §3.2 step 1); the other cells `resolve` returned are not rated; **IF** the accepted binding names more than one value for the item, return `unsupported_primitive` until the R-16 metadata encoding is decided (V56) - `inst-mod-dimension`
-3. [ ] - `p1` - **FOR EACH** granule of a usage line, re-evaluate the derived declaration's expression tree over exact fractions (`DerivedExactnessGuard`) and **IF** any `Add`, `Sub`, `Mul` or `DivConst` result is not exactly representable as a `rust_decimal::Decimal` (28 significant and 28 fractional digits), fail the child `derived_formula_inexact` without using Products' output (DESIGN [03 §4.3](../DESIGN.md#contract-03-4-3), V57) - `inst-mod-exactness`
-4. [ ] - `p1` - **FOR EACH** slice in order: the slice quantity is the sum over its granules of `bss_products_sdk::derived::evaluate` on the granule's input quantities (`fold = SUM`, T-D-75, T-D-76); place it on the bands at the running offset and apply the formula of [03 §4.1](../DESIGN.md#contract-03-4-1): `flat` → `amount`; `per_unit` → `unit_amount × q`; `graduated` → sum over bands; `volume` → `q × rate` of the first band with `q < up_to`; `package` → `ceil(q / package_size) × package_price` - `inst-mod-slices`
-5. [ ] - `p1` - Keep each amount in major units as an exact fraction tagged with the bound price's `currency` and its stored scale (`price.currency.scale()`, pricing D-531); nothing is scaled by `10^currency_scale` or rounded (T-D-74, T-D-80) - `inst-mod-composite`
-6. [ ] - `p1` - **RETURN** exact amounts; tiers restart only at `rating_window_start`, a clipped window rates its actual quantity against whole thresholds (`actual_quantity_full_thresholds`), and bands never reset inside a child ([03 §4.3](../DESIGN.md#contract-03-4-3)) - `inst-mod-return`
+1. [x] - `p1` - **IF** the derived declaration has a `Peak` or `TimeWeighted` input, return `unsupported_input_fold` (R-06) - `inst-mod-sum`
+2. [x] - `p1` - Rate the item's one rated cell, the `dimension_value` the fact's accepted binding names (bound at sale, R-16; §3.2 step 1); the other cells `resolve` returned are not rated; **IF** the accepted binding names more than one value for the item, return `unsupported_primitive` until the R-16 metadata encoding is decided (V56) - `inst-mod-dimension`
+3. [x] - `p1` - **FOR EACH** granule of a usage line, re-evaluate the derived declaration's expression tree over exact fractions (`DerivedExactnessGuard`) and **IF** any `Add`, `Sub`, `Mul` or `DivConst` result is not exactly representable as a `rust_decimal::Decimal` (a 96-bit coefficient, at most `2^96 − 1`, at a scale of at most 28), fail the child `derived_formula_inexact` without using Products' output (DESIGN [03 §4.3](../DESIGN.md#contract-03-4-3), V57) - `inst-mod-exactness`
+4. [x] - `p1` - **FOR EACH** slice in order: the slice quantity is the sum over its granules of `bss_products_sdk::derived::evaluate` on the granule's input quantities (`fold = SUM`, T-D-75, T-D-76); place it on the bands at the running offset and apply the formula of [03 §4.1](../DESIGN.md#contract-03-4-1): `flat` → `amount`; `per_unit` → `unit_amount × q`; `graduated` → sum over bands; `volume` → `q × rate` of the first band with `q < up_to`; `package` → `ceil(q / package_size) × package_price` - `inst-mod-slices`
+5. [x] - `p1` - Keep each amount in major units as an exact fraction tagged with the bound price's `currency` and its stored scale (`price.currency.scale()`, pricing D-531); nothing is scaled by `10^currency_scale` or rounded (T-D-74, T-D-80) - `inst-mod-composite`
+6. [x] - `p1` - **RETURN** exact amounts; tiers restart only at `rating_window_start`, a clipped window rates its actual quantity against whole thresholds (`actual_quantity_full_thresholds`), and bands never reset inside a child ([03 §4.3](../DESIGN.md#contract-03-4-3)) - `inst-mod-return`
 
 ### 3.4 Compute split points, window geometry, proration and the minimum-fee floor
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-geometry`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-geometry`
 
 **Input**: the binding's `usage_rating_policy`, the fact's billing period and served extent, the bindings' `ends_on`, the subscription's committed quantity intervals.
 
 **Output**: `split_points`, the expected `RatingWindow`s of a fact, prorated period lines, the minimum-fee floor of a price.
 
-1. [ ] - `p1` - `window_geometry` returns the windows of `rating_window`: `BillingCycle` → the fact's billing period; `CalendarHour{Utc}` → each UTC hour of the served extent; a partial window keeps its canonical bounds (T-D-75) - `inst-geo-windows`
-2. [ ] - `p1` - `split_points` returns only a binding's `ends_on` inside the child (never `effective_to`, pricing D-425), a term-slice change and, for a `period_line`, a quantity change carried by the fact; UTC hours are granules or windows and a billing-period boundary or a plan change separates children, so none of them is a split point; split points add slices, never children ([09 §4.3](../DESIGN.md#contract-09-4-3)) - `inst-geo-splits`
-3. [ ] - `p1` - Prorate each recurring `period_line` slice by the covered fraction = covered UTC seconds / the billing period's UTC seconds, exact (T-D-77; R-30) - `inst-geo-prorate`
-4. [ ] - `p2` - Provide the floor function used at roll-up: billed = `max(Σ exact amounts rated by one price_id, minimum_fee × covered_fraction(p))`, with `covered_fraction(p)` = the covered UTC seconds of the slices bound to price `p` / the billing period's UTC seconds, for every price that carries a `minimum_fee`: usage `BillingCycle` + `subscription_line` entries and recurring entries; a one-time price, which has no coverage, is floored at the full `minimum_fee` once one-time facts are rated (T-D-78, R-19) - `inst-geo-obligation`
-5. [ ] - `p1` - **RETURN** values only; the functions are pure and shared by the pipeline and `evaluate` - `inst-geo-return`
+1. [x] - `p1` - `window_geometry` returns the windows of `rating_window`: `BillingCycle` → the fact's billing period; `CalendarHour{Utc}` → each UTC hour of the served extent; a partial window keeps its canonical bounds (T-D-75) - `inst-geo-windows`
+2. [x] - `p1` - `split_points` returns only a binding's `ends_on` inside the child (never `effective_to`, pricing D-425), a term-slice change and, for a `period_line`, a quantity change carried by the fact; UTC hours are granules or windows and a billing-period boundary or a plan change separates children, so none of them is a split point; split points add slices, never children ([09 §4.3](../DESIGN.md#contract-09-4-3)) - `inst-geo-splits`
+3. [x] - `p1` - Prorate each recurring `period_line` slice by the covered fraction = covered UTC seconds / the billing period's UTC seconds, exact (T-D-77; R-30) - `inst-geo-prorate`
+4. [x] - `p2` - Provide the floor function used at roll-up (`minimum_fee_floor` over the price totals of a fact's children): billed = `max(Σ exact amounts rated by one price_id, minimum_fee × covered_fraction(p))`, with `covered_fraction(p)` = the UTC seconds of the union of the time the slices bound to price `p` cover / the billing period's UTC seconds (two dimension values of one price share one floor, V34), per price and `currency_scale`, for every price that carries a `minimum_fee`: usage `BillingCycle` + `subscription_line` entries and recurring entries; a usage `minimum_fee` on a `CalendarHour` or `resource`-scoped entry fails `unsupported_primitive` until R-34 decides a floor for it; a one-time price, which has no coverage, is floored at the full `minimum_fee` once one-time facts are rated (T-D-78, R-19) - `inst-geo-obligation`
+5. [x] - `p1` - **RETURN** values only; the functions are pure and shared by the pipeline and `evaluate` - `inst-geo-return`
 
 ### 3.5 Exact arithmetic under a budget
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-exact-arithmetic`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-exact-arithmetic`
 
 **Input**: operands as `ExactQuantity` / `ExactMoney` and the generation's `ArithmeticBudget`.
 
 **Output**: reduced exact results, or a deterministic bound error.
 
-1. [ ] - `p1` - Convert pricing decimals exactly into major-unit fractions with the binding's `currency` and `currency_scale`; combine two amounts only when both match, else `binding_currency_mismatch`; never use floating point, and never use `rust_decimal` arithmetic for a result that is not proven to fit (its checked operations round past 28 fractional digits) - `inst-ex-convert`
-2. [ ] - `p1` - Check the operand bit budget before each multiply and divide; **IF** exceeded, return `precision_overflow` - `inst-ex-budget`
-3. [ ] - `p1` - Reduce every amount; **IF** a result exceeds the wire and storage bounds of DESIGN §3.3, return `precision_overflow` or `quantity_out_of_range` before anything can be persisted - `inst-ex-bounds`
-4. [ ] - `p1` - **RETURN** without rounding money; the only rounding is declared business rounding of quantities (Products' per-granule rounding, the package `ceil`); Billing rounds each invoice line once at the stored `currency_scale` (T-D-51, T-D-80) - `inst-ex-return`
+1. [x] - `p1` - Convert pricing decimals exactly into major-unit fractions with the binding's `currency` and `currency_scale`; combine two amounts only when both match, else `binding_currency_mismatch`; never use floating point, and never use `rust_decimal` arithmetic for a result that is not proven to fit (its checked operations round past 28 fractional digits) - `inst-ex-convert`
+2. [x] - `p1` - Check the operand bit budget before each multiply and divide; **IF** exceeded, return `precision_overflow` - `inst-ex-budget`
+3. [x] - `p1` - Reduce every amount; **IF** a result exceeds the wire and storage bounds of DESIGN §3.3, return `precision_overflow` or `quantity_out_of_range` before anything can be persisted - `inst-ex-bounds`
+4. [x] - `p1` - **RETURN** without rounding money; the only rounding is declared business rounding of quantities (Products' per-granule rounding, the package `ceil`); Billing rounds each invoice line once at the stored `currency_scale` (T-D-51, T-D-80) - `inst-ex-return`
 
 ### 3.6 Release and retain engine generations
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-engine-generations`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-engine-generations`
 
 **Input**: a change of evaluation semantics.
 
 **Output**: a new frozen generation crate `cf-gears-bss-rating-engine-gen-<n>` (re-exported as `engine::gen_<n>`) with its vendored evaluation dependencies and its `engine_digest`.
 
-1. [ ] - `p1` - Put every change of formulas, step order, exact-arithmetic rules, budget or error classification into a new generation; a released generation's module is frozen - `inst-eg-new`
-2. [ ] - `p1` - Vendor every external crate that runs inside evaluation into the generation as a renamed path crate (`bss_products_sdk::derived`, `bss_money`'s exact module, `rust_decimal`, and the rest of the numeric closure: `bigdecimal`, `num-bigint`, `num-integer`, `num-traits`, `arrayvec`, `libm` as resolved; registry copies from the release whose `Cargo.lock` checksum the workspace recorded; DESIGN §4.1, ADR-0006), and fail CI if the generation crate depends on anything else outside the allowlist - `inst-eg-vendor`
-3. [ ] - `p1` - Compute `engine_digest` at build time over the generation's frozen source tree, which includes the vendored copies, and its golden-vector outputs; the releasing migration of the `rating` gear (feature 07 owns `bss_rating__engine_generation`) records it; this crate writes no table - `inst-eg-digest`
-4. [ ] - `p1` - Keep every generation compiled in while any retained result references it; removal needs an ADR and proof of no reference (DESIGN §4.1) - `inst-eg-retain`
-5. [ ] - `p1` - Run Rating's own golden vectors per retained generation, cross-checked against pricing's `amount_for` oracle (`pricing/src/domain/money.rs`) on cases where every intermediate of `amount_for` is exact (§6) and pricing's seam fixtures; the joint `bss-fixtures` corpus and its `CorpusEvaluator` were deleted with pricing phase 4 (DESIGN §1.3) - `inst-eg-corpus`
+1. [x] - `p1` - Put every change of formulas, step order, exact-arithmetic rules, budget or error classification into a new generation; a released generation's module is frozen - `inst-eg-new`
+2. [x] - `p1` - Vendor every external crate that runs inside evaluation, except `bss_money`, into the generation as a renamed path crate (`bss_products_sdk::derived`, `rust_decimal`, and the rest of the numeric closure: `bigdecimal`, `num-bigint`, `num-integer`, `num-traits`, `arrayvec`, `libm` as resolved; registry copies from the release whose `Cargo.lock` checksum the workspace recorded; DESIGN §4.1, ADR-0006) — the first-party crate from the start, the registry crates pinned by version and checksum in the generation's `vendor/LOCK.toml` until the generation is frozen and copied at the freeze —, use `bss_money` in place with the SHA-256 of its library sources in the same lock (T-D-84), and fail CI if the generation crate depends on anything else outside the allowlist or a vendored file, a `bss_money` source or a pinned crate drifts - `inst-eg-vendor`
+3. [x] - `p1` - Compute `engine_digest` at build time over the generation's frozen source tree, which includes the vendored copies and `vendor/LOCK.toml`, and its golden-vector outputs; the releasing migration of the `rating` gear (feature 07 owns `bss_rating__engine_generation`) records it; this crate writes no table - `inst-eg-digest`
+4. [x] - `p1` - Keep every generation compiled in while any retained result references it; removal needs an ADR and proof of no reference (DESIGN §4.1) - `inst-eg-retain`
+5. [x] - `p1` - Run Rating's own golden vectors per retained generation, cross-checked against pricing's `amount_for` oracle (`pricing/src/domain/money.rs`) on cases where every intermediate of `amount_for` is exact (§6) and pricing's seam fixtures; the joint `bss-fixtures` corpus and its `CorpusEvaluator` were deleted with pricing phase 4 (DESIGN §1.3) - `inst-eg-corpus`
 
 ### 3.7 Pass through governance evidence
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-algo-core-governance-passthrough`
+- [x] `p2` - **ID**: `cpt-cf-bss-rating-algo-core-governance-passthrough`
 
 **Input**: the bindings of a line.
 
 **Output**: lines carrying ASC 606 references and invoice inputs.
 
-1. [ ] - `p2` - Set `performance_obligation_ref` and `ssp_snapshot_pointer` to null: no PriceBook binding carries them ([10 §4.4](../DESIGN.md#contract-10-4-4)); copy the binding's `InvoiceInputs` (`gl_code`, `tax_category`, `template`) onto the line - `inst-gov-asc606`
-2. [ ] - `p1` - Bundle summing is dormant: Pricing refuses a bundle SKU (`BUNDLE_SKU_NOT_PRICEABLE`) and the sold-as bundle is deferred (pricing D-411); a line that names a bundle fails closed ([10 §4.5](../DESIGN.md#contract-10-4-5)) - `inst-gov-bundle`
+1. [x] - `p2` - Set `performance_obligation_ref` and `ssp_snapshot_pointer` to null: no PriceBook binding carries them ([10 §4.4](../DESIGN.md#contract-10-4-4)); copy the binding's `InvoiceInputs` (`gl_code`, `tax_category`, `template`) onto the line - `inst-gov-asc606`
+2. [x] - `p1` - Bundle summing is dormant: Pricing refuses a bundle SKU (`BUNDLE_SKU_NOT_PRICEABLE`) and the sold-as bundle is deferred (pricing D-411); a line that names a bundle fails closed ([10 §4.5](../DESIGN.md#contract-10-4-5)) - `inst-gov-bundle`
 
 ### 3.8 Evaluate an order input
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-algo-core-evaluate-order`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-core-evaluate-order`
 
-**Input**: an `OrderEvaluationInput` built from `OrderEvaluationRequest` (Orders D-167): per line the `plan_revision_id`, per item the `quantity` and the exact chain bindings; no subscription version and no renewal walk (T-D-79).
+**Input**: an `OrderEvaluationInput` built from Orders' purchase evaluation request (Orders D-197): the market currency, an optional contract reference and per line its Term (`rolling` | `fixed_periods{count}` | Preview's `missing`) and `BillingTerms.cycle`, per item its explicit quantity and the selected Pricing binding; no subscription version, no renewal walk and no `resolve` call (T-D-83).
 
 **Output**: an `OrderEvaluation` or an `EvaluationError`.
 
-1. [ ] - `p2` - Run the same model formulas, money conversion and proration under the current generation; apply a recurring price's minimum-fee floor per cycle and report each usage price's `minimum_fee` without a floor, as feature 10 defines; usage is flagged and excluded from totals (T-D-54, T-D-79) - `inst-ord-steps`
-2. [ ] - `p2` - **RETURN** the separate order DTO; nothing is persisted and no idempotency key is involved - `inst-ord-return`
+1. [x] - `p1` - Run the same model formulas under the current generation, nothing converted: a recurring item per cycle and a one-time item once, each floored at its `minimum_fee` (covered fraction 1, T-D-78); a usage item as rates, its `minimum_fee` reported without a floor; per line the recurring aggregate over the term's periods (`count`, 12 for a rolling `month`, 1 for a rolling `year`), per order the sum on its basis (`finite_term`, `rolling_annualized`, `mixed`), and the TCV; a Preview line without term or cycle withholds the TCV; every amount as exact and HALF_EVEN display decimal text (Orders D-216), as feature 10 and DESIGN 11 §4.10 define (T-D-54, T-D-83) - `inst-ord-steps`
+2. [x] - `p1` - **RETURN** the separate order DTO; nothing is persisted and no idempotency key is involved - `inst-ord-return`
 
 The SDK surface, authorization and price reads are [Pre-Purchase Order Evaluation](10-order-evaluation.md).
 
@@ -294,7 +294,7 @@ A generation is never replaced in place: a semantic change is always a new gener
 
 ### 5.1 Pure evaluation entry points
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-evaluate`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-evaluate`
 
 The system **MUST** provide `cf-gears-bss-rating-core` with `EngineRegistry`, `evaluate`, `evaluate_order`, `split_points`, `window_geometry` and `DerivedMeterEvaluator` per DESIGN §3.3, run the step order (bind, meter, model, guards; floor at roll-up) in the compiled order, apply the emission guards and return only typed errors of the closed taxonomy, with no I/O, no clock read and no store; a CI deny-list rejects tokio, sea-orm, http and ClientHub in the crate.
 
@@ -306,7 +306,7 @@ The system **MUST** provide `cf-gears-bss-rating-core` with `EngineRegistry`, `e
 
 ### 5.2 Bindings, models, windows and period math
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-pricing-semantics`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-pricing-semantics`
 
 The system **MUST** take each line's price from the resolved bindings and cross-check the period-start binding against the fact's accepted binding (T-D-73; an `ends_on` successor is not compared; no selection is built), convert `PriceModel` decimals exactly into major-unit fractions carrying `currency` and `currency_scale` (T-D-74, T-D-80), apply the model formulas, evaluate derived usage types per granule (T-D-76), derive windows from `UsageRatingPolicy` (T-D-75), compute split points at `ends_on` with band continuity, prorate by covered UTC seconds (T-D-77) and provide the minimum-fee floor (T-D-78) exactly as namespaces 02, 03 and 09 define them, and fail closed with the launch errors for `Peak` / `TimeWeighted` inputs, more than one dimension value per item and line, and other unsupported primitives; the one `dimension_value` the accepted binding names is rated (V56).
 
@@ -318,7 +318,7 @@ The system **MUST** take each line's price from the resolved bindings and cross-
 
 ### 5.3 Exact numbers and retained engine generations
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-exact-and-replay`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-exact-and-replay`
 
 The system **MUST** compute every amount and quantity exactly under the generation's arithmetic budget, fail deterministically beyond the bounds of DESIGN §3.3, never round, release each semantic change as a new frozen generation with a recorded `engine_digest`, and run every retained generation's golden corpus plus a cross-upgrade replay test in CI.
 
@@ -330,7 +330,7 @@ The system **MUST** compute every amount and quantity exactly under the generati
 
 ### 5.4 Governance pass-through and defensive rules
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-governance`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-core-governance`
 
 The system **MUST** run the remaining rating-time check (`rating-val-02`) defensively (`non_injective_mapping`), register nothing in Pricing's publish pipeline (R-12 closed: approval is the shared `bss-approval` engine), carry the binding's invoice inputs onto every line, keep ASC 606 references null and fail closed on a bundle line (pricing D-411).
 
@@ -355,11 +355,11 @@ The system **MUST** run the remaining rating-time check (`rating-val-02`) defens
 - [ ] **V29** A mid-period plan change prorates both `period_line` children by covered UTC seconds and their fractions sum to 1 (T-D-77; 09 §3.6 worked example in §7).
 - [ ] The floor function returns the amounts of V34, V50–V52 and V61 (vectors owned by [Roll-up and Delivery](09-rollup-delivery.md); T-D-78).
 - [ ] An intermediate operand over the arithmetic budget fails `precision_overflow` before any result is returned.
-- [ ] (unit level: the model function is called directly with the quantity, bypassing `evaluate`, because a derived granule output has at most 12 fractional digits) Rating's own arithmetic agrees with pricing's `amount_for` on every case where **each intermediate** of `amount_for` is exact in `rust_decimal` — not only its final result: `3.0000000000000000000000000001` units with `package_size` 3 bill 2 blocks in Rating, while `amount_for`'s rounded division gives 1 — and stays exact where `amount_for` would round (V39).
+- [ ] (unit level: the model function is called directly with the quantity, bypassing `evaluate`, because a derived granule output has at most 12 fractional digits) Rating's own arithmetic agrees with pricing's `amount_for`, which computes over exact fractions since pricing `958b5e2f1`, on every case `amount_for` accepts — `3.0000000000000000000000000001` units with `package_size` 3 bill 2 blocks in both — and stays exact where a `rust_decimal` computation would round (V39).
 - [ ] Rating serializes every `ExactMoney` and `ExactQuantity` as canonical strings with `currency` and `currency_scale` beside each amount, and rejects a JSON number in those fields with `InvalidArgument` (T-D-80; V41, V47).
 - [ ] A binding set that violates `rating-val-02` fails `non_injective_mapping` at evaluation; no line is emitted.
-- [ ] `evaluate_order` excludes usage from totals and returns the same exact arithmetic as `evaluate` for the same recurring binding.
-- [ ] The crate builds with the dependency deny-list enforced, and each generation crate depends only on its vendored copies and the allowlist; editing a vendored file changes the generation's digest.
+- [ ] `evaluate_order` excludes usage from totals and returns the same exact arithmetic as `evaluate` for the same recurring binding over a whole period; its TCV follows the term basis of Orders D-197 (feature 10, V48).
+- [ ] The crate builds with the dependency deny-list enforced, and each generation crate depends only on its vendored copies, `bss_money` and the allowlist; editing a vendored file changes the generation's digest.
 
 Acceptance vectors owned by this feature (DESIGN §4.13 index):
 

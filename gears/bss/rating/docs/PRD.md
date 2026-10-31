@@ -333,7 +333,7 @@ matrix).
 | Every usage and recurring requirement | p1 | Subscriptions carries the period's pins, plan revision, quantity and `BillingTerms` on each fact (SUB-D-29; R-03; UPSTREAM_REQS §2.6) | no fact ⇒ no child; a fact without pins, revision or quantity ⇒ its children wait `pending(pins_unavailable)`; `price_uncovered` for an uncovered cell |
 | `cpt-cf-bss-rating-fr-dimensional-pricing` (several dimension values per item and line) | p1 | R-16 (dimension-key encoding) | the one value pinned at sale per item is rated; more than one value per item and line is `unsupported_primitive` |
 | `cpt-cf-bss-rating-fr-tier-aggregation-window` (`resource` aggregation scope) | p1 | R-21 (scope proofs that list resources) | `resource_scope_not_supported`; `subscription_line` scope only |
-| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | p2 (p1 for Orders) | R-24 (Orders confirms the D-167 request and response, T-D-79) | `OrderEvaluationV1` returns `ServiceUnavailable` |
+| `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | p1 | R-24 (the SDK provider, grants and supported-profile declaration Orders D-197 lists; contract T-D-83) | `OrderEvaluationV1` returns `ServiceUnavailable` |
 
 Closed gates (2026-10-08): `subscription_lifetime` and `per_event` windows do not exist in Pricing (R-28 closed); publish-time validators have no hook in the shared approval engine (R-12 closed). The pricing adapter itself is designed (R-17 closed by T-D-73…T-D-78).
 
@@ -385,7 +385,8 @@ No subscription, activated cohort, receipt or complete billing snapshot is inven
 fixes assessment/line/revision identity and producer digests; Rating does not select a successor
 or return the obsolete catalog-version/cohort prefix as purchase authority.
 
-Rating **MUST** compute item/line/order monetary aggregation, scale conversion and rounding,
+Rating **MUST** compute item/line/order monetary aggregation and display rounding (nothing is
+converted: one currency and `currency_scale` per order),
 return exact amounts and major-unit display estimates rounded HALF_EVEN at `currency_scale`
 with gross/net/discount, promotion availability, all three charge kinds,
 cycle-labelled components and one net pre-tax TCV with finite/rolling-annualized/mixed basis.
@@ -399,14 +400,14 @@ payer authorization and the service grant are required before disclosure. Actual
 composition and activation geometry remain owned downstream. This replaces only the former
 pre-purchase caller-summation/catalog-prefix contract; it does not claim delivery, producer-owner
 signoff or reconciliation of the rest of Rating's historical design. While promotions are
-deferred, `discount` and `promotion_status` remain `unavailable`, never a guessed zero;
-brand-scoped terms and indicative tax are likewise unavailable. Missing or inconsistent required
-inputs fail with `evaluation-unavailable`.
+deferred, the discount remains `unavailable` (`discount_status`, Orders D-216), never a guessed
+zero; brand-scoped terms and indicative tax are likewise unavailable. Missing or inconsistent
+required inputs fail with a typed error, which Orders maps to `evaluation-unavailable`.
 
-**Design**: `OrderEvaluationV1::evaluate` (DECISIONS T-D-54/T-D-79), refined for the selected
-Orders D-197 purchase contract above, with exact money and display estimates (T-D-80; Orders
-D-216). Orders requires totals at submit and amendment as a `p1` dependency. Rating's historical
-`p2` priority and DTO confirmation remain tracked under R-24 in
+**Design**: `OrderEvaluationV1::evaluate` (DECISIONS T-D-54, T-D-83), the selected Orders D-197
+purchase contract above, with exact money and display estimates (T-D-80; Orders D-216); the pure
+arithmetic is `rating-core`'s `evaluate_order`. Orders requires totals at Preview, submit and
+amendment as a `p1` dependency. The delivery prerequisites stay tracked under R-24 in
 [`UPSTREAM_REQS.md` §2.11](./UPSTREAM_REQS.md#211-orders-lifecycle); this selected target does not
 claim producer-owner signoff.
 
@@ -1414,7 +1415,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 | ~~Rating & Charging (downstream gear)~~ | **Not a dependency — intra-gear since ADR-0002 / T-D-16.** The Usage → RatedCharge pipeline, dedup, windowed `Q`, unit synthesis, rated-output persistence and Billing handoff are **this gear's own** design contracts 12–16 (authored 2026-07-15); the core↔pipeline contract is in-process, not an external integration. The upstream `PRD-rating-engine-202604031200` is legacy provenance (§2.2), not a live counterpart | — |
 | Billing & Invoicing | Owns period state; consumes complete result revisions + snapshots; rounds invoice-line aggregates; posts immutable invoices and credit/debit notes to the ledger (`pricing_snapshot_ref` carries Rating's snapshot id). **No Billing gear exists** (DECISIONS R-04/R-05) | `p1` |
 | IRM / usage emitters (completeness evidence) | Coverage declarations and historical resource inventory that prove a usage window complete (Seam Atlas C05, proposed). **IRM has no code** (DECISIONS R-21) | `p1` (usage invoicing) |
-| Orders Lifecycle (consumer) | Calls pre-purchase evaluation at submit/amend with the accepted chain matrix (Orders D-154, D-167; DECISIONS T-D-79, R-24) | `p1` |
+| Orders (consumer) | Calls purchase evaluation at Preview, submit and amendment with the selected bindings (Orders D-197, D-216; DECISIONS T-D-83, R-24) | `p1` |
 | Finance (FX) | FX rate tables and lock policies; `fxTableVersion`. **No pinnable FX source exists**; launch is native-currency only (DECISIONS R-07) | `p1` |
 | Promotions / Discounts | Owned by Pricing and deferred (pricing D-409); no coupon source exists | `p2` |
 | Spend control / credit risk | Billing (post-aggregation cap) + OSS/Policy (real-time stop) + Finance (credit risk / prepaid gating); Rating sets amount only, no enforcement | `p2` |
@@ -1477,7 +1478,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 | Pricing PRD, DESIGN and DECISIONS (**pricing** gear — the PriceBook model) | `gears/bss/pricing/docs/` | Price books, entries, dated prices, plans and revisions; the read contract `resolve` / `prices/{id}` (D-419…D-425, `design/07-read-contract-events.md`); golden consumer contracts `pricing/tests/contract/*.json` |
 | Products PRD and DECISIONS (**products** gear) | `gears/bss/products/docs/` | SKU registry and versions; derived usage types (P-D-229, P-D-259); `bss_products_sdk::derived` |
 | Subscriptions PRD and DECISIONS (**subscriptions** gear) | `gears/bss/subscriptions/docs/` | Periods, committed quantity, `(changeEffectiveAt, changeMode)`; SUB-D-29 (pins per period, the PriceBook adapter), SUB-D-28 (one-time dedup) |
-| Orders Lifecycle UPSTREAM_REQS and DECISIONS | `gears/bss/orders-lifecycle/docs/` | The order-evaluation contract Orders expects (D-154, D-167) and the accepted bindings at activation (D-162) |
+| Orders UPSTREAM_REQS, DESIGN and DECISIONS | `gears/bss/orders/docs/` | The purchase evaluation contract Orders selected (D-197, D-216; DESIGN `contract-03-rating-purchase-evaluation`) and the accepted receipt at activation (D-188, D-192) |
 | Usage Collector PRD — usage feed | `gears/system/usage-collector/docs/PRD.md` (`cpt-cf-usage-collector-fr-billing-usage-feed`) | The ingestion contract this gear's [contract 12](DESIGN.md#contract-12) consumes (launch-gating) |
 | Trace chain | `AGENTS.md` (repository root) | Manifest → PRD → ADR → Design → Stories |
 | BSS Architecture Manifest | `docs/bss/manifest/vz-arch-manifest-bss-only.md` | **Historical — not vendored into this repo**; §4.1 Catalog, §4.2 Rating, §2.1.3 identities |

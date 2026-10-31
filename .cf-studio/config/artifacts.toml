@@ -616,6 +616,30 @@ name = "Nested SDK"
 path = "{system_root}/{system}-sdk/src"
 extensions = [".rs"]
 
+# A gear whose pure evaluation core is a crate of its own (rating: `rating-core`, and one frozen
+# engine generation crate per `rating-engine/gen-<n>`, rating ADR-0006). Without these entries the
+# @cpt markers of those crates are never checked against the gear's feature documents. A codebase
+# path takes no glob, so each engine generation adds its own two entries.
+[[systems.autodetect.codebase]]
+name = "Nested Core"
+path = "{system_root}/{system}-core/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Nested Core Tests"
+path = "{system_root}/{system}-core/tests"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Engine Generation 1"
+path = "{system_root}/{system}-engine/gen-1/src"
+extensions = [".rs"]
+
+[[systems.autodetect.codebase]]
+name = "Engine Generation 1 Tests"
+path = "{system_root}/{system}-engine/gen-1/tests"
+extensions = [".rs"]
+
 [[systems]]
 name = "examples"
 slug = "examples"

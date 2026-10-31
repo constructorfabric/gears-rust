@@ -16,7 +16,7 @@
   - [2.7 Child Evaluation and Finalization - HIGH](#27-child-evaluation-and-finalization---high)
   - [2.8 Corrections, Replay and Administrative Re-rate - HIGH](#28-corrections-replay-and-administrative-re-rate---high)
   - [2.9 Parent Roll-up and Billing Delivery - HIGH](#29-parent-roll-up-and-billing-delivery---high)
-  - [2.10 Pre-Purchase Order Evaluation - MEDIUM](#210-pre-purchase-order-evaluation---medium)
+  - [2.10 Pre-Purchase Order Evaluation - HIGH](#210-pre-purchase-order-evaluation---high)
   - [2.11 Operations, Reconciliation and Data Lifecycle - HIGH](#211-operations-reconciliation-and-data-lifecycle---high)
 - [3. Feature Dependencies](#3-feature-dependencies)
   - [3.1 Upstream and release prerequisites](#31-upstream-and-release-prerequisites)
@@ -47,7 +47,7 @@ twelve contract namespaces of [DESIGN §6](DESIGN.md#6-detailed-architecture-con
   operation matrix, the inbox, exceptions, work queues, coordination and the SDK contract rules are
   used by every pipeline feature, so they form the foundation.
 - **Consumer surfaces are separate when their consumer or priority differs.** Order evaluation has
-  its own consumer (Orders Lifecycle), SDK trait and open priority (R-24). Operations — the operator
+  its own consumer (Orders), SDK trait and delivery prerequisites (Orders D-197, R-24). Operations — the operator
   REST plane, reconciliation, data lifecycle and NFR verification — need every pipeline feature
   first.
 
@@ -802,26 +802,27 @@ generation, a new feature and a new design review.
 
 ---
 
-### 2.10 [Pre-Purchase Order Evaluation](features/10-order-evaluation.md) - MEDIUM
+### 2.10 [Pre-Purchase Order Evaluation](features/10-order-evaluation.md) - HIGH
 
-- [ ] `p2` - **ID**: `cpt-cf-bss-rating-feature-order-evaluation`
+- [ ] `p1` - **ID**: `cpt-cf-bss-rating-feature-order-evaluation`
 
-- **Purpose**: Orders Lifecycle needs resolved totals before a subscription exists. Serving them from
+- **Purpose**: Orders needs resolved totals before a subscription exists. Serving them from
   the same arithmetic, through a separate DTO that persists nothing, gives Orders exact numbers without
   making an order a rating input.
 
 - **Depends On**: `cpt-cf-bss-rating-feature-foundation`, `cpt-cf-bss-rating-feature-evaluation-core`
 
 - **Scope**:
-  - `OrderEvaluator` and `OrderEvaluationV1::evaluate`: authorization (`evaluation × evaluate`),
-    the request's bindings priced as given (no pricing read; T-D-79), `evaluate_order`, usage excluded
-    from TCV (T-D-54).
+  - `OrderEvaluator` and `OrderEvaluationV1::evaluate` (Orders' `RatingPurchaseEvaluationV1`):
+    authorization (`evaluation × evaluate`), the selected bindings priced as given (no pricing read;
+    Orders D-197, T-D-83), `evaluate_order`, the term horizon and TCV basis, Preview's withheld TCV,
+    usage excluded from TCV (T-D-54).
 - **Out of scope**:
-  - Persistence, idempotency keys, usage estimation; the order's own `OrderPin` and stored totals (Orders Lifecycle).
+  - Persistence, idempotency keys, usage estimation; the order's own pin and stored totals (Orders D-192, D-216); change orders' delta TCV (outside D-197).
 
 - **Requirements Covered**:
 
-  - [ ] `p2` - `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
+  - [ ] `p1` - `cpt-cf-bss-rating-fr-pre-purchase-evaluation`
 
 - **Design Principles Covered**:
 
@@ -852,7 +853,7 @@ generation, a new feature and a new design review.
 - **Detailed contract coverage**: [11 §4.10](DESIGN.md#contract-11-4-10).
   - **Interfaces**: `cpt-cf-bss-rating-interface-order-evaluation-cc`
 
-- **Phase**: 1 against the pricing fake; production after R-24 (`…-upreq-orders-evaluation-dto`; Orders confirms T-D-79).
+- **Phase**: 1 against the pricing fake; production after the prerequisites Orders D-197 lists — the SDK provider, grants and supported-profile declaration (`…-upreq-orders-evaluation-dto`, R-24; T-D-83).
 
 ---
 
@@ -935,9 +936,9 @@ cpt-cf-bss-rating-feature-foundation          cpt-cf-bss-rating-feature-evaluati
     cpt-cf-bss-rating-feature-operations            (after every pipeline feature)
 ```
 
-The table is the build-order authority. Numeric prefixes are stable identifiers, not the build order; all features but
-order evaluation are HIGH because each carries a `p1` obligation, and phases express sequencing, not
-priority.
+The table is the build-order authority. Numeric prefixes are stable identifiers, not the build order; every feature is
+HIGH because each carries a `p1` obligation (order evaluation since Orders D-197 made it one), and phases express
+sequencing, not priority.
 
 | Feature | Phase | Depends on |
 |---------|-------|------------|
@@ -966,7 +967,7 @@ priority.
 - `rollup-delivery` consumes current child results; `corrections-rerate` needs both, because a
   correction's acceptance is a new parent revision.
 - `order-evaluation` shares only the core and the foundation's SDK and authorization, so it can be
-  built in parallel with the pipeline once R-24 is settled.
+  built in parallel with the pipeline; its contract is Orders D-197 (T-D-83).
 - `operations` observes and repairs every pipeline feature, so it comes last; its load-test gates are
   run before implementation lock.
 

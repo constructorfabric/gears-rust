@@ -2426,6 +2426,46 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-bss-rating-core"
+version = "0.0.0"
+dependencies = [
+ "cf-gears-bss-money",
+ "cf-gears-bss-pricing",
+ "cf-gears-bss-rating-engine-gen-1",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "time",
+]
+
+[[package]]
+name = "cf-gears-bss-rating-engine-gen-1"
+version = "0.0.0"
+dependencies = [
+ "bigdecimal",
+ "cf-gears-bss-money",
+ "cf-gears-bss-rating-gen1-derived",
+ "proptest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-bss-rating-gen1-derived"
+version = "0.0.0"
+dependencies = [
+ "proptest",
+ "rust_decimal",
+]
+
+[[package]]
 name = "cf-gears-bss-rest"
 version = "0.0.0"
 dependencies = [

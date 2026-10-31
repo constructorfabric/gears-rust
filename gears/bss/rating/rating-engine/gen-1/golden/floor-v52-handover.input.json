@@ -1,0 +1,55 @@
+{
+  "description": "Price A bound days 1-14, price B days 15-30, each minimum_fee 30 and rated 5: floors 14 and 16, top-ups 9 and 11.",
+  "vectors": [
+    "V52"
+  ],
+  "entry": "minimum_fee_floor",
+  "input": [
+    {
+      "price_id": "00000000-0000-0000-0000-000000020001",
+      "currency_scale": 2,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered": [
+        {
+          "start": "2026-09-01T00:00:00Z",
+          "end": "2026-09-15T00:00:00Z"
+        }
+      ],
+      "period_seconds": 2592000,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    },
+    {
+      "price_id": "00000000-0000-0000-0000-000000020002",
+      "currency_scale": 2,
+      "rated": {
+        "numerator": "5",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      },
+      "covered": [
+        {
+          "start": "2026-09-15T00:00:00Z",
+          "end": "2026-10-01T00:00:00Z"
+        }
+      ],
+      "period_seconds": 2592000,
+      "minimum_fee": {
+        "numerator": "30",
+        "denominator": "1",
+        "currency": "EUR",
+        "currency_scale": 2
+      }
+    }
+  ]
+}

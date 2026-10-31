@@ -1,0 +1,6 @@
+{
+  "error": {
+    "reason_code": "unsupported_primitive",
+    "detail": "the accepted binding names 2 dimension values for item 00000000-0000-0000-0000-000000010001; one per item and line until R-16"
+  }
+}
