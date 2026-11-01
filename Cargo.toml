@@ -685,7 +685,7 @@ rdkafka = { version = "0.38", default-features = false, features = ["cmake-build
 # Pinned below 4.10: its librdkafka 2.12.1 tests `#ifdef WITH_OAUTHBEARER_OIDC`
 # against a `#cmakedefine01` macro, so a build without curl still includes
 # <curl/curl.h> and fails. rdkafka 0.39 requires 4.10, hence rdkafka 0.38.
-rdkafka-sys = { version = "=4.9.0", default-features = false }
+rdkafka-sys = { version = "=4.10.0", default-features = false }
 
 # Redis/Valkey client, used only by the Redis cluster plugin
 # (gears/system/cluster/plugins/redis-cluster-plugin, see its docs/DESIGN.md §3.1).
