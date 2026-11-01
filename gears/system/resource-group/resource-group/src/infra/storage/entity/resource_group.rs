@@ -13,7 +13,8 @@ pub struct Model {
     pub id: Uuid,
     #[sea_orm(nullable)]
     pub parent_id: Option<Uuid>,
-    pub gts_type_id: i16,
+    pub gts_type_id: Uuid,
+    pub is_tenant: bool,
     pub name: String,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<serde_json::Value>,

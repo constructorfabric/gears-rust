@@ -127,12 +127,13 @@ pub enum ScopeFilter {
     Eq(EqScopeFilter),
     /// Set membership: `property IN (values)`.
     In(InScopeFilter),
-    /// Typed group membership. The membership subquery resolves
-    /// `gts_type_id` through `gts_type.schema_id = membership_resource_type`
-    /// and compares its opaque `resource_id` with `CAST(property AS text)`.
+    /// Typed group membership. The membership subquery compares
+    /// `gts_type_id` directly with the Types Registry Registry Reference
+    /// (UUID) of `membership_resource_type` and compares its opaque
+    /// `resource_id` with `CAST(property AS text)`.
     InGroup(InGroupScopeFilter),
-    /// Typed group subtree. Uses the same local `gts_type` resolution and text
-    /// comparison as [`ScopeFilter::InGroup`], with matching group IDs selected
+    /// Typed group subtree. Uses the same member-type Registry Reference
+    /// comparison and text comparison as [`ScopeFilter::InGroup`], with matching group IDs selected
     /// from descendants in `resource_group_closure`.
     InGroupSubtree(InGroupSubtreeScopeFilter),
     /// Tenant subtree: `property IN (SELECT descendant_id FROM tenant_closure WHERE ancestor_id = root_tenant_id)`.

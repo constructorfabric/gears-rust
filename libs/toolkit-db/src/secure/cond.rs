@@ -181,19 +181,6 @@ fn warn_group_filter_denied(predicate: &'static str, property: &str, cause: &'st
     );
 }
 
-/// Resolve an external member-handle GTS schema ID to RG-local `gts_type.id` values.
-fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
-    let member_type = Alias::new("member_type");
-    Query::select()
-        .column((member_type.clone(), Alias::new(rg_tables::GTS_TYPE_ID)))
-        .from_as(Alias::new(rg_tables::GTS_TYPE_TABLE), member_type.clone())
-        .and_where(
-            Expr::col((member_type, Alias::new(rg_tables::GTS_TYPE_SCHEMA_ID)))
-                .eq(membership_resource_type),
-        )
-        .to_owned()
-}
-
 /// Build the common typed RG membership relation for direct and subtree
 /// predicates: membership rows selected by group and qualified by the RG
 /// member-handle type.
@@ -203,7 +190,13 @@ fn membership_type_subquery(membership_resource_type: &str) -> SelectStatement {
 /// instead would make valid non-UUID member types raise a `PostgreSQL`
 /// conversion error. An absent member-handle type fails closed (`None`)
 /// because otherwise identical external IDs from different types could be
-/// conflated.
+/// conflated. An unparsable member-handle type fails closed the same way.
+///
+/// Resource-group stores the Types Registry "Registry Reference" of the
+/// member type in `membership.gts_type_id`. Today Types Registry derives it as
+/// `GtsId::to_uuid()` of the GTS id, so the compiler derives it the same way
+/// and compares directly. If that derivation ever changed, the predicate would
+/// match nothing (fail closed).
 fn typed_membership_query(
     membership_resource_type: &str,
     group_selection: GroupSelection,
@@ -211,6 +204,10 @@ fn typed_membership_query(
     if membership_resource_type.is_empty() {
         return None;
     }
+    let member_type_ref = membership_resource_type
+        .parse::<toolkit_gts::GtsId>()
+        .ok()?
+        .to_uuid();
 
     let membership = Alias::new("membership");
     let group_id = Expr::col((
@@ -230,8 +227,7 @@ fn typed_membership_query(
         .and_where(group_predicate)
         .to_owned();
     membership_subquery.and_where(
-        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID)))
-            .in_subquery(membership_type_subquery(membership_resource_type)),
+        Expr::col((membership, Alias::new(rg_tables::MEMBERSHIP_GTS_TYPE_ID))).eq(member_type_ref),
     );
     Some(membership_subquery)
 }
@@ -561,8 +557,7 @@ where
                 // CAST(col AS text) IN (
                 //   SELECT resource_id FROM resource_group_membership
                 //    WHERE group_id IN (...)
-                //      AND gts_type_id IN (SELECT id FROM gts_type
-                //                           WHERE schema_id = <member type>))
+                //      AND gts_type_id = <Registry Reference UUID of the member type>)
                 let Some(group_values) = uuid_scope_values_to_sea_values(gf.group_ids()) else {
                     warn_group_filter_denied("InGroup", gf.property(), "non-UUID group_ids");
                     and_cond = and_cond.add(Expr::value(false));
@@ -583,7 +578,7 @@ where
                     warn_group_filter_denied(
                         "InGroup",
                         gf.property(),
-                        "empty membership resource type (untyped filter)",
+                        "empty or invalid membership resource type",
                     );
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
@@ -612,8 +607,7 @@ where
                 //    WHERE group_id IN (
                 //            SELECT descendant_id FROM resource_group_closure
                 //             WHERE ancestor_id IN (...))
-                //      AND gts_type_id IN (SELECT id FROM gts_type
-                //                           WHERE schema_id = <member type>))
+                //      AND gts_type_id = <Registry Reference UUID of the member type>)
                 let Some(ancestor_values) = uuid_scope_values_to_sea_values(sf.ancestor_ids())
                 else {
                     warn_group_filter_denied(
@@ -650,7 +644,7 @@ where
                     warn_group_filter_denied(
                         "InGroupSubtree",
                         sf.property(),
-                        "empty membership resource type (untyped filter)",
+                        "empty or invalid membership resource type",
                     );
                     and_cond = and_cond.add(Expr::value(false));
                     continue;
@@ -789,6 +783,15 @@ mod tests {
     const MEMBERSHIP_TYPE: &str =
         toolkit_gts::gts_id!("cf.core.rg.type.v1~example.core.rg.member.v1~");
 
+    /// Registry Reference of [`MEMBERSHIP_TYPE`], derived the same way the
+    /// compiler (and Types Registry) derive it.
+    fn member_type_ref() -> uuid::Uuid {
+        MEMBERSHIP_TYPE
+            .parse::<toolkit_gts::GtsId>()
+            .expect("valid GTS id")
+            .to_uuid()
+    }
+
     fn one(filter: ScopeFilter) -> AccessScope {
         AccessScope::from_constraints(vec![ScopeConstraint::new(vec![filter])])
     }
@@ -848,11 +851,11 @@ mod tests {
             ),
             (
                 group_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN ('00000000-0000-0000-0000-000000000007') AND "membership"."gts_type_id" = '{member_type_ref}') AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 group_subtree_scope(),
-                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" IN (SELECT "member_type"."id" FROM "gts_type" AS "member_type" WHERE "member_type"."schema_id" = 'gts.cf.core.rg.type.v1~example.core.rg.member.v1~')) AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
+                r#"SELECT 1 FROM "t" WHERE CAST("custom_prop_test"."id" AS text) IN (SELECT "membership"."resource_id" FROM "resource_group_membership" AS "membership" WHERE "membership"."group_id" IN (SELECT "group_closure"."descendant_id" FROM "resource_group_closure" AS "group_closure" WHERE "group_closure"."ancestor_id" IN ('00000000-0000-0000-0000-000000000007')) AND "membership"."gts_type_id" = '{member_type_ref}') AND "custom_prop_test"."tenant_id" = '00000000-0000-0000-0000-000000000000'"#,
             ),
             (
                 tenant_subtree_scope(),
@@ -863,7 +866,10 @@ mod tests {
         for (scope, expected) in cases {
             let predicate = build_scope_predicate::<E>(&scope, ColumnAddress::Table)
                 .expect("table addressing renders every arm");
-            assert_eq!(render(predicate.condition()), expected);
+            assert_eq!(
+                render(predicate.condition()),
+                expected.replace("{member_type_ref}", &member_type_ref().to_string())
+            );
             assert!(
                 predicate.siblings().is_empty(),
                 "the select path must never be handed a FROM item to place"
@@ -1308,11 +1314,11 @@ mod tests {
             "InGroup condition must join on resource_id, got: {cond_str}"
         );
         assert!(
-            cond_str.contains("gts_type_id") && cond_str.contains("schema_id"),
+            cond_str.contains("gts_type_id"),
             "InGroup condition must qualify the membership resource type, got: {cond_str}"
         );
         assert!(
-            cond_str.contains(MEMBERSHIP_TYPE) && cond_str.contains("Cast"),
+            cond_str.contains(&member_type_ref().to_string()) && cond_str.contains("Cast"),
             "InGroup condition must cast the entity ID to text and bind the type, got: {cond_str}"
         );
     }
@@ -1674,8 +1680,7 @@ mod tests {
         );
         assert!(
             cond_str.contains("gts_type_id")
-                && cond_str.contains("schema_id")
-                && cond_str.contains(MEMBERSHIP_TYPE)
+                && cond_str.contains(&member_type_ref().to_string())
                 && cond_str.contains("Cast"),
             "InGroupSubtree must cast the entity ID and qualify membership type, got: {cond_str}"
         );

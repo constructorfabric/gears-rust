@@ -24,7 +24,7 @@
   - [4.1 In Scope](#41-in-scope)
   - [4.2 Out of Scope](#42-out-of-scope)
 - [5. Functional Requirements](#5-functional-requirements)
-  - [5.1 RG Type Management](#51-rg-type-management)
+  - [5.1 RG Types in Types Registry](#51-rg-types-in-types-registry)
   - [5.2 RG Entity Management](#52-rg-entity-management)
   - [5.3 Membership Management](#53-membership-management)
   - [5.4 Hierarchy Operations (Closure Table)](#54-hierarchy-operations-closure-table)
@@ -109,7 +109,7 @@ Authorization flows additionally need a stable source for ownership hierarchy an
 
 - Provide one stable contract for group type, entity, hierarchy, and membership operations.
 - Enforce strict forest invariants (single parent, no cycles).
-- Support dynamic type configuration through API and DB seeding.
+- Take group types from Types Registry as GTS Type Schemas, so RG keeps no type catalogue of its own.
 - Provide efficient hierarchy operations using closure table.
 - Allow AuthZ integration without coupling RG to AuthZ semantics.
 
@@ -148,8 +148,8 @@ Authorization flows additionally need a stable source for ownership hierarchy an
 
 **ID**: `cpt-cf-resource-group-actor-instance-administrator`
 
-- **Role**: manages resource group types, resource group items, and seeding (tenants). Configures hierarchy query profile and operates migrations.
-- **Needs**: full control over type definitions, deterministic seeding, predictable behavior when constraints are tightened.
+- **Role**: manages resource group items and seeding (tenants). Registers resource group types in Types Registry (outside RG). Configures hierarchy query profile and operates migrations.
+- **Needs**: types defined in one place (Types Registry), deterministic seeding, predictable behavior when constraints are tightened.
 
 #### Tenant Administrator
 
@@ -164,7 +164,7 @@ Authorization flows additionally need a stable source for ownership hierarchy an
 
 **ID**: `cpt-cf-resource-group-actor-apps`
 
-- **Role**: programmatic access to RG via `ResourceGroupClient` SDK — manage types, groups, and memberships; read hierarchy and membership data.
+- **Role**: programmatic access to RG via `ResourceGroupClient` SDK — manage groups and memberships; read hierarchy and membership data.
 
 #### AuthZ Resolver Plugin (via AuthZ Resolver gear)
 
@@ -281,95 +281,59 @@ Caller: platform-admin, barrier_mode: "none"
 
 ### 4.1 In Scope
 
-- Dynamic type management API.
+- Resolution and enforcement of group types defined in Types Registry (placement rules, membership types, group metadata schema).
 - Group entity lifecycle API.
 - Closure-table-based hierarchy operations.
 - Membership lifecycle and lookup operations (qualified by `resource_type`).
 - Query profile constraints (`max_depth`, `max_width`) and enforcement behavior.
 - Generic read ports consumable by external gears/plugins.
-- REST API endpoints (`/api/resource-group/v1/...` for groups/memberships, `/api/types-registry/v1/...` for types) with OData `$filter` and cursor-based pagination (`cursor`, `limit`).
-- Deterministic type seeding for bootstrapping.
+- REST API endpoints (`/api/resource-group/v1/...` for groups/memberships) with OData `$filter` and cursor-based pagination (`cursor`, `limit`).
 
 ### 4.2 Out of Scope
 
+- Storage, CRUD and evolution of group types (owned by Types Registry; see ADR-002).
 - AuthN/AuthZ resolver contract changes.
 - PDP policy evaluation logic.
 - SQL compilation engine changes in PEP.
 
 ## 5. Functional Requirements
 
-### 5.1 RG Type Management
+### 5.1 RG Types in Types Registry
 
-#### Create, List, Get, Update, Delete Type
+#### Types Are Types Registry Entities
 
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-manage-types`
-
-**Actors**: `cpt-cf-resource-group-actor-instance-administrator`, `cpt-cf-resource-group-actor-apps`
-
-The gear **MUST** provide API operations to create, list, retrieve, update, and delete resource group types.
-
-A type includes:
-
-- `schema_id` (unique GTS type path, case-insensitive)
-- `can_be_root` (boolean; `true` means the type permits root placement — no `parent_id`). Resolved from `x-gts-traits` in the registered GTS schema.
-- `allowed_parents` (allowed parent type codes; may be empty if the type is root-only). Invariant: `can_be_root OR len(allowed_parents) >= 1` — a type must have at least one valid placement
-- `allowed_memberships` (GTS type paths of resource types allowed as members of groups of this type, e.g. `["gts.cf.core.idp.user.v1~"]`)
-- `metadata_schema` (optional JSON Schema — defines the structure and validation rules for the `metadata` field on group instances of this type)
-
-#### Validate Type Code Format
-
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-validate-type-code`
+- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-types-in-types-registry`
 
 **Actors**: `cpt-cf-resource-group-actor-instance-administrator`, `cpt-cf-resource-group-actor-apps`
 
-The gear **MUST** validate type code format:
+The gear **MUST NOT** store or manage resource group types and **MUST NOT** expose type CRUD in REST or in the SDK. A resource group type is a GTS Type Schema registered in Types Registry and derived from the abstract base type `gts.cf.core.rg.type.v1~`. Types are declared statically by the owning gear (the platform tenant type in the RG SDK; the AM user and user-group types in the AM SDK) or registered through the Types Registry API, subject to the deployment's registration policy.
 
-- length `1..63`
-- no whitespace
-- case-insensitive uniqueness
+A type carries its placement rules as trait values (`x-gts-traits`) on the base trait schema:
 
-Invalid input **MUST** return validation error with field-specific details.
+- `can_be_root` (boolean, default `false`; `true` means the type permits root placement — no `parent_id`)
+- `allowed_parent_types` (GTS ids of RG types allowed as parent, default empty; a type listing its own id allows nesting under itself)
+- `allowed_membership_types` (GTS ids of resource types allowed as members of groups of this type, default empty; e.g. `["gts.cf.core.am.user.v1~"]`)
 
-#### Reject Duplicate Type
+The JSON Schema of a group's `metadata` is the `metadata` property of the type schema.
 
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-reject-duplicate-type`
+#### Resolve Types Through Types Registry
 
-Creating a type with existing code **MUST** return `TypeAlreadyExists`.
+- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-resolve-types`
 
-#### Schema Migration and Type Data Seeding
+The gear **MUST** resolve types through the Types Registry SDK before the database transaction of a write starts, and **MUST** validate group `metadata` against the schema of the group's type. An unknown type **MUST** be an error and **MUST NOT** be silently skipped:
 
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-seed-types`
+- unknown group type on group create — `TypeNotFound` (HTTP 404)
+- unknown membership resource type — validation error (HTTP 400)
+- Types Registry unavailable — HTTP 503 with a retry hint
+- stored type reference that Types Registry cannot resolve — HTTP 500
 
-Any RG plugin **MUST** perform schema migration (create/update required database schema) as part of its deployment lifecycle.
+The gear **SHOULD NOT** cache type data itself; caching belongs to the Types Registry SDK.
 
-Type data seeding (populating type definitions) is **optional** and deployment-specific. It can be performed via:
+#### Store Types by Registry Reference
 
-- plugin data migration (built-in or custom)
-- manual database administration
-- RG API calls
+- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-store-type-reference`
 
-AuthZ deployment determines which types are needed:
-
-- **AuthZ does not use RG** — no type seeding required.
-- **Flat tenants** — create type `tenant` with `can_be_root: true, allowed_parents: {}` (root placement only, no nesting).
-- **Hierarchical tenants** — create type `tenant` with for example `can_be_root: true, allowed_parents: {'tenant'}` (root placement or nested under another tenant).
-
-#### Validate Type Update Against Existing Hierarchy
-
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-validate-type-update-hierarchy`
-
-Updating a type's placement rules (`allowed_parents`, `can_be_root`) **MUST** be validated against the existing group hierarchy:
-
-- Removing a type code from `allowed_parents` **MUST** be rejected if any group of this type currently has a parent whose type is the removed code.
-- Setting `can_be_root` from `true` to `false` **MUST** be rejected if any root group (no `parent_id`) of this type exists.
-
-Violation **MUST** return `AllowedParentsViolation` with details identifying the conflicting constraint.
-
-#### Delete Type Only If Unused
-
-- [x] `p1` - **ID**: `cpt-cf-resource-group-fr-delete-type-only-if-empty`
-
-Type deletion **MUST** be rejected if at least one entity of that type exists.
+Groups and memberships **MUST** reference their type by the Types Registry Registry Reference (UUID), with no foreign key and no gear-local type identifier. The gear **MUST NOT** re-validate existing groups when a type evolves: Types Registry guarantees that, within a major version, a type evolves only in a backward-compatible way, and narrowing placement rules requires a new major version (a new type id with a new Registry Reference).
 
 ### 5.2 RG Entity Management
 
@@ -383,7 +347,7 @@ The gear **MUST** provide API operations for:
 
 - create entity
 - retrieve entity by ID
-- full update of mutable fields via PUT (`name`, `type`, `metadata`)
+- full update of mutable fields via PUT (`name`, `parent_id`, `metadata`); the group type is immutable after creation
 - move entity to new parent (subtree move)
 - delete entity
 
@@ -416,17 +380,17 @@ The forest **MAY** contain multiple root groups. Each root has `parent_id = NULL
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`
 
-At most **one** root in the whole RG forest **MUST** be of a tenant type (GTS type code with prefix `TENANT_RG_TYPE_PATH`, see `resource_group_sdk::TENANT_RG_TYPE_PATH`). That unique tenant root is the **main tenant**; every other tenant exists as its sub-tenant (`parent_id` points inside the main tenant's subtree).
+At most **one** root in the whole RG forest **MUST** be of a tenant type (GTS type id with prefix `TENANT_RG_TYPE_PATH`, see `resource_group_sdk::TENANT_RG_TYPE_PATH`; the group's `is_tenant` flag is derived from it at creation). That unique tenant root is the **main tenant**; every other tenant exists as its sub-tenant (`parent_id` points inside the main tenant's subtree).
 
 Non-tenant roots **MAY** coexist alongside the main tenant root; they carry `tenant_id` of the main tenant but are not tenants themselves.
 
-Group creation that would produce a second tenant-type root **MUST** be rejected with `TenantRootAlreadyExists` (HTTP 409 Conflict). Moving an existing tenant-type group to become a root (setting `parent_id = NULL`) when a tenant root already exists **MUST** be rejected with the same error.
+Group creation that would produce a second tenant-type root **MUST** be rejected with `TenantRootAlreadyExists` (HTTP 409 Conflict). Moving an existing tenant-type group to become a root (setting `parent_id = NULL`) when a tenant root already exists **MUST** be rejected with the same error. A partial unique index over tenant root groups backs the check against concurrent writers.
 
 #### Validate Parent Type Compatibility
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-fr-validate-parent-type`
 
-Entity create/move with parent **MUST** validate parent-child type compatibility against type definition.
+Entity create/move with parent **MUST** validate parent-child type compatibility against the parent type's `allowed_parent_types` (and `can_be_root` for root placement) obtained from Types Registry.
 
 Invalid relation **MUST** return `InvalidParentType`.
 
@@ -564,7 +528,6 @@ Operator is responsible for separate data migration to restore compliance.
 
 The gear **MUST** expose REST API endpoints for:
 
-- types: list, create, get, update, delete — under `/api/types-registry/v1/types`
 - groups: list, create, get, update, delete — under `/api/resource-group/v1/groups`
 - memberships: list, add, remove — under `/api/resource-group/v1/memberships`
 
@@ -737,7 +700,7 @@ RG operations **MUST** produce audit events via the platform audit infrastructur
 
 **Actors**: `cpt-cf-resource-group-actor-apps`, `cpt-cf-resource-group-actor-authz-plugin-consumer`
 
-REST API **MUST** follow path-based versioning (`/api/resource-group/v1/` for groups/memberships, `/api/types-registry/v1/` for types). SDK trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`) are stable interfaces — breaking changes **MUST** follow platform versioning policy and require a new trait version with a migration path for consumers. Within a major version, source compatibility **MUST** be maintained.
+REST API **MUST** follow path-based versioning (`/api/resource-group/v1/` for groups/memberships). SDK trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`) are stable interfaces — breaking changes **MUST** follow platform versioning policy and require a new trait version with a migration path for consumers. Within a major version, source compatibility **MUST** be maintained.
 
 ### 6.10 Data Lifecycle
 
@@ -793,59 +756,40 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 ### 8.1 Types
 
-#### Scenario: Create Type
+#### Scenario: Create Group of a Registered Type
 
-- **GIVEN** valid code `branch` and allowed_parents `["tenant", "department"]`
-- **WHEN** caller creates type
-- **THEN** type is persisted with owner metadata
+- **GIVEN** type `gts.cf.core.rg.type.v1~cf.core._.tenant.v1~` is available in Types Registry
+- **WHEN** caller creates a group of that type
+- **THEN** the group stores the type's Registry Reference (UUID) and no type row is written locally
 
-#### Scenario: Reject Duplicate Type
+#### Scenario: Reject Unknown Group Type
 
-- **GIVEN** type `branch` already exists
-- **WHEN** caller creates same code
-- **THEN** `TypeAlreadyExists`
+- **GIVEN** a GTS type id that Types Registry does not know
+- **WHEN** caller creates a group of that type
+- **THEN** `TypeNotFound` (HTTP 404)
 
-#### Scenario: Reject Invalid Type Code
+#### Scenario: Reject Unknown Membership Resource Type
 
-- **GIVEN** code with whitespace or length > 63
-- **WHEN** caller creates type
-- **THEN** validation error
+- **GIVEN** a resource type that Types Registry does not know
+- **WHEN** caller adds a membership with that resource type
+- **THEN** validation error (HTTP 400)
 
-#### Scenario: Update Type Parents (Compatible)
+#### Scenario: Types Registry Unavailable
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant"]`
-- **AND** no existing `branch` groups have a parent of type `department`
-- **WHEN** caller updates allowed_parents to `["tenant", "department"]` (adds new allowed parent)
-- **THEN** type definition is updated
-- **AND** existing groups remain valid
+- **GIVEN** Types Registry cannot answer
+- **WHEN** caller creates a group or adds a membership
+- **THEN** HTTP 503 with a retry hint, and no database transaction was opened
 
-#### Scenario: Reject Update Type Parents When Existing Groups Violate New Rules
+#### Scenario: Type Evolves Compatibly
 
-- **GIVEN** type `branch` exists with allowed_parents `["tenant", "department"]`
-- **AND** group `B1` (type `branch`) has parent `D1` (type `department`)
-- **WHEN** caller updates `branch` allowed_parents to `["tenant"]` (removes `department`)
-- **THEN** update is rejected with `AllowedParentsViolation` — existing group `B1` would violate new parent type rules
+- **GIVEN** groups of type `branch` exist
+- **AND** the type schema is revised compatibly inside the same major version (for example a new allowed parent type is added)
+- **THEN** existing groups remain valid and are not re-validated
 
-#### Scenario: Delete Unused Type
+#### Scenario: Narrow Placement Rules
 
-- **GIVEN** type `team` exists
-- **AND** no groups of type `team` exist in the database
-- **WHEN** caller deletes type `team`
-- **THEN** type is removed
-
-#### Scenario: Reject Delete Type With Existing Groups
-
-- **GIVEN** type `branch` exists
-- **AND** at least one group of type `branch` exists
-- **WHEN** caller deletes type `branch`
-- **THEN** deletion is rejected with `conflict` — type is in use
-
-#### Scenario: Seed Types (Pre-Deployment Step)
-
-- **GIVEN** deployment configuration defines types `["tenant", "department", "branch"]`
-- **WHEN** operator runs the seeding step before deployment (pre-deployment migration)
-- **THEN** missing types are created, existing types are updated to match seed definitions
-- **AND** seeding is idempotent — repeated runs produce the same result
+- **GIVEN** placement rules must become stricter than a registered type allows
+- **THEN** a new major version of the type is registered (new id, new Registry Reference); existing groups keep their original type
 
 ### 8.2 Groups
 
@@ -870,10 +814,10 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 #### Scenario: Reject Invalid Parent Type
 
-- **GIVEN** type `team` allows allowed_parents `["branch"]` only
+- **GIVEN** type `team` allows only `["branch"]` in `allowed_parent_types`
 - **AND** parent entity `D1` has type `department`
 - **WHEN** caller creates group of type `team` with `parent_id = D1`
-- **THEN** `InvalidParentType` — `department` is not in allowed_parents for `team`
+- **THEN** `InvalidParentType` — `department` is not in `allowed_parent_types` of `team`
 
 #### Scenario: Move Subtree to Valid Parent
 
@@ -1123,15 +1067,16 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 - [x] `resource_group_membership` derives tenant scope from the referenced group's `tenant_id` via `group_id` JOIN, and AuthZ query path always uses effective tenant-scoped reads/SQL predicates.
 - [x] Platform-admin provisioning via RG API may run without caller tenant scoping, while tenant hierarchy compatibility invariants remain enforced.
 - [x] Membership operations use composite key `(group_id, resource_type, resource_id)`.
-- [x] REST API endpoints available under `/api/resource-group/v1/` (groups/memberships) and `/api/types-registry/v1/` (types) with OData query support.
+- [x] REST API endpoints available under `/api/resource-group/v1/` (groups/memberships) with OData query support.
 - [x] Dedicated group depth endpoint returns relative `depth` and supports depth-based filtering.
 
 ## 10. Dependencies
 
 | Dependency | Description | Criticality |
 |------------|-------------|-------------|
-| SQL persistence layer (database-agnostic) | durable storage for types/entities/membership/closure; no vendor-specific SQL extensions | p1 |
+| SQL persistence layer (database-agnostic) | durable storage for entities/membership/closure; no vendor-specific SQL extensions | p1 |
 | toolkit/client_hub | typed inter-gear client registration/discovery | p1 |
+| Types Registry gear | source of group types (placement traits, metadata schema) and Registry References, consumed through its SDK | p1 |
 | AuthZ Resolver gear | consumer of read contract via plugin path (optional consumer) | p1 |
 | Vendor-specific RG provider (optional) | alternative backend behind same read contracts | p2 |
 
@@ -1154,7 +1099,7 @@ See `cpt-cf-resource-group-fr-jwt-auth` in section 5.9 for the implemented JWT a
 
 - Should delete behavior support both `leaf-only` and `subtree-cascade` modes in v1? (REST API defines `force` query parameter for cascade control.) **Owner**: platform team. **Target**: resolve before DECOMPOSITION.
 - Should `resource_group_membership` be partitioned for production scale (projected 455M rows, ~110 GB)? Partitioning strategy needs evaluation since tenant scope is derived via group FK, not stored directly. **Owner**: platform team. **Target**: resolve before production deployment.
-- Should RG type `code` and membership `resource_type` be validated against GTS (Global Type System)? Current design: both are free-form strings with no external validation. Proposed alternative: validate that values correspond to registered GTS types at write time (type create/update for `code`, membership add for `resource_type`), keeping all other behavior unchanged (local storage, no runtime GTS dependency for reads). The case is stronger for `resource_type` — it references external domain entities (e.g., "User", "Document") that likely already exist as GTS types, and without validation nothing prevents typos or inconsistent naming. For `code`, the case is weaker — RG defines its own type topology, not referencing external concepts. Trade-offs: GTS validation adds governance and cross-gear type consistency, but introduces seed ordering dependency (types-registry must be available before RG writes), and adds a soft dependency on types-registry availability for write operations. Current recommendation: defer until cross-gear type reuse creates an actual governance need; `resource_type` validation is a stronger candidate to adopt first. **Owner**: platform team. **Target**: revisit when other gears begin referencing the same type codes or resource types.
+- Until Types Registry SDK offers caching, every group or membership write costs one type lookup. **Owner**: platform team. **Target**: revisit when the Types Registry SDK cache lands.
 
 ## 14. Traceability
 

@@ -1,9 +1,8 @@
 // Created: 2026-04-16 by Constructor Tech
 // @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-sdk-traits:p1
+use std::collections::HashMap;
+
 use async_trait::async_trait;
-use resource_group_sdk::models::{
-    ResourceGroup, ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth,
-};
 use toolkit_db::secure::DBRunner;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
@@ -11,20 +10,53 @@ use uuid::Uuid;
 
 use crate::domain::error::DomainError;
 use crate::infra::storage::entity::{
-    gts_type, resource_group as rg_entity, resource_group_membership as membership_entity,
+    resource_group as rg_entity, resource_group_membership as membership_entity,
 };
+
+/// One row of a hierarchy read: the group entity plus its depth relative to
+/// the reference group (`>= 0` for descendants, `<= 0` for ancestors).
+#[derive(Debug, Clone)]
+pub struct HierarchyRow {
+    pub model: rg_entity::Model,
+    pub depth: i32,
+}
+
+/// Type restriction of a hierarchy read, expressed in Registry References.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyTypeFilter {
+    /// No `type` restriction in the query.
+    None,
+    /// Only groups of this type.
+    Eq(Uuid),
+    /// The query named a type that the Types Registry does not know: no group
+    /// can match, the page is empty.
+    NoMatch,
+}
+
+impl HierarchyTypeFilter {
+    /// Whether a group of type `gts_type_id` passes the filter.
+    #[must_use]
+    pub fn matches(self, gts_type_id: Uuid) -> bool {
+        match self {
+            Self::None => true,
+            Self::Eq(wanted) => wanted == gts_type_id,
+            Self::NoMatch => false,
+        }
+    }
+}
 
 #[async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait GroupRepositoryTrait: Send + Sync + 'static {
     // -- Read operations --
 
-    async fn find_by_id<C: DBRunner>(
+    /// Read a group row within the caller's scope (`SecureORM` tenant filter).
+    async fn find_scoped_model<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         id: Uuid,
-    ) -> Result<Option<ResourceGroup>, DomainError>;
+    ) -> Result<Option<rg_entity::Model>, DomainError>;
 
     async fn find_model_by_id<C: DBRunner>(
         &self,
@@ -48,25 +80,22 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         id: Uuid,
     ) -> Result<Option<rg_entity::Model>, DomainError>;
 
-    /// Return the id of *any* existing root group (`parent_id` IS NULL) whose
-    /// `gts_type.schema_id` starts with the given prefix, or `None` when no
-    /// such root exists. Used to enforce tenant-root uniqueness
-    /// (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`).
-    ///
-    /// Expected to be called inside a `SERIALIZABLE` transaction so the
-    /// uniqueness check is race-free against concurrent root creations.
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
-        &self,
-        db: &C,
-        type_prefix: &str,
-    ) -> Result<Option<Uuid>, DomainError>;
+    /// Return the id of *any* existing tenant root group
+    /// (`parent_id IS NULL AND is_tenant`), or `None` when there is none.
+    /// Used to enforce tenant-root uniqueness
+    /// (`cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`); the
+    /// `uq_rg_tenant_root` unique index is the backstop against races.
+    async fn find_tenant_root_id<C: DBRunner>(&self, db: &C) -> Result<Option<Uuid>, DomainError>;
 
+    /// `resolved` maps every type path used in the `type` filter to its
+    /// Registry Reference.
     async fn list_groups<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroup>, DomainError>;
+        resolved: &HashMap<String, Uuid>,
+    ) -> Result<Page<rg_entity::Model>, DomainError>;
 
     async fn get_descendants<C: DBRunner>(
         &self,
@@ -74,7 +103,8 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError>;
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError>;
 
     async fn get_ancestors<C: DBRunner>(
         &self,
@@ -82,7 +112,8 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError>;
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError>;
 
     // -- Write operations --
 
@@ -91,7 +122,8 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
+        is_tenant: bool,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
@@ -105,6 +137,8 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
     /// value the row now holds was supplied by the caller, so a caller that
     /// wants the updated entity can assemble it without asking (RG-08).
     ///
+    /// The group's type is immutable, so the update carries no type.
+    ///
     /// `rows_affected` is `0` when `id` doesn't match any row; what to do
     /// about that is the caller's call, not this method's -- both current
     /// callers turn it into not-found.
@@ -113,7 +147,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError>;
@@ -224,168 +257,6 @@ pub trait GroupRepositoryTrait: Send + Sync + 'static {
         db: &C,
         group_id: Uuid,
     ) -> Result<bool, DomainError>;
-
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError>;
-}
-
-#[async_trait]
-pub trait TypeRepositoryTrait: Send + Sync + 'static {
-    async fn find_by_code<C: DBRunner>(
-        &self,
-        db: &C,
-        code: &str,
-    ) -> Result<Option<ResourceGroupType>, DomainError>;
-
-    /// Same lookup as `find_by_code`, but also returns the `gts_type` row
-    /// itself alongside the assembled `ResourceGroupType`, in one query
-    /// (RG-11).
-    ///
-    /// The row, not just its surrogate id: the update path needs
-    /// `created_at` off it to assemble its answer without reading the row
-    /// back a second time after the write, and this query already held it.
-    async fn find_by_code_with_model<C: DBRunner>(
-        &self,
-        db: &C,
-        code: &str,
-    ) -> Result<Option<(gts_type::Model, ResourceGroupType)>, DomainError>;
-
-    async fn load_full_type_by_id<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<ResourceGroupType, DomainError>;
-
-    async fn load_full_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_model: &gts_type::Model,
-    ) -> Result<ResourceGroupType, DomainError>;
-
-    async fn resolve_id<C: DBRunner>(&self, db: &C, code: &str)
-    -> Result<Option<i16>, DomainError>;
-
-    async fn insert<C: DBRunner>(
-        &self,
-        db: &C,
-        schema_id: &str,
-        metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
-
-    async fn insert_allowed_parent_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-        parent_ids: &[i16],
-    ) -> Result<(), DomainError>;
-
-    async fn insert_allowed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-        membership_ids: &[i16],
-    ) -> Result<(), DomainError>;
-
-    async fn delete_allowed_parent_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<(), DomainError>;
-
-    async fn delete_allowed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<(), DomainError>;
-
-    /// Update `metadata_schema` and `updated_at` on one `gts_type` row.
-    ///
-    /// Returns the row as the database now holds it: assembled from
-    /// `current` plus the two columns this write just set, not re-read.
-    /// Every other column is either the key `current` was addressed by or
-    /// immutable, so a second `gts_type` SELECT per update could not have
-    /// told the caller anything `current` didn't already have (RG-08).
-    async fn update_type<C: DBRunner>(
-        &self,
-        db: &C,
-        current: gts_type::Model,
-        metadata_schema: Option<&serde_json::Value>,
-    ) -> Result<gts_type::Model, DomainError>;
-
-    async fn delete_by_id<C: DBRunner>(&self, db: &C, type_id: i16) -> Result<(), DomainError>;
-
-    async fn count_groups_of_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<u64, DomainError>;
-
-    /// Batch replacement for a removed-allowed-parent-types sweep: resolves
-    /// every candidate parent-type path to its surrogate id and finds every
-    /// group of `child_type_id` whose direct parent is of one of those
-    /// types, in a small constant number of queries regardless of how many
-    /// paths are checked (was one `resolve_id` + one single-parent
-    /// violation lookup per candidate -- slope 2.0, N+1 audit finding (b)
-    /// -- see `check_hierarchy_safety`).
-    ///
-    /// A `parent_code` that doesn't currently resolve to any `gts_type` row
-    /// is silently skipped (mirrors the pre-batch code's per-item `if let
-    /// Some(parent_id) = ...` guard) -- reachable when the parent type was
-    /// deleted out from under a still-referencing junction row (junction
-    /// FKs declare `ON DELETE CASCADE`, but that cascade only fires when
-    /// the connection actually enforces FK constraints; the test suite's
-    /// `SQLite` connections don't turn that pragma on, see
-    /// `type_update_hierarchy_check_skips_deleted_parent`). A type that no
-    /// longer exists has no groups referencing it, so there's nothing to
-    /// check either way. Returns `(parent_code, group_id, group_name)`
-    /// triples so callers can attribute each violation back to the specific
-    /// removed-parent path that caused it.
-    async fn find_groups_violating_removed_parents<C: DBRunner>(
-        &self,
-        db: &C,
-        child_type_id: i16,
-        parent_codes: &[String],
-    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
-
-    async fn find_root_groups_of_type<C: DBRunner>(
-        &self,
-        db: &C,
-        type_id: i16,
-    ) -> Result<Vec<(Uuid, String)>, DomainError>;
-
-    /// The membership counterpart of `find_groups_violating_removed_parents`,
-    /// and it makes the same decisions for the same reasons: one query per
-    /// bind-parameter chunk rather than one per candidate path, the system
-    /// scope because an integrity sweep must see the real data regardless of
-    /// the caller's view, and a result bounded by the violating memberships
-    /// rather than by the popularity of the child type.
-    ///
-    /// Returns `(membership_code, group_id, group_name)` triples -- one per
-    /// violating pair, deduplicated, so a group with several memberships of
-    /// the same removed type is named once. A `membership_code` that no
-    /// longer resolves to a `gts_type` row is skipped: a type that does not
-    /// exist has no memberships to protect.
-    async fn find_groups_violating_removed_membership_types<C: DBRunner>(
-        &self,
-        db: &C,
-        child_type_id: i16,
-        membership_codes: &[String],
-    ) -> Result<Vec<(String, Uuid, String)>, DomainError>;
-
-    async fn list_types<C: DBRunner>(
-        &self,
-        db: &C,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, DomainError>;
-
-    async fn resolve_ids<C: DBRunner>(
-        &self,
-        db: &C,
-        codes: &[String],
-    ) -> Result<Vec<i16>, DomainError>;
 }
 
 #[async_trait]
@@ -394,13 +265,14 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         &self,
         db: &C,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, DomainError>;
+        resolved: &HashMap<String, Uuid>,
+    ) -> Result<Page<membership_entity::Model>, DomainError>;
 
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<membership_entity::Model, DomainError>;
 
@@ -408,7 +280,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<u64, DomainError>;
 
@@ -416,7 +288,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<Option<membership_entity::Model>, DomainError>;
 
@@ -447,7 +319,7 @@ pub trait MembershipRepositoryTrait: Send + Sync + 'static {
     async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError>;

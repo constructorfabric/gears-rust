@@ -2,7 +2,7 @@
 // @cpt-dod:cpt-cf-resource-group-dod-integration-auth-read-service:p1
 //! Unified service adapter implementing `ResourceGroupClient` for `ClientHub` registration.
 //!
-//! Delegates to `TypeService`, `GroupService`, and `MembershipService` to satisfy
+//! Delegates to `GroupService` and `MembershipService` to satisfy
 //! the full SDK trait contract.
 
 use std::sync::Arc;
@@ -10,8 +10,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use resource_group_sdk::ResourceGroupClient;
 use resource_group_sdk::models::{
-    CreateGroupRequest, CreateTypeRequest, ResourceGroup, ResourceGroupMembership,
-    ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest, UpdateTypeRequest,
+    CreateGroupRequest, ResourceGroup, ResourceGroupMembership, ResourceGroupWithDepth,
+    UpdateGroupRequest,
 };
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
@@ -20,34 +20,24 @@ use uuid::Uuid;
 
 use crate::domain::group_service::GroupService;
 use crate::domain::membership_service::MembershipService;
-use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
-use crate::domain::type_service::TypeService;
+use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait};
 
 /// Unified adapter registered with `ClientHub` as `dyn ResourceGroupClient`.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[allow(clippy::struct_field_names)]
-pub struct RgService<
-    GR: GroupRepositoryTrait,
-    TR: TypeRepositoryTrait,
-    MR: MembershipRepositoryTrait,
-> {
-    type_service: Arc<TypeService<TR>>,
-    group_service: Arc<GroupService<GR, TR>>,
-    membership_service: Arc<MembershipService<GR, TR, MR>>,
+pub struct RgService<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> {
+    group_service: Arc<GroupService<GR>>,
+    membership_service: Arc<MembershipService<GR, MR>>,
 }
 
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    RgService<GR, TR, MR>
-{
+impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> RgService<GR, MR> {
     /// Create a new `RgService`.
     #[must_use]
     pub fn new(
-        type_service: Arc<TypeService<TR>>,
-        group_service: Arc<GroupService<GR, TR>>,
-        membership_service: Arc<MembershipService<GR, TR, MR>>,
+        group_service: Arc<GroupService<GR>>,
+        membership_service: Arc<MembershipService<GR, MR>>,
     ) -> Self {
         Self {
-            type_service,
             group_service,
             membership_service,
         }
@@ -55,63 +45,9 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
 }
 
 #[async_trait]
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    ResourceGroupClient for RgService<GR, TR, MR>
+impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> ResourceGroupClient
+    for RgService<GR, MR>
 {
-    // -- Type lifecycle --
-
-    async fn create_type(
-        &self,
-        ctx: &SecurityContext,
-        request: CreateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        self.type_service
-            .create_type(ctx, request)
-            .await
-            .map_err(CanonicalError::from)
-    }
-
-    async fn get_type(
-        &self,
-        ctx: &SecurityContext,
-        code: &str,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        self.type_service
-            .get_type(ctx, code)
-            .await
-            .map_err(CanonicalError::from)
-    }
-
-    async fn list_types(
-        &self,
-        ctx: &SecurityContext,
-        query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-        self.type_service
-            .list_types(ctx, query)
-            .await
-            .map_err(CanonicalError::from)
-    }
-
-    async fn update_type(
-        &self,
-        ctx: &SecurityContext,
-        code: &str,
-        request: UpdateTypeRequest,
-    ) -> Result<ResourceGroupType, CanonicalError> {
-        self.type_service
-            .update_type(ctx, code, request)
-            .await
-            .map_err(CanonicalError::from)
-    }
-
-    async fn delete_type(&self, ctx: &SecurityContext, code: &str) -> Result<(), CanonicalError> {
-        self.type_service
-            .delete_type(ctx, code)
-            .await
-            .map_err(CanonicalError::from)
-    }
-
     // -- Group lifecycle --
 
     async fn create_group(

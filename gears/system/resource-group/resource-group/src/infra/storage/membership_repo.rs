@@ -2,11 +2,13 @@
 // @cpt-dod:cpt-cf-resource-group-dod-membership-service:p1
 //! Persistence layer for membership management.
 //!
-//! All surrogate SMALLINT ID resolution happens here. The domain and API layers
-//! work exclusively with string GTS type paths and UUIDs.
+//! The repository knows only Registry References (UUIDs) of types, never GTS
+//! type paths: resolving paths to UUIDs and back is the service's job, through
+//! the type catalog.
+
+use std::collections::HashMap;
 
 use async_trait::async_trait;
-use resource_group_sdk::models::ResourceGroupMembership;
 use resource_group_sdk::odata::MembershipFilterField;
 use sea_orm::ExprTrait;
 use sea_orm::sea_query::{Expr, Query};
@@ -45,25 +47,25 @@ impl MembershipRepositoryTrait for MembershipRepository {
     /// List memberships with `OData` filtering and pagination.
     ///
     /// The `OData` filter supports `group_id`, `resource_type`, and `resource_id` fields.
-    /// `resource_type` values in filters are GTS type path strings; they are resolved
-    /// to surrogate IDs at the persistence boundary.
+    /// `resource_type` values in filters are GTS type path strings; `resolved`
+    /// maps each of them to its Registry Reference (UUID).
     async fn list_memberships<C: DBRunner>(
         &self,
         db: &C,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupMembership>, DomainError> {
+        resolved: &HashMap<String, Uuid>,
+    ) -> Result<Page<membership_entity::Model>, DomainError> {
         let scope = system_scope();
         let base_query = MembershipEntity::find().secure().scope_with(&scope);
         let (base_query, query_no_filter) =
             prepare_filter::<MembershipFilterField, MembershipODataMapper, _>(
-                db,
                 base_query,
                 query,
                 MembershipFilterField::ResourceType,
-            )
-            .await?;
+                resolved,
+            )?;
 
-        let page = paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
+        paginate_odata::<MembershipFilterField, MembershipODataMapper, _, _, _, _>(
             base_query,
             db,
             &query_no_filter,
@@ -72,46 +74,15 @@ impl MembershipRepositoryTrait for MembershipRepository {
             |m: membership_entity::Model| m,
         )
         .await
-        .map_err(DomainError::from)?;
-
-        // Batch-resolve type IDs to GTS paths (single query)
-        let type_ids: Vec<i16> = page.items.iter().map(|m| m.gts_type_id).collect();
-        let group_repo = crate::infra::storage::group_repo::GroupRepository;
-        let type_map = crate::domain::repo::GroupRepositoryTrait::resolve_type_paths_batch(
-            &group_repo,
-            db,
-            &type_ids,
-        )
-        .await?;
-
-        let memberships = page
-            .items
-            .into_iter()
-            .map(|model| {
-                let type_path = type_map
-                    .get(&model.gts_type_id)
-                    .cloned()
-                    .unwrap_or_default();
-                ResourceGroupMembership {
-                    group_id: model.group_id,
-                    resource_type: type_path,
-                    resource_id: model.resource_id,
-                }
-            })
-            .collect();
-
-        Ok(Page {
-            items: memberships,
-            page_info: page.page_info,
-        })
+        .map_err(DomainError::from)
     }
 
-    /// Insert a membership. Returns the created membership with resolved type path.
+    /// Insert a membership. Returns the created row.
     async fn insert<C: DBRunner>(
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<membership_entity::Model, DomainError> {
         let scope = system_scope();
@@ -140,13 +111,11 @@ impl MembershipRepositoryTrait for MembershipRepository {
                     // it and this insert, and then the answer comes from
                     // `fk_rgm_group_id` -- a missing group, not an internal
                     // failure. Matched by constraint name, the same way
-                    // `GroupRepository::insert` does: this table's other
-                    // foreign key, `fk_rgm_gts_type`, fails on a concurrent
-                    // `delete_type` and must not be reported as a missing
-                    // group. PostgreSQL names the constraint; SQLite says
-                    // only "FOREIGN KEY constraint failed", so there the
-                    // answer stays a database error rather than a confident
-                    // lie about which resource was missing.
+                    // `GroupRepository::insert` does. PostgreSQL names the
+                    // constraint; SQLite says only "FOREIGN KEY constraint
+                    // failed", so there the answer stays a database error
+                    // rather than a confident lie about which resource was
+                    // missing.
                     let msg = e.to_string();
                     if msg.contains(FK_RGM_GROUP_ID) {
                         DomainError::group_not_found(group_id)
@@ -176,7 +145,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<u64, DomainError> {
         let scope = system_scope();
@@ -197,7 +166,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
         &self,
         db: &C,
         group_id: Uuid,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
     ) -> Result<Option<membership_entity::Model>, DomainError> {
         let scope = system_scope();
@@ -218,7 +187,7 @@ impl MembershipRepositoryTrait for MembershipRepository {
     async fn has_membership_in_other_tenant<C: DBRunner>(
         &self,
         db: &C,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
         resource_id: &str,
         tenant_id: Uuid,
     ) -> Result<bool, DomainError> {

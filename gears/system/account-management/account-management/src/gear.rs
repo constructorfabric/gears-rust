@@ -835,57 +835,11 @@ impl Gear for AccountManagementGear {
             PolicyEnforcer::new(authz).with_capabilities(vec![Capability::TenantHierarchy]);
         info!("authz-resolver client resolved from client hub; PolicyEnforcer wired");
 
-        // FEATURE 2.6 — idempotent user-group RG type registration.
-        // Must complete before the gear signals ready so the type
-        // is guaranteed to exist for any consumer that resolves AM's
-        // `Running` state. Failure aborts init.
-        // @cpt-begin:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
-        {
-            use crate::domain::user_groups::registration::RegistrationError;
-            // Resolve the narrow, un-gated bootstrap client instead of the
-            // full `ResourceGroupClient`: at this point in `init` the
-            // platform's `AuthZ` machinery is structurally unreachable (see
-            // `resource_group_sdk::ResourceGroupTypeBootstrap`'s doc
-            // comment for the full rationale). TEMPORARY: this bootstrap
-            // split only exists because the GTS type registry lives inside
-            // the resource-group gear — revisit when it becomes its own
-            // gear (see that trait's "Temporary" doc section).
-            let rg_type_bootstrap: Arc<
-                dyn resource_group_sdk::ResourceGroupTypeBootstrap + Send + Sync,
-            > = ctx
-                .client_hub()
-                .get::<dyn resource_group_sdk::ResourceGroupTypeBootstrap>()
-                .map_err(|e| anyhow::anyhow!("failed to get ResourceGroupTypeBootstrap: {e}"))?;
-            // System-actor context: stable subject UUID across processes
-            // so a future RG-side authz tightening that rejects anonymous
-            // does not regress gear init into permanent fail-closed.
-            let sys_ctx = crate::domain::system_actor::for_gear_init();
-            match crate::domain::user_groups::register_user_group_types(
-                &rg_type_bootstrap,
-                &sys_ctx,
-            )
-            .await
-            {
-                Ok(outcome) => {
-                    info!(
-                        target: "am.user_groups",
-                        ?outcome,
-                        "user-groups RG type registrations completed (member handle + container)"
-                    );
-                }
-                Err(RegistrationError::ServiceUnavailable(detail)) => {
-                    return Err(anyhow::anyhow!(
-                        "user-groups RG type registration failed (service_unavailable): {detail}"
-                    ));
-                }
-                Err(RegistrationError::DivergentSchema(detail)) => {
-                    return Err(anyhow::anyhow!(
-                        "user-groups RG type registration failed (divergent_schema): {detail}"
-                    ));
-                }
-            }
-        }
-        // @cpt-end:cpt-cf-account-management-flow-user-groups-rg-type-registration:p1:inst-flow-rgreg-invoke-algo
+        // FEATURE 2.6 — the AM resource-group types (user member handle +
+        // user-group container) are declared statically in
+        // `account_management_sdk::gts` and seeded into Types Registry
+        // from the `toolkit-gts` inventory at TR init; no runtime
+        // registration is needed here.
 
         // FEATURE 2.6 — register the cascade cleanup hook so
         // tenant hard-delete removes the tenant's user-group subtree

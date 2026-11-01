@@ -178,6 +178,9 @@ gears:
       registration_policy:
         "gts.acme.e2e.*":
           allowed_vendors: [acme]
+        # Resource-group suite registers its test types (vendor `x`) in TR.
+        "gts.cf.core.rg.type.v1~*":
+          allowed_vendors: [x]
 
   static-tr-plugin:
     config:

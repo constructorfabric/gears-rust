@@ -1,29 +1,51 @@
-//! RG filter normalization and batched GTS resolution.
+//! RG filter normalization and GTS type-code substitution.
 
 use std::collections::HashMap;
 
 use resource_group_sdk::GtsTypePath;
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::EntityTrait;
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, filter_node_to_condition};
-use toolkit_db::secure::{DBRunner, ScopeError, Scoped, SecureEntityExt, SecureSelect};
+use toolkit_db::secure::{Scoped, SecureSelect};
 use toolkit_odata::ODataQuery;
 use toolkit_odata::ast::{Expr, Value};
 use toolkit_odata::filter::{
     FieldKind, FilterField, FilterNode, FilterOp, convert_expr_to_filter_node,
 };
-use toolkit_security::AccessScope;
 use uuid::Uuid;
 
-use super::entity::gts_type::{Column as TypeColumn, Entity as TypeEntity};
 use crate::domain::error::DomainError;
+
+/// Distinct, sorted GTS type path strings the filter compares `type_field`
+/// against. Validates the filter AST and rejects unsupported operators and
+/// non-string values for that field, exactly as `prepare_filter` does, so
+/// the caller can resolve the codes (against the Types Registry) before
+/// opening a transaction.
+pub fn type_codes_in_filter<F: FilterField>(
+    query: &ODataQuery,
+    type_field: F,
+) -> Result<Vec<String>, DomainError> {
+    let Some(ast) = query.filter.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let validated = validate_filter::<F>(ast)?;
+    let mut paths: Vec<&str> = Vec::new();
+    collect_type_paths(&validated, type_field, &mut paths)?;
+    let mut codes: Vec<String> = paths.into_iter().map(str::to_owned).collect();
+    codes.sort_unstable();
+    codes.dedup();
+    Ok(codes)
+}
 
 /// Apply the resolved filter once, preserving the caller's scope and original
 /// filter hash for pagination, and clear the AST to prevent a second application.
-pub(super) async fn prepare_filter<F, M, E>(
-    db: &impl DBRunner,
+///
+/// `resolved` maps every type path that appears in the filter to its Registry
+/// Reference (see [`type_codes_in_filter`]).
+pub(super) fn prepare_filter<F, M, E>(
     mut select: SecureSelect<E, Scoped>,
     query: &ODataQuery,
     type_field: F,
+    resolved: &HashMap<String, Uuid>,
 ) -> Result<(SecureSelect<E, Scoped>, ODataQuery), DomainError>
 where
     F: FilterField,
@@ -32,8 +54,8 @@ where
 {
     if let Some(ast) = query.filter.as_deref() {
         let validated = validate_filter::<F>(ast)?;
-        let resolved = resolve_type_filter(db, &validated, type_field).await?;
-        let condition = filter_node_to_condition::<F, M>(&resolved)
+        let substituted = resolve_type_filter(&validated, type_field, resolved)?;
+        let condition = filter_node_to_condition::<F, M>(&substituted)
             .map_err(|e| DomainError::validation(format!("invalid $filter: {e}")))?;
         select = select.filter(condition);
     }
@@ -89,45 +111,17 @@ fn normalize_uuid_literal<F: FilterField>(
     Ok(())
 }
 
-/// Resolve the public GTS string field to its numeric storage ID. Ordered and
-/// string operations do not have the same meaning on surrogate IDs.
-pub(super) async fn resolve_type_filter<F: FilterField>(
-    db: &impl DBRunner,
+/// Substitute the public GTS string field with its Registry Reference (UUID).
+/// Ordered and string operations do not have the same meaning on UUIDs.
+pub(super) fn resolve_type_filter<F: FilterField>(
     node: &FilterNode<F>,
     type_field: F,
+    resolved: &HashMap<String, Uuid>,
 ) -> Result<FilterNode<F>, DomainError> {
-    let mut paths = Vec::new();
-    collect_type_paths(node, type_field, &mut paths)?;
-    if paths.is_empty() {
-        return Ok(node.clone());
-    }
-    paths.sort_unstable();
-    paths.dedup();
-
-    // Preserve the existing group-listing bound on query count and bind count.
-    // A client can reference many types through IN or nested predicates.
-    let scope = AccessScope::allow_all();
-    let mut ids = HashMap::new();
-    for chunk in paths.chunks(toolkit_db::secure::max_bind_params_for(db)) {
-        let rows = TypeEntity::find()
-            .filter(TypeColumn::SchemaId.is_in(chunk.to_vec()))
-            .secure()
-            .scope_with(&scope)
-            .all(db)
-            .await
-            .map_err(|e| match e {
-                ScopeError::Db(db) => DomainError::Database(db),
-                other => DomainError::database(other.to_string()),
-            })?;
-        ids.extend(rows.into_iter().map(|row| (row.schema_id, row.id)));
-    }
     map_type_values(node, type_field, &mut |value| {
         let raw = type_path(value, type_field.name())?;
-        // Registered identifiers are authoritative: type creation historically
-        // accepted codes outside the stricter GTS grammar. Keep those records
-        // queryable by their exact stored identifier.
-        if let Some(id) = ids.get(raw) {
-            return Ok(Value::Number((*id).into()));
+        if let Some(uuid) = resolved.get(raw) {
+            return Ok(Value::Uuid(*uuid));
         }
         if let Err(e) = GtsTypePath::new(raw) {
             return Err(DomainError::validation(format!(

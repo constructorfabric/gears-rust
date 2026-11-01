@@ -11,20 +11,14 @@ info:
   description: |
     Resource Group API — generic hierarchy and membership engine.
 
-    ## Types API
+    ## Types
 
-    The `/types` endpoint is a **GTS schema store**. You POST raw GTS JSON Schema documents
-    and the server stores them as-is. The server extracts type metadata from the schema structure:
-    - `$id` → GTS type path (becomes the `schema_id` for lookups)
-    - `x-gts-traits-schema` → trait shape definition (on base contracts)
-    - `x-gts-traits` → concrete trait values like `can_be_root`, `allowed_parents`, `allowed_memberships`
-    - `allOf` + `$ref` → type inheritance chain
-
-    For chained RG types, the server stores extracted traits in junction tables
-    for DB-enforced referential integrity.
-
-    **Registration order**: base types first (entity types, resource types, base contract),
-    then chained types (that reference base types via `$ref`).
+    Resource group types are not part of this API. A group type is a GTS Type Schema in the
+    Types Registry, derived from the abstract base `gts.cf.core.rg.type.v1~`; register and manage
+    types through the Types Registry API. Placement rules are trait values (`x-gts-traits`):
+    `can_be_root`, `allowed_parent_types`, `allowed_membership_types`. The group `metadata`
+    schema is the `metadata` property of the type schema. A group's type is set at creation and
+    never changes.
 
     ## Groups & Memberships API
 
@@ -44,10 +38,6 @@ info:
 servers:
   - url: https://api.example.com
 tags:
-  - name: types
-    description: |
-      GTS schema store. Accepts and returns raw GTS JSON Schema documents.
-      The server extracts type-level metadata from `x-gts-traits` for internal use.
   - name: groups
     description: |
       Resource groups organized in a hierarchy.
@@ -56,449 +46,6 @@ tags:
     description: Resource memberships bind resources to groups.
 
 paths:
-
-  # ── Types ──────────────────────────────────────────────────────────
-
-  /types-registry/v1/types:
-    get:
-      operationId: listTypes
-      tags: [types]
-      summary: List registered GTS schemas
-      description: |
-        Returns paginated GTS JSON Schema documents.
-
-        - `$filter`: `schema_id` (eq, ne, in) — matches against the `$id` field (without `gts://` prefix)
-        - `limit`: page size (1..200), default 25
-        - `cursor`: opaque token for pagination
-      x-odata-filter:
-        supported_fields:
-          schema_id: [eq, ne, in]
-      parameters:
-        - $ref: '#/components/parameters/ODataFilter'
-        - $ref: '#/components/parameters/Limit'
-        - $ref: '#/components/parameters/Cursor'
-      responses:
-        '200':
-          description: Paginated list of GTS schemas
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchemaPage'
-              examples:
-                chained-types:
-                  summary: Chained RG types
-                  value:
-                    items:
-                      - $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  custom_domain: { type: string, format: hostname }
-                                  barrier: { type: boolean, default: false }
-                            x-gts-traits:
-                              can_be_root: true
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                      - $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  category: { type: string, maxLength: 100 }
-                                  short_description: { type: string, maxLength: 500 }
-                            x-gts-traits:
-                              can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                      - $id: "gts://gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                        $schema: "http://json-schema.org/draft-07/schema#"
-                        allOf:
-                          - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                          - properties:
-                              metadata:
-                                type: object
-                                additionalProperties: false
-                                properties:
-                                  location: { type: string }
-                            x-gts-traits:
-                              can_be_root: false
-                              allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                              allowed_memberships: ["gts.cf.core.idp.user.v1~", "gts.cf.core.lms.course.v1~"]
-                    page_info:
-                      next_cursor: "eyJpZCI6Ijc3NzcuLi4ifQ"
-                      limit: 25
-
-    post:
-      operationId: createType
-      tags: [types]
-      summary: Register a GTS schema
-      description: |
-        Accepts a raw GTS JSON Schema document. The `$id` field determines the GTS type path.
-
-        **Registration order**: base types first, then chained types.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/GtsSchema'
-            examples:
-
-              # ── Step 1: Base contract ──
-
-              rg-base-contract:
-                summary: "Step 1a: RG base contract (x-gts-traits-schema)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: "Resource Group Type"
-                  type: object
-                  x-gts-traits-schema:
-                    type: object
-                    additionalProperties: false
-                    properties:
-                      can_be_root:
-                        type: boolean
-                        description: "Whether this type permits root placement."
-                        default: false
-                      allowed_parents:
-                        type: array
-                        items: { type: string, x-gts-type-ref: "gts.cf.core.rg.type.v1~" }
-                        description: "GTS type identifiers of allowed parent RG types."
-                        default: []
-                      allowed_memberships:
-                        type: array
-                        items: { type: string, x-gts-type-ref: "gts.*" }
-                        description: "Resource types allowed as members."
-                        default: []
-                  x-gts-traits:
-                    can_be_root: false
-                    allowed_parents: []
-                    allowed_memberships: []
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    parent_id: { type: [string, "null"], format: uuid }
-                    tenant_id: { type: string, format: uuid, readOnly: true }
-                    depth: { type: integer, readOnly: true }
-                    metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
-                  x-gts-constraints:
-                    placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
-
-              # ── Step 2: Entity types ──
-
-              tenant-entity:
-                summary: "Step 2a: Tenant entity type"
-                value:
-                  $id: "gts://gts.cf.core.tn.tenant.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Tenant
-                  type: object
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    custom_domain: { type: string, format: hostname }
-                    barrier: { type: boolean, default: false }
-
-              department-entity:
-                summary: "Step 2b: Department entity type"
-                value:
-                  $id: "gts://gts.cf.core.org.department.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Department
-                  type: object
-                  required: [id]
-                  properties:
-                    id: { type: string, format: uuid }
-                    short_description: { type: string, maxLength: 500 }
-                    category: { type: string, maxLength: 100 }
-
-              branch-entity:
-                summary: "Step 2c: Branch entity type"
-                value:
-                  $id: "gts://gts.cf.core.rg.branch.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Branch
-                  type: object
-                  required: [id, name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    name: { type: string, minLength: 1, maxLength: 255 }
-                    location: { type: string }
-
-              user-resource:
-                summary: "Step 2d: User resource type"
-                value:
-                  $id: "gts://gts.cf.core.idp.user.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: User
-                  type: object
-                  required: [id, email, display_name]
-                  properties:
-                    id: { type: string, format: uuid }
-                    email: { type: string, format: email }
-                    display_name: { type: string, minLength: 1, maxLength: 255 }
-                    avatar_url: { type: string, format: uri }
-
-              course-resource:
-                summary: "Step 2e: Course resource type"
-                value:
-                  $id: "gts://gts.cf.core.lms.course.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  title: Course
-                  type: object
-                  required: [id, title]
-                  properties:
-                    id: { type: string, format: uuid }
-                    title: { type: string, minLength: 1, maxLength: 255 }
-
-              # ── Step 3: Chained RG types (base types must exist) ──
-
-              tenant-rg-type:
-                summary: "Step 3a: Tenant as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            custom_domain: { type: string, format: hostname }
-                            barrier: { type: boolean, default: false }
-                      x-gts-traits:
-                        can_be_root: true
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-
-              department-rg-type:
-                summary: "Step 3b: Department as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~w.core.org.department.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            category: { type: string, maxLength: 100 }
-                            short_description: { type: string, maxLength: 500 }
-                      x-gts-traits:
-                        can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-
-              branch-rg-type:
-                summary: "Step 3c: Branch as RG type (chained, x-gts-traits)"
-                value:
-                  $id: "gts://gts.cf.core.rg.type.v1~cf.core.rg.branch.v1~"
-                  $schema: "http://json-schema.org/draft-07/schema#"
-                  allOf:
-                    - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                    - properties:
-                        metadata:
-                          type: object
-                          additionalProperties: false
-                          properties:
-                            location: { type: string }
-                      x-gts-traits:
-                        can_be_root: false
-                        allowed_parents: ["gts.cf.core.rg.type.v1~w.core.org.department.v1~"]
-                        allowed_memberships: ["gts.cf.core.idp.user.v1~", "gts.cf.core.lms.course.v1~"]
-
-      responses:
-        '201':
-          description: Schema registered
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-              examples:
-                rg-base-contract:
-                  summary: "Base contract registered"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: "Resource Group Type"
-                    type: object
-                    x-gts-traits-schema:
-                      type: object
-                      additionalProperties: false
-                      properties:
-                        can_be_root:
-                          type: boolean
-                          description: "Whether this type permits root placement."
-                          default: false
-                        allowed_parents:
-                          type: array
-                          items: { type: string, x-gts-type-ref: "gts.cf.core.rg.type.v1~" }
-                          description: "GTS type identifiers of allowed parent RG types."
-                          default: []
-                        allowed_memberships:
-                          type: array
-                          items: { type: string, x-gts-type-ref: "gts.*" }
-                          description: "Resource types allowed as members."
-                          default: []
-                    x-gts-traits:
-                      can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      parent_id: { type: [string, "null"], format: uuid }
-                      tenant_id: { type: string, format: uuid, readOnly: true }
-                      depth: { type: integer, readOnly: true }
-                      metadata: { type: object, description: "Type-specific fields. Schema overridden by each chained RG type via allOf." }
-                    x-gts-constraints:
-                      placement-invariant: "can_be_root OR len(allowed_parents) >= 1"
-                tenant-rg-type:
-                  summary: "Chained tenant RG type registered"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    allOf:
-                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                      - properties:
-                          metadata:
-                            type: object
-                            additionalProperties: false
-                            properties:
-                              custom_domain: { type: string, format: hostname }
-                              barrier: { type: boolean, default: false }
-                        x-gts-traits:
-                          can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                tenant-entity:
-                  summary: "Entity type registered"
-                  value:
-                    $id: "gts://gts.cf.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: Tenant
-                    type: object
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      custom_domain: { type: string, format: hostname }
-                      barrier: { type: boolean, default: false }
-
-  /types-registry/v1/types/{code}:
-    parameters:
-      - $ref: '#/components/parameters/TypeSchemaId'
-    get:
-      operationId: getType
-      tags: [types]
-      summary: Get a GTS schema by schema_id
-      description: Returns the raw GTS JSON Schema document.
-      responses:
-        '200':
-          description: Schema found
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-              examples:
-                tenant-rg-type:
-                  summary: "Chained: Tenant as RG type"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    allOf:
-                      - { $ref: "gts://gts.cf.core.rg.type.v1~" }
-                      - properties:
-                          metadata:
-                            type: object
-                            additionalProperties: false
-                            properties:
-                              custom_domain: { type: string, format: hostname }
-                              barrier: { type: boolean, default: false }
-                        x-gts-traits:
-                          can_be_root: true
-                          allowed_parents: ["gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"]
-                          allowed_memberships: ["gts.cf.core.idp.user.v1~"]
-                tenant-entity:
-                  summary: "Entity: Tenant"
-                  value:
-                    $id: "gts://gts.cf.core.tn.tenant.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: Tenant
-                    type: object
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      custom_domain: { type: string, format: hostname }
-                      barrier: { type: boolean, default: false }
-                rg-base-contract:
-                  summary: "Base: RG contract"
-                  value:
-                    $id: "gts://gts.cf.core.rg.type.v1~"
-                    $schema: "http://json-schema.org/draft-07/schema#"
-                    title: "Resource Group Type"
-                    type: object
-                    x-gts-traits-schema:
-                      type: object
-                      additionalProperties: false
-                      properties:
-                        can_be_root: { type: boolean, default: false }
-                        allowed_parents: { type: array, items: { type: string }, default: [] }
-                        allowed_memberships: { type: array, items: { type: string }, default: [] }
-                    x-gts-traits:
-                      can_be_root: false
-                      allowed_parents: []
-                      allowed_memberships: []
-                    required: [id, name]
-                    properties:
-                      id: { type: string, format: uuid }
-                      name: { type: string, minLength: 1, maxLength: 255 }
-                      parent_id: { type: [string, "null"], format: uuid }
-                      tenant_id: { type: string, format: uuid, readOnly: true }
-                      depth: { type: integer, readOnly: true }
-                      metadata: { type: object }
-        '404':
-          $ref: '#/components/responses/NotFound'
-    put:
-      operationId: updateType
-      tags: [types]
-      summary: Update a GTS schema
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/GtsSchema'
-      responses:
-        '200':
-          description: Schema updated
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/GtsSchema'
-    delete:
-      operationId: deleteType
-      tags: [types]
-      summary: Delete a GTS schema
-      responses:
-        '204':
-          description: Schema deleted
 
   # ── Groups ─────────────────────────────────────────────────────────
 
@@ -728,6 +275,12 @@ paths:
                     status: 400
                     detail: "Type 'gts.cf.core.rg.type.v1~w.core.org.department.v1~' cannot be root (can_be_root=false and no parent_id provided)"
                     trace_id: 01HXYZRGNOROOT
+        '404':
+          description: Group type or parent group not found. The type is looked up in the Types Registry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '409':
           description: Conflict
           content:
@@ -743,6 +296,12 @@ paths:
                     status: 409
                     detail: "Setting parent_id would create a cycle in the hierarchy"
                     trace_id: 01HXYZRGCYCLE
+        '503':
+          description: Types Registry unavailable; retry after the interval in the `Retry-After` header.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
 
   /resource-group/v1/groups/{group_id}:
     parameters:
@@ -1049,15 +608,6 @@ components:
         format: uuid
       example: 22222222-2222-2222-2222-222222222222
 
-    TypeSchemaId:
-      name: code
-      in: path
-      required: true
-      description: "GTS type path (`$id` value without `gts://` prefix)."
-      schema:
-        type: string
-      example: "gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~"
-
     MembershipGroupId:
       name: group_id
       in: path
@@ -1136,30 +686,6 @@ components:
             type: https://api.example.com/errors/not-found
 
   schemas:
-
-    # ── Types ──
-
-    GtsSchema:
-      type: object
-      description: |
-        Raw GTS JSON Schema document. The server stores the schema as-is and extracts metadata:
-        - `$id` → GTS type path (used as lookup key)
-        - `x-gts-traits-schema` → trait shape (on base contracts)
-        - `x-gts-traits` → trait values like `can_be_root`, `allowed_parents`, `allowed_memberships` (on chained types)
-        - `allOf` + `$ref` → type inheritance chain
-        For chained RG types, extracted traits are stored in junction tables for DB-enforced referential integrity.
-      additionalProperties: true
-
-    GtsSchemaPage:
-      type: object
-      required: [items, page_info]
-      properties:
-        items:
-          type: array
-          items:
-            $ref: '#/components/schemas/GtsSchema'
-        page_info:
-          $ref: '#/components/schemas/PageInfo'
 
     # ── Groups ──
 

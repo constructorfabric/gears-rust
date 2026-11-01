@@ -2,3 +2,4 @@
 // @cpt-dod:cpt-cf-resource-group-dod-sdk-foundation-gear-scaffold:p1
 pub mod metrics;
 pub mod storage;
+pub mod type_catalog;

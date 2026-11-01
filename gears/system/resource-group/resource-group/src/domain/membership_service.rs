@@ -6,9 +6,11 @@
 //! Implements business rules for adding, removing, and listing memberships
 //! between resources and groups. Delegates persistence to the infra layer.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use authz_resolver_sdk::pep::{PolicyEnforcer, ResourceType};
+use resource_group_sdk::odata::MembershipFilterField;
 use resource_group_sdk::{GROUP_MEMBERSHIP_RESOURCE_TYPE, models::ResourceGroupMembership};
 use toolkit_db::secure::TxConfig;
 use toolkit_odata::{ODataQuery, Page};
@@ -19,7 +21,10 @@ use tracing::debug;
 
 use crate::domain::DbProvider;
 use crate::domain::error::DomainError;
-use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait, TypeRepositoryTrait};
+use crate::domain::repo::{GroupRepositoryTrait, MembershipRepositoryTrait};
+use crate::domain::type_catalog::{ResolvedTypes, RgTypeDef, TypeCatalog};
+use crate::infra::storage::entity::resource_group_membership as membership_entity;
+use crate::infra::storage::odata_filter::type_codes_in_filter;
 
 /// `AuthZ` resource type descriptor for group memberships.
 pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
@@ -35,21 +40,15 @@ pub const RG_MEMBERSHIP_RESOURCE: ResourceType = ResourceType::from_static(
 /// Service for resource group membership lifecycle management.
 #[allow(unknown_lints, de0309_must_have_domain_model)]
 #[derive(Clone)]
-pub struct MembershipService<
-    GR: GroupRepositoryTrait,
-    TR: TypeRepositoryTrait,
-    MR: MembershipRepositoryTrait,
-> {
+pub struct MembershipService<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> {
     db: Arc<DbProvider>,
     enforcer: PolicyEnforcer,
     group_repo: Arc<GR>,
-    type_repo: Arc<TR>,
+    catalog: Arc<dyn TypeCatalog>,
     membership_repo: Arc<MR>,
 }
 
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    MembershipService<GR, TR, MR>
-{
+impl<GR: GroupRepositoryTrait, MR: MembershipRepositoryTrait> MembershipService<GR, MR> {
     /// Create a new `MembershipService` with the given database provider
     /// and `PolicyEnforcer` for AuthZ-scoped queries.
     #[must_use]
@@ -57,14 +56,14 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         db: Arc<DbProvider>,
         enforcer: PolicyEnforcer,
         group_repo: Arc<GR>,
-        type_repo: Arc<TR>,
+        catalog: Arc<dyn TypeCatalog>,
         membership_repo: Arc<MR>,
     ) -> Self {
         Self {
             db,
             enforcer,
             group_repo,
-            type_repo,
+            catalog,
             membership_repo,
         }
     }
@@ -97,64 +96,60 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .await
             .map_err(DomainError::from)?;
 
-        self.add_membership_inner(group_id, resource_type, resource_id)
-            .await
-    }
-
-    /// Add a membership link without `AuthZ` enforcement.
-    ///
-    /// **Internal API** — never expose this through a REST handler. Used by
-    /// the membership seeding adapter (which runs at gear init, before
-    /// any caller `SecurityContext` exists). Domain invariants
-    /// (group existence, type registration, `allowed_membership_types`
-    /// compatibility, tenant scope) still run; only the `PolicyEnforcer`
-    /// gate is skipped.
-    pub async fn add_membership_unscoped(
-        &self,
-        group_id: Uuid,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> Result<ResourceGroupMembership, DomainError> {
-        self.add_membership_inner(group_id, resource_type, resource_id)
-            .await
-    }
-
-    /// Shared post-authz body of `add_membership` / `add_membership_unscoped`.
-    async fn add_membership_inner(
-        &self,
-        group_id: Uuid,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> Result<ResourceGroupMembership, DomainError> {
-        let conn = self.conn()?;
-
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
-        // Verify the group exists and get its type info
-        let group_model = self
-            .group_repo
-            .find_model_by_id(&conn, group_id)
-            .await?
-            .ok_or(DomainError::GroupNotFound { id: group_id })?;
+        // Verify the group exists and get its type info. The connection is
+        // released before the catalog is awaited.
+        let group_model = {
+            let conn = self.conn()?;
+            self.group_repo
+                .find_model_by_id(&conn, group_id)
+                .await?
+                .ok_or(DomainError::GroupNotFound { id: group_id })?
+        };
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-4
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-3
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
-        // Resolve the GTS type path to a surrogate SMALLINT ID
-        let gts_type_id = self
-            .type_repo
-            .resolve_id(&conn, resource_type)
-            .await?
-            .ok_or_else(|| {
-                DomainError::validation(format!("Unknown resource type: {resource_type}"))
-            })?;
+        // Resolve the resource type and the group's type through the Types
+        // Registry, before BEGIN.
+        let ResolvedTypes {
+            by_code: mut member_defs,
+            by_uuid: mut group_defs,
+        } = self
+            .catalog
+            .resolve(&[resource_type.to_owned()], &[group_model.gts_type_id])
+            .await?;
+        let member_def = member_defs.remove(resource_type).ok_or_else(|| {
+            DomainError::validation(format!("Unknown resource type: {resource_type}"))
+        })?;
+        let group_def = group_defs
+            .remove(&group_model.gts_type_id)
+            .ok_or_else(|| DomainError::unresolved_group_type(group_model.gts_type_id))?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-5
 
-        // Tenant compatibility, the allowed_membership_types check, and the
-        // membership insert all share one transaction, and that transaction
-        // is `SERIALIZABLE` (RG-01).
+        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
+        // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
+        // `allowed_membership_types` is a property of the group's type, which
+        // the registry keeps immutable within a major version, so this check
+        // needs no place inside the transaction.
+        if !group_def
+            .allowed_membership_types
+            .iter()
+            .any(|m| m == &member_def.code)
+        {
+            return Err(DomainError::validation(format!(
+                "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
+                group_def.code
+            )));
+        }
+        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
+        // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
+
+        // Tenant compatibility and the membership insert share one
+        // transaction, and that transaction is `SERIALIZABLE` (RG-01).
         //
         // The check reads a predicate -- "which tenants already own
         // memberships of this pair" -- and the insert then writes into that
@@ -174,51 +169,17 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // different reason.
         let db = self.db.db();
         let membership_repo = self.membership_repo.clone();
-        let type_repo = self.type_repo.clone();
-        let resource_type_owned = resource_type.to_owned();
+        let resource_type_owned = member_def.code.clone();
         let resource_id_owned = resource_id.to_owned();
         let target_tenant_id = group_model.tenant_id;
-        let group_type_id = group_model.gts_type_id;
+        let member_type_uuid = member_def.uuid;
 
         let model = db
             .transaction_with_retry(TxConfig::serializable(), DomainError::db_err, |tx| {
                 let membership_repo = membership_repo.clone();
-                let type_repo = type_repo.clone();
                 let resource_type = resource_type_owned.clone();
                 let resource_id = resource_id_owned.clone();
                 Box::pin(async move {
-                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-                    // Load group type's allowed_membership_types and validate.
-                    //
-                    // Moved inside this SERIALIZABLE transaction on purpose:
-                    // PostgreSQL's SSI only tracks rw-antidependencies between
-                    // reads and writes that both happen inside a serializable
-                    // transaction. `update_type` (which can remove this
-                    // resource type from `allowed_membership_types`) also runs
-                    // at `SERIALIZABLE`, but a read of the type made on the
-                    // pool -- outside any transaction -- is invisible to that
-                    // machinery. Such a read could see the type as still
-                    // allowing this membership, have `update_type` commit its
-                    // removal in the gap, and then have this function insert
-                    // the now-disallowed membership anyway, with neither side
-                    // ever seeing a `40001`. Reading it here, inside the same
-                    // transaction as the insert it gates, closes that gap.
-                    let allowed = type_repo.load_full_type_by_id(tx, group_type_id).await?;
-                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-7
-
-                    // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-                    if !allowed
-                        .allowed_membership_types
-                        .iter()
-                        .any(|m| m == &resource_type)
-                    {
-                        return Err(DomainError::validation(format!(
-                            "Resource type '{resource_type}' is not in allowed_membership_types for group type '{}'",
-                            allowed.code
-                        )));
-                    }
-                    // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-8
-
                     // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-1
                     // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-2
                     // @cpt-begin:cpt-cf-resource-group-algo-membership-check-tenant-compat:p1:inst-tenant-check-3
@@ -231,7 +192,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
                     let owned_elsewhere = membership_repo
                         .has_membership_in_other_tenant(
                             tx,
-                            gts_type_id,
+                            member_type_uuid,
                             &resource_id,
                             target_tenant_id,
                         )
@@ -270,7 +231,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
                     // @cpt-begin:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
                     // Insert the membership (repo handles duplicate detection)
                     membership_repo
-                        .insert(tx, group_id, gts_type_id, &resource_id)
+                        .insert(tx, group_id, member_type_uuid, &resource_id)
                         .await
                     // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-12
                     // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-11
@@ -282,7 +243,7 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         // Resolve back to GTS path for the SDK model
         Ok(ResourceGroupMembership {
             group_id: model.group_id,
-            resource_type: resource_type.to_owned(),
+            resource_type: member_def.code,
             resource_id: model.resource_id,
         })
         // @cpt-end:cpt-cf-resource-group-flow-membership-add:p1:inst-add-memb-13
@@ -308,18 +269,21 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .map_err(DomainError::from)?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-1
 
-        let conn = self.conn()?;
-
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-2
-        // Resolve resource_type GTS path to surrogate ID
+        // Resolve resource_type GTS path to its Registry Reference
         let gts_type_id = self
-            .type_repo
-            .resolve_id(&conn, resource_type)
+            .catalog
+            .resolve(&[resource_type.to_owned()], &[])
             .await?
+            .by_code
+            .get(resource_type)
+            .map(|def| def.uuid)
             .ok_or_else(|| {
                 DomainError::validation(format!("Unknown resource type: {resource_type}"))
             })?;
         // @cpt-end:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-2
+
+        let conn = self.conn()?;
 
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-remove:p1:inst-remove-memb-4
@@ -370,14 +334,12 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
             .await
             .map_err(DomainError::from)?;
 
-        let conn = self.conn()?;
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-3
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-4
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-begin:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
-        #[allow(clippy::let_and_return)]
-        let result = self.membership_repo.list_memberships(&conn, query).await;
+        let result = self.list_memberships_inner(query).await;
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-7
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-6
         // @cpt-end:cpt-cf-resource-group-flow-membership-list:p1:inst-list-memb-5
@@ -398,32 +360,70 @@ impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepository
         &self,
         query: &ODataQuery,
     ) -> Result<Page<ResourceGroupMembership>, DomainError> {
-        let conn = self.conn()?;
-        self.membership_repo.list_memberships(&conn, query).await
+        self.list_memberships_inner(query).await
     }
-}
 
-// -- MembershipAdder trait implementation for seeding --
-
-#[async_trait::async_trait]
-impl<GR: GroupRepositoryTrait, TR: TypeRepositoryTrait, MR: MembershipRepositoryTrait>
-    crate::domain::seeding::MembershipAdder for MembershipService<GR, TR, MR>
-{
-    async fn add_membership(
+    /// Shared body of the scoped and unscoped list: resolve the type paths of
+    /// the filter, read the page, resolve the page's type UUIDs back to
+    /// codes. Every catalog call happens outside any connection.
+    async fn list_memberships_inner(
         &self,
-        group_id: Uuid,
-        resource_type: &str,
-        resource_id: &str,
-    ) -> Result<(), DomainError> {
-        // Seeding runs at gear init, before any caller `SecurityContext`
-        // exists; using `SecurityContext::anonymous()` here would gate the
-        // path on whether anonymous subjects are allowed to create
-        // memberships, which is brittle and outright fails in locked-down
-        // deployments. Use the dedicated unscoped entry point — domain
-        // invariants still run, only the `PolicyEnforcer` gate is skipped.
-        self.add_membership_unscoped(group_id, resource_type, resource_id)
-            .await
-            .map(|_| ())
+        query: &ODataQuery,
+    ) -> Result<Page<ResourceGroupMembership>, DomainError> {
+        let codes = type_codes_in_filter(query, MembershipFilterField::ResourceType)?;
+        let filter_types = self.catalog.resolve(&codes, &[]).await?;
+        let resolved: HashMap<String, Uuid> = filter_types
+            .by_code
+            .iter()
+            .map(|(code, def)| (code.clone(), def.uuid))
+            .collect();
+
+        let page = {
+            let conn = self.conn()?;
+            self.membership_repo
+                .list_memberships(&conn, query, &resolved)
+                .await?
+        };
+
+        // Types the filter already resolved are reused; only the rest is
+        // asked for, and nothing is asked when nothing is missing.
+        let mut defs = filter_types.by_uuid;
+        let mut missing: Vec<Uuid> = page
+            .items
+            .iter()
+            .map(|m| m.gts_type_id)
+            .filter(|u| !defs.contains_key(u))
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        if !missing.is_empty() {
+            defs.extend(self.catalog.resolve(&[], &missing).await?.by_uuid);
+        }
+        Self::build_memberships(page, &defs)
+    }
+
+    fn build_memberships(
+        page: Page<membership_entity::Model>,
+        defs: &HashMap<Uuid, RgTypeDef>,
+    ) -> Result<Page<ResourceGroupMembership>, DomainError> {
+        let items = page
+            .items
+            .into_iter()
+            .map(|model| {
+                let def = defs
+                    .get(&model.gts_type_id)
+                    .ok_or_else(|| DomainError::unresolved_group_type(model.gts_type_id))?;
+                Ok(ResourceGroupMembership {
+                    group_id: model.group_id,
+                    resource_type: def.code.clone(),
+                    resource_id: model.resource_id,
+                })
+            })
+            .collect::<Result<Vec<_>, DomainError>>()?;
+        Ok(Page {
+            items,
+            page_info: page.page_info,
+        })
     }
 }
 // @cpt-end:cpt-cf-resource-group-dod-membership-service:p1:inst-full

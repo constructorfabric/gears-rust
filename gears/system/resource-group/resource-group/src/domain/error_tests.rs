@@ -9,11 +9,10 @@ use toolkit_odata::Error as OdataError;
 /// `Error` enum (`libs/toolkit-odata/src/lib.rs`) and on this `impl` above.
 /// Before this test module it had no direct unit test at all: it was only
 /// exercised indirectly, through `MembershipRepository::list_memberships`'s
-/// REST tests. `GroupRepository::list_groups` and
-/// `TypeRepository::list_types` instead folded every `paginate_odata`
-/// failure into a blanket `DomainError::database(..)`, silently bypassing
-/// this classifier -- these tests pin the classifier itself so that defect
-/// class cannot recur unnoticed on any of its three call sites.
+/// REST tests. `GroupRepository::list_groups` once folded every
+/// `paginate_odata` failure into a blanket `DomainError::database(..)`,
+/// silently bypassing this classifier -- these tests pin the classifier
+/// itself so that defect class cannot recur unnoticed on any call site.
 ///
 /// All 13 client-caused variants (bad `$filter`, unknown `$orderby` field,
 /// malformed/stale/mismatched cursor, bad `$top`) are covered individually

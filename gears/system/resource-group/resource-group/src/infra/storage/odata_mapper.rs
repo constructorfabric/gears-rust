@@ -6,43 +6,14 @@
 //! This gear maps from DTO-level filter fields to `SeaORM` Column types.
 
 use toolkit_db::odata::sea_orm_filter::{FieldToColumn, ODataFieldMapping};
-use toolkit_odata::filter::{FieldKind, FilterField as _};
 
-use crate::infra::storage::entity::gts_type::{
-    Column as TypeColumn, Entity as TypeEntity, Model as TypeModel,
-};
 use crate::infra::storage::entity::resource_group::{
     Column as GroupColumn, Entity as GroupEntity, Model as GroupModel,
 };
 use crate::infra::storage::entity::resource_group_membership::{
     Column as MembershipColumn, Entity as MembershipEntity, Model as MembershipModel,
 };
-use resource_group_sdk::odata::{
-    GroupFilterField, HierarchyFilterField, MembershipFilterField, TypeFilterField,
-};
-
-/// `OData` mapper for GTS types.
-pub struct TypeODataMapper;
-
-impl FieldToColumn<TypeFilterField> for TypeODataMapper {
-    type Column = TypeColumn;
-
-    fn map_field(field: TypeFilterField) -> TypeColumn {
-        match field {
-            TypeFilterField::Code => TypeColumn::SchemaId,
-        }
-    }
-}
-
-impl ODataFieldMapping<TypeFilterField> for TypeODataMapper {
-    type Entity = TypeEntity;
-
-    fn extract_cursor_value(model: &TypeModel, field: TypeFilterField) -> sea_orm::Value {
-        match field {
-            TypeFilterField::Code => sea_orm::Value::String(Some(model.schema_id.clone())),
-        }
-    }
-}
+use resource_group_sdk::odata::{GroupFilterField, HierarchyFilterField, MembershipFilterField};
 
 /// `OData` mapper for resource groups.
 pub struct GroupODataMapper;
@@ -59,6 +30,12 @@ impl FieldToColumn<GroupFilterField> for GroupODataMapper {
             GroupFilterField::Name => GroupColumn::Name,
         }
     }
+
+    /// `type` is a GTS path on the wire but a Registry Reference (UUID) in
+    /// storage; neither order is meaningful, so it is not orderable.
+    fn is_orderable(field: GroupFilterField) -> bool {
+        !matches!(field, GroupFilterField::Type)
+    }
 }
 
 impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
@@ -73,19 +50,7 @@ impl ODataFieldMapping<GroupFilterField> for GroupODataMapper {
                 None => sea_orm::Value::Uuid(None),
             },
             GroupFilterField::TenantId => sea_orm::Value::Uuid(Some(model.tenant_id)),
-            GroupFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
-        }
-    }
-
-    /// `type` is a wire string but its cursor value is the storage
-    /// `SMALLINT` gts ordinal — without this override the cursor codec
-    /// would try to encode the `SmallInt` under the wire `String` kind
-    /// and fail with `InvalidCursor` on any `$orderby=type` page
-    /// overflow (same wire-vs-storage seam as AM's `status`).
-    fn cursor_kind(field: GroupFilterField) -> FieldKind {
-        match field {
-            GroupFilterField::Type => FieldKind::I64,
-            other => other.kind(),
+            GroupFilterField::Type => sea_orm::Value::Uuid(Some(model.gts_type_id)),
         }
     }
 }
@@ -103,6 +68,10 @@ impl FieldToColumn<HierarchyFilterField> for HierarchyODataMapper {
             HierarchyFilterField::Type => GroupColumn::GtsTypeId,
         }
     }
+
+    fn is_orderable(field: HierarchyFilterField) -> bool {
+        !matches!(field, HierarchyFilterField::Type)
+    }
 }
 
 impl ODataFieldMapping<HierarchyFilterField> for HierarchyODataMapper {
@@ -111,15 +80,7 @@ impl ODataFieldMapping<HierarchyFilterField> for HierarchyODataMapper {
     fn extract_cursor_value(model: &GroupModel, field: HierarchyFilterField) -> sea_orm::Value {
         match field {
             HierarchyFilterField::HierarchyDepth => sea_orm::Value::Int(None),
-            HierarchyFilterField::Type => sea_orm::Value::SmallInt(Some(model.gts_type_id)),
-        }
-    }
-
-    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
-    fn cursor_kind(field: HierarchyFilterField) -> FieldKind {
-        match field {
-            HierarchyFilterField::Type => FieldKind::I64,
-            HierarchyFilterField::HierarchyDepth => field.kind(),
+            HierarchyFilterField::Type => sea_orm::Value::Uuid(Some(model.gts_type_id)),
         }
     }
 }
@@ -137,6 +98,10 @@ impl FieldToColumn<MembershipFilterField> for MembershipODataMapper {
             MembershipFilterField::ResourceId => MembershipColumn::ResourceId,
         }
     }
+
+    fn is_orderable(field: MembershipFilterField) -> bool {
+        !matches!(field, MembershipFilterField::ResourceType)
+    }
 }
 
 impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
@@ -148,20 +113,10 @@ impl ODataFieldMapping<MembershipFilterField> for MembershipODataMapper {
     ) -> sea_orm::Value {
         match field {
             MembershipFilterField::GroupId => sea_orm::Value::Uuid(Some(model.group_id)),
-            MembershipFilterField::ResourceType => {
-                sea_orm::Value::SmallInt(Some(model.gts_type_id))
-            }
+            MembershipFilterField::ResourceType => sea_orm::Value::Uuid(Some(model.gts_type_id)),
             MembershipFilterField::ResourceId => {
                 sea_orm::Value::String(Some(model.resource_id.clone()))
             }
-        }
-    }
-
-    /// Same wire-string / storage-SMALLINT seam as `GroupODataMapper`.
-    fn cursor_kind(field: MembershipFilterField) -> FieldKind {
-        match field {
-            MembershipFilterField::ResourceType => FieldKind::I64,
-            other => other.kind(),
         }
     }
 }

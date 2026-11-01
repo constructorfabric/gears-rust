@@ -56,7 +56,7 @@ Whether and which tables to project depends on the deployment topology and acces
 |------------|------------------------|-----------|
 | **Monolith** (single shared DB) | **None** — all tables are already co-located | PEP JOINs against canonical tables directly; no extra databases or sync needed |
 | **Microservices** (separate DBs, typical case) | **`resource_group` + `resource_group_closure`** | Supports local hierarchy operations. Authorization must use explicit `in` predicates expanded by a capable PDP because the membership table is absent. Hierarchy tables are small (~100 K rows). |
-| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership` + `gts_type`** | Only when profiling confirms the two-request pattern (RG API → domain service) is unacceptable for latency budget. `gts_type` is required to resolve external member-handle types to RG-local membership discriminators. The membership table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates) for concrete numbers |
+| **Microservices** with membership filtering/pagination | **`resource_group` + `resource_group_closure` + `resource_group_membership`** | Only when profiling confirms the two-request pattern (RG API → domain service) is unacceptable for latency budget. No type table is needed: the membership type column holds the member type's Types Registry Registry Reference, which native predicates compare directly. The membership table grows as `M_resources × N_groups_per_resource` and is expected to be **10× or more larger** than hierarchy tables — see [RG DESIGN §Storage Estimates](../../../gears/system/resource-group/docs/DESIGN.md#storage-estimates) for concrete numbers |
 
 > **Important:** When a domain service query includes filters by resource group attributes (e.g., `GET /tasks?status=pending&project={projectX}&after=…&limit=50`), the two-request pattern means N additional round-trips to the RG Membership API (one per filter page or group), not just +1. If this N-request fan-out violates the latency budget, that is the signal to project the membership table locally.
 >
@@ -64,8 +64,8 @@ Whether and which tables to project depends on the deployment topology and acces
 
 | Native predicate | Capabilities advertised together | Required local tables |
 |------------------|----------------------------------|-----------------------|
-| `in_group` | `GroupMembership` | `resource_group_membership`, `gts_type` |
-| `in_group_subtree` | `GroupMembership`, `GroupHierarchy` | `resource_group_membership`, `gts_type`, `resource_group_closure` |
+| `in_group` | `GroupMembership` | `resource_group_membership` |
+| `in_group_subtree` | `GroupMembership`, `GroupHierarchy` | `resource_group_membership`, `resource_group_closure` |
 
 `GroupHierarchy` is not independently executable: subtree membership also needs
 `GroupMembership` and all of its tables. A service MUST omit either capability
@@ -78,19 +78,17 @@ For native group predicates, the PEP resource descriptor MUST opt in with
 `ResourceType::with_native_group_predicates()` and use the resource's exact
 canonical GTS type path as its `ResourceType` name. That same identity is sent to
 AuthZ and used to qualify membership rows; consumers do not configure a second
-policy-to-membership type mapping. SecureORM resolves the path through RG's
-local `gts_type` table and adds the resulting `gts_type_id` condition to the
-membership subquery. This is required because
+policy-to-membership type mapping. SecureORM derives the member type's Types Registry Registry Reference (a UUID)
+from that path and compares it directly with the membership type column; there
+is no subquery to a type table. This is required because
 `resource_group_membership` is shared by all member types and external resource
 IDs are only unique within a type.
 
-The type MUST already resolve in the local or projected `gts_type` table. RG's
-current public registration path accepts external membership types during
-validation but cannot materialize a non-RG-prefixed type row; that independent
-registry inconsistency is tracked by
-[#4052](https://github.com/constructorfabric/gears-rust/issues/4052). A service
-MUST NOT opt an affected resource into native group predicates until the
-canonical external type can be registered and projected. It must instead use
+The member type must be known to Types Registry when memberships are written,
+because Resource Group stores the Registry Reference it obtains from Types
+Registry; a resource type that Types Registry does not know cannot have
+memberships. A service MUST NOT opt a resource into native group predicates
+unless its canonical GTS type is registered there; it must instead use
 PDP-expanded explicit `in` predicates or deny.
 
 A resource without the per-resource opt-in, or with a non-canonical GTS policy

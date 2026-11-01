@@ -23,6 +23,8 @@ What a systematic audit of this gear's database behavior found, how it was
 found, and how to repeat it on another module. The detection tooling is meant
 to be reused — this gear is the worked example, not the point.
 
+> **Update (types moved to Types Registry, ADR-002).** Resource group types are no longer stored or managed by this gear: the type tables, the type repository, the type service and the `SMALLINT` surrogate keys are gone, and the type reference columns are UUID Registry References with no foreign key. Findings below that name the type service or type repository (RG-02, RG-03, RG-07, RG-12, TX-01, `(b)`, and the type-related deferred items) are kept as the record of what the audit found; they describe code that no longer exists. RG-09 (an external call inside a transaction) now holds by construction: every Types Registry lookup happens before `BEGIN`, in both the group and the membership services.
+
 ## Scope of this branch
 
 Two terms recur in the Status column below and are worth fixing before they
@@ -119,27 +121,7 @@ the batch version brought both back to equal.
 ### Known and not fixed: `IN (...)` lists bounded only by a column's domain
 
 Every list-valued predicate whose length follows the *data* or the *request*
-is now chunked against `max_bind_params_for`. Two are chunked against nothing,
-and are recorded here rather than fixed:
-
-- `group_repo.rs` `resolve_type_paths_batch` and `type_repo.rs`
-  `load_full_types_batch` bind one parameter per distinct GTS type id. The
-  column is `SMALLINT`, so the list cannot exceed 32 767 — which is above the
-  30 000 `max_bind_params_for` allows on SQLite and below the 60 000 it allows
-  on PostgreSQL.
-
-Those two numbers are `toolkit-db`'s, not the databases'. SQLite's own limit
-is 32 766 host parameters and PostgreSQL's is 65 535; `max_bind_params_for`
-returns a deliberately rounder, lower figure so that a caller chunking against
-it has room for the predicates it did not count. Read every "ceiling" in this
-document as that budget rather than as the backend's hard limit.
-
-Reaching it needs more than 30 000 distinct types registered in one
-deployment, at which point the failure is a driver error on a read path, not
-data loss. The fix is the same three lines used everywhere else; what makes it
-not worth landing blind is that no test can reach the boundary without
-building 30 000 rows. If the type count ever gets within an order of magnitude
-of that, chunk these two the same way.
+is now chunked against `max_bind_params_for`. Two were once chunked against nothing (the per-type batch lookups, bounded only by the `SMALLINT` type id domain); both are gone with the type tables, because `gts_type_id` is now a UUID Registry Reference and type lookups go through the Types Registry SDK. Nothing is chunked against nothing today.
 
 Not on this list: `build_hierarchy_page`, which *is* bounded by the data
 (subtree size) and is chunked — at half the ceiling, because the caller's
@@ -204,10 +186,7 @@ getting it wrong.
 
 Two further observations from that pass, neither acted on:
 
-- `check_hierarchy_safety` inside `update_type_in_tx` loops over the removed allowed-parent types
-  with three queries per iteration. It scales with the size of the *request*, not of the database,
-  so it is not in the N+1 class above — but a very long list holds a `SERIALIZABLE` transaction open
-  proportionally longer. Low risk in practice: type definitions are administered by hand.
+- (Closed) the hierarchy-safety check on type update no longer exists: types are owned by Types Registry and RG does not re-validate groups when a type evolves.
 - `11_database_patterns.md` documents transactions exclusively through
   `SecureConn::in_transaction_mapped`, which has neither retry nor a configurable isolation level.
   The `Db` / `TxConfig::serializable()` / `transaction_with_retry` path this gear uses — and so do

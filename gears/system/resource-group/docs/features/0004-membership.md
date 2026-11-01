@@ -30,7 +30,6 @@
 - [6. Acceptance Criteria](#6-acceptance-criteria)
 - [7. Unit Test Plan](#7-unit-test-plan)
   - [Membership Test Cases](#membership-test-cases)
-  - [Seeding — Memberships](#seeding--memberships)
   - [Membership Table Assertions (`resource_group_membership`)](#membership-table-assertions-resource_group_membership)
 - [8. E2E Test Plan](#8-e2e-test-plan)
   - [S10: `test_membership_filter_wiring`](#s10-test_membership_filter_wiring)
@@ -82,7 +81,9 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 - Group not found → NotFound
 - Duplicate membership (same composite key) → Conflict
 - resource_type not in group type's allowed_membership_types → Validation error
-- resource_type GTS path not registered → Validation error
+- resource_type GTS path unknown to Types Registry → Validation error (400)
+- Types Registry unavailable → ServiceUnavailable (503)
+- Group's stored type reference not resolvable by Types Registry → Internal (500)
 - Tenant-incompatible: resource already linked in incompatible tenant → TenantIncompatibility
 
 **Steps**:
@@ -90,13 +91,13 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 2. [x] - `p1` - Validate resource_type is a valid GtsTypePath - `inst-add-memb-2`
 3. [x] - `p1` - DB: SELECT id, gts_type_id, tenant_id FROM resource_group WHERE id = {group_id} — load target group - `inst-add-memb-3`
 4. [x] - `p1` - **IF** group not found → **RETURN** NotFound - `inst-add-memb-4`
-5. [x] - `p1` - Resolve resource_type GTS path to surrogate ID; verify type exists in gts_type - `inst-add-memb-5`
-6. [x] - `p1` - **IF** resource_type not registered → **RETURN** Validation error - `inst-add-memb-6`
-7. [x] - `p1` - Load group type's allowed_membership_types from gts_type_allowed_membership junction - `inst-add-memb-7`
+5. [x] - `p1` - Before the transaction: resolve the resource_type code and the group's Registry Reference through the Type Catalog (Types Registry SDK) - `inst-add-memb-5`
+6. [x] - `p1` - **IF** resource_type is unknown to Types Registry → **RETURN** Validation error; **IF** the group's type is unknown → **RETURN** Internal - `inst-add-memb-6`
+7. [x] - `p1` - Read the group type's `allowed_membership_types` from the resolved type definition - `inst-add-memb-7`
 8. [x] - `p1` - **IF** resource_type not in allowed_membership_types → **RETURN** Validation error: "resource_type not permitted for this group type" - `inst-add-memb-8`
 9. [x] - `p1` - Invoke tenant compatibility check for resource across existing memberships - `inst-add-memb-9`
 10. [x] - `p1` - **IF** tenant incompatible → **RETURN** TenantIncompatibility - `inst-add-memb-10`
-11. [x] - `p1` - DB: INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id, created_at) with UNIQUE constraint - `inst-add-memb-11`
+11. [x] - `p1` - DB: INSERT INTO resource_group_membership (group_id, gts_type_id, resource_id, created_at) with UNIQUE constraint — `gts_type_id` is the resource type's Registry Reference - `inst-add-memb-11`
 12. [x] - `p1` - **IF** unique constraint violation → **RETURN** Conflict: membership already exists - `inst-add-memb-12`
 13. [x] - `p1` - **RETURN** created ResourceGroupMembership with group_id, resource_type, resource_id - `inst-add-memb-13`
 
@@ -114,8 +115,8 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 
 **Steps**:
 1. [x] - `p1` - Actor sends DELETE /api/resource-group/v1/memberships/{group_id}/{resource_type}/{resource_id} - `inst-remove-memb-1`
-2. [x] - `p1` - Resolve resource_type GTS path to surrogate ID - `inst-remove-memb-2`
-3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_id} AND resource_id = {resource_id} - `inst-remove-memb-3`
+2. [x] - `p1` - Resolve the resource_type GTS path to its Registry Reference through the Type Catalog - `inst-remove-memb-2`
+3. [x] - `p1` - DB: DELETE FROM resource_group_membership WHERE group_id = {group_id} AND gts_type_id = {type_registry_reference} AND resource_id = {resource_id} - `inst-remove-memb-3`
 4. [x] - `p1` - **IF** no rows affected → **RETURN** NotFound: membership does not exist - `inst-remove-memb-4`
 5. [x] - `p1` - **RETURN** success (204 No Content) - `inst-remove-memb-5`
 
@@ -131,9 +132,9 @@ Memberships link resources (users, courses, documents, etc.) to groups in the hi
 **Steps**:
 1. [x] - `p1` - Actor sends GET /api/resource-group/v1/memberships?$filter={expr}&cursor={token}&limit={n} - `inst-list-memb-1`
 2. [x] - `p1` - Parse OData $filter: supported fields `resource_id` (eq, ne, in), `resource_type` (eq, ne, in), `group_id` (eq, ne, in) - `inst-list-memb-2`
-3. [x] - `p1` - Resolve any GTS type paths in filter values to surrogate IDs at persistence boundary - `inst-list-memb-3`
+3. [x] - `p1` - Resolve any GTS type paths in filter values to Registry References through the Type Catalog - `inst-list-memb-3`
 4. [x] - `p1` - DB: SELECT group_id, gts_type_id, resource_id FROM resource_group_membership WHERE {filter} ORDER BY {stable} LIMIT {limit+1} - `inst-list-memb-4`
-5. [x] - `p1` - Resolve surrogate IDs back to GTS type paths for response - `inst-list-memb-5`
+5. [x] - `p1` - Resolve Registry References back to GTS type paths for the response - `inst-list-memb-5`
 6. [x] - `p1` - Build Page response with items and cursor tokens - `inst-list-memb-6`
 7. [x] - `p1` - **RETURN** Page<ResourceGroupMembership> - `inst-list-memb-7`
 
@@ -188,11 +189,11 @@ Not applicable. Memberships are stateless links — they exist or do not exist. 
 The system **MUST** implement a Membership Service that provides add, remove, and list operations for membership links with composite key semantics and tenant compatibility enforcement.
 
 **Required behavior**:
-- Add: validate group existence, validate resource_type exists and is in allowed_membership_types, check tenant compatibility, persist with unique constraint
+- Add: validate group existence, validate resource_type exists in Types Registry and is in the group type's allowed_membership_types, check tenant compatibility, persist with unique constraint
 - Remove: delete by composite key, return NotFound if absent
 - List: paginated query with OData `$filter` on `resource_id`, `resource_type`, `group_id`; cursor-based pagination
 - Tenant compatibility: derive tenant scope from group's tenant_id; reject if resource already linked in incompatible tenant
-- GTS type path resolution for resource_type at persistence boundary (no surrogate IDs in API)
+- GTS type path ↔ Registry Reference resolution for resource_type through the Types Registry SDK (no Registry References in the API)
 - Active reference integration: membership count checked by entity delete in feature 3
 
 **Implements**:
@@ -266,7 +267,7 @@ All acceptance criteria from feature 0004 are covered by automated tests:
 - [x] List memberships with `$filter=group_id eq 'G1'` returns all memberships for group G1
 - [x] List memberships with `$filter=resource_type eq 'User' and resource_id eq 'R1'` returns all groups containing that resource
 - [x] Membership responses do not include `tenant_id` — tenant scope derived from group
-- [x] No SMALLINT surrogate IDs exposed in membership REST responses
+- [x] No Registry References (type UUIDs) exposed in membership REST responses
 - [x] Membership seeding creates links, skips duplicates, validates tenant compatibility (idempotent)
 - [x] Tenant deprovisioning cascade-deletes associated memberships
 
@@ -280,11 +281,11 @@ All acceptance criteria from feature 0004 are covered by automated tests:
 
 **File**: `membership_service_test.rs`
 
-Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
+Test setup: SQLite in-memory + mock Types Registry + GroupService + MembershipService.
 
 #### TC-MBR-01: Add membership happy path [P1]
 - **Covers**: G25, 0004-AC-1
-- **Setup**: Create type with allowed_membership_types=[member_type], create group. Add membership.
+- **Setup**: Register a type with allowed_membership_types=[member_type] in the mock Types Registry, create group. Add membership.
 - **Assert**: Membership returned with group_id, resource_type, resource_id
 
 #### TC-MBR-02: Add membership to nonexistent group [P1]
@@ -349,34 +350,11 @@ Test setup: SQLite in-memory + TypeService + GroupService + MembershipService.
 - No memberships exist, query returns empty Page
 - **Assert**: `page.items.is_empty()`
 
-### Seeding — Memberships
-
-**File**: `seeding_test.rs` (integration tests with SQLite)
-
-#### TC-SEED-07: seed_memberships creates links [P1]
-- **Covers**: G48, 0004-AC-14
-- **Setup**: Create group + type, seed membership definitions.
-- **Assert**: `result.created == N`
-
-#### TC-SEED-08: seed_memberships skips duplicates (Conflict -> skip) [P1]
-- **Covers**: G48
-- **Setup**: Seed membership, seed again.
-- **Assert**: `result.unchanged == 1`
-
-#### TC-SEED-09: seed_memberships skips tenant-incompatible (TenantIncompatibility -> skip) [P2]
-- **Covers**: G48
-- **Setup**: Seed membership in tenant A, then seed same resource to tenant B group.
-- **Assert**: `result.skipped == 1`
-
-#### TC-SEED-12: seed_memberships with nonexistent group [P2]
-- group_id not in DB → error NOT caught by Conflict/TenantIncompatibility → early return Err
-- **Assert**: Error propagated (not silently skipped)
-
 ### Membership Table Assertions (`resource_group_membership`)
 
 | Operation | Required DB Assertions |
 |-----------|----------------------|
-| **Add membership** | Row exists with correct composite key `(group_id, gts_type_id, resource_id)`. `gts_type_id` is SMALLINT (resolved). |
+| **Add membership** | Row exists with correct composite key `(group_id, gts_type_id, resource_id)`. `gts_type_id` is the resource type's Registry Reference (UUID). |
 | **Remove membership** | Row **gone**. Other memberships of same group **untouched**. |
 | **Force delete group** | All membership rows for subtree groups → **0**. |
 | **Same resource multiple groups** | Two rows with different `group_id`, same `(gts_type_id, resource_id)`. |

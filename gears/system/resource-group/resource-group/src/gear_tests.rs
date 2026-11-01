@@ -7,8 +7,8 @@ use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit::{ClientHub, ConfigProvider, Gear, GearCtx};
 use toolkit_db::{ConnectOpts, DBProvider, connect_db};
-use types_registry_sdk::TypesRegistryClient;
-use types_registry_sdk::testing::MockTypesRegistryClient;
+use types_registry_sdk::PlatformTypesRegistryApi;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use super::ResourceGroup;
@@ -35,7 +35,9 @@ async fn init_does_not_need_authz_in_the_hub() {
         .expect("connect sqlite");
 
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(Arc::new(MockTypesRegistryClient::new()));
+    // Group types are read through the Types Registry platform API, which
+    // `init` resolves from the hub (`deps = [types_registry]`).
+    hub.register::<dyn PlatformTypesRegistryApi>(Arc::new(MockTypesRegistry::new()));
 
     let ctx = GearCtx::new(
         ResourceGroup::MODULE_NAME,

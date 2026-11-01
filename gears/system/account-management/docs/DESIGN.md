@@ -114,7 +114,7 @@ graph LR
 | `cpt-cf-account-management-fr-service-account-rotate` | `ServiceAccountService::rotate_secret` gates on the separately grantable `rotate_secret` action and calls `IdpPluginClient::rotate_service_account_secret`; the 200 carries `Cache-Control: no-store` and a new one-time secret with the account's identity unchanged. Unlike revoke, a provider-reported absence is surfaced as `not_found` (404) carrying the addressed `client_id` — a rotation that found nothing minted no usable credential. |
 | `cpt-cf-account-management-fr-service-account-revoke` | `ServiceAccountService::revoke` calls `IdpPluginClient::revoke_service_account` and folds a provider-reported absence into the same 204 as a removal (idempotency by error-mapping: the adapter maps vendor errors, AM assigns meaning), which also makes revoke useless as a probe for accounts owned by other tenants. A clean failure or an ambiguous outcome is NOT absence-equivalent. |
 | `cpt-cf-account-management-fr-service-account-secret-confidentiality` | The secret is wrapped in `secrecy::SecretString` (redacted `Debug`, zeroize-on-drop, no Serde) from the contract boundary to the single DTO conversion that serialises it; nothing persists it and no endpoint reads it back. `ServiceAccountFailureExt` discards every provider `detail` and `field` rather than digesting them, substituting fixed AM-owned messages and logging only category, length, and whether a field was attributed — see §4.2 Credential Handling on the Machine-Identity Surface. |
-| `cpt-cf-account-management-fr-user-group-rg-type` | `AccountManagementGear` idempotently registers the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` during gear initialization, with `allowed_memberships` including the platform user resource type (`gts.cf.core.am.user.v1~`). |
+| `cpt-cf-account-management-fr-user-group-rg-type` | AM declares the user-group Resource Group type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` and the user member-handle type `gts.cf.core.rg.type.v1~cf.core.am.user.v1~` statically in its SDK; they reach Types Registry through the type inventory, so `AccountManagementGear` registers nothing at initialization. The user-group type's `allowed_membership_types` includes the user member-handle type and its `allowed_parent_types` includes itself. |
 | `cpt-cf-account-management-fr-user-group-lifecycle` | Consumers call `ResourceGroupClient` directly for group create/update/delete. AM does not proxy these operations. |
 | `cpt-cf-account-management-fr-user-group-membership` | Consumers call `ResourceGroupClient` directly for membership add/remove. Callers verify user existence via AM's user-list endpoint; RG treats `resource_id` as opaque. |
 | `cpt-cf-account-management-fr-nested-user-groups` | Nested groups via Resource Group parent-child hierarchy; cycle detection enforced by Resource Group forest invariants. No AM involvement at runtime. |
@@ -221,7 +221,7 @@ AM does not enforce access-control barriers. It stores the `self_managed` flag o
 
 - [ ] `p2` - **ID**: `cpt-cf-account-management-principle-delegation-to-rg`
 
-User group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are handled by the Resource Group gearAM registers the user-group RG type at gear initialization and triggers RG cleanup during tenant hard-deletion. Consumers call `ResourceGroupClient` directly for all group and membership operations — AM does not proxy or coordinate these calls. AM's user-list endpoint (`GET /tenants/{id}/users`) provides the valid user set; callers combine it with RG's membership API.
+User group hierarchy, membership storage, cycle detection, and tenant-scoped isolation are handled by the Resource Group gear. AM declares the user-group RG type statically (served by Types Registry; no runtime registration) and triggers RG cleanup during tenant hard-deletion. Consumers call `ResourceGroupClient` directly for all group and membership operations — AM does not proxy or coordinate these calls. AM's user-list endpoint (`GET /tenants/{id}/users`) provides the valid user set; callers combine it with RG's membership API.
 
 **Drivers**: `cpt-cf-account-management-fr-user-group-rg-type`, `cpt-cf-account-management-fr-user-group-lifecycle`, `cpt-cf-account-management-fr-user-group-membership`, `cpt-cf-account-management-fr-nested-user-groups`
 
@@ -323,7 +323,7 @@ Legacy system integration is handled through the pluggable IdP provider contract
 - Tenant → ConversionRequest: One-to-many overall, at most one **pending** request per tenant at any time (enforced by partial unique index). A conversion request references the target tenant; `initiator_side` records which side (`child` or `parent`) issued the `POST`. Resolved rows remain attached to the tenant until the soft-delete retention window elapses and the cleanup job hard-deletes them.
 - Tenant → GTS Type: Many-to-one (via internal `tenant_type_uuid`, projected publicly as chained `tenant_type`). Each tenant references a GTS-registered type that defines parent-child constraints.
 - Tenant → IdP: Logical relationship via opaque tenant identifier used for IdP linking. No local foreign key — IdP is external.
-- Tenant → Resource Group (User Groups): Logical relationship. User groups are Resource Group entities scoped to a tenant. AM registers the RG type at init; consumers call `ResourceGroupClient` directly. `TenantService` triggers RG group cleanup during tenant hard-deletion.
+- Tenant → Resource Group (User Groups): Logical relationship. User groups are Resource Group entities scoped to a tenant. AM declares the RG type statically; consumers call `ResourceGroupClient` directly. `TenantService` triggers RG group cleanup during tenant hard-deletion.
 
 #### Value Objects and Invariants
 
@@ -388,15 +388,15 @@ When strict-mode enforcement is active, AM validates the chained schema identifi
 3. Validate the requested parent-child type relationship against the GTS `allowed_parent_types` rules — reject with `CanonicalError::FailedPrecondition` (HTTP 400, `reason=TYPE_NOT_ALLOWED`) if not permitted
 4. Call `IdpPluginClient::provision_tenant`; provider implementations create tenant-scoped resources or reuse shared ones based on deployment-specific behavior and tenant traits such as `idp_provisioning`. Providers **MUST NOT** silently no-op — unsupported operations **MUST** fail with `CanonicalError::Unimplemented` (HTTP 501)
 
-**User-group Resource Group type schema:** AM registers the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). It lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
+**User-group Resource Group type schema:** AM declares the chained RG type `gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~` — [user_group.v1.schema.json](./schemas/user_group.v1.schema.json). The declaration is static, in the AM SDK, and the type reaches Types Registry through the type inventory; AM performs no registration call at gear initialization. The document lives in the flat AM docs schema list, reuses the RG base contract, and defines no AM-specific `metadata` fields in v1. The `user_group` schema uses a chained GTS `$id` (`gts://gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`) because user groups are delegated to Resource Group per the Delegation-to-RG principle; the chain expresses that AM's user-group type extends the RG base resource-group type.
 
-**Referenced user resource schema:** The user-group type's `allowed_memberships` points at the platform user resource type `gts.cf.core.am.user.v1~` — [user.v1.schema.json](./schemas/user.v1.schema.json).
+**Referenced user member type:** The user-group type's `allowed_membership_types` points at the AM user member-handle RG type `gts.cf.core.rg.type.v1~cf.core.am.user.v1~`, also declared statically in the AM SDK (root-capable, no parents, no members, closed empty metadata). It is the type that user memberships resolve against; the platform user resource schema remains [user.v1.schema.json](./schemas/user.v1.schema.json).
 
 | Trait | Value | Meaning |
 |-------|-------|---------|
 | `can_be_root` | `true` | Allows top-level user groups inside a tenant's RG subtree. |
-| `allowed_parents` | [`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`] | Allows nested user groups, but only under the same user-group type. |
-| `allowed_memberships` | [`gts.cf.core.am.user.v1~`] | Restricts direct memberships to platform users. |
+| `allowed_parent_types` | [`gts.cf.core.rg.type.v1~cf.core.am.user_group.v1~`] | Allows nested user groups, but only under the same user-group type. |
+| `allowed_membership_types` | [`gts.cf.core.rg.type.v1~cf.core.am.user.v1~`] | Restricts direct memberships to platform users. |
 
 Tenant-scoped placement is intentionally **not** encoded as a GTS trait on this schema. Resource Group's ownership-graph profile enforces tenant compatibility and scope isolation at write time, while the schema is responsible only for type topology and membership type constraints.
 
@@ -909,7 +909,7 @@ This interface exposes raw and resolved tenant metadata keyed by registered GTS 
 
 | Dependency Gear    | Interface Used | Purpose |
 |-------------------|----------------|---------|
-| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM registers a user-group RG type at gear initialization, uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
+| [Resource Group](../../resource-group/docs/PRD.md) | `ResourceGroupClient` (SDK trait via ClientHub) | AM declares the user-group RG type statically (no startup registration), uses RG ownership-graph reads to verify that no tenant-owned resource associations remain before soft deletion, and triggers tenant-scoped group cleanup during hard-deletion. If RG is unavailable during deletion validation, AM fails the operation with `service_unavailable` rather than proceeding. Consumers call `ResourceGroupClient` directly for all group lifecycle, membership, and hierarchy operations. |
 | GTS Types Registry | `TypesRegistryClient` (SDK trait via ClientHub) | Runtime tenant type definitions, parent-child constraint validation, metadata schema registration and validation. |
 
 **Dependency Rules** (per project conventions):

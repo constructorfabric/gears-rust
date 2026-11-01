@@ -50,7 +50,7 @@ RG is a generic hierarchy and membership gear.
 
 It provides:
 
-- dynamic type model
+- group types resolved from Types Registry (GTS Type Schemas with placement traits)
 - strict forest entity topology
 - closure-table hierarchy read model
 - membership links between groups and resources
@@ -64,9 +64,9 @@ RG is intentionally policy-agnostic:
 
 The architecture consists of:
 
-- **RG Resolver SDK** — read and write trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`, `ResourceGroupTypeBootstrap` — the last one un-gated, for in-process type registration at gear init, see the AuthZ matrix below)
+- **RG Resolver SDK** — read and write trait contracts (`ResourceGroupClient`, `ResourceGroupReadHierarchy`) and the statically declared tenant RG type
 - **RG Gear (Gateway)** — routes requests to built-in or vendor-specific provider
-- **RG Plugin** — full service with database, REST API, seeding, and domain logic
+- **RG Plugin** — full service with database, REST API, seeding, and domain logic; group types are read from Types Registry
 
 Deployments use either: (RG Plugin + RG Service) or (Vendor RG Plugin + Vendor RG Service) — both behind the same SDK contracts.
 
@@ -84,18 +84,15 @@ For AuthZ-facing deployments aligned with current platform architecture, `owners
 | `cpt-cf-resource-group-fr-rest-api`                           | REST API layer with OperationBuilder and OData query support.                                                                         |
 | `cpt-cf-resource-group-fr-odata-query`                        | OData `$filter` and cursor-based pagination (`cursor`, `limit`) on all list endpoints. Ordering is undefined but consistent. No `$orderby`. |
 | `cpt-cf-resource-group-fr-list-groups-depth`                  | Dedicated depth endpoint (`/{group_id}/hierarchy`) returns hierarchy with relative depth and depth-based filtering.                       |
-| `cpt-cf-resource-group-fr-manage-types`                       | Type service with validated lifecycle API and uniqueness guarantees.                                                                  |
-| `cpt-cf-resource-group-fr-validate-type-code`                 | Type service enforces code format, length, and case-insensitive normalization before persistence.                                     |
-| `cpt-cf-resource-group-fr-reject-duplicate-type`              | Unique `schema_id` persistence constraint and deterministic conflict mapping prevent duplicate type creation.                         |
-| `cpt-cf-resource-group-fr-seed-types`                         | Any RG plugin MUST perform schema migration. Type data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). AuthZ config determines required types. Types have no interdependencies and SHOULD be seeded in parallel (`JoinSet`) for throughput. |
+| `cpt-cf-resource-group-fr-types-in-types-registry`            | Types are GTS Type Schemas derived from `gts.cf.core.rg.type.v1~` and owned by Types Registry; RG has no type storage, CRUD, seeding or bootstrap. Placement rules are trait values (`can_be_root`, `allowed_parent_types`, `allowed_membership_types`). |
+| `cpt-cf-resource-group-fr-resolve-types`                      | `TypeCatalog` port backed by the Types Registry SDK; lookups happen before the DB transaction; unknown type is an error (404/400), registry outage maps to 503, unresolvable stored reference to 500. |
+| `cpt-cf-resource-group-fr-store-type-reference`               | Group and membership rows store the Registry Reference UUID without a foreign key; no re-validation of existing groups when a type evolves (compatibility guaranteed within a major version). |
 | `cpt-cf-resource-group-fr-seed-groups`                        | Group data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). Validates parent-child links and type compatibility when performed. Groups MUST be seeded sequentially (parents before children) due to hierarchy dependencies. |
 | `cpt-cf-resource-group-fr-seed-memberships`                   | Membership data seeding is optional and deployment-specific (plugin data migration, manual DB admin, or RG API). Validates group existence and tenant compatibility when performed. Memberships have no interdependencies and SHOULD be seeded in parallel. |
-| `cpt-cf-resource-group-fr-validate-type-update-hierarchy`     | Type update validates removed `allowed_parents` and `can_be_root` changes against existing groups; rejects with `AllowedParentsViolation` when hierarchy would become inconsistent. |
-| `cpt-cf-resource-group-fr-delete-type-only-if-empty`          | Type deletion flow checks for existing entities and rejects delete when references remain.                                            |
 | `cpt-cf-resource-group-fr-manage-entities`                    | Entity service with create/get/update/move/delete operations.                                                                         |
 | `cpt-cf-resource-group-fr-enforce-forest-hierarchy`           | Domain invariants + cycle checks before writes. Multiple roots permitted (forest).                                                    |
-| `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`     | Entity create/move validates that at most one root group is of a tenant type (GTS code starts with `TENANT_RG_TYPE_PATH`); second tenant root rejected with `TenantRootAlreadyExists` (409 Conflict). |
-| `cpt-cf-resource-group-fr-validate-parent-type`               | Entity create/move validates parent-child compatibility against runtime type parent rules.                                            |
+| `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`     | Entity create/move validates that at most one root group is of a tenant type (GTS id starts with `TENANT_RG_TYPE_PATH`; `is_tenant` is derived at creation); second tenant root rejected with `TenantRootAlreadyExists` (409 Conflict); the `uq_rg_tenant_root` partial unique index backs the check against races. |
+| `cpt-cf-resource-group-fr-validate-parent-type`               | Entity create/move validates parent-child compatibility against the parent type's `allowed_parent_types` / `can_be_root` read from Types Registry. |
 | `cpt-cf-resource-group-fr-delete-entity-no-active-references` | Delete orchestration applies reference-policy checks before entity removal and closure mutation.                                      |
 | `cpt-cf-resource-group-fr-tenant-scope-ownership-graph`       | Ownership-graph profile enforces tenant-hierarchy-compatible parent-child and membership writes, with tenant-scoped AuthZ query path. |
 | `cpt-cf-resource-group-fr-manage-membership`                  | Membership service provides deterministic add/remove lifecycle operations.                                                            |
@@ -132,7 +129,8 @@ For AuthZ-facing deployments aligned with current platform architecture, `owners
 
 | ADR ID | Title |
 | --- | --- |
-| `cpt-cf-resource-group-adr-p1-gts-type-system` | [GTS Type System for Resource Group](ADR/ADR-001-gts-type-system.md) — GTS chained type paths, SMALLINT surrogate keys, junction tables, barrier semantics |
+| `cpt-cf-resource-group-adr-p1-gts-type-system` | [GTS Type System for Resource Group](ADR/ADR-001-gts-type-system.md) — GTS chained type paths, traits pattern, barrier semantics (storage parts superseded by ADR-002) |
+| `cpt-cf-resource-group-adr-p1-types-in-types-registry` | [Resource Group Types Live in Types Registry](ADR/ADR-002-types-in-types-registry.md) — types are Types Registry entities, RG stores the Registry Reference |
 
 #### Key Compatibility Anchors
 
@@ -151,8 +149,8 @@ For AuthZ-facing deployments aligned with current platform architecture, `owners
 | Layer                  | Responsibility                                    | Technology                    |
 | ---------------------- | ------------------------------------------------- | ----------------------------- |
 | REST API Layer         | HTTP endpoints with OData query support           | OperationBuilder + REST handlers |
-| SDK API Layer          | expose type/entity/membership + read contracts    | Rust SDK traits + ClientHub   |
-| Domain Layer           | validate type compatibility and forest invariants | domain services               |
+| SDK API Layer          | expose entity/membership + read contracts    | Rust SDK traits + ClientHub   |
+| Domain Layer           | validate type compatibility (types from Types Registry) and forest invariants | domain services               |
 | Hierarchy Engine       | closure-table updates/queries and profile checks  | domain service + repositories |
 | Integration Read Layer | read-only hierarchy queries for AuthZ plugin      | `ResourceGroupReadHierarchy`  |
 | Persistence Layer      | transactional storage and indexing                | SQL + SeaORM repositories     |
@@ -178,17 +176,17 @@ Hierarchy guarantees single parent and cycle prevention for all writes. Multiple
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-tenant-root-uniqueness`
 
-The forest **MAY** contain multiple root groups, but at most **one** of them **MUST** be a tenant-type group (GTS code starts with `TENANT_RG_TYPE_PATH`). That unique tenant root is the **main tenant**; every other tenant lives as its sub-tenant. Non-tenant roots (e.g. auxiliary ownership forests that are not part of the tenant tree) may coexist alongside the main tenant root and carry the main tenant's `tenant_id`, but they are not tenants themselves. This invariant aligns the RG forest with the AuthZ/TR single-root tenant tree: `TENANT_MODEL.md`'s single-root-tree is realized as exactly the tenant-root subtree inside the RG forest. Enforcement at create time rejects a second tenant-type root with `TenantRootAlreadyExists` (409 Conflict).
+The forest **MAY** contain multiple root groups, but at most **one** of them **MUST** be a tenant-type group (GTS id starts with `TENANT_RG_TYPE_PATH`). That unique tenant root is the **main tenant**; every other tenant lives as its sub-tenant. Non-tenant roots (e.g. auxiliary ownership forests that are not part of the tenant tree) may coexist alongside the main tenant root and carry the main tenant's `tenant_id`, but they are not tenants themselves. This invariant aligns the RG forest with the AuthZ/TR single-root tenant tree: `TENANT_MODEL.md`'s single-root-tree is realized as exactly the tenant-root subtree inside the RG forest. Enforcement at create/move time rejects a second tenant-type root with `TenantRootAlreadyExists` (409 Conflict); a partial unique index on `resource_group` (`is_tenant` where `parent_id IS NULL`) guarantees the invariant against concurrent writers.
 
-#### Dynamic Type Governance
+#### Type Governance in Types Registry
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-principle-dynamic-types`
 
-Type rules are runtime-configurable through API/seed data with deterministic validation.
+Group types are owned by Types Registry, not by RG. A type is a GTS Type Schema derived from the abstract base `gts.cf.core.rg.type.v1~`; its placement rules are trait values (`x-gts-traits`: `can_be_root`, `allowed_parent_types`, `allowed_membership_types`, defaults false / empty / empty, declared as the trait schema on the base). Types are declared statically (the tenant type in the RG SDK, the AM user and user-group types in the AM SDK) or registered through the Types Registry API; the deployment's registration policy governs which vendors may derive from the RG base type. Types Registry guarantees that within a major version a type only evolves backward-compatibly, so RG does not re-validate existing groups on type evolution; narrowing placement rules requires a new major (new id, new Registry Reference).
 
-**ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`
+**ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`, `cpt-cf-resource-group-adr-p1-types-in-types-registry`
 
-**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `barrier`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g., `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`), the chained GTS schema defines `properties.metadata` with `additionalProperties: false` for field isolation. `metadata_schema` on the RG type definition is null for chained types — instance metadata is validated against the GTS schema. The `metadata_schema` field is reserved for optional RG-level schema overrides. Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
+**Derived type fields — metadata object, JSONB storage (v1)**: Derived type fields (e.g. `barrier`, `custom_domain`, `category`) are nested inside a `metadata` object in API requests and responses. In the database, they are stored in a `metadata` JSONB column on `resource_group`. For chained types (e.g., `gts.cf.core.rg.type.v1~y.core.tn.tenant.v1~`), the type schema defines `properties.metadata` with `additionalProperties: false` for field isolation. Group `metadata` is validated against the resolved schema of the group's type, obtained from Types Registry; an unknown type is an error (it is never silently skipped). Advanced validation (e.g., Starlark-based cross-field rules) is out of scope for v1.
 
 #### Query Profile as Guardrail
 
@@ -244,30 +242,28 @@ RG cannot generate SQL fragments or access-scope objects.
 
 RG persistence layer uses SeaORM abstractions and standard SQL. The gear **MUST NOT** depend on vendor-specific SQL extensions or features of a particular RDBMS. Any SQL-compatible database supported by SeaORM can be used as the storage backend.
 
-**Implementation note**: the reference DDL (`migration.sql`) uses a PostgreSQL-specific `CREATE DOMAIN gts_type_path` with regex validation. The SeaORM migration code must provide a database-agnostic equivalent — GTS type path format validation (`^gts\.[a-z_]...~$`) is enforced at the application layer (service/domain code) as fallback for non-PostgreSQL backends. The `DOMAIN` in the reference DDL serves as defense-in-depth for PostgreSQL deployments only.
+**Implementation note**: the reference DDL (`migration.sql`) uses plain types supported by both PostgreSQL and SQLite (UUID/TEXT, partial unique index). RG stores no GTS type path in the database, so no type path format validation is needed in the persistence layer; type identifiers are validated by Types Registry.
 
-#### Surrogate IDs Are Internal Only
+#### Type References Are Registry References
 
 - [x] `p1` - **ID**: `cpt-cf-resource-group-constraint-surrogate-ids-internal`
 
-SMALLINT surrogate IDs (`gts_type.id`, `gts_type_id` FK columns) are a **DB-internal optimization**. They MUST NOT appear in any API response, SDK type, REST contract, or OpenAPI schema. All external interfaces (REST API, SDK traits, gRPC) use GTS type paths (strings) exclusively. The server resolves GTS paths to/from SMALLINT IDs at the persistence layer boundary.
+`gts_type_id` columns on `resource_group` and `resource_group_membership` hold the Types Registry Registry Reference (UUID). They are opaque and **MUST NOT** appear in any API response, SDK type, REST contract, or OpenAPI schema. All external interfaces (REST API, SDK traits) use GTS type paths (strings) exclusively; RG resolves paths to and from Registry References through the Types Registry SDK. There is no foreign key and no gear-local surrogate.
 
-**Strict type existence validation**: every GTS type path used in any API operation **MUST** reference an already-registered type in `gts_type`. This applies to:
-- `type` in group create/update requests (`POST /groups`, `PUT /groups/{id}`)
-- `allowed_parents` in type create/update requests
-- `allowed_memberships` in type create/update requests
+**Strict type existence validation**: every GTS type path used in an RG operation **MUST** be known to Types Registry. This applies to:
+- `type` in group create requests (`POST /groups`); a group's type never changes, so `PUT /groups/{id}` does not change it
 - `resource_type` in membership operations (`POST /memberships/...`)
 
-If a referenced type does not exist, the operation **MUST** return a validation error. Each chained type (e.g., `gts.cf.core.rg.type.v1~y.system.tn.tenant.v1~`) is a distinct type that must be registered separately — chaining does not auto-create constituent types. Registration order matters: base/resource types first, then chained RG types that reference them. Base types (including `gts.cf.core.rg.type.v1~`) must be created before use — via seeding, API calls, or manual DB administration.
+If a group type does not exist the operation **MUST** return `TypeNotFound` (404); if a membership resource type does not exist it **MUST** return a validation error (400). The allowed parent and member types are checked from the type's traits (`allowed_parent_types`, `allowed_membership_types`).
 
 **RG type prefix requirement (`gts.cf.core.rg.type.v1~`)**:
-- **`type` in group operations**: `POST /groups`, `PUT /groups/{id}` — **MUST** have `gts.cf.core.rg.type.v1~` prefix. Rejected without it.
-- **`allowed_parents`**: **MUST** have `gts.cf.core.rg.type.v1~` prefix — parent groups are always RG types.
-- **`allowed_memberships`**: **NO prefix requirement** — membership resource types are external domain types (e.g., `gts.vendor.system.idp.user.v1~`, `gts.vendor.system.lms.course.v1~`) that do not need to be RG types.
+- **`type` in group operations** **MUST** have the `gts.cf.core.rg.type.v1~` prefix. Rejected without it.
+- **`allowed_parent_types`** entries **MUST** be derived from `gts.cf.core.rg.type.v1~` — parent groups are always RG types (enforced by Types Registry through the trait schema).
+- **`allowed_membership_types`** have **no prefix requirement** — membership resource types are external domain types (e.g., `gts.cf.core.am.user.v1~`) that do not need to be RG types.
 
-This ensures the hierarchy is always governed by the RG type contract (`can_be_root`, `allowed_parents`, `allowed_memberships`), while membership resources can be any registered GTS type.
+This ensures the hierarchy is always governed by the RG type contract, while membership resources can be any registered GTS type.
 
-**ADRs**: `cpt-cf-resource-group-adr-p1-gts-type-system`
+**ADRs**: `cpt-cf-resource-group-adr-p1-types-in-types-registry`
 
 #### Profile Change Safety
 
@@ -299,7 +295,7 @@ Reducing enabled `max_depth`/`max_width` cannot rewrite existing rows. Writes th
 
 | Entity                    | Description                                                         |
 | ------------------------- | ------------------------------------------------------------------- |
-| `ResourceGroupType`       | type code and allowed parent types                                  |
+| `ResourceGroupType`       | type as read from Types Registry (GTS id, Registry Reference, placement traits, metadata schema); not stored by RG |
 | `ResourceGroupEntity`     | group node with optional parent, stored in `resource_group` table   |
 | `ResourceGroupMembership` | resource-to-group many-to-many link, qualified by `resource_type`   |
 | `ResourceGroupClosure`    | ancestor-descendant-depth projection                                |
@@ -307,14 +303,14 @@ Reducing enabled `max_depth`/`max_width` cannot rewrite existing rows. Writes th
 
 **Entity relationships**:
 
-- `ResourceGroupType` * ←→ * `ResourceGroupType` via `gts_type_allowed_parent` (M:N self-referential: which types can be parents of which)
-- `ResourceGroupType` * ←→ * `ResourceGroupType` via `gts_type_allowed_membership` (M:N: which resource types can be members of groups of which type)
-- `ResourceGroupEntity` * → 1 `ResourceGroupType` (each group has one type)
+- `ResourceGroupType` * ←→ * `ResourceGroupType` via the `allowed_parent_types` trait (M:N self-referential, held in Types Registry: which types can be parents of which)
+- `ResourceGroupType` * ←→ * resource types via the `allowed_membership_types` trait (held in Types Registry: which resource types can be members of groups of which type)
+- `ResourceGroupEntity` * → 1 `ResourceGroupType` (each group has one type, referenced by Registry Reference with no foreign key)
 - `ResourceGroupEntity` * → 0..1 `ResourceGroupEntity` (optional parent — forest root has no parent)
 - `ResourceGroupEntity` 1 ←→ * `ResourceGroupMembership` (group has many members)
 - `ResourceGroupEntity` 1 ←→ * `ResourceGroupClosure` (as ancestor and as descendant)
 
-**Value objects**: `GtsTypePath` (validated type code string), `ListQuery` (OData filter + pagination params), `PageInfo` (cursor pagination metadata), `Page<T>` (paginated response wrapper).
+**Value objects**: `GtsTypePath` (validated GTS type path string), `ListQuery` (OData filter + pagination params), `PageInfo` (cursor pagination metadata), `Page<T>` (paginated response wrapper).
 
 ### 3.2 Component Model
 
@@ -324,11 +320,13 @@ graph TD
     X[AuthZ Plugin] --> Z[ResourceGroupReadHierarchy]
     B --> D[RG Gear]
     Z --> D
-    D --> E[Type Service]
+    D --> E[Type Catalog]
     D --> F[Entity Service]
     D --> G[Hierarchy Service]
     D --> H[Membership Service]
-    E --> I[Persistence Adapter]
+    E --> TR[Types Registry SDK]
+    F --> E
+    H --> E
     F --> I
     G --> I
     H --> I
@@ -347,7 +345,7 @@ Responsibilities:
 
 - wire services and repositories
 - register public clients in ClientHub
-- expose REST API endpoints under `/api/resource-group/v1/` (groups, memberships) and `/api/types-registry/v1/` (types)
+- expose REST API endpoints under `/api/resource-group/v1/` (groups, memberships)
 - load query profile config
 - route `ResourceGroupReadHierarchy` calls to built-in data path or configured vendor-specific plugin path
 
@@ -356,15 +354,21 @@ Boundaries:
 - no business rule implementation
 - no authz decision logic
 
-#### Type Service
+#### Type Catalog
 
-- [x] `p1` - **ID**: `cpt-cf-resource-group-component-type-service`
+- [x] `p1` - **ID**: `cpt-cf-resource-group-component-type-catalog`
 
 Responsibilities:
 
-- manage type lifecycle
-- validate code format and uniqueness
-- enforce delete-if-unused
+- resolve GTS id strings and Registry References to type definitions (effective traits plus resolved schema) through the Types Registry SDK, in one fixed projection
+- run before any database transaction of a write starts, so no transaction waits on a remote call
+- resolve every key known up front in one batched request per operation; a list page adds a request only for types its filter resolution did not return
+- report unknown types as absent (callers map them to 404 or 400) and registry failures as unavailability (503)
+
+Boundaries:
+
+- read-only: RG never creates, updates or deletes types
+- no local cache; caching belongs to the Types Registry SDK
 
 #### Entity Service
 
@@ -373,8 +377,9 @@ Responsibilities:
 Responsibilities:
 
 - create/get/update/move/delete entities
-- validate parent type compatibility (on create, move, and type change)
-- on `type` change: validate that the new type's `allowed_parents` permits the current parent's type, AND that all children's types include the new type in their `allowed_parents` — reject with `InvalidParentType` if any child would become invalid
+- validate parent type compatibility on create and move using the type's `allowed_parent_types` and `can_be_root`; a group's type never changes after creation
+- derive `is_tenant` from the type id prefix at creation and reject a second tenant root
+- validate group `metadata` against the schema of the group's type
 - orchestrate subtree operations
 
 #### Hierarchy Service
@@ -416,8 +421,8 @@ Responsibilities:
 - consistent canonical + closure updates
 - support canonical persistence strategy
 
-Each repository MUST be defined as a trait first (e.g., `TypeRepositoryTrait`, `GroupRepositoryTrait`, `MembershipRepositoryTrait`, `ClosureRepositoryTrait`) and injected into domain services as `Arc<dyn Trait>`. This enables:
-- unit testing via in-memory trait implementations (`InMemoryTypeRepository`, etc.) without database
+Each repository MUST be defined as a trait first (e.g., `GroupRepositoryTrait`, `MembershipRepositoryTrait`, `ClosureRepositoryTrait`) and injected into domain services as `Arc<dyn Trait>`. This enables:
+- unit testing via in-memory trait implementations without database; types are supplied by a mock Types Registry
 - swappable storage backends without touching domain layer
 - clear contract boundary between domain and infrastructure
 
@@ -433,10 +438,6 @@ Boundaries:
 
 | Method | Returns | Description |
 | ------ | ------- | ----------- |
-| `create_type` / `update_type` | `ResourceGroupType` | type lifecycle |
-| `get_type` | `ResourceGroupType` | get type by code |
-| `list_types` | `Page<ResourceGroupType>` | list types with OData query |
-| `delete_type` | `()` | delete type |
 | `create_group` / `update_group` | `ResourceGroup` | group lifecycle |
 | `get_group` | `ResourceGroup` | get group by ID |
 | `list_groups` | `Page<ResourceGroup>` | list groups with OData query |
@@ -451,11 +452,12 @@ SDK models are defined in `resource-group-sdk/src/models.rs` and are aligned wit
 
 | SDK Type | REST Schema | Description |
 | -------- | ----------- | ----------- |
-| `ResourceGroupType` | `Type` | `schema_id`, `allowed_parents`, `allowed_memberships`, `metadata_schema`. `can_be_root` resolved from `x-gts-traits`. |
 | `ResourceGroup` | `Group` | group identity (`id`, `type`, `name`), `hierarchy` context, `metadata` (type-specific fields) |
 | `ResourceGroupWithDepth` | `GroupWithDepth` | same as `ResourceGroup` plus `hierarchy.depth` (relative distance) |
 | `ResourceGroupMembership` | `Membership` | `group_id`, `resource_type`, `resource_id` |
 | `Page<T>` / `PageInfo` | `*Page` | cursor-based pagination wrapper |
+
+The SDK has no type model and no type methods: group types are Types Registry entities, read through the Types Registry SDK. The SDK only declares the platform tenant type and the type path constant `TENANT_RG_TYPE_PATH`.
 
 Core API trait (`ResourceGroupClient`) is defined in `resource-group-sdk/src/api.rs`. All methods accept `SecurityContext` as the first argument for tenant-scoped authorization.
 
@@ -477,15 +479,10 @@ Platform-admin provisioning exception:
 
 #### REST API Endpoints
 
-Base path: `/api/resource-group/v1` (groups, memberships), `/api/types-registry/v1` (types)
+Base path: `/api/resource-group/v1` (groups, memberships). There are no type endpoints: types are managed through the Types Registry API.
 
 | Method | Base | Path | Operation | Description |
 | ------ | ---- | ---- | --------- | ----------- |
-| GET | types-registry | `/types` | `listTypes` | List types with OData query |
-| POST | types-registry | `/types` | `createType` | Create type |
-| GET | types-registry | `/types/{code}` | `getType` | Get type by code |
-| PUT | types-registry | `/types/{code}` | `updateType` | Update type |
-| DELETE | types-registry | `/types/{code}` | `deleteType` | Delete type |
 | GET | resource-group | `/groups` | `listGroups` | List groups with OData query |
 | POST | resource-group | `/groups` | `createGroup` | Create group (`tenant_id` derived from `SecurityContext` effective tenant scope) |
 | GET | resource-group | `/groups/{group_id}` | `getGroup` | Get group by ID |
@@ -514,8 +511,6 @@ REST API field projection notes:
 - Group responses (`Group` schema) do not include `created_at`/`updated_at` timestamps. These fields exist in the database for audit purposes but are not exposed in API responses.
 - Membership list responses (`Membership` schema) do not include `tenant_id`. Memberships are always scoped to a single tenant; tenant scope is derived from the group's `tenant_id` via `group_id` JOIN and is not stored on the membership row itself.
 
-Type list `$filter` fields: `code` (eq, ne, in).
-
 **Integration read API** (stable):
 
 `ResourceGroupReadHierarchy` is a narrow read-only contract for in-process plugin consumers — the AuthZ resolver plugin, the tenant-resolver RG plugin, and an in-process AuthZ PDP. It carries hierarchy walks (`get_group_descendants` / `get_group_ancestors`), flat OData-filtered group listing (`list_groups`), single-group existence lookup (`get_group`), and membership listing (`list_memberships`). All other consumers use `ResourceGroupClient`, which includes the same reads plus full CRUD.
@@ -540,7 +535,7 @@ Integration read trait hierarchy (defined in `resource-group-sdk/src/api.rs`):
 | Trait | Extends | Methods | Used by |
 | ----- | ------- | ------- | ------- |
 | `ResourceGroupReadHierarchy` | — | `get_group_descendants`, `get_group_ancestors`, `list_groups`, `get_group`, `list_memberships` (all unscoped / PEP-bypassing) | AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP |
-| `ResourceGroupClient` | — | full CRUD (types, groups, memberships, hierarchy) | General consumers |
+| `ResourceGroupClient` | — | full CRUD (groups, memberships, hierarchy) | General consumers |
 
 > The previously planned two-tier split — a separate `ResourceGroupReadPluginClient` extending `ResourceGroupReadHierarchy` with `list_memberships` — was collapsed. `list_memberships` and `get_group` now live directly on `ResourceGroupReadHierarchy`, and the vendor-specific plugin gateway resolves `dyn ResourceGroupReadHierarchy`. A vendor backend replaces the registered `ResourceGroupReadHierarchy` implementation at gear init rather than implementing a distinct plugin trait.
 
@@ -548,7 +543,7 @@ ClientHub registration: single implementation (`RgService`), registered as both 
 
 Plugin gateway routing notes:
 
-- `ResourceGroupClient` is the full read+write contract for type/entity/membership lifecycle and hierarchy queries (used by domain clients and general consumers)
+- `ResourceGroupClient` is the full read+write contract for entity/membership lifecycle and hierarchy queries (used by domain clients and general consumers)
 - `ResourceGroupReadHierarchy` is the narrow read-only contract for in-process plugin consumers (AuthZ resolver plugin, tenant-resolver RG plugin, in-process AuthZ PDP); its reads are resolved unscoped (bypass `PolicyEnforcer`)
 - both are registered in ClientHub backed by the same implementation
 - gear service resolves configured provider:
@@ -659,10 +654,11 @@ Client initialization: AuthZ plugin resolves `dyn ResourceGroupReadHierarchy` fr
 | Dependency                            | Interface                       | Purpose                                                       |
 | ------------------------------------- | ------------------------------- | ------------------------------------------------------------- |
 | SQL database                          | SeaORM repositories             | durable canonical + closure storage                           |
+| Types Registry SDK                    | `PlatformTypesRegistryApi` (in-process local client) | read group types (effective traits + resolved schema) and Registry References before the DB transaction; no RG-side cache |
 | AuthZ Resolver SDK                    | `PolicyEnforcer` / `AuthZResolverApi` | AuthZ evaluation for JWT-authenticated RG API requests (write + read) |
 | Vendor-specific RG backend (optional) | `ResourceGroupReadHierarchy`    | alternative hierarchy/membership source for integration reads (vendor impl replaces the registered `ResourceGroupReadHierarchy` at gear init) |
 | AuthZ plugin consumer (optional)      | `ResourceGroupReadHierarchy`    | read group context in PDP logic (narrow reads: hierarchy + listing + single-group + memberships, resolved unscoped; in-process via `ClientHub` — `p1`; MTLS transport — `p2`, deferred / not implemented yet) |
-| General consumers (optional)          | `ResourceGroupClient`           | full read+write access to types/entities/memberships/hierarchy |
+| General consumers (optional)          | `ResourceGroupClient`           | full read+write access to entities/memberships/hierarchy |
 
 
 ### 3.6 Interactions & Sequences
@@ -677,15 +673,19 @@ Tenant Administrator creates a child resource group (e.g. department, branch) un
 sequenceDiagram
     participant TA as Tenant Admin (REST API)
     participant ES as Entity Service
+    participant TC as Type Catalog (Types Registry SDK)
     participant HS as Hierarchy Service
     participant DB as Persistence
 
     TA->>ES: create_entity(type, parent)
+    ES->>TC: resolve group type (traits, metadata schema)
+    TC-->>ES: type definition (or not found / unavailable)
+    ES->>ES: validate metadata against type schema
     ES->>DB: begin tx (SERIALIZABLE)
     ES->>HS: load current hierarchy snapshot in tx
-    ES->>ES: validate type + parent compatibility in tx
+    ES->>ES: validate parent type compatibility in tx
     ES->>HS: validate cycle/depth/width in tx
-    ES->>DB: insert resource_group row
+    ES->>DB: insert resource_group row (is_tenant derived from type id)
     HS->>DB: insert closure self row
     HS->>DB: insert ancestor-descendant rows
     DB-->>ES: commit
@@ -708,14 +708,16 @@ Tenant Administrator moves a resource group (and its entire subtree) to a new pa
 sequenceDiagram
     participant TA as Tenant Admin (REST API)
     participant ES as Entity Service
+    participant TC as Type Catalog (Types Registry SDK)
     participant HS as Hierarchy Service
     participant DB as Persistence
 
     TA->>ES: move_entity(node, new_parent)
+    ES->>TC: resolve involved types (before the transaction)
     ES->>DB: begin tx (SERIALIZABLE)
     ES->>HS: load current hierarchy snapshot in tx
     ES->>HS: validate not-in-subtree (cycle check) in tx
-    ES->>HS: validate type/depth/width in tx
+    ES->>HS: validate parent type/depth/width in tx
     HS->>DB: delete affected closure paths
     HS->>DB: insert rebuilt closure paths
     DB-->>ES: commit
@@ -770,7 +772,7 @@ RG Management API depends on AuthZ SDK; AuthZ plugin depends on RG Access API SD
 
 ```
 Phase 1 (SystemCapability):
-  1. RG gear init
+  1. RG gear init (deps: [authz_resolver, types_registry]; the Types Registry platform API is resolved from ClientHub, so Types Registry initializes first)
      → registers ResourceGroupClient in ClientHub
      → registers ResourceGroupReadHierarchy in ClientHub
      → REST/gRPC endpoints NOT yet accepting traffic
@@ -874,8 +876,6 @@ RG Gear exposes its REST/gRPC API with **two authentication modes**. The mode de
 Standard user/service requests authenticated via JWT bearer token. **All** RG REST API endpoints are available. Every request goes through AuthZ evaluation via `PolicyEnforcer`, same as any other domain service (e.g. courses). JWT token lifecycle (expiry, refresh, revocation) is managed by the AuthN Resolver and API Gateway — RG delegates token validation entirely to the platform authentication layer and does not implement its own session timeout or token renewal logic.
 
 Applies to:
-- `GET /api/types-registry/v1/types` — list/get types
-- `POST/PUT/DELETE /api/types-registry/v1/types/{code}` — type lifecycle
 - `GET /api/resource-group/v1/groups` — list/get groups
 - `POST/PUT/DELETE /api/resource-group/v1/groups/{group_id}` — group lifecycle
 - `GET /api/resource-group/v1/groups/{group_id}/hierarchy` — hierarchy traversal
@@ -1065,54 +1065,7 @@ In both cases, the AuthZ plugin uses `ResourceGroupReadHierarchy` trait. The tra
 
 ### 3.7 Database schemas & tables
 
-#### Table: `gts_type`
-
-
-| Column     | Type        | Description               |
-| ---------- | ----------- | ------------------------- |
-| `id`       | SMALLINT    | surrogate PK (auto-generated identity) |
-| `schema_id` | gts_type_path | GTS chained type path (UNIQUE, TEXT with regex validation) |
-| `metadata_schema` | JSONB NULL  | JSON Schema for the `metadata` object of instances of this type |
-| `created_at`  | TIMESTAMPTZ | creation time             |
-| `updated_at` | TIMESTAMPTZ | update time (nullable)    |
-
-
-Constraints:
-
-- PK on `id` (SMALLINT GENERATED ALWAYS AS IDENTITY)
-- UNIQUE on `schema_id`
-- `can_be_root` is resolved at runtime from `x-gts-traits` in the registered GTS schema (not a DB column)
-- Placement invariant (`can_be_root` OR at least one allowed parent) is enforced at the application layer.
-
-#### Table: `gts_type_allowed_parent`
-
-Junction table storing which parent types are allowed for a given type.
-
-| Column           | Type     | Description                                      |
-| ---------------- | -------- | ------------------------------------------------ |
-| `type_id`        | SMALLINT | child type (FK to `gts_type.id`)                 |
-| `parent_type_id` | SMALLINT | allowed parent type (FK to `gts_type.id`)        |
-
-Constraints:
-
-- PK on `(type_id, parent_type_id)`
-- FK `type_id` → `gts_type(id)` ON DELETE CASCADE
-- FK `parent_type_id` → `gts_type(id)` ON DELETE CASCADE
-
-#### Table: `gts_type_allowed_membership`
-
-Junction table storing which membership types are allowed for a given type.
-
-| Column               | Type     | Description                                      |
-| -------------------- | -------- | ------------------------------------------------ |
-| `type_id`            | SMALLINT | group type (FK to `gts_type.id`)                 |
-| `membership_type_id` | SMALLINT | allowed membership type (FK to `gts_type.id`)    |
-
-Constraints:
-
-- PK on `(type_id, membership_type_id)`
-- FK `type_id` → `gts_type(id)` ON DELETE CASCADE
-- FK `membership_type_id` → `gts_type(id)` ON DELETE CASCADE
+Group types are not stored in RG. They are GTS Type Schemas in Types Registry; the `gts_type_id` columns below hold the Types Registry Registry Reference (UUID) of the type, with no foreign key. The former tables `gts_type`, `gts_type_allowed_parent`, `gts_type_allowed_membership` and the `gts_type_path` domain no longer exist (see ADR-002).
 
 #### Table: `resource_group`
 
@@ -1121,9 +1074,10 @@ Constraints:
 | ------------- | ----------- | ------------------------------------------------- |
 | `id`          | UUID        | entity ID (PK, default `gen_random_uuid()`)       |
 | `parent_id`   | UUID NULL   | parent entity (FK to `resource_group.id`)         |
-| `gts_type_id` | SMALLINT    | type reference (FK to `gts_type.id`)              |
+| `gts_type_id` | UUID        | Types Registry Registry Reference of the group type (no FK) |
+| `is_tenant`   | BOOLEAN     | `true` when the type id starts with `TENANT_RG_TYPE_PATH`; derived at creation, never changes |
 | `name`        | TEXT        | display name                                      |
-| `metadata`    | JSONB NULL  | type-specific fields for group instance, validated against the chained GTS type schema. For types supporting barrier semantics, includes `metadata.self_managed` (boolean). |
+| `metadata`    | JSONB NULL  | type-specific fields for group instance, validated against the schema of the group's type from Types Registry. For types supporting barrier semantics, includes `metadata.self_managed` (boolean). |
 | `tenant_id`   | UUID        | tenant scope                                      |
 | `created_at`     | TIMESTAMPTZ | creation time                                     |
 | `updated_at`    | TIMESTAMPTZ | update time (nullable)                            |
@@ -1131,7 +1085,6 @@ Constraints:
 
 Constraints:
 
-- FK `gts_type_id` → `gts_type(id)` ON DELETE RESTRICT
 - FK `parent_id` → `resource_group(id)` ON UPDATE CASCADE ON DELETE RESTRICT
 
 Indexes:
@@ -1140,6 +1093,7 @@ Indexes:
 - `(name)`
 - `(gts_type_id, id)` — composite for type-scoped queries
 - `(tenant_id)` — SecureORM tenant scope filtering
+- UNIQUE `(is_tenant)` WHERE `parent_id IS NULL AND is_tenant` (`uq_rg_tenant_root`) — at most one tenant root in the whole forest
 
 #### Table: `resource_group_membership`
 
@@ -1147,7 +1101,7 @@ Indexes:
 | Column          | Type        | Description                                |
 | --------------- | ----------- | ------------------------------------------ |
 | `group_id`      | UUID        | group entity ID (FK to `resource_group.id`)|
-| `gts_type_id`   | SMALLINT    | resource type reference (FK to `gts_type.id`) |
+| `gts_type_id`   | UUID        | Types Registry Registry Reference of the member resource type (no FK) |
 | `resource_id`   | TEXT        | caller-defined resource identifier         |
 | `created_at`       | TIMESTAMPTZ | creation time                              |
 
@@ -1157,7 +1111,6 @@ Constraints/indexes:
 
 - UNIQUE `(group_id, gts_type_id, resource_id)`
 - FK `group_id` → `resource_group(id)` ON UPDATE CASCADE ON DELETE RESTRICT
-- FK `gts_type_id` → `gts_type(id)` ON DELETE RESTRICT
 - index `(gts_type_id, resource_id)` — for reverse lookups by resource
 - in ownership-graph usage, tenant scope is validated against operation context for tenant-scoped callers via the referenced group's `tenant_id`
 
@@ -1214,11 +1167,12 @@ Ownership-graph tenant enforcement:
 | Failure                     | Public Error               |
 | --------------------------- | -------------------------- |
 | invalid input               | `Validation`               |
-| missing type/entity         | `NotFound`                 |
-| duplicate type              | `TypeAlreadyExists`        |
+| missing type/entity         | `NotFound` (unknown group type on create: 404 type not found) |
+| unknown membership resource type | `Validation` (HTTP 400) |
+| Types Registry unavailable  | `ServiceUnavailable` (HTTP 503 with retry hint) |
+| stored type reference that Types Registry cannot resolve | `Internal` (HTTP 500, data inconsistency) |
 | second tenant-type root rejected | `TenantRootAlreadyExists` (409 Conflict) — enforces `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness` |
 | invalid parent type         | `InvalidParentType`        |
-| type update violates existing hierarchy | `AllowedParentsViolation` |
 | cycle attempt               | `CycleDetected`            |
 | active references on delete | `ConflictActiveReferences` (response body MUST include list of blocking entities — children and/or memberships — so the caller can display what prevents deletion) |
 | depth/width violation       | `LimitViolation`           |
@@ -1270,17 +1224,12 @@ RG relies on database-level performance rather than application-level caching:
 | Privilege escalation via membership | Adding resource to higher-privilege group | Unauthorized access to resources | AuthZ evaluation via `PolicyEnforcer` on all JWT endpoints |
 | Hierarchy DoS | Creating extremely deep/wide trees | Query latency degradation, resource exhaustion | `max_depth`/`max_width` query profile enforcement |
 | Unauthorized subtree access | Accessing hierarchy outside caller tenant scope | Information disclosure | SecureORM `WHERE tenant_id IN (...)` on all reads |
-| Unauthorized type manipulation | Modifying type rules to weaken hierarchy constraints | Weakened access control boundaries | Type update validates against existing hierarchy; AuthZ on type endpoints |
+| Unauthorized type manipulation | Modifying type rules in Types Registry to weaken hierarchy constraints | Weakened access control boundaries | Out of RG scope: Types Registry registration policy and AuthZ govern who may register or evolve types; compatible-only evolution inside a major version; RG applies the rules to new writes only |
 - **Audit logging**: RG delegates to platform-level request audit logging. No RG-specific audit trail beyond standard Gears access logs and database-level `created_at`/`updated_at` timestamps. See PRD section 6.7.
 - **Authorization permissions**: RG REST API endpoints are protected by `PolicyEnforcer` (standard Gears AuthZ flow). Permission mapping for RG operations is configured in the AuthZ policy, not hardcoded in RG. RG does not define its own permission matrix — it relies on the platform AuthZ policy configuration. The table below lists expected permissions (`resource.type` + `action.name` as per AuthZ PDP request model — see [AuthZ DESIGN §Scope Determination](../../../../docs/arch/authorization/DESIGN.md)) and the REST operations where `PolicyEnforcer` is invoked:
 
 | Resource (`resource.type`) | Action (`action.name`) | REST Operation | Method | Path | Auth Mode |
 | -------------------------- | ---------------------- | -------------- | ------ | ---- | --------- |
-| `gts.cf.core.rg.type.v1~` | `list` | `listTypes` | GET | `/api/types-registry/v1/types` | JWT |
-| `gts.cf.core.rg.type.v1~` | `create` | `createType` | POST | `/api/types-registry/v1/types` | JWT |
-| `gts.cf.core.rg.type.v1~` | `read` | `getType` | GET | `/api/types-registry/v1/types/{code}` | JWT |
-| `gts.cf.core.rg.type.v1~` | `update` | `updateType` | PUT | `/api/types-registry/v1/types/{code}` | JWT |
-| `gts.cf.core.rg.type.v1~` | `delete` | `deleteType` | DELETE | `/api/types-registry/v1/types/{code}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `list` | `listGroups` | GET | `/groups` | JWT |
 | `gts.cf.core.rg.group.v1~` | `create` | `createGroup` | POST | `/groups` | JWT |
 | `gts.cf.core.rg.group.v1~` | `read` | `getGroup` | GET | `/groups/{group_id}` | JWT |
@@ -1288,7 +1237,6 @@ RG relies on database-level performance rather than application-level caching:
 | `gts.cf.core.rg.group.v1~` | `delete` | `deleteGroup` | DELETE | `/groups/{group_id}` | JWT |
 | `gts.cf.core.rg.group.v1~` | `read` | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | JWT |
 | _(AuthZ bypassed)_ | — | `listGroupHierarchy` | GET | `/groups/{group_id}/hierarchy` | MTLS |
-| _(AuthZ bypassed)_ | — | `ResourceGroupTypeBootstrap` (no REST surface) | — | — | in-process |
 | `gts.cf.core.rg.group_membership.v1~` | `list` | `listMemberships` | GET | `/memberships` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `create` | `addMembership` | POST | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
 | `gts.cf.core.rg.group_membership.v1~` | `delete` | `deleteMembership` | DELETE | `/memberships/{group_id}/{resource_type}/{resource_id}` | JWT |
@@ -1298,7 +1246,6 @@ Notes:
   - Standard action vocabulary: `list` (collection), `read` (single resource), `create`, `update`, `delete` — aligned with [AuthZ usage scenarios](../../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md).
   - The AuthZ plugin reads hierarchy in-process via `ResourceGroupReadHierarchy` registered in `ClientHub` and **bypasses `PolicyEnforcer` invocation** on those reads (`AccessScope::allow_all()`); the plugin still produces AuthZ tenant/subtree constraints from the returned hierarchy — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - MTLS-authenticated requests (AuthZ plugin only) **also** bypass `PolicyEnforcer` entirely — `p2`, **deferred / not implemented yet**, planned for the future microservice split — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
-  - `ResourceGroupTypeBootstrap` is a narrow, deliberately un-gated SDK trait registered in `ClientHub`, backed by `TypeService`'s unscoped methods. Its one permitted caller is account-management's `register_user_group_types`, which registers the RG type schemas it owns from its own `Gear::init` — a phase at which no gated call can both find a plugin (types-registry keeps registrations in a staging buffer until `post_init`) and be admitted by it (the only actor a gear-init path has is platform-scoped, which the static AuthZ plugin rejects). Guardrail: it must never be exposed through REST, pinned by `bootstrap_bypasses_policy_enforcer_while_gated_path_denies`. Sunset: the carve-out exists only because the GTS type registry lives inside this gear, and should not survive a split of the registry.
   - `listGroupHierarchy` shares `resource_group` + `read` permission with `getGroup` — both are group read operations; the AuthZ policy may differentiate them if needed.
 
 ### Reliability Architecture
@@ -1306,12 +1253,13 @@ Notes:
 RG is a stateless service layer backed by a PostgreSQL database:
 
 - **Fault tolerance**: HA, failover, and backup are handled at the platform database infrastructure level. RG does not implement its own circuit breakers or redundancy beyond transaction retry for serialization conflicts (see Concurrency Testing section).
+- **Types Registry dependency**: group creation, group metadata validation and membership creation need a type lookup through the Types Registry SDK. If Types Registry is unavailable these writes fail with **503 Service Unavailable** and a retry hint, before any database transaction starts; reads of existing groups and memberships do not need type data and are unaffected. RG keeps no type cache until the Types Registry SDK provides one. A stored type reference that Types Registry cannot resolve is a data inconsistency and maps to 500.
 - **AuthZ dependency resilience**: Circuit breaking for the AuthZ Resolver dependency (PolicyEnforcer calls on JWT path) is handled at the platform PolicyEnforcer/SDK level. If the AuthZ Resolver becomes unavailable, JWT-authenticated RG requests will fail with **503 Service Unavailable** errors. RG does not implement its own circuit breaker for this dependency.
 - **Recovery**: RPO/RTO follow platform defaults for stateful services with PostgreSQL persistence. No gear-specific recovery architecture.
 
 ### Data Governance
 
-- **Data ownership**: RG gear owns all data in `gts_type`, `gts_type_allowed_parent`, `gts_type_allowed_membership`, `resource_group`, `resource_group_membership`, and `resource_group_closure` tables.
+- **Data ownership**: RG gear owns all data in the `resource_group`, `resource_group_membership`, and `resource_group_closure` tables. Group types are owned by Types Registry; RG stores only their Registry References.
 - **Data lineage**: RG data is produced by RG API consumers (Instance/Tenant Admins, Apps) and consumed by AuthZ plugin via `ResourceGroupReadHierarchy` for tenant hierarchy resolution.
 - **Data dictionary**: field definitions are documented in Database Schemas section (3.7).
 
@@ -1323,7 +1271,7 @@ REST API uses path-based versioning (`/api/resource-group/v1/`). SDK trait contr
 
 RG follows standard Gears observability patterns:
 
-- **Logging**: structured request/response logging via platform middleware (request ID, tenant ID, operation, latency). Domain-level events (type created, group moved, membership added) logged at INFO level. Error paths logged at WARN/ERROR with deterministic error category.
+- **Logging**: structured request/response logging via platform middleware (request ID, tenant ID, operation, latency). Domain-level events (group created, group moved, membership added) logged at INFO level. Error paths logged at WARN/ERROR with deterministic error category.
 - **Metrics**: standard HTTP endpoint metrics (request count, latency histogram, error rate) exposed via platform metrics infrastructure. No RG-specific custom metrics in v1.
 - **Alerting**: follows platform alerting defaults for error rate and latency thresholds. No RG-specific alert rules in v1.
 - **Health checks**: RG delegates health check and readiness/liveness probe endpoints to the platform infrastructure layer (`toolkit` runtime). The platform exposes standard health endpoints (e.g., `GET /health`, `GET /ready`) that include database connectivity checks. RG does not implement its own health check endpoint.
@@ -1331,16 +1279,15 @@ RG follows standard Gears observability patterns:
 
 ### Architecture Evolution: RG as Persistent Storage for Types Registry
 
-**Phase 1 (current, pre-this-commit)**: Types Registry uses in-memory storage (`gts-rust`). RG types endpoints are served under `/api/resource-group/v1/types*` — types managed exclusively within the RG gear with its own DB persistence (`gts_type` + junction tables). Types Registry and RG operate independently with no shared storage.
+Group types were first stored by RG itself (three local tables, a type CRUD API and an init-time bootstrap used by other gears) and exposed first under the RG URL namespace and then under the Types Registry URL namespace. That evolution is done, and it did not take the planned saga form: RG no longer stores types at all. Types are GTS Type Schemas in Types Registry derived from `gts.cf.core.rg.type.v1~`, and RG keeps only the Types Registry Registry Reference in its group and membership rows (see ADR-002).
 
-**Phase 2 (this commit)**: Types endpoints move to `/api/types-registry/v1/types*` URL namespace. RG gear implements the types CRUD with DB persistence, but the URL aligns with Types Registry as the conceptual owner of GTS type operations. This is a URL-only change — no storage or runtime integration between gears yet.
+What this means for the design:
 
-**Phase 3 (planned)**: GTS types migrate to their own persistent storage within the Types Registry gear. Types Registry becomes the **single source of truth** for all GTS type definitions with its own DB-backed store, replacing the current in-memory `gts-rust` engine. RG and Types Registry coordinate via a **saga pattern**: type registration flows through Types Registry (schema validation, GTS catalog) and RG (hierarchy rules, junction tables for `allowed_parents`/`allowed_memberships`). Each gear owns its domain-specific slice of the type data, and the saga ensures cross-gear consistency.
-
-Rationale:
-- Phase 2 aligns the URL namespace early to avoid breaking changes for API consumers when storage migration occurs in Phase 3
-- Phase 3 separates concerns: Types Registry owns GTS schema catalog and validation, RG owns hierarchy topology rules — neither duplicates the other's domain
-- Saga between TR and RG enables each gear to evolve its storage independently while maintaining cross-gear referential integrity
+- Types Registry is the single source of truth for group types; RG has no type endpoints, no type SDK methods, no type service, no seeding and no bootstrap, and gears that own types (Account Management) declare them statically instead of registering them at startup.
+- RG depends on the Types Registry SDK for type lookups; the lookup happens before the database transaction and is not cached by RG.
+- There is no cross-gear consistency protocol to run: type evolution is governed by Types Registry compatibility rules, and RG applies the current rules to new writes only.
+- The migration recreated the RG tables without carrying data over, because the gears were not deployed to production.
+- Temporary: until Types Registry delivers its own publication of the RG type inventory (its P0 task T31), the Types Registry gear seeds the `gts.cf.core.rg.*` inventory into its database and publishes the local contracts itself. This bridge is removed when that task lands.
 
 ### Known Technical Debt
 
@@ -1349,8 +1296,8 @@ Rationale:
 | ETag-based optimistic concurrency for `PUT /groups/{id}` | Concurrent update conflicts observed in production | Low |
 | `resource_group_membership` partitioning (455M rows projected) | Table size >50 GB or query latency degradation | Medium |
 | Domain events for group/membership lifecycle | Consumer demand for real-time notifications or cache invalidation | Medium |
-| GTS validation for `resource_type` in membership operations | Cross-gear type reuse creates governance need | Low |
-| Parallel seeding for types and memberships via `JoinSet` | Large seed configurations with many independent items | Low |
+| Type lookup cache | Types Registry SDK offers a cache (planned upstream); RG has none today | Medium |
+| Parallel seeding for memberships via `JoinSet` | Large seed configurations with many independent items | Low |
 
 ### Open Questions
 
@@ -1358,7 +1305,7 @@ See [PRD §13 Open Questions](./PRD.md#13-open-questions) for active design ques
 
 - Delete behavior modes (`leaf-only` vs `subtree-cascade`) — resolve before DECOMPOSITION
 - `resource_group_membership` partitioning strategy — resolve before production
-- GTS validation for type `code` and `resource_type` — deferred; `resource_type` validation is the stronger candidate
+- Type lookup cache — waits for the Types Registry SDK cache
 
 - AuthN/AuthZ gear contracts remain unchanged.
 - AuthZ can operate without RG — RG is an optional data source.
@@ -1379,18 +1326,17 @@ Test dataset: 100K groups, 200K memberships, 359K closure rows:
 | `resource_group` | 100,000 | 10 MB | 20 MB | **30 MB** | 101 B |
 | `resource_group_closure` | 359,400 | 23 MB | 36 MB | **60 MB** | 68 B |
 | `resource_group_membership` | 200,000 | 14 MB | 30 MB | **44 MB** | 73 B |
-| `gts_type` | 20 | 4 KB | 16 KB | **20 KB** | 80 B |
-| `gts_type_allowed_parent` | ~40 | <1 KB | <1 KB | **<1 KB** | 4 B |
-| `gts_type_allowed_membership` | ~40 | <1 KB | <1 KB | **<1 KB** | 4 B |
 | **Total** | — | **48 MB** | **86 MB** | **135 MB** | — |
 
 #### Column Widths (avg bytes, measured via pg_stats in test environment)
 
-**resource_group** (~100 B/row): `id` 16 B (UUID), `parent_id` 16 B (UUID nullable), `gts_type_id` 2 B (SMALLINT), `name` 14 B (TEXT avg), `metadata` variable (JSONB nullable, typically 20–60 B when present; includes `barrier` for applicable types), `tenant_id` 16 B (UUID), `created_at`/`updated_at` 8 B each, row overhead ~20 B. Note: `barrier` is not a separate column — it is stored inside `metadata` JSONB as `metadata.self_managed` (see `cpt-cf-resource-group-principle-barrier-as-data`).
+> The measurements below predate the move of group types to Types Registry, when `gts_type_id` was a 2 B SMALLINT and the three local type tables existed. `gts_type_id` is now a 16 B UUID Registry Reference on `resource_group` and `resource_group_membership`, and `resource_group` gains a 1 B `is_tenant` column. As an estimate (not re-measured): about +15 B per `resource_group` row, and +14 B per membership row in the table and in each index that contains `gts_type_id` (the primary key and `(gts_type_id, resource_id)`), i.e. roughly +6 GB data and +13 GB indexes at 455M memberships. The type tables are gone.
+
+**resource_group** (~100 B/row): `id` 16 B (UUID), `parent_id` 16 B (UUID nullable), `gts_type_id` 2 B (SMALLINT at measurement time; 16 B UUID now), `name` 14 B (TEXT avg), `metadata` variable (JSONB nullable, typically 20–60 B when present; includes `barrier` for applicable types), `tenant_id` 16 B (UUID), `created_at`/`updated_at` 8 B each, row overhead ~20 B. Note: `barrier` is not a separate column — it is stored inside `metadata` JSONB as `metadata.self_managed` (see `cpt-cf-resource-group-principle-barrier-as-data`).
 
 **resource_group_closure** (68 B/row): `ancestor_id` 16 B, `descendant_id` 16 B, `depth` 4 B, row overhead ~32 B.
 
-**resource_group_membership** (73 B/row): `group_id` 16 B, `resource_type` 6 B, `resource_id` 10 B, `created_at` 8 B, row overhead ~33 B.
+**resource_group_membership** (73 B/row): `group_id` 16 B, `gts_type_id` 6 B at measurement time (16 B UUID now), `resource_id` 10 B, `created_at` 8 B, row overhead ~33 B.
 
 #### Production Extrapolation
 
@@ -1401,9 +1347,6 @@ Assumptions: **1.5M tenants**, **303.5M users** (1–2 memberships each → ~455
 | `resource_group_membership` | 455M | 33.2 GB | 68.3 GB | **101.5 GB** | 95.3% |
 | `resource_group_closure` | 18M | 1.15 GB | 1.80 GB | **2.95 GB** | 2.8% |
 | `resource_group` | 5M | 560 MB | 1.0 GB | **1.6 GB** | 1.5% |
-| `gts_type` | ~50 | ~4 KB | ~16 KB | **~20 KB** | ~0% |
-| `gts_type_allowed_parent` | ~100 | <1 KB | <1 KB | **<1 KB** | ~0% |
-| `gts_type_allowed_membership` | ~100 | <1 KB | <1 KB | **<1 KB** | ~0% |
 | **Total** | — | **~35 GB** | **~71.1 GB** | **~106.1 GB** | — |
 
 Index-to-data ratio: **2.03×** (reasonable for btree-only indexes with UUID keys; higher ratio reflects compact data rows relative to multi-column index entries).
@@ -1422,7 +1365,7 @@ Index-to-data ratio: **2.03×** (reasonable for btree-only indexes with UUID key
 | Level | Database | Network | What is real | What is mocked |
 |---|---|---|---|---|
 | **Unit** | No DB — in-memory trait mocks | No network | Domain services, invariant logic, error mapping | All repositories (trait-based `InMemory*` impls) |
-| **Integration** | SQLite in-memory (`:memory:`, per-test schema) | No network — direct repo calls | Repositories, closure table SQL, SecureORM tenant scoping, constraints | PostgreSQL-dialect SQL, SERIALIZABLE semantics, `gts_type_path` DOMAIN (covered by E2E) |
+| **Integration** | SQLite in-memory (`:memory:`, per-test schema) | No network — direct repo calls | Repositories, closure table SQL, SecureORM tenant scoping, constraints | PostgreSQL-dialect SQL, SERIALIZABLE semantics |
 | **API** | SQLite in-memory | No real network — `Router::oneshot()` (in-process HTTP simulation) | REST handlers, OData parsing, domain services, DB | `PolicyEnforcer` / `AuthZResolverApi` (mock Allow/Deny) |
 | **E2E** | Real PostgreSQL (Docker or hosted) | Real HTTP via `httpx` to running `cf-gears-server` | Everything: AuthZ, DB, network, auth modes | Nothing — full production-like stack |
 
@@ -1436,23 +1379,24 @@ Unit tests verify domain invariants and service logic in isolation from the data
 
 | Mock | Purpose | Pattern |
 |------|---------|---------|
-| `InMemoryTypeRepository` | HashMap-backed store keyed by `code` | returns / rejects on demand |
+| `MockTypesRegistry` | Types Registry SDK double that serves registered type schemas (tenant type plus test types) | returns / rejects / reports unavailability on demand |
 | `InMemoryEntityRepository` | HashMap-backed store keyed by `id` | seed via `with_entities(vec![...])` |
 | `InMemoryClosureRepository` | Vec-backed closure rows | seed via `with_closure(vec![...])` |
 | `InMemoryMembershipRepository` | Vec-backed membership links | seed via `with_memberships(vec![...])` |
 
-Test builder: `RgTestHarness::unit()` with fluent API — `.with_types(...)`, `.with_entities(...)`, `.with_closure(...)`, `.with_query_profile(max_depth, max_width)` → `.build()` returns `(TypeService, EntityService, HierarchyService, MembershipService)`. See `src/domain/test_support.rs`.
+Test builder: `RgTestHarness::unit()` with fluent API — `.with_types(...)` (registers types in the mock Types Registry), `.with_entities(...)`, `.with_closure(...)`, `.with_query_profile(max_depth, max_width)` → `.build()` returns `(EntityService, HierarchyService, MembershipService)`. See `src/domain/test_support.rs`.
 
 | What to test | What is mocked | Verification target |
 |---|---|---|
-| Type code validation (length, whitespace, case) | `InMemoryTypeRepository` | `Validation` error returned for invalid codes |
-| Type uniqueness on create | `InMemoryTypeRepository` pre-seeded with existing code | `TypeAlreadyExists` error returned |
-| `allowed_parents` update vs existing hierarchy | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentsViolation` when groups would break new rules |
-| `can_be_root` removal vs existing root groups | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `AllowedParentsViolation` when root groups exist |
-| Type delete-if-unused guard | `InMemoryTypeRepository` + `InMemoryEntityRepository` with matching type | `ConflictActiveReferences` when entities exist |
+| Unknown group type on create | `MockTypesRegistry` without the type | `TypeNotFound` (404) |
+| Unknown membership resource type | `MockTypesRegistry` without the type | `Validation` (400) |
+| Types Registry unavailable | `MockTypesRegistry` failing | `ServiceUnavailable` (503), no transaction opened |
+| Stored type reference not resolvable | `InMemoryEntityRepository` with a group whose type UUID is unknown to `MockTypesRegistry` | `Internal` (500) |
+| Metadata validation against type schema | `MockTypesRegistry` with a type schema | invalid `metadata` rejected with `Validation` |
+| Second tenant root | `InMemoryEntityRepository` with an existing tenant root | `TenantRootAlreadyExists` |
 | Cycle detection in entity create/move | `InMemoryClosureRepository` with ancestor chain | `CycleDetected` when target is descendant |
 | Self-parent rejection | `InMemoryEntityRepository` | `CycleDetected` for `parent_id == id` |
-| Parent type compatibility | `InMemoryTypeRepository` + `InMemoryEntityRepository` | `InvalidParentType` when parent type not in `allowed_parents` |
+| Parent type compatibility | `MockTypesRegistry` + `InMemoryEntityRepository` | `InvalidParentType` when parent type not in `allowed_parent_types` |
 | Depth limit enforcement | `InMemoryClosureRepository` + profile `max_depth=3` | `LimitViolation` at depth 4 |
 | Width limit enforcement | `InMemoryClosureRepository` + profile `max_width=N` | `LimitViolation` when exceeding |
 | Membership add — group does not exist | `InMemoryEntityRepository` empty | `NotFound` |
@@ -1476,12 +1420,12 @@ Integration tests verify SQL correctness, closure table integrity, transactional
 
 | What to test | Setup | Verification target |
 |---|---|---|
-| Type CRUD — insert, read, update, delete | Empty DB | Rows persisted and retrievable; `schema_id` uniqueness enforced at DB level |
-| Placement invariant — `can_be_root` OR at least one allowed parent | Empty DB | Application layer rejects type definitions that have no valid placement |
-| Entity CRUD — insert with parent, read, update mutable fields | Seed types | Entity rows persisted with correct FK relations |
-| Closure table correctness — create root | Empty DB + seed types | Self-row `(id, id, 0)` created |
+| Tenant root uniqueness — second tenant root | Seed a tenant root group | Unique violation on `uq_rg_tenant_root` mapped to `TenantRootAlreadyExists`; non-tenant roots may coexist |
+| Type reference storage | Empty DB | `gts_type_id` stored as the Registry Reference UUID with no foreign key; no type tables exist |
+| Entity CRUD — insert with parent, read, update mutable fields | Types in mock Types Registry | Entity rows persisted with correct FK relations |
+| Closure table correctness — create root | Empty DB + types in mock Types Registry | Self-row `(id, id, 0)` created |
 | Closure table correctness — create child | Seed parent entity | Self-row + parent row `(parent, child, 1)` + transitive ancestor rows |
-| Closure table correctness — create 5-level deep tree | Seed types | Verify `(N*(N+1))/2` closure rows with correct depths |
+| Closure table correctness — create 5-level deep tree | Types in mock Types Registry | Verify `(N*(N+1))/2` closure rows with correct depths |
 | Subtree move — closure rebuild | Seed tree `A→B→C`, move `B` under `D` | Old closure paths removed, new paths via `D` created, `C` ancestors updated |
 | Subtree delete — cascade closure removal | Seed tree with subtree | All closure rows for removed nodes deleted |
 | Cycle detection at DB level — concurrent moves | Seed `A→B→C`, concurrent move `A` under `C` + move `C` under `A` | At least one fails with serialization error or `CycleDetected` _(SERIALIZABLE semantics verified at E2E only — SQLite does not support SERIALIZABLE isolation)_ |
@@ -1490,11 +1434,11 @@ Integration tests verify SQL correctness, closure table integrity, transactional
 | Membership — duplicate rejection at DB level | Pre-seed membership | `UNIQUE` constraint violation mapped to `Conflict` |
 | Tenant isolation — SecureORM | Seed data for tenant A, query with `SecurityContext` of tenant B | Empty result set |
 | Tenant isolation — cross-tenant parent rejected | Seed entity in tenant A, create child with `tenant_id = B` | Tenant incompatibility error |
-| OData `$filter` — types, groups, memberships | Seed diverse dataset | Filtered results match expected subset |
+| OData `$filter` — groups, memberships | Seed diverse dataset | Filtered results match expected subset |
 | Cursor pagination — traverse all pages | Seed 75 entities, `limit=25` | Three pages, no duplicates, no gaps, stable order |
 | Cursor pagination — empty result set | Empty DB | Single empty page with no cursors |
 | Query profile — depth limit on write, no truncation on read | Seed tree exceeding new limit | Reads return full data; new writes at violating depth rejected |
-| Seeding idempotency — types, groups, memberships | Run seed twice | Second run produces no changes; DB state identical |
+| Seeding idempotency — groups, memberships | Run seed twice | Second run produces no changes; DB state identical |
 | Force delete — cascade subtree + memberships | Seed tree with memberships, delete root with `force=true` | All descendants and their memberships removed |
 
 **Closure integrity checker** (test utility):
@@ -1521,14 +1465,12 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | Database | SQLite in-memory | REST tests need real query execution for OData/pagination; PostgreSQL-dialect behavior covered by E2E |
 | Domain services | Real (not mocked) | REST layer delegates to real services |
 
-**Schema setup**: same pattern as Integration — SQLite `:memory:` + `run_migrations_for_testing()`. Test builder (`RgTestHarness::api()`) encapsulates all initialization: DB, migrations, domain services, routes, AuthZ mocks. Builder provides `.with_types(...)`, `.with_authz_client(...)`, `.build().await` → returns harness with `.router()` accessor.
+**Schema setup**: same pattern as Integration — SQLite `:memory:` + `run_migrations_for_testing()`. Test builder (`RgTestHarness::api()`) encapsulates all initialization: DB, migrations, domain services, routes, AuthZ mocks. Builder provides `.with_types(...)` (mock Types Registry), `.with_authz_client(...)`, `.build().await` → returns harness with `.router()` accessor.
 
 | What to test | Method | Verification target |
 |---|---|---|
-| Create type — happy path | `POST /types` | 201 Created, response body matches `ResourceGroupType` schema |
-| Create type — duplicate | `POST /types` (same code) | 409 Conflict, Problem JSON with `TypeAlreadyExists` |
-| Create type — invalid code | `POST /types` (whitespace in code) | 400 Bad Request, Problem JSON with validation details |
-| List types — OData filter | `GET /types?$filter=code eq 'tenant'` | 200 OK, filtered result set |
+| Create group — unknown type | `POST /groups` | 404, Problem JSON with type not found |
+| Create group — Types Registry unavailable | `POST /groups` | 503 with retry hint |
 | Create group — with parent | `POST /groups` | 201 Created, closure rows created |
 | Create group — invalid parent type | `POST /groups` | 400/409, Problem JSON with `InvalidParentType` |
 | Move group — cycle | `PUT /groups/{id}` (parent = descendant) | 409, `CycleDetected` |
@@ -1540,7 +1482,7 @@ API tests verify HTTP-level behavior: request/response shapes, status codes, ODa
 | Add membership — duplicate | `POST /memberships/{gid}/{rtype}/{rid}` again | 409 Conflict |
 | Remove membership | `DELETE /memberships/{gid}/{rtype}/{rid}` | 204 No Content |
 | List memberships — by group | `GET /memberships?$filter=group_id eq '...'` | 200 OK, filtered result |
-| Cursor pagination — all list endpoints | `GET /types?limit=2`, follow `next_cursor` | All items eventually returned |
+| Cursor pagination — all list endpoints | `GET /groups?limit=2`, follow `next_cursor` | All items eventually returned |
 | Invalid OData filter | `GET /groups?$filter=invalid` | 400 Bad Request |
 | JWT auth — standard request | Request with bearer token | `PolicyEnforcer` called, response scoped by tenant |
 | JWT auth — AuthZ denies | Request + `DenyingAuthZResolverClient` | 403 Forbidden |
@@ -1559,8 +1501,7 @@ E2E tests verify the full stack running as `cf-gears-server` with real AuthZ, re
 ```
 testing/e2e/suites/resource_group/
 ├── conftest.py       # fixtures: base_url, tenant_id, seed data
-├── helpers.py        # create_type(), create_group(), add_membership(), etc.
-├── test_types.py     # type CRUD, validation, idempotent seed
+├── helpers.py        # register_type() (via Types Registry), create_group(), add_membership(), etc.
 ├── test_groups.py    # group CRUD, hierarchy, move, delete
 ├── test_memberships.py  # membership add/remove/query
 └── test_hierarchy.py    # depth traversal, ancestor/descendant queries
@@ -1570,11 +1511,11 @@ Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env 
 
 | What to test | Marker | Verification target |
 |---|---|---|
-| Type CRUD happy path | `@pytest.mark.smoke` | Create → list → get → update → delete type |
+| Group of a type registered in Types Registry | `@pytest.mark.smoke` | Type registered through Types Registry, group create succeeds; unknown type returns 404 |
 | Group hierarchy — create tree, query descendants | `@pytest.mark.smoke` | Descendants returned with correct `depth` values |
 | Membership — add, query by group, query by resource, remove | `@pytest.mark.smoke` | Membership links appear/disappear as expected |
 | Tenant isolation — two tenants, no cross-visibility | — | Tenant A data invisible to tenant B |
-| Error scenarios — duplicate type, cycle, invalid parent | — | Correct HTTP status codes (400, 409) |
+| Error scenarios — cycle, invalid parent, second tenant root | — | Correct HTTP status codes (400, 409) |
 | OData filter — eq, ne, in across all list endpoints | — | Filtered results match expected |
 | Pagination — large dataset traversal | — | All items returned across pages |
 
@@ -1587,7 +1528,6 @@ Fixtures (following `oagw` e2e pattern): session-scoped `rg_base_url` (from env 
 | SecureORM tenant scoping | Integration (Level 2) | Must verify real `WHERE tenant_id IN (...)` generation |
 | PostgreSQL FK enforcement order | E2E (Level 4) | `ON DELETE RESTRICT` enforcement order differs from SQLite — only testable against real PG |
 | SERIALIZABLE transaction semantics | E2E (Level 4) | Retry-under-concurrent-writes behavior is PostgreSQL-specific |
-| `gts_type_path` DOMAIN validation | E2E (Level 4) | PostgreSQL DOMAIN-level regex enforcement not present in SQLite |
 
 #### Concurrency Testing
 

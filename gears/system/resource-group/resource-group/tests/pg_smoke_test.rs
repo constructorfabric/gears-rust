@@ -23,8 +23,8 @@
 //!   a derived table so `MySQL` accepts it (see the migration history on
 //!   this branch) -- worth confirming the same statement still runs
 //!   correctly on `PostgreSQL`, not just that it parses.
-//! - The chunked deletes (`delete_by_id_many`, and the removed-parent sweep
-//!   in `type_repo.rs`) bind one parameter per id per chunk; `SQLite`'s bind
+//! - The chunked deletes (`delete_by_id_many`) bind one parameter per id per
+//!   chunk; `SQLite`'s bind
 //!   ceiling and `PostgreSQL`'s are different numbers, so this is also where
 //!   the chunking math first runs against the ceiling it was actually
 //!   written for.
@@ -53,10 +53,6 @@ mod common;
 use std::sync::Arc;
 
 use resource_group::domain::group_service::GroupService;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::entity::gts_type::{
-    Column as GtsTypeColumn, Entity as GtsTypeEntity,
-};
 use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity,
 };
@@ -68,8 +64,6 @@ use resource_group::infra::storage::entity::resource_group_membership::{
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
 use resource_group::infra::storage::migrations::Migrator;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::{CreateTypeRequest, UpdateTypeRequest};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{ImageExt, runners::AsyncRunner};
@@ -78,7 +72,6 @@ use toolkit_db::secure::{SecureEntityExt, secure_insert};
 use toolkit_db::{
     ConnectOpts, DBProvider, DbError, connect_db, migration_runner::run_migrations_for_testing,
 };
-use toolkit_gts::gts_id;
 use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
@@ -171,51 +164,11 @@ macro_rules! pg_fixture_or_skip {
     };
 }
 
-/// A type that can root itself and allows itself as a parent -- lets a
-/// single type build chains/trees of arbitrary depth. Mirrors
-/// `db_behavior_audit_test.rs`'s helper of the same name.
-async fn create_self_referencing_type(
-    type_svc: &TypeService<TypeRepository>,
-    suffix: &str,
-) -> resource_group_sdk::ResourceGroupType {
-    // `resolve_ids` rejects a parent path that doesn't exist yet, so a type
-    // can't reference itself as an allowed parent at create time; create it
-    // plain, then update it to add the self-reference.
-    let code = format!(
-        "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create self-referencing type (initial)");
-    type_svc
-        .update_type_unscoped(
-            &code,
-            UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![code.clone()],
-                allowed_membership_types: vec![],
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("update type to add self-reference")
-}
-
 /// Build a chain of `depth` nodes (root + `depth - 1` single children),
 /// returning the id of the last (deepest) node. Mirrors
 /// `db_behavior_audit_test.rs`'s helper of the same name.
 async fn build_chain(
-    group_svc: &GroupService<GroupRepository, TypeRepository>,
+    group_svc: &GroupService<GroupRepository>,
     ctx: &SecurityContext,
     type_code: &str,
     tenant_id: Uuid,
@@ -248,12 +201,12 @@ async fn build_chain(
 async fn pg_move_under_deep_parent_rebuilds_every_depth() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t = create_self_referencing_type(&type_svc, "pgmove").await;
+    let t = common::create_self_parenting_type(&types, "pgmove");
 
     // A 5-deep chain: insert_ancestor_closure_rows's INSERT ... SELECT runs
     // once per create, copying a growing ancestor set each time.
@@ -305,16 +258,15 @@ async fn pg_move_under_deep_parent_rebuilds_every_depth() {
 async fn pg_force_delete_leaves_no_orphans() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "pgforce").await;
-    let child_type =
-        common::create_child_type(&type_svc, "pgforcechild", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "pgforce");
+    let child_type = common::create_child_type(&types, "pgforcechild", &[&root_type.code], &[]);
     let grandchild_type =
-        common::create_child_type(&type_svc, "pgforcegrandchild", &[&child_type.code], &[]).await;
+        common::create_child_type(&types, "pgforcegrandchild", &[&child_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "root", tenant_id).await;
@@ -338,19 +290,11 @@ async fn pg_force_delete_leaves_no_orphans() {
     .await;
 
     // A direct membership insert (mirrors group_service_test.rs's
-    // group_force_delete_subtree): resolve the real surrogate gts_type_id
-    // instead of hard-coding one.
+    // group_force_delete_subtree): use the Registry Reference the Types
+    // Registry reports for the type instead of hard-coding one.
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
+    let root_type_id = types.uuid_of(&root_type.code).await;
     let membership = membership_entity::ActiveModel {
         group_id: Set(child.id),
         gts_type_id: Set(root_type_id),
@@ -412,15 +356,6 @@ async fn pg_force_delete_leaves_no_orphans() {
         mem_count, 0,
         "memberships for the deleted group should be gone"
     );
-
-    // With every membership of the subtree gone, nothing on real PostgreSQL
-    // FK-restricts deleting `root_type` any more: `ON DELETE RESTRICT` on
-    // `resource_group_membership.gts_type_id` is what would otherwise answer
-    // with "group(s) or membership(s) of this type exist".
-    type_svc
-        .delete_type_unscoped(&root_type.code)
-        .await
-        .expect("delete_type should succeed once the subtree's memberships are gone");
 }
 
 /// RG-06 on real PostgreSQL: a 4-deep create chain, then the full closure
@@ -430,12 +365,12 @@ async fn pg_force_delete_leaves_no_orphans() {
 async fn pg_create_chain_closure_invariant() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t = create_self_referencing_type(&type_svc, "pgchain").await;
+    let t = common::create_self_parenting_type(&types, "pgchain");
     build_chain(&group_svc, &ctx, &t.code, tenant_id, 4).await;
 
     let conn = db.conn().expect("conn");
@@ -447,26 +382,18 @@ async fn pg_create_chain_closure_invariant() {
 async fn pg_membership_filters_resolve_gts_and_accept_quoted_uuid() {
     let fixture = pg_fixture_or_skip!();
     let db = fixture.db.clone();
-    let types = common::make_type_service(db.clone());
-    let groups = common::make_group_service(db.clone());
-    let memberships = common::make_membership_service(db);
+    let types = common::TestTypes::new();
+    let groups = common::make_group_service(db.clone(), &types);
+    let memberships = common::make_membership_service(db, &types);
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
-    let member_type = common::create_root_type(&types, "pgfiltermember").await;
-    let other_type = common::create_root_type(&types, "pgfilterother").await;
-    let group_type = common::create_root_type(&types, "pgfiltergroup").await;
-    types
-        .update_type_unscoped(
-            &group_type.code,
-            UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![],
-                allowed_membership_types: vec![member_type.code.clone(), other_type.code.clone()],
-                metadata_schema: None,
-            },
-        )
-        .await
-        .unwrap();
+    let member_type = common::create_root_type(&types, "pgfiltermember");
+    let other_type = common::create_root_type(&types, "pgfilterother");
+    let group_type = common::create_root_type_with_memberships(
+        &types,
+        "pgfiltergroup",
+        &[&member_type.code, &other_type.code],
+    );
     let group =
         common::create_root_group(&groups, &ctx, &group_type.code, "matching", tenant).await;
     let other_group =

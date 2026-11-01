@@ -11,9 +11,9 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use toolkit_gts::GTS_ID_PREFIX;
 use toolkit_gts::gts_id;
 
 use async_trait::async_trait;
@@ -23,11 +23,7 @@ use uuid::Uuid;
 use resource_group::domain::error::DomainError;
 use resource_group::domain::group_service::{GroupService, QueryProfile};
 use resource_group::domain::metrics::{Operation, Outcome, RgMetricsPort};
-use resource_group::domain::repo::GroupRepositoryTrait;
-use resource_group::domain::type_service::TypeService;
-use resource_group::infra::storage::entity::gts_type::{
-    Column as GtsTypeColumn, Entity as GtsTypeEntity,
-};
+use resource_group::domain::repo::{GroupRepositoryTrait, HierarchyRow, HierarchyTypeFilter};
 use resource_group::infra::storage::entity::resource_group::{
     Column as RgColumn, Entity as RgEntity, Model as RgModel,
 };
@@ -35,30 +31,11 @@ use resource_group::infra::storage::entity::resource_group_membership::{
     self as membership_entity, Entity as MembershipEntity,
 };
 use resource_group::infra::storage::group_repo::GroupRepository;
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::models::{ResourceGroup as ResourceGroupSdkModel, ResourceGroupWithDepth};
-use resource_group_sdk::{
-    CreateGroupRequest, CreateTypeRequest, UpdateGroupRequest, UpdateTypeRequest,
-};
+use resource_group_sdk::{CreateGroupRequest, UpdateGroupRequest};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, Set};
 use toolkit_db::secure::{DBRunner, SecureEntityExt, secure_insert};
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::AccessScope;
-
-/// Build a `GroupService` with custom `QueryProfile`.
-fn make_group_service_with_profile(
-    db: std::sync::Arc<toolkit_db::DBProvider<toolkit_db::DbError>>,
-    profile: QueryProfile,
-) -> GroupService<GroupRepository, TypeRepository> {
-    GroupService::new(
-        db,
-        profile,
-        common::make_enforcer(),
-        Arc::new(GroupRepository),
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
-    )
-}
 
 // =========================================================================
 // Group creation tests (TC-GRP-01, 02, 03, 04, 22, 23, 24, 25)
@@ -69,14 +46,14 @@ fn make_group_service_with_profile(
 #[tokio::test]
 async fn group_create_child_with_closure() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     // Create a root type and a child type that allows it as parent
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     // Create root group
     let root =
@@ -111,16 +88,15 @@ async fn group_create_child_with_closure() {
 #[tokio::test]
 async fn group_three_level_hierarchy_closure() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
     // Grandchild type allows child_type as parent
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -165,16 +141,16 @@ async fn group_three_level_hierarchy_closure() {
 #[tokio::test]
 async fn group_create_incompatible_parent_type() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let other_root_type = common::create_root_type(&type_svc, "other").await;
+    let root_type = common::create_root_type(&types, "org");
+    let other_root_type = common::create_root_type(&types, "other");
     // unrelated_type allows only other_root_type as parent, NOT root_type
     let unrelated_type =
-        common::create_child_type(&type_svc, "unrelated", &[&other_root_type.code], &[]).await;
+        common::create_child_type(&types, "unrelated", &[&other_root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -199,13 +175,13 @@ async fn group_create_incompatible_parent_type() {
 #[tokio::test]
 async fn group_create_root_when_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let err = group_svc
         .create_group(
@@ -226,7 +202,8 @@ async fn group_create_root_when_cannot_be_root() {
 #[tokio::test]
 async fn group_create_nonexistent_type() {
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -252,16 +229,16 @@ async fn group_create_nonexistent_type() {
 #[tokio::test]
 async fn group_create_cross_tenant_parent() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = common::make_ctx(tenant_a);
     let ctx_b = common::make_ctx(tenant_b);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     // Create root under tenant A
     let root_a =
@@ -288,12 +265,12 @@ async fn group_create_cross_tenant_parent() {
 #[tokio::test]
 async fn group_create_with_metadata() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let meta = json!({"department": "engineering", "code": 42});
     let group = group_svc
@@ -326,12 +303,12 @@ async fn group_create_with_metadata() {
 #[tokio::test]
 async fn group_multiple_roots_same_type() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let root1 =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root1", tenant_id).await;
@@ -356,15 +333,14 @@ async fn group_multiple_roots_same_type() {
 #[tokio::test]
 async fn group_move_closure_rebuild() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let root1 =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root1", tenant_id).await;
@@ -431,43 +407,6 @@ async fn group_move_closure_rebuild() {
     assert_eq!(model.name, "Child");
 }
 
-/// A type that allows itself as a parent, so a chain of arbitrary depth can
-/// be built. `resolve_ids` rejects a parent path that does not exist yet, so
-/// the self-reference is added by a follow-up update.
-async fn create_self_parenting_type(
-    type_svc: &TypeService<TypeRepository>,
-    suffix: &str,
-) -> resource_group_sdk::ResourceGroupType {
-    let code = format!(
-        "{}x.test.{}.i{}.v1~",
-        gts_id!("cf.core.rg.type.v1~"),
-        suffix.to_ascii_lowercase(),
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create self-parenting type");
-    type_svc
-        .update_type_unscoped(
-            &code,
-            UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![code.clone()],
-                allowed_membership_types: vec![],
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("add the self-reference")
-}
-
 /// Move a two-level subtree under a parent that is itself two levels down.
 ///
 /// `group_move_closure_rebuild` above moves under a *root*, so every new
@@ -478,12 +417,12 @@ async fn create_self_parenting_type(
 #[tokio::test]
 async fn group_move_under_deep_parent_rebuilds_every_depth() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t = create_self_parenting_type(&type_svc, "deepmv").await;
+    let t = common::create_self_parenting_type(&types, "deepmv");
 
     // Destination chain: root -> mid -> target. `target` sits at depth 2, so
     // it has three closure rows of its own (itself, mid, root).
@@ -545,10 +484,10 @@ async fn group_move_under_deep_parent_rebuilds_every_depth() {
 #[tokio::test]
 async fn group_move_to_parent_in_another_tenant_rejected() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
-    let t = create_self_parenting_type(&type_svc, "xtenant").await;
+    let t = common::create_self_parenting_type(&types, "xtenant");
 
     let tenant_a = Uuid::now_v7();
     let ctx_a = common::make_ctx(tenant_a);
@@ -593,10 +532,10 @@ async fn group_move_to_parent_in_another_tenant_rejected() {
 #[tokio::test]
 async fn group_update_parent_to_another_tenant_rejected() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
-    let t = create_self_parenting_type(&type_svc, "xtenantupd").await;
+    let t = common::create_self_parenting_type(&types, "xtenantupd");
 
     let tenant_a = Uuid::now_v7();
     let ctx_a = common::make_ctx(tenant_a);
@@ -641,13 +580,13 @@ async fn group_update_parent_to_another_tenant_rejected() {
 #[tokio::test]
 async fn group_move_under_descendant_cycle() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -677,12 +616,12 @@ async fn group_move_under_descendant_cycle() {
 #[tokio::test]
 async fn group_move_self_parent_cycle() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
@@ -701,15 +640,15 @@ async fn group_move_self_parent_cycle() {
 #[tokio::test]
 async fn group_move_incompatible_parent_type() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let type_a = common::create_root_type(&type_svc, "orgA").await;
-    let type_b = common::create_root_type(&type_svc, "orgB").await;
+    let type_a = common::create_root_type(&types, "orgA");
+    let type_b = common::create_root_type(&types, "orgB");
     // child type only allows type_a as parent
-    let child_type = common::create_child_type(&type_svc, "dept", &[&type_a.code], &[]).await;
+    let child_type = common::create_child_type(&types, "dept", &[&type_a.code], &[]);
 
     let root_a =
         common::create_root_group(&group_svc, &ctx, &type_a.code, "RootA", tenant_id).await;
@@ -742,27 +681,15 @@ async fn group_move_incompatible_parent_type() {
 #[tokio::test]
 async fn group_move_child_to_root() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     // Create a type that can be both root and child
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flexible{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    let _flexible_type = type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: child_code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![root_type.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create flexible type");
+    let root_type = common::create_root_type(&types, "org");
+    let child_code = common::unique_rg_code("flexible");
+    types.add_rg_type(&child_code, true, &[&root_type.code], &[], None);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -788,13 +715,13 @@ async fn group_move_child_to_root() {
 #[tokio::test]
 async fn group_move_to_root_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -820,7 +747,8 @@ async fn group_move_to_root_cannot_be_root() {
 #[tokio::test]
 async fn group_move_nonexistent() {
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
     let err = group_svc
         .move_group(Uuid::now_v7(), None)
@@ -837,12 +765,12 @@ async fn group_move_nonexistent() {
 #[tokio::test]
 async fn group_move_to_nonexistent_parent() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
@@ -861,30 +789,18 @@ async fn group_move_to_nonexistent_parent() {
 #[tokio::test]
 async fn group_move_max_width_exceeded() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(1),
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.flex{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: child_code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![root_type.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create flexible child type");
+    let root_type = common::create_root_type(&types, "org");
+    let child_code = common::unique_rg_code("flex");
+    types.add_rg_type(&child_code, true, &[&root_type.code], &[], None);
 
     let root1 =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root1", tenant_id).await;
@@ -921,12 +837,12 @@ async fn group_move_max_width_exceeded() {
 #[tokio::test]
 async fn group_update_name_and_metadata() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "OldName", tenant_id).await;
 
@@ -992,13 +908,13 @@ async fn group_update_name_and_metadata() {
 #[tokio::test]
 async fn group_delete_leaf() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1042,13 +958,13 @@ async fn group_delete_leaf() {
 #[tokio::test]
 async fn group_delete_with_children_no_force() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1078,30 +994,20 @@ async fn group_delete_with_children_no_force() {
 #[tokio::test]
 async fn group_delete_with_memberships_no_force() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
-    // Insert membership directly. Resolve the surrogate `gts_type_id` from the
-    // type we just created instead of hard-coding `1` — that hard-code would
-    // silently break if `common::test_db()` ever seeds base types or if the
-    // SMALLINT IDENTITY sequence behaviour changes.
+    // Insert membership directly. `gts_type_id` is the Registry Reference
+    // (UUID) of the type we just registered, as the Types Registry reports it.
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
+    let root_type_id = types.uuid_of(&root_type.code).await;
     let membership = membership_entity::ActiveModel {
         group_id: Set(root.id),
         gts_type_id: Set(root_type_id),
@@ -1128,15 +1034,14 @@ async fn group_delete_with_memberships_no_force() {
 #[tokio::test]
 async fn group_force_delete_subtree() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1159,19 +1064,11 @@ async fn group_force_delete_subtree() {
     )
     .await;
 
-    // Add a membership to child (direct insert). Resolve the surrogate
-    // `gts_type_id` from the actual type row instead of hard-coding `1`.
+    // Add a membership to child (direct insert) using the Registry Reference
+    // (UUID) the Types Registry reports for the type.
     let conn = db.conn().expect("conn");
     let scope = AccessScope::allow_all();
-    let root_type_id = GtsTypeEntity::find()
-        .filter(GtsTypeColumn::SchemaId.eq(&root_type.code))
-        .secure()
-        .scope_with(&scope)
-        .one(&conn)
-        .await
-        .expect("query gts_type")
-        .expect("type row exists")
-        .id;
+    let root_type_id = types.uuid_of(&root_type.code).await;
     let membership = membership_entity::ActiveModel {
         group_id: Set(child.id),
         gts_type_id: Set(root_type_id),
@@ -1218,7 +1115,8 @@ async fn group_force_delete_subtree() {
 #[tokio::test]
 async fn group_delete_nonexistent() {
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -1237,12 +1135,12 @@ async fn group_delete_nonexistent() {
 #[tokio::test]
 async fn group_force_delete_leaf() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
 
@@ -1273,15 +1171,14 @@ async fn group_force_delete_leaf() {
 #[tokio::test]
 async fn group_hierarchy_depth_traversal() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let a = common::create_root_group(&group_svc, &ctx, &root_type.code, "A", tenant_id).await;
     let b =
@@ -1349,7 +1246,8 @@ async fn group_hierarchy_depth_traversal() {
 #[tokio::test]
 async fn group_hierarchy_nonexistent() {
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -1372,17 +1270,17 @@ async fn group_hierarchy_nonexistent() {
 #[tokio::test]
 async fn group_create_max_depth_exceeded() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let profile = QueryProfile {
         max_depth: Some(1), // only root allowed (depth 0), child at depth 1 is >= max
         max_width: None,
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1407,17 +1305,17 @@ async fn group_create_max_depth_exceeded() {
 #[tokio::test]
 async fn group_create_max_width_exceeded() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(1),
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1454,34 +1352,22 @@ async fn group_create_max_width_exceeded() {
 #[tokio::test]
 async fn group_move_max_depth_exceeded() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     // max_depth=2: root(0), child(1) ok, but grandchild(2) would be >= max
     let profile = QueryProfile {
         max_depth: Some(2),
         max_width: None,
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
     // child_type allows root_type as parent, can also be root
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
     // sub_type allows child_type as parent, can also be root
-    let sub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.sub{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: sub_code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![child_type.code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create sub type");
+    let sub_code = common::unique_rg_code("sub");
+    types.add_rg_type(&sub_code, true, &[&child_type.code], &[], None);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1500,20 +1386,8 @@ async fn group_move_max_depth_exceeded() {
     let standalone =
         common::create_root_group(&group_svc, &ctx, &sub_code, "Standalone", tenant_id).await;
     // sub needs a type that allows sub_code as parent -- create another type for that
-    let subsub_code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.subsub{}.v1~",
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: subsub_code.clone(),
-            can_be_root: false,
-            allowed_parent_types: vec![sub_code.clone()],
-            allowed_membership_types: vec![],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create subsub type");
+    let subsub_code = common::unique_rg_code("subsub");
+    types.add_rg_type(&subsub_code, false, &[&sub_code], &[], None);
 
     let _sub = common::create_child_group(
         &group_svc,
@@ -1545,21 +1419,20 @@ async fn group_move_max_depth_exceeded() {
 #[tokio::test]
 async fn group_create_depth_exact_boundary() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     // max_depth=2: root is at depth 0, child at depth 1 (parent_depth=0, 0+1=1 < 2 ok)
     // grandchild at depth 2 (parent_depth=1, 1+1=2 >= 2 -> violation)
     let profile = QueryProfile {
         max_depth: Some(2),
         max_width: None,
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1594,17 +1467,17 @@ async fn group_create_depth_exact_boundary() {
 #[tokio::test]
 async fn group_create_width_exact_boundary() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
+    let types = common::TestTypes::new();
     let profile = QueryProfile {
         max_depth: None,
         max_width: Some(2),
     };
-    let group_svc = make_group_service_with_profile(db.clone(), profile);
+    let group_svc = common::make_group_service_with_profile(db.clone(), &types, profile);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1654,12 +1527,12 @@ async fn group_create_width_exact_boundary() {
 #[tokio::test]
 async fn group_create_name_empty() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let err = group_svc
         .create_group(
@@ -1680,12 +1553,12 @@ async fn group_create_name_empty() {
 #[tokio::test]
 async fn group_create_name_too_long() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let long_name = "x".repeat(256);
     let err = group_svc
@@ -1712,12 +1585,12 @@ async fn group_create_name_too_long() {
 #[tokio::test]
 async fn group_metadata_barrier_stored() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let meta = json!({"self_managed": true});
     let group = group_svc
@@ -1751,12 +1624,12 @@ async fn group_metadata_barrier_stored() {
 #[tokio::test]
 async fn group_metadata_rich_multiple_fields() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let meta = json!({
         "barrier": false,
@@ -1782,12 +1655,12 @@ async fn group_metadata_rich_multiple_fields() {
 #[tokio::test]
 async fn group_metadata_update_replaces_entirely() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let old_meta = json!({"old_key": "old_value", "shared": 1});
     let group = group_svc
@@ -1837,12 +1710,12 @@ async fn group_metadata_update_replaces_entirely() {
 #[tokio::test]
 async fn group_metadata_none_to_some() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let group = group_svc
         .create_group(
@@ -1877,12 +1750,12 @@ async fn group_metadata_none_to_some() {
 #[tokio::test]
 async fn group_metadata_some_to_none() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
+    let root_type = common::create_root_type(&types, "org");
 
     let meta = json!({"initial": true});
     let group = group_svc
@@ -1916,15 +1789,14 @@ async fn group_metadata_some_to_none() {
 #[tokio::test]
 async fn group_metadata_barrier_in_hierarchy() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
-    let grandchild_type =
-        common::create_child_type(&type_svc, "team", &[&child_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
+    let grandchild_type = common::create_child_type(&types, "team", &[&child_type.code], &[]);
 
     let root =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "Root", tenant_id).await;
@@ -1978,13 +1850,13 @@ async fn group_metadata_barrier_in_hierarchy() {
 #[tokio::test]
 async fn group_metadata_in_hierarchy_response() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "org").await;
-    let child_type = common::create_child_type(&type_svc, "dept", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "org");
+    let child_type = common::create_child_type(&types, "dept", &[&root_type.code], &[]);
 
     let root_meta = json!({"level": "root"});
     let root = group_svc
@@ -2036,63 +1908,49 @@ async fn group_metadata_in_hierarchy_response() {
 
 /// Helper: build the ADR-001 type ecosystem.
 /// Returns (tenant_type, dept_type, branch_type, user_type, course_type).
-async fn create_adr_types(
-    type_svc: &resource_group::domain::type_service::TypeService<TypeRepository>,
+fn create_adr_types(
+    types: &common::TestTypes,
 ) -> (
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
-    resource_group_sdk::ResourceGroupType,
+    common::TestType,
+    common::TestType,
+    common::TestType,
+    common::TestType,
+    common::TestType,
 ) {
-    let user_type = common::create_root_type(type_svc, "adruser").await;
-    let course_type = common::create_root_type(type_svc, "adrcourse").await;
+    let user_type = common::create_root_type(types, "adruser");
+    let course_type = common::create_root_type(types, "adrcourse");
 
-    let suffix_t = format!("adrtenant{}", uuid::Uuid::now_v7().as_simple());
-    let tenant_code = format!("{}x.test.{suffix_t}.v1~", gts_id!("cf.core.rg.type.v1~"));
-
-    // Tenant type: create first without self-reference, then update
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code: tenant_code.clone(),
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: vec![user_type.code.clone()],
-            metadata_schema: None,
-        })
-        .await
-        .expect("create tenant type");
-
-    let tenant_type = type_svc
-        .update_type_unscoped(
-            &tenant_code,
-            resource_group_sdk::UpdateTypeRequest {
-                can_be_root: true,
-                allowed_parent_types: vec![tenant_code.clone()],
-                allowed_membership_types: vec![user_type.code.clone()],
-                metadata_schema: None,
-            },
-        )
-        .await
-        .expect("update tenant type with self-reference");
+    // Tenant type: root-capable, nests under itself, accepts users.
+    let tenant_code = common::unique_rg_code("adrtenant");
+    types.add_rg_type(
+        &tenant_code,
+        true,
+        &[&tenant_code],
+        &[&user_type.code],
+        None,
+    );
+    let tenant_type = common::TestType {
+        code: tenant_code.clone(),
+        can_be_root: true,
+        allowed_parent_types: vec![tenant_code],
+        allowed_membership_types: vec![user_type.code.clone()],
+    };
 
     // Dept type: NOT root, parent=tenant, allows users+courses
     let dept_type = common::create_child_type(
-        type_svc,
+        types,
         "adrdept",
         &[&tenant_type.code],
         &[&user_type.code, &course_type.code],
-    )
-    .await;
+    );
 
     // Branch type: NOT root, parent=dept, allows users+courses
     let branch_type = common::create_child_type(
-        type_svc,
+        types,
         "adrbranch",
         &[&dept_type.code],
         &[&user_type.code, &course_type.code],
-    )
-    .await;
+    );
 
     (tenant_type, dept_type, branch_type, user_type, course_type)
 }
@@ -2102,14 +1960,13 @@ async fn create_adr_types(
 #[tokio::test]
 async fn adr_full_hierarchy_reproduction() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let membership_svc = common::make_membership_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, dept_type, branch_type, user_type, course_type) =
-        create_adr_types(&type_svc).await;
+    let (tenant_type, dept_type, branch_type, user_type, course_type) = create_adr_types(&types);
 
     // T1: root tenant
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
@@ -2175,12 +2032,12 @@ async fn adr_full_hierarchy_reproduction() {
 #[tokio::test]
 async fn adr_tenant_self_nesting() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, _, _, _, _) = create_adr_types(&type_svc).await;
+    let (tenant_type, _, _, _, _) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
     let t7 =
@@ -2193,12 +2050,12 @@ async fn adr_tenant_self_nesting() {
 #[tokio::test]
 async fn adr_department_cannot_be_root() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (_, dept_type, _, _, _) = create_adr_types(&type_svc).await;
+    let (_, dept_type, _, _, _) = create_adr_types(&types);
 
     let err = group_svc
         .create_group(
@@ -2219,12 +2076,12 @@ async fn adr_department_cannot_be_root() {
 #[tokio::test]
 async fn adr_branch_only_under_department() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, _, branch_type, _, _) = create_adr_types(&type_svc).await;
+    let (tenant_type, _, branch_type, _, _) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
 
@@ -2239,11 +2096,8 @@ async fn adr_branch_only_under_department() {
         .unwrap_err();
 
     assert!(
-        matches!(
-            err,
-            DomainError::InvalidParentType { .. } | DomainError::AllowedParentTypesViolation { .. }
-        ),
-        "Expected InvalidParentType or AllowedParentTypesViolation, got {err:?}"
+        matches!(err, DomainError::InvalidParentType { .. }),
+        "Expected InvalidParentType, got {err:?}"
     );
 }
 
@@ -2251,14 +2105,13 @@ async fn adr_branch_only_under_department() {
 #[tokio::test]
 async fn adr_branch_allows_users_and_courses() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let membership_svc = common::make_membership_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, dept_type, branch_type, user_type, course_type) =
-        create_adr_types(&type_svc).await;
+    let (tenant_type, dept_type, branch_type, user_type, course_type) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
     let d2 =
@@ -2282,13 +2135,13 @@ async fn adr_branch_allows_users_and_courses() {
 #[tokio::test]
 async fn adr_tenant_rejects_course_membership() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let membership_svc = common::make_membership_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, _, _, _, course_type) = create_adr_types(&type_svc).await;
+    let (tenant_type, _, _, _, course_type) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
 
@@ -2310,13 +2163,13 @@ async fn adr_tenant_rejects_course_membership() {
 #[tokio::test]
 async fn adr_same_user_in_multiple_groups() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let membership_svc = common::make_membership_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, dept_type, _, user_type, _) = create_adr_types(&type_svc).await;
+    let (tenant_type, dept_type, _, user_type, _) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
     let t7 =
@@ -2340,14 +2193,13 @@ async fn adr_same_user_in_multiple_groups() {
 #[tokio::test]
 async fn adr_same_resource_different_types() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
-    let membership_svc = common::make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let membership_svc = common::make_membership_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let (tenant_type, dept_type, branch_type, user_type, course_type) =
-        create_adr_types(&type_svc).await;
+    let (tenant_type, dept_type, branch_type, user_type, course_type) = create_adr_types(&types);
 
     let t1 = common::create_root_group(&group_svc, &ctx, &tenant_type.code, "T1", tenant_id).await;
     let d2 =
@@ -2376,12 +2228,12 @@ async fn adr_same_resource_different_types() {
 #[tokio::test]
 async fn security_group_metadata_sql_injection() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "sqlmeta").await;
+    let root_type = common::create_root_type(&types, "sqlmeta");
 
     let evil_meta = json!({
         "name": "'; DROP TABLE resource_group; --",
@@ -2419,12 +2271,12 @@ async fn security_group_metadata_sql_injection() {
 #[tokio::test]
 async fn security_group_metadata_large_payload() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "bigmeta").await;
+    let root_type = common::create_root_type(&types, "bigmeta");
 
     let big_value = "A".repeat(1_000_000);
     let big_meta = json!({"payload": big_value});
@@ -2469,62 +2321,16 @@ async fn security_group_metadata_large_payload() {
 // Tenant-root uniqueness (cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness)
 // =========================================================================
 
-/// Build a unique tenant-type code: code starts with `TENANT_RG_TYPE_PATH` so
-/// `type_code.starts_with(TENANT_RG_TYPE_PATH)` classifies the group as a
-/// tenant-type group.
-fn unique_tenant_type_code() -> String {
-    format!(
-        "{}test{}.v1~",
-        resource_group_sdk::TENANT_RG_TYPE_PATH,
-        Uuid::now_v7().as_simple()
-    )
-}
-
-/// Create a tenant-type RG type (`can_be_root=true`, `allowed_parent_types=[self]`).
-async fn create_tenant_type(
-    svc: &TypeService<TypeRepository>,
-) -> resource_group_sdk::models::ResourceGroupType {
-    // `allowed_parent_types = []` because self-references aren't allowed at
-    // create time (the type is not yet in the registry). Suitable for testing
-    // the uniqueness invariant at root level.
-    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-        code: unique_tenant_type_code(),
-        can_be_root: true,
-        allowed_parent_types: vec![],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    })
-    .await
-    .expect("create tenant type")
-}
-
-/// Create a tenant-type RG type that allows being placed under the given
-/// parent tenant-type (used to build a root→sub-tenant fixture).
-async fn create_tenant_sub_type(
-    svc: &TypeService<TypeRepository>,
-    parent_type_code: &str,
-) -> resource_group_sdk::models::ResourceGroupType {
-    svc.create_type_unscoped(resource_group_sdk::CreateTypeRequest {
-        code: unique_tenant_type_code(),
-        can_be_root: true,
-        allowed_parent_types: vec![parent_type_code.to_owned()],
-        allowed_membership_types: vec![],
-        metadata_schema: None,
-    })
-    .await
-    .expect("create tenant sub-type")
-}
-
 /// TC-TRU-01: First tenant-type root is accepted.
 #[tokio::test]
 async fn tenant_root_first_create_allowed() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let tenant_type = create_tenant_type(&type_svc).await;
+    let tenant_type = common::create_tenant_type(&types);
     let root = group_svc
         .create_group(
             &ctx,
@@ -2542,13 +2348,13 @@ async fn tenant_root_first_create_allowed() {
 #[tokio::test]
 async fn tenant_root_second_create_rejected() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     // Create the first tenant root.
-    let tenant_type = create_tenant_type(&type_svc).await;
+    let tenant_type = common::create_tenant_type(&types);
     group_svc
         .create_group(
             &ctx,
@@ -2560,7 +2366,7 @@ async fn tenant_root_second_create_rejected() {
 
     // Second tenant-type root must be rejected regardless of type identity
     // (any tenant-type root collides with any other tenant-type root).
-    let second_type = create_tenant_type(&type_svc).await;
+    let second_type = common::create_tenant_type(&types);
     let err = group_svc
         .create_group(
             &ctx,
@@ -2579,13 +2385,13 @@ async fn tenant_root_second_create_rejected() {
 #[tokio::test]
 async fn non_tenant_root_alongside_tenant_root_allowed() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     // Tenant root.
-    let tenant_type = create_tenant_type(&type_svc).await;
+    let tenant_type = common::create_tenant_type(&types);
     let tenant_root = group_svc
         .create_group(
             &ctx,
@@ -2597,7 +2403,7 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
 
     // Non-tenant root (auxiliary forest, e.g. "workspace") — created with a
     // regular can_be_root type whose code does NOT start with TENANT_RG_TYPE_PATH.
-    let workspace_type = common::create_root_type(&type_svc, "workspace").await;
+    let workspace_type = common::create_root_type(&types, "workspace");
     let workspace = group_svc
         .create_group(
             &ctx,
@@ -2614,13 +2420,13 @@ async fn non_tenant_root_alongside_tenant_root_allowed() {
 #[tokio::test]
 async fn tenant_root_update_to_second_root_rejected() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
     // Tenant root #1 (root type — no parents allowed at root level).
-    let root_type = create_tenant_type(&type_svc).await;
+    let root_type = common::create_tenant_type(&types);
     let root = group_svc
         .create_group(
             &ctx,
@@ -2631,7 +2437,7 @@ async fn tenant_root_update_to_second_root_rejected() {
         .expect("tenant root");
 
     // Sub-tenant type: another tenant-type group placed under root_type.
-    let sub_type = create_tenant_sub_type(&type_svc, &root_type.code).await;
+    let sub_type = common::create_tenant_sub_type(&types, &root_type.code);
     let child = group_svc
         .create_group(
             &ctx,
@@ -2670,12 +2476,12 @@ async fn tenant_root_update_to_second_root_rejected() {
 #[tokio::test]
 async fn tenant_root_self_update_allowed() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let tenant_type = create_tenant_type(&type_svc).await;
+    let tenant_type = common::create_tenant_type(&types);
     let root = group_svc
         .create_group(
             &ctx,
@@ -2710,12 +2516,12 @@ async fn tenant_root_self_update_allowed() {
 #[tokio::test]
 async fn get_group_unscoped_returns_group_without_ctx() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "unscopedget").await;
+    let root_type = common::create_root_type(&types, "unscopedget");
     let group =
         common::create_root_group(&group_svc, &ctx, &root_type.code, "UnscopedGet", tenant_id)
             .await;
@@ -2732,7 +2538,8 @@ async fn get_group_unscoped_returns_group_without_ctx() {
 #[tokio::test]
 async fn get_group_unscoped_missing_is_not_found() {
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
     let err = group_svc
         .get_group_unscoped(Uuid::now_v7())
@@ -2751,14 +2558,14 @@ async fn get_group_unscoped_missing_is_not_found() {
 #[tokio::test]
 async fn group_create_duplicate_id_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = common::make_ctx(tenant_a);
     let ctx_b = common::make_ctx(tenant_b);
-    let root_type = common::create_root_type(&type_svc, "dupid").await;
+    let root_type = common::create_root_type(&types, "dupid");
 
     let id = Uuid::now_v7();
     let req = |name: &str| {
@@ -2799,12 +2606,12 @@ async fn group_create_duplicate_id_is_already_exists() {
 #[tokio::test]
 async fn group_create_duplicate_id_same_tenant_is_already_exists() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = common::make_ctx(tenant);
-    let root_type = common::create_root_type(&type_svc, "dupidsame").await;
+    let root_type = common::create_root_type(&types, "dupidsame");
 
     let id = Uuid::now_v7();
     let req = |name: &str| {
@@ -2830,9 +2637,10 @@ async fn group_create_duplicate_id_same_tenant_is_already_exists() {
 // =========================================================================
 // `$filter` type-path resolution
 //
-// A `type` filter names a GTS path; the column holds a surrogate SMALLINT.
-// `list_groups` therefore walks the filter AST, collects every type literal,
-// resolves them in one query, and substitutes the ids back. Each node shape
+// A `type` filter names a GTS path; the column holds the type's Registry
+// Reference (UUID). `list_groups` therefore walks the filter AST, collects
+// every type literal, resolves them through the catalog in one call, and
+// substitutes the references back. Each node shape
 // is a separate arm of that walk, and the scale test elsewhere in this suite
 // only ever builds `type in (...)` -- so the plain comparison, the boolean
 // combinations, the negation and the unknown-path rejection went unexercised.
@@ -2847,13 +2655,13 @@ fn filter_query(expr: &str) -> ODataQuery {
 #[tokio::test]
 async fn list_groups_filters_by_a_single_type() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t_a = common::create_root_type(&type_svc, "fone").await;
-    let t_b = common::create_root_type(&type_svc, "ftwo").await;
+    let t_a = common::create_root_type(&types, "fone");
+    let t_b = common::create_root_type(&types, "ftwo");
     let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
     common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
 
@@ -2866,7 +2674,7 @@ async fn list_groups_filters_by_a_single_type() {
     assert_eq!(ids, vec![a.id], "only the group of the filtered type");
     assert_eq!(
         page.items[0].code, t_a.code,
-        "the surrogate id must be mapped back to the GTS path on the way out"
+        "the Registry Reference must be mapped back to the GTS path on the way out"
     );
 }
 
@@ -2875,14 +2683,14 @@ async fn list_groups_filters_by_either_of_two_types() {
     // `or` is a Composite node: the walk has to recurse into every child to
     // find the literals, and again to substitute them.
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t_a = common::create_root_type(&type_svc, "fora").await;
-    let t_b = common::create_root_type(&type_svc, "forb").await;
-    let t_c = common::create_root_type(&type_svc, "forc").await;
+    let t_a = common::create_root_type(&types, "fora");
+    let t_b = common::create_root_type(&types, "forb");
+    let t_c = common::create_root_type(&types, "forc");
     let a = common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
     let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
     common::create_root_group(&group_svc, &ctx, &t_c.code, "c", tenant_id).await;
@@ -2906,15 +2714,15 @@ async fn list_groups_filters_by_either_of_two_types() {
 async fn list_groups_filters_by_negated_type() {
     // `not` wraps a single child; the walk descends through it in both
     // passes, and a miss there would silently drop the substitution and leave
-    // a GTS path where the column wants a SMALLINT.
+    // a GTS path where the column wants a UUID.
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t_a = common::create_root_type(&type_svc, "fnota").await;
-    let t_b = common::create_root_type(&type_svc, "fnotb").await;
+    let t_a = common::create_root_type(&types, "fnota");
+    let t_b = common::create_root_type(&types, "fnotb");
     common::create_root_group(&group_svc, &ctx, &t_a.code, "a", tenant_id).await;
     let b = common::create_root_group(&group_svc, &ctx, &t_b.code, "b", tenant_id).await;
 
@@ -2932,12 +2740,13 @@ async fn list_groups_filters_by_negated_type() {
 
 #[tokio::test]
 async fn list_groups_rejects_an_unknown_type_in_the_filter() {
-    // The resolution map is built from the paths that exist. A path that is
-    // absent has no id to substitute, and the request is a client error --
+    // The resolution map is built from the paths the Types Registry knows. A
+    // path that is absent has no reference to substitute, and the request is a client error --
     // not an empty page, which would read as "no such groups" rather than
     // "no such type", and not a 500.
     let db = common::test_db().await;
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
@@ -2964,12 +2773,12 @@ async fn list_groups_leaves_a_filter_without_a_type_alone() {
     // Nothing to resolve: the walk must pass the node through untouched
     // rather than rewriting or rejecting it.
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let t = common::create_root_type(&type_svc, "fnamed").await;
+    let t = common::create_root_type(&types, "fnamed");
     let a = common::create_root_group(&group_svc, &ctx, &t.code, "keep-me", tenant_id).await;
     common::create_root_group(&group_svc, &ctx, &t.code, "drop-me", tenant_id).await;
 
@@ -3061,7 +2870,6 @@ impl ParentFlippingGroupRepo {
                     db,
                     id,
                     Some(self.new_parent_id),
-                    model.gts_type_id,
                     &model.name,
                     model.metadata.as_ref(),
                 )
@@ -3079,12 +2887,12 @@ impl ParentFlippingGroupRepo {
 
 #[async_trait]
 impl GroupRepositoryTrait for ParentFlippingGroupRepo {
-    async fn find_by_id<C: DBRunner>(
+    async fn find_scoped_model<C: DBRunner>(
         &self,
         db: &C,
         scope: &AccessScope,
         id: Uuid,
-    ) -> Result<Option<ResourceGroupSdkModel>, DomainError> {
+    ) -> Result<Option<RgModel>, DomainError> {
         // In the stale-snapshot variant the "concurrent" reparent lands
         // here -- on the first read `update_group_inner` makes -- so that
         // every later read in this transaction has to decide for itself
@@ -3092,7 +2900,7 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         if self.stale_unlocked_parent.is_some() {
             self.flip_once(db, id).await?;
         }
-        self.inner.find_by_id(db, scope, id).await
+        self.inner.find_scoped_model(db, scope, id).await
     }
 
     async fn find_model_by_id<C: DBRunner>(
@@ -3122,7 +2930,6 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
                     db,
                     id,
                     Some(self.new_parent_id),
-                    model.gts_type_id,
                     &model.name,
                     model.metadata.as_ref(),
                 )
@@ -3139,14 +2946,8 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         self.inner.find_model_by_id_for_update(db, id).await
     }
 
-    async fn find_root_id_with_type_prefix<C: DBRunner>(
-        &self,
-        db: &C,
-        type_prefix: &str,
-    ) -> Result<Option<Uuid>, DomainError> {
-        self.inner
-            .find_root_id_with_type_prefix(db, type_prefix)
-            .await
+    async fn find_tenant_root_id<C: DBRunner>(&self, db: &C) -> Result<Option<Uuid>, DomainError> {
+        self.inner.find_tenant_root_id(db).await
     }
 
     async fn list_groups<C: DBRunner>(
@@ -3154,8 +2955,9 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         db: &C,
         scope: &AccessScope,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupSdkModel>, DomainError> {
-        self.inner.list_groups(db, scope, query).await
+        resolved: &HashMap<String, Uuid>,
+    ) -> Result<Page<RgModel>, DomainError> {
+        self.inner.list_groups(db, scope, query, resolved).await
     }
 
     async fn get_descendants<C: DBRunner>(
@@ -3164,8 +2966,11 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        self.inner.get_descendants(db, scope, group_id, query).await
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError> {
+        self.inner
+            .get_descendants(db, scope, group_id, query, type_filter)
+            .await
     }
 
     async fn get_ancestors<C: DBRunner>(
@@ -3174,8 +2979,11 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         scope: &AccessScope,
         group_id: Uuid,
         query: &ODataQuery,
-    ) -> Result<Page<ResourceGroupWithDepth>, DomainError> {
-        self.inner.get_ancestors(db, scope, group_id, query).await
+        type_filter: HierarchyTypeFilter,
+    ) -> Result<Page<HierarchyRow>, DomainError> {
+        self.inner
+            .get_ancestors(db, scope, group_id, query, type_filter)
+            .await
     }
 
     async fn insert<C: DBRunner>(
@@ -3183,13 +2991,23 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
+        gts_type_id: Uuid,
+        is_tenant: bool,
         name: &str,
         metadata: Option<&serde_json::Value>,
         tenant_id: Uuid,
     ) -> Result<RgModel, DomainError> {
         self.inner
-            .insert(db, id, parent_id, gts_type_id, name, metadata, tenant_id)
+            .insert(
+                db,
+                id,
+                parent_id,
+                gts_type_id,
+                is_tenant,
+                name,
+                metadata,
+                tenant_id,
+            )
             .await
     }
 
@@ -3198,13 +3016,10 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
         db: &C,
         id: Uuid,
         parent_id: Option<Uuid>,
-        gts_type_id: i16,
         name: &str,
         metadata: Option<&serde_json::Value>,
     ) -> Result<u64, DomainError> {
-        self.inner
-            .update(db, id, parent_id, gts_type_id, name, metadata)
-            .await
+        self.inner.update(db, id, parent_id, name, metadata).await
     }
 
     async fn delete_by_id<C: DBRunner>(&self, db: &C, id: Uuid) -> Result<(), DomainError> {
@@ -3330,14 +3145,6 @@ impl GroupRepositoryTrait for ParentFlippingGroupRepo {
     ) -> Result<bool, DomainError> {
         self.inner.has_memberships(db, group_id).await
     }
-
-    async fn resolve_type_paths_batch<C: DBRunner>(
-        &self,
-        db: &C,
-        type_ids: &[i16],
-    ) -> Result<std::collections::HashMap<i16, String>, DomainError> {
-        self.inner.resolve_type_paths_batch(db, type_ids).await
-    }
 }
 
 /// Records only `isolation_escalation` calls; every other `RgMetricsPort`
@@ -3377,14 +3184,13 @@ impl RgMetricsPort for EscalationRecorder {
 #[tokio::test]
 async fn group_rename_does_not_revert_a_concurrent_reparent() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let bootstrap_group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let bootstrap_group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "lostupd").await;
-    let child_type =
-        common::create_child_type(&type_svc, "lostupdchild", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "lostupd");
+    let child_type = common::create_child_type(&types, "lostupdchild", &[&root_type.code], &[]);
 
     let parent_a = common::create_root_group(
         &bootstrap_group_svc,
@@ -3424,8 +3230,7 @@ async fn group_rename_does_not_revert_a_concurrent_reparent() {
         QueryProfile::default(),
         common::make_enforcer(),
         racing_repo,
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        types.catalog(),
     );
 
     // A pure rename: the request carries the parent the group already had.
@@ -3478,14 +3283,13 @@ async fn group_rename_does_not_revert_a_concurrent_reparent() {
 #[tokio::test]
 async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
     let db = common::test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let bootstrap_group_svc = common::make_group_service(db.clone());
+    let types = common::TestTypes::new();
+    let bootstrap_group_svc = common::make_group_service(db.clone(), &types);
     let tenant_id = Uuid::now_v7();
     let ctx = common::make_ctx(tenant_id);
 
-    let root_type = common::create_root_type(&type_svc, "escroot").await;
-    let child_type =
-        common::create_child_type(&type_svc, "escchild", &[&root_type.code], &[]).await;
+    let root_type = common::create_root_type(&types, "escroot");
+    let child_type = common::create_child_type(&types, "escchild", &[&root_type.code], &[]);
 
     let parent_a = common::create_root_group(
         &bootstrap_group_svc,
@@ -3520,8 +3324,7 @@ async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
         QueryProfile::default(),
         common::make_enforcer(),
         flipping_repo,
-        Arc::new(TypeRepository),
-        common::make_types_registry(),
+        types.catalog(),
     )
     .with_metrics(recorder.clone());
 
@@ -3568,4 +3371,252 @@ async fn group_update_escalates_to_serializable_on_concurrent_reparent() {
     assert_eq!(model.name, "Renamed");
 
     common::assert_closure_matches_parent_links(&conn).await;
+}
+
+// =========================================================================
+// Types Registry as the type catalog
+// =========================================================================
+
+/// A Types Registry failure surfaces as `TypesRegistryUnavailable` (503 on the
+/// wire), not as `TypeNotFound` and not as a database error; nothing is
+/// persisted.
+#[tokio::test]
+async fn group_create_types_registry_unavailable() {
+    let db = common::test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let root_type = common::create_root_type(&types, "tru");
+    types.fail_reads();
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(root_type.code.clone(), "Unreachable".to_owned()),
+            tenant_id,
+        )
+        .await
+        .expect_err("a failing registry must fail the create");
+
+    assert!(
+        matches!(err, DomainError::TypesRegistryUnavailable { .. }),
+        "expected TypesRegistryUnavailable, got: {err:?}"
+    );
+
+    let conn = db.conn().expect("conn");
+    let scope = AccessScope::allow_all();
+    let rows = RgEntity::find()
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .expect("query groups");
+    assert!(
+        rows.is_empty(),
+        "nothing is persisted when the registry fails"
+    );
+}
+
+/// Metadata is validated against the schema the Types Registry resolves for
+/// the type: a conforming document is accepted, a non-conforming one is a
+/// validation error (create and update alike).
+#[tokio::test]
+async fn group_metadata_is_validated_against_the_registry_schema() {
+    let db = common::test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let code = types.add_rg_type(
+        &common::unique_rg_code("strictmeta"),
+        true,
+        &[],
+        &[],
+        Some(json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "x": { "type": "string" } }
+        })),
+    );
+
+    let ok = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(code.clone(), "Good".to_owned())
+                .with_metadata(Some(json!({"x": "a"}))),
+            tenant_id,
+        )
+        .await
+        .expect("conforming metadata is accepted");
+    assert_eq!(ok.metadata, Some(json!({"x": "a"})));
+
+    let err = group_svc
+        .create_group(
+            &ctx,
+            CreateGroupRequest::new(code.clone(), "Bad".to_owned())
+                .with_metadata(Some(json!({"y": 1}))),
+            tenant_id,
+        )
+        .await
+        .expect_err("non-conforming metadata is rejected");
+    assert!(
+        matches!(&err, DomainError::Validation { message } if message.contains("Metadata does not match type schema")),
+        "expected a type-schema validation error, got: {err:?}"
+    );
+
+    let err = group_svc
+        .update_group(
+            &ctx,
+            ok.id,
+            UpdateGroupRequest {
+                name: "Good".to_owned(),
+                parent_id: None,
+                metadata: Some(json!({"y": 1})),
+            },
+        )
+        .await
+        .expect_err("update validates metadata against the same schema");
+    assert!(
+        matches!(&err, DomainError::Validation { message } if message.contains("Metadata does not match type schema")),
+        "expected a type-schema validation error on update, got: {err:?}"
+    );
+
+    let persisted = group_svc.get_group(&ctx, ok.id).await.expect("get group");
+    assert_eq!(
+        persisted.metadata,
+        Some(json!({"x": "a"})),
+        "a rejected update leaves the stored metadata untouched"
+    );
+}
+
+/// A list page costs ONE catalog read for all distinct types on the page (plus
+/// one for resolving a `type` `$filter`), never one per group.
+#[tokio::test]
+async fn list_groups_calls_the_catalog_once_per_page() {
+    let db = common::test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t_a = common::create_root_type(&types, "pagea");
+    let t_b = common::create_root_type(&types, "pageb");
+    common::create_root_group(&group_svc, &ctx, &t_a.code, "a1", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_a.code, "a2", tenant_id).await;
+    common::create_root_group(&group_svc, &ctx, &t_b.code, "b1", tenant_id).await;
+
+    let before = types.batch_get_calls();
+    let page = group_svc
+        .list_groups(&ctx, &ODataQuery::default())
+        .await
+        .expect("list groups");
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(
+        types.batch_get_calls() - before,
+        1,
+        "one catalog read for the whole page"
+    );
+
+    let before = types.batch_get_calls();
+    let page = group_svc
+        .list_groups(&ctx, &filter_query(&format!("type eq '{}'", t_a.code)))
+        .await
+        .expect("list groups with a type filter");
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(
+        types.batch_get_calls() - before,
+        1,
+        "the filter resolution already covers the page: no second read"
+    );
+
+    // A page holding a type the filter did not name costs one more read.
+    let before = types.batch_get_calls();
+    let page = group_svc
+        .list_groups(
+            &ctx,
+            &filter_query(&format!("type eq '{}' or name eq 'b1'", t_a.code)),
+        )
+        .await
+        .expect("list groups with a mixed filter");
+    assert_eq!(page.items.len(), 3);
+    assert_eq!(
+        types.batch_get_calls() - before,
+        2,
+        "one read for the filter, one for the page type it did not name"
+    );
+}
+
+/// Creating a child group reads the group type and the parent type in ONE
+/// catalog request.
+#[tokio::test]
+async fn create_group_with_a_parent_makes_one_catalog_request() {
+    let db = common::test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+
+    let t = common::create_self_parenting_type(&types, "onereq");
+    let root = common::create_root_group(&group_svc, &ctx, &t.code, "root", tenant_id).await;
+
+    let before = types.batch_get_calls();
+    common::create_child_group(&group_svc, &ctx, &t.code, root.id, "child", tenant_id).await;
+    assert_eq!(
+        types.batch_get_calls() - before,
+        1,
+        "group type and parent type are one catalog request"
+    );
+}
+
+/// The `uq_rg_tenant_root` partial unique index is the backstop behind the
+/// service's pre-check: a second tenant root inserted straight through the
+/// repository (bypassing the pre-check, as a lost race would) is rejected and
+/// mapped to the conflict answer, and nothing is persisted.
+#[tokio::test]
+async fn tenant_root_unique_index_rejects_second_root_inserted_directly() {
+    let db = common::test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = common::make_group_service(db.clone(), &types);
+    let tenant_id = Uuid::now_v7();
+    let ctx = common::make_ctx(tenant_id);
+    let tenant_type = common::create_tenant_type(&types);
+    let tenant_type_uuid = types.uuid_of(&tenant_type.code).await;
+
+    let first =
+        common::create_root_group(&group_svc, &ctx, &tenant_type.code, "Tenant 1", tenant_id).await;
+
+    let second_id = Uuid::now_v7();
+    let conn = db.conn().expect("conn");
+    let err = GroupRepository
+        .insert(
+            &conn,
+            second_id,
+            None,
+            tenant_type_uuid,
+            true,
+            "Tenant 2",
+            None,
+            second_id,
+        )
+        .await
+        .expect_err("a second tenant root must violate uq_rg_tenant_root");
+    assert!(
+        matches!(&err, DomainError::Conflict { message } if message.contains("tenant root")),
+        "expected the tenant-root conflict mapping, got: {err:?}"
+    );
+
+    // Nothing was persisted for the rejected root; the first one is intact.
+    let scope = AccessScope::allow_all();
+    let rows = RgEntity::find()
+        .filter(RgColumn::IsTenant.eq(true))
+        .secure()
+        .scope_with(&scope)
+        .all(&conn)
+        .await
+        .expect("query tenant groups");
+    assert_eq!(rows.len(), 1, "only the first tenant root may exist");
+    assert_eq!(rows[0].id, first.id);
 }

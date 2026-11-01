@@ -1291,9 +1291,8 @@ mod cleanup {
     use account_management_sdk::gts::{USER_GROUP_RG_TYPE_CODE, USER_RG_TYPE_CODE};
     use async_trait::async_trait;
     use resource_group_sdk::{
-        CreateGroupRequest, CreateTypeRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
-        ResourceGroupMembership, ResourceGroupType, ResourceGroupWithDepth, UpdateGroupRequest,
-        UpdateTypeRequest,
+        CreateGroupRequest, GroupHierarchy, ResourceGroup, ResourceGroupClient,
+        ResourceGroupMembership, ResourceGroupWithDepth, UpdateGroupRequest,
     };
     use std::sync::Mutex;
     use toolkit_canonical_errors::{CanonicalError, resource_error};
@@ -1441,42 +1440,6 @@ mod cleanup {
             unreachable!(
                 "cleanup uses list_groups(tenant) + per-group remove, never list_memberships"
             )
-        }
-        async fn create_type(
-            &self,
-            _ctx: &SecurityContext,
-            _request: CreateTypeRequest,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn get_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn list_types(
-            &self,
-            _ctx: &SecurityContext,
-            _query: &ODataQuery,
-        ) -> Result<Page<ResourceGroupType>, CanonicalError> {
-            unreachable!()
-        }
-        async fn update_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-            _request: UpdateTypeRequest,
-        ) -> Result<ResourceGroupType, CanonicalError> {
-            unreachable!()
-        }
-        async fn delete_type(
-            &self,
-            _ctx: &SecurityContext,
-            _code: &str,
-        ) -> Result<(), CanonicalError> {
-            unreachable!()
         }
         async fn create_group(
             &self,

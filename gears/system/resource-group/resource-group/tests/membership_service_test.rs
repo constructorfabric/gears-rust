@@ -8,70 +8,47 @@
 
 mod common;
 
-use common::{create_root_type, make_ctx, make_group_service, make_membership_service, test_db};
+use common::{
+    create_root_type, create_root_type_with_memberships, make_ctx, make_group_service,
+    make_membership_service, test_db,
+};
 use toolkit_odata::ODataQuery;
 use uuid::Uuid;
 
 use resource_group::domain::error::DomainError;
-use resource_group::domain::type_service::TypeService;
 use resource_group::infra::storage::entity::resource_group_membership::{
     Column as MbrColumn, Entity as MbrEntity,
 };
-use resource_group::infra::storage::type_repo::TypeRepository;
-use resource_group_sdk::CreateTypeRequest;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use toolkit_db::secure::SecureEntityExt;
-use toolkit_gts::{GTS_ID_PREFIX, gts_id};
+use toolkit_gts::gts_id;
 use toolkit_security::AccessScope;
-
-/// Helper: create a root type that allows the given membership type paths.
-async fn create_type_with_memberships(
-    type_svc: &TypeService<TypeRepository>,
-    suffix: &str,
-    memberships: &[&str],
-) -> resource_group_sdk::ResourceGroupType {
-    let code = format!(
-        "{GTS_ID_PREFIX}cf.core.rg.type.v1~x.test.{}{}.v1~",
-        suffix,
-        Uuid::now_v7().as_simple()
-    );
-    type_svc
-        .create_type_unscoped(CreateTypeRequest {
-            code,
-            can_be_root: true,
-            allowed_parent_types: vec![],
-            allowed_membership_types: memberships.iter().map(|s| (*s).to_owned()).collect(),
-            metadata_schema: None,
-        })
-        .await
-        .expect("create type with memberships")
-}
 
 // TC-MBR-01: Add membership happy path
 #[tokio::test]
 async fn membership_add_happy_path() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
     // Create a member resource type first (must be registered)
-    let member_type = create_root_type(&type_svc, "mbr").await;
+    let member_type = types.new_member_type("mbr");
     // Create a group type that allows membership of the member type
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
 
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let result = mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-001")
+        .add_membership(&ctx, group.id, &member_type, "res-001")
         .await
         .expect("add membership should succeed");
 
     assert_eq!(result.group_id, group.id);
-    assert_eq!(result.resource_type, member_type.code);
+    assert_eq!(result.resource_type, member_type);
     assert_eq!(result.resource_id, "res-001");
 
     // Direct DB assertion: row exists with correct composite key
@@ -94,16 +71,16 @@ async fn membership_add_happy_path() {
 #[tokio::test]
 async fn membership_add_nonexistent_group() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
+    let member_type = types.new_member_type("mbr");
 
     let err = mbr_svc
-        .add_membership(&ctx, Uuid::now_v7(), &member_type.code, "res-001")
+        .add_membership(&ctx, Uuid::now_v7(), &member_type, "res-001")
         .await
         .expect_err("should fail for nonexistent group");
 
@@ -117,24 +94,24 @@ async fn membership_add_nonexistent_group() {
 #[tokio::test]
 async fn membership_add_duplicate() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-dup")
+        .add_membership(&ctx, group.id, &member_type, "res-dup")
         .await
         .expect("first add should succeed");
 
     let err = mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-dup")
+        .add_membership(&ctx, group.id, &member_type, "res-dup")
         .await
         .expect_err("duplicate add should fail");
 
@@ -153,19 +130,19 @@ async fn membership_add_duplicate() {
 #[tokio::test]
 async fn membership_add_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
     // Create a group type that allows some registered type (we just need a valid group)
-    let registered_type = create_root_type(&type_svc, "reg").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&registered_type.code]).await;
+    let registered_type = types.new_member_type("reg");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&registered_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
-    // Try to add membership with a type path that is NOT registered in gts_type table
+    // Try to add membership with a type path that is NOT registered in the Types Registry
     let err = mbr_svc
         .add_membership(
             &ctx,
@@ -190,23 +167,23 @@ async fn membership_add_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_add_not_in_allowed_membership_types() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
     // Create two types: one allowed, one not
-    let allowed_type = create_root_type(&type_svc, "allowed").await;
-    let disallowed_type = create_root_type(&type_svc, "disallowed").await;
+    let allowed_type = types.new_member_type("allowed");
+    let disallowed_type = types.new_member_type("disallowed");
 
     // Group only allows `allowed_type`
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&allowed_type.code]).await;
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&allowed_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let err = mbr_svc
-        .add_membership(&ctx, group.id, &disallowed_type.code, "res-001")
+        .add_membership(&ctx, group.id, &disallowed_type, "res-001")
         .await
         .expect_err("disallowed type should fail");
 
@@ -224,17 +201,17 @@ async fn membership_add_not_in_allowed_membership_types() {
 #[tokio::test]
 async fn membership_add_tenant_incompatibility() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant_a = Uuid::now_v7();
     let tenant_b = Uuid::now_v7();
     let ctx_a = make_ctx(tenant_a);
     let ctx_b = make_ctx(tenant_b);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
 
     let group_a =
         common::create_root_group(&group_svc, &ctx_a, &grp_type.code, "GA", tenant_a).await;
@@ -243,13 +220,13 @@ async fn membership_add_tenant_incompatibility() {
 
     // Add resource to tenant A group
     mbr_svc
-        .add_membership(&ctx_a, group_a.id, &member_type.code, "shared-res")
+        .add_membership(&ctx_a, group_a.id, &member_type, "shared-res")
         .await
         .expect("add to tenant A should succeed");
 
     // Try to add same resource to tenant B group
     let err = mbr_svc
-        .add_membership(&ctx_b, group_b.id, &member_type.code, "shared-res")
+        .add_membership(&ctx_b, group_b.id, &member_type, "shared-res")
         .await
         .expect_err("cross-tenant should fail");
 
@@ -263,24 +240,24 @@ async fn membership_add_tenant_incompatibility() {
 #[tokio::test]
 async fn membership_remove_existing() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-rm")
+        .add_membership(&ctx, group.id, &member_type, "res-rm")
         .await
         .expect("add membership");
 
     mbr_svc
-        .remove_membership(&ctx, group.id, &member_type.code, "res-rm")
+        .remove_membership(&ctx, group.id, &member_type, "res-rm")
         .await
         .expect("remove should succeed");
 
@@ -305,19 +282,19 @@ async fn membership_remove_existing() {
 #[tokio::test]
 async fn membership_remove_nonexistent() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let err = mbr_svc
-        .remove_membership(&ctx, group.id, &member_type.code, "nonexistent")
+        .remove_membership(&ctx, group.id, &member_type, "nonexistent")
         .await
         .expect_err("remove nonexistent should fail");
 
@@ -331,25 +308,24 @@ async fn membership_remove_nonexistent() {
 #[tokio::test]
 async fn membership_multiple_resource_types_same_group() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let type_a = create_root_type(&type_svc, "typeA").await;
-    let type_b = create_root_type(&type_svc, "typeB").await;
-    let grp_type =
-        create_type_with_memberships(&type_svc, "grp", &[&type_a.code, &type_b.code]).await;
+    let type_a = types.new_member_type("typea");
+    let type_b = types.new_member_type("typeb");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&type_a, &type_b]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     mbr_svc
-        .add_membership(&ctx, group.id, &type_a.code, "res-a")
+        .add_membership(&ctx, group.id, &type_a, "res-a")
         .await
         .expect("add type A membership");
     mbr_svc
-        .add_membership(&ctx, group.id, &type_b.code, "res-b")
+        .add_membership(&ctx, group.id, &type_b, "res-b")
         .await
         .expect("add type B membership");
 
@@ -367,20 +343,20 @@ async fn membership_multiple_resource_types_same_group() {
 #[tokio::test]
 async fn membership_first_always_allowed_tenant() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     // First membership for a new resource always succeeds (no tenant conflict possible)
     let result = mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "brand-new-res")
+        .add_membership(&ctx, group.id, &member_type, "brand-new-res")
         .await;
     assert!(result.is_ok(), "first membership should always succeed");
 }
@@ -389,20 +365,20 @@ async fn membership_first_always_allowed_tenant() {
 #[tokio::test]
 async fn membership_empty_resource_id() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     // Document behavior: empty resource_id is accepted (no domain validation on it)
     let result = mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "")
+        .add_membership(&ctx, group.id, &member_type, "")
         .await;
     // The service does not validate resource_id content, so this should succeed
     assert!(
@@ -415,15 +391,15 @@ async fn membership_empty_resource_id() {
 #[tokio::test]
 async fn membership_remove_unregistered_resource_type() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let err = mbr_svc
@@ -450,20 +426,20 @@ async fn membership_remove_unregistered_resource_type() {
 #[tokio::test]
 async fn membership_empty_allowed_membership_types_rejects_all() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
+    let member_type = types.new_member_type("mbr");
     // Group type with NO allowed memberships
-    let grp_type = create_root_type(&type_svc, "grp_empty").await;
+    let grp_type = create_root_type(&types, "grp_empty");
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
 
     let err = mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-001")
+        .add_membership(&ctx, group.id, &member_type, "res-001")
         .await
         .expect_err("empty allowed_membership_types should reject");
 
@@ -481,25 +457,25 @@ async fn membership_empty_allowed_membership_types_rejects_all() {
 #[tokio::test]
 async fn membership_same_resource_multiple_groups_same_tenant() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "mbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "grp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("mbr");
+    let grp_type = create_root_type_with_memberships(&types, "grp", &[&member_type]);
 
     let group1 = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
     let group2 = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G2", tenant).await;
 
     mbr_svc
-        .add_membership(&ctx, group1.id, &member_type.code, "shared-res")
+        .add_membership(&ctx, group1.id, &member_type, "shared-res")
         .await
         .expect("add to group1");
     mbr_svc
-        .add_membership(&ctx, group2.id, &member_type.code, "shared-res")
+        .add_membership(&ctx, group2.id, &member_type, "shared-res")
         .await
         .expect("add to group2 same tenant should succeed");
 
@@ -527,7 +503,8 @@ async fn membership_same_resource_multiple_groups_same_tenant() {
 #[tokio::test]
 async fn membership_list_empty() {
     let db = test_db().await;
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
@@ -549,18 +526,18 @@ async fn membership_list_empty() {
 #[tokio::test]
 async fn list_memberships_unscoped_returns_rows_without_ctx() {
     let db = test_db().await;
-    let type_svc = common::make_type_service(db.clone());
-    let group_svc = make_group_service(db.clone());
-    let mbr_svc = make_membership_service(db.clone());
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
 
     let tenant = Uuid::now_v7();
     let ctx = make_ctx(tenant);
 
-    let member_type = create_root_type(&type_svc, "umbr").await;
-    let grp_type = create_type_with_memberships(&type_svc, "ugrp", &[&member_type.code]).await;
+    let member_type = types.new_member_type("umbr");
+    let grp_type = create_root_type_with_memberships(&types, "ugrp", &[&member_type]);
     let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "UG1", tenant).await;
     mbr_svc
-        .add_membership(&ctx, group.id, &member_type.code, "res-u")
+        .add_membership(&ctx, group.id, &member_type, "res-u")
         .await
         .expect("add membership");
 
@@ -572,4 +549,60 @@ async fn list_memberships_unscoped_returns_rows_without_ctx() {
 
     let count = page.items.iter().filter(|m| m.group_id == group.id).count();
     assert_eq!(count, 1, "seeded membership must be listed");
+}
+
+/// `add_membership` reads the resource type and the group type in ONE
+/// catalog request.
+#[tokio::test]
+async fn membership_add_makes_one_catalog_request() {
+    let db = test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+
+    let member_type = types.new_member_type("one");
+    let grp_type = create_root_type_with_memberships(&types, "onegrp", &[&member_type]);
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
+
+    let before = types.batch_get_calls();
+    mbr_svc
+        .add_membership(&ctx, group.id, &member_type, "res-1")
+        .await
+        .expect("add membership");
+    assert_eq!(types.batch_get_calls() - before, 1);
+}
+
+/// A `resource_type` filter that covers the page needs no second catalog
+/// request after the query.
+#[tokio::test]
+async fn list_memberships_with_resource_type_filter_makes_one_catalog_request() {
+    let db = test_db().await;
+    let types = common::TestTypes::new();
+    let group_svc = make_group_service(db.clone(), &types);
+    let mbr_svc = make_membership_service(db.clone(), &types);
+    let tenant = Uuid::now_v7();
+    let ctx = make_ctx(tenant);
+
+    let member_type = types.new_member_type("flt");
+    let grp_type = create_root_type_with_memberships(&types, "fltgrp", &[&member_type]);
+    let group = common::create_root_group(&group_svc, &ctx, &grp_type.code, "G1", tenant).await;
+    mbr_svc
+        .add_membership(&ctx, group.id, &member_type, "res-1")
+        .await
+        .expect("add membership");
+
+    let parsed = toolkit_odata::parse_filter_string(&format!("resource_type eq '{member_type}'"))
+        .expect("parse filter");
+    let query = ODataQuery::new().with_filter(parsed.into_expr());
+
+    let before = types.batch_get_calls();
+    let page = mbr_svc
+        .list_memberships(&ctx, &query)
+        .await
+        .expect("list memberships");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].resource_type, member_type);
+    assert_eq!(types.batch_get_calls() - before, 1);
 }

@@ -13,14 +13,8 @@ pub enum DomainError {
     #[error("Type not found: {code}")]
     TypeNotFound { code: String },
 
-    #[error("Type already exists: {code}")]
-    TypeAlreadyExists { code: String },
-
     #[error("Validation failed: {message}")]
     Validation { message: String },
-
-    #[error("Allowed parents violation: {message}")]
-    AllowedParentTypesViolation { message: String },
 
     #[error("Active references exist: {message}")]
     ConflictActiveReferences { message: String },
@@ -55,8 +49,7 @@ pub enum DomainError {
     /// Second tenant-type root rejected.
     ///
     /// Raised when a `create_group`/`update_group` would leave the RG forest
-    /// with more than one root group whose GTS type code starts with
-    /// `TENANT_RG_TYPE_PATH`. Enforces
+    /// with more than one root group of a tenant type (`is_tenant`). Enforces
     /// `cpt-cf-resource-group-fr-enforce-tenant-root-uniqueness`. Maps to
     /// canonical `already_exists` (HTTP 409) with `existing_root_id` as the
     /// `resource_name`.
@@ -74,6 +67,19 @@ pub enum DomainError {
     /// of a single tenant.
     #[error("Tenant incompatibility: {message}")]
     TenantIncompatibility { message: String },
+
+    /// The Types Registry could not be reached or failed to answer.
+    ///
+    /// `message` is operator-only diagnostics (logged server-side); it never
+    /// reaches the wire. Maps to canonical `service_unavailable` (HTTP 503).
+    #[error("Types Registry unavailable: {message}")]
+    TypesRegistryUnavailable { message: String },
+
+    /// A stored group references a type UUID that the Types Registry no
+    /// longer resolves. Server-side data inconsistency; maps to canonical
+    /// internal (HTTP 500).
+    #[error("Group type {type_uuid} cannot be resolved in the Types Registry")]
+    UnresolvedGroupType { type_uuid: uuid::Uuid },
 
     #[error("Access denied: {message}")]
     AccessDenied { message: String },
@@ -121,18 +127,8 @@ impl DomainError {
         Self::TypeNotFound { code: code.into() }
     }
 
-    pub fn type_already_exists(code: impl Into<String>) -> Self {
-        Self::TypeAlreadyExists { code: code.into() }
-    }
-
     pub fn validation(message: impl Into<String>) -> Self {
         Self::Validation {
-            message: message.into(),
-        }
-    }
-
-    pub fn allowed_parent_types_violation(message: impl Into<String>) -> Self {
-        Self::AllowedParentTypesViolation {
             message: message.into(),
         }
     }
@@ -201,6 +197,17 @@ impl DomainError {
             existing_root_id,
             detail: detail.into(),
         }
+    }
+
+    pub fn types_registry_unavailable(message: impl Into<String>) -> Self {
+        Self::TypesRegistryUnavailable {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn unresolved_group_type(type_uuid: uuid::Uuid) -> Self {
+        Self::UnresolvedGroupType { type_uuid }
     }
 
     pub fn tenant_incompatibility(message: impl Into<String>) -> Self {
@@ -296,7 +303,7 @@ impl From<EnforcerError> for DomainError {
 /// backend fault, so it must map to `Validation`, not `Database`.
 ///
 /// Used by every list repository of this gear — `list_memberships`
-/// , `list_groups` and `list_types` (ML-7391) — so a malformed
+/// and `list_groups` (ML-7391) — so a malformed
 /// `$filter` (unknown field, type mismatch, bad `$orderby` field, stale
 /// cursor) surfaces as 400 instead of being folded into a blanket 500
 /// alongside actual DB failures.
