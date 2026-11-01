@@ -1781,6 +1781,44 @@ mod tests {
         assert_eq!(outcome.actual_credits_micro, 1050);
     }
 
+    // A completed turn with zero or absent provider usage must not settle free.
+    #[tokio::test]
+    async fn completed_turn_without_usage_settles_estimated_debit() {
+        use crate::domain::llm::Usage;
+        use crate::domain::model::billing_outcome::{
+            BillingDerivationInput, derive_billing_outcome,
+        };
+        use crate::domain::model::finalization::{has_known_usage, settlement_path_from_billing};
+        use crate::infra::db::entity::chat_turn::TurnState;
+
+        for usage in [None, Some(Usage::default())] {
+            let db = mock_db_provider(inmem_db().await);
+            let svc = make_test_service(Arc::clone(&db), default_snapshot(), 1.10);
+            let today = OffsetDateTime::now_utc().date();
+            seed_reserve(&db, ModelTier::Premium, 10_000, today).await;
+
+            let billing = derive_billing_outcome(&BillingDerivationInput {
+                terminal_state: TurnState::Completed,
+                error_code: None,
+                has_usage: has_known_usage(usage),
+            });
+            let path = settlement_path_from_billing(billing.settlement_method, usage);
+            let input = settlement_input("gpt-5", ModelTier::Premium, 2000, 10_000, path, today);
+
+            let conn = db.conn().unwrap();
+            let scope = AccessScope::for_tenant(Uuid::nil());
+            let outcome = svc.settle(&conn, &scope, input).await.unwrap();
+            assert_eq!(
+                outcome.settlement_method,
+                SettlementMethod::Estimated,
+                "{usage:?}"
+            );
+            // Same figures as `settle_estimated_deterministic`: 1000 estimated
+            // input tokens plus the 50-token generation floor.
+            assert_eq!(outcome.actual_credits_micro, 1050, "{usage:?}");
+        }
+    }
+
     // 9.5: Same inputs → same output
     #[tokio::test]
     async fn settle_estimated_same_inputs_same_output() {

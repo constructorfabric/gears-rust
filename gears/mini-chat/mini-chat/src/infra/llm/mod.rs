@@ -288,6 +288,9 @@ pub enum TerminalOutcome {
         name: String,
         /// Parsed arguments JSON (empty object if unparseable).
         input: serde_json::Value,
+        /// Usage of this provider call. The turn is billed for the sum over
+        /// all of its calls.
+        usage: Usage,
     },
 }
 
