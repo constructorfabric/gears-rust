@@ -16,25 +16,38 @@ use crate::link::{LinkError, exactly_one};
 use crate::models::{Conditions, Grant};
 use crate::reason::DenialReason;
 
-/// One binding filter. The store reads the live grants whose binding type
-/// matches `type_pattern` (by GTS derivation) and whose binding id is
-/// `binding_id`.
+/// One binding filter. The store reads the live grants whose binding id is
+/// `binding_id` and whose binding type matches `type_pattern`: the same type
+/// when `exact`, else the type or one that derives from it. Minor versions do
+/// not count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BindingFilter {
-    /// GTS type pattern. A type that derives from it matches.
+    /// GTS type pattern.
     pub type_pattern: GtsTypeId,
     /// Binding id.
     pub binding_id: String,
+    /// Only the type itself matches, not the types that derive from it.
+    pub exact: bool,
 }
 
 impl BindingFilter {
-    /// A filter on a type pattern and a binding id.
+    /// A filter on a type pattern and a binding id; a derived type matches.
     #[must_use]
     pub fn new(type_pattern: GtsTypeId, binding_id: impl Into<String>) -> Self {
         Self {
             type_pattern,
             binding_id: binding_id.into(),
+            exact: false,
+        }
+    }
+
+    /// A filter on one type and a binding id; a derived type does not match.
+    #[must_use]
+    pub fn exact(type_id: GtsTypeId, binding_id: impl Into<String>) -> Self {
+        Self {
+            exact: true,
+            ..Self::new(type_id, binding_id)
         }
     }
 }
@@ -102,7 +115,7 @@ pub enum EvaluationError {
 
 /// The evaluator contract, version 1.
 pub trait GrantEvaluatorV1: Send + Sync {
-    /// Type ids that the evaluator names. The gear checks at init that each one
+    /// Type ids that the evaluator names. The gear checks at start that each one
     /// is registered.
     fn named_types(&self) -> Vec<GtsTypeId>;
 

@@ -1,0 +1,79 @@
+[package]
+name = "cf-gears-license-enforcement"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "License enforcement gear - grant store, management API, and license-resolver backend"
+repository.workspace = true
+readme = "README.md"
+keywords = ["constructorfabric", "cf-gears", "licensing"]
+categories = ["authentication"]
+metadata.docs.rs.all-features = true
+
+[lib]
+name = "license_enforcement"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Local dependencies
+license-enforcement-sdk = { workspace = true, features = ["rest-server"] }
+license-resolver-sdk = { workspace = true }
+types-registry-sdk = { workspace = true }
+types-registry = { workspace = true }
+authz-resolver-sdk = { workspace = true }
+authz-resolver = { workspace = true }
+tenant-resolver-sdk = { workspace = true }
+tenant-resolver = { workspace = true }
+
+# ToolKit dependencies
+toolkit = { workspace = true }
+toolkit-canonical-errors = { workspace = true }
+toolkit-db = { workspace = true, features = ["sqlite", "pg"] }
+toolkit-db-macros = { workspace = true }
+toolkit-macros = { workspace = true }
+toolkit-odata = { workspace = true }
+toolkit-security = { workspace = true }
+
+# `register_rest` hands an `axum::Router` to the SDK's generated routes.
+axum = { workspace = true }
+http = { workspace = true }
+
+gts = { workspace = true }
+sea-orm = { workspace = true }
+sea-orm-migration = { workspace = true }
+
+anyhow = { workspace = true }
+aws-lc-rs = { workspace = true }
+hex = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true, features = ["v7"] }
+
+# Required by toolkit::gear macro
+inventory = { workspace = true }
+
+[features]
+# Runs the tests on PostgreSQL in a `testcontainers` container instead of
+# in-memory SQLite; Docker is required
+# (`cargo test -p cf-gears-license-enforcement --features integration`).
+integration = []
+
+[dev-dependencies]
+# Path-only: a versioned dev-dependency that is not a normal one fails
+# `tools/scripts/check_release_config.py`.
+le-default-evaluator = { package = "cf-gears-le-default-evaluator", path = "../plugins/default-evaluator" }
+le-issue-admission-plugin = { package = "cf-gears-le-issue-admission-plugin", path = "../plugins/issue-admission-plugin" }
+tokio = { workspace = true }
+time = { workspace = true, features = ["macros"] }
+types-registry-sdk = { workspace = true, features = ["test-util"] }
+testcontainers = { workspace = true }
+testcontainers-modules = { workspace = true }
+test-containers = { workspace = true }

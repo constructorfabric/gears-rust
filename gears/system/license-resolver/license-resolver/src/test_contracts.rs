@@ -114,6 +114,18 @@ pub fn user_subject_schema() -> GtsTypeSchema {
     derived_schema::<TestUserSubjectV1>(subject_base_schema())
 }
 
+/// A Subject contract derived from [`TestUserSubjectV1`], with the same shape.
+pub const ADMIN_SUBJECT: &str =
+    gts_id!("cf.core.lic.subj.v1~test.lic.gateway.user.v1~test.lic.gateway.admin.v1~");
+
+#[must_use]
+pub fn admin_subject_schema() -> GtsTypeSchema {
+    let mut body = TestUserSubjectV1::gts_schema_with_refs();
+    body["$id"] = Value::String(format!("gts://{ADMIN_SUBJECT}"));
+    body["allOf"] = serde_json::json!([{ "$ref": format!("gts://{USER_SUBJECT}") }]);
+    schema_of(ADMIN_SUBJECT, body, Some(Arc::new(user_subject_schema())))
+}
+
 #[must_use]
 pub fn tenant_subject_schema() -> GtsTypeSchema {
     derived_schema::<TestTenantSubjectV1>(subject_base_schema())

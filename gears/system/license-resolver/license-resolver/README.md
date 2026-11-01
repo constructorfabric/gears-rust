@@ -68,7 +68,7 @@ Each check resolves both contract types and reports **every** violation it finds
 | `CONTRACT_NOT_DERIVED` | the contract does not derive from the licensing base for its slot |
 | `CONTRACT_ABSTRACT` | the contract type is abstract — a check names a derived contract |
 | `SCHEMA_MISMATCH` | the contract object does not conform to its registered schema |
-| `SUBJECT_NOT_ADMITTED` | the Subject contract is not in the Resource's `admitted_subjects` |
+| `SUBJECT_NOT_ADMITTED` | the Subject contract is not in the Resource's `admitted_subjects` and does not derive from an entry |
 
 Two properties of this are deliberate:
 

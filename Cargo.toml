@@ -209,6 +209,9 @@ members = [
     "gears/system/license-resolver/license-resolver",
     "gears/system/license-resolver/plugins/static-license-plugin",
     "gears/system/license-enforcement/license-enforcement-sdk",
+    "gears/system/license-enforcement/license-enforcement",
+    "gears/system/license-enforcement/plugins/default-evaluator",
+    "gears/system/license-enforcement/plugins/issue-admission-plugin",
     "gears/system/admission-control/admission-control-sdk",
     "gears/system/admission-control/admission-control",
     "gears/system/policy-engine/policy-engine-sdk",
@@ -945,6 +948,9 @@ license-resolver-sdk = { package = "cf-gears-license-resolver-sdk", version = "0
 license-resolver = { package = "cf-gears-license-resolver", version = "0.1.8", path = "gears/system/license-resolver/license-resolver" }
 static-license-plugin = { package = "cf-gears-static-license-plugin", version = "0.1.8", path = "gears/system/license-resolver/plugins/static-license-plugin" }
 license-enforcement-sdk = { package = "cf-gears-license-enforcement-sdk", version = "0.1.0", path = "gears/system/license-enforcement/license-enforcement-sdk" }
+license-enforcement = { package = "cf-gears-license-enforcement", version = "0.1.0", path = "gears/system/license-enforcement/license-enforcement" }
+le-default-evaluator = { package = "cf-gears-le-default-evaluator", version = "0.1.0", path = "gears/system/license-enforcement/plugins/default-evaluator" }
+le-issue-admission-plugin = { package = "cf-gears-le-issue-admission-plugin", version = "0.1.0", path = "gears/system/license-enforcement/plugins/issue-admission-plugin" }
 
 # Admission control + policy engine
 admission-control-sdk = { package = "cf-gears-admission-control-sdk", version = "0.1.0", path = "gears/system/admission-control/admission-control-sdk" }

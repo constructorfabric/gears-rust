@@ -90,8 +90,8 @@ of its parent.
 | `cpt-cf-license-enforcement-fr-precedence` | Replacement in the grant service terminates the replaced grants and moves each binding, with its sub-grant chain, to a successor in one transaction. It fails as a whole if a binding has no successor (§3.1). |
 | `cpt-cf-license-enforcement-fr-pack` | A pack (§3.1) groups grants, and no operation changes its members. Pack operations of the grant service apply to all members in one transaction. |
 | `cpt-cf-license-enforcement-fr-management-api` | The management API (`cpt-cf-license-enforcement-component-management-api`) exposes the same operations over REST in api-gateway and over the in-process SDK client. Lifecycle operations are explicit sub-operations, and check-explain runs the same evaluation as the check (§3.3). |
-| `cpt-cf-license-enforcement-fr-idempotent-mutations` | Every mutating request carries an idempotency token. The management API stores the result per tenant and token and returns it on replay (§3.7). It keeps the result for the idempotency window, a configuration parameter of the gear. For the `issue` intake, the tenant and the idempotency token are the replay key of the evidence. Thus a repeated `issue` after the window is rejected as a replay (§3.1). A replay with a different payload is rejected as a conflict. Grants and packs carry a version, and a request can set it as a precondition (§3.3). |
-| `cpt-cf-license-enforcement-fr-pdp-gated-management` | The management API gets a PDP decision before each operation, with the tenant from the security context. The PDP constraints scope the mutating transaction. |
+| `cpt-cf-license-enforcement-fr-idempotent-mutations` | Every mutating request carries an idempotency token. The grant service stores the result per tenant and token and returns it on replay (§3.7). It keeps the result for the idempotency window, a configuration parameter of the gear. For the `issue` intake, the tenant and the idempotency token are the replay key of the evidence. Thus a repeated `issue` after the window is rejected as a replay (§3.1). A replay with a different payload is rejected as a conflict. Grants and packs carry a version, and a request can set it as a precondition (§3.3). |
+| `cpt-cf-license-enforcement-fr-pdp-gated-management` | The grant service gets a PDP decision before each operation, with the tenant from the security context. The PDP constraints scope the mutating transaction. |
 | `cpt-cf-license-enforcement-fr-audit-ledger` | Each change writes its audit events to the transactional outbox of `toolkit-db` in its own transaction. After commit, the outbox delivers them to the audit plugin (`cpt-cf-license-enforcement-component-audit`). The plugin delivers them to an audit target outside this module. The target stores the audit ledger, gives tenant-scoped read access, and owns retention. |
 | `cpt-cf-license-enforcement-fr-verification-fixed` | Verification follows only from the plugin crate that the binary links (`cpt-cf-license-enforcement-adr-compile-time-admission`). A binary without a verifying plugin contains no verification code. A plugin can verify evidence at admission and at each evaluation. Root fields are the fields of a root grant that the plugin reads from its verified evidence. When the plugin returns them, the check uses them instead of the stored fields. It also checks that a sub-grant is a subset of these fields. It also checks that each link of its chain is the only live child of its parent (`cpt-cf-license-enforcement-adr-payload-authority`). |
 | `cpt-cf-license-enforcement-fr-signed-artifact` | The plugin model lets a plugin own its evidence format and admit only evidence that it verifies (§3.3). Evidence keeps the exact bytes that the plugin admitted. A plugin that admits signed artifacts verifies them at admission and at each evaluation. |
@@ -136,10 +136,10 @@ grant.
 
 ```text
  license-resolver ──is_licensed──▶ ┌──────────────────────────────────────────────┐ ◀──REST/SDK── License Management,
-                                   │ api: resolver adapter │ management API (PDP) │               Subscriptions
+                                   │ api: resolver adapter │ management API       │               Subscriptions
                                    ├──────────────────────────────────────────────┤
                                    │ domain: check service · evaluator ·          │◀── linked evaluator crate
-                                   │         grant service ·                      │◀── linked admission plugin
+                                   │         grant service (PDP) ·                │◀── linked admission plugin
                                    │         admission boundary                   │
                                    ├──────────────────────────────────────────────┤
                                    │ infra: store (SecureORM) ·                   │
@@ -151,8 +151,8 @@ grant.
 
 | Layer | Responsibility | Technology |
 |-------|----------------|------------|
-| API | Resolver plugin adapter, REST operations and SDK client, PDP enforcement point, Problem mapping | ToolKit `OperationBuilder`, `PolicyEnforcer`, `toolkit-canonical-errors` |
-| Domain | Grant model and invariants, lifecycle verbs, check service, evaluator trait and reasons, admission boundary | Rust |
+| API | Resolver plugin adapter, REST operations and SDK client, Problem mapping | ToolKit `OperationBuilder`, `toolkit-canonical-errors` |
+| Domain | Grant model and invariants, lifecycle verbs, PDP enforcement point, check service, evaluator trait and reasons, admission boundary | Rust, `PolicyEnforcer` |
 | Infrastructure | Repositories, idempotency records, and plugin material. Audit outbox and adapter. Registry, tenant-resolver, and PDP clients. Telemetry. | SecureORM over PostgreSQL, `types-registry-sdk`, `tenant-resolver-sdk`, `authz-resolver-sdk`, OTel |
 | Plugins | Admission plugins and the evaluator as separate crates | Rust crates under `plugins/`. The binary links one admission plugin and one evaluator. |
 
@@ -459,13 +459,17 @@ the reported reason comes from the candidate that reached the latest step. Candi
    selects the reason in this order: `subject_not_bound` if the tenant holds a grant on the resource that is not
    terminated and whose window has not ended. Else the reason of the grant that matches the filter and ended last:
    `expired` or `grace_expired` when its window ended, `terminated` with the termination reason when a decision ended
-   it. Else `no_grant_for_resource`. Candidate order: by the first filter that matches, then by `id`.
+   it. Else `no_grant_for_resource`. Candidate order: first the active grants whose window has started, then the
+   others, which can only give a reason to deny; in each part by the first filter that matches, then by `id`. The check
+   service reads at most the configured number of candidates in this order, and the later ones take no part.
 2. Evaluation: on the stored fields, the evaluator checks the state of the root and of the candidate, the validity
    window of the candidate, and the conditions of the candidate against the `metadata` of the request. Delegation
    already made the candidate a subset of every grant above it. The first failed check denies the candidate with its
    reason. A candidate in its grace period passes and marks the decision with grace.
-3. Verification: for the first candidate that passes evaluation, the check service calls `verify` of the linked plugin
-   with the id and the evidence of its root. A denial reason denies the candidate. A revocation state denies it as
+3. Verification: for the first candidate that passes evaluation, the check service reads the evidence of its root.
+   If another plugin admitted this evidence → `chain_invalid`: a plugin verifies only its own evidence. Else the check
+   service calls `verify` of the linked plugin with the id and the evidence of the root. A denial reason denies the
+   candidate. A revocation state denies it as
    `suspended` or `terminated`. If `verify` returns root fields and the candidate is the root, the check service checks
    that their resource covers the request, that their holder is `request.context.tenant`, and that the type of the
    stored binding is their subject type or derives from it → `chain_invalid`. The evaluator evaluates it again on these
@@ -491,7 +495,7 @@ binding in this order:
 2. The type of the binding is the tenant Subject type or derives from it. Its id is `request.context.tenant`.
 
 A GTS id of a derived type contains the ids of its base types. Thus the filter needs no registry call at check time.
-At init, the gear checks that each type that the evaluator names is registered. A missing type stops init.
+At start, the gear checks that each type that the evaluator names is registered. A missing type stops the start.
 
 **Type comparison**: the check compares GTS type ids by the derived-type coverage rule of the GTS specification,
 without minor versions. Thus a grant still covers a request after an additive minor revision of a contract. A subject
@@ -511,7 +515,7 @@ the ids and does not need the registry.
 | `duplicated`                                     | From the plugin: the evidence does not name the root. From the check service, when `verify` returned fields: a link is not the only live child of its parent, or the parent binding does not name the link, or the store holds more than one live row with the id of the root. |
 | `awaiting_acceptance`, `suspended`, `terminated` | The root or the candidate is in that state, stored or by the revocation state from `verify`. Diagnostics carry the termination reason.                                                                      |
 | `not_yet_valid`, `expired`, `grace_expired`      | The effective window fails at the evaluation instant                                                                                                                                                        |
-| `chain_invalid`                                  | From the check service, when `verify` returned fields: the sub-grant is not a subset of the root fields, the root fields do not match the request or the type of the stored binding, or the stored binding is not one that the root fields permit. Or a parent link of its chain is broken. |
+| `chain_invalid`                                  | From the check service, when `verify` returned fields: the sub-grant is not a subset of the root fields, the root fields do not match the request or the type of the stored binding, or the stored binding is not one that the root fields permit. Or a parent link of its chain is broken. Or another plugin admitted the evidence of the root. |
 | `condition_unmet`                                | A condition is false, or its attribute is absent                                                                                                                                                            |
 | `condition_budget_exceeded`                      | Condition evaluation exceeded the per-check budget in evaluation steps                                                                                                                                      |
 
@@ -525,7 +529,7 @@ candidate tenant as `tenant-resolver` returns it.
  license-resolver ──▶ [resolver adapter] ──▶ [check service] ──────▶ [evaluator] ◀── linked evaluator crate
                                                ▲    │    │                ▲
  REST / SDK ──▶ [management API] ──────────────┘    │    │ verify         │
-    (PDP)            │                              │    │                │
+                     │                              │    │                │
                      ▼                              │    │                │
               [grant service] ──────────────────────┼────┼────────────────┘
                 │      │                            │    │
@@ -603,8 +607,8 @@ candidate tenant as `tenant-resolver` returns it.
   returns. Each operation is one transaction. The transaction holds the row lock of every grant whose binding changes
   and records the idempotency result. Writes the audit events to the outbox in the same transaction. A rejection at
   import writes its event in a transaction of its own.
-- **Boundaries**: Creates no root itself. Roots go through the admission boundary inside the same transaction. The API
-  layer calls the PDP before the service runs. The service never calls the PDP.
+- **Boundaries**: Creates no root itself. Roots go through the admission boundary inside the same transaction. Asks
+  the PDP for each operation and passes its constraints to the store as the `AccessScope`.
 - **Related**: Calls `cpt-cf-license-enforcement-component-admission` for roots. Calls
   `cpt-cf-license-enforcement-component-evaluator` to validate conditions and to evaluate recipient rules. Writes
   `cpt-cf-license-enforcement-component-store`.
@@ -632,9 +636,8 @@ candidate tenant as `tenant-resolver` returns it.
 - [ ] `p1` - **ID**: `cpt-cf-license-enforcement-component-management-api`
 
 - **Why**: The REST and SDK surface, with one authorization and one semantics.
-- **Scope**: the routes of the REST projection and the in-process `LicenseEnforcementApi`. A `PolicyEnforcer` decision per
-  operation, with the tenant from `SecurityContext`. Passes the PDP constraints as the `AccessScope` of the
-  transaction. Idempotency token handling. `Problem` mapping. Validates a check-explain request against the registered
+- **Scope**: the routes of the REST projection and the in-process `LicenseEnforcementApi`. Passes `SecurityContext`
+  to the grant service. `Problem` mapping. Validates a check-explain request against the registered
   contracts and `admitted_subjects`, as the `license-resolver` gateway does for a check.
 - **Boundaries**: No domain rules. Rejects as `unimplemented` an operation that needs an intake that the linked plugin
   does not declare.
@@ -662,8 +665,9 @@ candidate tenant as `tenant-resolver` returns it.
 - **Scope**: Repositories over §3.7 with `AccessScope`-scoped queries. The candidate-and-root query. The chain read of
   the check service. The partial unique index that holds I3. The retention sweeper for terminated grants. It deletes a
   terminated grant only with its whole subtree, and only when every grant in the subtree is terminated.
-- **Boundaries**: No business rules beyond constraints. No cross-tenant query except the named grantor query and the
-  chain read of the check service.
+- **Boundaries**: No business rules beyond constraints. `AccessScope` applies to the rows that a tenant holds. Plugin
+  material belongs to no tenant, and evidence is unique across tenants, so the queries on them take no scope. The only
+  other cross-tenant reads are the named grantor query and the chain read of the check service.
 - **Related**: Written by `cpt-cf-license-enforcement-component-grant-service`. Read by
   `cpt-cf-license-enforcement-component-check-service` and `cpt-cf-license-enforcement-component-admission`.
 
@@ -709,8 +713,8 @@ The plugin is a separate crate that depends only on the SDK. It registers itself
 
 **Evaluator** — `GrantEvaluatorV1` (`cpt-cf-license-enforcement-adr-compile-time-evaluator`):
 
-- `candidate_filter(request)` returns an ordered list of binding filters. Each filter is a GTS type pattern and a
-  binding id.
+- `candidate_filter(request)` returns an ordered list of binding filters. Each filter is a GTS type pattern, a
+  binding id, and whether a binding of a derived type matches.
 - `evaluate(request, candidate, root, instant)` returns pass, pass in grace, or a denial reason.
 - `validate(conditions, schema)` returns the violations of conditions or recipient rules against a contract or
   projection schema.
@@ -721,16 +725,16 @@ The evaluator is a separate crate that depends only on the SDK. It registers its
 
 **Management** — REST under `/license-enforcement/v1`, and the same operations on `LicenseEnforcementApi`:
 
-| Method | Path                                                                                            | Description                                                                                                                                                                                               | Stability |
-|--------|-------------------------------------------------------------------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
-| `POST` | `/packs`, `/grants`                                                                             | Issue through the `issue` intake. `unimplemented` without that intake.                                                                                                                                    | unstable  |
-| `POST` | `/evidence`                                                                                     | Submit evidence (base64 in JSON) to the linked plugin through the `import` intake. `unimplemented` without that intake.                                                                                   | unstable  |
-| `GET`  | `/packs`, `/packs/{id}`, `/grants`, `/grants/{id}`, `/delegations/{id}`                         | Read and list in the scope that the PDP gives. Lists take OData `$filter` and `$orderby` on resource type, state, subject, pack, and parent grant, and a cursor. A filter only narrows a list. Packs carry unbound, bound, and delegated counts per resource. | unstable  |
-| `POST` | `/packs/{id}/{suspend,reinstate,revoke,renew,replace}`                                          | Pack verbs, atomic over members. `unimplemented` without the `issue` intake.                                                                                                                              | unstable  |
-| `POST` | `/grants/{id}/{accept,reject,suspend,reinstate,revoke,renew,bind,unbind,return,recall,replace}` | Grant verbs. `replace` takes successors through the `issue` intake. Without the `issue` intake, replacement is evidence supersession, and the API rejects root `suspend`, `reinstate`, `revoke`, `renew`. | unstable  |
-| `POST` | `/delegations`                                                                                  | Delegate N unbound grants (by ids, or by resource and count) to a recipient tenant in one transaction                                                                                                     | unstable  |
-| `POST` | `/delegations/{id}/{accept,reject,return,recall}`                                               | Delegation verbs, atomic over its sub-grants                                                                                                                                                              | unstable  |
-| `POST` | `/check-explain`                                                                                | Decision, reason, matched grant, and diagnostics that the check would produce                                                                                                                             | unstable  |
+| Method | Path                                                                                            | Description                                                                                                                                                                                                                                                                         | Stability |
+|--------|-------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|-----------|
+| `POST` | `/packs`, `/grants`                                                                             | Issue through the `issue` intake. `unimplemented` without that intake.                                                                                                                                                                                                              | unstable  |
+| `POST` | `/evidence`                                                                                     | Submit evidence (base64 in JSON) to the linked plugin through the `import` intake. `unimplemented` without that intake.                                                                                                                                                             | unstable  |
+| `GET`  | `/packs`, `/packs/{id}`, `/grants`, `/grants/{id}`, `/delegations/{id}`                         | Read and list in the scope that the PDP gives. Lists take OData `$filter` on id, resource type, state, bound subject, pack, and parent grant, `$orderby` on the id only, and a cursor. A filter only narrows a list. Packs carry unbound, bound, and delegated counts per resource. | unstable  |
+| `POST` | `/packs/{id}/{suspend,reinstate,revoke,renew,replace}`                                          | Pack verbs, atomic over members. `unimplemented` without the `issue` intake.                                                                                                                                                                                                        | unstable  |
+| `POST` | `/grants/{id}/{accept,reject,suspend,reinstate,revoke,renew,bind,unbind,return,recall,replace}` | Grant verbs. `replace` takes successors through the `issue` intake. Without the `issue` intake, replacement is evidence supersession, and the API rejects root `suspend`, `reinstate`, `revoke`, `renew`.                                                                           | unstable  |
+| `POST` | `/delegations`                                                                                  | Delegate N unbound grants (by ids, or by resource and count) to a recipient tenant in one transaction                                                                                                                                                                               | unstable  |
+| `POST` | `/delegations/{id}/{accept,reject,return,recall}`                                               | Delegation verbs, atomic over its sub-grants                                                                                                                                                                                                                                        | unstable  |
+| `POST` | `/check-explain`                                                                                | Decision, reason, matched grant, and diagnostics that the check would produce                                                                                                                                                                                                       | unstable  |
 
 Reads return the stored state. Check-explain returns the state that a check derives. Every mutating request carries an
 idempotency token and may carry `expected_version`. Verb availability per actor follows PRD
@@ -738,21 +742,22 @@ idempotency token and may carry `expected_version`. Verb availability per actor 
 
 **Error model** — domain errors map to canonical errors before the wire:
 
-| Domain error                     | Canonical error       | When                                                                                                                                                                                                                                       |
-|----------------------------------|-----------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `NotFound`                       | `not_found`           | grant, pack, delegation, or evidence not visible in the scope of the caller                                                                                                                                                                |
-| `PermissionDenied`               | `permission_denied`   | PDP denies the verb                                                                                                                                                                                                                        |
-| `InvalidArgument(violations)`    | `invalid_argument`    | unknown or non-derived type id, subject type not admitted, condition or recipient rule fails schema validation, sub-grant not a subset, recipient fails rules, malformed evidence, check-explain request does not conform to its contracts |
-| `InvalidTransition`              | `failed_precondition` | verb not allowed from the current state, `return` or `delegate` of a bound grant, recipient not a descendant                                                                                                                               |
-| `BindingsWithoutSuccessor(list)` | `failed_precondition` | replacement or supersession cannot carry every binding, or a delegation does not fit its updated root                                                                                                                                      |
-| `VersionMismatch`                | `aborted`             | `expected_version` differs                                                                                                                                                                                                                 |
-| `AdmissionConflict`              | `aborted`             | a concurrent admission changed the plugin material that `admit` read. The caller retries the request with the same idempotency token.                                                                                                      |
-| `IdempotencyConflict`            | `already_exists`      | same token, different payload                                                                                                                                                                                                              |
-| `EvidenceRejected(reason)`       | `invalid_argument`    | plugin rejects: verification failure, replay, version regression                                                                                                                                                                           |
-| `EvidenceChainBroken`            | `failed_precondition` | the evidence that new evidence replaces is not in the store, or other evidence already replaced it                                                                                                                                         |
-| `EvaluationTimeout`              | `deadline_exceeded`   | the wall-clock guard of condition evaluation expires during a check or check-explain. The resolver fails closed. It is not a decision.                                                                                                     |
-| `IntakeNotServed`                | `unimplemented`       | the operation needs an intake that the linked plugin does not declare                                                                                                                                                                      |
-| `DependencyUnavailable`          | `service_unavailable` | PDP, registry, tenant-resolver, or store cannot answer. The module refuses the operation.                                                                                                                                                  |
+| Domain error                     | Canonical error       | When                                                                                                                                                                                                                                                                                          |
+|----------------------------------|-----------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `NotFound`                       | `not_found`           | grant, pack, delegation, or evidence not visible in the scope of the caller                                                                                                                                                                                                                   |
+| `PermissionDenied`               | `permission_denied`   | PDP denies the verb                                                                                                                                                                                                                                                                           |
+| `InvalidArgument(violations)`    | `invalid_argument`    | unknown or non-derived type id, subject type not admitted, condition or recipient rule fails schema validation, sub-grant not a subset, recipient fails rules, malformed evidence, check-explain request does not conform to its contracts, `issue` token reused after its idempotency window |
+| `InvalidTransition`              | `failed_precondition` | verb not allowed from the current state, `return` or `delegate` of a bound grant, recipient not a descendant                                                                                                                                                                                  |
+| `BindingsWithoutSuccessor(list)` | `failed_precondition` | replacement or supersession cannot carry every binding, or a delegation does not fit its updated root                                                                                                                                                                                         |
+| `VersionMismatch`                | `aborted`             | `expected_version` differs                                                                                                                                                                                                                                                                    |
+| `AdmissionConflict`              | `aborted`             | a concurrent admission changed the plugin material that `admit` read. The caller retries the request with the same idempotency token.                                                                                                                                                         |
+| `IdempotencyConflict`            | `already_exists`      | same token, different payload                                                                                                                                                                                                                                                                 |
+| `RootAlreadyAdmitted(id)`        | `already_exists`      | the evidence names a root whose id is already stored; a retry does not help                                                                                                                                                                                                                   |
+| `EvidenceRejected(reason)`       | `invalid_argument`    | plugin rejects: verification failure, replay, version regression                                                                                                                                                                                                                              |
+| `EvidenceChainBroken`            | `failed_precondition` | the evidence that new evidence replaces is not in the store, or other evidence already replaced it                                                                                                                                                                                            |
+| `EvaluationTimeout`              | `deadline_exceeded`   | the wall-clock guard of condition evaluation expires during a check or check-explain. The resolver fails closed. It is not a decision.                                                                                                                                                        |
+| `IntakeNotServed`                | `unimplemented`       | the operation needs an intake that the linked plugin does not declare                                                                                                                                                                                                                         |
+| `DependencyUnavailable`          | `service_unavailable` | PDP, registry, tenant-resolver, or store cannot answer. The module refuses the operation.                                                                                                                                                                                                     |
 
 ### 3.4 Internal Dependencies
 
@@ -841,9 +846,9 @@ sequenceDiagram
     participant S as Store
     participant AU as Audit plugin
     M ->> API: POST /delegations (recipient, resource type, count, token)
-    API ->> P: decide(delegate, tenant from SecurityContext)
-    P -->> API: permit + constraints
-    API ->> G: delegate(scope, recipient, count)
+    API ->> G: delegate(recipient, count)
+    G ->> P: decide(delegate, tenant from SecurityContext)
+    P -->> G: permit + constraints
     G ->> T: is_ancestor(holder, recipient), get_tenant(recipient)
     T -->> G: descendant + recipient tenant (else InvalidTransition)
     G ->> E: matches(recipient rules, recipient projection)
@@ -853,9 +858,9 @@ sequenceDiagram
     S -) AU: audit events (outbox, after commit)
     G -->> M: delegation id, sub-grants
     M ->> API: POST /delegations/{id}/recall (token)
-    API ->> P: decide(recall, tenant from SecurityContext)
-    P -->> API: permit + constraints
     API ->> G: recall(delegation)
+    G ->> P: decide(recall, tenant from SecurityContext)
+    P -->> G: permit + constraints
     G ->> S: tx: lock parents, terminate sub-grants and descendants, unbind chain ends, bindings to none, audit outbox
     S -) AU: audit events (outbox, after commit)
 ```
@@ -886,22 +891,22 @@ sequenceDiagram
     participant S as Store
     participant AU as Audit plugin
     B ->> API: issue_pack(params, token)
-    API ->> P: decide(issue, tenant from SecurityContext)
-    P -->> API: permit + constraints
-    API ->> S: idempotency lookup(tenant, token)
+    API ->> G: issue(params, token)
+    G ->> P: decide(issue, holder)
+    P -->> G: permit + constraints
+    G ->> S: idempotency lookup(tenant, token)
     alt replay, same payload
-        API -->> B: stored response
+        G -->> B: stored response
     else first call
-        API ->> G: issue(params)
-        G ->> TR: resolve types and contract schemas
-        G ->> E: validate(conditions, schema)
         G ->> AD: admit(params)
         AD ->> PL: admit(params, instant, material)
         PL -->> AD: evidence + roots
         AD -->> G: evidence + roots
+        G ->> TR: resolve the types and contract schemas of the roots
+        G ->> E: validate(conditions of the roots, schema)
         G ->> S: tx: evidence, pack, grants, idempotency, audit outbox
         S -) AU: audit events (outbox, after commit)
-        API -->> B: pack, grants
+        G -->> B: pack, grants
     end
 ```
 
@@ -928,9 +933,9 @@ sequenceDiagram
     participant S as Store
     participant AU as Audit plugin
     O ->> API: POST /evidence (bytes, token)
-    API ->> P: decide(import, tenant from SecurityContext)
-    P -->> API: permit + constraints
     API ->> G: import(bytes)
+    G ->> P: decide(import, tenant from SecurityContext)
+    P -->> G: permit + constraints
     G ->> AD: admit(bytes)
     AD ->> PL: admit(bytes, instant, material)
     PL -->> AD: evidence + roots | plugin material | rejection
@@ -956,7 +961,9 @@ the stored models and the fields that the design needs. It is not a complete sch
   version.
   - A partial unique index on the parent of live grants holds at most one live child (I3).
   - The check reads candidates through two indexes: by tenant and resource type, and by tenant and bound subject.
-    Both indexes cover only grants that are not terminated, and include the end of the window.
+    Both indexes cover only grants that are not terminated. The resource index includes the end of the window. The
+    subject index orders by id instead: one subject has few grants on one resource, so the check tests the end of the
+    window on these rows.
 - **Packs.** Id, holder tenant, version.
 - **Evidence.** Id, plugin id, intake, the exact bytes that the plugin admitted, replay key, external id, replaced
   evidence. The replay key, the external id, and the replaced evidence are each unique per plugin.

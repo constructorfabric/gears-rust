@@ -28,9 +28,10 @@ use super::ports::{
     CheckOutcome, ContractRegistry, ContractRegistryError, LicenseMetrics, ViolationKind,
 };
 pub use crate::test_contracts::{
-    BARE_RESOURCE, MODEL_USAGE_RESOURCE, RESOURCE_BASE, SUBJECT_BASE, TENANT_SUBJECT,
-    TestModelUsageResourceV1, USER_SUBJECT, bare_resource_schema, model_usage_schema,
-    resource_base_schema, subject_base_schema, tenant_subject_schema, user_subject_schema,
+    ADMIN_SUBJECT, BARE_RESOURCE, MODEL_USAGE_RESOURCE, RESOURCE_BASE, SUBJECT_BASE,
+    TENANT_SUBJECT, TestModelUsageResourceV1, USER_SUBJECT, admin_subject_schema,
+    bare_resource_schema, model_usage_schema, resource_base_schema, subject_base_schema,
+    tenant_subject_schema, user_subject_schema,
 };
 
 #[must_use]

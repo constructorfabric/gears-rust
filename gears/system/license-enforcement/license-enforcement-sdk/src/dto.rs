@@ -1,6 +1,6 @@
 //! Request and response types of [`LicenseEnforcementApi`](crate::LicenseEnforcementApi).
 //!
-//! Every mutation carries an `idempotency_token`. A replay with the same token
+//! Every mutation carries a non-empty `idempotency_token`. A replay with the same token
 //! and payload returns the first result; a different payload is a conflict.
 //! `expected_version`, when set, must equal the current version.
 
@@ -192,8 +192,10 @@ pub struct Delegation {
 
 /// `OData` query of a list, as the client sends it. On the server the gear
 /// binds these keys with the platform `OData` extractor, which also accepts
-/// `$top` and `$skiptoken` and rejects unknown `$` options. `$filter` and
-/// `$orderby` address the fields of [`GrantFilterField`] or [`PackFilterField`].
+/// `$top` and `$skiptoken` and rejects unknown `$` options. `$filter`
+/// addresses the fields of [`GrantFilterField`] or [`PackFilterField`]; a type
+/// field takes only `eq`, `ne`, and `in`, and compares without minor versions.
+/// `$orderby` addresses `id` only.
 #[derive(
     Debug,
     Clone,
@@ -209,7 +211,7 @@ pub struct ListQuery {
     /// `OData` filter expression.
     #[serde(rename = "$filter", default, skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
-    /// `OData` order, for example `resource_type asc`.
+    /// `OData` order, for example `id desc`.
     #[serde(rename = "$orderby", default, skip_serializing_if = "Option::is_none")]
     pub orderby: Option<String>,
     /// Page size.
@@ -224,6 +226,9 @@ pub struct ListQuery {
 #[derive(ODataFilterable)]
 #[allow(dead_code)]
 struct GrantQuery {
+    /// Grant id. The default order and the cursor tiebreaker.
+    #[odata(filter(kind = "Uuid"))]
+    pub id: Uuid,
     /// Resource contract type.
     #[odata(filter(kind = "String"))]
     pub resource_type: String,
@@ -232,10 +237,10 @@ struct GrantQuery {
     pub state: String,
     /// Type of the bound subject.
     #[odata(filter(kind = "String"))]
-    pub subject_type: String,
+    pub binding_subject_type: String,
     /// Id of the bound subject.
     #[odata(filter(kind = "String"))]
-    pub subject_id: String,
+    pub binding_subject_id: String,
     /// Pack of the grant.
     #[odata(filter(kind = "Uuid"))]
     pub pack_id: Uuid,

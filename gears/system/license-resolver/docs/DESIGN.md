@@ -260,7 +260,7 @@ Rust **value objects** (the SDK models passed in and out of a check).
 | `type`                      | GTS type id, **required**          | The derived Resource contract this object instantiates                                      |
 | `id`                        | optional — UUID or well-known name | Absent = whole-type check (e.g. on `POST`); how it is answered is the backend's policy      |
 | `metadata`                  | object                             | Resource properties, conforming to the derived type's schema                                |
-| *trait* `admitted_subjects` | set of Subject contract types      | The `gts.cf.core.lic.subj.v1~*` types this Resource may be checked against (`x-gts-traits`). A derived Resource type **MUST** declare it: an empty list admits no subject at all, so a contract that omits it inherits the base's `[]` and rejects every check |
+| *trait* `admitted_subjects` | set of Subject contract types      | The `gts.cf.core.lic.subj.v1~*` types this Resource may be checked against (`x-gts-traits`). A derived Resource type **MUST** declare it: an empty list admits no subject at all, so a contract that omits it inherits the base's `[]` and rejects every check. A Subject type that derives from an admitted type is admitted (GTS implicit derived-type coverage); a derived Subject type uses the id space of its base |
 
 **Derived types — a Gear's licensing surface** (example, LLM gateway):
 

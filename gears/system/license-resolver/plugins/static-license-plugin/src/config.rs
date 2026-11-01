@@ -1,7 +1,7 @@
 //! Configuration for the static license resolver plugin.
 
 use anyhow::{Context, bail};
-use gts::{GtsSchema, GtsTypeId};
+use gts::{GtsId, GtsIdPattern, GtsSchema, GtsTypeId};
 use license_resolver_sdk::LicenseCheckRequest;
 use license_resolver_sdk::gts::{LicenseResourceV1, LicenseSubjectV1};
 use serde::Deserialize;
@@ -96,7 +96,7 @@ impl GrantRule {
     #[must_use]
     pub fn matches(&self, request: &LicenseCheckRequest) -> bool {
         self.resource_type == request.resource.gts_type.as_ref()
-            && self.subject_type == request.subject.gts_type.as_ref()
+            && covers_subject(&self.subject_type, request.subject.gts_type.as_ref())
             && matches_instance(self.resource_id.as_deref(), request.resource.id.as_deref())
             && matches_instance(self.subject_id.as_deref(), request.subject.id.as_deref())
             && self
@@ -118,6 +118,15 @@ impl GrantRule {
             "subject_type",
         )
     }
+}
+
+/// The rule's subject type covers the request's subject type and every type
+/// derived from it (GTS implicit derived-type coverage). The resource type
+/// matches exactly: a derived resource is another product.
+fn covers_subject(rule_type: &str, request_type: &str) -> bool {
+    GtsId::try_new(request_type).is_ok_and(|subject| {
+        GtsIdPattern::try_new(rule_type).is_ok_and(|pattern| subject.matches_pattern(&pattern))
+    })
 }
 
 /// An unset id in a rule covers any instance; a set one must be exactly the

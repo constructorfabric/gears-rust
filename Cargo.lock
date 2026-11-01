@@ -3404,6 +3404,77 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-le-default-evaluator"
+version = "0.1.0"
+dependencies = [
+ "cf-gears-license-enforcement-sdk",
+ "cf-gears-license-resolver-sdk",
+ "cf-gears-toolkit-canonical-errors",
+ "gts",
+ "serde_json",
+ "time",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-le-issue-admission-plugin"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "cf-gears-license-enforcement-sdk",
+ "gts",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "cf-gears-license-enforcement"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-lc-rs",
+ "axum",
+ "cf-gears-authz-resolver",
+ "cf-gears-authz-resolver-sdk",
+ "cf-gears-le-default-evaluator",
+ "cf-gears-le-issue-admission-plugin",
+ "cf-gears-license-enforcement-sdk",
+ "cf-gears-license-resolver-sdk",
+ "cf-gears-tenant-resolver",
+ "cf-gears-tenant-resolver-sdk",
+ "cf-gears-test-containers",
+ "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-db",
+ "cf-gears-toolkit-db-macros",
+ "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-odata",
+ "cf-gears-toolkit-security",
+ "cf-gears-types-registry",
+ "cf-gears-types-registry-sdk",
+ "gts",
+ "hex",
+ "http",
+ "inventory",
+ "sea-orm",
+ "sea-orm-migration",
+ "serde",
+ "serde_json",
+ "testcontainers",
+ "testcontainers-modules",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cf-gears-license-enforcement-sdk"
 version = "0.1.0"
 dependencies = [

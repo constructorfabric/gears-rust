@@ -8,6 +8,9 @@
 //! - `FailedPrecondition` → `violations[].type` is [`PRECONDITION_TYPE`],
 //!   `violations[].subject` from [`precondition`];
 //! - `Aborted` → `reason` from [`aborted`];
+//! - `AlreadyExists` → `resource` is `idempotency_token` for a token reused
+//!   with another payload, else the id of a root grant that the evidence names
+//!   and the gear already stores;
 //! - `Unimplemented` → the linked plugin does not serve the intake that the
 //!   operation needs (`issue` or `import`). The binary cannot serve it at all,
 //!   so no discriminator is needed.
@@ -72,4 +75,18 @@ pub mod reason {
     pub const EVIDENCE_VERSION_REGRESSION: &str = "EVIDENCE_VERSION_REGRESSION";
     /// The check-explain request does not conform to its contracts.
     pub const REQUEST_NONCONFORMING: &str = "REQUEST_NONCONFORMING";
+    /// A required field is empty, for example no grant to issue.
+    pub const REQUIRED: &str = "REQUIRED";
+    /// The window does not satisfy `not_before < expires_at <= grace_until`,
+    /// has ended, or has a time outside years 0..=9999 in UTC.
+    pub const INVALID_WINDOW: &str = "INVALID_WINDOW";
+    /// The holder is not the caller's tenant or its descendant.
+    pub const HOLDER_NOT_IN_SUBTREE: &str = "HOLDER_NOT_IN_SUBTREE";
+    /// An id or a token contains a NUL character.
+    pub const INVALID_CHARACTER: &str = "INVALID_CHARACTER";
+    /// A field is over its limit in [`limits`](crate::limits).
+    pub const TOO_LARGE: &str = "TOO_LARGE";
+    /// The idempotency token already issued grants, and its idempotency window
+    /// is over: the first result is gone. Retry with a new token.
+    pub const TOKEN_REUSED: &str = "TOKEN_REUSED";
 }
