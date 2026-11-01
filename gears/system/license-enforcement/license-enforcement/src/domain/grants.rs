@@ -4,7 +4,6 @@ use std::sync::Arc;
 
 use authz_resolver_sdk::pep::ResourceType;
 use authz_resolver_sdk::{AccessRequest, PolicyEnforcer};
-use aws_lc_rs::digest::{SHA256, digest};
 use gts::GtsTypeId;
 use license_enforcement_sdk::dto::IssueResult;
 use license_enforcement_sdk::error::{precondition, reason};
@@ -27,6 +26,7 @@ use toolkit_canonical_errors::FieldViolation;
 use toolkit_db::DBProvider;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
+use toolkit_security::crypto::hash::Sha256;
 use toolkit_security::{SecurityContext, pep_properties};
 use uuid::Uuid;
 
@@ -61,7 +61,7 @@ mod actions {
 fn payload_hash(op: &str, payload: &impl Serialize) -> Result<String, DomainError> {
     let bytes = serde_json::to_vec(&(op, payload))
         .map_err(|e| DomainError::Internal(format!("cannot hash the request: {e}")))?;
-    Ok(hex::encode(digest(&SHA256, &bytes)))
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 fn too_large(field: impl Into<String>, len: usize, max: usize, out: &mut Vec<FieldViolation>) {

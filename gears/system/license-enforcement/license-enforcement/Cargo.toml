@@ -46,7 +46,6 @@ sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
 
 anyhow = { workspace = true }
-aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
