@@ -1711,7 +1711,7 @@ dependencies = [
  "http",
  "http-body-util",
  "inventory",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "parking_lot",
@@ -1800,7 +1800,7 @@ dependencies = [
  "cf-gears-toolkit-gts",
  "cf-gears-toolkit-security",
  "gts",
- "jsonschema 0.40.2",
+ "jsonschema",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -2600,7 +2600,7 @@ dependencies = [
  "hex",
  "http",
  "inventory",
- "jsonschema 0.40.2",
+ "jsonschema",
  "proptest",
  "reqwest",
  "sea-orm",
@@ -2630,7 +2630,7 @@ dependencies = [
  "cf-gears-toolkit-macros",
  "cf-gears-toolkit-security",
  "gts",
- "jsonschema 0.40.2",
+ "jsonschema",
  "schemars 1.2.3",
  "serde",
  "serde_json",
@@ -2657,7 +2657,7 @@ dependencies = [
  "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "rand 0.10.3",
@@ -2781,7 +2781,7 @@ dependencies = [
  "gts",
  "http",
  "http-body-util",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "rand 0.10.3",
@@ -2861,7 +2861,7 @@ dependencies = [
  "futures-util",
  "gts",
  "http-body-util",
- "jsonschema 0.40.2",
+ "jsonschema",
  "rusqlite",
  "schemars 1.2.3",
  "sea-orm",
@@ -3236,7 +3236,7 @@ dependencies = [
  "gts",
  "hex",
  "http",
- "jsonschema 0.40.2",
+ "jsonschema",
  "sea-orm",
  "sea-orm-migration",
  "serde",
@@ -3449,7 +3449,7 @@ dependencies = [
  "cf-gears-types-registry-sdk",
  "gts",
  "inventory",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "schemars 1.2.3",
@@ -4072,7 +4072,7 @@ dependencies = [
  "http",
  "http-body-util",
  "inventory",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "opentelemetry_sdk",
  "sea-orm",
@@ -4224,7 +4224,7 @@ dependencies = [
  "gts",
  "http",
  "inventory",
- "jsonschema 0.40.2",
+ "jsonschema",
  "opentelemetry",
  "regex",
  "sea-orm",
@@ -4256,7 +4256,7 @@ dependencies = [
  "cf-gears-toolkit-odata-macros",
  "cf-gears-toolkit-security",
  "gts-id",
- "jsonschema 0.40.2",
+ "jsonschema",
  "secrecy",
  "serde",
  "serde_json",
@@ -6921,16 +6921,6 @@ dependencies = [
 
 [[package]]
 name = "fraction"
-version = "0.15.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0f158e3ff0a1b334408dc9fb811cd99b446986f4d8b741bb08f9df1604085ae7"
-dependencies = [
- "lazy_static",
- "num",
-]
-
-[[package]]
-name = "fraction"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e246562084dde8ebbcc943b261c406ce4f68e5032ec28029a251a47d6a295500"
@@ -7280,10 +7270,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "289c22c51cf505ecca932eb353f1520433601880f3280ce703d3e9a1a6d860e2"
 dependencies = [
  "gts-id",
- "jsonschema 0.58.6",
+ "jsonschema",
  "jsonschema-regex",
  "num-cmp",
- "referencing 0.58.6",
+ "referencing",
  "regex",
  "schemars 1.2.3",
  "serde",
@@ -8352,33 +8342,6 @@ dependencies = [
 
 [[package]]
 name = "jsonschema"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba783d17473c27cfd4d1d72785dc1c26d5faba8072f50fec4ebea179bec8f33d"
-dependencies = [
- "ahash 0.8.12",
- "bytecount",
- "data-encoding",
- "email_address",
- "fancy-regex 0.17.0",
- "fraction 0.15.3",
- "getrandom 0.3.4",
- "idna",
- "itoa",
- "num-cmp",
- "num-traits",
- "percent-encoding",
- "referencing 0.40.2",
- "regex",
- "regex-syntax",
- "serde",
- "serde_json",
- "unicode-general-category",
- "uuid-simd",
-]
-
-[[package]]
-name = "jsonschema"
 version = "0.58.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1"
@@ -8388,7 +8351,7 @@ dependencies = [
  "data-encoding",
  "email_address",
  "fancy-regex 0.19.2",
- "fraction 0.17.0",
+ "fraction",
  "getrandom 0.3.4",
  "itoa",
  "jsonschema-regex",
@@ -8396,7 +8359,7 @@ dependencies = [
  "num-cmp",
  "num-traits",
  "percent-encoding",
- "referencing 0.58.6",
+ "referencing",
  "regex",
  "serde",
  "serde_json",
@@ -8422,7 +8385,7 @@ checksum = "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96"
 dependencies = [
  "ahash 0.8.12",
  "bytecount",
- "fraction 0.17.0",
+ "fraction",
  "getrandom 0.3.4",
  "num-cmp",
  "num-traits",
@@ -11069,21 +11032,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "referencing"
-version = "0.40.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bef39a30a317e883d1ef4c43aa849f90f480d90bb24904fd38266e61d6be58f2"
-dependencies = [
- "ahash 0.8.12",
- "fluent-uri",
- "getrandom 0.3.4",
- "hashbrown 0.16.1",
- "parking_lot",
- "percent-encoding",
- "serde_json",
 ]
 
 [[package]]
