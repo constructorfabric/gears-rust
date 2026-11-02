@@ -377,8 +377,7 @@ async fn overlap_claim_collision_is_nonfatal_and_only_release_is_mutable() -> an
 #[ignore = "requires Docker (testcontainers)"]
 #[expect(
     clippy::too_many_lines,
-    reason = "one fixture walked through every acceptance, totals, reflection and projection key \
-              in order; the idempotency suite's long fault scenarios are the precedent"
+    reason = "One ordered scenario over real keys across several committed transactions"
 )]
 async fn acceptance_totals_reflections_and_projection_have_real_keys() -> anyhow::Result<()> {
     let pg = Pg::new().await?;
@@ -608,7 +607,8 @@ async fn acceptance_totals_reflections_and_projection_have_real_keys() -> anyhow
         .is_err()
     );
     assert!(pg.sql(&format!("INSERT INTO bss_orders__line_fulfillment VALUES('{}','{}',4,'activated','{}',NULL,now())",u(1),u(101),u(200))).await.is_err()); // no committed line
-    pg.sql(&format!("INSERT INTO bss_orders__order_line(order_id,version,line_id,plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_kind,authored_term,billing_cycle,date_policy_switch_state) VALUES('{}',4,'{}','{}','{}','[]','USD',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,'rolling','{{\"kind\":\"rolling\"}}','month','{}')",u(1),u(101),u(200),u(201),PLATFORM_SNAPSHOT)).await?;
+    let attempt = pinned_fixture_attempt(&pg, 1, 4).await?;
+    pg.sql(&format!("INSERT INTO bss_orders__order_line(order_id,version,line_id,plan_id,plan_revision_id,selected_items,currency,contract_effective_date,service_activation_date,acceptance_due_date,term_kind,authored_term,billing_cycle,date_policy_switch_state,commercial_attempt_id,pricing_acceptance_id,pricing_request_digest,pricing_terms_digest,order_pin) VALUES('{}',4,'{}','{}','{}','[]','USD',CURRENT_DATE,CURRENT_DATE,CURRENT_DATE,'rolling','{{\"kind\":\"rolling\"}}','month','{}','{attempt}','{attempt}','{}','{}','{{}}')",u(1),u(101),u(200),u(201),PLATFORM_SNAPSHOT,"00".repeat(32),"00".repeat(32))).await?;
     let projection = format!(
         "INSERT INTO bss_orders__line_fulfillment VALUES('{}','{}',4,'activated','{}',NULL,now())",
         u(1),
@@ -655,5 +655,112 @@ async fn concurrent_overlap_claims_have_exactly_one_winner() -> anyhow::Result<(
         assert_eq!(live(&pg, winner).await?, expected, "round {round}");
         assert!(live(&pg, loser).await?.is_empty(), "round {round}");
     }
+    Ok(())
+}
+
+/// n90: the Rust `decimal_valid` (domain/gate/totals.rs) and the SQL function
+/// `bss_orders__decimal_valid` (07 integrity) agree over one shared corpus. Tier: Docker/PG.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn decimal_rule_agrees_with_the_schema_function() -> anyhow::Result<()> {
+    use crate::domain::gate::totals::decimal_valid;
+    use proptest::strategy::{Strategy, ValueTree};
+    use proptest::test_runner::TestRunner;
+
+    let mut corpus: Vec<(String, i32)> = Vec::new();
+    // The case table of `tests/gate_submit_shape.rs` (copied).
+    for (value, scale) in [
+        ("0", 2),
+        ("10", 2),
+        ("10.5", 2),
+        ("-10.25", 2),
+        ("10.00", 2),
+        ("10.123", 2),
+        ("010", 2),
+        ("-0", 2),
+        ("+1", 2),
+        ("1e3", 2),
+        (".5", 2),
+        ("1.", 2),
+        ("", 2),
+        ("1234567890123456789012345678", 0),
+        ("12345678901234567890123456789", 0),
+        ("0.0000000000000000000000000001", 28),
+    ] {
+        corpus.push((value.to_owned(), scale));
+    }
+    // Boundaries: 28/29 significant digits, 31/32 characters, the scale limits, odd spellings.
+    let boundary = [
+        "1234567890123456789012345678",
+        "12345678901234567890123456789",
+        "-123456789012345678901234567",
+        "-1234567890123456789012345678",
+        "1234567890123456789012345.678",
+        "0.1234567890123456789012345678",
+        "0.12345678901234567890123456789",
+        "123456789012345678901234567.8",
+        "-1234567890123456789012345.678",
+        "-12345678901234567890123456.78",
+        "12345678901234567890123456789.1",
+        // 32 characters (28 zeros then a 1 after the point) is rejected by length and scale
+        // together. No case can isolate length: with at most 28 significant digits and scale
+        // at most 28, the longest valid text is 31 characters.
+        "-0.1234567890123456789012345678",
+        "-0.00000000000000000000000000001",
+        "-0",
+        "-0.5",
+        "0.0001",
+        "1.",
+        ".5",
+        "+1",
+        "1e3",
+        "\u{0661}",
+        "1.\u{0665}",
+    ];
+    for value in boundary {
+        for scale in [0, 2, 28, 29] {
+            corpus.push((value.to_owned(), scale));
+        }
+    }
+    // Deterministic generated strings, each paired with a scale in 0..=29.
+    let mut runner = TestRunner::deterministic();
+    let numeric = "-?[0-9]{0,30}(\\.[0-9]{0,30})?";
+    let any_text = "[^\\x00]{0,33}"; // `.` minus NUL, which Postgres text cannot hold
+    for i in 0..2000_usize {
+        let source = if i % 2 == 0 { numeric } else { any_text };
+        let value = source.new_tree(&mut runner).expect("tree").current();
+        let scale = (0..=29_i32)
+            .new_tree(&mut runner)
+            .expect("scale tree")
+            .current();
+        corpus.push((value, scale));
+    }
+
+    let pg = Pg::new().await?;
+    let values: Vec<String> = corpus.iter().map(|(v, _)| v.clone()).collect();
+    let scales: Vec<i32> = corpus.iter().map(|(_, s)| *s).collect();
+    let rows = pg
+        .raw
+        .query_all_raw(Statement::from_sql_and_values(
+            DbBackend::Postgres,
+            "SELECT bss_orders__decimal_valid(v, s) AS ok FROM unnest($1::text[], $2::int[]) WITH ORDINALITY AS t(v, s, n) ORDER BY n",
+            [values.into(), scales.into()],
+        ))
+        .await?;
+    assert_eq!(rows.len(), corpus.len());
+    let mut mismatches = Vec::new();
+    for ((value, scale), row) in corpus.iter().zip(&rows) {
+        let sql: bool = row.try_get("", "ok")?;
+        let rust = u8::try_from(*scale).is_ok_and(|s| decimal_valid(value, s));
+        if sql != rust {
+            mismatches.push(format!("({value:?}, {scale}): sql={sql} rust={rust}"));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "Rust and SQL decimal rules disagree on {} of {} pairs: {mismatches:#?}",
+        mismatches.len(),
+        corpus.len()
+    );
     Ok(())
 }

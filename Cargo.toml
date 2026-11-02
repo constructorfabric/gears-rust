@@ -186,6 +186,7 @@ members = [
     "gears/bss/products/products-sdk",
     "gears/bss/orders/orders",
     "gears/bss/orders/orders-sdk",
+    "gears/bss/orders/test-authz-plugin",
     "gears/bss/approvals/approvals",
     "gears/bss/approvals/approvals-sdk",
     "gears/bss/rate-provider/rate-provider-sdk",
@@ -468,6 +469,7 @@ bss-pricing = { package = "cf-gears-bss-pricing", path = "gears/bss/pricing/pric
 # not published either.
 bss-products-sdk = { package = "cf-gears-bss-products-sdk", path = "gears/bss/products/products-sdk" }
 bss-orders-sdk = { package = "cf-gears-bss-orders-sdk", path = "gears/bss/orders/orders-sdk" }
+bss-orders-test-authz-plugin = { package = "cf-gears-bss-orders-test-authz-plugin", version = "0.1.0", path = "gears/bss/orders/test-authz-plugin" }
 # The approvals inbox. Same WIP posture as pricing: no `version`, because neither
 # crate is a release artifact yet.
 bss-approvals-sdk = { package = "cf-gears-bss-approvals-sdk", path = "gears/bss/approvals/approvals-sdk" }

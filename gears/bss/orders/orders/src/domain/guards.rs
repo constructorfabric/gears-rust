@@ -212,6 +212,7 @@ pub const GUARDS: &[GuardDecl] = &[
         rows: SUBMIT_AMEND,
         reasons: &[
             "axis-invalid",
+            "payer-relationship-unconfirmed",
             "contract-not-active",
             "contract-party-ineligible",
             "quantity-below-floor",
@@ -220,10 +221,12 @@ pub const GUARDS: &[GuardDecl] = &[
             "reference-duplicated",
             "currency-mixed",
             "overlap-cardinality-exceeded",
+            "order-in-flight-for-key",
             "overlap-key-unresolvable",
             "pin-unresolvable",
             "pricing-revision-absent",
             "order-binding-policy-missing",
+            "billing-terms-unsupported",
             "catalog-predicate-failed",
             "catalog-predicate-unevaluable",
             "date-cascade-invalid",
@@ -603,7 +606,10 @@ impl GuardRegistry {
                 .iter()
                 .map(|t| reason(decl.name, t))
                 .collect::<Result<Vec<_>, _>>()?;
-            if let Some(r) = reasons.iter().find(|r| ENGINE_REASONS.contains(r)) {
+            if let Some(r) = reasons.iter().find(|r| {
+                ENGINE_REASONS.contains(r)
+                    && !(decl.name == GATE_COMPOSITE && **r == Reason::OrderInFlightForKey)
+            }) {
                 return Err(GuardRegistryError::EngineReason(decl.name, *r));
             }
             owned.extend(reasons.iter().map(|r| reason_index(*r)));

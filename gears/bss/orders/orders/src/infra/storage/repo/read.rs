@@ -1,4 +1,4 @@
-//! Scoped keyset reads of the early S6-01 draft subset (08 §2.2, §3.6 *List Orders* step 6,
+//! Scoped keyset reads of draft and committed membership (08 §2.2, §3.6 *List Orders* step 6,
 //! *Read One Order* step 4). Every query applies the PDP scope, the validated filters and the
 //! strict cursor boundary in SQL before `ORDER BY`/`LIMIT`; nothing is post-filtered. Child
 //! reads bind to the current scoped parent through the aggregate join; draft membership is a
@@ -102,6 +102,41 @@ pub async fn draft_line_page(
         query = query.limit(limit);
     }
     query
+        .secure()
+        .scope_with(&AccessScope::for_resources(vec![order_id]))
+        .and_scope_for::<order::Entity>(scope)
+        .all(runner)
+        .await
+}
+
+/// Committed membership selected in SQL before the keyset boundary and limit.
+pub async fn committed_line_page(
+    runner: &impl DBRunner,
+    scope: &AccessScope,
+    order_id: Uuid,
+    version: i32,
+    cursor: Option<Position>,
+    limit: Option<u64>,
+) -> Result<Vec<order_line_identity::Model>, ScopeError> {
+    use crate::infra::storage::entity::order_line;
+    use order_line_identity::Column;
+    let members = Query::select()
+        .column(order_line::Column::LineId)
+        .from(order_line::Entity)
+        .and_where(order_line::Column::OrderId.eq(order_id))
+        .and_where(order_line::Column::Version.eq(version))
+        .to_owned();
+    let mut query = order_line_identity::Entity::find()
+        .inner_join(order::Entity)
+        .filter(Column::OrderId.eq(order_id))
+        .filter(Column::LineId.in_subquery(members));
+    if let Some(position) = cursor {
+        query = query.filter(after(Column::CreatedAt, Column::LineId, position)?);
+    }
+    query
+        .order_by_asc(Column::CreatedAt)
+        .order_by_asc(Column::LineId)
+        .limit(limit)
         .secure()
         .scope_with(&AccessScope::for_resources(vec![order_id]))
         .and_scope_for::<order::Entity>(scope)

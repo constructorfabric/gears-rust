@@ -4,17 +4,27 @@ edition.workspace = true
 license.workspace = true
 description = "Orders gear: transition engine, draft authoring and draft reads"
 
-# TEMPORARY (D-229): declares the `orders_event_broker_test_support` cfg; see build.rs.
-build = "build.rs"
-
 [lib]
 name = "bss_orders"
 
 [lints]
 workspace = true
 
+[features]
+# Development stubs of the nine undelivered gate providers (Task 8b): never enabled by default,
+# never by `apps/example-server`; binds only with `gate.dev_stubs = true`.
+gate-dev-stubs = []
+
 [dependencies]
 bss-orders-sdk = { workspace = true }
+# The gate's typed upstream reads (D-187): Pricing's resolve/current-revision answers and the
+# Products SKU, mapped into adopted predicate outcomes without a second wire model.
+bss-pricing-sdk = { workspace = true }
+bss-products-sdk = { workspace = true }
+# The gate's quantity floor (F03 §4.2 predicate 3, D-216): canonical decimal text parsed by the
+# shared BSS money rules, never a local parser; `exact` renders a producer's exact fraction as
+# canonical decimal text at a scale for the resolved totals (D-213, D-216), never rounding it.
+bss-money = { workspace = true, features = ["exact"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -56,6 +66,16 @@ toolkit-macros = { workspace = true }
 utoipa = { workspace = true }
 toolkit-gts = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
+# The D-194 commercial service principal (Q13): `exchange_client_credentials` turns the configured
+# seller identity into the SecurityContext the gate presents to Pricing and Products. No workspace
+# entry exists; path form as mini-chat, settings-service and api-gateway declare it.
+authn-resolver-sdk = { package = "cf-gears-authn-resolver-sdk", version = "0.3.37", path = "../../../system/authn-resolver/authn-resolver-sdk" }
+# The `deps = [authn_resolver]` gear-macro edge re-exports `::authn_resolver`, so the gear crate
+# must be a direct dependency (init ordering, D-194; not used in code), as mini-chat and
+# api-gateway declare it.
+authn-resolver = { workspace = true }
+# Bounded concurrent SKU reads (`buffer_unordered` up to the run bulkhead).
+futures = { workspace = true }
 authz-resolver = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 types-registry = { workspace = true }
@@ -64,8 +84,10 @@ toolkit = { workspace = true, features = ["db"] }
 toolkit-db = { workspace = true, features = ["pg"] }
 
 [dev-dependencies]
+# Gate deadline, retry and breaker tests use Tokio's paused test clock directly.
+tokio = { workspace = true, features = ["test-util"] }
 # The real gateway throttling maps and middleware, so the D-185 zone bindings are proven against
-# the platform limiter in-process.
+# the platform limiter in-process (the live E2E runs the whole gateway).
 api-gateway = { workspace = true }
 # The real in-process Event Broker gear harness (LocalBroker, ingest, spec loading).
 event-broker = { workspace = true, features = ["test-utils"] }
@@ -73,6 +95,9 @@ static-authz-plugin = { workspace = true }
 # Property tests of the pure codecs (cursor tokens, interval text); approvals precedent.
 proptest = { workspace = true }
 serde-saphyr = { workspace = true }
+# The gate's OTel instruments read back through an in-memory exporter installed as the global
+# meter provider; the api-gateway `http_metrics_tests` and usage-collector `metrics_tests` precedent.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # Captured log signals (sanitized PDP and prefetch events); the bss libs/rest precedent.
 tracing-test = { workspace = true, features = ["no-env-filter"] }
 trybuild = { workspace = true }

@@ -1,0 +1,562 @@
+# E2E host configuration for the bss-orders gear (S2-12 live HTTP/PostgreSQL E2E).
+#
+# Loaded by testing/e2e/suites/bss/orders/conftest.py, which (1) deep-merges the
+# gear's checked-in fragment gears/bss/orders/config/e2e-orders.yaml into
+# `gears` (the Orders block, the Event Broker topic partition count, the producer's AuthZ grants
+# and the api-gateway throttling zones), (2) substitutes `__E2E_PG_PORT__`, `__E2E_PG_USER__`
+# and `__E2E_HOME__`, and (3) exports the secret references the Orders block names
+# (ORDERS_AUDIT_MINIMIZATION_KEY, ORDERS_*_DSN, ORDERS_PG_PASSWORD, ORDERS_SELLER_CLIENT_SECRET).
+#
+# Milestone 3b (D-238): the server runs three times. `migrate`, then boot 1 without the gate
+# block, which seeds Pricing/Products over REST; conftest.py writes the stub fixture keyed by the
+# seeded ids and boot 2 adds `development_delivery` (below) with `__E2E_FIXTURE__` substituted.
+# `development_delivery` is removed from every rendered file: it is not a server config key.
+#
+# Two server runs use this file: `migrate` under the schema-owner login (`orders_admin`), then
+# `run` under the restricted runtime login (`orders_runtime`, a member of `bss_orders_runtime`
+# only). The runtime login holds no DDL privilege: the toolkit migration runner probes the
+# history table and skips applied migrations, and a pending migration would refuse startup.
+#
+# A top-level `database:` section with a SQLite template is required regardless of Orders:
+# credstore, resource-group and simple-user-settings are compiled unconditionally into
+# cf-gears-example-server and call `ctx.db_required()` at init (see the usage-collector suite).
+database:
+  servers:
+    sqlite_orders_e2e:
+      engine: "sqlite"
+      params:
+        WAL: "true"
+        busy_timeout: "5000"
+        synchronous: "NORMAL"
+      pool:
+        max_conns: 5
+
+server:
+  home_dir: "__E2E_HOME__"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/cf-gears-e2e-orders.log"
+    file_level: debug
+    max_age_days: 7
+    max_backups: 3
+    max_size_mb: 50
+  sqlx:
+    console_level: warn
+    file: "logs/sql-orders.log"
+    file_level: debug
+
+gears:
+  api-gateway:
+    config:
+      bind_addr: "127.0.0.1:8090"
+      enable_docs: true
+      cors_enabled: false
+      auth_disabled: false
+      require_auth_by_default: true
+      openapi:
+        title: "CF/Gears Orders E2E"
+        version: "0.1.0"
+        description: "Orders draft milestone E2E server"
+      defaults:
+        body_limit_bytes: 64000000
+      # The Orders zones (`rl_orders_caller_write`, `rl_orders_workflow_write`) come from the
+      # gear fragment; a zone the mounted routes reference must exist or gateway startup fails.
+
+  grpc-hub:
+    config:
+      listen_addr: "uds:///tmp/cf-gears-grpc-orders-e2e"
+
+  types-registry:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "types_registry.db"
+    config: {}
+
+  tenant-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # One root (the platform root the Orders producer publishes under, D-95) with every E2E
+  # tenant as a direct child: the resource tenant A, the seller S, the payer P, the foreign
+  # tenant B, the delegated partner D and the service-principal tenant of the fragment.
+  static-tr-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 20
+      tenants:
+        - id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          name: "e2e-root"
+          parent_id: null
+          status: active
+        - id: "a0000000-0000-4000-8000-00000000000a"
+          name: "e2e-orders-resource-a"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "5e11e000-0000-4000-8000-000000000005"
+          name: "e2e-orders-seller-s"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "9a9e0000-0000-4000-8000-000000000009"
+          name: "e2e-orders-payer-p"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+          name: "e2e-orders-foreign-b"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "d0000000-0000-4000-8000-00000000000d"
+          name: "e2e-orders-partner-d"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+        - id: "0e0e0000-0000-4000-8000-0000000000aa"
+          name: "e2e-orders-services"
+          parent_id: "00000000-df51-5b42-9538-d2b56b7ee953"
+          status: active
+
+  authn-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Every identity is distinct (D-115): the users carry the user subject type; the two service
+  # principals carry a service subject type and are the fragment's configured workflow and
+  # subscriptions principals. No token is a superuser of anything: authority comes only from
+  # the e2e policy AuthZ plugin block below.
+  static-authn-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+      mode: static_tokens
+      tokens:
+        # Eight buyers of resource tenant A, one per test: the gateway caller zone is keyed per
+        # authenticated subject (3/s, burst 20), so each test spends its own budget.
+        - token: "e2e-orders-buyer-1"
+          identity:
+            subject_id: "11111111-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-2"
+          identity:
+            subject_id: "11111112-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-3"
+          identity:
+            subject_id: "11111113-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-4"
+          identity:
+            subject_id: "11111114-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-5"
+          identity:
+            subject_id: "11111115-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-6"
+          identity:
+            subject_id: "11111116-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-7"
+          identity:
+            subject_id: "11111117-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-buyer-8"
+          identity:
+            subject_id: "11111118-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        # Same tenant as the buyer, no rule names it: membership alone grants nothing.
+        - token: "e2e-orders-member"
+          identity:
+            subject_id: "44444444-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "a0000000-0000-4000-8000-00000000000a"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-seller"
+          identity:
+            subject_id: "55555555-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "5e11e000-0000-4000-8000-000000000005"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        # Seeds Pricing and Products in the seller tenant (boot 1). Distinct from the seller
+        # operator so the Orders matrix rows stay unchanged; no Orders rule names it.
+        - token: "e2e-orders-catalog-author"
+          identity:
+            subject_id: "55555556-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "5e11e000-0000-4000-8000-000000000005"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        # The bearer the seller's commercial identity (s2s credential below) carries, so a
+        # forwarded context authenticates as the same service subject.
+        - token: "e2e-orders-seller-s-token"
+          identity:
+            subject_id: "0e0e0000-0000-4000-8000-000000000006"
+            subject_tenant_id: "5e11e000-0000-4000-8000-000000000005"
+            subject_type: "gts.cf.core.security.subject_service.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-payer"
+          identity:
+            subject_id: "99999999-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "9a9e0000-0000-4000-8000-000000000009"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-foreign"
+          identity:
+            subject_id: "22222222-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-partner"
+          identity:
+            subject_id: "dddddddd-6a88-4768-9dfc-6bcd5187d9ed"
+            subject_tenant_id: "d0000000-0000-4000-8000-00000000000d"
+            subject_type: "gts.cf.core.security.subject_user.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-workflow"
+          identity:
+            subject_id: "0e0e0000-0000-4000-8000-000000000002"
+            subject_tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+            subject_type: "gts.cf.core.security.subject_service.v1~"
+            token_scopes: ["*"]
+        - token: "e2e-orders-subscriptions"
+          identity:
+            subject_id: "0e0e0000-0000-4000-8000-000000000003"
+            subject_tenant_id: "0e0e0000-0000-4000-8000-0000000000aa"
+            subject_type: "gts.cf.core.security.subject_service.v1~"
+            token_scopes: ["*"]
+      # The seller's commercial identity (D-194, M3B-6): the Orders gate exchanges these client
+      # credentials for a service subject in the seller tenant and reads Pricing/Products as it.
+      # The plugin does not expand `${VAR}`, so conftest.py substitutes the per-run secret for
+      # `__E2E_ORDERS_SELLER_SECRET__`; the Orders block names the same value as
+      # `${ORDERS_SELLER_CLIENT_SECRET}`.
+      s2s_credentials:
+        - client_id: "e2e-orders-seller-s"
+          client_secret: "__E2E_ORDERS_SELLER_SECRET__"
+          identity:
+            subject_id: "0e0e0000-0000-4000-8000-000000000006"
+            subject_tenant_id: "5e11e000-0000-4000-8000-000000000005"
+            subject_type: "gts.cf.core.security.subject_service.v1~"
+          bearer_token: "e2e-orders-seller-s-token"
+
+  authz-resolver:
+    config:
+      vendor: "constructorfabric"
+
+  # Linked by the base features; never selected (the resolver picks the lowest priority).
+  static-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 100
+
+  # The Orders permission matrix (DESIGN 08 §4.3) for the identities above, evaluated by the
+  # real resolver/PolicyEnforcer (test-host PDP: bss-orders-test-authz-plugin). Actions are the registered snake_case names. The fragment
+  # appends the Event Broker producer grants to `rules`/`unconditional_grants`.
+  bss-orders-test-authz-plugin:
+    config:
+      vendor: "constructorfabric"
+      priority: 10
+      policy_revision: "orders-e2e-s2-12"
+      rules:
+        # Each buyer authors on resource tenant A; one identical rule per buyer identity. The
+        # policy names no payer: which payer an order names is a business rule (D-215). Preview
+        # and submit (M3b) are the PEP's `preview`/`submit` actions under the same constraint.
+        - id: "e2e-buyer-1"
+          subject: { id: "11111111-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-2"
+          subject: { id: "11111112-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-3"
+          subject: { id: "11111113-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-4"
+          subject: { id: "11111114-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-5"
+          subject: { id: "11111115-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-6"
+          subject: { id: "11111116-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-7"
+          subject: { id: "11111117-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        - id: "e2e-buyer-8"
+          subject: { id: "11111118-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["create", "write", "edit", "read", "preview", "submit"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+        # The seller operator reads, holds and resumes the seller's orders; never authors.
+        - id: "e2e-seller-operator"
+          subject: { id: "55555555-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["read", "hold", "resume"]
+          paths:
+            - predicates:
+                - { property: "seller_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        # The payer's reader sees orders that bill payer P.
+        - id: "e2e-payer-reader"
+          subject: { id: "99999999-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "payer_tenant_id", values: ["9a9e0000-0000-4000-8000-000000000009"] }
+        # The delegated partner reads resource tenant A only with an accepted proof reference
+        # (interim delegation semantics, S2-03).
+        - id: "e2e-partner-delegated"
+          subject: { id: "dddddddd-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "resource_tenant_id", values: ["a0000000-0000-4000-8000-00000000000a"] }
+          delegation:
+            proof_property: "delegation_proof_ref"
+            accepted: ["e2e-proof-ok"]
+        # The Workflow service principal reads only finite explicit order IDs (08 §4.3); the
+        # listed ID is never an order of this run, so its scope is finite and empty.
+        - id: "e2e-workflow-finite"
+          subject: { id: "0e0e0000-0000-4000-8000-000000000002" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["read", "begin_fulfillment"]
+          paths:
+            - predicates:
+                - { property: "id", values: ["0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"] }
+                - { property: "seller_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        # A service principal whose only path is tenant-wide: a service decision without a
+        # finite order-ID restriction is an integration failure, never a grant.
+        - id: "e2e-subscriptions-tenant-only"
+          subject: { id: "0e0e0000-0000-4000-8000-000000000003" }
+          resource_type: "gts.cf.bss.orders.order.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "seller_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        # The catalog author seeds the seller's catalog (M3B-4): every Pricing and Products action
+        # (author, submit, approve, settings, reference, read, create) on rows the seller tenant
+        # owns. Both gears always require constraints and compile `owner_tenant_id` (their only
+        # tenant property; a read may also send `id`, which this path leaves unconstrained).
+        - id: "e2e-catalog-author-pricing"
+          subject: { id: "55555556-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.pricing.*"
+          actions: ["*"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        - id: "e2e-catalog-author-products"
+          subject: { id: "55555556-6a88-4768-9dfc-6bcd5187d9ed" }
+          resource_type: "gts.cf.bss.products.*"
+          actions: ["*"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        # The seller's commercial identity (M3B-6) reads the seller's catalog and nothing else, by
+        # exact type: Pricing's current revision and resolve scope PLAN and PRICE
+        # (`pricing_read.rs`), Orders' SkuRead and Pricing's dated SKU-version read ask Products'
+        # SKU `read`. No acceptance row: in the development delivery submit's acceptance is the
+        # `SellabilityStub`, which reads Pricing's `resolve` only (gear.rs `dev_acceptance`).
+        # Its own subject (…0006), never the Orders event producer (…0005, the fragment).
+        - id: "e2e-seller-commercial-plan-read"
+          subject: { id: "0e0e0000-0000-4000-8000-000000000006" }
+          resource_type: "gts.cf.bss.pricing.plan.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        - id: "e2e-seller-commercial-price-read"
+          subject: { id: "0e0e0000-0000-4000-8000-000000000006" }
+          resource_type: "gts.cf.bss.pricing.price.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        - id: "e2e-seller-commercial-sku-read"
+          subject: { id: "0e0e0000-0000-4000-8000-000000000006" }
+          resource_type: "gts.cf.bss.products.sku.v1~"
+          actions: ["read"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        # Pricing's and Products' Event Broker producers (their fixed system actors, `bss-pricing`
+        # `PRICING_SYSTEM_ACTOR` in `bss_products_sdk::references` and `bss-products` `PRODUCER_ACTOR`
+        # in `infra/broker.rs`, both with the nil subject tenant) publish the seed's events. As the
+        # fragment grants the Orders producer: the tenant-scope `request` `produce` check here, for
+        # the event's tenant (the seller: every seeded row is the seller's), and the property-less
+        # `event_type` check in `unconditional_grants` below (the concrete event GTS resource,
+        # `gts.cf.core.events.event.v1~cf.bss.<gear>.*`, #5383). Without them each publish is denied
+        # and retried in the server log; no Orders assertion depends on them.
+        - id: "e2e-pricing-producer-seller-produce"
+          subject: { id: "00000000-0000-0f01-0000-627373722d70", tenant_id: "00000000-0000-0000-0000-000000000000" }
+          resource_type: "gts.cf.core.events.request.v1~"
+          actions: ["produce"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+        - id: "e2e-products-producer-seller-produce"
+          subject: { id: "00000000-0000-0f01-0000-627373702d70", tenant_id: "00000000-0000-0000-0000-000000000000" }
+          resource_type: "gts.cf.core.events.request.v1~"
+          actions: ["produce"]
+          paths:
+            - predicates:
+                - { property: "owner_tenant_id", values: ["5e11e000-0000-4000-8000-000000000005"] }
+      unconditional_grants:
+        - id: "e2e-pricing-producer-event-type-produce"
+          subject: { id: "00000000-0000-0f01-0000-627373722d70", tenant_id: "00000000-0000-0000-0000-000000000000" }
+          resource_type: "gts.cf.core.events.event.v1~cf.bss.pricing.*"
+          action: "produce"
+        - id: "e2e-products-producer-event-type-produce"
+          subject: { id: "00000000-0000-0f01-0000-627373702d70", tenant_id: "00000000-0000-0000-0000-000000000000" }
+          resource_type: "gts.cf.core.events.event.v1~cf.bss.products.*"
+          action: "produce"
+
+  # Mandatory gears compiled into the binary; none is exercised here.
+  credstore:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "credstore.db"
+    config:
+      vendor: "constructorfabric"
+
+  resource-group:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "resource_group.db"
+    config: {}
+
+  simple-user-settings:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "settings.db"
+    config: {}
+
+  file-parser:
+    config:
+      allowed_local_base_dir: /tmp
+
+  # Pricing and Products are real (M3B-4), as `config/e2e-local.yaml` declares them for the
+  # pricebook suite: SQLite files under the run's home, config defaults (approval quorums are
+  # tenant policy, set to 0 by the seed over REST). Without its block bss-pricing does not serve.
+  bss-products:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "bss_products.db"
+
+  bss-pricing:
+    database:
+      server: "sqlite_orders_e2e"
+      file: "bss_pricing.db"
+
+  # Event Broker in standalone mode (D-200): the zero-dependency cluster cache, its own SQLite
+  # metadata database and the SQLite event-log backend. The Orders topic's partition count is
+  # the fragment's `topics` entry, which must equal Orders' declared `events.broker_partitions`.
+  cluster:
+    config:
+      profiles:
+        event-broker:
+          cache:
+            provider: standalone
+
+  event-broker:
+    database:
+      engine: sqlite
+      file: "event_broker.db"
+      params:
+        journal_mode: "WAL"
+        busy_timeout: "5000"
+        synchronous: "NORMAL"
+    config:
+      mode: standalone
+      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+      topics:
+        "gts.cf.core.events.topic.v1~":
+          backend:
+            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+            path: "__E2E_HOME__/event-broker/event_log.db"
+
+  # The Orders store: the real PostgreSQL container. `__E2E_PG_USER__` is `orders_admin` for
+  # the migrate run and `orders_runtime` for the server run; the password is a secret
+  # reference. The gear `config` block is merged from the fragment.
+  bss-orders:
+    database:
+      engine: postgres
+      host: "127.0.0.1"
+      port: __E2E_PG_PORT__
+      user: "__E2E_PG_USER__"
+      password: "${ORDERS_PG_PASSWORD}"
+      dbname: "orders"
+      params:
+        sslmode: "disable"
+      pool:
+        max_conns: 8
+    # The gear block itself comes from the checked-in fragment (deep-merged by conftest.py). The
+    # one host-side override is the per-(caller, order) edge limiter (D-185, Q-26 fallback): the
+    # E2E host runs it at 10 per minute instead of the §3.7 baseline of 20, so the live suite can
+    # tell the gear-local fallback (no `RateLimit-*` policy headers) from the gateway caller zone
+    # (`rl_orders_caller_write`, burst 20) over TCP. Production keeps the baseline (absent = 20).
+    config:
+      throttling:
+        per_order_per_minute: 10
+
+# The development delivery (D-235, M3B-5), deep-merged into `gears` for boot 2 only (conftest.py);
+# never a server key. The gate binds the nine undelivered ports to the per-run fixture, presents
+# the seller's commercial identity (the s2s credential above), and runs Preview at 20 and submit
+# at 10 per caller per minute, so the Preview throttle test's 21st call fits the gateway zone only
+# because of its 0.34 s pause (the zone's burst is 20).
+development_delivery:
+  bss-orders:
+    config:
+      gate:
+        dev_stubs: true
+        dev_stub_fixture: "__E2E_FIXTURE__"
+        commercial_identities:
+          - seller_tenant_id: "5e11e000-0000-4000-8000-000000000005"
+            client_id: "e2e-orders-seller-s"
+            client_secret: "${ORDERS_SELLER_CLIENT_SECRET}"
+            scopes: []
+        preview_per_caller_per_minute: 20
+        submit_per_caller_per_minute: 10

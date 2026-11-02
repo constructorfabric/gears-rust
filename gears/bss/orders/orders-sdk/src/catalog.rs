@@ -386,6 +386,9 @@ pub enum Reason {
     /// `axis-invalid`.
     #[serde(rename = "axis-invalid")]
     AxisInvalid,
+    /// `payer-relationship-unconfirmed`.
+    #[serde(rename = "payer-relationship-unconfirmed")]
+    PayerRelationshipUnconfirmed,
     /// `contract-not-active`.
     #[serde(rename = "contract-not-active")]
     ContractNotActive,
@@ -440,6 +443,9 @@ pub enum Reason {
     /// `order-binding-policy-missing`.
     #[serde(rename = "order-binding-policy-missing")]
     OrderBindingPolicyMissing,
+    /// `billing-terms-unsupported`.
+    #[serde(rename = "billing-terms-unsupported")]
+    BillingTermsUnsupported,
     /// `purchase-capacity-exceeded`.
     #[serde(rename = "purchase-capacity-exceeded")]
     PurchaseCapacityExceeded,
@@ -630,6 +636,7 @@ impl Reason {
         Self::LineCapExceeded,
         Self::DateCascadeInvalid,
         Self::AxisInvalid,
+        Self::PayerRelationshipUnconfirmed,
         Self::ContractNotActive,
         Self::ContractPartyIneligible,
         Self::QuantityBelowFloor,
@@ -648,6 +655,7 @@ impl Reason {
         Self::CatalogPinCompositionUnavailable,
         Self::OrderBindingExpired,
         Self::OrderBindingPolicyMissing,
+        Self::BillingTermsUnsupported,
         Self::PurchaseCapacityExceeded,
         Self::OverlapKeyUnavailable,
         Self::CatalogPredicateFailed,
@@ -725,6 +733,7 @@ impl Reason {
             Self::LineCapExceeded => "line-cap-exceeded",
             Self::DateCascadeInvalid => "date-cascade-invalid",
             Self::AxisInvalid => "axis-invalid",
+            Self::PayerRelationshipUnconfirmed => "payer-relationship-unconfirmed",
             Self::ContractNotActive => "contract-not-active",
             Self::ContractPartyIneligible => "contract-party-ineligible",
             Self::QuantityBelowFloor => "quantity-below-floor",
@@ -743,6 +752,7 @@ impl Reason {
             Self::CatalogPinCompositionUnavailable => "catalog-pin-composition-unavailable",
             Self::OrderBindingExpired => "order-binding-expired",
             Self::OrderBindingPolicyMissing => "order-binding-policy-missing",
+            Self::BillingTermsUnsupported => "billing-terms-unsupported",
             Self::PurchaseCapacityExceeded => "purchase-capacity-exceeded",
             Self::OverlapKeyUnavailable => "overlap-key-unavailable",
             Self::CatalogPredicateFailed => "catalog-predicate-failed",
@@ -823,6 +833,7 @@ impl Reason {
             "line-cap-exceeded" => Some(Self::LineCapExceeded),
             "date-cascade-invalid" => Some(Self::DateCascadeInvalid),
             "axis-invalid" => Some(Self::AxisInvalid),
+            "payer-relationship-unconfirmed" => Some(Self::PayerRelationshipUnconfirmed),
             "contract-not-active" => Some(Self::ContractNotActive),
             "contract-party-ineligible" => Some(Self::ContractPartyIneligible),
             "quantity-below-floor" => Some(Self::QuantityBelowFloor),
@@ -841,6 +852,7 @@ impl Reason {
             "catalog-pin-composition-unavailable" => Some(Self::CatalogPinCompositionUnavailable),
             "order-binding-expired" => Some(Self::OrderBindingExpired),
             "order-binding-policy-missing" => Some(Self::OrderBindingPolicyMissing),
+            "billing-terms-unsupported" => Some(Self::BillingTermsUnsupported),
             "purchase-capacity-exceeded" => Some(Self::PurchaseCapacityExceeded),
             "overlap-key-unavailable" => Some(Self::OverlapKeyUnavailable),
             "catalog-predicate-failed" => Some(Self::CatalogPredicateFailed),
@@ -1016,6 +1028,12 @@ const REASON_MAPPINGS: &[ReasonMapping] = &[
         category: ProblemCategory::InvalidArgument,
     },
     ReasonMapping {
+        reason: "payer-relationship-unconfirmed",
+        code: "PAYER_RELATIONSHIP_UNCONFIRMED",
+        gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.payer_relationship_unconfirmed.v1~"),
+        category: ProblemCategory::FailedPrecondition,
+    },
+    ReasonMapping {
         reason: "contract-not-active",
         code: "CONTRACT_NOT_ACTIVE",
         gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.contract_not_active.v1~"),
@@ -1124,6 +1142,12 @@ const REASON_MAPPINGS: &[ReasonMapping] = &[
         code: "ORDER_BINDING_POLICY_MISSING",
         gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.order_binding_policy_missing.v1~"),
         category: ProblemCategory::ServiceUnavailable,
+    },
+    ReasonMapping {
+        reason: "billing-terms-unsupported",
+        code: "BILLING_TERMS_UNSUPPORTED",
+        gts_id: gts_id!("cf.bss.orders.err.v1~cf.bss.orders.billing_terms_unsupported.v1~"),
+        category: ProblemCategory::FailedPrecondition,
     },
     ReasonMapping {
         reason: "purchase-capacity-exceeded",

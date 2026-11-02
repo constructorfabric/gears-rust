@@ -131,6 +131,9 @@ use bss_approvals as _;
 
 #[cfg(feature = "bss-orders")]
 use bss_orders as _;
+
+#[cfg(feature = "bss-orders-test-authz")]
+use bss_orders_test_authz_plugin as _;
 // Orders' required Event Broker gear (and, through it, the cluster gear) plus the plugins its
 // standalone deployment selects.
 #[cfg(feature = "bss-orders")]
