@@ -95,22 +95,14 @@ curl http://127.0.0.1:8087/cf/readyz      # readiness: 200 ready / 503 not ready
 curl http://127.0.0.1:8087/cf/healthz     # liveness: "ok"
 ```
 
-Other quick start examples:
+Run the example server directly with SQLite:
 
 ```bash
-# Option 1: Run with SQLite database (recommended for development)
 cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run
-
-# Option 2: Parse/load a configuration without a database and exit
-# (does not initialize gears or validate startup prerequisites)
-cargo run --bin cf-gears-example-server -- --config config/no-db.yaml check
 ```
 
-`run` needs a database with the default features: they link the full types registry, and
-gears that publish GTS documents to it (the AuthN/AuthZ/tenant resolvers, among others). An
-embedded registry without its database cannot admit them, so `config/no-db.yaml run` stops at
-startup with a configuration error instead of waiting forever. A composition without GTS
-publishers still runs without a database.
+The default composition needs a database for its embedded Types Registry and the
+AuthN/AuthZ/tenant resolvers. `config/no-db.yaml` cannot run this composition.
 
 ### Example Configuration (config/quickstart.yaml)
 

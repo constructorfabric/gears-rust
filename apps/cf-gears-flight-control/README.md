@@ -91,4 +91,9 @@ a Kubernetes Secret and supplied as `DB_PASSWORD`, while the ConfigMap contains 
 `${DB_PASSWORD}`. The api-contracts example charts keep their local SQLite
 catalogues and do not require PostgreSQL.
 
+PostgreSQL wiring belongs to this chart. Its templates pass the connection settings,
+credentials and environment variable through `toolkit-common`'s existing `config.data`,
+`secrets[]` and `extraEnv` inputs. Explicit `config.data.database.servers.postgres` fields
+override the connection defaults; configuration and Secret checksums trigger pod rollouts.
+
 Local YAML examples under `config/` continue to use SQLite.
