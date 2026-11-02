@@ -30,6 +30,7 @@ Created: 2026-10-23 by Constructor Tech
   - [GTS Checks](#gts-checks)
   - [Error Handling](#error-handling)
   - [Tenant Isolation and Data Protection](#tenant-isolation-and-data-protection)
+  - [Credential Binding](#credential-binding)
   - [Security Assumptions](#security-assumptions)
   - [Observability](#observability)
   - [Fault Tolerance and Consistency](#fault-tolerance-and-consistency)
@@ -56,13 +57,13 @@ Model Registry is an in-process gear that owns two tables: providers and models.
 
 The effective catalog is built from three inputs: the caller's ancestor chain, the provider rows owned by the tenants in that chain, and the model rows of the winning providers. The ancestor chain comes from Tenant Resolver and is kept in a small in-process cache. Provider and model rows are always read from the database. Visibility is decided in one place: for each provider slug, the nearest visible provider wins. A model is visible only when its provider is the winner for its slug. Provider enabled state, model approval, and the policy decision point (PDP) then decide whether a visible model can be evaluated.
 
-The gear follows the platform SDK pattern. The SDK crate `cf-gears-model-registry-sdk` holds one versioned trait, `ModelRegistryClientV1`, together with its models and error vocabulary. The gear crate `cf-gears-model-registry` implements the trait, registers it in ClientHub, and exposes a REST API that maps one-to-one to the trait methods. Provider-specific settings are opaque JSON documents. The gear validates them on write against the GTS schema that the LLM Gateway provider plugin registered in Types Registry. Nothing on the resolution path calls Types Registry.
+The gear follows the platform SDK pattern. The SDK crate `cf-gears-model-registry-sdk` holds one versioned trait, `ModelRegistryClientV1`, together with its models and error vocabulary. The gear crate `cf-gears-model-registry` implements the trait, registers it in ClientHub, and exposes a REST API that maps one-to-one to the trait methods. Provider-specific settings are opaque JSON documents. The gear validates them on write against the GTS schema that the LLM Gateway provider plugin registered in Types Registry. Model cost is a provider-independent field of the model record, not part of the provider settings. Nothing on the resolution path calls Types Registry.
 
 Terms used below:
 
 - **PDP**: the policy decision point. The PRD's Authorization PDP is the platform AuthZ Resolver (`authz-resolver`), called through the toolkit `PolicyEnforcer`.
 - **Fail closed**: when a check cannot complete, the request is refused, never granted.
-- **Dependency unavailable**: the `service_unavailable` error (HTTP 503) returned when Tenant Resolver, the PDP, Types Registry, or the database cannot answer within its deadline (§4 Error Handling).
+- **Dependency unavailable**: the `service_unavailable` error (HTTP 503) returned when Tenant Resolver, the PDP, Types Registry, CredStore, or the database cannot answer within its deadline (§4 Error Handling).
 - **Row predicate**: the SQL condition built from PDP row constraints and added to a list query.
 - **Promoted column**: a real column that holds a copy of a value stored inside a JSON column, used for filtering and ordering.
 - **Keyset page**: a page addressed by an opaque cursor that encodes the order key of the last row, not an offset.
@@ -74,34 +75,41 @@ Terms used below:
 
 | Requirement | Design Response |
 |-------------|------------------|
-| `cpt-cf-model-registry-fr-provider-management` | Provider CRUD in `cpt-cf-model-registry-component-catalog-service`, stored in `cpt-cf-model-registry-dbtable-providers` with a unique `(tenant_id, slug)` key. Slug and `gts_type` are immutable (`cpt-cf-model-registry-constraint-immutable-identity`). Delete removes the provider and its models in one transaction. Visibility is recomputed per request, so a provider it shadowed becomes visible again (§3.6 `cpt-cf-model-registry-seq-provider-write`). |
+| `cpt-cf-model-registry-fr-provider-management` | Provider CRUD in `cpt-cf-model-registry-component-catalog-service`, stored in `cpt-cf-model-registry-dbtable-providers` with a unique `(tenant_id, slug)` key. Slug is immutable (`cpt-cf-model-registry-constraint-immutable-identity`); `gts_type` changes only through type migration, which re-validates every model of the provider against the new type and switches the provider and its models in one transaction, keeping ids and canonical ids (§3.6 `cpt-cf-model-registry-seq-provider-write`). Delete removes the provider and its models in one transaction. Visibility is recomputed per request, so a provider it shadowed becomes visible again (§3.6 `cpt-cf-model-registry-seq-provider-write`). |
 | `cpt-cf-model-registry-fr-provider-disable` | The `enabled` flag does not change who wins a slug. A disabled winner is left out of the allow-list, so none of its models resolve or appear in the available list, for the owner and every inheriting tenant. Rows are kept; re-enabling restores them. Resolution reports `PROVIDER_DISABLED` only after the model is found (§3.6 `cpt-cf-model-registry-seq-resolve-model`). |
 | `cpt-cf-model-registry-fr-provider-sharing` | `sharing_mode` column with values `tenant` and `shared`. Only `shared` ancestor providers become candidates for descendants. The mode is read per request, so a change applies to the next resolution (§3.6 `cpt-cf-model-registry-seq-effective-catalog`). |
 | `cpt-cf-model-registry-fr-provider-shadowing` | Winner per slug over the candidate set ordered by chain distance; a tenant's own provider is always a candidate for itself, and an ancestor's provider is a candidate only when `shared`. Implemented once in `cpt-cf-model-registry-component-visibility-resolver`. |
-| `cpt-cf-model-registry-fr-model-identity` | `canonical_id = provider_slug::provider_model_id`, built by the gear on create, stored with unique keys `(tenant_id, canonical_id)` and `(provider_id, provider_model_id)`. Parsing splits on the first `::`. `provider_id` and `provider_model_id` are immutable. |
-| `cpt-cf-model-registry-fr-model-management` | Model CRUD in `cpt-cf-model-registry-component-catalog-service`. The record holds general settings (optional `base_url`, optional `secret_ref`), default parameters with override policy, capabilities, user-facing information, sharing mode, approval, and opaque `provider_settings` (§3.1 `cpt-cf-model-registry-entity-model-info`). `gts_type` is copied from the provider on create and never set by the caller. |
-| `cpt-cf-model-registry-fr-model-settings-validation` | `cpt-cf-model-registry-component-gts-validator` fetches the resolved schema of the provider type from Types Registry on create and on any update that carries `provider_settings`, validates the document locally, and rejects it with field violations. Types Registry failure rejects the write as dependency unavailable (§3.6 `cpt-cf-model-registry-seq-model-write`). |
+| `cpt-cf-model-registry-fr-model-identity` | `canonical_id = provider_slug::name`, built by the gear on create from the caller-chosen model `name`, stored with unique keys `(tenant_id, canonical_id)` and `(provider_id, name)`. Parsing splits on the first `::`. `provider_id` and `name` are immutable. `provider_model_id` is not part of the identity: it is mutable, and several models of one provider may share it. |
+| `cpt-cf-model-registry-fr-model-management` | Model CRUD in `cpt-cf-model-registry-component-catalog-service`. The record holds general settings (optional `base_url`, optional `secret_ref`), cost in AI credits, default parameters with override policy, capabilities, user-facing information, sharing mode, approval, and opaque `provider_settings` (§3.1 `cpt-cf-model-registry-entity-model-info`). `gts_type` is copied from the provider on create and never set by the caller. A `secret_ref` must name a CredStore secret the writing tenant owns; the gear checks it on create and on an update that sets it (§4 Credential Binding). |
+| `cpt-cf-model-registry-fr-model-settings-validation` | `cpt-cf-model-registry-component-gts-validator` fetches the resolved schema of the provider type from Types Registry on create and on any update whose `provider_settings` differs from the stored value, validates the document locally, and rejects it with field violations. Types Registry failure rejects the write as dependency unavailable (§3.6 `cpt-cf-model-registry-seq-model-write`). |
+| `cpt-cf-model-registry-fr-model-cost` | The `cost` object of `cpt-cf-model-registry-entity-model-info`, one shape for every provider type, stored in the `cost` JSON column of `cpt-cf-model-registry-dbtable-models` and returned in `ModelV1`. Not filterable in v1. |
 | `cpt-cf-model-registry-fr-model-approval` | Approval state, decider, and decision time live on the model row (`cpt-cf-model-registry-entity-approval`). Create and update set them under the model `update`/`create` permissions; a create without a state starts as Approved. Only Approved models resolve or appear in the available list. Approval travels with the model; descendants cannot write it. |
 | `cpt-cf-model-registry-fr-model-sharing` | `sharing_mode` on models. A descendant sees a model only when the model is `shared` and its provider is a `shared` winner. There is no model-level shadowing: visibility is keyed on `provider_id` only. |
 | `cpt-cf-model-registry-fr-effective-catalog` | `cpt-cf-model-registry-component-visibility-resolver` computes winners per slug and the allow-list of provider ids, and filters models by `provider_id` membership, never by `canonical_id` dedupe. Inherited entries are read-only and returned with their full record. |
 | `cpt-cf-model-registry-fr-resolve-model` | `resolve_model` runs the PRD order: find in the effective catalog, provider enabled, approved, PDP `evaluate`. Each failure has a distinct canonical error and reason code (§4 Error Handling). PDP or Tenant Resolver failures fail closed. |
-| `cpt-cf-model-registry-fr-list-available-models` | `list_available_models` requires the PDP action `list_available` and applies the gates of `resolve_model` in one model query, so every listed model resolves (decision rules in §4 Authorization). It returns `AvailableModelV1`, which omits `provider_settings`, `base_url`, and `secret_ref`. OData options run on promoted columns (§3.6 `cpt-cf-model-registry-seq-list-available-models`). |
+| `cpt-cf-model-registry-fr-list-available-models` | `list_available_models` takes one PDP `evaluate` decision, the same action `resolve_model` takes per model, and applies the gates of `resolve_model` in one model query, so every listed model resolves (decision rules in §4 Authorization). It returns a page of full `ModelV1` records, the same record `resolve_model` returns. OData options run on promoted columns (§3.6 `cpt-cf-model-registry-seq-list-available-models`). |
 | `cpt-cf-model-registry-fr-tenant-isolation` | Every write is clamped to `tenant_id = caller tenant` through `SecureConn`. Reads return own rows and rows that ancestors share. There are no reads of sibling or descendant rows and no writes to ancestor rows (`cpt-cf-model-registry-principle-owner-only-writes`). |
-| `cpt-cf-model-registry-fr-authorization` | `cpt-cf-model-registry-component-access-guard` calls the PDP through `PolicyEnforcer` on every operation. Two GTS-identified resource types; distinct action groups for provider management (provider `get`, `list`, `create`, `update`, `delete`), model management (model `get`, `list`, `create`, `update`, `delete`), and model evaluation (model `evaluate` and `list_available`) (§4 Authorization). |
-| `cpt-cf-model-registry-fr-management-api-conventions` | Versioned paths under `/model-registry/v1/`, `OperationBuilder` with `.authenticated()` and `.standard_errors()`, OData on every list, canonical Problem errors. Management reads return own and inherited entries with `inherited`, `shadowed`, and eval-availability flags; writes on inherited entries fail with `INHERITED_READ_ONLY` (§3.3). |
-| `cpt-cf-model-registry-fr-change-audit` | `p2`, partly covered. Per-row audit columns `created_by`, `created_at`, `updated_by`, `updated_at` on both tables, plus `approval_decided_by` and `approval_decided_at` on models. The append-only change log for deletes and full history is not part of this design (§4 Change Audit Follow-up). |
+| `cpt-cf-model-registry-fr-authorization` | `cpt-cf-model-registry-component-access-guard` calls the PDP through `PolicyEnforcer` on every operation. Two GTS-identified resource types; distinct action groups for provider management (provider `get`, `list`, `create`, `update`, `delete`), model management (model `get`, `list`, `create`, `update`, `delete`), and model evaluation (model `evaluate`, for resolving one model and for listing the evaluable models) (§4 Authorization). |
+| `cpt-cf-model-registry-fr-management-api-conventions` | Versioned paths under `/model-registry/v1/`, `OperationBuilder` with `.authenticated()` and `.standard_errors()`, OData on every list, canonical Problem errors. Management reads return own and inherited entries with `inherited`, `shadowed`, and eval-availability flags; writes on inherited entries fail with `INHERITED_READ_ONLY`. Every record carries `version`; single-entry responses carry `ETag`, and `PATCH` requires `If-Match` (§3.3). |
+| `cpt-cf-model-registry-fr-change-audit` | `p2`. The audit columns `created_by`, `created_at`, `updated_by`, `updated_at` on both tables and `approval_decided_by`, `approval_decided_at` on models ship in p1 as part of the record. The append-only change log of this FR is not part of this design (§4 Change Audit Follow-up). |
+| `cpt-cf-model-registry-fr-change-notifications` | `p2`, not covered. The gear publishes no change events; consumers read the catalog on each request (§4 Open Questions). |
 
 #### NFR Allocation
 
 | NFR ID | NFR Summary | Allocated To | Design Response | Verification Approach |
 |--------|-------------|--------------|-----------------|----------------------|
-| `cpt-cf-model-registry-nfr-resolution-latency` | p99 ≤ 10 ms in-gear, excluding PDP and Tenant Resolver wait; 1,000 rps sustained, 5,000 rps peak; 10,000 models; hierarchy depth up to 10 | `cpt-cf-model-registry-component-chain-cache`, `cpt-cf-model-registry-component-visibility-resolver`, `cpt-cf-model-registry-component-storage` | On a cache hit, resolution makes no Tenant Resolver call. It runs two indexed point queries: providers by `(tenant_id IN chain, slug)` on the unique key (at most 11 rows), and the model by the unique `(provider_id, provider_model_id)` key. No Types Registry call on the read path. The available list runs one chain-wide provider query and one model query with the allow-list predicate on indexed columns. p99 sub-budget: chain cache lookup 0.1 ms, provider query 3 ms, model query 3 ms, mapping and constraint check 1 ms; the rest is headroom. Each resolution takes one PDP decision, so the PDP receives up to 5,000 decisions per second at peak. Outside the in-gear budget, a resolution waits for that decision (Policy Engine target 25 ms p95, `cpt-cf-policy-engine-nfr-decision-latency`; bounded by `pdp_deadline_ms`) and, on a chain cache miss, for Tenant Resolver (bounded by `tenant_resolver_deadline_ms`). | Automated benchmark with 10,000 models, hierarchy depth 10, 1,000 rps sustained and 5,000 rps bursts; the gear reports in-gear duration with dependency wait subtracted (§4 Observability). |
-| `cpt-cf-model-registry-nfr-availability` | 99.9% monthly availability of resolution; recovery within 15 minutes after a gear failure | `cpt-cf-model-registry-topology-in-process-gear`, `cpt-cf-model-registry-component-chain-cache` | Stateless replicas; all state is in the platform database. A chain cache miss calls Tenant Resolver. A failed replica is replaced by platform restart without data recovery (§4 Fault Tolerance and Consistency). Every PDP, Tenant Resolver, Types Registry, and database call has a deadline (§4 Configuration). The resolution path makes no retries. An expired deadline fails closed as dependency unavailable. | Availability SLI of §4 Observability. Recovery time is measured from the outcomes-by-reason metric after injected gear failures. |
+| `cpt-cf-model-registry-nfr-resolution-latency` | p99 ≤ 10 ms in-gear, excluding PDP and Tenant Resolver wait; 1,000 rps sustained, 5,000 rps peak; 10,000 models; hierarchy depth up to 10 | `cpt-cf-model-registry-component-chain-cache`, `cpt-cf-model-registry-component-visibility-resolver`, `cpt-cf-model-registry-component-storage` | On a cache hit, resolution makes no Tenant Resolver call. It runs two indexed point queries in one read-only snapshot transaction: providers by `(tenant_id IN chain, slug)` on the unique key (at most 11 rows), and the model by the unique `(provider_id, name)` key. No Types Registry call on the read path. The available list runs one chain-wide provider query and one model query with the allow-list predicate on indexed columns. p99 sub-budget: chain cache lookup 0.1 ms, transaction begin and end 1 ms, provider query 3 ms, model query 3 ms, mapping and constraint check 1 ms; the rest is headroom. Each resolution takes one PDP decision, so the PDP receives up to 5,000 decisions per second at peak. Outside the in-gear budget, a resolution waits for that decision (Policy Engine target 25 ms p95, `cpt-cf-policy-engine-nfr-decision-latency`; bounded by `pdp_deadline_ms`) and, on a chain cache miss, for Tenant Resolver (bounded by `tenant_resolver_deadline_ms`). | Automated benchmark with 10,000 models, hierarchy depth 10, 1,000 rps sustained and 5,000 rps bursts; the gear reports in-gear duration with dependency wait subtracted (§4 Observability). |
+| `cpt-cf-model-registry-nfr-availability` | 99.9% monthly availability of resolution; recovery within 15 minutes after a gear failure | `cpt-cf-model-registry-topology-in-process-gear`, `cpt-cf-model-registry-component-chain-cache` | Stateless replicas; all state is in the platform database. A chain cache miss calls Tenant Resolver. A failed replica is replaced by platform restart without data recovery (§4 Fault Tolerance and Consistency). Every PDP, Tenant Resolver, Types Registry, CredStore, and database call has a deadline (§4 Configuration). The resolution path makes no retries. An expired deadline fails closed as dependency unavailable. | Availability SLI of §4 Observability. Recovery time is measured from the outcomes-by-reason metric after injected gear failures. |
 | `cpt-cf-model-registry-nfr-durability` | Zero loss of acknowledged writes | `cpt-cf-model-registry-component-storage`, `cpt-cf-model-registry-db-catalog-storage` | Every write commits in a database transaction before the response is sent. Provider delete and its model deletes share one transaction. No catalog state lives only in memory. The tables are part of the platform database and its standard backups. | Restart tests and backup-restore tests confirming that acknowledged writes survive. |
 
 #### Key ADRs
 
-No accepted ADRs exist for this gear yet. The decisions are specified in this document.
+| ADR | Status | Decision |
+|-----|--------|----------|
+| [ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md) `cpt-cf-model-registry-adr-inherited-read-scope` | accepted | Reads run under a gear-built upward scope (acting tenant and its ancestors) with the PDP tenant constraint as a gate; the ancestor chain respects isolation barriers (`BarrierMode::Respect`); `InTenantSubtree` tenant constraints fail closed. As in CredStore ADR-0005, except for barriers. |
+| [ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md) `cpt-cf-model-registry-adr-credential-binding` | accepted | A `secret_ref` is accepted only when the writing tenant's own CredStore row holds a secret, checked once at write time by a metadata-only `get_record` read under the caller's context; no owner check at evaluation; the fallback to an ancestor's `shared` secret after the owner removes its own is an accepted residual that CredStore suppression closes. |
+| [ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md) `cpt-cf-model-registry-adr-caching-strategy` | accepted | Provider and model rows are read from the database on every request and never cached by the gear or its consumers; only the tenant ancestor chain is cached, per replica, in a bounded LRU with TTL and jitter, with no invalidation, no change events, and no cluster gear dependency. |
+| [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) `cpt-cf-model-registry-adr-update-semantics` | accepted | Present top-level fields replace the stored value as a whole on SDK and REST, with no RFC 7396 merge and `null` clearing optional fields; every record carries `version`, REST `PATCH` requires `If-Match` (strong `ETag` is the bare version, `*` is unconditional, optional on `DELETE`) and SDK `expected_version` is optional; a stale precondition is `aborted` (409) with reason `OPTIMISTIC_LOCK_FAILURE`, not 412. |
 
 ### 1.3 Architecture Layers
 
@@ -135,6 +143,7 @@ graph TB
     TR["Tenant Resolver SDK"]
     PDP["AuthZ Resolver SDK"]
     TY["Types Registry SDK"]
+    CRS["CredStore SDK"]
 
     LLMGW --> TRAIT
     CG --> TRAIT
@@ -145,6 +154,7 @@ graph TB
     SVC --> VIS
     SVC --> AG
     SVC --> GV
+    SVC --> CRS
     SVC --> STORE
     VIS --> CACHE
     VIS --> STORE
@@ -161,10 +171,10 @@ graph TB
 | Layer | Responsibility | Technology |
 |-------|---------------|------------|
 | Presentation | REST handlers and DTOs, OData query extraction, `$select` projection, mapping of domain errors to canonical Problem responses | Axum handlers registered with toolkit `OperationBuilder`; `utoipa` DTOs in `api/rest/` only |
-| Domain | Local client; catalog service (operation flow, authorization calls, validation order, transactions, audit columns); effective-catalog algorithm, approval and sharing rules, PDP scope gate, GTS type and settings checks | Rust in `domain/` (local client in `domain/local_client.rs`), `#[domain_model]` types, toolkit `PolicyEnforcer` (`cpt-cf-model-registry-tech-toolkit-gear`); settings validated with the workspace JSON Schema validator (`jsonschema`) against schemas from Types Registry (`cpt-cf-model-registry-tech-json-schema-validation`) |
+| Domain | Local client; catalog service (operation flow, authorization calls, validation order, transactions, audit columns); effective-catalog algorithm, approval and sharing rules, PDP scope gate, GTS type and settings checks | Rust in `domain/` (local client included), `#[domain_model]` types, toolkit `PolicyEnforcer` (`cpt-cf-model-registry-tech-toolkit-gear`); settings validated with the workspace JSON Schema validator (`jsonschema`) against schemas from Types Registry (`cpt-cf-model-registry-tech-json-schema-validation`) |
 | Infrastructure | SeaORM entities with `Scopable`, repositories over `DBRunner`, migrations, OData field-to-column mapping, chain cache | SeaORM through `toolkit-db` `SecureConn`; PostgreSQL in production, SQLite in dev/test (`cpt-cf-model-registry-tech-relational-storage`) |
 
-Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverClient` through `PolicyEnforcer`, `TypesRegistryClient`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
+Domain components call dependency SDK traits (`TenantResolverClient`, `AuthZResolverClient` through `PolicyEnforcer`, `TypesRegistryClient`, `CredStoreClientV2`) obtained from ClientHub, and storage through repository traits. These traits are the seams where tests inject mocks.
 
 Layer rules follow the [platform gear layout](../../../docs/toolkit_unified_system/02_gear_layout_and_sdk_pattern.md): serde and `ToSchema` derives appear only in `api/rest/` DTOs and in SDK models; domain types carry `#[domain_model]`; all endpoints are versioned. `unsafe` is forbidden and `unwrap`/`expect` are denied in non-test code.
 
@@ -202,7 +212,13 @@ When the gear cannot decide, it refuses. A PDP denial or an unknown constraint d
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-principle-uncached-catalog-rows`
 
-Provider and model rows are read from the database on every request. Only the tenant ancestor chain is cached. A provider disable, a sharing change, a revocation, or a delete takes effect on the next request on every replica. Drivers: `cpt-cf-model-registry-fr-provider-disable`, `cpt-cf-model-registry-fr-model-approval`.
+Provider and model rows are read from the database on every request. Only the tenant ancestor chain is cached ([ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md)). A provider disable, a sharing change, a revocation, or a delete takes effect on the next request on every replica. Drivers: `cpt-cf-model-registry-fr-provider-disable`, `cpt-cf-model-registry-fr-model-approval`.
+
+#### One Snapshot per Read
+
+- [ ] `p1` - **ID**: `cpt-cf-model-registry-principle-snapshot-reads`
+
+Every catalog read runs all its row queries in one read-only database transaction at snapshot isolation (§3.6 `cpt-cf-model-registry-seq-effective-catalog`). The provider winner, its `enabled` and `sharing_mode`, the approval state of the model, and every row of a list page come from one committed state. A request never combines rows from states that were never committed together. No dependency call runs inside the transaction: it starts after the chain lookup and after any PDP decision the operation takes first, and it ends before the PDP call of resolution. Drivers: `cpt-cf-model-registry-fr-provider-disable`, `cpt-cf-model-registry-fr-model-approval`, `cpt-cf-model-registry-fr-resolve-model`.
 
 #### Validate on Write
 
@@ -214,7 +230,7 @@ All GTS checks run on writes: provider type checks on provider create and settin
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-principle-owner-only-writes`
 
-A tenant writes only rows it owns. It reads its own rows and the rows its ancestors share with it. Inherited rows are read-only, including their approval state. The root administrator manages the platform-wide shared catalog as the root tenant's own rows; there is no cross-tenant administration path in this gear. Drivers: `cpt-cf-model-registry-fr-tenant-isolation`, `cpt-cf-model-registry-fr-model-approval`.
+A tenant writes only rows it owns. It reads its own rows and the rows its ancestors share with it. Inherited rows are read-only, including their approval state. The root administrator manages the platform-wide shared catalog as the root tenant's own rows; it does not reach a self-managed tenant or its subtree, where the self-managed tenant's own shared rows take that role. There is no cross-tenant administration path in this gear. Drivers: `cpt-cf-model-registry-fr-tenant-isolation`, `cpt-cf-model-registry-fr-model-approval`.
 
 ### 2.2 Constraints
 
@@ -222,13 +238,13 @@ A tenant writes only rows it owns. It reads its own rows and the rows its ancest
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-constraint-no-secret-storage`
 
-The gear stores only a CredStore secret reference (`secret_ref`), never secret material. The reference uses the CredStore `SecretRef` format ([credstore-sdk](../../credstore/credstore-sdk/src/models.rs)): 1 to 255 characters from `[a-zA-Z0-9_-]`. The gear does not call CredStore and does not check that the reference exists. LLM Gateway resolves the reference through CredStore at evaluation time. The gear does not bind a secret reference to a destination; that control belongs to LLM Gateway, OAGW, and CredStore (§4 Security Assumptions).
+The gear stores only a CredStore secret reference (`secret_ref`), never secret material. The reference uses the CredStore `SecretRef` format ([credstore-sdk](../../credstore/credstore-sdk/src/models.rs)): 1 to 255 characters from `[a-zA-Z0-9_-]`. The gear calls CredStore on writes only, to check that a `secret_ref` names a secret the writing tenant owns (§4 Credential Binding); the check is a metadata read that returns no secret value. Nothing on the resolution path calls CredStore. LLM Gateway resolves the reference through CredStore at evaluation time. The gear does not bind a secret reference to a destination; that control belongs to LLM Gateway and OAGW (§4 Security Assumptions).
 
 #### Opaque Provider Settings
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-constraint-opaque-provider-settings`
 
-The gear does not define or interpret provider-specific fields, including cost. `provider_settings` is a JSON document whose shape belongs to the LLM Gateway provider plugin that registered the provider type schema. The gear validates the document against that schema and stores it unchanged.
+The gear does not define or interpret provider-specific fields. `provider_settings` is a JSON document whose shape belongs to the LLM Gateway provider plugin that registered the provider type schema. The gear validates the document against that schema and stores it unchanged. Cost is not a provider-specific field: it is the `cost` object of Model Info, with one shape for every provider type.
 
 #### OData Filters on Real Columns
 
@@ -246,13 +262,13 @@ Models have no lifecycle status. Model delete is a hard delete. Setting approval
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-constraint-immutable-identity`
 
-Provider `slug`, provider `gts_type`, model `provider_id`, model `provider_model_id`, and the owning `tenant_id` of both entities never change after create. These fields are absent from the update requests. As a result, `canonical_id` and the model's `gts_type` never change and need no resynchronization. This is the canonical list of immutable fields; other sections refer to it.
+Provider `slug`, model `provider_id`, model `name`, and the owning `tenant_id` of both entities never change after create. These fields are absent from the update requests. As a result, `canonical_id` never changes. The provider `gts_type` is not caller-immutable: it changes only through type migration (§3.6 `cpt-cf-model-registry-seq-provider-write`), which rewrites the `gts_type` of every model of the provider in the same transaction, so a model's `gts_type` always equals its provider's and is never set by a caller. This is the canonical list of immutable fields; other sections refer to it.
 
 #### Local Chain Cache Only
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-constraint-local-chain-cache`
 
-The ancestor-chain cache is an in-process map per replica. The gear uses no platform cache primitive and no `cluster` gear. The cache holds tenant ids only. Hierarchy changes take effect within the TTL bound of `cpt-cf-model-registry-component-chain-cache`, as the PRD contract `cpt-cf-model-registry-contract-tenant-hierarchy` allows.
+The ancestor-chain cache is an in-process map per replica ([ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md)). The gear uses no platform cache primitive and no `cluster` gear. The cache holds tenant ids only. Hierarchy changes take effect within the TTL bound of `cpt-cf-model-registry-component-chain-cache`, as the PRD contract `cpt-cf-model-registry-contract-tenant-hierarchy` allows.
 
 ## 3. Technical Architecture
 
@@ -268,7 +284,6 @@ The ancestor-chain cache is an in-process map per replica. The gear uses no plat
 |--------|-------------|--------|
 | Provider | Where models come from: a tenant-owned record with slug, name, provider GTS type, enabled flag, and sharing mode | [models/](../model-registry-sdk/src/models/) (`ProviderV1`) |
 | Model | A tenant-owned catalog entry for one model of one provider: identity, sharing, approval, audit, and the model info | [models/](../model-registry-sdk/src/models/) (`ModelV1`) |
-| Available Model | The model as listed for evaluation: every `ModelV1` field except `info.provider_settings`, `info.base_url`, and `info.secret_ref` | [models/](../model-registry-sdk/src/models/) (`AvailableModelV1`) |
 | Model Info | The record LLM Gateway uses to evaluate the model; the shape of its `provider_settings` is fixed by the provider type | [models/](../model-registry-sdk/src/models/) (`ModelInfoV1`) |
 | Provider Type | GTS type derived from `gts.cf.genai.model.provider.v1~` and published by an LLM Gateway provider plugin; its schema constrains `provider_settings` | Types Registry |
 | Approval | The owning tenant's latest decision on a model | [models/](../model-registry-sdk/src/models/) (`ApprovalV1`) |
@@ -286,11 +301,12 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `tenant_id` | uuid | Owning tenant. Immutable. |
 | `slug` | string | 1–64 characters: lowercase letters, digits, hyphen. Unique among the providers of the owning tenant. Immutable. Shadowing key and left part of every canonical id. |
 | `name` | string | Display name, 1–255 characters, free text. |
-| `gts_type` | string | Provider GTS type: a type derived from `gts.cf.genai.model.provider.v1~`, for example `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`. Names the LLM Gateway plugin family that evaluates the provider's models. Immutable. |
+| `gts_type` | string | Provider GTS type: a type derived from `gts.cf.genai.model.provider.v1~`, for example `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`. Names the LLM Gateway plugin family that evaluates the provider's models. Changes only through type migration, together with the `gts_type` of every model of the provider (§3.6 `cpt-cf-model-registry-seq-provider-write`). |
 | `enabled` | bool | When false, no model of this provider can be evaluated by the owner or any inheriting tenant. Default true. |
 | `sharing_mode` | enum | `tenant` (owner only) or `shared` (owner and all descendants). Default `tenant`. |
 | `managed` | bool | Whether the platform manages the provider runtime, for example a local runtime. Informational; the gear does not act on it. Default false. |
 | `metadata` | json? | Optional provider metadata. Opaque; stored and returned unchanged. |
+| `version` | i64 | Row version: 1 on create, incremented by every update. Returned as `ETag` on REST; updates are conditional on it (§3.3). |
 | `created_at`, `created_by` | timestamp, uuid | When and by which subject the provider was created. |
 | `updated_at`, `updated_by` | timestamp, uuid | When and by which subject the provider was last changed. |
 
@@ -303,10 +319,12 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `id` | uuid | Model id, generated by the gear (UUIDv7). Management operations address the model by this id. |
 | `tenant_id` | uuid | Owning tenant. Always equal to the provider's `tenant_id`. Immutable. |
 | `provider_id` | uuid | The provider that serves the model. Must be owned by the same tenant. Immutable. |
-| `canonical_id` | string | `provider_slug::provider_model_id`, for example `openai::gpt-4o`. Built by the gear. Unique among the models of the owning tenant. Never changes. |
+| `name` | string | 1–128 characters: lowercase letters, digits, hyphen, dot, underscore. Chosen by the caller on create. Unique among the models of the provider. Immutable. Right part of the canonical id; independent of `provider_model_id`. |
+| `canonical_id` | string | `provider_slug::name`, for example `openai::gpt-4o`. Built by the gear. Unique among the models of the owning tenant. Never changes. |
 | `sharing_mode` | enum | `tenant` or `shared`. Descendants see the model only when it is `shared` and its provider is `shared`. Default `tenant`. |
 | `approval` | object | Approval decision, see Approval. |
 | `info` | object | Model info, see Model Info. |
+| `version` | i64 | Row version: 1 on create, incremented by every update. Returned as `ETag` on REST; updates are conditional on it (§3.3). |
 | `created_at`, `created_by` | timestamp, uuid | Creation time and subject. |
 | `updated_at`, `updated_by` | timestamp, uuid | Last change time and subject. |
 
@@ -318,10 +336,10 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 
 | Field | Type | Meaning |
 |-------|------|---------|
-| `gts_type` | string | The provider GTS type, copied from the model's provider on create. Read-only for callers; never part of a create or update request. LLM Gateway selects the plugin whose provider type equals this value. |
-| `provider_model_id` | string | The provider's own model identifier, sent to the provider. 1–255 characters without whitespace or control characters. Immutable. |
+| `gts_type` | string | The provider GTS type, copied from the model's provider on create and rewritten by a type migration of the provider. Read-only for callers; never part of a create or update request. LLM Gateway selects the plugin whose provider type equals this value. |
+| `provider_model_id` | string | The provider's own model identifier, sent to the provider. 1–255 characters without whitespace or control characters. Mutable; not part of the canonical id. Several models of one provider may share it, for example the same provider model in two regions or with different settings. |
 | `base_url` | string? | General setting: the absolute `http` or `https` URL the plugin calls for this model, up to 2,048 characters, with no user information (`user:password@`). SSRF protection is handled by OAGW at call time (§4 Security Assumptions). When absent, the LLM Gateway provider plugin uses its provider's default URL. The registry stores no default and returns the field as absent. |
-| `secret_ref` | string? | General setting: optional CredStore secret reference for the provider credential. |
+| `secret_ref` | string? | General setting: optional CredStore secret reference for the provider credential. Must name a secret owned by the model's tenant (§4 Credential Binding). |
 | `display_name` | string | Name shown to users, 1–255 characters. |
 | `description` | string? | Free-text description, up to 4,096 characters. |
 | `family` | string? | Model family label, for example `gpt-4` or `llama`. |
@@ -334,10 +352,11 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `hosted_by` | string? | Infrastructure host, for example `Azure` or `self-hosted`. |
 | `last_release_at` | timestamp? | When the vendor last released this model version. |
 | `reasoning_level` | string? | Display-only reasoning level label. |
-| `version` | string? | Model version string. |
+| `model_version` | string? | The model's release version as published by the vendor. |
 | `sort_order` | i32 | Position in model pickers; lower first. Default 0. |
 | `icon` | string? | Absolute `http` or `https` URL of the model icon, up to 2,048 characters. Other schemes are rejected with `INVALID_FORMAT`. |
 | `multiplier_display` | string? | Display label for the relative cost, for example `3x`. |
+| `cost` | object | Cost in AI credits, see Cost. |
 | `performance` | object | Expected performance: `response_latency_ms` (u32?) and `tokens_per_second` (u32?). |
 | `additional_info` | json | Map from string keys to JSON values for deployment-specific metadata. Default empty. |
 | `supported_api` | set of enum | API kinds the model serves: `completion`, `embedding`, `batch`. A closed set owned by the registry; adding a value is a non-breaking change within `v1`. |
@@ -347,7 +366,7 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `default_parameters` | object | Provider-independent inference defaults, see Default Parameters. |
 | `allow_parameter_override` | bool | Whether callers may override `default_parameters` per request. Default false. |
 | `allow_extra_params` | list of string | Names of extra request parameters callers may pass to the provider, up to 64 names of up to 128 characters. Default empty. |
-| `provider_settings` | json | Provider-specific settings, including cost. Shape defined by the provider type schema. Opaque to the registry beyond validation. |
+| `provider_settings` | json | Provider-specific settings. Shape defined by the provider type schema. Opaque to the registry beyond validation. |
 
 **Capabilities** (`capabilities`). A media capability has two fields: `enabled` (bool) and `supported_mime_types` (list of up to 64 strings). MIME types follow RFC 6838 in lowercase. `disabled_mime_types` has the same bound.
 
@@ -386,6 +405,16 @@ Type notation in the field tables: `?` marks an optional field; `uuid`, `string`
 | `tool_choice` | enum? | `auto`, `required`, `none`, or a named function. |
 | `store` | bool? | Whether the provider should store the response. |
 
+**Cost** (`cost`). Rates in micro-credits: 1 AI credit = 1,000,000 micro-credits. Every field is optional; an absent rate means the model does not price that kind of usage. The registry stores the rates and applies no range limits. LLM Gateway computes the cost of a call from them. Default: all absent.
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `input_per_1m_micro` | u64? | Per 1,000,000 input tokens. |
+| `output_per_1m_micro` | u64? | Per 1,000,000 output tokens. |
+| `cache_read_per_1m_micro` | u64? | Per 1,000,000 input tokens read from the provider's prompt cache. |
+| `cache_write_per_1m_micro` | u64? | Per 1,000,000 input tokens written to the provider's prompt cache. |
+| `web_search_per_1k_calls_micro` | u64? | Per 1,000 web search calls. |
+
 #### Approval
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-entity-approval`
@@ -412,7 +441,7 @@ The effective catalog of tenant T0 is computed per request from T0's ancestor ch
 - Model Info → Provider type schema: `gts_type` names the schema in Types Registry that constrains `provider_settings`.
 
 **Invariants**:
-- `(tenant_id, slug)` is unique for providers; `(tenant_id, canonical_id)` and `(provider_id, provider_model_id)` are unique for models.
+- `(tenant_id, slug)` is unique for providers; `(tenant_id, canonical_id)` and `(provider_id, name)` are unique for models. `provider_model_id` is not unique.
 - A model's `tenant_id` and `gts_type` equal its provider's.
 - Identity fields listed in `cpt-cf-model-registry-constraint-immutable-identity` never change.
 - Every model row's `provider_settings` passed schema validation when it was last written.
@@ -438,6 +467,7 @@ graph LR
     TRS["Tenant Resolver SDK"]
     AZ["AuthZ Resolver SDK"]
     TYS["Types Registry SDK"]
+    CRSS["CredStore SDK"]
     DBS[("Database")]
 
     LC -.implements.-> SDK
@@ -447,6 +477,7 @@ graph LR
     CS --> VR
     CS --> AGC
     CS --> GVC
+    CS --> CRSS
     CS --> ST
     VR --> CC
     VR --> ST
@@ -532,13 +563,14 @@ Implements the twelve operations of §3.3:
 
 - validates request fields;
 - calls the access guard, the visibility resolver, and the GTS validator in the order defined in §3.6;
+- checks `secret_ref` ownership through the CredStore client (§4 Credential Binding);
 - builds `canonical_id`, copies `gts_type` from the provider, and sets approval and audit fields from the `SecurityContext` subject;
-- runs each write in one database transaction;
+- runs each read in one read-only snapshot transaction (`cpt-cf-model-registry-principle-snapshot-reads`) and each write in one read-write transaction, and enforces `expected_version` (§3.3);
 - computes the `inherited`, `shadowed`, `provider_enabled`, and `available_for_eval` flags on management reads.
 
 ##### Responsibility boundaries
 
-Does not compute visibility itself and does not talk to the PDP, Tenant Resolver, or Types Registry directly. Does not interpret `provider_settings`.
+Does not compute visibility itself and does not talk to the PDP, Tenant Resolver, or Types Registry directly; CredStore is called for the ownership check only. Does not interpret `provider_settings`.
 
 ##### Related components (by ID)
 
@@ -557,7 +589,7 @@ Inheritance and shadowing must give the same answer on every path.
 
 ##### Responsibility scope
 
-Gets the caller's chain from the chain cache, loads candidate providers through storage, and computes winners per slug, the allow-list, and the shadowed set (§3.6 `cpt-cf-model-registry-seq-effective-catalog`). Provides three views: the winner for one slug (resolution), the allow-list and own-or-shared model predicate (available list), and the candidate sets with flags (management reads).
+Gets the caller's chain from the chain cache, loads candidate providers through storage inside the operation's read transaction, and computes winners per slug, the allow-list, and the shadowed set (§3.6 `cpt-cf-model-registry-seq-effective-catalog`). Provides three views: the winner for one slug (resolution), the allow-list and own-or-shared model predicate (available list), and the candidate sets with flags (management reads).
 
 ##### Responsibility boundaries
 
@@ -604,7 +636,7 @@ Provider types and provider settings come from plugins the gear does not know at
 
 ##### Responsibility scope
 
-Checks provider GTS types on provider create (§4 GTS Checks). Fetches the resolved schema of a provider type from Types Registry and validates `provider_settings` against it on model create and settings update. Publishes nothing itself.
+Checks provider GTS types on provider create and on type migration (§4 GTS Checks). Fetches the resolved schema of a provider type from Types Registry and validates `provider_settings` against it on model create, on settings update, and for every model of a provider on type migration. Publishes nothing itself.
 
 ##### Responsibility boundaries
 
@@ -624,19 +656,19 @@ Without it, every resolution calls Tenant Resolver. That wait is outside the in-
 
 ##### Responsibility scope
 
-An in-process map from tenant id to that tenant's ordered ancestor chain (parent first, root last) plus the time the entry was stored. On a miss or an expired entry it calls `TenantResolverClient::get_ancestors` with `GetAncestorsOptions { barrier_mode: BarrierMode::Ignore }`, bounded by `tenant_resolver_deadline_ms`, and stores the result. Rules:
+An in-process map from tenant id to that tenant's ordered ancestor chain (parent first, root last) plus the time the entry was stored ([ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md)). The chain is read with the default `BarrierMode::Respect` and drives inheritance and shadowing ([ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md)). On a miss or an expired entry it calls `TenantResolverClient::get_ancestors` once, bounded by `tenant_resolver_deadline_ms`, and stores the result in one entry. Rules:
 
 1. TTL is `chain_cache_ttl_seconds`, default 30, maximum 300 (checked at gear start). Value 0 disables caching; every request calls Tenant Resolver. Each stored entry gets a TTL reduced by a random jitter of up to 10%, so entries stored together do not expire together.
-2. An empty chain (root tenant) is a cached value, not a miss.
-3. Failures are not cached. A failed call fails the request with dependency unavailable.
+2. An empty chain (the root tenant or a self-managed tenant) is a cached value, not a miss.
+3. Failures are not cached. A failed call fails the request with dependency unavailable; no entry is stored.
 4. The map is a bounded concurrent LRU cache of `chain_cache_max_entries` (default 100,000) entries. Inserting into a full map evicts the least recently used entry in constant time.
-5. There is no invalidation API. A stale entry is used for at most one TTL plus the duration of the request that read it. A stale chain can narrow or widen visibility. A tenant moved under a new parent keeps its former ancestors' shared catalog and does not yet see the new ancestors' shared providers, including ones that would shadow an inherited slug. A detached tenant keeps its former ancestors' shared catalog. Deployments that need hierarchy changes to apply on the next request set the TTL to 0.
+5. There is no invalidation API. A stale entry is used for at most one TTL plus the duration of the request that read it. A stale chain can narrow or widen visibility. A tenant moved under a new parent keeps its former ancestors' shared catalog and does not yet see the new ancestors' shared providers, including ones that would shadow an inherited slug. A detached tenant keeps its former ancestors' shared catalog. A tenant whose `self_managed` flag changes keeps its previous chain, and so does each tenant below it. Deployments that need hierarchy changes to apply on the next request set the TTL to 0.
 6. Concurrent misses for the same tenant share one Tenant Resolver call (single flight per tenant).
 7. Expiry is checked against an injectable clock, the same clock that sets audit and approval timestamps.
 
 ##### Responsibility boundaries
 
-Holds tenant ids only, never provider or model data. The cache affects visibility only within the staleness bound of rule 5. With the cache empty or disabled, every request depends on Tenant Resolver. The key is the tenant id alone; the barrier mode is fixed and the chain does not depend on the caller.
+Holds tenant ids only, never provider or model data. The cache affects visibility only within the staleness bound of rule 5. With the cache empty or disabled, every request depends on Tenant Resolver. The key is the tenant id alone; the chain is fixed per tenant and does not depend on the caller.
 
 ##### Related components (by ID)
 
@@ -652,7 +684,7 @@ Durable, tenant-scoped persistence of providers and models.
 
 ##### Responsibility scope
 
-SeaORM entities for `providers` and `models` deriving `Scopable`, with `tenant_id` as the tenant column, `id` as the resource column, and PEP properties `provider_id`, `canonical_id`, and `gts_type`. Repositories over `DBRunner` that run every query through `SecureConn` with an `AccessScope`. Whole-row projection between the SDK model and the columns, including promoted filter columns. Resolution and the available list read providers through a narrow projection (`id`, `tenant_id`, `slug`, `enabled`, `sharing_mode`); `metadata` and other provider fields are read only by management operations. OData field-to-column mappings (§3.3). Migrations exposed through the gear's database capability.
+SeaORM entities for `model_registry__providers` and `model_registry__models` deriving `Scopable`, with `tenant_id` as the tenant column, `id` as the resource column, and PEP properties `provider_id`, `canonical_id`, and `gts_type`. Repositories over `DBRunner` that run every query through `SecureConn` with an `AccessScope`. Read operations open their transaction with `TxConfig { isolation: RepeatableRead, access_mode: ReadOnly }` (`cpt-cf-model-registry-principle-snapshot-reads`): on PostgreSQL every statement of the transaction reads one snapshot, and on SQLite every transaction is serializable and its read view is stable for its duration. Write operations use the default read-write transaction. Whole-row projection between the SDK model and the columns, including promoted filter columns. Resolution and the available list read providers through a narrow projection (`id`, `tenant_id`, `slug`, `enabled`, `sharing_mode`); `metadata` and other provider fields are read only by management operations. OData field-to-column mappings (§3.3). Migrations exposed through the gear's database capability.
 
 ##### Responsibility boundaries
 
@@ -680,28 +712,30 @@ Every method takes `&SecurityContext` and returns `Result<_, CanonicalError>`. T
 | Method | Input | Output | Behavior |
 |--------|-------|--------|----------|
 | `resolve_model` | canonical id | `ModelV1` | Resolution for evaluation (§3.6 `cpt-cf-model-registry-seq-resolve-model`). |
-| `list_available_models` | `ODataQuery` | `Page<AvailableModelV1>` | Exactly the models `resolve_model` would return for the caller, without `provider_settings`, `base_url`, and `secret_ref`. Permissions per §4 Authorization (§3.6 `cpt-cf-model-registry-seq-list-available-models`). |
+| `list_available_models` | `ODataQuery` | `Page<ModelV1>` | Exactly the models `resolve_model` would return for the caller, as full records. Permissions per §4 Authorization (§3.6 `cpt-cf-model-registry-seq-list-available-models`). |
 | `create_provider` | `CreateProviderRequestV1` | `ProviderEntryV1` | Creates a provider in the acting tenant. |
 | `get_provider` | provider id | `ProviderEntryV1` | Own or inherited provider. |
 | `list_providers` | `ODataQuery` | `Page<ProviderEntryV1>` | Own providers plus inherited candidates. |
-| `update_provider` | provider id, `UpdateProviderRequestV1` | `ProviderEntryV1` | Own providers only. |
-| `delete_provider` | provider id | nothing | Own providers only; deletes its models. |
+| `update_provider` | provider id, `UpdateProviderRequestV1` | `ProviderEntryV1` | Own providers only; conditional on `expected_version`. A request whose `gts_type` differs from the stored one is a type migration (§3.6 `cpt-cf-model-registry-seq-provider-write`). |
+| `delete_provider` | provider id, `expected_version?` | nothing | Own providers only; deletes its models. |
 | `create_model` | `CreateModelRequestV1` | `ModelEntryV1` | Creates a model under an own provider. |
 | `get_model` | model id | `ModelEntryV1` | Own or inherited model. |
 | `list_models` | `ODataQuery` | `Page<ModelEntryV1>` | Admin list under the model `list` action: own models plus inherited candidates in every state, including models of disabled providers and models that are not approved, with flags. |
-| `update_model` | model id, `UpdateModelRequestV1` | `ModelEntryV1` | Own models only; may change approval. |
-| `delete_model` | model id | nothing | Own models only; hard delete. |
+| `update_model` | model id, `UpdateModelRequestV1` | `ModelEntryV1` | Own models only; may change approval; conditional on `expected_version`. |
+| `delete_model` | model id, `expected_version?` | nothing | Own models only; hard delete. |
 
 Request contents:
 
 | Request | Fields |
 |---------|--------|
 | `CreateProviderRequestV1` | `slug`, `name`, `gts_type`, `enabled?` (default true), `sharing_mode?` (default `tenant`), `managed?` (default false), `metadata?` |
-| `UpdateProviderRequestV1` | Any of `name`, `enabled`, `sharing_mode`, `managed`, `metadata` (null clears) |
-| `CreateModelRequestV1` | `provider_id`, `sharing_mode?` (default `tenant`), `approval_state?` (default `approved`), and every Model Info field except `gts_type` |
-| `UpdateModelRequestV1` | Any of `sharing_mode`, `approval_state`, and every mutable Model Info field (`cpt-cf-model-registry-constraint-immutable-identity`); optional fields accept null to clear |
+| `UpdateProviderRequestV1` | `expected_version?`, and any of `name`, `enabled`, `sharing_mode`, `managed`, `metadata` (null clears), `gts_type` (type migration) |
+| `CreateModelRequestV1` | `provider_id`, `name`, `sharing_mode?` (default `tenant`), `approval_state?` (default `approved`), and every Model Info field except `gts_type` |
+| `UpdateModelRequestV1` | `expected_version?`, and any of `sharing_mode`, `approval_state`, and every Model Info field except `gts_type`; optional fields accept null to clear |
 
-Update semantics: a field present in the request replaces the stored value as a whole, including nested objects such as `capabilities`, `default_parameters`, and `provider_settings`. Absent fields stay unchanged.
+Update semantics: a field present in the request replaces the stored value as a whole, including nested objects such as `capabilities`, `cost`, `default_parameters`, and `provider_settings`. Absent fields stay unchanged.
+
+Optimistic concurrency ([ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md)): `ProviderV1` and `ModelV1` carry `version`. An update or delete with `expected_version` applies only when the stored `version` equals it; otherwise it fails with `OPTIMISTIC_LOCK_FAILURE` (§4 Error Handling) and nothing changes. Every successful update increments `version`. An update without `expected_version` is an explicit unconditional write; on REST it must be requested with `If-Match: *`.
 
 Management responses:
 
@@ -716,18 +750,18 @@ OData on lists: `$filter`, `$orderby`, `$select`, `limit` (alias `$top`), and `c
 
 - Page size defaults to `default_page_size` (20) and is capped at `max_page_size` (100). Lists read whole rows; the page cap and the document size limits bound a page.
 - Default order is `canonical_id asc` for models and `slug asc` for providers, with `id` as the final tie-breaker. Pages are keyset pages.
-- `$orderby` accepts only non-nullable fields. Nullable fields are filter-only, and a `$orderby` on one is rejected as `invalid_argument` with a field violation. Filter-only model fields: `family`, `vendor`, `hosted_by`, `region`, `version`, `architecture`, `format`, `last_release_at`, `max_output_tokens`. The other fields in the table below are orderable, and every provider field is orderable.
+- `$orderby` accepts only non-nullable fields. Nullable fields are filter-only, and a `$orderby` on one is rejected as `invalid_argument` with a field violation. Filter-only model fields: `family`, `vendor`, `hosted_by`, `region`, `model_version`, `architecture`, `format`, `last_release_at`, `max_output_tokens`. The other fields in the table below are orderable, and every provider field is orderable.
 - `$select` is applied to the serialized response on REST. The SDK always returns whole records.
 
 Filter and order fields, with their columns (this is the canonical list):
 
 | List | Group | Fields | Column |
 |------|-------|--------|--------|
-| Available models and models | Identity | `id`, `tenant_id`, `provider_id`, `canonical_id`, `provider_model_id`, `gts_type`, `sharing_mode` | Same name |
+| Available models and models | Identity | `id`, `tenant_id`, `provider_id`, `name`, `canonical_id`, `provider_model_id`, `gts_type`, `sharing_mode` | Same name |
 | Available models and models | Approval | `approval_state`, `approval_decided_at` | Same name |
 | Available models and models | Capabilities (effective values) | `vision`, `reasoning_effort`, `function_calling`, `response_schema`, `streaming`, `file_input`, `image_generation`, `audio_input`, `audio_output`, `code_interpreter`, `web_search` | `cap_<field>` |
 | Available models and models | Supported API | `api_completion`, `api_embedding`, `api_batch` | Same name |
-| Available models and models | User-facing | `display_name`, `family`, `vendor`, `hosted_by`, `region`, `version`, `managed`, `architecture`, `format`, `sort_order`, `last_release_at` | Same name |
+| Available models and models | User-facing | `display_name`, `family`, `vendor`, `hosted_by`, `region`, `model_version`, `managed`, `architecture`, `format`, `sort_order`, `last_release_at` | Same name |
 | Available models and models | Context window | `max_input_tokens`, `max_output_tokens` | `ctx_<field>`: the `context_window` limits, not `default_parameters.max_output_tokens` |
 | Available models and models | Audit | `created_at`, `updated_at` | Same name |
 | Providers | All | `id`, `tenant_id`, `slug`, `name`, `gts_type`, `enabled`, `sharing_mode`, `managed`, `created_at`, `updated_at` | Same name |
@@ -740,32 +774,33 @@ The flags `inherited`, `shadowed`, `provider_enabled`, and `available_for_eval` 
 
 - **Contracts**: `cpt-cf-model-registry-contract-provider-settings-schema`, `cpt-cf-model-registry-contract-tenant-hierarchy`
 - **Technology**: REST over JSON, generated OpenAPI from `OperationBuilder` registrations; realizes `cpt-cf-model-registry-interface-rest-api`
-- **Location**: `api/rest/routes.rs` in the gear crate; published in the platform OpenAPI document
+- **Location**: the `api/rest` layer of the gear crate; published in the platform OpenAPI document
 
 **Endpoints Overview**:
 
 | Method | Path | Description | Stability |
 |--------|------|-------------|-----------|
-| `GET` | `/model-registry/v1/available-models/{canonical_id}` | `resolve_model`. The canonical id is one percent-encoded path segment: clients encode `/`, `%`, `?`, and `#`. API Gateway routes on the encoded path and the handler decodes the segment once, so `%2F` stays inside the segment. 200 with the model as `AvailableModelV1`; the full `ModelV1` is returned only through the SDK. | stable |
-| `GET` | `/model-registry/v1/available-models` | `list_available_models`. 200 with a page of `AvailableModelV1`. | stable |
-| `POST` | `/model-registry/v1/providers` | `create_provider`. 201 with `Location` and the entry. | stable |
-| `GET` | `/model-registry/v1/providers/{id}` | `get_provider`. 200. | stable |
+| `GET` | `/model-registry/v1/available-models/{canonical_id}` | `resolve_model`. The canonical id is one percent-encoded path segment: clients encode `/`, `%`, `?`, and `#`. API Gateway routes on the encoded path and the handler decodes the segment once, so `%2F` stays inside the segment. 200 with the full `ModelV1`, the same record the SDK returns. | stable |
+| `GET` | `/model-registry/v1/available-models` | `list_available_models`. 200 with a page of `ModelV1`. | stable |
+| `POST` | `/model-registry/v1/providers` | `create_provider`. 201 with `Location`, `ETag`, and the entry. | stable |
+| `GET` | `/model-registry/v1/providers/{id}` | `get_provider`. 200 with `ETag`. | stable |
 | `GET` | `/model-registry/v1/providers` | `list_providers`. 200 with a page. | stable |
-| `PATCH` | `/model-registry/v1/providers/{id}` | `update_provider`. 200 with the entry. | stable |
-| `DELETE` | `/model-registry/v1/providers/{id}` | `delete_provider`. 204. | stable |
-| `POST` | `/model-registry/v1/models` | `create_model`. 201 with `Location` and the entry. | stable |
-| `GET` | `/model-registry/v1/models/{id}` | `get_model`. 200. | stable |
+| `PATCH` | `/model-registry/v1/providers/{id}` | `update_provider`. Requires `If-Match`. 200 with `ETag` and the entry. | stable |
+| `DELETE` | `/model-registry/v1/providers/{id}` | `delete_provider`. Optional `If-Match`. 204. | stable |
+| `POST` | `/model-registry/v1/models` | `create_model`. 201 with `Location`, `ETag`, and the entry. | stable |
+| `GET` | `/model-registry/v1/models/{id}` | `get_model`. 200 with `ETag`. | stable |
 | `GET` | `/model-registry/v1/models` | `list_models`. 200 with a page. | stable |
-| `PATCH` | `/model-registry/v1/models/{id}` | `update_model`. 200 with the entry. | stable |
-| `DELETE` | `/model-registry/v1/models/{id}` | `delete_model`. 204. | stable |
+| `PATCH` | `/model-registry/v1/models/{id}` | `update_model`. Requires `If-Match`. 200 with `ETag` and the entry. | stable |
+| `DELETE` | `/model-registry/v1/models/{id}` | `delete_model`. Optional `If-Match`. 204. | stable |
 
 REST conventions:
 
 - Every route is registered with `OperationBuilder`, `.authenticated()`, the platform license check with no gear-specific feature, `.standard_errors()` plus the 503 response, and operation id `model_registry.<sdk_method>`. List routes add `.with_odata_filter`, `.with_odata_orderby`, and `.with_odata_select` for their field enums.
 - JSON field names are snake_case. REST DTOs flatten the entry types: provider or model fields plus the flags at the top level.
-- REST update DTOs reject the immutable fields of `cpt-cf-model-registry-constraint-immutable-identity`, `canonical_id`, and audit fields with `invalid_argument` and field reason `IMMUTABLE_FIELD`.
+- REST update DTOs reject the immutable fields of `cpt-cf-model-registry-constraint-immutable-identity`, `canonical_id`, `version`, the model `gts_type`, and audit fields with `invalid_argument` and field reason `IMMUTABLE_FIELD`. The provider `gts_type` is accepted on `PATCH /providers/{id}` as a type migration.
+- Optimistic concurrency: responses that return one entry (`POST`, `GET /{id}`, `PATCH`) carry the strong `ETag` `"<version>"`. `PATCH` requires `If-Match`: a validator maps to `expected_version`, `*` to an unconditional update, and a missing header is rejected as `invalid_argument` with reason `IF_MATCH_REQUIRED`. `DELETE` accepts an optional `If-Match`. A stale validator is `aborted` (409) with reason `OPTIMISTIC_LOCK_FAILURE` (§4 Error Handling; reason for 409 instead of 412 in [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md)). `PATCH` takes `Content-Type: application/json` with top-level whole-field replacement semantics and is not advertised as `application/merge-patch+json`.
 - Errors are canonical Problem documents (RFC 9457) produced by `toolkit-canonical-errors`. The wire carries category, title, detail, resource type and name, and the category context (reason, field violations). Internal diagnostics, SQL text, stored JSON documents, and the ids of rows the caller cannot see are never put on the wire. The error table is in §4 Error Handling.
-- Versioning follows the [platform versioning guideline](../../../guidelines/DNA/REST/VERSIONING.md). Breaking REST changes require `/v2/`. A breaking SDK change adds `ModelRegistryClientV2` next to `ModelRegistryClientV1`, and V1 is deprecated per that guideline. Additions of optional fields, endpoints, filter fields, and `supported_api` values are non-breaking.
+- Versioning follows the [platform versioning guideline](../../../guidelines/DNA/REST/VERSIONING.md). Breaking REST changes require `/v2/`. A breaking SDK change adds `ModelRegistryClientV2` next to `ModelRegistryClientV1`, and V1 is deprecated per that guideline. The first SDK release that a gear implements publishes `ModelRegistryClientV1` as defined in this document, and the V2 rule applies from then on. Additions of optional fields, endpoints, filter fields, and `supported_api` values are non-breaking.
 
 #### Provider Base Type
 
@@ -775,30 +810,33 @@ REST conventions:
 - **Technology**: GTS type schema in Types Registry, declared in the SDK crate
 - **Location**: [model-registry-sdk/src/models/](../model-registry-sdk/src/models/)
 
-The gear owns the provider base type `gts.cf.genai.model.provider.v1~` (the AI model provider type of the [platform GTS guideline](../../../guidelines/GTS.md)). Its schema declares one open object property, `provider_settings`. Each LLM Gateway provider plugin publishes a derived provider type, for example `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`, whose schema narrows `provider_settings` to the plugin's settings, including cost. Plugins follow the compatibility rule of `cpt-cf-model-registry-contract-provider-settings-schema`: schema changes stay backward compatible with stored settings, or ship as a new type version. The base type changes only additively within `v1`. A provider moves to a new provider type version by replacement: the administrator creates a provider of the new type and recreates its models, deleting the old provider first to keep the slug and canonical ids. There is no in-place type migration.
+The gear owns the provider base type `gts.cf.genai.model.provider.v1~` (the AI model provider type of the [platform GTS guideline](../../../guidelines/GTS.md)). Its schema declares one open object property, `provider_settings`. Each LLM Gateway provider plugin publishes a derived provider type, for example `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~`, whose schema narrows `provider_settings` to the plugin's settings. Plugins follow the compatibility rule of `cpt-cf-model-registry-contract-provider-settings-schema`: schema changes stay backward compatible with stored settings, or ship as a new type version. The base type changes only additively within `v1`. A provider moves to a new provider type version in place: an `update_provider` that carries the new `gts_type` validates every model of the provider against the new type's schema and, only when all pass, switches the `gts_type` of the provider and of all its models in one transaction (§3.6 `cpt-cf-model-registry-seq-provider-write`). Ids, slugs, and canonical ids are kept. A migration fails if the settings of any model fail the new schema.
 
-The gear publishes the provider base type `gts.cf.genai.model.provider.v1~` and the permission instances of §4 Authorization to Types Registry through the platform's GTS publication. Provider plugins publish their derived types after the base type exists; until then, provider and model writes that need a provider type fail with `GTS_TYPE_NOT_REGISTERED`.
+The gear declares the provider base type `gts.cf.genai.model.provider.v1~` and the permission instances of §4 Authorization; the platform's GTS publication registers them in Types Registry before the gear starts. Provider plugins publish their derived types after the base type exists; until then, provider and model writes that need a provider type fail with `GTS_TYPE_NOT_REGISTERED`.
 
 #### Consumer Contract
 
 What LLM Gateway and its provider plugins rely on:
 
-1. **SDK surface.** `ModelInfoV1` is not generic; `provider_settings` is JSON that the plugin narrows. The SDK defines no provider settings types; they live in the LLM Gateway provider plugins that own the derived provider types. Models have no lifecycle status (`cpt-cf-model-registry-constraint-no-model-lifecycle`), and provider availability is the `enabled` flag. The resolution methods are `resolve_model`, which returns the full `ModelV1`, and `list_available_models`, which returns `AvailableModelV1`; the management list is `list_models`, which returns `ModelEntryV1`. `llm-gateway-sdk` depends on the SDK crate; the `provider_type` of its plugin specification carries provider type ids derived from `gts.cf.genai.model.provider.v1~`.
+1. **SDK surface.** `ModelInfoV1` is not generic; `provider_settings` is JSON that the plugin narrows. The SDK defines no provider settings types; they live in the LLM Gateway provider plugins that own the derived provider types. Models have no lifecycle status (`cpt-cf-model-registry-constraint-no-model-lifecycle`), and provider availability is the `enabled` flag. The resolution methods are `resolve_model`, which returns the full `ModelV1` on the SDK and on REST alike, and `list_available_models`, which returns a page of the same full `ModelV1`; the management list is `list_models`, which returns `ModelEntryV1`. `llm-gateway-sdk` depends on the SDK crate; the `provider_type` of its plugin specification carries provider type ids derived from `gts.cf.genai.model.provider.v1~`.
 2. **Errors.** `resolve_model` reports distinct outcomes: model not found, `PROVIDER_DISABLED`, `MODEL_NOT_APPROVED`, `NOT_PERMITTED`, and dependency unavailable (§4 Error Handling). LLM Gateway decides its own external mapping of each.
 3. **Destination.** The model is called at `base_url` when set, otherwise at the plugin's default URL for the provider. The plugin sends every call through OAGW, whose egress policy admits only upstreams enabled for the caller's tenant and otherwise fails with `unapproved_destination` (§4 Security Assumptions). A plugin that addresses OAGW by an upstream alias keeps that alias in its own `provider_settings` schema.
-4. **Permissions.** The caller's `SecurityContext` must be granted model `evaluate` for `resolve_model`, and both `list_available` and `evaluate` for `list_available_models`.
-5. **Plugin obligations.** Each plugin publishes a provider type derived from `gts.cf.genai.model.provider.v1~` whose schema constrains `provider_settings`, after the base type exists. It keeps the schema backward compatible with stored settings or publishes a new type version.
+4. **Credentials.** `secret_ref` names a credential that the model's owning tenant, `ModelV1.tenant_id`, held under that name when the model was written; the gear enforces this on write and not at evaluation (§4 Credential Binding). LLM Gateway loads the secret under the caller's context with `CredStoreClientV2::get_secret` and performs no owner check: CredStore returns no owner, and for an inherited model the caller legitimately loads a secret it does not own. A missing, suppressed, or expired secret is `credentials_unavailable` without a provider call. For descendants of the model's tenant to evaluate a shared model, the secret must be `shared` in CredStore; the registry does not check this.
+5. **Permissions.** The caller's `SecurityContext` must be granted model `evaluate` for both `resolve_model` and `list_available_models`; there is no separate list permission.
+6. **Plugin obligations.** Each plugin publishes a provider type derived from `gts.cf.genai.model.provider.v1~` whose schema constrains `provider_settings`, after the base type exists. It keeps the schema backward compatible with stored settings or publishes a new type version.
+7. **Cost.** The plugin computes the AI credits of a call from `info.cost`: micro-credits per 1M input, output, cache read, and cache write tokens, and per 1K web search calls. Provider type schemas carry no cost rates.
 
 ### 3.4 Internal Dependencies
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|----------------|----------|
-| `tenant-resolver` | `TenantResolverClient::get_ancestors` via ClientHub, `GetAncestorsOptions { barrier_mode: BarrierMode::Ignore }` | Ancestor chain of the acting tenant for inheritance and shadowing |
+| `tenant-resolver` | `TenantResolverClient::get_ancestors` via ClientHub, once with the default `BarrierMode::Respect` per cache miss | Ancestor chain for inheritance and shadowing |
 | `authz-resolver` | `AuthZResolverClient` wrapped in `PolicyEnforcer` (`authz-resolver-sdk`) | PDP decisions for every operation |
 | `types-registry` | `TypesRegistryClient::get_type_schema` (the effective schema, parent chain inlined) under the caller's context; platform GTS publication (provider base type and permission instances) | Provider type checks and settings validation on writes |
+| `credstore` | `CredStoreClientV2::get_record` via ClientHub, under the caller's context | Ownership check of `secret_ref` on model create and on an update that sets it (§4 Credential Binding) |
 | `llm-gateway` (consumer) | Calls `ModelRegistryClientV1` | Resolves models on every inference request; its provider plugins publish provider types derived from `gts.cf.genai.model.provider.v1~` (§3.3 Consumer Contract) |
 
-The gear declares `deps = [tenant_resolver, authz_resolver, types_registry]` and `capabilities = [db, rest]`. The CredStore reference format is a data contract only; the gear does not call CredStore.
+The gear declares `deps = [tenant_resolver, authz_resolver, types_registry, credstore]` and `capabilities = [db, rest]`. CredStore is called on writes only, never on the resolution path.
 
 **Dependency Rules** (per [platform dependency rules](../../../docs/GEARS.md#dependency-rules)):
 - No circular dependencies
@@ -815,9 +853,9 @@ The gear declares `deps = [tenant_resolver, authz_resolver, types_registry]` and
 
 | Dependency Gear | Interface Used | Purpose |
 |-------------------|---------------|---------|
-| `tenant-resolver` | `get_ancestors(ctx, tenant, GetAncestorsOptions { barrier_mode: BarrierMode::Ignore })` returning the tenant and its ancestors from parent to root | Builds the chain `[T0, parent, …, root]` used by `cpt-cf-model-registry-seq-effective-catalog` |
+| `tenant-resolver` | `get_ancestors(ctx, tenant, GetAncestorsOptions::default())` (`BarrierMode::Respect`), returning the tenant's ancestors from parent up to the nearest isolation barrier | The chain `[T0, parent, …, root or nearest self-managed ancestor]` drives `cpt-cf-model-registry-seq-effective-catalog` |
 
-The gear uses the parent-first, root-last order that Tenant Resolver returns, as the PRD contract states. With `BarrierMode::Ignore`, a self-managed tenant inherits its ancestors' shared providers and models, and changes an ancestor makes to its shared entries (disable, revoke, sharing, shadowing) apply to the self-managed subtree (§4 Deviations). Ancestors never read the self-managed subtree's rows; the gear never reads descendant rows. Tenant Resolver errors map as listed in §4 Error Handling. Hierarchy changes take effect within the chain cache TTL (`cpt-cf-model-registry-component-chain-cache` rule 5).
+The gear uses the parent-first, root-last order that Tenant Resolver returns, as the PRD contract states. Under `BarrierMode::Respect`, a self-managed tenant has an empty chain and sees its own rows only. A tenant below a self-managed tenant has a chain that ends at that tenant: it inherits the self-managed tenant's shared providers and models and nothing from above it ([ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md)). The gear never calls Tenant Resolver with `BarrierMode::Ignore`. Ancestors never read the self-managed subtree's rows; the gear never reads descendant rows. Tenant Resolver errors map as listed in §4 Error Handling. Hierarchy changes take effect within the chain cache TTL (`cpt-cf-model-registry-component-chain-cache` rule 5).
 
 #### Provider Settings Schemas
 
@@ -828,6 +866,16 @@ The gear uses the parent-first, root-last order that Tenant Resolver returns, as
 | `types-registry` (schemas registered by LLM Gateway provider plugins) | `TypesRegistryClient::get_type_schema`, taking the effective schema (the type's schema with its parent chain inlined) | Source of the JSON Schema for `provider_settings` of each provider type |
 
 Schema reads go through the Types Registry client registered in ClientHub and take the effective schema, the type's schema with its parent chain inlined. The read runs under the caller's context, which needs the Types Registry read grant.
+
+#### Credential Ownership
+
+- **Contract**: none; the CredStore SDK read is used as published
+
+| Dependency Gear | Interface Used | Purpose |
+|-------------------|---------------|---------|
+| `credstore` | `CredStoreClientV2::get_record(ctx, secret_ref)` under the caller's context, bounded by `credstore_deadline_ms` | Confirms that the writing tenant's own row under `secret_ref` holds a secret: `own` is present with `status` `active` or `expired` |
+
+The read is metadata only and returns no secret value (`cpt-cf-model-registry-constraint-no-secret-storage`); it requires the CredStore `read` action, not `read_secret`. `Ok(None)` is `SECRET_REF_NOT_FOUND`; no own row, or an own row with `status` `declared`, is `SECRET_REF_NOT_OWNED`; `PermissionDenied` is `NOT_PERMITTED`; other failures are dependency unavailable (§4 Error Handling, [ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md)).
 
 #### Platform Database
 
@@ -860,7 +908,7 @@ graph TD
     C -.owns.-> CP["openai, shared, enabled<br/>gpt-4o shared approved"]
 ```
 
-**Description**: Builds the effective catalog of the acting tenant T0. All read paths use these steps.
+**Description**: Builds the effective catalog of the acting tenant T0. All read paths use these steps. The row reads of steps 2 and 5, and every other row read of the same request, run in one read-only snapshot transaction (`cpt-cf-model-registry-principle-snapshot-reads`), so the candidate providers and the model rows come from one committed state.
 
 1. Get the chain `C = [T0, a1, …, ak]`, nearest first, from the chain cache. Distance of `ai` is `i`; distance of T0 is 0.
 2. Load candidate providers in one query: providers with `tenant_id = T0` in any sharing mode, plus providers with `tenant_id IN (a1 … ak)` and `sharing_mode = shared`. A failed query fails the request.
@@ -877,6 +925,7 @@ Rules that follow from these steps:
 - A `tenant`-mode shadowing provider is not a candidate for descendants, so they keep inheriting the ancestor's shared provider.
 - A `shared`, disabled shadowing provider still wins its slug but is not in the allow-list, so no model with that slug resolves anywhere in its subtree.
 - Deleting a shadowing provider removes it from the candidates; the ancestor's provider wins again on the next request.
+- A read sees every write committed before its snapshot and none committed after it, so it never combines a provider state and a model state that were never committed together.
 - Filtering is by `provider_id` membership, never by `canonical_id` dedupe. In the example below, Root's `openai::gpt-4o-mini` stays invisible to Customer although Customer owns no model with that name.
 
 Result of the example hierarchy in the diagram:
@@ -908,19 +957,21 @@ sequenceDiagram
     participant PDP as AuthZ Resolver PDP
 
     GW->>MR: resolve_model(ctx, "openai::gpt-4o")
-    MR->>MR: split on first "::" into slug and provider_model_id
+    MR->>MR: split on first "::" into slug and name
     MR->>CC: chain(T0)
     alt miss or expired
-        CC->>TR: get_ancestors(T0, barrier_mode Ignore)
+        CC->>TR: get_ancestors(T0, Respect)
         TR-->>CC: ancestors or error
         Note over CC: error gives dependency unavailable
     end
     CC-->>MR: [T0, a1, ..., ak]
+    MR->>DB: begin read-only snapshot transaction
     MR->>DB: candidate providers with slug in chain
     DB-->>MR: up to one row per chain tenant
     Note over MR: winner = nearest candidate, none gives model not found
-    MR->>DB: model by provider_id = winner and provider_model_id
+    MR->>DB: model by provider_id = winner and name
     DB-->>MR: row or none
+    MR->>DB: end transaction
     Note over MR: none, or tenant mode and not owned by T0, gives model not found
     Note over MR: winner disabled gives PROVIDER_DISABLED
     Note over MR: approval not approved gives MODEL_NOT_APPROVED
@@ -932,16 +983,16 @@ sequenceDiagram
 
 **Description**: Resolves a canonical id for the acting tenant T0 in the PRD order.
 
-1. Parse the canonical id on the first `::`. A missing separator or an empty part yields model not found.
+1. Parse the canonical id on the first `::` into the provider slug and the model `name`. A missing separator or an empty part yields model not found.
 2. Get the chain (cache first). A Tenant Resolver failure yields dependency unavailable.
-3. Load candidate providers with the parsed slug (step 2 of the effective-catalog algorithm, restricted to one slug). No candidate yields model not found.
-4. Load the model by `(provider_id = winner.id, provider_model_id)`. If no row exists, or the row belongs to an ancestor and is in `tenant` mode, the result is model not found.
+3. Open one read-only snapshot transaction and load candidate providers with the parsed slug (step 2 of the effective-catalog algorithm, restricted to one slug). No candidate yields model not found.
+4. Load the model by `(provider_id = winner.id, name)` in the same transaction, then end the transaction. If no row exists, or the row belongs to an ancestor and is in `tenant` mode, the result is model not found.
 5. If the winner is disabled, return `PROVIDER_DISABLED`. Provider state is reported only for a canonical id that names a visible model.
 6. If the approval state is not `approved`, return `MODEL_NOT_APPROVED`.
 7. Ask the PDP for `evaluate` on the model resource with the model id, `owner_tenant_id = T0`, and the properties `provider_id`, `canonical_id`, `gts_type`. Apply any returned row constraints to the found row in memory. Denial yields `NOT_PERMITTED`; a PDP failure yields dependency unavailable.
 8. Return the full `ModelV1`, including `provider_settings`, `base_url` and `secret_ref` when set, defaults, and capabilities. An absent `base_url` stays absent; the gear does not fill in a default.
 
-The record is read from the database on every call; a revocation, disable, sharing change, or delete applies to the next resolution.
+The rows are read from the database on every call, from one snapshot (`cpt-cf-model-registry-principle-snapshot-reads`): the winner's `enabled` and `sharing_mode` and the model's approval state come from one committed state, and the transaction ends before the PDP call of step 7. A revocation, disable, sharing change, or delete committed after the snapshot applies to the next resolution.
 
 #### List Available Models
 
@@ -962,34 +1013,33 @@ sequenceDiagram
     CG->>MR: list_available_models(ctx, filter vision eq true, limit 20)
     MR->>CC: chain(T0)
     CC-->>MR: [T0, a1, ..., ak]
+    MR->>PDP: evaluate on model type, owner_tenant_id = T0, no resource id
+    PDP-->>MR: decision and constraints
+    Note over MR: denied gives NOT_PERMITTED, failure gives dependency unavailable; tenant constraints gate T0, other constraints become a row predicate
+    MR->>DB: begin read-only snapshot transaction
     MR->>DB: all candidate providers in chain
     DB-->>MR: provider rows
     Note over MR: winners per slug, allow-list = enabled winners
-    MR->>PDP: list_available on model type, owner_tenant_id = T0
-    PDP-->>MR: decision
-    Note over MR: denied gives NOT_PERMITTED, failure gives dependency unavailable
-    MR->>PDP: evaluate on model type, owner_tenant_id = T0, no resource id
-    PDP-->>MR: decision and constraints
-    Note over MR: tenant constraints gate T0, other constraints become a row predicate
-    alt allow-list empty or evaluate denies
+    alt allow-list empty
+        MR->>DB: end transaction
         MR-->>CG: empty page
     else
         MR->>DB: models where provider_id in allow-list and own-or-shared and approved and evaluate predicate and filter, ordered, keyset page
         DB-->>MR: rows
-        MR-->>CG: Page of AvailableModelV1
+        MR->>DB: end transaction
+        MR-->>CG: Page of ModelV1
     end
 ```
 
 **Description**: Returns exactly the models that `resolve_model` would return for the same caller.
 
-1. Build the chain, candidates, winners, and allow-list as in `cpt-cf-model-registry-seq-effective-catalog`.
-2. Take the PDP `list_available` decision on the model resource type, with `owner_tenant_id = T0` and no resource id. This decision is the gate for the operation: only its tenant gate applies, and it contributes no row predicate. A denial fails the request with `NOT_PERMITTED`.
-3. Take the PDP `evaluate` decision on the model resource type, with `owner_tenant_id = T0` and no resource id. Its row constraints become the row predicate. A denial yields an empty page: the caller may list, but no model would resolve for it.
-4. A PDP failure on either decision fails the request with dependency unavailable; nothing is listed by default.
-5. Run one model query with these mandatory predicates: `provider_id IN allow-list`, `(tenant_id = T0 OR sharing_mode = shared)`, `approval_state = approved`, and the row predicate from the `evaluate` constraints on `id`, `provider_id`, `canonical_id`, and `gts_type`. The caller's `$filter`, `$orderby`, cursor, and limit are applied on top. The allow-list holds at most one id per slug among the chain's candidates; PDP value lists are capped by `max_pdp_constraint_values` (§4 Authorization rule 3).
-6. If the allow-list is empty, return an empty page without querying models.
+1. Get the chain and take one PDP `evaluate` decision on the model resource type, with `owner_tenant_id = T0` and no resource id. Its tenant constraints gate T0 and its row constraints become the row predicate. A denial fails the request with `NOT_PERMITTED`.
+2. A PDP failure fails the request with dependency unavailable; nothing is listed by default.
+3. Open one read-only snapshot transaction and build the candidates, winners, and allow-list as in `cpt-cf-model-registry-seq-effective-catalog`.
+4. Run one model query in the same transaction with these mandatory predicates: `provider_id IN allow-list`, `(tenant_id = T0 OR sharing_mode = shared)`, `approval_state = approved`, and the row predicate from the `evaluate` constraints on `id`, `provider_id`, `canonical_id`, and `gts_type`. The caller's `$filter`, `$orderby`, cursor, and limit are applied on top. The allow-list holds at most one id per slug among the chain's candidates; PDP value lists are capped by `max_pdp_constraint_values` (§4 Authorization rule 3).
+5. If the allow-list is empty, return an empty page without querying models. The transaction ends after the last query, before the response is built.
 
-Only `evaluate` decides which rows appear, and the resolve path applies the same PDP property set and constraint rules to a single row, so a consistent PDP gives the same membership on both paths. The cursor's filter hash covers the caller's `$filter` only; a provider disable or approval change between pages changes later pages.
+One `evaluate` decision decides which rows appear, and the resolve path applies the same PDP property set and constraint rules to a single row, so a consistent PDP gives the same membership on both paths. The allow-list and the page rows come from one snapshot, so a model is listed only when its provider was enabled and its approval was `approved` in the same committed state. The cursor's filter hash covers the caller's `$filter` only, and each page is a separate request with its own snapshot; a provider disable or approval change between pages changes later pages.
 
 #### Provider Write Path
 
@@ -1023,8 +1073,18 @@ sequenceDiagram
 **Description**: Provider create, update, and delete.
 
 - **Create**: format checks, PDP `create`, the GTS checks of §4 GTS Checks, a check of any PDP row constraints in memory against the built record, then insert with `tenant_id = T0`, `created_by` and `updated_by` set to the subject. A duplicate slug in the tenant yields `already_exists`. A new provider with an inherited slug immediately shadows the inherited provider as described in `cpt-cf-model-registry-seq-effective-catalog`.
-- **Update**: PDP `update` with the provider id, then one transaction: load the row by id under `tenant_id = T0` with an exclusive row lock (a PostgreSQL row lock for update; SQLite serializes writers), apply the fields present in the request, and write the row. Zero rows loaded means the id is either an inherited provider visible to T0 (`INHERITED_READ_ONLY`) or not visible (not found). Changing `enabled` or `sharing_mode` applies to the next request.
-- **Delete**: PDP `delete` with the provider id, then one transaction deletes the provider's models and the provider, both scoped to `tenant_id = T0`. The foreign key from models to providers is `ON DELETE CASCADE` as a backstop. If the provider shadowed an inherited one, the inherited provider wins its slug again on the next request.
+- **Update and type migration**: an update whose request carries a `gts_type` different from the stored one is a type migration; an equal `gts_type` is a plain update. Guarantees:
+  - PDP `update` with the provider id precedes any write.
+  - Every write runs in one transaction scoped to `tenant_id = T0`. No database connection is held during the Types Registry call.
+  - The transaction of an update, a type migration, and a delete locks the provider row exclusively (a PostgreSQL row lock; SQLite serializes writers); a type migration also locks the provider's model rows. Concurrent writes of the same provider are serialized by the lock.
+  - `expected_version`, when given, is compared against the locked row and must equal its `version`; otherwise the request fails with `OPTIMISTIC_LOCK_FAILURE` and nothing is written. Every successful write increments `version`.
+  - A request `gts_type` equal to the value read before the transaction is compared again with the locked row; a difference fails with `aborted` and reason `OPTIMISTIC_LOCK_FAILURE` and writes nothing, including for an unconditional update.
+  - Fields present in the request are applied to the locked row, including those equal to the stored value. Changes to `enabled` or `sharing_mode` apply to the next request.
+  - A type migration runs the provider GTS checks of §4 GTS Checks on the new type and validates every model's `provider_settings` against the `provider_settings` subschema of the new type. Each violation is one field violation with field `gts_type`, reason `SCHEMA_MISMATCH`, and a description naming the model's canonical id and the JSON pointer; one failing model fails the request and nothing is written.
+  - A type migration is atomic across the provider and all its models: it fails with `OPTIMISTIC_LOCK_FAILURE` if the locked provider row or model rows differ from the validated state (the provider version, the model set, or any model version changed), and otherwise sets `gts_type` on the provider and every model, increments every row's `version`, and sets `updated_at` and `updated_by` on every row. Readers see the old or the new type atomically; the next resolution selects the plugin of the new type. The provider row and its model rows are updated in place and never deleted and recreated, so the provider keeps its id and stays the candidate for its slug throughout; an inherited provider it shadows is never exposed.
+  - Validation cost grows with the provider's model count and is bounded by `max_json_document_bytes` per model and by the Types Registry deadline for the single schema read.
+  - A write on an inherited provider fails with `INHERITED_READ_ONLY`; an invisible provider is not found.
+- **Delete**: PDP `delete` with the provider id precedes the delete. One transaction scoped to `tenant_id = T0` locks the provider row, checks `expected_version` against it when given, and deletes the provider's models and the provider (FK `ON DELETE CASCADE` backstop). If the provider shadowed an inherited one, the inherited provider wins its slug again on the next request.
 
 #### Model Write Path
 
@@ -1041,9 +1101,10 @@ sequenceDiagram
     participant PDP as AuthZ Resolver PDP
     participant DB as Database
     participant TY as Types Registry
+    participant CR as CredStore
 
-    A->>MR: create_model(provider_id, info, sharing_mode, approval_state)
-    MR->>MR: validate field formats and sizes
+    A->>MR: create_model(provider_id, name, info, sharing_mode, approval_state)
+    MR->>MR: validate name, field formats and sizes
     MR->>PDP: create on model type, owner_tenant_id = T0, provider_id
     PDP-->>MR: decision
     MR->>DB: provider by id, tenant_id = T0
@@ -1053,7 +1114,12 @@ sequenceDiagram
     TY-->>MR: resolved schema or failure
     MR->>MR: validate provider_settings against the provider_settings part of the schema
     Note over MR: violations give invalid_argument with one field violation each
-    MR->>MR: canonical_id = slug::provider_model_id, gts_type from provider, approval and audit fields
+    opt secret_ref set
+        MR->>CR: get_record(ctx, secret_ref)
+        CR-->>MR: own row status, none, denied, or failure
+        Note over MR: no own row holding a secret gives invalid_argument
+    end
+    MR->>MR: canonical_id = slug::name, gts_type from provider, approval and audit fields
     MR->>MR: check PDP row constraints against the built record
     MR->>DB: insert model with promoted columns in transaction
     DB-->>MR: ok, unique violation, or foreign-key violation
@@ -1063,24 +1129,29 @@ sequenceDiagram
 
 **Description**: Model create and update, including approval changes.
 
-- **Create**:
-  1. Validate formats and sizes (`base_url` only when present).
-  2. PDP `create` on the model type with `owner_tenant_id = T0` and `provider_id`. A denial fails here.
-  3. Load the provider under `tenant_id = T0`.
-  4. Validate `provider_settings` (§4 GTS Checks). No database connection is held during the Types Registry call.
-  5. Build `canonical_id`, copy `gts_type`, and set approval (default `approved`, decided by the subject now).
-  6. Check any row constraints of the step 2 decision in memory against the built record.
-  7. Insert all columns in one transaction. A duplicate `canonical_id` yields `already_exists`. If the provider was deleted after step 3, the insert fails on the foreign key and the gear reports provider not found.
-- **Update**:
-  1. PDP `update` with the model id.
-  2. Load the row under `tenant_id = T0` to read its `gts_type`. Zero rows: `INHERITED_READ_ONLY` or not found, as for providers.
-  3. Validate `base_url` when the request sets it (null clears it), and `provider_settings` when the request carries it.
-  4. In one transaction, load the row again with an exclusive row lock and apply the fields present in the request to the locked row. When the request carries `approval_state`, set `approval_decided_by` to the subject and `approval_decided_at` to now. Rewrite every promoted column from the merged record and write the row under `tenant_id = T0`.
-  5. A concurrent update of other fields cannot revert a revoke or any other approval change. Two updates of the same field apply in commit order; the last one wins.
+- **Create**: guarantees:
+  - Formats and sizes are validated first, including the `name` format (`base_url` only when present).
+  - PDP `create` on the model type with `owner_tenant_id = T0` and `provider_id` precedes any write. Row constraints of the decision are checked in memory against the built record.
+  - `provider_settings` is validated (§4 GTS Checks) and `secret_ref`, when set, is ownership-checked (§4 Credential Binding). No database connection is held during the Types Registry or CredStore call.
+  - The record gets `canonical_id = slug::name`, the provider's `gts_type`, `version = 1`, and approval (default `approved`, decided by the subject now). All columns are written in one transaction.
+  - The insert transaction re-reads the provider's `gts_type` under a shared lock on the provider row; a create validated against a provider type that changed since fails with `aborted` and reason `PROVIDER_TYPE_CHANGED` (the caller retries).
+  - A duplicate `name` under the provider, and so a duplicate `canonical_id`, yields `already_exists`. A provider deleted in between yields provider not found.
+- **Update**: guarantees:
+  - PDP `update` with the model id precedes any write. A write on an inherited model fails with `INHERITED_READ_ONLY`; an invisible model is not found.
+  - `base_url` is validated when the request sets it (null clears it), `provider_settings` when the request carries a value different from the stored one, and `secret_ref` ownership when the request carries a non-null value different from the stored one (null clears it; §4 Credential Binding). A present field equal to the stored value triggers neither check and is written.
+  - The write runs in one transaction scoped to `tenant_id = T0` that locks the model row exclusively (a PostgreSQL row lock; SQLite serializes writers). Under the lock, in this order:
+    - `expected_version`, when given, is compared with the locked `version`; a mismatch fails with `OPTIMISTIC_LOCK_FAILURE` and writes nothing.
+    - Each field whose check was skipped because the request value equalled the stored value read before the transaction (`provider_settings`, `secret_ref`) is compared again with the locked row; a difference fails with `OPTIMISTIC_LOCK_FAILURE` and writes nothing, including for an unconditional update.
+    - When `provider_settings` was validated, the locked row's `gts_type` is compared with the value read before validation; a difference fails with `aborted` and reason `PROVIDER_TYPE_CHANGED`.
+  - `OPTIMISTIC_LOCK_FAILURE` takes precedence over `PROVIDER_TYPE_CHANGED`: the version compare is evaluated first, so a conditional update that raced a type migration reports `OPTIMISTIC_LOCK_FAILURE`.
+  - Two updates with the same `expected_version` apply in commit order and the second fails. Unconditional updates are serialized by the lock.
+  - The request's present fields are applied to the locked row and `version` is incremented, so concurrent changes to other fields are kept. Unconditional updates (no `expected_version`) change only the fields they carry.
+  - When the request carries `approval_state`, `approval_decided_by` is set to the subject and `approval_decided_at` to now.
+  - Every promoted column is rewritten from the merged record (the locked row with the present fields applied).
 - **Approve**: an update with `approval_state = approved` (PRD use case approve-model). Later resolutions of the model succeed when its provider is enabled and the PDP permits evaluation. Revoke is the same update with `revoked`; later resolutions report `MODEL_NOT_APPROVED`.
-- **Delete**: PDP `delete` with the model id; scoped hard delete under `tenant_id = T0`.
+- **Delete**: PDP `delete` with the model id precedes a hard delete scoped to `tenant_id = T0`, conditional on `expected_version` when given.
 
-There is no bulk create or update in this design. Each model write fetches and compiles its provider type schema once.
+There is no bulk create or update in this design. Each model write fetches and compiles its provider type schema once and makes at most one CredStore call.
 
 #### Management Reads
 
@@ -1103,24 +1174,26 @@ sequenceDiagram
     PDP-->>MR: decision and constraints
     MR->>CC: chain(T0)
     CC-->>MR: [T0, a1, ..., ak]
+    MR->>DB: begin read-only snapshot transaction
     MR->>DB: candidate providers in chain
     DB-->>MR: provider rows
     Note over MR: winners, shadowed set, inherited shared provider ids
     MR->>DB: models where tenant_id = T0, or provider in inherited shared candidates and model shared, plus PDP predicate and filter
     DB-->>MR: rows
+    MR->>DB: end transaction
     Note over MR: flags inherited, shadowed, provider_enabled, available_for_eval
     MR-->>A: Page of ModelEntryV1
 ```
 
-**Description**: `list_models` is the admin list, authorized by the model `list` action and separate from the available list (`list_available_models`). It returns every model the tenant manages or inherits, including models of disabled providers and models that are not approved. `list_providers`, `get_provider`, `list_models`, and `get_model` return own entries in any state and inherited entries that are candidates for T0, including shadowed ones. An inherited provider is a candidate when it is `shared`. An inherited model is a candidate when it is `shared` and its provider is a `shared` candidate for T0. Each entry carries `inherited` and `shadowed` flags and its eval availability. Point reads take the PDP `get` decision first, then load the row by id and check that it is own or an inherited candidate; anything else is not found. Inherited entries contain the full record. Management reads never return rows of descendant or sibling tenants.
+**Description**: `list_models` is the admin list, authorized by the model `list` action and separate from the available list (`list_available_models`). It returns every model the tenant manages or inherits, including models of disabled providers and models that are not approved. `list_providers`, `get_provider`, `list_models`, and `get_model` return own entries in any state and inherited entries that are candidates for T0, including shadowed ones. An inherited provider is a candidate when it is `shared`. An inherited model is a candidate when it is `shared` and its provider is a `shared` candidate for T0. Each entry carries `inherited` and `shadowed` flags and its eval availability. Point reads take the PDP `get` decision first, then load the row by id and check that it is own or an inherited candidate; anything else is not found. The candidate provider query and the row query of a management read run in one read-only snapshot transaction (`cpt-cf-model-registry-principle-snapshot-reads`), so the `shadowed`, `provider_enabled`, and `available_for_eval` flags of an entry are computed from the same committed state as the entry. Inherited entries contain the full record. Management reads never return rows of descendant or sibling tenants.
 
 ### 3.7 Database schemas & tables
 
 - [ ] `p1` - **ID**: `cpt-cf-model-registry-db-catalog-storage`
 
-Two tables in the platform database, created by the gear's migrations and recorded in the gear's own migration history table. Logical types map per backend: `UUID` (PostgreSQL `UUID`, SQLite `TEXT`), `TIMESTAMP` (PostgreSQL `TIMESTAMPTZ`, SQLite `TEXT` in ISO-8601 UTC), `JSON` (PostgreSQL `JSONB`, SQLite `TEXT`), `BOOLEAN`, `INTEGER` (32-bit), `BIGINT` (64-bit; used for unsigned 32-bit values so they fit on PostgreSQL), `VARCHAR(n)`, `TEXT`. All indexes are B-tree. JSON columns have no indexes and are never filtered.
+Two tables in the platform database under the gear's stable `db_namespace = model_registry` ([database object namespacing ADR](../../../docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md)): `model_registry__providers` and `model_registry__models`, created by the gear's migrations and recorded in the gear's own migration history table. Explicitly named indexes and constraints follow the ADR grammar `idx_`, `uq_`, `fk_`, `ck_` + `<table>__<purpose>`. Logical types map per backend: `UUID` (PostgreSQL `UUID`, SQLite `TEXT`), `TIMESTAMP` (PostgreSQL `TIMESTAMPTZ`, SQLite `TEXT` in ISO-8601 UTC), `JSON` (PostgreSQL `JSONB`, SQLite `TEXT`), `BOOLEAN`, `INTEGER` (32-bit), `BIGINT` (64-bit; used for unsigned 32-bit values so they fit on PostgreSQL), `VARCHAR(n)`, `TEXT`. All indexes are B-tree. JSON columns have no indexes and are never filtered.
 
-#### Table: providers
+#### Table: model_registry__providers
 
 **ID**: `cpt-cf-model-registry-dbtable-providers`
 
@@ -1137,6 +1210,7 @@ Two tables in the platform database, created by the gear's migrations and record
 | sharing_mode | VARCHAR(16) | `tenant` or `shared` |
 | managed | BOOLEAN | Platform-managed provider flag |
 | metadata | JSON | Opaque metadata, nullable |
+| version | BIGINT | Row version, 1 on create, incremented by every update |
 | created_at | TIMESTAMP | Creation time |
 | created_by | UUID | Creating subject |
 | updated_at | TIMESTAMP | Last change time |
@@ -1144,9 +1218,9 @@ Two tables in the platform database, created by the gear's migrations and record
 
 **PK**: `id`
 
-**Constraints**: all columns NOT NULL except `metadata`; UNIQUE `(tenant_id, slug)`; UNIQUE `(id, tenant_id)`, the target of the models foreign key; CHECK on `sharing_mode` values.
+**Constraints**: all columns NOT NULL except `metadata`; `uq_model_registry__providers__tenant_slug` UNIQUE `(tenant_id, slug)`; `uq_model_registry__providers__id_tenant` UNIQUE `(id, tenant_id)`, the target of the models foreign key; `ck_model_registry__providers__sharing_mode` CHECK on `sharing_mode` values.
 
-**Additional info**: Indexes: the unique `(tenant_id, slug)` key serves the chain-wide candidate query and the slug lookup of resolution; `(slug, id)` serves the default keyset order; one index for every other filterable provider field of §3.3. Referenced by `models (provider_id, tenant_id)`.
+**Additional info**: Indexes: the unique `(tenant_id, slug)` key serves the chain-wide candidate query and the slug lookup of resolution; `idx_model_registry__providers__slug_id` on `(slug, id)` serves the default keyset order; `idx_model_registry__providers__<column>` for every other filterable provider field of §3.3. Referenced by `model_registry__models (provider_id, tenant_id)`.
 
 **Example**:
 
@@ -1155,7 +1229,7 @@ Two tables in the platform database, created by the gear's migrations and record
 | `0192…a1` | `root…` | `openai` | OpenAI | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | true | shared | false |
 | `0192…b7` | `customer…` | `openai` | OpenAI (Customer contract) | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | true | shared | false |
 
-#### Table: models
+#### Table: model_registry__models
 
 **ID**: `cpt-cf-model-registry-dbtable-models`
 
@@ -1165,9 +1239,10 @@ Two tables in the platform database, created by the gear's migrations and record
 |--------|------|-------------|
 | id | UUID | Model id |
 | tenant_id | UUID | Owning tenant; equals the provider's |
-| provider_id | UUID | Provider; FK with `tenant_id` to `providers(id, tenant_id)` |
-| provider_model_id | VARCHAR(255) | Provider's model id |
-| canonical_id | VARCHAR(321) | `slug::provider_model_id` |
+| provider_id | UUID | Provider; FK with `tenant_id` to `model_registry__providers(id, tenant_id)` |
+| name | VARCHAR(128) | Model name; right part of the canonical id |
+| canonical_id | VARCHAR(194) | `slug::name` |
+| provider_model_id | VARCHAR(255) | Identifier sent to the provider; not unique |
 | gts_type | VARCHAR(512) | Copied from the provider on create |
 | sharing_mode | VARCHAR(16) | `tenant` or `shared` |
 | approval_state | VARCHAR(16) | `pending`, `approved`, `rejected`, `revoked` |
@@ -1187,10 +1262,11 @@ Two tables in the platform database, created by the gear's migrations and record
 | hosted_by | VARCHAR(128) | Nullable |
 | last_release_at | TIMESTAMP | Nullable |
 | reasoning_level | VARCHAR(64) | Nullable |
-| version | VARCHAR(64) | Nullable |
+| model_version | VARCHAR(64) | Nullable |
 | sort_order | INTEGER | Default 0 |
 | icon | VARCHAR(2048) | Nullable |
 | multiplier_display | VARCHAR(32) | Nullable |
+| cost | JSON | `cost` object |
 | performance | JSON | `performance` object |
 | additional_info | JSON | `additional_info` map |
 | supported_api | JSON | `supported_api` set (source of truth) |
@@ -1204,7 +1280,8 @@ Two tables in the platform database, created by the gear's migrations and record
 | default_parameters | JSON | `default_parameters` object |
 | allow_parameter_override | BOOLEAN | Override policy |
 | allow_extra_params | JSON | List of parameter names |
-| provider_settings | JSON | Opaque provider-specific settings including cost |
+| provider_settings | JSON | Opaque provider-specific settings |
+| version | BIGINT | Row version, 1 on create, incremented by every update |
 | created_at | TIMESTAMP | Creation time |
 | created_by | UUID | Creating subject |
 | updated_at | TIMESTAMP | Last change time |
@@ -1212,16 +1289,19 @@ Two tables in the platform database, created by the gear's migrations and record
 
 **PK**: `id`
 
-**Constraints**: NOT NULL on every column not marked nullable; UNIQUE `(tenant_id, canonical_id)`; UNIQUE `(provider_id, provider_model_id)`; FK `(provider_id, tenant_id) → providers(id, tenant_id)` ON DELETE CASCADE, which enforces the same-tenant rule; CHECK on `sharing_mode` and `approval_state` values. SQLite connections run with foreign-key enforcement on, so the FK holds on both backends.
+**Constraints**: NOT NULL on every column not marked nullable; `uq_model_registry__models__tenant_canonical_id` UNIQUE `(tenant_id, canonical_id)`; `uq_model_registry__models__provider_name` UNIQUE `(provider_id, name)`; `fk_model_registry__models__provider` FK `(provider_id, tenant_id) → model_registry__providers(id, tenant_id)` ON DELETE CASCADE, which enforces the same-tenant rule; `ck_model_registry__models__sharing_mode` and `ck_model_registry__models__approval_state` CHECK on the enum values. SQLite connections run with foreign-key enforcement on, so the FK holds on both backends.
 
-**Additional info**: Indexes: the unique `(provider_id, provider_model_id)` key serves resolution and the `provider_id IN allow-list` predicate; the unique `(tenant_id, canonical_id)` key serves own-tenant scans; `(canonical_id, id)` serves the default keyset order; one single-column index for every other filterable model field of §3.3, on its mapped column, low-cardinality `cap_*`, `api_*`, `sharing_mode`, and `approval_state` included (`cpt-cf-model-registry-constraint-real-column-filters`). A migration test fails when a filter field has no index. Every create and update rewrites all columns from the full record, so promoted columns never drift from their JSON sources. Eval visibility, `shadowed`, and provider enabled state are not stored on models; they are computed per request from `providers`.
+**Additional info**: Indexes: the unique `(provider_id, name)` key serves resolution and the `provider_id IN allow-list` predicate; the unique `(tenant_id, canonical_id)` key serves own-tenant scans; `idx_model_registry__models__canonical_id_id` on `(canonical_id, id)` serves the default keyset order; `idx_model_registry__models__<column>` for every other filterable model field of §3.3, on its mapped column, low-cardinality `cap_*`, `api_*`, `sharing_mode`, and `approval_state` included (`cpt-cf-model-registry-constraint-real-column-filters`). A migration test fails when a filter field has no index. Every create and update rewrites all columns from the merged record (§3.6 `cpt-cf-model-registry-seq-model-write`), so promoted columns never drift from their JSON sources. Eval visibility, `shadowed`, and provider enabled state are not stored on models; they are computed per request from `model_registry__providers`.
 
 **Example**:
 
-| id | tenant_id | provider_id | canonical_id | gts_type | sharing_mode | approval_state | cap_vision | base_url | secret_ref |
-|----|-----------|-------------|--------------|----------|--------------|----------------|------------|----------|------------|
-| `0192…c3` | `root…` | `0192…a1` | `openai::gpt-4o` | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | shared | approved | true | `https://api.openai.com/v1` | `platform-openai-key` |
-| `0192…d9` | `customer…` | `0192…b7` | `openai::gpt-4o` | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | shared | pending | true | NULL (plugin default URL) | `customer-openai-key` |
+| id | tenant_id | provider_id | name | canonical_id | provider_model_id | region | gts_type | sharing_mode | approval_state | base_url | secret_ref |
+|----|-----------|-------------|------|--------------|-------------------|--------|----------|--------------|----------------|----------|------------|
+| `0192…c3` | `root…` | `0192…a1` | `gpt-4o` | `openai::gpt-4o` | `gpt-4o` | NULL | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | shared | approved | `https://api.openai.com/v1` | `platform-openai-key` |
+| `0192…c4` | `root…` | `0192…a1` | `gpt-4o-eu` | `openai::gpt-4o-eu` | `gpt-4o` | `eu-west-1` | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | shared | approved | `https://eu.api.openai.com/v1` | `platform-openai-eu-key` |
+| `0192…d9` | `customer…` | `0192…b7` | `gpt-4o` | `openai::gpt-4o` | `gpt-4o` | NULL | `gts.cf.genai.model.provider.v1~cf.genai._.openai.v1~` | shared | pending | NULL (plugin default URL) | `customer-openai-key` |
+
+The two root rows are two models of one provider for the same provider model id, with their own region, URL, and credential.
 
 ### 3.8 Deployment Topology
 
@@ -1245,7 +1325,7 @@ graph LR
     G2 --> DB
 ```
 
-The gear runs in-process inside the platform server binary, enabled by a cargo feature and registered with the other gears. It runs no background tasks of its own and has no listener of its own; REST traffic arrives through API Gateway and SDK calls arrive through ClientHub. GTS publication is run by the platform. Each replica keeps its own chain cache. All replicas share the platform database. Replicas are stateless and can be added, removed, or restarted at any time. Packaging, orchestration, environment promotion, configuration injection, and database credentials are owned by the platform server deployment.
+The gear runs in-process inside the platform server binary, enabled by a cargo feature and registered with the other gears. It runs no background tasks of its own and has no listener of its own; REST traffic arrives through API Gateway and SDK calls arrive through ClientHub. The gear declares its GTS types and the platform's GTS publication registers them in Types Registry before the gear starts. Each replica keeps its own chain cache. All replicas share the platform database. Replicas are stateless and can be added, removed, or restarted at any time. Packaging, orchestration, environment promotion, configuration injection, and database credentials are owned by the platform server deployment.
 
 Database load: at most two point queries per resolution, so up to 10,000 queries per second at the 5,000 rps peak, on the primary (no read replica). Connections come from the platform pool and are never held across a PDP, Tenant Resolver, or Types Registry call.
 
@@ -1260,14 +1340,14 @@ PDP resource types (GTS-identified) and actions:
 | Resource type | Supported properties | Actions |
 |---------------|---------------------|---------|
 | `gts.cf.genai.model_registry.provider.v1~` | `owner_tenant_id`, `id`, `gts_type` | `get`, `list`, `create`, `update`, `delete` (provider management) |
-| `gts.cf.genai.model_registry.model.v1~` | `owner_tenant_id`, `id`, `provider_id`, `canonical_id`, `gts_type` | `get`, `list`, `create`, `update`, `delete` (model management, including approval; `list` is the admin list); `evaluate` and `list_available` (model evaluation: resolve one model, list the evaluable models) |
+| `gts.cf.genai.model_registry.model.v1~` | `owner_tenant_id`, `id`, `provider_id`, `canonical_id`, `gts_type` | `get`, `list`, `create`, `update`, `delete` (model management, including approval; `list` is the admin list); `evaluate` (model evaluation: resolve one model and list the evaluable models) |
 
 The resource types do not opt into native group predicates.
 
 | Operation | Resource type | Action | Resource id | Properties sent |
 |-----------|---------------|--------|-------------|-----------------|
 | `resolve_model` | model | `evaluate` | model id | `owner_tenant_id = T0`, `provider_id`, `canonical_id`, `gts_type` |
-| `list_available_models` | model | `list_available` (gate), then `evaluate` (row predicate) | none | `owner_tenant_id = T0` |
+| `list_available_models` | model | `evaluate` | none | `owner_tenant_id = T0` |
 | `create_provider` | provider | `create` | none | `owner_tenant_id = T0` |
 | `get_provider`, `update_provider`, `delete_provider` | provider | `get`, `update`, `delete` | provider id | `owner_tenant_id = T0` |
 | `list_providers` | provider | `list` | none | `owner_tenant_id = T0` |
@@ -1279,13 +1359,13 @@ Decision rules:
 
 1. Every call uses `PolicyEnforcer::access_scope_with` with `require_constraints(false)`, since the gear builds the row scope itself (rule 7). A permit with no constraints admits the operation for T0 with no row constraint. T0 is the subject tenant of the `SecurityContext`.
 2. `owner_tenant_id` is always the acting tenant T0, also for inherited rows owned by an ancestor. The decision answers "may this subject perform the action for tenant T0"; the effective-catalog algorithm decides which ancestor rows T0 sees.
-3. Tenant constraints returned by the PDP are a gate: each constraint alternative is kept only if its `owner_tenant_id` filter admits T0. An `InTenantSubtree` filter on `owner_tenant_id` admits T0 when its subtree root is T0 or in T0's ancestor chain. If no alternative remains, the result is `NOT_PERMITTED`. Constraint kinds that cannot be evaluated in memory deny, and so does a filter with more than `max_pdp_constraint_values` values.
-4. The remaining filters on `id`, `provider_id`, `canonical_id`, and `gts_type` are row constraints. Lists apply them in SQL through `SecureConn`; point operations check them in memory against the row. On `list_available_models` only the `evaluate` decision supplies row constraints; the `list_available` decision is a gate only.
+3. Tenant constraints returned by the PDP are a gate: each constraint alternative is kept only if its `owner_tenant_id` filter is `Eq` or `In` and admits T0. An alternative with no `owner_tenant_id` filter is kept, and its row constraints apply. An `InTenantSubtree` filter on `owner_tenant_id` fails closed regardless of `respect_barriers` or `descendant_status`: the alternative admits nothing. Unknown `ScopeFilter` variants and constraint kinds that cannot be evaluated in memory deny, and so does a filter with more than `max_pdp_constraint_values` values. If no alternative remains, the result is `NOT_PERMITTED` ([ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md)).
+4. The remaining filters on `id`, `provider_id`, `canonical_id`, and `gts_type` are row constraints. Lists apply them in SQL through `SecureConn`; point operations check them in memory against the row.
 5. `EnforcerError::Denied` and `CompileFailed` map to `NOT_PERMITTED`; `EvaluationFailed` maps to dependency unavailable. Access is never granted by default.
 6. Writes are additionally clamped to `tenant_id = T0` in SQL, independent of the PDP answer: own-row writes run through `SecureConn` under `AccessScope::for_tenant(T0)`.
-7. Reads run through `SecureConn` under a scope the gear builds from the validated ancestor chain: `AccessScope::for_tenants` over T0 and its ancestors (`tenant_id IN chain`). The mandatory sharing and winner predicates of `cpt-cf-model-registry-seq-effective-catalog` are ANDed onto it; on lists, so are the PDP row constraints of rule 4. The PDP tenant constraints gate T0 only (rule 3) and are never used as the row scope. A caller `$filter` is ANDed on top and never widens the scope.
+7. Reads run through `SecureConn` under a scope the gear builds from the validated ancestor chain: `AccessScope::for_tenants` over T0 and its ancestors (`tenant_id IN chain`), built in one storage function that every read path uses ([ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md)). The mandatory sharing and winner predicates of `cpt-cf-model-registry-seq-effective-catalog` are ANDed onto it; on lists, so are the PDP row constraints of rule 4. The PDP tenant constraints gate T0 only (rule 3) and are never used as the row scope. A caller `$filter` is ANDed on top and never widens the scope.
 
-This section is the canonical statement of the `list_available` and `evaluate` rules. Management operations call the PDP before any row lookup. `list_available_models` takes both of its decisions before the model query: a `list_available` denial is `NOT_PERMITTED`, an `evaluate` denial is an empty page, and a failure of either is dependency unavailable. The `list_available` decision adds no row predicate; the list is exactly the set of models that resolve. `resolve_model` calls the PDP last, per the PRD order: catalog reasons (not found, provider disabled, not approved) about the caller's own effective catalog are reported before the PDP is asked.
+This section is the canonical statement of the `evaluate` rules. Management operations call the PDP before any row lookup. `list_available_models` takes its one `evaluate` decision before the model query: a denial is `NOT_PERMITTED`, a failure is dependency unavailable, and a permit whose row constraints match no row is an empty page. The list is exactly the set of models that resolve. `resolve_model` calls the PDP last, per the PRD order: catalog reasons (not found, provider disabled, not approved) about the caller's own effective catalog are reported before the PDP is asked.
 
 Permission catalog. The two resource types are declared as abstract GTS type schemas, and each action is declared as one instance of `gts.cf.toolkit.authz.permission.v1~`. All are published to Types Registry (§3.3 `cpt-cf-model-registry-interface-model-info-schema`), so administrators can discover and grant them.
 
@@ -1302,27 +1382,26 @@ Permission catalog. The two resource types are declared as abstract GTS type sch
 | `gts.cf.toolkit.authz.permission.v1~cf.model_registry._.model_update.v1` | `gts.cf.genai.model_registry.model.v1~` | `update` |
 | `gts.cf.toolkit.authz.permission.v1~cf.model_registry._.model_delete.v1` | `gts.cf.genai.model_registry.model.v1~` | `delete` |
 | `gts.cf.toolkit.authz.permission.v1~cf.model_registry._.model_evaluate.v1` | `gts.cf.genai.model_registry.model.v1~` | `evaluate` |
-| `gts.cf.toolkit.authz.permission.v1~cf.model_registry._.model_list_available.v1` | `gts.cf.genai.model_registry.model.v1~` | `list_available` |
 
 ### GTS Checks
 
-On provider create:
+On provider create, and on a provider update whose `gts_type` differs from the stored one (type migration):
 
 1. `gts_type` parses as a GTS type id (schema id ending with `~`). Failure: `invalid_argument`, field `gts_type`, reason `INVALID_GTS_TYPE`.
 2. The chain starts with the base type `gts.cf.genai.model.provider.v1~` and has at least one derived segment. Failure: reason `NOT_A_PROVIDER_TYPE`.
 3. Types Registry returns an active type schema for the id (`TypesRegistryClient::get_type_schema` under the caller's context). Not found: reason `GTS_TYPE_NOT_REGISTERED`. Read denied: `NOT_PERMITTED`. Types Registry failure: dependency unavailable.
 
-On model create, and on model update when the request carries `provider_settings`:
+On model create, on model update when the request's `provider_settings` differs from the stored value, and for every model of the provider on type migration (against the new type):
 
 1. Read the resolved schema of the provider's `gts_type` from Types Registry (read options in §3.5). Not found: `invalid_argument`, field `provider_settings`, reason `GTS_TYPE_NOT_REGISTERED`. Read denied: `NOT_PERMITTED`. Failure: dependency unavailable.
 2. Take the subschema at `properties.provider_settings` of the resolved schema and validate the document with the workspace JSON Schema validator as JSON Schema Draft-07, the GTS dialect ([GTS guideline](../../../guidelines/GTS.md)). Schema-only `x-gts-*` keywords do not affect validation. A provider type that does not constrain `provider_settings` accepts any JSON object.
 3. Report every violation as one field violation: field `provider_settings` plus the JSON pointer of the offending value, reason `SCHEMA_MISMATCH`, and the validator message as description.
 
-Schemas are fetched on these writes only. They are not cached and not fetched on resolution or listing. Stored settings are not re-validated when a plugin publishes a new schema; plugins keep schemas backward compatible or publish a new type version.
+Schemas are fetched on these writes only. They are not cached and not fetched on resolution or listing. Stored settings are not re-validated when a plugin publishes a new schema; plugins keep schemas backward compatible or publish a new type version, to which administrators move providers by type migration.
 
 ### Error Handling
 
-All errors are `CanonicalError` values at the SDK boundary and canonical Problem documents on REST, from one mapping in the gear. Reason codes and field reason codes are public constants in the SDK. The opt-in projection `ModelRegistryError` has the variants `ModelNotFound`, `ProviderNotFound`, `ProviderDisabled`, `ModelNotApproved`, `NotPermitted`, `InheritedReadOnly`, `AlreadyExists`, `Invalid`, `DependencyUnavailable`, `Internal`, and `Other`, which wraps any other `CanonicalError`.
+All errors are `CanonicalError` values at the SDK boundary and canonical Problem documents on REST, from one mapping in the gear. Reason codes and field reason codes are public constants in the SDK. The opt-in projection `ModelRegistryError` has the variants `ModelNotFound`, `ProviderNotFound`, `ProviderDisabled`, `ModelNotApproved`, `NotPermitted`, `InheritedReadOnly`, `AlreadyExists`, `OptimisticLockFailure` (the projection of both `aborted` reasons `OPTIMISTIC_LOCK_FAILURE` and `PROVIDER_TYPE_CHANGED`; the wire reasons stay distinct), `Invalid`, `DependencyUnavailable`, `Internal`, and `Other`, which wraps any other `CanonicalError`.
 
 | Condition | Category | HTTP | Reason / context | Raised by |
 |-----------|----------|------|------------------|-----------|
@@ -1330,12 +1409,15 @@ All errors are `CanonicalError` values at the SDK boundary and canonical Problem
 | Provider not found | `not_found` | 404 | resource type `gts.cf.genai.model_registry.provider.v1~`, resource name = id | provider operations, `create_model` |
 | Provider disabled | `permission_denied` | 403 | reason `PROVIDER_DISABLED` | `resolve_model` |
 | Model not approved (pending, rejected, revoked) | `permission_denied` | 403 | reason `MODEL_NOT_APPROVED` | `resolve_model` |
-| PDP denies, or Types Registry denies the caller's schema read | `permission_denied` | 403 | reason `NOT_PERMITTED` | all operations |
+| PDP denies, Types Registry denies the caller's schema read, or CredStore denies the caller's credential read | `permission_denied` | 403 | reason `NOT_PERMITTED` | all operations |
 | Write against an inherited entry | `permission_denied` | 403 | reason `INHERITED_READ_ONLY` | updates, deletes, `create_model` under an inherited provider |
-| Duplicate slug or canonical id in the tenant | `already_exists` | 409 | resource type and name | creates |
-| Invalid request field, GTS type, or settings | `invalid_argument` | 400 | field violations with reasons `INVALID_FORMAT`, `TOO_LARGE`, `IMMUTABLE_FIELD`, `INVALID_GTS_TYPE`, `NOT_A_PROVIDER_TYPE`, `GTS_TYPE_NOT_REGISTERED`, `SCHEMA_MISMATCH` | writes |
+| Duplicate provider slug in the tenant, or duplicate model name under the provider | `already_exists` | 409 | resource type and name | creates |
+| `expected_version` or `If-Match` does not match the stored `version`, or the provider or its model set changed during a type migration, or a resent `provider_settings`, `secret_ref`, or provider `gts_type` changed concurrently | `aborted` | 409 | reason `OPTIMISTIC_LOCK_FAILURE`; takes precedence over `PROVIDER_TYPE_CHANGED` | updates and deletes with a precondition; type migration; `update_model` |
+| The provider's `gts_type` changed between validation and the model write | `aborted` | 409 | reason `PROVIDER_TYPE_CHANGED`; reported only when `OPTIMISTIC_LOCK_FAILURE` does not apply | `create_model`, `update_model` with `provider_settings` validated |
+| `PATCH` without `If-Match` | `invalid_argument` | 400 | reason `IF_MATCH_REQUIRED` | REST updates |
+| Invalid request field, GTS type, settings, or secret reference | `invalid_argument` | 400 | field violations with reasons `INVALID_FORMAT`, `TOO_LARGE`, `IMMUTABLE_FIELD`, `INVALID_GTS_TYPE`, `NOT_A_PROVIDER_TYPE`, `GTS_TYPE_NOT_REGISTERED`, `SCHEMA_MISMATCH`, `SECRET_REF_NOT_FOUND`, `SECRET_REF_NOT_OWNED` | writes |
 | Invalid OData option or cursor | `invalid_argument` | 400 | toolkit OData field violations | lists |
-| Tenant Resolver, PDP, or Types Registry cannot answer (unavailable, deadline expired, internal failure) | `service_unavailable` | 503 | no context; the category is the reason "dependency unavailable" | all operations that call the dependency |
+| Tenant Resolver, PDP, Types Registry, or CredStore cannot answer (unavailable, deadline expired, internal failure) | `service_unavailable` | 503 | no context; the category is the reason "dependency unavailable" | all operations that call the dependency |
 | Database connectivity loss, pool acquire timeout, statement timeout, serialization failure, or deadlock | `service_unavailable` | 503 | no context; diagnostic kept in logs | all operations |
 | Logic or invariant failure, unexpected database error | `internal` | 500 | diagnostic kept in logs, stripped from the wire | all operations |
 
@@ -1350,6 +1432,10 @@ Dependency errors map as follows:
 | Types Registry `NotFound` | `invalid_argument` with `GTS_TYPE_NOT_REGISTERED` (§4 GTS Checks) |
 | Types Registry `permission_denied` (the caller lacks the Types Registry read grant; projected as `TypesRegistryError::Other`) | `NOT_PERMITTED`, with an operator-visible log diagnostic naming the missing grant |
 | Types Registry `Unavailable`, `DeadlineExceeded`, `Internal`, or `types_registry_deadline_ms` expired | dependency unavailable |
+| CredStore `Ok(None)` for `secret_ref` | `invalid_argument`, field `secret_ref`, reason `SECRET_REF_NOT_FOUND` |
+| CredStore `Ok(Some)` with no own row, or an own row with `status` `declared` | `invalid_argument`, field `secret_ref`, reason `SECRET_REF_NOT_OWNED` |
+| CredStore `PermissionDenied` (the caller lacks the CredStore `read` grant) | `NOT_PERMITTED`, with an operator-visible log diagnostic naming the missing grant |
+| CredStore `Unavailable`, `DeadlineExceeded`, `Internal`, or `credstore_deadline_ms` expired | dependency unavailable |
 
 Database errors are classified with the toolkit-db contention check for serialization failures and deadlocks, and by error kind for connectivity and timeouts. The gear does not retry. Callers retry only `service_unavailable`, with backoff; every other category is final for the same request.
 
@@ -1357,12 +1443,22 @@ Authentication failures (401) are produced by the platform before the gear runs.
 
 ### Tenant Isolation and Data Protection
 
-- Rows of a tenant reach other tenants only through the effective-catalog algorithm: downward, read-only, and only when `shared`. Reads never return sibling or descendant rows. Not-found answers do not distinguish "does not exist" from "not visible".
-- Inheriting tenants see the full inherited record, including `provider_settings` with cost, `base_url` when set, and `secret_ref`, as the PRD requires (`cpt-cf-model-registry-fr-effective-catalog`). `secret_ref` is a name, not a secret; secret values are never stored or returned.
-- `list_available_models` and both `/available-models` REST routes return `AvailableModelV1`, without `provider_settings`, `base_url`, and `secret_ref`, because holders of `list_available` and `evaluate` include end users. The full record for evaluation is returned only by the SDK `resolve_model`.
+- Rows of a tenant reach other tenants only through the effective-catalog algorithm: downward, read-only, only when `shared`, and never across an isolation barrier. Reads never return sibling or descendant rows. Not-found answers do not distinguish "does not exist" from "not visible".
+- Inheriting tenants see the full inherited record, including `cost`, `provider_settings`, `base_url` when set, and `secret_ref`, as the PRD requires (`cpt-cf-model-registry-fr-effective-catalog`). `secret_ref` is a name, not a secret; secret values are never stored or returned.
+- `resolve_model` and `list_available_models` return the full record on the SDK and on REST alike, including `cost`, `provider_settings`, `base_url`, and `secret_ref`, as the PRD requires (`cpt-cf-model-registry-fr-resolve-model`, `cpt-cf-model-registry-fr-list-available-models`). There is no reduced record: both operations are granted to holders of model `evaluate`, and deployments that expose either to end users grant `evaluate` accordingly.
+- A `secret_ref` is bound to the owning tenant: a tenant can store only references to secrets it owns (§4 Credential Binding).
 - The gear stores configuration and subject ids of administrators (audit and approval columns), and no end-user content. Platform baselines for encryption at rest and in transit apply.
 - Administrator subject ids stay for the life of their row and are removed with it by hard delete; copies in backups age out with the platform backup retention. Rows of a deleted tenant are removed by an operator with the runbook procedure (§4 Limitations).
 - Logs and traces carry tenant id, ids, canonical id, slug, outcome, and reason code. They never carry `provider_settings`, `metadata`, `additional_info`, or request bodies.
+
+### Credential Binding
+
+A model's `secret_ref` is bound to the model's owning tenant. The binding check rejects an inherited or unknown reference on write; secret values stay governed by CredStore sharing and the `read_secret` action. Rules ([ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md)):
+
+1. On model create with `secret_ref`, and on an update whose `secret_ref` is a non-null value different from the stored one, the gear reads the record through `CredStoreClientV2::get_record` under the caller's context (§3.5 Credential Ownership). The reference is accepted only when the response is `Ok(Some)` and the caller's own row holds a secret: `own` is present with `status` `active` or `expired`. `Ok(None)` is rejected with `SECRET_REF_NOT_FOUND`, no own row or a `declared` own row with `SECRET_REF_NOT_OWNED`, `PermissionDenied` with `NOT_PERMITTED`, and any other failure as dependency unavailable (§4 Error Handling). No row is written on rejection.
+2. The read is metadata only; no secret value enters the gear (`cpt-cf-model-registry-constraint-no-secret-storage`). The secret's sharing mode and expiry are not checked: an expired secret is accepted; CredStore sharing is checked at evaluation.
+3. The check runs before the transaction and holds no database connection; the write is otherwise unchanged. Clearing `secret_ref` (null) needs no CredStore call. A provider type migration does not re-check model secret references.
+4. The check is not repeated on resolution or at evaluation. When CredStore cannot resolve the reference at evaluation, evaluation fails with `credentials_unavailable` while `resolve_model` keeps returning the model.
 
 ### Security Assumptions
 
@@ -1370,7 +1466,7 @@ Controls this gear relies on but does not enforce:
 
 | Threat | Assumed control | Owner |
 |--------|-----------------|-------|
-| Credential exfiltration: a descendant administrator creates its own model that reuses an ancestor's `shared` `secret_ref` with a `base_url` it controls | The registry stores references only and cannot bind a secret reference to a destination. LLM Gateway sends provider credentials only through OAGW, whose egress policy admits only upstreams enabled for the caller's tenant and otherwise fails with `unapproved_destination`. CredStore `shared` semantics let descendants use a shared secret by design. | LLM Gateway team, with the CredStore and OAGW teams |
+| Stale binding: the owner removes its own secret and CredStore resolves the same `secret_ref` to an ancestor's `shared` secret | The fallback reaches only an ancestor secret `shared` to the owner's tenant; CredStore sharing and `read_secret` govern it ([ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md)). The owner suppresses the reference in CredStore (`fallback: none`); the stop covers its descendants only with `sharing: shared`. LLM Gateway sends provider credentials only through OAGW, whose egress policy admits only upstreams enabled for the caller's tenant and otherwise fails with `unapproved_destination`. | Tenant administrators (suppression); LLM Gateway team, with the OAGW team (egress) |
 | Server-side request forgery (SSRF) through `base_url`: a model points the plugin at an internal host | The registry checks `base_url` on write only: optional, absolute `http` or `https`, no user information, at most 2,048 characters. SSRF protection is handled by OAGW at call time. | LLM Gateway team, with the OAGW team |
 | Secret material in free-form fields (`base_url` query, `provider_settings`, `metadata`, `additional_info`), which inheriting tenants can read | Plugin schemas reference credentials through `secret_ref` and define no secret-valued fields; administrators put no secrets in free-form fields. The registry cannot detect secrets in opaque values. | LLM Gateway team (plugin schemas); tenant administrators |
 | Catalog disclosure before the PDP: `resolve_model` reports not found, `PROVIDER_DISABLED`, or `MODEL_NOT_APPROVED` to a caller without `evaluate` | Accepted per the PRD resolution order. The disclosure is limited to the caller's own effective catalog. | Model Registry team |
@@ -1380,11 +1476,11 @@ Controls this gear relies on but does not enforce:
 
 ### Observability
 
-- Metrics: resolution duration histogram measured in-gear with PDP and Tenant Resolver wait subtracted; outcomes by reason code for `resolve_model` and `list_available_models`; chain cache hits, misses, and evictions; dependency errors by dependency; settings validation failures.
+- Metrics: resolution duration histogram measured in-gear with PDP and Tenant Resolver wait subtracted; outcomes by reason code for `resolve_model` and `list_available_models`; chain cache hits, misses, and evictions; dependency errors by dependency (Tenant Resolver, PDP, Types Registry, CredStore, database); settings validation failures; secret reference rejections by reason; version mismatches.
 - Availability SLI for `cpt-cf-model-registry-nfr-availability`: measured at the gear's interfaces (SDK and REST) for `resolve_model` and `list_available_models`, from the outcomes-by-reason metric. A bad event is an `internal` (500) or `service_unavailable` (503) response, including `service_unavailable` caused by a dependency. Every other response is good, including domain refusals such as model not found, `PROVIDER_DISABLED`, `MODEL_NOT_APPROVED`, and `NOT_PERMITTED`. The window is a calendar month and the target is 99.9% good events, an error budget of about 43 minutes per month. Recovery time runs from the first failed resolution to the first successful one after a gear failure, read from the same metric.
-- Tracing: one span per operation and one child span per dependency call (Tenant Resolver, PDP, Types Registry, database).
+- Tracing: one span per operation and one child span per dependency call (Tenant Resolver, PDP, Types Registry, CredStore, database). The CredStore span carries the reference, never the value.
 - Logs: structured records carrying the trace id. `info` per write (operation, tenant id, entity id, subject id, outcome); `warn` per dependency failure or deadline expiry; `error` per `internal`. Successful resolutions log nothing above `debug`. Aggregation follows the platform logging baseline.
-- Security events: each `NOT_PERMITTED` and `INHERITED_READ_ONLY` is logged with subject, tenant, operation, and resource id. A write that changes `sharing_mode`, `enabled`, or approval state is logged with the old and new values. Retention and tamper protection follow the platform log baseline.
+- Security events: each `NOT_PERMITTED` and `INHERITED_READ_ONLY` is logged with subject, tenant, operation, and resource id. A write that changes `sharing_mode`, `enabled`, `gts_type` (type migration, with the number of models moved), or approval state is logged with the old and new values. Retention and tamper protection follow the platform log baseline.
 - Alerts: availability SLI burn rate against the monthly error budget; in-gear p99 resolution latency above 10 ms for 10 minutes; dependency errors or deadline expiries above their baseline rate. Dashboards follow the platform monitoring baseline.
 - Readiness: a replica reports ready through the platform gear lifecycle after its migrations run and its client is registered in ClientHub (start conditions in §4 Fault Tolerance and Consistency). Dependency health shows in the dependency-error metrics, not in readiness.
 
@@ -1395,16 +1491,17 @@ Controls this gear relies on but does not enforce:
 | Tenant Resolver unavailable or slow | Requests with a valid cache entry proceed; others wait at most `tenant_resolver_deadline_ms`, then fail with `service_unavailable` |
 | PDP unavailable or slow | Each decision waits at most `pdp_deadline_ms`, then the request fails with `service_unavailable`; never grant |
 | Types Registry unavailable or slow | Provider and model writes that need it wait at most `types_registry_deadline_ms`, then fail with `service_unavailable`; reads are unaffected |
-| Types Registry fails at replica start | Types Registry runs in the same server process and registers the gear's published types in its own `init`, which runs before the gear's `init` (`deps`). A failed registration fails the server start, so the replica never becomes ready; running replicas are unaffected |
+| CredStore unavailable or slow | Model writes that bind a new `secret_ref` wait at most `credstore_deadline_ms`, then fail with `service_unavailable`; other writes and all reads are unaffected |
+| Types Registry fails at replica start | The platform's GTS publication registers the gear's declared types before the gear starts (platform dependency). A failed registration prevents the server from becoming ready; running replicas are unaffected |
 | Database unavailable or slow | Waits are bounded by the pool `acquire_timeout` and the PostgreSQL `statement_timeout` (§4 Configuration); then the request fails with `service_unavailable`. No catalog data is served from memory |
-| Database serialization failure or deadlock | The transaction is rolled back and the request fails with `service_unavailable` |
+| Database serialization failure or deadlock | The transaction is rolled back and the request fails with `service_unavailable`. Read-only snapshot transactions take no row locks and raise neither; only writes can |
 | Replica crash | No state lost; the platform restarts or replaces the replica |
 
 No dependency or database call is retried inside the gear, on the resolution path or elsewhere; callers retry `service_unavailable` (§4 Error Handling).
 
-Creates are not idempotent: a retried create after a lost response fails with `already_exists` on the slug or canonical id, and the caller reads the existing entry. A retried delete of a removed row reports not found.
+Creates are not idempotent: a retried create after a lost response fails with `already_exists` on the slug or model name, and the caller reads the existing entry. A retried delete of a removed row reports not found.
 
-Catalog reads are strongly consistent with committed writes on every replica. The queries of one read do not share a snapshot: a read reflects every write committed before its first query, and a write committed during the request applies at the latest to the next request. Hierarchy changes become visible within `chain_cache_ttl_seconds` plus the duration of one request, and until then a stale chain can narrow or widen visibility (`cpt-cf-model-registry-component-chain-cache`). Concurrent updates of the same row are serialized by an exclusive row lock (`cpt-cf-model-registry-seq-provider-write`, `cpt-cf-model-registry-seq-model-write`): only fields present in a request change, the last write to the same field wins, and a concurrent edit of other fields cannot revert an approval change or `enabled`. Creates are protected against duplicates by the unique keys, and a model create whose provider was deleted concurrently fails with provider not found.
+Catalog rows are never cached, and every read runs its row queries in one read-only transaction at snapshot isolation (`cpt-cf-model-registry-principle-snapshot-reads`). A read on any replica reflects every write committed before its snapshot and none committed after it; a write committed during the request applies to the next request. Within one request the provider winner, its `enabled` and `sharing_mode`, the model's approval state, and every row of a list page come from one committed state, so a request never combines states that were never committed together: with an enabled provider and a pending model, a resolution that runs while a provider disable and then a model approval commit returns `MODEL_NOT_APPROVED` or `PROVIDER_DISABLED`, never the model, and an available list run at the same time never contains it. Pages of one listing are separate requests with separate snapshots. The chain and the PDP decision are not part of the snapshot: hierarchy changes become visible within `chain_cache_ttl_seconds` plus the duration of one request, and until then a stale chain can narrow or widen visibility (`cpt-cf-model-registry-component-chain-cache`). Concurrent updates of the same row are serialized by the row lock and guarded by `expected_version` and the recompare under the lock (guarantees of `cpt-cf-model-registry-seq-provider-write`, `cpt-cf-model-registry-seq-model-write`): two updates with the same `expected_version` apply in commit order and the second fails with `OPTIMISTIC_LOCK_FAILURE`, so a concurrent edit with `expected_version` cannot revert an approval change or `enabled`; an unconditional update changes only the fields it carries, may overwrite a concurrent change to a field it carries, and fails with `OPTIMISTIC_LOCK_FAILURE` when a skipped-check field it resends unchanged (`provider_settings`, `secret_ref`, or a provider's `gts_type`) was changed concurrently. Creates are protected against duplicates by the unique keys, and a model create whose provider was deleted concurrently fails with provider not found.
 
 ### Configuration
 
@@ -1418,21 +1515,23 @@ Catalog reads are strongly consistent with committed writes on every replica. Th
 | `pdp_deadline_ms` | 1000 | Deadline for one PDP decision, passed to `PolicyEnforcer::with_deadline` |
 | `tenant_resolver_deadline_ms` | 1000 | Deadline for one `get_ancestors` call |
 | `types_registry_deadline_ms` | 3000 | Deadline for one Types Registry schema read on writes |
+| `credstore_deadline_ms` | 1000 | Deadline for one CredStore read in the `secret_ref` ownership check |
 | `max_pdp_constraint_values` | 1000 | Largest value list in one PDP row-constraint filter; a larger list denies |
 
-The keys live in the gear's `config` section of the platform YAML configuration, with the platform's environment-variable overrides; absent keys take the defaults above. The gear checks the values at start and refuses to start when a check fails: `chain_cache_ttl_seconds` is between 0 and 300; `chain_cache_max_entries`, the page sizes, the document size, the deadlines, and `max_pdp_constraint_values` are greater than 0; `default_page_size` is at most `max_page_size`.
+The keys live in the gear's `config` section of the platform YAML configuration, with the platform's environment-variable overrides; every key has a default, and absent keys take the defaults listed above. The gear checks the values at start and refuses to start when a check fails: `chain_cache_ttl_seconds` is between 0 and 300; `chain_cache_max_entries`, the page sizes, the document size, the deadlines, and `max_pdp_constraint_values` are greater than 0; `default_page_size` is at most `max_page_size`.
 
 Database waits are bounded by the gear's `database` section of the platform configuration: the pool `acquire_timeout` (toolkit-db default 30 s) and, on PostgreSQL, the `statement_timeout` runtime parameter, which has no platform default. Deployments of the gear set both to 2 s.
 
 ### Testability
 
-- Unit tests for the effective-catalog algorithm cover the hierarchy table of `cpt-cf-model-registry-seq-effective-catalog`, including the `canonical_id` dedupe leak case and the disabled shared shadow.
-- Integration tests run on SQLite and on PostgreSQL, the production backend, with migrations applied and mock Tenant Resolver, PDP, and Types Registry clients, through the real service. Each test builds its own database (in-memory SQLite or a fresh PostgreSQL schema) and seeds its hierarchy through the service. Mocks return configured chains, PDP decisions with constraints, schemas, errors, and delays past deadlines.
+- Unit tests for the effective-catalog algorithm cover the hierarchy table of `cpt-cf-model-registry-seq-effective-catalog`, including its shadowing and dedupe rules.
+- Integration tests run on SQLite and on PostgreSQL, the production backend, with migrations applied and mock Tenant Resolver, PDP, Types Registry, and CredStore clients, through the real service. Each test builds its own database (in-memory SQLite or a fresh PostgreSQL schema) and seeds its hierarchy through the service. Mocks return configured chains, PDP decisions with constraints, schemas, errors, and delays past deadlines.
 - The service takes an injectable clock. Tests advance it to expire chain cache entries and pin audit and approval timestamps; TTL 0 tests the uncached path. No test sleeps.
-- A promoted-column test writes models through create and update and asserts that every `cap_*`, `api_*`, and `ctx_*` column equals the value derived from its JSON source.
-- Contract tests: each REST endpoint and its SDK method give the same result and error category for the same input, except that `GET /available-models/{canonical_id}` returns the `resolve_model` record as `AvailableModelV1`; the provider base type and permission instances the gear declares are valid GTS; stored settings fixtures validate against a sample derived provider type.
+- Promoted columns: integration tests on the storage layer check that the `cap_*`, `api_*`, and `ctx_*` columns stay in sync with their JSON sources after create and update.
+- Contract tests: each REST endpoint and its SDK method give the same result and error category for the same input, including the full `ModelV1` from `GET /available-models/{canonical_id}`; the provider base type and permission instances the gear declares are valid GTS; stored settings fixtures validate against a sample derived provider type.
 - End-to-end REST tests run against the example server and make at least one call per API method ([E2E guide](../../../docs/toolkit_unified_system/13_e2e_testing.md)). Coverage follows the workspace CI gates.
 - A property test checks that `list_available_models` returns exactly the canonical ids for which `resolve_model` succeeds.
+- Model identity: integration tests through the service cover resolution by `canonical_id`, `name` uniqueness per provider, and the stability of `canonical_id` across updates.
 - REST round-trip tests pin every reason code and field reason to its Problem JSON location.
 - The latency benchmark for `cpt-cf-model-registry-nfr-resolution-latency` runs on PostgreSQL at the NFR load, catalog size, and hierarchy depth. It also measures `list_available_models` in the default order at the same catalog size.
 - Restart and backup-restore durability tests for `cpt-cf-model-registry-nfr-durability` run against a persistent PostgreSQL database.
@@ -1443,24 +1542,30 @@ PRD §9 acceptance criteria map to test layers:
 |------------------|------------|
 | A model of a disabled provider never resolves and is absent from the available list | Unit (algorithm); integration on SQLite and PostgreSQL |
 | A descendant sees shared ancestor providers and models and none of their `tenant`-mode entries | Unit; integration on SQLite and PostgreSQL |
+| Inheritance stops at a self-managed tenant: it inherits nothing, and its descendants inherit from it only | Integration on SQLite and PostgreSQL |
 | A `shared` shadowing provider replaces the inherited models of its slug for the tenant and its subtree | Unit; integration on SQLite and PostgreSQL |
 | A `tenant`-mode shadowing provider replaces them for the owner only | Unit; integration on SQLite and PostgreSQL |
 | A `shared`, disabled shadowing provider blocks the slug in the whole subtree | Unit; integration on SQLite and PostgreSQL |
 | Deleting a shadowing provider restores the inherited provider and models | Integration on SQLite and PostgreSQL |
 | Only approved models resolve, and a revoke stops resolution on the next call | Integration on SQLite and PostgreSQL; REST |
 | Settings that violate the provider type schema are rejected with a validation error | Integration on SQLite (mock Types Registry); REST |
+| A provider moves to a new type version, keeping ids and canonical ids, or not at all when one model fails validation | Integration on SQLite and PostgreSQL; REST |
 | Management calls never return another tenant's owned entries beyond inherited candidates | Integration on SQLite and PostgreSQL (isolation matrix below); REST |
 | Resolution meets the latency NFR | Benchmark on PostgreSQL |
 | Resolution meets the availability NFR | Production monitoring of the availability SLI (§4 Observability) |
 
 Security tests:
 
-- Multi-tenant isolation matrix over a hierarchy with siblings: no sideways reads, no reads of descendant rows, no writes to ancestor rows, and inherited rows read-only (`INHERITED_READ_ONLY`).
-- A PDP stub returns each constraint kind (tenant gate, row constraints on `id`, `provider_id`, `canonical_id`, `gts_type`, a kind that cannot be evaluated in memory) and each error (denied, compile failure, evaluation failure, deadline expiry); tests assert the result and reason of §4 Authorization and §4 Error Handling.
-- Fail closed per dependency: PDP, Tenant Resolver, Types Registry, and database failures and deadline expiries each yield `service_unavailable` and never a grant.
+- Multi-tenant isolation matrix over a hierarchy with siblings and a self-managed subtree: no sideways reads, no reads across a barrier, no reads of descendant rows, no writes to ancestor rows, and inherited rows read-only (`INHERITED_READ_ONLY`).
+- Every PDP constraint kind and error of §4 Authorization is exercised against a PDP stub; tests assert the result and reason of §4 Authorization and §4 Error Handling.
+- Fail closed per dependency: PDP, Tenant Resolver, Types Registry, CredStore, and database failures and deadline expiries each yield `service_unavailable` and never a grant.
+- Credential binding: integration tests of the write path against a mock CredStore client (the `get_record` seam) cover the accepted and rejected `secret_ref` states and reasons of §4 Credential Binding; unit tests cover the write conditions that trigger the CredStore read and the schema validation (§3.6 `cpt-cf-model-registry-seq-model-write`).
+- Type migration: integration tests on SQLite and PostgreSQL, with a mock Types Registry client, cover the atomic migration of §3.6 `cpt-cf-model-registry-seq-provider-write` (all models switch with the provider, or no row changes). The concurrency guarantees of §3.6 are covered on PostgreSQL only, because SQLite serializes writers, so these interleavings cannot be reproduced there.
+- Optimistic concurrency: integration and REST tests cover the precondition rules of §3.3 (stale `expected_version` or `If-Match`, `IF_MATCH_REQUIRED`, `If-Match: *`) and that a stale update cannot re-approve a revoked model.
 - A caller `$filter` cannot widen visibility on any list.
-- A self-managed (barrier) tenant inherits its ancestors' shared entries, and ancestors' changes to those entries apply to it.
-- A concurrent update of another field cannot revert a revoke or a provider disable (PostgreSQL).
+- A self-managed tenant sees none of its ancestors' entries, `shared` or not; a descendant of a self-managed tenant sees that tenant's `shared` entries and nothing from above it; ancestors see nothing of the self-managed subtree; any ancestor-rooted subtree constraint denies.
+- Concurrent updates of different fields leave a revoke or a provider disable intact, and an unconditional provider update that resends the old `gts_type` during a type migration fails (§3.6); PostgreSQL only, because SQLite serializes writers, so these interleavings cannot be reproduced there.
+- Snapshot reads (`cpt-cf-model-registry-principle-snapshot-reads`; PostgreSQL only, for the same reason): the service exposes a test-only pause point between the candidate provider query and the model query of a read transaction. With an enabled provider and a pending model, a test pauses a resolution there, commits a provider disable and then a model approval on other connections, and resumes it: the result is `MODEL_NOT_APPROVED`, never `ModelV1`, and a resolution started after both commits reports `PROVIDER_DISABLED`. The same sequence around `list_available_models` never lists the model, and around `list_models` returns the entry with `provider_enabled` true and approval `pending`, never `provider_enabled` false with `pending` or `provider_enabled` true with `approved`.
 
 ### Documentation
 
@@ -1474,7 +1579,8 @@ Platform baselines apply ([ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_
 
 - User-facing architecture, accessibility, internationalization, offline use, safety: the gear has no user interface; consumer gears own presentation (PRD §6.2).
 - CDN and edge caching: SDK calls are in-process; REST traffic is administrative.
-- Events, dead-letter queues, poison messages, sagas, distributed transactions: the gear uses no messaging; every write is a single-database transaction.
+- Events, dead-letter queues, poison messages, sagas, distributed transactions: the gear uses no messaging; every write is a single-database transaction. Change notifications are p2 (§4 Open Questions).
+- Authentication, MFA, SSO, token and session management: owned by the platform; the gear consumes the authenticated `SecurityContext` and propagates it on service-to-service calls (§3.4, §3.5).
 - Queues, sessions, load balancing: replicas are stateless; request distribution is owned by the platform.
 - CORS, DMZ, firewall, network segmentation: REST enters through API Gateway; the gear runs in-process and has no listener.
 - Rate limiting and overload protection: owned by API Gateway ([platform gears overview](../../../docs/GEARS.md#api-ingress)) and the platform server.
@@ -1482,6 +1588,10 @@ Platform baselines apply ([ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_
 - Partitioning, sharding, tiering, archival: the catalog is small, deletes are hard, and no history is kept.
 - Replication, backup, point-in-time recovery, disaster recovery: the platform database baseline applies. An accidental hard delete is recovered by an operator from the platform backup; the gear has no undelete.
 - Cost budgets and time-to-market: no new infrastructure; the gear adds two tables to the platform database and runs in-process.
+- Circuit breaker, bulkhead: none in the gear; each dependency call has a deadline and fails closed with `service_unavailable`; callers retry (§4 Error Handling).
+- Rollback, canary, blue-green: platform deployment baseline; schema changes are expand-contract (§3.8), so a rollback to the previous release keeps working.
+- Data lineage, data catalog, data dictionary, data-quality monitoring: not applicable; the gear owns two configuration tables and has no analytical data flows.
+- Technical-debt roadmap, deprecation timeline: not applicable beyond §4 Limitations and the versioning rules in §3.3.
 - Data residency, licensing, legacy integration, team and budget constraints: platform baselines and the workspace license policy apply; the gear is new and replaces no legacy system.
 
 ### Change Audit Follow-up
@@ -1492,15 +1602,15 @@ Platform baselines apply ([ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_
 
 | Deviation | Baseline | Rationale | Review owner |
 |-----------|----------|-----------|--------------|
-| The ancestor chain is read with `BarrierMode::Ignore`: a self-managed tenant inherits its ancestors' shared providers and models, and ancestors' changes to those entries apply to it. Ancestors never read the self-managed subtree's rows. Validated by a hierarchy test with a self-managed tenant. | Tenant Resolver default `BarrierMode::Respect` | Same rule as CredStore shared secrets: data crosses the barrier, authority does not | Model Registry team |
-| Update replaces present top-level fields as a whole, including nested objects; it does not merge nested objects. | [REST guideline](../../../guidelines/DNA/REST/API.md): PATCH with JSON Merge Patch | Gives SDK and REST identical update semantics and makes "settings changed" a simple presence check for re-validation | Model Registry team |
-| No `ETag` / `If-Match` optimistic locking. Each update locks the row it changes, so concurrent updates are serialized: only fields present in a request change, and the last write to the same field wins. | [REST guideline](../../../guidelines/DNA/REST/API.md): representations carry `ETag` | Catalog writes are rare and made by the owning tenant's administrators | Model Registry team |
+| Reads run under an `AccessScope` the gear builds from the ancestor chain, with the PDP tenant constraint as a gate. | [Secure ORM](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md): do not construct `AccessScope` manually in production code | A flat tenant clamp would drop the inherited half of the catalog. [ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md) | Platform Architecture |
+| Update replaces present top-level fields as a whole, including nested objects; it does not merge nested objects. | [REST guideline](../../../guidelines/DNA/REST/API.md): PATCH with JSON Merge Patch | Gives SDK and REST identical update semantics and makes "settings changed" a comparison of the sent object with the stored one. [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) | Platform Architecture |
+| A stale `If-Match` is reported as `aborted` (409), not 412. | [REST guideline](../../../guidelines/DNA/REST/API.md): `If-Match` mismatch is 412 | The canonical error categories have no 412; CredStore reports the same condition as 409. [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) | Platform Architecture |
 | `gts_type` is stored as text on both tables, not as the GTS UUID. | [GTS guideline](../../../guidelines/GTS.md) §5.1: GTS types stored as UUIDs | The value is an OData filter field and a PDP property in its string form and is passed to Types Registry by id; no join or foreign key uses it | Model Registry team |
 | `cpt-cf-model-registry-fr-change-audit` (p2) is covered by per-row audit columns only; deletes and change history are not recorded. | `cpt-cf-model-registry-fr-change-audit` | p2 scope; the change log is designed with the p2 scope (§4 Change Audit Follow-up) | Model Registry team |
 
 ### Limitations
 
-- The gear has no tenant event surface. A hierarchy change is picked up only through the chain cache TTL.
+- The gear has no tenant event surface. A hierarchy change, including a change of a tenant's `self_managed` flag, is picked up only through the chain cache TTL.
 - Rows of a deleted tenant stay until an operator removes them with the runbook procedure (§4 Documentation). Owner: Model Registry team provides the procedure; platform operations run it.
 - The gear does not check that an LLM Gateway plugin instance exists for a provider type; LLM Gateway reports a missing plugin at evaluation time.
 
@@ -1509,13 +1619,16 @@ Platform baselines apply ([ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_
 PRD §13 questions, with their disposition in this design:
 
 - External approval service and model auto-discovery: carried open to P2 planning; out of scope of this design (`cpt-cf-model-registry-constraint-no-model-lifecycle`) (owners: Platform Architecture; Model Registry team).
+- Change notifications (`cpt-cf-model-registry-fr-change-notifications`): event types and payload, recipients of a change to a shared entry, and crash-safe publication after commit (for example, an outbox in the catalog transaction). Carried open to P2 planning; this design publishes no events (owner: Model Registry team).
+
+New in this design: none.
 
 ## 5. Traceability
 
 - **PRD**: [PRD.md](./PRD.md)
-- **ADRs**: none yet
+- **ADRs**: [ADR-0001](./ADR/0001-cpt-cf-model-registry-adr-inherited-read-scope.md) inherited read scope; [ADR-0002](./ADR/0002-cpt-cf-model-registry-adr-credential-binding.md) credential binding; [ADR-0003](./ADR/0003-cpt-cf-model-registry-adr-caching-strategy.md) caching strategy; [ADR-0004](./ADR/0004-cpt-cf-model-registry-adr-update-semantics.md) update semantics and concurrency
 - **Features**: none yet
 - **SDK crate**: [model-registry-sdk](../model-registry-sdk/) (`cf-gears-model-registry-sdk`)
-- **Gear crate**: `gears/model-registry/model-registry/` (`cf-gears-model-registry`). Layout: `src/gear.rs`, `src/config.rs`, `src/api/rest/` (DTOs, handlers, routes), `src/domain/` (local client, catalog service, visibility resolver, access guard, GTS validator), and `src/infra/` (storage entities, repositories, mapper, migrations; chain cache).
+- **Gear crate**: `gears/model-registry/model-registry/` (`cf-gears-model-registry`). Layers: `api/rest` (DTOs, handlers, routes), `domain` (local client, catalog service, visibility resolver, access guard, GTS validator), and `infra` (storage entities, repositories, mapper, migrations, chain cache); gear registration and configuration at the crate root.
 - **Platform sources**: [ARCHITECTURE_MANIFEST.md](../../../docs/ARCHITECTURE_MANIFEST.md), [guidelines](../../../guidelines/README.md), [REST API guideline](../../../guidelines/DNA/REST/API.md), toolkit [OperationBuilder](../../../docs/toolkit_unified_system/04_rest_operation_builder.md), [errors](../../../docs/toolkit_unified_system/05_errors_rfc9457.md), [secure ORM](../../../docs/toolkit_unified_system/06_authn_authz_secure_orm.md), [OData](../../../docs/toolkit_unified_system/07_odata_pagination_select_filter.md).
 - **Precedence**: the PRD for requirements; platform sources for conventions, except where §4 Deviations records a departure; this DESIGN for gear specifics.
