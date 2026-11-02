@@ -1846,7 +1846,11 @@ impl ConversionService {
         let expected_tenant_type_uuid = tenant.tenant_type_uuid;
         let expected_parent_tenant_type_uuid = parent.tenant_type_uuid;
         self.tenant_type_checker
-            .check_parent_child(expected_parent_tenant_type_uuid, expected_tenant_type_uuid)
+            .check_parent_child(
+                ctx,
+                expected_parent_tenant_type_uuid,
+                expected_tenant_type_uuid,
+            )
             .await?;
 
         let approved = self

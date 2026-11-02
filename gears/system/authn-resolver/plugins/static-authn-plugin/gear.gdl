@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the static AuthN plugin.
 #
-# Projected from #[toolkit::gear]: id, colocated_deps (types-registry).
+# Projected from #[toolkit::gear]: id, runtime_caps (system).
 # Declared below: which extension point this gear implements, by the spec its host
 # declares. The `impl AuthNResolverPluginClient` in this crate is checked
 # against the declaration, not read as it.
@@ -12,8 +12,12 @@ gdl_version = "1.0"
 # itself under (`constructorfabric` / 100), which is the join key the host's
 # `vendor` selector matches against.
 
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"])
+
 gear(
-    deps = ["types-registry"],
+    deps = [],
+    # The instance is published over the consumed platform contract in `post_init`.
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authn-resolver/plugins/static-authn-plugin"),
     maturity = "preview",
     name = "Static AuthN Plugin",

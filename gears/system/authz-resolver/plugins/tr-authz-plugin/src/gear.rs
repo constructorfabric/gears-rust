@@ -6,22 +6,30 @@ use async_trait::async_trait;
 use authz_resolver_sdk::{AuthZResolverPluginClient, AuthZResolverPluginSpecV1};
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::TrAuthZPluginConfig;
 use crate::domain::Service;
+
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.tr_authz_resolver.plugin.v1";
 
 /// TR-based `AuthZ` resolver plugin gear.
 ///
 /// Resolves tenant hierarchy via `TenantResolverClient` instead of
 /// accessing Resource Group directly.
+///
+/// The runtime publishes the instance built from the configuration
+/// (`entities`) — locally or to a remote registry — and calls `init` only once
+/// it is admitted; `init` binds the scoped client to the admitted instance.
 #[toolkit::gear(
     name = "tr-authz-plugin",
-    deps = [types_registry, tenant_resolver]
+    deps = [tenant_resolver],
+    gts(entities = Self::plugin_instance),
 )]
 pub struct TrAuthZPlugin {
     service: OnceLock<Arc<Service>>,
@@ -35,9 +43,28 @@ impl Default for TrAuthZPlugin {
     }
 }
 
+impl TrAuthZPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let cfg: TrAuthZPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<AuthZResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
+    }
+}
+
 #[async_trait]
 impl Gear for TrAuthZPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        if self.service.get().is_some() {
+            anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
+        }
+
         let cfg: TrAuthZPluginConfig = ctx.config_or_default()?;
         info!(
             vendor = %cfg.vendor,
@@ -45,29 +72,10 @@ impl Gear for TrAuthZPlugin {
             "Loaded TR AuthZ plugin configuration"
         );
 
-        // Generate plugin instance ID
-        let instance_id = AuthZResolverPluginSpecV1::gts_make_instance_id(
-            "cf.builtin.tr_authz_resolver.plugin.v1",
-        );
-
-        // Resolve Tenant Resolver client from ClientHub first — if it's not
-        // available we want to fail before leaving a dangling instance in
-        // the types-registry.
+        // Without the tenant resolver the plugin could not evaluate anything:
+        // fail before binding a client.
         let tr: Arc<dyn TenantResolverClient> =
             ctx.client_hub().get::<dyn TenantResolverClient>()?;
-
-        // Register plugin instance in types-registry
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let instance = PluginV1::<AuthZResolverPluginSpecV1> {
-            id: instance_id.clone(),
-            vendor: cfg.vendor.clone(),
-            priority: cfg.priority,
-            properties: AuthZResolverPluginSpecV1,
-        };
-        let instance_json = serde_json::to_value(&instance)?;
-
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
 
         // Create service with TR dependency
         let service = Arc::new(Service::new(tr));
@@ -75,15 +83,18 @@ impl Gear for TrAuthZPlugin {
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // Register scoped client in ClientHub
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
         let api: Arc<dyn AuthZResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn AuthZResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        bind_plugin_instances::<AuthZResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &api,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

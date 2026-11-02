@@ -7,11 +7,13 @@ gdl_version = "1.0"
 # Fills authz-resolver's extension point (`AuthZResolverPluginClient`) by
 # walking the tenant hierarchy through tenant-resolver. The point is declared
 # by `implements`; vendor and priority are read from source, and so is the link to
-# tenant-resolver, which the attribute states as
-# `deps = [types_registry, tenant_resolver]`.
+# tenant-resolver, which the attribute states as `deps = [tenant_resolver]`.
+#
+# `init` requires a host-linked, database-backed types-registry (system gear, initialized
+# first). No `deps` or `consumes`; missing registry fails boot. Remote support: T41/T42.
 
 gear(
-    deps = ["tenant-resolver", "types-registry"],
+    deps = ["tenant-resolver"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authz-resolver/plugins/tr-authz-plugin"),
     maturity = "preview",
     name = "Tenant-Resolver AuthZ Plugin",

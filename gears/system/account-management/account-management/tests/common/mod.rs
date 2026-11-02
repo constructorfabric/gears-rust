@@ -1304,47 +1304,36 @@ pub fn harness_tenant_type_uuid() -> Uuid {
         .to_uuid()
 }
 
-/// `MockTypesRegistryClient` pre-seeded with the schemas the AM REST
+/// `MockTypesRegistry` pre-seeded with the schemas the AM REST
 /// surface needs to reach its happy-path branches: the
 /// AM user-projection schema (required by
-/// `create_user` per the fail-closed GTS validator) and a minimal
-/// tenant-type schema chain so `resolve_active_tenant` (which uses
+/// `create_user` per the fail-closed GTS validator) and the harness
+/// tenant type so `resolve_active_tenant` (which uses
 /// `tenant_type_uuid` to compute the chained id) does not fail closed.
 #[must_use]
-pub fn types_registry_for_users() -> Arc<dyn types_registry_sdk::TypesRegistryClient> {
+pub fn types_registry_for_users() -> Arc<types_registry_sdk::testing_platform::MockTypesRegistry> {
     use serde_json::json;
-    use types_registry_sdk::{GtsTypeId, GtsTypeSchema, testing::MockTypesRegistryClient};
+    use types_registry_sdk::testing_platform::MockTypesRegistry;
 
-    let user_body = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["id", "username"],
-        "properties": {
-            "id": { "type": "string", "format": "uuid" },
-            "username": { "type": "string", "minLength": 1, "maxLength": 255 },
-            "email": { "type": "string", "format": "email" },
-            "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
-        },
-    });
-    let user_schema = GtsTypeSchema::try_new(
-        GtsTypeId::new(gts_id!("cf.core.am.user.v1~")),
-        user_body,
-        None,
-        None,
-    )
-    .expect("synthetic user schema is valid");
-
-    // Derived chains require the parent to be passed in. We build the
-    // full chain root→child recursively.
-    fn build_tenant_type_chain(type_id: &str) -> GtsTypeSchema {
-        let parent = GtsTypeSchema::derive_parent_type_id(type_id)
-            .map(|p| std::sync::Arc::new(build_tenant_type_chain(p.as_ref())));
-        GtsTypeSchema::try_new(GtsTypeId::new(type_id), serde_json::json!({}), None, parent)
-            .expect("synthetic tenant_type chain is valid")
-    }
-    let tenant_type_schema = build_tenant_type_chain(HARNESS_TENANT_TYPE_ID);
-
-    Arc::new(MockTypesRegistryClient::new().with_type_schemas([user_schema, tenant_type_schema]))
+    let registry = MockTypesRegistry::new();
+    registry.seed(
+        gts_id!("cf.core.am.user.v1~"),
+        json!({
+            "$id": toolkit_gts::gts_uri!("cf.core.am.user.v1~"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "username"],
+            "properties": {
+                "id": { "type": "string", "format": "uuid" },
+                "username": { "type": "string", "minLength": 1, "maxLength": 255 },
+                "email": { "type": "string", "format": "email" },
+                "display_name": { "type": "string", "minLength": 1, "maxLength": 255 },
+            },
+        }),
+    );
+    registry.seed(HARNESS_TENANT_TYPE_ID, json!({ "type": "object" }));
+    Arc::new(registry)
 }
 
 /// Empty metadata schema registry — every per-schema lookup
@@ -1426,7 +1415,7 @@ pub fn build_services_full(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
 ) -> TestServices {
     build_services_full_with_sa_enforcer(
         harness,
@@ -1448,7 +1437,7 @@ pub fn build_services_full_with_sa_enforcer(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
     sa_enforcer: PolicyEnforcer,
 ) -> TestServices {
     build_services_with_enforcers(
@@ -1485,7 +1474,7 @@ pub fn build_services_with_enforcers(
     harness: &Harness,
     idp: Arc<dyn IdpPluginClient>,
     metadata_registry: Arc<dyn MetadataSchemaRegistry>,
-    types_registry: Arc<dyn types_registry_sdk::TypesRegistryClient>,
+    types_registry: Arc<types_registry_sdk::testing_platform::MockTypesRegistry>,
     tenant_enforcer: PolicyEnforcer,
     sa_enforcer: PolicyEnforcer,
 ) -> TestServices {
@@ -1502,20 +1491,23 @@ pub fn build_services_with_enforcers(
             tenant_enforcer,
             cfg,
         )
-        .with_types_registry(Arc::clone(&types_registry)),
+        .with_types_registry(
+            Arc::clone(&types_registry) as _,
+            Arc::clone(&types_registry) as _,
+        ),
     );
 
     let user_service = Arc::new(UserService::new(
         Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
         Arc::clone(&idp),
-        Arc::clone(&types_registry),
+        Arc::clone(&types_registry) as _,
         mock_enforcer(),
     ));
 
     let service_account_service = Arc::new(ServiceAccountService::new(
         Arc::clone(&harness.repo) as Arc<dyn TenantRepo>,
         Arc::clone(&idp),
-        Arc::clone(&types_registry),
+        Arc::clone(&types_registry) as _,
         sa_enforcer,
     ));
 

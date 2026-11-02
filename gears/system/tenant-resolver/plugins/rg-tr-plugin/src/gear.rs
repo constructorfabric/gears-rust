@@ -6,22 +6,31 @@ use async_trait::async_trait;
 use resource_group_sdk::api::ResourceGroupReadHierarchy;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::RgTrPluginConfig;
 use crate::domain::Service;
+
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.rg_tenant_resolver.plugin.v1";
 
 /// RG tenant resolver plugin gear.
 ///
 /// Resolves tenant hierarchy via `ResourceGroupReadHierarchy`.
 /// Does not seed the tenant RG type — it must be created externally.
+///
+/// The runtime publishes the instance built from the configuration
+/// (`entities`) — locally or to a remote registry, independently of Resource
+/// Group's state — and calls `init` only once it is admitted; `init` binds the
+/// scoped client to the admitted instance.
 #[toolkit::gear(
     name = "rg-tr-plugin",
-    deps = [types_registry, resource_group]
+    deps = [resource_group],
+    gts(entities = Self::plugin_instance),
 )]
 pub struct RgTrPlugin {
     service: OnceLock<Arc<Service>>,
@@ -32,6 +41,21 @@ impl Default for RgTrPlugin {
         Self {
             service: OnceLock::new(),
         }
+    }
+}
+
+impl RgTrPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let cfg: RgTrPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<TenantResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
     }
 }
 
@@ -49,39 +73,24 @@ impl Gear for RgTrPlugin {
         let rg: Arc<dyn ResourceGroupReadHierarchy> =
             ctx.client_hub().get::<dyn ResourceGroupReadHierarchy>()?;
 
-        // Generate plugin instance ID
-        let instance_id = TenantResolverPluginSpecV1::gts_make_instance_id(
-            "cf.builtin.rg_tenant_resolver.plugin.v1",
-        );
-
-        // Register plugin instance in types-registry
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let instance = PluginV1::<TenantResolverPluginSpecV1> {
-            id: instance_id.clone(),
-            vendor: cfg.vendor.clone(),
-            priority: cfg.priority,
-            properties: TenantResolverPluginSpecV1,
-        };
-        let instance_json = serde_json::to_value(&instance)?;
-
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
         // Create service
         let service = Arc::new(Service::new(rg));
         self.service
             .set(service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // Register scoped client in ClientHub
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
         let api: Arc<dyn TenantResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn TenantResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        bind_plugin_instances::<TenantResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &api,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

@@ -61,7 +61,11 @@ use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::model::{NewTenant, TenantModel, TenantStatus};
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::util::backoff::compute_next_backoff;
-use types_registry_sdk::TypesRegistryClient;
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    EntityField, FieldSelection, LifecycleStatus, PlatformTypesRegistryApi,
+    PlatformTypesRegistryApiExt, Projection, ReadOptions,
+};
 
 /// Internal classification produced by `BootstrapService::classify`.
 #[allow(clippy::large_enum_variant)]
@@ -234,7 +238,7 @@ struct RunCtx {
 pub struct BootstrapService<R: TenantRepo> {
     repo: Arc<R>,
     idp: Arc<dyn IdpPluginClient>,
-    types_registry: Option<Arc<dyn TypesRegistryClient>>,
+    types_registry: Option<Arc<dyn PlatformTypesRegistryApi>>,
     cfg: BootstrapConfig,
     root_type: RootTypeConfig,
     /// Mirrors `cfg.idp.required` from the parent
@@ -320,7 +324,10 @@ impl<R: TenantRepo> BootstrapService<R> {
     /// preflight. Tests that exercise non-GTS paths may omit this; gear
     /// wiring supplies it when `ClientHub` resolves the registry client.
     #[must_use]
-    pub fn with_types_registry(mut self, types_registry: Arc<dyn TypesRegistryClient>) -> Self {
+    pub fn with_types_registry(
+        mut self,
+        types_registry: Arc<dyn PlatformTypesRegistryApi>,
+    ) -> Self {
         self.types_registry = Some(types_registry);
         self
     }
@@ -838,10 +845,33 @@ impl<R: TenantRepo> BootstrapService<R> {
         // and can correlate with the deadline.
         let entity = match tokio::time::timeout_at(
             deadline,
-            registry.get_type_schema(self.root_type.gts_id.as_ref()),
+            registry.get_type_schema(
+                &PlatformSecurityContext::outbound_marker(),
+                &self.root_type.gts_id,
+                ReadOptions {
+                    projection: Projection::Select(FieldSelection::with(&[
+                        EntityField::EffectiveTraits,
+                    ])),
+                    ..ReadOptions::default()
+                },
+            ),
         )
         .await
         {
+            Ok(Ok(entity)) if entity.lifecycle_status != LifecycleStatus::Active => {
+                emit_metric(
+                    AM_BOOTSTRAP_LIFECYCLE,
+                    MetricKind::Counter,
+                    &[
+                        ("phase", "gts_preflight"),
+                        ("classification", "invalid_tenant_type"),
+                        ("outcome", "failure"),
+                    ],
+                );
+                return Err(DomainError::InvalidTenantType {
+                    detail: format!("{} is deleted in GTS", self.root_type.gts_id),
+                });
+            }
             Ok(Ok(entity)) => entity,
             Ok(Err(err)) => {
                 if matches!(
@@ -890,8 +920,8 @@ impl<R: TenantRepo> BootstrapService<R> {
             }
         };
 
-        // `GtsTypeSchema` is by construction a type-schema (the
-        // `is_schema` axis is implicit in the type), so the only check
+        // `TypeSchema` is by construction a type-schema (the
+        // kind is implicit in the type), so the only check
         // remaining is that the chain root is AM's tenant_type root.
         let entity_type_id = entity.type_id.as_ref();
         let is_am_tenant_type = gts::GtsId::try_new(entity_type_id)
@@ -914,15 +944,21 @@ impl<R: TenantRepo> BootstrapService<R> {
             });
         }
 
-        // `effective_traits` resolves the GTS chain (own + ancestors)
-        // so a root type that inherits a non-empty
+        // The registry-materialized `effective_traits` merges the GTS
+        // chain (own + ancestors) so a root type that inherits a non-empty
         // `allowed_parent_types` from a base schema is correctly
-        // rejected. Reading `entity.raw_schema` directly only sees the
+        // rejected. Reading the authored content directly only sees the
         // type's own declarations and would silently accept an
         // inherited rule, breaking the root-eligibility contract —
         // the same effective-trait resolution that
         // `GtsTenantTypeChecker` already uses for child create.
-        let allowed = extract_allowed_parent_types_from_effective(&entity.effective_traits())?;
+        let effective = entity.effective_traits.as_ref().ok_or_else(|| {
+            DomainError::internal(format!(
+                "types-registry answered root tenant type {} without the selected effective_traits",
+                self.root_type.gts_id
+            ))
+        })?;
+        let allowed = extract_allowed_parent_types_from_effective(effective)?;
         if !allowed.is_empty() {
             emit_metric(
                 AM_BOOTSTRAP_LIFECYCLE,
@@ -1012,11 +1048,15 @@ impl<R: TenantRepo> BootstrapService<R> {
         let Some(registry) = self.types_registry.as_ref() else {
             return Ok(());
         };
+        // A platform read: the saga runs for no request, and the root
+        // name is AM configuration, not a caller's input (P33).
         match tokio::time::timeout_at(
             deadline,
             crate::domain::gts_validation::validate_tenant_name_via_gts(
                 &self.cfg.root_name,
-                registry.as_ref(),
+                crate::domain::types_registry_reader::TypesRegistryReader::Platform(
+                    registry.as_ref(),
+                ),
             ),
         )
         .await
@@ -1884,7 +1924,7 @@ fn record_invariant_violation() {
 // @cpt-end:cpt-cf-account-management-dod-platform-bootstrap-audit-and-metrics:p1:inst-dod-bootstrap-invariant-telemetry
 
 /// Extract `allowed_parent_types` from a flat effective-traits map
-/// (the shape returned by `GtsTypeSchema::effective_traits`), which
+/// (the registry-materialized `effective_traits`), which
 /// keys traits directly rather than nesting them under
 /// `x-gts-traits` / `allOf`.
 fn extract_allowed_parent_types_from_effective(

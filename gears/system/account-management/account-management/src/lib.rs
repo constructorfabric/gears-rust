@@ -42,6 +42,9 @@
 //! `ConversionRepo` call.
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+// AM publishes this crate's GTS declarations itself; see `gts`.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
 pub mod client;
 pub mod config;

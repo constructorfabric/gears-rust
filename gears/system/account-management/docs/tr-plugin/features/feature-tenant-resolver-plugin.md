@@ -312,12 +312,17 @@ This feature realizes the sole feature entry in the `cf-tr-plugin` sub-system DE
 
 **Output**: public chained `tenant_type` identifier for each UUID (for example, the `gts.cf.core.am.tenant_type.v1~` envelope tail), or `TenantResolverError::Internal` when Types Registry cannot resolve a UUID — the plugin MUST NOT return raw UUIDs in place of the public `tenant_type` field per `contract-types-registry-reverse-lookup`.
 
-> **Status (current):** UUID-keyed reverse-lookup is **implemented** against `TypesRegistryClient::get_type_schema_by_uuid` (single-row hot paths) and `TypesRegistryClient::get_type_schemas_by_uuid` (batched page-style hot paths). Any registry failure surfaces `TenantResolverError::Internal` per `inst-algo-tenant-type-return-unavailable` rather than returning a partially-resolved projection — `Internal` is selected over `ServiceUnavailable` because the latter is reserved for recoverable outages with an operator retry hint, while opaque registry / DB failures do not carry that hint (see `tr_plugin/error_map.rs` for the mapping rationale shared with DB-side failures).
+> **Implemented:** `PlatformTypesRegistryApiExt::resolve_type_id` for single rows,
+> `resolve_type_ids` for batches. Deleted types still resolve, preserving tenants'
+> `tenant_type`. Any registry failure returns `TenantResolverError::Internal`
+> (`inst-algo-tenant-type-return-unavailable`); no partial projection is returned.
+> `ServiceUnavailable` requires a recoverable outage with an operator retry hint,
+> absent from opaque registry/DB failures (see `tr_plugin/error_map.rs`).
 
 **Steps**:
 
 1. [ ] - `p1` - Receive the input `tenant_type_uuid` (single or batch) from the invoking flow step - `inst-algo-tenant-type-receive`
-2. [ ] - `p1` - Resolve each UUID through `TypesRegistryClient` (batched `get_type_schemas_by_uuid` when more than one UUID is supplied; single `get_type_schema_by_uuid` otherwise) per `contract-types-registry-reverse-lookup`; the registry client owns its own bounded TTL-aware cache so the plugin **MUST NOT** maintain a parallel cache of these mappings - `inst-algo-tenant-type-resolve`
+2. [ ] - `p1` - Resolve each UUID through `PlatformTypesRegistryApi` (batched `resolve_type_ids` when more than one UUID is supplied; single `resolve_type_id` otherwise) per `contract-types-registry-reverse-lookup`; the registry client owns its own bounded TTL-aware cache so the plugin **MUST NOT** maintain a parallel cache of these mappings - `inst-algo-tenant-type-resolve`
 3. [ ] - `p1` - **IF** Types Registry cannot resolve one or more UUIDs - `inst-algo-tenant-type-unresolved-branch`
    1. [ ] - `p1` - **RETURN** `TenantResolverError::Internal` to the caller without writing a raw UUID into the SDK projection - `inst-algo-tenant-type-return-unavailable`
 4. [ ] - `p1` - **RETURN** the resolved public chained `tenant_type` identifiers to the caller - `inst-algo-tenant-type-return-resolved`

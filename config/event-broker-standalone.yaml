@@ -32,6 +32,13 @@ database:
 
 gears:
   types-registry:
+    # AuthN plugins publish their instances to, and authn-resolver selects them from,
+    # the registry's database-backed catalogue.
+    database:
+      engine: sqlite
+      file: "types_registry.db"
+      params:
+        busy_timeout: "5000"
     config:
       entities:
         # A topic is an *instance* of the topic base type, carrying the stream's

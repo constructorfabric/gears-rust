@@ -321,6 +321,15 @@ pub enum DomainError {
     #[error("feature disabled: {detail}")]
     FeatureDisabled { detail: String },
 
+    // ---- Unauthenticated (HTTP 401) / PermissionDenied (HTTP 403) ----
+    /// A Types Registry read made under the request's own credential
+    /// refused that caller. The registry's `Unauthenticated` or
+    /// `PermissionDenied` is returned as is, so a client can tell an
+    /// expired or insufficient credential from AM failing. Built only by
+    /// [`Self::caller_registry_failure`].
+    #[error("types-registry refused the caller: {0}")]
+    RegistryRefusedCaller(toolkit_canonical_errors::CanonicalError),
+
     // ---- PermissionDenied (HTTP 403) ----
     /// `cause` is `Some` only when the denial originates upstream
     /// (e.g. `From<authz_resolver_sdk::EnforcerError::Denied>`); plain
@@ -443,6 +452,47 @@ impl DomainError {
             detail: detail.into(),
             retry_after: None,
             cause: None,
+        }
+    }
+
+    /// A failed Types Registry read made for the request's caller
+    /// ([`crate::domain::types_registry_reader::TypesRegistryReader::Caller`]):
+    /// a refusal of that caller's credential is the caller's
+    /// ([`Self::RegistryRefusedCaller`]); anything else is classified as
+    /// [`Self::platform_registry_failure`] does. `context` names the read.
+    #[must_use]
+    pub fn caller_registry_failure(
+        err: toolkit_canonical_errors::CanonicalError,
+        context: impl std::fmt::Display,
+    ) -> Self {
+        use toolkit_canonical_errors::CanonicalError;
+        match err {
+            CanonicalError::Unauthenticated { .. } | CanonicalError::PermissionDenied { .. } => {
+                Self::RegistryRefusedCaller(err)
+            }
+            other => Self::platform_registry_failure(other, context),
+        }
+    }
+
+    /// A failed Types Registry read: only an availability failure is a
+    /// retryable [`Self::ServiceUnavailable`]. Anything else — a corrupt
+    /// answer, a contract mismatch, a refusal of AM's own platform
+    /// credential — fails the same way again, so it is [`Self::Internal`].
+    /// `context` names the read.
+    #[must_use]
+    pub fn platform_registry_failure(
+        err: toolkit_canonical_errors::CanonicalError,
+        context: impl std::fmt::Display,
+    ) -> Self {
+        use toolkit_canonical_errors::CanonicalError;
+        match err {
+            CanonicalError::ServiceUnavailable { .. }
+            | CanonicalError::DeadlineExceeded { .. }
+            | CanonicalError::ResourceExhausted { .. }
+            | CanonicalError::Aborted { .. } => {
+                Self::service_unavailable(format!("{context}: {err}"))
+            }
+            other => Self::internal(format!("{context}: {other}")),
         }
     }
 

@@ -42,6 +42,9 @@
 //! ```
 #![cfg_attr(coverage_nightly, feature(coverage_attribute))]
 
+// `authz-resolver` publishes this crate's GTS declarations itself when configured to; see `gts`.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
 pub mod constraints;
 pub mod error;

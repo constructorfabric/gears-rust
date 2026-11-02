@@ -35,6 +35,9 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+// AM publishes this crate's GTS declarations itself; see `gts`.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod client;
 pub mod error;
 pub mod field;

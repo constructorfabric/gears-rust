@@ -5,28 +5,50 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::SingleTenantTrPluginConfig;
 use crate::domain::Service;
+
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.single_tenant_resolver.plugin.v1";
 
 /// Single-tenant resolver plugin gear.
 ///
 /// Zero-configuration plugin for single-tenant deployments.
 /// Returns the tenant from security context as the only accessible tenant.
+///
+/// The runtime publishes the instance built from the configuration
+/// (`entities`) — locally or to a remote registry — and calls `init` only once
+/// it is admitted; `init` binds the scoped client to the admitted instance.
 #[toolkit::gear(
     name = "single-tenant-tr-plugin",
-    deps = [types_registry]
+    gts(entities = Self::plugin_instance),
 )]
 pub struct SingleTenantTrPlugin;
 
 impl Default for SingleTenantTrPlugin {
     fn default() -> Self {
         Self
+    }
+}
+
+impl SingleTenantTrPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let cfg: SingleTenantTrPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<TenantResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
     }
 }
 
@@ -40,29 +62,18 @@ impl Gear for SingleTenantTrPlugin {
             "Loaded single-tenant resolver plugin configuration"
         );
 
-        // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) =
-            PluginV1::<TenantResolverPluginSpecV1>::build_registration(
-                "cf.builtin.single_tenant_resolver.plugin.v1",
-                &cfg.vendor,
-                cfg.priority,
-            )?;
-
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
-        // Create service and register scoped client in ClientHub
-        let service = Arc::new(Service);
-        let api: Arc<dyn TenantResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn TenantResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id, vendor = %cfg.vendor, priority = cfg.priority, "registered");
-        Ok(())
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        let api: Arc<dyn TenantResolverPluginClient> = Arc::new(Service);
+        bind_plugin_instances::<TenantResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &api,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

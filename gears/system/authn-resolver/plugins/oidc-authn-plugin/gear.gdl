@@ -13,8 +13,12 @@ gdl_version = "1.0"
 # the first would report "no default" here, and a missing default is what the
 # vendor-match check keys on.
 
+TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../../types-registry/types-registry-sdk", features = ["rest-client"])
+
 gear(
-    deps = ["authn-resolver", "types-registry"],
+    deps = [],
+    # The instance is published over the consumed platform contract in `post_init`.
+    consumes = [consume(contract = "PlatformTypesRegistryApi", rust = "types_registry_sdk::PlatformTypesRegistryApi", sdk = TR_SDK)],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authn-resolver/plugins/oidc-authn-plugin"),
     maturity = "preview",
     name = "OIDC AuthN Plugin",

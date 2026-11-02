@@ -37,6 +37,9 @@
 //! let is_anc = resolver.is_ancestor(&ctx, parent_id, child_id, &IsAncestorOptions::default()).await?;
 //! ```
 
+// `tenant-resolver` publishes this crate's GTS declarations itself when configured to; see `gts`.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
 pub mod error;
 pub mod gts;

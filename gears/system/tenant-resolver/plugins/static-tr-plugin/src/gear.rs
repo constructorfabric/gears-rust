@@ -5,47 +5,51 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use tenant_resolver_sdk::{TenantResolverPluginClient, TenantResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::StaticTrPluginConfig;
 use crate::domain::Service;
 
-/// Static tenant resolver plugin gear.
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.static_tenant_resolver.plugin.v1";
+
+/// Static tenant resolver plugin gear: tenant data from configuration, with
+/// hierarchical support.
 ///
-/// Provides tenant data from configuration with hierarchical support.
-///
-/// **Plugin registration pattern:**
-/// - Gateway registers the plugin schema (GTS type definition)
-/// - This plugin registers its instance (implementation metadata)
-/// - This plugin registers its scoped client (implementation in `ClientHub`)
+/// The runtime publishes the plugin instance built from the configuration
+/// (`entities`) and calls `init` only once it is admitted; `init` binds the
+/// scoped client to the admitted instance, before anything can select it.
 #[toolkit::gear(
     name = "static-tr-plugin",
-    deps = [types_registry]
+    gts(entities = Self::plugin_instance),
 )]
+#[derive(Default)]
 pub struct StaticTrPlugin {
-    service: OnceLock<Arc<Service>>,
+    service: OnceLock<Arc<dyn TenantResolverPluginClient>>,
 }
 
-impl Default for StaticTrPlugin {
-    fn default() -> Self {
-        Self {
-            service: OnceLock::new(),
-        }
+impl StaticTrPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let cfg: StaticTrPluginConfig = inputs.config_or_default()?;
+        let (id, document) = PluginV1::<TenantResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
     }
 }
 
 #[async_trait]
 impl Gear for StaticTrPlugin {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        if self.service.get().is_some() {
-            anyhow::bail!("{} gear already initialized", Self::MODULE_NAME);
-        }
-
-        // Load configuration
         let cfg: StaticTrPluginConfig = ctx.config_or_default()?;
         info!(
             vendor = %cfg.vendor,
@@ -53,35 +57,21 @@ impl Gear for StaticTrPlugin {
             tenant_count = cfg.tenants.len(),
             "Loaded plugin configuration"
         );
-
-        let service = Arc::new(Service::from_config(&cfg)?);
-
-        // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) =
-            PluginV1::<TenantResolverPluginSpecV1>::build_registration(
-                "cf.builtin.static_tenant_resolver.plugin.v1",
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
+        let service: Arc<dyn TenantResolverPluginClient> = Arc::new(Service::from_config(&cfg)?);
         self.service
-            .set(service.clone())
+            .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-
-        // Register scoped client in ClientHub
-        let api: Arc<dyn TenantResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn TenantResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        bind_plugin_instances::<TenantResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )
     }
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "gear_tests.rs"]
+mod gear_tests;

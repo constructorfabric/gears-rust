@@ -245,3 +245,108 @@ async fn pre_warm_exhausts_budget_on_persistent_transient() {
         "error message must surface the underlying status, got: {msg}",
     );
 }
+
+// ---- types-registry publication ----
+
+/// The publication is config-only: the runtime builds it before any `init`,
+/// without `CredStore` or Keycloak.
+mod publication {
+    use std::sync::Arc;
+
+    use account_management_sdk::IdpPluginSpecV1;
+    use serde_json::{Value, json};
+    use tokio_util::sync::CancellationToken;
+    use toolkit::ConfigProvider;
+    use toolkit::client_hub::ClientHub;
+    use toolkit::gts::PluginV1;
+    use toolkit::gts_publication::{
+        GtsManifest, GtsPublicationCapability as _, GtsPublicationError, PreparedGtsPublication,
+    };
+    use types_registry_sdk::AdmissionFailureReason;
+    use types_registry_sdk::testing_platform::{Call, MockTypesRegistry};
+
+    use crate::module::KeycloakIdpPluginGear;
+
+    struct Config(Value);
+
+    impl ConfigProvider for Config {
+        fn get_gear_config(&self, _gear: &str) -> Option<&Value> {
+            Some(&self.0)
+        }
+    }
+
+    fn instance(priority: i16) -> (String, Value) {
+        let (id, content) = PluginV1::<IdpPluginSpecV1>::build_registration(
+            "cf.builtin.keycloak_idp.plugin.v1",
+            "keycloak",
+            priority,
+        )
+        .expect("plugin instance serializes");
+        (id.as_ref().to_owned(), content)
+    }
+
+    /// Only the knobs of the instance; no Keycloak section, no secret.
+    fn manifest(config: &Value) -> GtsManifest {
+        KeycloakIdpPluginGear
+            .descriptor()
+            .build_gts_manifest(&Config(json!({ "config": config })))
+            .expect("manifest")
+    }
+
+    #[test]
+    fn the_manifest_is_the_configured_instance_without_any_secret() {
+        assert_eq!(
+            manifest(&json!({ "priority": 10 })).documents(),
+            [instance(10)]
+        );
+        assert_eq!(manifest(&json!({})).documents(), [instance(50)], "defaults");
+    }
+
+    #[test]
+    fn a_disabled_plugin_publishes_nothing() {
+        assert!(manifest(&json!({ "enabled": false })).is_empty());
+    }
+
+    async fn published(
+        registry: &Arc<MockTypesRegistry>,
+        priority: i16,
+    ) -> Result<(), GtsPublicationError> {
+        let hub = ClientHub::new();
+        registry.install(&hub);
+        PreparedGtsPublication::bind(
+            KeycloakIdpPluginGear.descriptor(),
+            Arc::new(manifest(&json!({ "priority": priority }))),
+            &hub,
+        )?
+        .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
+        .await
+    }
+
+    #[tokio::test]
+    async fn an_equal_restart_submits_nothing_and_a_change_updates() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, content) = instance(10);
+        registry.seed(&id, content);
+
+        published(&registry, 10).await.expect("up to date");
+        assert_eq!(registry.calls(Call::Register), 0);
+
+        published(&registry, 20).await.expect("updated");
+        assert_eq!(registry.content(&id), Some(instance(20).1));
+    }
+
+    #[tokio::test]
+    async fn a_refusal_names_the_instance_and_its_outcome() {
+        let registry = Arc::new(MockTypesRegistry::new());
+        let (id, _) = instance(10);
+        registry.reject(&id, AdmissionFailureReason::InvalidValue);
+
+        let error = published(&registry, 10).await.expect_err("refused");
+
+        let text = error.to_string();
+        assert!(
+            text.contains(&id) && text.contains("invalid_value"),
+            "{text}"
+        );
+    }
+}

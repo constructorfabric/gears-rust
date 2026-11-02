@@ -31,6 +31,7 @@ pub mod service_account;
 pub mod system_actor;
 pub mod tenant;
 pub mod tenant_type;
+pub mod types_registry_reader;
 pub mod user;
 pub mod user_groups;
 pub mod util;

@@ -171,8 +171,20 @@ database:
   servers: {{}}
 
 gears:
+  # The resolvers and plugins publish their GTS documents to the registry's
+  # database-backed catalogue, as in config/event-broker-standalone.yaml.
   types-registry:
+    database:
+      engine: sqlite
+      file: "types_registry.db"
     config:
+      # The fixtures' event types and topics use vendor `x`; it is open in
+      # their `x.eb` namespace only.
+      registration_policy:
+        "gts.cf.core.events.event.v1~x.eb.*":
+          allowed_vendors: [x]
+        "gts.cf.core.events.topic.v1~x.eb.*":
+          allowed_vendors: [x]
       entities: [{entities}]
 
   cluster:

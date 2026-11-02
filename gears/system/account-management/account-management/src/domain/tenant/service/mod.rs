@@ -89,7 +89,7 @@ use serde_json::Value;
 use tenant_resolver_sdk::TenantId;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_odata::{ODataQuery, Page};
-use types_registry_sdk::TypesRegistryClient;
+use types_registry_sdk::{PlatformTypesRegistryApi, TypesRegistryApi};
 
 use crate::config::AccountManagementConfig;
 use crate::domain::error::DomainError;
@@ -108,6 +108,7 @@ use crate::domain::tenant::model::{
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
 use crate::domain::tenant_type::checker::TenantTypeChecker;
+use crate::domain::types_registry_reader::TypesRegistryReader;
 
 /// Upper bound on the byte size of the opaque `IdP`-metadata blob AM
 /// will persist into `tenant_idp_metadata` and replay on every
@@ -187,16 +188,15 @@ pub struct TenantService<R: TenantRepo> {
     /// incompatible parent / child type pairings before any tenants /
     /// closure rows are written.
     tenant_type_checker: Arc<dyn TenantTypeChecker + Send + Sync>,
-    /// Optional GTS Types Registry client used to resolve a tenant's
-    /// `tenant_type_uuid` back to its chained-id string before the
-    /// service hands a [`Tenant`] to public callers. `None` in
-    /// dev / test deployments without a registry plugin (in which case
-    /// `Tenant.tenant_type` is left as `None`). Production reads
-    /// rely on the registry client's own caching — every CRUD return
-    /// fans out one `get_type_schema_by_uuid` call (or one batched
-    /// `get_type_schemas_by_uuid` for `list_children`); the cache
-    /// keeps real RTT off the hot path.
-    types_registry: Option<Arc<dyn TypesRegistryClient>>,
+    /// Request registry for type hydration, tenant-name checks and parent `IdP` context
+    /// (P33). Single returns use `resolve_type_id`; `list_children` batches with
+    /// `resolve_type_ids`. Tests may omit it, leaving `Tenant.tenant_type` as `None`.
+    /// Reads hit the database until the SDK cache (T36).
+    types_registry: Option<Arc<dyn TypesRegistryApi>>,
+    /// The platform client for the service's own background pipelines —
+    /// retention and the provisioning reaper — which run for no request
+    /// and so have no caller to name. Never used on a request path.
+    platform_types_registry: Option<Arc<dyn PlatformTypesRegistryApi>>,
     /// PEP boundary (DESIGN §4.2). Every public CRUD method calls
     /// [`Self::authorize`] before any structural precondition or
     /// repo read. Cross-tenant authorization (subtree clamp,
@@ -212,16 +212,23 @@ pub(super) mod reaper;
 pub(super) mod retention;
 mod scope_util;
 
+/// Who a [`TenantService`] registry read is made for (P33).
+#[domain_model]
+#[derive(Clone, Copy)]
+pub(crate) enum CallerOrigin<'a> {
+    /// The caller of the request being served; read through the tenant
+    /// API under exactly this context.
+    Request(&'a SecurityContext),
+    /// Retention or the provisioning reaper: an autonomous pipeline with
+    /// no request behind it, read through the platform API.
+    Background,
+}
+
 impl<R: TenantRepo> TenantService<R> {
-    /// Construct a fully-wired service. Production wiring lives in the
-    /// AM gear entry-point ([`crate::gear::AccountManagementGear`]):
-    /// `types-registry` and `resource-group` are declared as hard `deps`,
-    /// so the entry-point hard-resolves `TypesRegistryClient` (passes
-    /// [`crate::infra::types_registry::GtsTenantTypeChecker`]) and
-    /// `ResourceGroupClient` (passes
-    /// [`crate::infra::rg::RgResourceOwnershipChecker`]); a missing
-    /// client fails `init`. Tests pass explicit checkers (typically the
-    /// inert ones or test fakes) directly.
+    /// Construct with explicit type and resource-ownership checkers. Production
+    /// [`crate::gear::AccountManagementGear`] requires `TypesRegistryApi` from the
+    /// local registry and `ResourceGroupClient` from its hard dependency; missing
+    /// clients fail init. Tests supply inert checkers or fakes.
     #[must_use]
     pub fn new(
         repo: Arc<R>,
@@ -239,40 +246,52 @@ impl<R: TenantRepo> TenantService<R> {
             resource_checker,
             tenant_type_checker,
             types_registry: None,
+            platform_types_registry: None,
             enforcer,
         }
     }
 
-    /// Wire a Types Registry client used to resolve `tenant_type_uuid`
-    /// back to its chained GTS id when lowering [`TenantModel`] to
-    /// [`Tenant`] on public CRUD return values. Without this the
-    /// service still works — `Tenant.tenant_type` is just left as
-    /// `None`. Production wiring (`gear.rs`) calls this from
-    /// `init` after the registry client resolves from `ClientHub`;
-    /// tests (which usually pin an inert tenant-type checker) leave
-    /// it unset.
+    /// Wire request reads under each caller's context and background reads through
+    /// the platform API. Production init resolves both from `ClientHub`.
+    /// Tests may leave them unset, yielding `Tenant.tenant_type = None`.
     #[must_use]
-    pub fn with_types_registry(mut self, registry: Arc<dyn TypesRegistryClient>) -> Self {
-        self.types_registry = Some(registry);
+    pub fn with_types_registry(
+        mut self,
+        requests: Arc<dyn TypesRegistryApi>,
+        background: Arc<dyn PlatformTypesRegistryApi>,
+    ) -> Self {
+        self.types_registry = Some(requests);
+        self.platform_types_registry = Some(background);
         self
     }
 
-    /// Assemble a [`TenantContext`] for a tenant the reaper / retention
-    /// pipeline is about to feed into
-    /// [`account_management_sdk::IdpPluginClient::deprovision_tenant`].
-    /// Fetches the `tenants` row, resolves `tenant_type_uuid` to the
-    /// chained [`gts::GtsTypeId`] via the configured registry, and
-    /// loads the opaque plugin-private metadata from
-    /// `tenant_idp_metadata`. A registry blip surfaces as
-    /// [`DomainError::service_unavailable`] (uniform with the user-ops
-    /// path) so the caller knows to defer the row to the next tick
-    /// instead of calling the plugin with a stale or invented type.
-    ///
-    /// Both retention (`hard_delete_batch`) and the provisioning
-    /// reaper consume this helper. A row that has been removed
-    /// underneath them returns [`DomainError::NotFound`].
+    /// The registry reads for `origin`: a request's under its caller, the
+    /// background pipelines' through the platform API. Neither stands in
+    /// for the other.
+    fn types_registry_reader<'a>(
+        &'a self,
+        origin: CallerOrigin<'a>,
+    ) -> Option<TypesRegistryReader<'a>> {
+        match origin {
+            CallerOrigin::Request(ctx) => self
+                .types_registry
+                .as_deref()
+                .map(|api| TypesRegistryReader::caller(api, ctx)),
+            CallerOrigin::Background => self
+                .platform_types_registry
+                .as_deref()
+                .map(TypesRegistryReader::Platform),
+        }
+    }
+
+    /// Load a [`TenantContext`] with its resolved type and opaque `tenant_idp_metadata`.
+    /// The create saga reads for [`CallerOrigin::Request`]; retention and the reaper
+    /// use [`CallerOrigin::Background`] for `IdpPluginClient::deprovision_tenant`.
+    /// Registry unavailability returns [`DomainError::service_unavailable`] so cleanup
+    /// can defer the row. A removed row returns [`DomainError::NotFound`].
     pub(crate) async fn load_tenant_context(
         &self,
+        origin: CallerOrigin<'_>,
         tenant_id: Uuid,
     ) -> Result<TenantContext, DomainError> {
         let system_scope = AccessScope::allow_all();
@@ -284,18 +303,14 @@ impl<R: TenantRepo> TenantService<R> {
                 detail: format!("tenant {tenant_id} not found"),
                 resource: tenant_id.to_string(),
             })?;
-        let registry = self.types_registry.as_ref().ok_or_else(|| {
+        let reader = self.types_registry_reader(origin).ok_or_else(|| {
             DomainError::service_unavailable(format!(
                 "tenant_type resolution requires a types-registry client \
-                 (tenant {tenant_id} cannot be fed to IdpPluginClient::deprovision_tenant \
-                 without one)"
+                 (tenant {tenant_id} cannot be fed to the IdP plugin without one)"
             ))
         })?;
-        let tenant_type = match registry
-            .get_type_schema_by_uuid(tenant.tenant_type_uuid)
-            .await
-        {
-            Ok(schema) => schema.type_id,
+        let tenant_type = match reader.resolve_type_id(tenant.tenant_type_uuid).await {
+            Ok(type_id) => type_id,
             // Catalog drift: the tenant row references a
             // `tenant_type_uuid` that the registry no longer
             // resolves. SDK contract on `IdpTenantContext::tenant_type`
@@ -350,14 +365,14 @@ impl<R: TenantRepo> TenantService<R> {
     }
 
     /// Resolve a tenant-type UUID into its chained GTS string via the
-    /// configured registry client. Returns `None` when no registry is
-    /// wired or when the lookup fails — the public `tenant_type` field
-    /// on [`Tenant`] is `Option<String>` precisely so a registry
-    /// blip doesn't fail an otherwise-fine read.
-    async fn resolve_tenant_type(&self, type_uuid: Uuid) -> Option<String> {
-        let registry = self.types_registry.as_ref()?;
-        match registry.get_type_schema_by_uuid(type_uuid).await {
-            Ok(schema) => Some(schema.type_id.as_ref().to_owned()),
+    /// configured registry client, for the request's caller. Returns
+    /// `None` when no registry is wired or when the lookup fails — the
+    /// public `tenant_type` field on [`Tenant`] is `Option<String>`
+    /// precisely so a registry blip doesn't fail an otherwise-fine read.
+    async fn resolve_tenant_type(&self, ctx: &SecurityContext, type_uuid: Uuid) -> Option<String> {
+        let reader = self.types_registry_reader(CallerOrigin::Request(ctx))?;
+        match reader.resolve_type_id(type_uuid).await {
+            Ok(type_id) => Some(type_id.as_ref().to_owned()),
             Err(err) => {
                 tracing::warn!(
                     target: "am.tenant.service",
@@ -384,10 +399,11 @@ impl<R: TenantRepo> TenantService<R> {
     /// panic.
     async fn lower_to_tenant(
         &self,
+        ctx: &SecurityContext,
         scope: &AccessScope,
         model: TenantModel,
     ) -> Result<Tenant, DomainError> {
-        let tenant_type = self.resolve_tenant_type(model.tenant_type_uuid).await;
+        let tenant_type = self.resolve_tenant_type(ctx, model.tenant_type_uuid).await;
         let status =
             account_management_sdk::TenantStatus::try_from(model.status).map_err(|_| {
                 DomainError::Internal {
@@ -425,16 +441,17 @@ impl<R: TenantRepo> TenantService<R> {
     }
 
     /// One types-registry round-trip for a set of tenant-type uuids.
-    /// Uuids the registry fails on are absent from the map; the
+    /// Unknown uuids, and every uuid of a failed read, are absent from the map; the
     /// projection then carries `tenant_type: None` (best-effort, same
     /// policy as the single-row helper). Empty when no registry is
     /// wired.
     async fn resolve_type_strings(
         &self,
+        ctx: &SecurityContext,
         mut uuids: Vec<Uuid>,
     ) -> std::collections::HashMap<Uuid, String> {
         let mut out = std::collections::HashMap::new();
-        let Some(registry) = self.types_registry.as_ref() else {
+        let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx)) else {
             return out;
         };
         uuids.sort_unstable();
@@ -442,9 +459,18 @@ impl<R: TenantRepo> TenantService<R> {
         if uuids.is_empty() {
             return out;
         }
-        for (uuid, res) in registry.get_type_schemas_by_uuid(uuids).await {
-            if let Ok(schema) = res {
-                out.insert(uuid, schema.type_id.as_ref().to_owned());
+        match reader.resolve_type_ids(&uuids).await {
+            Ok(found) => {
+                out.extend(found.into_iter().filter_map(|(uuid, type_id)| {
+                    type_id.map(|type_id| (uuid, type_id.as_ref().to_owned()))
+                }));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: "am.tenant.service",
+                    error = %err,
+                    "tenant_type batch resolution failed; returning the page without tenant types"
+                );
             }
         }
         out
@@ -455,11 +481,12 @@ impl<R: TenantRepo> TenantService<R> {
     /// page, so latency scales with pages, not rows.
     async fn lower_to_tenant_page(
         &self,
+        ctx: &SecurityContext,
         scope: &AccessScope,
         page: Page<TenantModel>,
     ) -> Result<Page<Tenant>, DomainError> {
         let type_strings = self
-            .resolve_type_strings(page.items.iter().map(|m| m.tenant_type_uuid).collect())
+            .resolve_type_strings(ctx, page.items.iter().map(|m| m.tenant_type_uuid).collect())
             .await;
         self.lower_page_with_types(scope, page, &type_strings).await
     }
@@ -749,12 +776,9 @@ impl<R: TenantRepo> TenantService<R> {
         // Trim first: an all-whitespace name passes both `minLength: 1`
         // and the DB CHECK, so the AM-side rule is the only gate.
         let name = verify_tenant_name("create_tenant", input.name)?;
-        if let Some(registry) = self.types_registry.as_ref() {
-            crate::domain::gts_validation::validate_tenant_name_via_gts(
-                name.as_str(),
-                registry.as_ref(),
-            )
-            .await?;
+        if let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx)) {
+            crate::domain::gts_validation::validate_tenant_name_via_gts(name.as_str(), reader)
+                .await?;
         }
         // No AM-side schema validation of `input.provisioning_metadata`:
         // the IdP plugin owns that shape end-to-end per the
@@ -783,7 +807,7 @@ impl<R: TenantRepo> TenantService<R> {
         // rejection. Registry unavailability surfaces as
         // `service_unavailable` (HTTP 503) with no DB side effects.
         self.tenant_type_checker
-            .check_parent_child(parent.tenant_type_uuid, tenant_type_uuid)
+            .check_parent_child(ctx, parent.tenant_type_uuid, tenant_type_uuid)
             .await?;
 
         // `checked_add` rather than `saturating_add` so an overflow
@@ -869,7 +893,9 @@ impl<R: TenantRepo> TenantService<R> {
 
         // Saga step 2 — invoke IdP provider outside any TX.
         // @cpt-begin:cpt-cf-account-management-dod-tenant-hierarchy-management-idp-tenant-provision:p1:inst-dod-idp-provision-call
-        let parent_ctx = self.load_tenant_context(parent.id).await?;
+        let parent_ctx = self
+            .load_tenant_context(CallerOrigin::Request(ctx), parent.id)
+            .await?;
         let mut req = IdpProvisionTenantRequest::new(
             provisioning_row.id,
             parent.id,
@@ -1204,7 +1230,7 @@ impl<R: TenantRepo> TenantService<R> {
         // resolves to 0 regardless of scope, so the saga's `allow_all`
         // posture is fine here.
         let mut info = self
-            .lower_to_tenant(&AccessScope::allow_all(), activated)
+            .lower_to_tenant(ctx, &AccessScope::allow_all(), activated)
             .await?;
         if info.tenant_type.is_none() {
             // `Tenant.tenant_type` is `Option<String>` per the
@@ -1493,7 +1519,7 @@ impl<R: TenantRepo> TenantService<R> {
                 resource: id.to_string(),
             });
         }
-        self.lower_to_tenant(&scope, tenant).await
+        self.lower_to_tenant(ctx, &scope, tenant).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-tenant-read-scope:p1:inst-dod-read-scope-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-read-tenant:p1:inst-flow-read-service
@@ -1580,7 +1606,7 @@ impl<R: TenantRepo> TenantService<R> {
         // `relaxed` one used for the listing query: a self-managed
         // child's own subtree stays behind its barrier, so its
         // `child_count` is scope-filtered to what the caller may see.
-        self.lower_to_tenant_page(&scope, page).await
+        self.lower_to_tenant_page(ctx, &scope, page).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-children-query-paginated:p1:inst-dod-children-query-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-list-children:p1:inst-flow-listch-service
@@ -1657,6 +1683,7 @@ impl<R: TenantRepo> TenantService<R> {
         // One registry round-trip for the rows' and the chains' types.
         let type_strings = self
             .resolve_type_strings(
+                ctx,
                 page.items
                     .iter()
                     .map(|m| m.tenant_type_uuid)
@@ -1779,13 +1806,10 @@ impl<R: TenantRepo> TenantService<R> {
             .transpose()?;
         if let Some(ref new_name) = new_name
             && new_name.as_str() != current.name
-            && let Some(registry) = self.types_registry.as_ref()
+            && let Some(reader) = self.types_registry_reader(CallerOrigin::Request(ctx))
         {
-            crate::domain::gts_validation::validate_tenant_name_via_gts(
-                new_name.as_str(),
-                registry.as_ref(),
-            )
-            .await?;
+            crate::domain::gts_validation::validate_tenant_name_via_gts(new_name.as_str(), reader)
+                .await?;
         }
         patch.name = new_name.map(TenantName::into_inner);
         let updated = self.repo.update_tenant_mutable(&scope, id, &patch).await?;
@@ -1810,7 +1834,7 @@ impl<R: TenantRepo> TenantService<R> {
             );
         }
 
-        self.lower_to_tenant(&scope, updated).await
+        self.lower_to_tenant(ctx, &scope, updated).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-update-mutable-only:p1:inst-dod-update-mutable-service
     // @cpt-end:cpt-cf-account-management-flow-tenant-hierarchy-management-update-tenant:p1:inst-flow-update-service
@@ -1929,7 +1953,7 @@ impl<R: TenantRepo> TenantService<R> {
                 "am tenant state changed"
             );
         }
-        self.lower_to_tenant(&scope, updated).await
+        self.lower_to_tenant(ctx, &scope, updated).await
     }
 
     // -----------------------------------------------------------------
@@ -2005,7 +2029,7 @@ impl<R: TenantRepo> TenantService<R> {
         // downstream filters can distinguish first-write events from
         // idempotent retries.
         if matches!(tenant.status, TenantStatus::Deleted) {
-            return self.lower_to_tenant(&scope, tenant).await;
+            return self.lower_to_tenant(ctx, &scope, tenant).await;
         }
         // 1. Child-rejection guard. `include_deleted = false` excludes
         // ONLY rows in `Deleted` status; `Provisioning`, `Active` and
@@ -2064,7 +2088,7 @@ impl<R: TenantRepo> TenantService<R> {
             retention_secs = self.cfg.retention.default_window_secs,
             "am tenant state changed"
         );
-        self.lower_to_tenant(&scope, updated).await
+        self.lower_to_tenant(ctx, &scope, updated).await
     }
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-data-lifecycle:p1:inst-dod-data-lifecycle-soft-delete
     // @cpt-end:cpt-cf-account-management-dod-tenant-hierarchy-management-soft-delete-preconditions:p1:inst-dod-soft-delete-preconditions

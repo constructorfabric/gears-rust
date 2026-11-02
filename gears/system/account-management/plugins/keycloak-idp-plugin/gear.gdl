@@ -8,8 +8,11 @@ gdl_version = "1.0"
 # (`IdpPluginClient`), declared by `implements`. This plugin's vendor and priority
 # are read from source.
 
+# `init` requires a host-linked, database-backed types-registry (system gear, initialized
+# first). No `deps` or `consumes`; missing registry fails boot. Remote support: T41/T42.
+
 gear(
-    deps = ["credstore", "types-registry"],
+    deps = ["credstore"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/account-management/plugins/keycloak-idp-plugin"),
     maturity = "preview",
     name = "Keycloak IdP Plugin",
