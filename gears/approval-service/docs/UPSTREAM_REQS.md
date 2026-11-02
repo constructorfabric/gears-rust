@@ -267,6 +267,5 @@ Before it can replace `cf-gears-bss-approval`, the future gear **MUST** support 
 
 - [Orders Workflow PRD](../../bss/orders-workflow/docs/PRD.md) — §6.2 Approval Execution, §9.2 Approval Request/Decision Contract, §15 Open Questions
 - [Orders Changes PRD](../../bss/orders-changes/docs/PRD.md) — Generic Approval Service actor
-- [Orders Lifecycle DECISIONS](../../bss/orders-lifecycle/docs/DECISIONS.md) — D-73, D-166, Q-09
 - [BSS approval library](../../bss/libs/approval/README.md) and [BSS Approvals Inbox PRD](../../bss/approvals/docs/PRD.md)
 - [Contracts PRD](../../bss/contracts/docs/PRD.md) — contract signature approval deferred
