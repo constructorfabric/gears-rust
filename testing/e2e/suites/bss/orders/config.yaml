@@ -511,12 +511,14 @@ gears:
         synchronous: "NORMAL"
     config:
       mode: standalone
-      default_storage_backend: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+      backends:
+        main:
+          type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
+          path: "__E2E_HOME__/event-broker/event_log.db"
+      backend_routing:
+        "gts.cf.core.events.topic.v1~": main
       topics:
-        "gts.cf.core.events.topic.v1~":
-          backend:
-            type: "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~"
-            path: "__E2E_HOME__/event-broker/event_log.db"
+        "gts.cf.core.events.topic.v1~": {}
 
   # The Orders store: the real PostgreSQL container. `__E2E_PG_USER__` is `orders_admin` for
   # the migrate run and `orders_runtime` for the server run; the password is a secret
