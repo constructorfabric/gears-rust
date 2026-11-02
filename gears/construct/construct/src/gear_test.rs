@@ -181,14 +181,14 @@ async fn a_worker_that_panicked_makes_stop_fail() {
 #[tracing_test::traced_test]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn stop_gives_up_on_an_aborted_worker_that_does_not_end_and_says_so() {
-    // A worker blocked in a call that never yields, so the abort cannot
-    // reach it; it ends well after the grace stop waits for.
+    // A worker on a blocking thread: once it runs, an abort cannot reach it,
+    // and it ends well after the grace stop waits for.
     let blocked = std::time::Duration::from_secs(3);
     let gear = ConstructGear::default();
     let started_blocking = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let handle = tokio::spawn({
+    let handle = tokio::task::spawn_blocking({
         let started_blocking = Arc::clone(&started_blocking);
-        async move {
+        move || {
             started_blocking.store(true, std::sync::atomic::Ordering::SeqCst);
             std::thread::sleep(blocked);
         }
