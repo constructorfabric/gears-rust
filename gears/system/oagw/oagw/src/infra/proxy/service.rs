@@ -2390,6 +2390,7 @@ mod tests {
         fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_credential_withheld(&self, _: &str, _: &'static str) {}
         fn record_proxy_cache_lookup(
             &self,
             _: crate::domain::ports::metric_labels::CacheMap,
@@ -2528,6 +2529,7 @@ mod tests {
         }
         fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
         fn record_registry_provisioning_run(&self, _: &str) {}
+        fn record_credential_withheld(&self, _: &str, _: &'static str) {}
         fn record_proxy_cache_lookup(
             &self,
             _: crate::domain::ports::metric_labels::CacheMap,

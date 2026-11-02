@@ -66,6 +66,7 @@ pub struct OagwMetricsMeter {
     websocket_session_duration_seconds: Histogram<f64>,
     registry_provisioning_failures: Counter<u64>,
     registry_provisioning_runs: Counter<u64>,
+    credentials_withheld: Counter<u64>,
     proxy_cache_lookups: Counter<u64>,
     proxy_cache_entries: Gauge<u64>,
     proxy_cache_evictions: Counter<u64>,
@@ -145,6 +146,12 @@ impl OagwMetricsMeter {
             registry_provisioning_runs: meter
                 .u64_counter(format!("{prefix}_registry_provisioning_runs"))
                 .with_description("Registry reconcile runs by outcome")
+                .build(),
+            credentials_withheld: meter
+                .u64_counter(format!("{prefix}_credentials_withheld"))
+                .with_description(
+                    "Ancestor auth or headers not sent to endpoints their owner did not configure",
+                )
                 .build(),
             proxy_cache_lookups: meter
                 .u64_counter(format!("{prefix}_proxy_cache_lookups"))
@@ -279,6 +286,16 @@ impl OagwMetricsPort for OagwMetricsMeter {
     fn record_registry_provisioning_run(&self, outcome: &str) {
         self.registry_provisioning_runs
             .add(1, &[KeyValue::new(key::OUTCOME, outcome.to_owned())]);
+    }
+
+    fn record_credential_withheld(&self, host: &str, outcome: &'static str) {
+        self.credentials_withheld.add(
+            1,
+            &[
+                KeyValue::new(key::HOST, host.to_owned()),
+                KeyValue::new(key::OUTCOME, outcome),
+            ],
+        );
     }
 
     // The cache's labels are static: no allocation per lookup.

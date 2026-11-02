@@ -5209,24 +5209,31 @@ async fn closest_ancestor_lookup_picks_nearest_ancestor_with_alias() {
         .unwrap();
 
     let chain = svc.build_tenant_chain(&test_ctx(leaf)).await.unwrap();
-    let found = ancestor::closest_ancestor_upstream(&*svc.upstreams, &chain, &root_up.alias)
+    let found = ancestor::ancestor_upstreams(&*svc.upstreams, &chain, &root_up.alias)
         .await
         .unwrap();
-    assert_eq!(found.map(|u| u.id), Some(mid_up.id));
+    assert_eq!(
+        found.iter().map(|u| u.id).collect::<Vec<_>>(),
+        vec![mid_up.id, root_up.id],
+        "closest first"
+    );
 
     // The requesting tenant itself is never its own ancestor.
     let mid_chain = svc.build_tenant_chain(&test_ctx(mid)).await.unwrap();
-    let found = ancestor::closest_ancestor_upstream(&*svc.upstreams, &mid_chain, &root_up.alias)
+    let found = ancestor::ancestor_upstreams(&*svc.upstreams, &mid_chain, &root_up.alias)
         .await
         .unwrap();
-    assert_eq!(found.map(|u| u.id), Some(root_up.id));
+    assert_eq!(
+        found.iter().map(|u| u.id).collect::<Vec<_>>(),
+        vec![root_up.id]
+    );
 
     // A root tenant has no ancestors.
     let root_chain = svc.build_tenant_chain(&test_ctx(root)).await.unwrap();
-    let found = ancestor::closest_ancestor_upstream(&*svc.upstreams, &root_chain, &root_up.alias)
+    let found = ancestor::ancestor_upstreams(&*svc.upstreams, &root_chain, &root_up.alias)
         .await
         .unwrap();
-    assert!(found.is_none());
+    assert!(found.is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -6962,4 +6969,438 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
         "{err:?}"
     );
     assert_eq!(selects(), cached, "the upstream came from the cache");
+}
+
+fn ep(scheme: Scheme, host: &str) -> Endpoint {
+    Endpoint {
+        scheme,
+        host: host.into(),
+        port: 443,
+    }
+}
+
+fn on(hosts: &[&str]) -> Server {
+    Server {
+        endpoints: hosts.iter().map(|h| ep(Scheme::Https, h)).collect(),
+    }
+}
+
+#[test]
+fn server_within_is_a_one_way_subset_check() {
+    use super::merge::server_within;
+
+    let owner = on(&["a.example", "b.example"]);
+    assert!(server_within(&owner, &owner), "equal");
+    assert!(
+        server_within(&on(&["b.example", "a.example"]), &owner),
+        "order"
+    );
+    assert!(server_within(&on(&["b.example"]), &owner), "subset");
+    assert!(
+        server_within(&on(&["A.Example."]), &owner),
+        "case and trailing dot"
+    );
+    assert!(
+        !server_within(&on(&["a.example", "c.example"]), &owner),
+        "extra endpoint"
+    );
+    assert!(!server_within(&on(&["c.example"]), &owner), "disjoint");
+    assert!(!server_within(&on(&[]), &owner), "empty server");
+    assert!(!server_within(&on(&["a.example"]), &on(&[])), "empty owner");
+    let other_port = Server {
+        endpoints: vec![Endpoint {
+            port: 8443,
+            ..ep(Scheme::Https, "a.example")
+        }],
+    };
+    assert!(!server_within(&other_port, &owner), "port");
+    let plaintext = Server {
+        endpoints: vec![ep(Scheme::Http, "a.example")],
+    };
+    assert!(!server_within(&plaintext, &owner), "scheme");
+}
+
+/// An upstream on `hosts` with the given auth sharing (none for `None`) and,
+/// when `headers` is set, a request header naming it.
+fn layer(hosts: &[&str], auth: Option<SharingMode>, headers: Option<&str>) -> Upstream {
+    let mut u = make_upstream(
+        Uuid::new_v4(),
+        "svc",
+        auth.map(|sharing| AuthConfig {
+            plugin_type: "apikey".into(),
+            sharing,
+            config: None,
+        }),
+        None,
+        None,
+        vec![],
+    );
+    u.server = on(hosts);
+    u.headers = headers.map(|value| crate::domain::model::HeadersConfig {
+        request: Some(crate::domain::model::RequestHeaderRules {
+            set: [("x-owner".to_owned(), value.to_owned())].into(),
+            ..Default::default()
+        }),
+        response: None,
+    });
+    u
+}
+
+fn merged(chain: &[Upstream]) -> (Result<Upstream, DomainError>, Vec<super::merge::Withheld>) {
+    let mut withheld = Vec::new();
+    let result =
+        super::merge::compute_effective_config_reporting(chain, None, &mut |w| withheld.push(w));
+    (result, withheld)
+}
+
+#[test]
+fn a_child_on_part_of_the_owners_endpoints_keeps_the_credential() {
+    let root = layer(&["a", "a2"], Some(SharingMode::Inherit), Some("root"));
+    let child = layer(&["a"], None, None);
+    let (effective, withheld) = merged(&[root.clone(), child]);
+    let effective = effective.unwrap();
+    assert!(effective.auth.is_some());
+    assert!(effective.headers.is_some());
+    assert!(withheld.is_empty());
+}
+
+#[test]
+fn a_child_with_an_endpoint_the_owner_lacks_loses_the_credential() {
+    use super::merge::WithheldKind;
+
+    let root = layer(&["a"], Some(SharingMode::Inherit), Some("root"));
+    let child = layer(&["a", "b"], None, None);
+    let (effective, withheld) = merged(&[root.clone(), child.clone()]);
+    let effective = effective.unwrap();
+    assert!(effective.auth.is_none());
+    assert!(effective.headers.is_none());
+    let kinds: Vec<_> = withheld.iter().map(|w| w.kind).collect();
+    assert_eq!(kinds, vec![WithheldKind::Auth, WithheldKind::Headers]);
+    assert!(
+        withheld
+            .iter()
+            .all(|w| w.owner_id == root.id && w.upstream_id == child.id)
+    );
+}
+
+/// The credential is checked against its owner's endpoints, not the level
+/// above: a leaf may use an endpoint the root lists that the middle tenant
+/// left out.
+#[test]
+fn an_enforced_auth_is_checked_against_its_owner() {
+    let root = layer(&["a", "a2"], Some(SharingMode::Enforce), None);
+    let mid = layer(&["a"], None, None);
+
+    let (effective, _) = merged(&[root.clone(), mid.clone(), layer(&["a2"], None, None)]);
+    assert!(effective.unwrap().auth.is_some());
+
+    let (refused, withheld) = merged(&[root.clone(), mid, layer(&["b"], None, None)]);
+    assert!(
+        matches!(&refused, Err(DomainError::Forbidden { reason, .. })
+            if reason == super::merge::ENFORCED_AUTH_OTHER_SERVER),
+        "{refused:?}"
+    );
+    assert_eq!(withheld.len(), 1);
+    assert_eq!(withheld[0].kind, super::merge::WithheldKind::EnforcedAuth);
+    assert_eq!(withheld[0].owner_id, root.id);
+}
+
+/// The middle tenant's own key belongs to the middle tenant's endpoints,
+/// even if the root lists more.
+#[test]
+fn a_middle_tenants_key_stays_on_its_endpoints() {
+    let root = layer(&["a", "a2"], Some(SharingMode::Inherit), None);
+    let mid = layer(&["a"], Some(SharingMode::Inherit), None);
+    let leaf = layer(&["a2"], None, None);
+    let (effective, withheld) = merged(&[root, mid.clone(), leaf]);
+    assert!(effective.unwrap().auth.is_none());
+    assert_eq!(withheld[0].owner_id, mid.id);
+}
+
+/// Headers have their own owner: a child that sets its auth but not its
+/// headers still checks the root's headers against the root's endpoints.
+#[test]
+fn headers_and_auth_have_separate_owners() {
+    let root = layer(&["a"], Some(SharingMode::Inherit), Some("root"));
+    let child = layer(&["b"], Some(SharingMode::Private), None);
+    let (effective, withheld) = merged(&[root, child]);
+    let effective = effective.unwrap();
+    assert!(effective.auth.is_some(), "the child's own auth");
+    assert!(effective.headers.is_none());
+    assert_eq!(
+        withheld.iter().map(|w| w.kind).collect::<Vec<_>>(),
+        vec![super::merge::WithheldKind::Headers]
+    );
+}
+
+/// An enforced root auth binds a grandchild even when the tenant between them
+/// bound the alias without auth of its own: the grandchild cannot move the
+/// alias to another server.
+#[tokio::test]
+async fn an_auth_enforced_above_the_closest_ancestor_still_pins_the_server() {
+    use crate::domain::model::{AuthConfig, SharingMode};
+
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.auth = Some(AuthConfig {
+        plugin_type: "noop".into(),
+        sharing: SharingMode::Enforce,
+        config: None,
+    });
+    svc.create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+    // The middle tenant binds on the root's server, with no auth of its own.
+    svc.create_upstream(&test_ctx(mid), make_create_upstream_ip("svc"))
+        .await
+        .unwrap();
+
+    let mut moved = make_create_upstream_ip("svc");
+    moved.server.endpoints[0].host = "10.6.6.6".into();
+    let err = svc
+        .create_upstream(&test_ctx(leaf), moved)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+
+    // On the root's server the bind is fine.
+    svc.create_upstream(&test_ctx(leaf), make_create_upstream_ip("svc"))
+        .await
+        .unwrap();
+}
+
+/// The server that counts is the enforcing ancestor's, not the closest one's:
+/// a tenant in between that shadows the alias elsewhere with nothing to share
+/// is invisible to its descendants and skipped by the merge.
+#[tokio::test]
+async fn an_enforced_auth_pins_bindings_to_the_enforcing_ancestors_server() {
+    use crate::domain::model::{AuthConfig, SharingMode};
+
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+    let auth = |sharing| AuthConfig {
+        plugin_type: "noop".into(),
+        sharing,
+        config: None,
+    };
+
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.auth = Some(auth(SharingMode::Inherit));
+    let root_up = svc
+        .create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+    // The middle tenant shadows on another server and shares nothing.
+    let mut mid_req = make_create_upstream_ip("svc");
+    mid_req.server.endpoints[0].host = "10.0.0.2".into();
+    svc.create_upstream(&test_ctx(mid), mid_req).await.unwrap();
+    // The root enforces its auth afterwards.
+    let mut enforce = make_update_from_upstream(&root_up);
+    enforce.auth = Some(auth(SharingMode::Enforce));
+    svc.update_upstream(&test_ctx(root), root_up.id, enforce)
+        .await
+        .unwrap();
+
+    let mut on_mid_server = make_create_upstream_ip("svc");
+    on_mid_server.server.endpoints[0].host = "10.0.0.2".into();
+    let err = svc
+        .create_upstream(&test_ctx(leaf), on_mid_server)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    svc.create_upstream(&test_ctx(leaf), make_create_upstream_ip("svc"))
+        .await
+        .unwrap();
+}
+
+/// Under an enforced auth a binding is checked against the enforcing
+/// ancestor's endpoints: a subset is fine, an extra endpoint is not.
+#[tokio::test]
+async fn an_enforced_auth_allows_bindings_on_part_of_its_endpoints() {
+    use crate::domain::model::{AuthConfig, SharingMode};
+
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let svc = make_service_with_resolver(resolver);
+
+    let two = |hosts: &[&str]| {
+        let mut req = make_create_upstream_ip("svc");
+        req.server.endpoints = hosts
+            .iter()
+            .map(|h| Endpoint {
+                scheme: Scheme::Https,
+                host: (*h).into(),
+                port: 443,
+            })
+            .collect();
+        req
+    };
+    let mut root_req = two(&["10.0.0.1", "10.0.0.2"]);
+    root_req.auth = Some(AuthConfig {
+        plugin_type: "noop".into(),
+        sharing: SharingMode::Enforce,
+        config: None,
+    });
+    svc.create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+
+    let err = svc
+        .create_upstream(&test_ctx(child), two(&["10.0.0.2", "10.6.6.6"]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    svc.create_upstream(&test_ctx(child), two(&["10.0.0.2"]))
+        .await
+        .unwrap();
+}
+
+/// On the proxy path every withheld credential is counted, and each binding
+/// warns at most once a minute; the SDK's resolve reports nothing.
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn withheld_credentials_are_counted_and_warned_once() {
+    use crate::domain::model::{AuthConfig, SharingMode};
+    use crate::domain::ports::metric_labels::withheld_outcome;
+    use crate::domain::test_support::ProvisioningMetrics;
+
+    let (root, child) = (Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![TenantId(root), TenantId(child)]);
+    let metrics = Arc::new(ProvisioningMetrics::default());
+    let svc = make_service_with_resolver(resolver).with_metrics(metrics.clone());
+
+    let mut root_req = make_create_upstream_ip("svc");
+    root_req.auth = Some(AuthConfig {
+        plugin_type: "noop".into(),
+        sharing: SharingMode::Inherit,
+        config: None,
+    });
+    let root_up = svc
+        .create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+    svc.create_route(&test_ctx(root), make_create_route(root_up.id))
+        .await
+        .unwrap();
+    let mut child_req = make_create_upstream_ip("svc");
+    child_req.server.endpoints[0].host = "10.6.6.6".into();
+    svc.create_upstream(&test_ctx(child), child_req)
+        .await
+        .unwrap();
+
+    let (method, path) = ("POST", "/v1/chat/completions");
+    for _ in 0..2 {
+        let (effective, _) = svc
+            .resolve_proxy_target(&test_ctx(child), "svc", method, path, Tags::Skip)
+            .await
+            .unwrap();
+        assert!(effective.auth.is_none());
+    }
+    svc.resolve_proxy_target(&test_ctx(child), "svc", method, path, Tags::Load)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *metrics.withheld.lock().unwrap(),
+        vec![
+            ("svc".to_owned(), withheld_outcome::DROPPED_AUTH),
+            ("svc".to_owned(), withheld_outcome::DROPPED_AUTH),
+        ]
+    );
+    logs_assert(|lines: &[&str]| {
+        match lines
+            .iter()
+            .filter(|l| l.contains("ancestor auth dropped"))
+            .count()
+        {
+            1 => Ok(()),
+            n => Err(format!("expected one warning, got {n}")),
+        }
+    });
+}
+
+/// A full warning log keeps the quiet windows it has: a binding that warned
+/// stays quiet, and a new one waits for a slot.
+#[test]
+fn a_full_withheld_log_keeps_its_quiet_windows() {
+    use super::merge::{Withheld, WithheldKind};
+    use super::withheld::WithheldLog;
+
+    let log = WithheldLog::default();
+    let withheld = |owner_id| Withheld {
+        owner_id,
+        upstream_id: Uuid::nil(),
+        alias: "svc".into(),
+        kind: WithheldKind::Auth,
+    };
+    let first = withheld(Uuid::new_v4());
+    assert!(log.warns(&first));
+    for _ in 1..1024 {
+        assert!(log.warns(&withheld(Uuid::new_v4())));
+    }
+    assert!(!log.warns(&withheld(Uuid::new_v4())), "no free slot");
+    assert!(!log.warns(&first), "still quiet");
+}
+
+/// A disabled ancestor is not in the proxy merge, so its enforced auth does
+/// not decide where a binding may go.
+#[tokio::test]
+async fn a_disabled_ancestors_enforced_auth_does_not_pin_bindings() {
+    use crate::domain::model::{AuthConfig, SharingMode};
+
+    let (root, mid, leaf) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+    let resolver = MockTenantResolverClient::with_hierarchy(vec![
+        TenantId(root),
+        TenantId(mid),
+        TenantId(leaf),
+    ]);
+    let svc = make_service_with_resolver(resolver);
+    let auth = |sharing| AuthConfig {
+        plugin_type: "noop".into(),
+        sharing,
+        config: None,
+    };
+    let at = |host: &str| {
+        let mut req = make_create_upstream_ip("svc");
+        req.server.endpoints[0].host = host.into();
+        req
+    };
+
+    let mut root_req = at("10.0.0.1");
+    root_req.auth = Some(auth(SharingMode::Inherit));
+    let root_up = svc
+        .create_upstream(&test_ctx(root), root_req)
+        .await
+        .unwrap();
+    let mut mid_req = at("10.0.0.2");
+    mid_req.auth = Some(auth(SharingMode::Enforce));
+    svc.create_upstream(&test_ctx(mid), mid_req).await.unwrap();
+    // The root enforces its auth afterwards, and is disabled.
+    let mut update = make_update_from_upstream(&root_up);
+    update.auth = Some(auth(SharingMode::Enforce));
+    update.enabled = false;
+    svc.update_upstream(&test_ctx(root), root_up.id, update)
+        .await
+        .unwrap();
+
+    let err = svc
+        .create_upstream(&test_ctx(leaf), at("10.0.0.1"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DomainError::Validation { .. }), "{err:?}");
+    svc.create_upstream(&test_ctx(leaf), at("10.0.0.2"))
+        .await
+        .unwrap();
 }

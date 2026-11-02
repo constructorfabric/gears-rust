@@ -415,7 +415,7 @@ Multi-tenant hierarchy with sharing modes (`private`/`inherit`/`enforce`) per co
 
 | Field | Merge Strategy |
 |---|---|
-| Auth | Override if `inherit`; forced if `enforce` |
+| Auth | Override if `inherit`; forced if `enforce`; never sent to endpoints its owner did not configure |
 | Rate Limits | `min(ancestor, descendant)` — stricter always wins |
 | Plugins | Concatenate: `ancestor.plugins + descendant.plugins` |
 | CORS | Union origins if `inherit`; forced if `enforce` |
@@ -423,6 +423,10 @@ Multi-tenant hierarchy with sharing modes (`private`/`inherit`/`enforce`) per co
 Tags do not have a sharing mode — they always use add-only union semantics: `effective_tags = union(ancestor_tags, descendant_tags)`. Descendants cannot remove inherited tags.
 
 Alias resolution walks tenant hierarchy from descendant to root; closest match wins (shadowing). Enforced ancestor constraints are never bypassed by shadowing.
+
+An ancestor's auth and headers are sent only to endpoints their owner configured, the upstream that set them. A descendant that shadows the alias keeps them only if each of its endpoints is one of the owner's (same host, port and scheme; a subset is fine, an extra endpoint is not). Otherwise it uses its own auth and headers, or none. If the auth in effect is `enforce`, binding the alias to endpoints its owner does not list is rejected, and a proxy request through such a binding fails with `PermissionDenied` (reason `ENFORCED_AUTH_OTHER_SERVER`).
+
+Changes on the owner's side are checked at proxy time, not at write time, so they affect existing descendant bindings: removing an endpoint a descendant uses, changing its port, moving it from `http` to `https` (the key does not follow a binding left on plaintext), or switching the auth to `enforce` makes those descendants send without the owner's auth and headers, or get 403. Adding an endpoint affects no one. Every withheld credential on the proxy path is counted in `{prefix}_credentials_withheld_total` (`outcome`: `dropped_auth`, `dropped_headers`, `enforced_refused`) and logged as a warning with the owner's and the descendant's upstream ids, at most once a minute per binding.
 
 #### Alias Resolution
 
@@ -943,6 +947,7 @@ Prometheus metrics at `/metrics` (admin-only):
 **Registry Provisioning Metrics** ([ADR: Optional Persistence](./ADR/0018-optional-persistence.md#provisioning-from-the-types-registry)):
 - `oagw_registry_provisioning_failures_total{kind, reason}` — counter (a registry instance the reconcile skipped, or a dropped upstream it kept; `kind`: `upstream`, `route`; `reason`: `invalid_instance`, `invalid_request`, `duplicate_alias`, `unknown_upstream`, `overlapping_registry_routes`, `id_held_by_api`, `conflict`, `validation`, `not_found`, `forbidden`, `secret_not_accessible`, `registry_managed`, `plugin`, `unexpected`, `alias_cycle`, `path_cycle`, `kept_in_use`)
 - `oagw_registry_provisioning_runs_total{outcome}` — counter (`up_to_date`, `stale`, `clean`, `not_clean`, `failed`; a run stopped by shutdown, or cancelled while waiting for the lease, counts as `not_clean`)
+- `oagw_credentials_withheld_total{host, outcome}` — counter (`dropped_auth`, `dropped_headers`, `enforced_refused`): an ancestor's auth or headers not sent because the resolved upstream serves the alias on endpoints their owner did not configure (proxy path only)
 
 **Upstream Health Metrics**:
 - `oagw_upstream_available{host, endpoint}` — gauge (0=down, 1=up)

@@ -1072,3 +1072,7 @@ mod tests {
         assert!(selector.0.lock().unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "shadowing_tests.rs"]
+mod shadowing_tests;
