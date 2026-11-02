@@ -57,6 +57,9 @@ Matrix jobs with OS legs route the Linux leg only:
   `windows-latest` under every event and with the kill switch on.
 - **`code-ranker.yml`** calls an external reusable workflow that picks its own
   runner.
+- **`scorecard.yml`** stays on `ubuntu-latest`: `ossf/scorecard-action` with
+  `publish_results: true` accepts results only from a GitHub-hosted Ubuntu
+  runner, and a rejected publish only warns.
 
 ## Caches
 
