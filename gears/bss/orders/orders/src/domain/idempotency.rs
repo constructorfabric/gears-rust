@@ -348,7 +348,7 @@ pub fn authorization_fact_fingerprint(
     let mut preimage = AUTHORIZATION_FACTS_TAG.as_bytes().to_vec();
     preimage.push(0x1f);
     preimage.extend(canonical(&document)?.as_bytes());
-    let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, &preimage);
+    let digest = toolkit_security::crypto::hash::Sha256::digest(&preimage);
     let mut hex = String::with_capacity(AUTHORIZATION_FACTS_PREFIX.len() + 64);
     hex.push_str(AUTHORIZATION_FACTS_PREFIX);
     for byte in digest.as_ref() {
