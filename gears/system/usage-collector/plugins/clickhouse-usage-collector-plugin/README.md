@@ -159,7 +159,7 @@ Setting `cluster` switches the plugin from a self-provisioned single node to a s
 gears:
   clickhouse-usage-collector-plugin:
     config:
-      database_url: "https://user:${CH_PASSWORD}@ch-node:8443/usage"
+      database_url: "https://user:${CH_PASSWORD}@ch-lb:8443/usage"  # a load balancer over the nodes
       async_insert: false          # required in cluster mode
       cluster:
         name: "usage_cluster"      # from remote_servers
@@ -169,14 +169,17 @@ gears:
 
 **Layout.** `usage_records` and `usage_type_catalog` are `Distributed` tables. Behind them are shard-local `ReplicatedReplacingMergeTree` tables, `usage_records_local` and `usage_type_catalog_local`. `usage_records` is sharded by `cityHash64(tenant_id)` and `usage_type_catalog` by `cityHash64(gts_id)`. The tenant sharding key is required, not a tuning choice: a deactivation marker clones the row it marks, so the two always land on the same shard. That is what lets the plugin run the `id NOT IN (SELECT id … 'inactive')` anti-join of `list` and `aggregate` shard-locally (`distributed_product_mode = 'local'`).
 
-**Prerequisites (both modes).** On every node, configure the cluster in `remote_servers`, ClickHouse Keeper (`zookeeper`), and the `{shard}` / `{replica}` `macros`, then create the target database `ON CLUSTER`.
+**Prerequisites (both modes).** On every node, configure the cluster in `remote_servers`, ClickHouse Keeper (`zookeeper`), and the `{shard}` / `{replica}` `macros`, then create the target database `ON CLUSTER`. In addition:
+- point `database_url` at a load balancer or proxy over the nodes, not at a single node: the plugin tolerates an unreachable replica only if it can still reach some node;
+- set `internal_replication = true` for every shard in `remote_servers`, so that a `Distributed` insert goes to one replica of the shard and replication copies it to the others;
+- configure `insert_quorum: auto` only for three or more replicas per shard. `auto` means a majority of the shard's replicas, so with two replicas it needs both, and every insert fails with `TOO_FEW_LIVE_REPLICAS` while one of them is down.
 
 **Provisioning by the operator (default).**
 1. Configure `cluster` and start the plugin. With the tables missing, startup fails, and the error ends with the cluster DDL for your configured cluster name, local table names and retention (`migrator::render_ddl`: every migration step's DDL, rendered for the cluster).
 2. Run that DDL once on any node in the target database (`clickhouse-client --database <db> --multiquery`). Its statements are `ON CLUSTER`, so this creates all four tables on every node.
 3. Start the plugin again.
 
-**Provisioning by the plugin (`manage_schema: true`).** Start the plugin. It runs the migration steps, which execute the same DDL, then reconciles the TTL `ON CLUSTER`. Each statement is bounded by `migration_statement_timeout_secs`, which also sets how long the server waits for every host to run an `ON CLUSTER` statement (`distributed_ddl_task_timeout`). The plugin's user then needs `CREATE TABLE`, `ALTER`, `INSERT` and `SELECT` on the plugin's tables and the `CLUSTER` privilege.
+**Provisioning by the plugin (`manage_schema: true`).** Start the plugin. It runs the migration steps, which execute the same DDL, then reconciles the TTL `ON CLUSTER`. Each statement is bounded by `migration_statement_timeout_secs`, which also sets how long the server waits for every host to run an `ON CLUSTER` statement (`distributed_ddl_task_timeout`). Once the schema is up to date, startup issues no `ON CLUSTER` statement, so an unreachable host does not delay it. A pending statement waits only for the hosts ClickHouse Keeper reports active (`distributed_ddl_output_mode = 'throw_only_active'`): a host that has just gone down holds it until Keeper expires that host's session (`session_timeout_ms`, 30 s by default), and a failure on an active host still fails startup. A host that was down runs the statement from the DDL queue when it returns. Replicated tables also catch up on `ALTER`s through Keeper replication, but `CREATE TABLE` depends on the DDL queue alone, whose entries expire after `task_max_lifetime` (7 days by default). A host that comes back after that lacks the new tables: startup validation then names it, and the operator applies the DDL the error prints. The plugin's user then needs `CREATE TABLE`, `ALTER`, `INSERT` and `SELECT` on the plugin's tables and the `CLUSTER` privilege.
 
 The integration suite (`tests/cluster_integration_ch.rs`) covers both paths, and both use this same DDL.
 
@@ -184,15 +187,18 @@ The integration suite (`tests/cluster_integration_ch.rs`) covers both paths, and
 
 **Startup validation.** The plugin refuses to start, listing every problem, when:
 - the cluster is not declared in `system.clusters`;
-- any of the four tables is missing on any replica (checked through `clusterAllReplicas`, so an unreachable replica also fails startup);
+- any of the four tables is missing on a reachable replica (checked through `clusterAllReplicas`);
 - a local table is not `ReplicatedReplacingMergeTree` or has a different `ORDER BY` or `PARTITION BY`;
 - a `Distributed` table targets another cluster, database or local table, or uses another sharding key.
+
+Unreachable replicas do not prevent startup, so a plugin pod can restart during a rolling ClickHouse upgrade. The plugin logs a warning and checks those replicas on the next start that reaches them. If every replica of a shard is unreachable, it logs a second warning and starts anyway: requests that need that shard fail with a retryable `Transient` error (`ALL_CONNECTION_TRIES_FAILED`) until a replica is back, and tenants on the other shards keep working.
 
 With an operator-provisioned schema, a `usage_records` TTL that differs from `retention_period_secs` only produces a warning; change it with `ALTER TABLE usage_records_local ON CLUSTER … MODIFY TTL`. With `manage_schema`, the plugin runs that `ALTER` itself. The single-node migration steps never run in cluster mode.
 
 **What the plugin sends.** Every request carries:
 - `distributed_product_mode = 'local'`;
 - `optimize_skip_unused_shards = 1`, so tenant-pinned reads touch one shard;
+- `skip_unavailable_shards = 0`, pinned so that a request needing an unreachable shard fails as a retryable `Transient` error instead of returning a partial result, even if a server settings profile enables the setting;
 - `distributed_foreground_insert = 1`, so an `INSERT` returns only after the owning shard committed it and the `insert_deduplication_token` is enforced by the replicated table's `replicated_deduplication_window`;
 - `insert_quorum`, when configured.
 
@@ -200,7 +206,7 @@ With an operator-provisioned schema, a `usage_records` TTL that differs from `re
 
 **Mutations.** `delete_usage_type` and its orphan sweep run `ALTER TABLE <local> ON CLUSTER <name> DELETE WHERE gts_id = ?` with `mutations_sync = 2`, waiting for every replica, because ClickHouse refuses mutations on a `Distributed` table. The plugin's database user therefore needs `ALTER DELETE` on the local tables and the `CLUSTER` privilege, besides `SELECT` and `INSERT` on all four tables.
 
-**Consistency.** A read through a `Distributed` table may be served by a replica that has not yet fetched a just-committed part, so read-your-writes across replicas is bounded by replication lag (ADR-0006 accepts this). That includes the dedup pre-read of a retried create. The insert dedup token still drops an exact retry, because dedup is coordinated through Keeper. Set `insert_quorum` (for example `auto`) to acknowledge an insert only once a quorum of the shard's replicas has it. This narrows the window at a write-latency cost.
+**Consistency.** A read through a `Distributed` table may be served by a replica that has not yet fetched a just-committed part, so read-your-writes across replicas is bounded by replication lag (ADR-0006 accepts this). That includes the dedup pre-read of a retried create. The insert dedup token still drops an exact retry, because dedup is coordinated through Keeper. Set `insert_quorum` (for example `auto`, with three or more replicas per shard; see the prerequisites above) to acknowledge an insert only once a quorum of the shard's replicas has it. This narrows the window at a write-latency cost.
 
 ## Storage semantics
 

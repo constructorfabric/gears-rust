@@ -14,6 +14,7 @@
 //!   dedup window onto tables created before the migration carried it (the
 //!   body of the single-node `m0002_insert_dedup_window` step).
 //! - [`validate_cluster_schema`] — checks the cluster schema at startup.
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -628,6 +629,54 @@ pub(crate) struct SystemTableRow {
     pub create_table_query: String,
 }
 
+/// How many of the plugin's tables one reachable cluster host has, as the
+/// `clusterAllReplicas` probe of [`validate_cluster_schema`] reports it.
+#[derive(Debug, Clone, clickhouse::Row, serde::Deserialize)]
+#[cfg_attr(test, derive(serde::Serialize))]
+pub(crate) struct HostTablesRow {
+    /// The host's `{shard}` macro.
+    pub shard: String,
+    pub host: String,
+    pub tables: u64,
+}
+
+/// Warn about cluster replicas the schema probe did not reach (`hosts` are the
+/// ones it did, out of `replicas` over `shards` declared in `system.clusters`),
+/// and separately about shards none of whose replicas answered: requests that
+/// need such a shard fail as `Transient` (`ALL_CONNECTION_TRIES_FAILED`) until
+/// a replica is back, while the other shards keep serving.
+fn warn_on_unreachable_replicas(
+    hosts: &[HostTablesRow],
+    replicas: u64,
+    shards: u64,
+    cluster: &str,
+) {
+    let reached = hosts.len() as u64;
+    if reached >= replicas {
+        return;
+    }
+    tracing::warn!(
+        cluster,
+        reached,
+        replicas,
+        "some cluster replicas are unreachable; their schema was not checked"
+    );
+    let live_shards = hosts
+        .iter()
+        .map(|h| h.shard.as_str())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    if live_shards < shards {
+        tracing::warn!(
+            cluster,
+            live_shards,
+            shards,
+            "some cluster shards have no reachable replica; requests that need them fail \
+             as Transient until a replica is back"
+        );
+    }
+}
+
 /// Drop all whitespace so `ClickHouse`'s formatting of a key expression
 /// (`gts_id, tenant_id`) compares equal to the canonical form (`gts_id,tenant_id`).
 fn squash(s: &str) -> String {
@@ -814,10 +863,15 @@ pub(crate) async fn timed<T>(
 /// * a table is missing or has the wrong engine, sort key, partition key, or
 ///   `Distributed` target / sharding key, or a local table's engine lacks the
 ///   `version` column ([`check_cluster_schema`]);
-/// * any replica of the cluster lacks one of the four tables — the plugin
-///   may be pointed at any node, and an `ON CLUSTER` mutation needs the local
-///   tables everywhere. An unreachable replica fails this probe too, which is
-///   the right default for a deployment check.
+/// * a reachable replica of the cluster lacks one of the four tables — the
+///   plugin may be pointed at any node, and an `ON CLUSTER` mutation needs
+///   the local tables everywhere.
+///
+/// Unreachable replicas, even every replica of a shard, are only warned about
+/// ([`warn_on_unreachable_replicas`]): the cluster keeps serving the tenants of
+/// the other shards, and a plugin pod that restarts during a rolling
+/// `ClickHouse` upgrade must still start. Their schema is checked on the
+/// next start that reaches them.
 ///
 /// A `usage_records` TTL that differs from `retention_period_secs` is only
 /// warned about: reconciling it would be DDL (the managed path reconciles it
@@ -850,11 +904,11 @@ pub async fn validate_cluster_schema(
     )
     .await?;
 
-    let replicas: u64 = timed(
+    let (replicas, shards): (u64, u64) = timed(
         deadline,
         "reading system.clusters",
         client
-            .query("SELECT count() FROM system.clusters WHERE cluster = ?")
+            .query("SELECT count(), uniqExact(shard_num) FROM system.clusters WHERE cluster = ?")
             .bind(cluster)
             .fetch_one(),
     )
@@ -891,32 +945,41 @@ pub async fn validate_cluster_schema(
 
     let mut problems = check_cluster_schema(&rows, topology, &database);
 
-    // `cluster` is a validated plain identifier (`ClickHouseClusterConfig::validate`),
-    // so interpolating it into the table-function argument is safe.
-    let present: u64 = timed(
+    // One row per reachable host. `countIf` rather than `WHERE` keeps a host
+    // that has none of the tables in the result. `skip_unavailable_shards`
+    // applies to this probe only: on the request path it would turn an
+    // unreachable shard into a silently partial result
+    // (`Topology::client_settings` pins it off). `cluster` is a validated
+    // plain identifier (`ClickHouseClusterConfig::validate`), so interpolating
+    // it into the table-function argument is safe.
+    let hosts: Vec<HostTablesRow> = timed(
         deadline,
         "reading system.tables across the cluster",
         client
             .query(&format!(
-                "SELECT count() FROM clusterAllReplicas('{cluster}', system.tables) \
-                 WHERE database = ? AND name IN (?, ?, ?, ?)"
+                "SELECT getMacro('shard') AS shard, hostName() AS host, \
+                 countIf(database = ? AND name IN (?, ?, ?, ?)) AS tables \
+                 FROM clusterAllReplicas('{cluster}', system.tables) \
+                 GROUP BY shard, host ORDER BY shard, host \
+                 SETTINGS skip_unavailable_shards = 1"
             ))
             .bind(&database)
             .bind(names[0])
             .bind(names[1])
             .bind(names[2])
             .bind(names[3])
-            .fetch_one(),
+            .fetch_all(),
     )
     .await?;
-    // Four tables (`names`) per replica.
-    let expected = replicas.saturating_mul(4);
-    if present != expected {
+    let expected = names.len() as u64;
+    for h in hosts.iter().filter(|h| h.tables != expected) {
         problems.push(format!(
-            "only {present} of {expected} expected tables exist across the {replicas} replicas \
-             of cluster `{cluster}`; create them with ON CLUSTER"
+            "only {} of {expected} tables exist on host `{}` (shard `{}`) of cluster \
+             `{cluster}`; create them with ON CLUSTER",
+            h.tables, h.host, h.shard
         ));
     }
+    warn_on_unreachable_replicas(&hosts, replicas, shards, cluster);
 
     if !problems.is_empty() {
         let ddl = match migrator::render_ddl(topology, retention_period_secs).await {

@@ -8,7 +8,7 @@
 
 use clickhouse::test::{Mock, handlers};
 
-use crate::infra::storage::pool::SystemTableRow;
+use crate::infra::storage::pool::{HostTablesRow, SystemTableRow};
 use crate::infra::storage::topology::Topology;
 
 /// A client whose every request goes to `mock`.
@@ -132,13 +132,34 @@ pub fn good_cluster_rows() -> Vec<SystemTableRow> {
     ]
 }
 
-/// Queue the four `validate_cluster_schema` probes for a usable cluster of
-/// `replicas` replicas in database `db` whose records TTL is `ttl_secs`.
-pub fn valid_cluster_probes(mock: &Mock, replicas: u64, ttl_secs: u64) {
+/// One host row of the `clusterAllReplicas` probe: `host` of shard `shard`
+/// holding `tables` of the plugin's four tables.
+pub fn host(shard: &str, host: &str, tables: u64) -> HostTablesRow {
+    HostTablesRow {
+        shard: shard.to_owned(),
+        host: host.to_owned(),
+        tables,
+    }
+}
+
+/// Queue the `validate_cluster_schema` probes up to the per-host one: database
+/// `db`, a cluster of `replicas` replicas over `shards` shards, and the
+/// connected node's tables with a records TTL of `ttl_secs`.
+pub fn cluster_probes_before_hosts(mock: &Mock, replicas: u64, shards: u64, ttl_secs: u64) {
     let mut tables = good_cluster_rows();
     tables[0].create_table_query = create_sql(&ttl(ttl_secs), None);
     rows(mock, ["db".to_owned()]);
-    rows(mock, [replicas]);
+    rows(mock, [(replicas, shards)]);
     rows(mock, tables);
-    rows(mock, [replicas * 4]);
+}
+
+/// Queue the four `validate_cluster_schema` probes for a usable single-shard
+/// cluster of `replicas` reachable replicas in database `db` whose records
+/// TTL is `ttl_secs`.
+pub fn valid_cluster_probes(mock: &Mock, replicas: u64, ttl_secs: u64) {
+    cluster_probes_before_hosts(mock, replicas, 1, ttl_secs);
+    rows(
+        mock,
+        (0..replicas).map(|i| host("01", &format!("ch{i}"), 4)),
+    );
 }

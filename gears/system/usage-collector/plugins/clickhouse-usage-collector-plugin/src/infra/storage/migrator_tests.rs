@@ -106,7 +106,7 @@ fn cluster_tracker_is_replicated_to_every_host() {
 // `clickhouse::test::Mock` serves one queued answer per request, in order, and
 // fails the test on an extra request or an unused answer, so each test pins
 // the exact statement sequence of a run. A fresh single-node run is: tracker
-// DDL, read of the recorded steps, then per step its statements followed by
+// probe, tracker DDL, read of the recorded steps, then per step its statements followed by
 // the tracker `INSERT`.
 
 mod mocked {
@@ -130,9 +130,20 @@ mod mocked {
         rows(mock, names.iter().map(|n| (*n).to_owned()));
     }
 
+    /// Answer the tracker probe: the connected node lacks the table.
+    fn tracker_missing(mock: &Mock) {
+        rows(mock, [0_u64]);
+    }
+
+    /// Answer the tracker probe: the connected node has the table.
+    fn tracker_present(mock: &Mock) {
+        rows(mock, [1_u64]);
+    }
+
     #[tokio::test]
     async fn a_fresh_single_node_runs_and_records_every_step() {
         let mock = Mock::new();
+        tracker_missing(&mock);
         let tracker = capture(&mock);
         recorded(&mock, &[]);
         let catalog = capture(&mock);
@@ -159,11 +170,11 @@ mod mocked {
         assert!(second.query().await.contains("'m0002_insert_dedup_window'"));
     }
 
-    /// Nothing pending: the tracker DDL and the read are the whole run.
+    /// Nothing pending: the tracker probe and the read are the whole run.
     #[tokio::test]
     async fn an_up_to_date_schema_runs_nothing() {
         let mock = Mock::new();
-        ok(&mock);
+        tracker_present(&mock);
         recorded(&mock, &migration_names());
 
         let ran = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
@@ -178,7 +189,7 @@ mod mocked {
     #[tokio::test]
     async fn only_the_pending_steps_run() {
         let mock = Mock::new();
-        ok(&mock);
+        tracker_present(&mock);
         recorded(&mock, &["m0001_init"]);
         rows(&mock, [create_sql("", None)]);
         let alter = capture(&mock);
@@ -203,6 +214,7 @@ mod mocked {
     #[tokio::test]
     async fn a_fresh_cluster_runs_every_step_on_cluster() {
         let mock = Mock::new();
+        tracker_missing(&mock);
         let tracker = capture(&mock);
         recorded(&mock, &[]);
         // m0001: a local and a Distributed table per logical table.
@@ -228,9 +240,40 @@ mod mocked {
         }
     }
 
+    /// An up-to-date cluster sends no `ON CLUSTER` statement, so startup does
+    /// not wait on every host: the mock fails the test on any extra request.
+    #[tokio::test]
+    async fn an_up_to_date_cluster_sends_no_ddl() {
+        let mock = Mock::new();
+        tracker_present(&mock);
+        recorded(&mock, &migration_names());
+
+        let ran = run_migrations(&client(&mock), &cluster_topology(), OPTS, DEADLINE)
+            .await
+            .expect("an up-to-date cluster is a no-op");
+
+        assert!(ran.is_empty(), "{ran:?}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_tracker_probe_fails_the_run() {
+        let mock = Mock::new();
+        fail(&mock);
+
+        let err = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
+            .await
+            .expect_err("no probe, no run");
+
+        assert!(
+            format!("{err:#}").contains("probing the migration tracking table failed"),
+            "{err:#}"
+        );
+    }
+
     #[tokio::test]
     async fn a_tracker_that_cannot_be_created_fails_the_run() {
         let mock = Mock::new();
+        tracker_missing(&mock);
         fail(&mock);
 
         let err = run_migrations(&client(&mock), &Topology::SingleNode, OPTS, DEADLINE)
@@ -246,6 +289,7 @@ mod mocked {
     #[tokio::test]
     async fn a_failing_step_is_named_and_not_recorded() {
         let mock = Mock::new();
+        tracker_missing(&mock);
         ok(&mock);
         recorded(&mock, &[]);
         fail(&mock);
@@ -263,6 +307,7 @@ mod mocked {
     #[tokio::test]
     async fn a_step_that_cannot_be_recorded_fails_the_run() {
         let mock = Mock::new();
+        tracker_missing(&mock);
         ok(&mock);
         recorded(&mock, &[]);
         ok(&mock);
@@ -329,25 +374,32 @@ mod live {
             .expect("tracking table is readable")
     }
 
-    /// Every timeout the migration budget must cover reaches the server; a
-    /// misspelt setting name would be rejected here rather than silently
-    /// leave `ON CLUSTER` DDL on the 180 s default.
+    /// Every timeout the migration budget must cover, and the output mode
+    /// that skips inactive hosts, reach the server; a misspelt setting name
+    /// would be rejected here rather than silently leave `ON CLUSTER` DDL on
+    /// the 180 s default or waiting on a dead host.
     #[tokio::test]
     #[ignore = "requires Docker (testcontainers)"]
     async fn migration_client_raises_every_server_timeout() {
         let client = migration_client(&fresh_client().await, 1234);
-        let got: (String, String, String) = client
+        let got: (String, String, String, String) = client
             .query(
                 "SELECT toString(getSetting('send_timeout')), \
                         toString(getSetting('receive_timeout')), \
-                        toString(getSetting('distributed_ddl_task_timeout'))",
+                        toString(getSetting('distributed_ddl_task_timeout')), \
+                        toString(getSetting('distributed_ddl_output_mode'))",
             )
             .fetch_one()
             .await
             .expect("reading the effective settings");
         assert_eq!(
             got,
-            ("1234".to_owned(), "1234".to_owned(), "1234".to_owned())
+            (
+                "1234".to_owned(),
+                "1234".to_owned(),
+                "1234".to_owned(),
+                "throw_only_active".to_owned()
+            )
         );
     }
 

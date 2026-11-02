@@ -44,7 +44,7 @@ use clickhouse_usage_collector_plugin::infra::storage::migrator::{
     MIGRATIONS_TRACKER, MigrationOptions, migration_client, render_ddl, run_migrations,
 };
 use clickhouse_usage_collector_plugin::infra::storage::pool::{
-    build_client, validate_cluster_schema,
+    build_client, ensure_retention_ttl, validate_cluster_schema,
 };
 use clickhouse_usage_collector_plugin::infra::storage::record_store::ChRecordStore;
 use clickhouse_usage_collector_plugin::infra::storage::topology::Topology;
@@ -62,7 +62,7 @@ const BOOT_BUDGET: Duration = Duration::from_secs(240);
 
 /// A running two-shard cluster. Dropping it removes both containers.
 struct Cluster {
-    _nodes: Vec<ContainerAsync<GenericImage>>,
+    nodes: Vec<ContainerAsync<GenericImage>>,
     /// Host port of node 1's HTTP interface.
     port: u16,
 }
@@ -179,10 +179,7 @@ async fn boot(provision: bool) -> anyhow::Result<Cluster> {
             .await
             .map_err(|e| anyhow::anyhow!("reference cluster DDL failed: {e}\n{stmt}"))?;
     }
-    Ok(Cluster {
-        _nodes: nodes,
-        port,
-    })
+    Ok(Cluster { nodes, port })
 }
 
 /// Boot a cluster provisioned from the reference DDL, or skip (return
@@ -552,7 +549,7 @@ async fn ch_cluster_validation_rejects_a_deviating_schema() {
     .expect_err("a missing local table must be refused")
     .to_string();
     assert!(err.contains("usage_type_catalog_local"), "{err}");
-    assert!(err.contains("expected tables exist across"), "{err}");
+    assert!(err.contains("of 4 tables exist on host"), "{err}");
 
     // An undeclared cluster name fails before any table probe.
     let mut wrong = cfg.clone();
@@ -629,6 +626,62 @@ async fn ch_cluster_managed_schema_provisions_a_bare_cluster() {
     ingest_sixteen_tenants(&records).await;
     let shards = rows_per_shard(&client, "usage_records_local").await;
     assert_eq!(shards.len(), 2, "both shards hold rows: {shards:?}");
+}
+
+/// A node down, here its shard's only replica as during a rolling upgrade,
+/// does not hold startup of an up-to-date managed cluster: the migrations
+/// issue no `ON CLUSTER` statement, which would wait out the whole 120 s
+/// migration budget, and validation only warns about the node. A statement
+/// that does run `ON CLUSTER` (a retention change) skips the node once
+/// Keeper reports it inactive.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_starts_with_a_node_down() {
+    let Some(cluster) = boot_bare_or_skip().await else {
+        return;
+    };
+    let cfg = managed_config(&cluster);
+    let (client, _records, _catalog) = stores(&cfg);
+    migrate(&client, &cfg)
+        .await
+        .expect("managed cluster migrations");
+    assert_eq!(tracker_rows_everywhere(&client, 4).await, 4);
+
+    cluster.nodes[1].stop().await.expect("stop node 2");
+    let started = std::time::Instant::now();
+    let ran = migrate(&client, &cfg)
+        .await
+        .expect("an up-to-date cluster migrates with a node down");
+    assert!(ran.is_empty(), "nothing runs: {ran:?}");
+    validate_cluster_schema(
+        &client,
+        &Topology::from_config(&cfg),
+        cfg.retention_period_secs,
+        common::TEST_REQUEST_TIMEOUT,
+    )
+    .await
+    .expect("an unreachable node is only warned about");
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "startup waited on the down node: {:?}",
+        started.elapsed()
+    );
+
+    let cluster_cfg = cfg.cluster.as_ref().expect("cluster config");
+    let started = std::time::Instant::now();
+    ensure_retention_ttl(
+        &migration_client(&client, cluster_cfg.migration_statement_timeout_secs),
+        &Topology::from_config(&cfg),
+        86_400,
+        cluster_cfg.migration_deadline(),
+    )
+    .await
+    .expect("the TTL change skips the inactive node");
+    assert!(
+        started.elapsed() < Duration::from_secs(100),
+        "the TTL change waited out the budget on the down node: {:?}",
+        started.elapsed()
+    );
 }
 
 // ── `Gear::init` on a real cluster ───────────────────────────────────────────

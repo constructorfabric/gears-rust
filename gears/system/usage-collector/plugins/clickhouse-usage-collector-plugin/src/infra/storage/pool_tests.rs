@@ -1144,8 +1144,8 @@ mod mocked {
         validate_cluster_schema,
     };
     use crate::infra::storage::test_mock::{
-        capture, client, cluster_topology, create_sql, fail, good_cluster_rows, ok, rows, ttl,
-        valid_cluster_probes,
+        capture, client, cluster_probes_before_hosts, cluster_topology, create_sql, fail,
+        good_cluster_rows, host, ok, rows, ttl, valid_cluster_probes,
     };
     use crate::infra::storage::topology::Topology;
 
@@ -1364,7 +1364,7 @@ mod mocked {
     async fn validation_fails_when_the_cluster_is_not_declared() {
         let mock = Mock::new();
         rows(&mock, ["db".to_owned()]);
-        rows(&mock, [0_u64]);
+        rows(&mock, [(0_u64, 0_u64)]);
 
         let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
             .await
@@ -1381,9 +1381,9 @@ mod mocked {
     async fn validation_fails_with_the_problems_and_the_ddl_on_a_deviating_schema() {
         let mock = Mock::new();
         rows(&mock, ["db".to_owned()]);
-        rows(&mock, [2_u64]);
+        rows(&mock, [(2_u64, 1_u64)]);
         rows(&mock, good_cluster_rows().into_iter().skip(1));
-        rows(&mock, [8_u64]);
+        rows(&mock, [host("01", "ch0", 4), host("01", "ch1", 4)]);
 
         let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
             .await
@@ -1402,17 +1402,58 @@ mod mocked {
     #[tokio::test]
     async fn validation_fails_when_a_replica_lacks_tables() {
         let mock = Mock::new();
-        rows(&mock, ["db".to_owned()]);
-        rows(&mock, [2_u64]);
-        rows(&mock, good_cluster_rows());
-        rows(&mock, [6_u64]);
+        cluster_probes_before_hosts(&mock, 2, 1, RETENTION);
+        rows(&mock, [host("01", "ch0", 4), host("01", "ch1", 2)]);
 
         let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
             .await
             .expect_err("a replica missing tables fails startup");
 
         assert!(
-            format!("{err:#}").contains("only 6 of 8 expected tables exist across the 2 replicas"),
+            format!("{err:#}").contains("only 2 of 4 tables exist on host `ch1` (shard `01`)"),
+            "{err:#}"
+        );
+    }
+
+    /// A replica down for a rolling upgrade does not block startup; its
+    /// schema is checked on the next start that reaches it.
+    #[tokio::test]
+    async fn validation_passes_when_a_replica_is_unreachable() {
+        let mock = Mock::new();
+        cluster_probes_before_hosts(&mock, 2, 1, RETENTION);
+        rows(&mock, [host("01", "ch0", 4)]);
+
+        validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect("an unreachable replica is only warned about");
+    }
+
+    /// The tenants of the other shards keep working while a whole shard is
+    /// down, so that does not block startup either.
+    #[tokio::test]
+    async fn validation_passes_when_a_whole_shard_is_unreachable() {
+        let mock = Mock::new();
+        cluster_probes_before_hosts(&mock, 4, 2, RETENTION);
+        rows(&mock, [host("01", "ch0", 4), host("01", "ch1", 4)]);
+
+        validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect("an unreachable shard is only warned about");
+    }
+
+    /// An unreachable replica does not excuse a reachable one that deviates.
+    #[tokio::test]
+    async fn validation_fails_on_a_reachable_replica_while_another_is_unreachable() {
+        let mock = Mock::new();
+        cluster_probes_before_hosts(&mock, 3, 1, RETENTION);
+        rows(&mock, [host("01", "ch0", 4), host("01", "ch1", 3)]);
+
+        let err = validate_cluster_schema(&client(&mock), &cluster_topology(), RETENTION, DEADLINE)
+            .await
+            .expect_err("the reachable replica missing a table fails startup");
+
+        assert!(
+            format!("{err:#}").contains("only 3 of 4 tables exist on host `ch1`"),
             "{err:#}"
         );
     }

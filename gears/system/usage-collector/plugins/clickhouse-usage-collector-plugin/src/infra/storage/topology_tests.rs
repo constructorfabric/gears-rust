@@ -27,6 +27,7 @@ fn cluster_client_settings_cover_reads_and_inserts() {
     };
     assert_eq!(get("distributed_product_mode"), Some("local"));
     assert_eq!(get("optimize_skip_unused_shards"), Some("1"));
+    assert_eq!(get("skip_unavailable_shards"), Some("0"));
     assert_eq!(get("distributed_foreground_insert"), Some("1"));
     assert_eq!(get("insert_quorum"), None);
 }

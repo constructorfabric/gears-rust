@@ -169,7 +169,7 @@ async fn init_fails_at_the_migration_step_when_the_backend_is_unreachable() {
 
     let msg = format!("{err:#}");
     assert!(
-        msg.contains("migration DDL statement"),
+        msg.contains("probing the migration tracking table"),
         "the failure must come from the migration step, not from config validation \
          or the registry handshake, got: {msg}"
     );
@@ -207,7 +207,7 @@ mod mocked {
     use super::{StaticConfig, install_test_crypto_provider};
     use crate::config::ClickHousePluginConfig;
     use crate::infra::storage::migrator::migration_names;
-    use crate::infra::storage::test_mock::{create_sql, fail, ok, rows, ttl, valid_cluster_probes};
+    use crate::infra::storage::test_mock::{create_sql, fail, rows, ttl, valid_cluster_probes};
 
     const RETENTION: u64 = 31_536_000;
 
@@ -357,10 +357,10 @@ mod mocked {
         ClientScope::gts_id(&instance_id)
     }
 
-    /// An up-to-date single-node schema: tracker DDL, every step recorded,
-    /// and a TTL that already matches.
+    /// An up-to-date single-node schema: the tracker exists, every step is
+    /// recorded, and the TTL already matches.
     fn up_to_date_single_node(mock: &Mock) {
-        ok(mock);
+        rows(mock, [1_u64]);
         rows(mock, migration_names().into_iter().map(str::to_owned));
         rows(mock, [create_sql(&ttl(RETENTION), None)]);
     }
@@ -416,7 +416,7 @@ mod mocked {
     async fn init_on_a_managed_cluster_migrates_then_validates() {
         install_test_crypto_provider();
         let mock = Mock::new();
-        ok(&mock);
+        rows(&mock, [1_u64]);
         rows(&mock, migration_names().into_iter().map(str::to_owned));
         rows(&mock, [create_sql(&ttl(RETENTION), None)]);
         valid_cluster_probes(&mock, 2, RETENTION);
@@ -436,7 +436,7 @@ mod mocked {
     async fn init_fails_when_the_retention_ttl_cannot_be_reconciled() {
         install_test_crypto_provider();
         let mock = Mock::new();
-        ok(&mock);
+        rows(&mock, [1_u64]);
         rows(&mock, migration_names().into_iter().map(str::to_owned));
         fail(&mock);
 
@@ -458,7 +458,7 @@ mod mocked {
         install_test_crypto_provider();
         let mock = Mock::new();
         rows(&mock, ["db".to_owned()]);
-        rows(&mock, [0_u64]);
+        rows(&mock, [(0_u64, 0_u64)]);
 
         let err = ClickHouseUsageCollectorPlugin
             .init(&ctx(

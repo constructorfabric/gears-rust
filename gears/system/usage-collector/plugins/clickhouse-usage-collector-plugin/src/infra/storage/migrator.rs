@@ -70,12 +70,16 @@ pub struct MigrationOptions {
     pub retention_period_secs: u64,
 }
 
-/// `client` with the server-side timeouts of a cluster migration statement:
-/// `send_timeout` / `receive_timeout` for the HTTP exchange, and
+/// `client` with the server-side settings of a cluster migration statement:
+/// `send_timeout` / `receive_timeout` for the HTTP exchange,
 /// `distributed_ddl_task_timeout` for how long the initiator waits on every
 /// host of an `ON CLUSTER` query (180 s by default, which would otherwise cut
-/// the budget short). Used for every migration-time statement on a cluster:
-/// [`run_migrations`] and `pool::ensure_retention_ttl`.
+/// the budget short), and `distributed_ddl_output_mode = 'throw_only_active'`
+/// so that wait skips a host Keeper reports inactive instead of running out
+/// the budget on it. A failure on an active host is still raised. The skipped
+/// host runs the statement from the DDL queue when it returns. Used for every
+/// migration-time statement on a cluster: [`run_migrations`] and
+/// `pool::ensure_retention_ttl`.
 #[must_use]
 pub fn migration_client(
     client: &clickhouse::Client,
@@ -87,6 +91,7 @@ pub fn migration_client(
         .with_setting("send_timeout", secs.clone())
         .with_setting("receive_timeout", secs.clone())
         .with_setting("distributed_ddl_task_timeout", secs)
+        .with_setting("distributed_ddl_output_mode", "throw_only_active")
 }
 
 /// Where a step's statements go.
@@ -220,14 +225,33 @@ pub async fn render_ddl(
 }
 
 /// Create the tracking table if missing and read the recorded step names.
+///
+/// The tracker DDL runs only when the connected node lacks the table. On a
+/// cluster it is `ON CLUSTER`, which waits for every host, so an up-to-date
+/// schema must not issue it: one unreachable host would otherwise hold
+/// startup for the whole migration budget.
 async fn applied_steps(
     client: &clickhouse::Client,
     topology: &Topology,
     deadline: Duration,
 ) -> anyhow::Result<Vec<String>> {
-    exec_statement(client, &tracker_ddl(topology), deadline)
-        .await
-        .context("failed to create the migration tracking table")?;
+    let tracker_exists: u64 = timed(
+        deadline,
+        "probing the migration tracking table",
+        client
+            .query(
+                "SELECT count() FROM system.tables \
+                 WHERE database = currentDatabase() AND name = ?",
+            )
+            .bind(MIGRATIONS_TRACKER)
+            .fetch_one(),
+    )
+    .await?;
+    if tracker_exists == 0 {
+        exec_statement(client, &tracker_ddl(topology), deadline)
+            .await
+            .context("failed to create the migration tracking table")?;
+    }
     timed(
         deadline,
         "reading applied migrations",

@@ -73,6 +73,11 @@ impl Topology {
     ///   subquery (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
     /// * `optimize_skip_unused_shards = 1` — a query pinning `tenant_id`
     ///   reads only the owning shard.
+    /// * `skip_unavailable_shards = 0` — pinned so a server settings profile
+    ///   cannot turn it on: with it, an unreachable shard returns an empty
+    ///   result instead of a retryable error, so `aggregate` would sum a
+    ///   part of the data, `get` / `deactivate` would report `NotFound`, and
+    ///   the catalog existence check would reject records of a known type.
     /// * `distributed_foreground_insert = 1` — an `INSERT` into a
     ///   `Distributed` table returns only once the target shard committed it,
     ///   so errors surface to the caller and the `insert_deduplication_token`
@@ -89,6 +94,7 @@ impl Topology {
                 let mut settings = vec![
                     ("distributed_product_mode", "local".to_owned()),
                     ("optimize_skip_unused_shards", "1".to_owned()),
+                    ("skip_unavailable_shards", "0".to_owned()),
                     ("distributed_foreground_insert", "1".to_owned()),
                 ];
                 if let Some(q) = insert_quorum {
