@@ -527,6 +527,7 @@ mod tests {
     use toolkit_security::ScopeFilter;
 
     use super::*;
+    use crate::domain::settings_scope::{ScopeRefusal, SettingsOutOfScope};
 
     fn key() -> SubjectKey {
         SubjectKey {
@@ -635,5 +636,29 @@ mod tests {
             .map(ScopeFilter::property)
             .collect();
         assert_eq!(properties, [pep_properties::OWNER_TENANT_ID]);
+    }
+
+    #[test]
+    fn a_settings_read_the_platform_forbids_is_not_visible() {
+        assert!(matches!(
+            read_failure(DomainError::forbidden("refused")),
+            DomainError::NotVisible(_)
+        ));
+    }
+
+    #[test]
+    fn a_settings_read_out_of_the_policy_scope_is_not_visible() {
+        let refused = SettingsOutOfScope {
+            caller: Uuid::new_v4(),
+            caller_tenant: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            subject_id: Uuid::new_v4(),
+            refusal: ScopeRefusal::NotCovered,
+        };
+
+        assert!(matches!(
+            read_failure(DomainError::OutOfScope(refused)),
+            DomainError::NotVisible(_)
+        ));
     }
 }
