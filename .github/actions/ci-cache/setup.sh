@@ -4,7 +4,9 @@
 # Key: the read-write pair from ci-trusted when the job passed it, else the
 # runner's read-only pair (CI_CACHE_RO_*, set in the runner's environment).
 # Neither: a runner without the caches, so one notice and nothing exported.
-# An endpoint that does not answer is treated the same way, with a warning.
+# A runner with a key but no endpoint or region (a GitHub-hosted runner given
+# the read-write key) is treated the same way, and so is an endpoint that does
+# not answer, with a warning.
 #
 # Writing needs trusted=true AND the read-write pair. Read mode is enforced
 # here as well as by the key: SCCACHE_S3_RW_MODE=READ_ONLY,
@@ -48,12 +50,13 @@ if [ -z "$project" ]; then
     studio-web) project=studio ;;
   esac
 fi
-for v in endpoint region project; do
-  if [ -z "${!v}" ]; then
-    echo "::error::ci-cache: no $v (input, or CI_CACHE_$(tr '[:lower:]' '[:upper:]' <<<"$v") on the runner)"
-    exit 1
-  fi
-done
+if [ -z "$endpoint" ] || [ -z "$region" ]; then
+  uncached "::notice::ci-cache: no cache endpoint on this runner; running without the shared caches"
+fi
+if [ -z "$project" ]; then
+  echo "::error::ci-cache: no project (input, or CI_CACHE_PROJECT on the runner)"
+  exit 1
+fi
 endpoint="${endpoint%/}"
 prefix="$IN_PREFIX"
 
