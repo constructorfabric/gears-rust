@@ -67,7 +67,7 @@ The PRD requires Construct to serve a subject's profile by category to the appli
 | `admission.*` | see above | The admission rules; `trusted_connectors` lists connector identities as UUIDs |
 | `profile_category_check` | none; required with a processing identity | How the readable categories are asked: `one_call` or `per_category` |
 
-A queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout above 600 seconds, the nil UUID as processing identity, a processing identity without `profile_category_check`, an entity kind that is not a category, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a trusted connector that is not a UUID, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_` stops the gear from starting.
+A queue capacity above 100000, more than 256 workers, more than 10 reruns, more than 64 model rounds, more than 1000000 tokens per record, a model call timeout above 600 seconds, the nil UUID as processing identity, a processing identity without `profile_category_check`, an entity kind that is not a category, a confidence floor outside 0 to 1, a step cap outside 1 to 10000, a value cap outside 1 to 100000, a trusted connector that is not a UUID, or a model upstream alias that is not 1 to 63 letters, digits, `-` or `_`, starting with a letter or digit, stops the gear from starting.
 
 **Out of scope**:
 
@@ -246,7 +246,7 @@ The gear **MUST** run received records through the planner, the checks, Admissio
 
 ## 7. Non-Functional Considerations
 
-- **Security**: the caller is taken only from the platform. A named tenant is honored only when the AuthZ resolver authorizes the caller for it. Reading profiles is a permission the tenant grants per caller; Construct declares it, with its other permissions, as GTS permission instances. A caller that may not act for the subject cannot tell a missing profile from a refused one. The facts are read as Construct's processing identity, which the deployment grants graph storage's read, write, delete and type registration and the settings read, in every tenant.
+- **Security**: the caller is taken only from the platform. A named tenant is honored only when the AuthZ resolver authorizes the caller for it. Reading profiles is a permission the tenant grants per caller; Construct declares it, with its other permissions, as GTS permission instances. A caller that may not act for the subject cannot tell a missing profile from a refused one. The subject's settings are read with the caller's own context, under the caller's scope. The facts are read as Construct's processing identity, which the deployment grants graph storage's read, write, delete and type registration in every tenant, and the settings read that record processing needs.
 - **Privacy**: the answer is marked `no-store`, with the security headers above. No log line holds a value; the read event names categories only.
 - **Reliability**: the queue is bounded; a full queue refuses the record with `503`, and intake keeps no identity of it, so the connector sends it again. A record queued or in flight when the gear stops is lost, and the gear logs how many; its identity stays, so a resend is a repeat, as the DESIGN states.
 - **Permissions**: changes apply from the next read; nothing is cached.
