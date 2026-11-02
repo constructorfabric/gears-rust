@@ -138,7 +138,7 @@ mod tests {
 
     fn sha256_hex(text: &str) -> String {
         const HEX: &[u8; 16] = b"0123456789abcdef";
-        aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, text.as_bytes())
+        toolkit_security::crypto::hash::Sha256::digest(text.as_bytes())
             .as_ref()
             .iter()
             .flat_map(|byte| [HEX[usize::from(byte >> 4)], HEX[usize::from(byte & 0xf)]])
