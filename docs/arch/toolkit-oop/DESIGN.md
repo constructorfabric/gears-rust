@@ -1482,6 +1482,17 @@ conventions into reusable named templates.
 | Labels             | `app.kubernetes.io/*` standard labels                                     | Automatic from chart metadata                     |
 | Image pull secrets | Global pull secrets for private registries                                | `global.imagePullSecrets`                         |
 
+**Optional PostgreSQL.** Chart `postgres` values (`host`, `port`, `database`, `user`,
+`password`) populate `database.servers.postgres` via `toolkit-common.configmap`;
+explicit `config.data.database.servers.postgres` fields override them. Gears bind
+with `database.server: postgres`. The `${DB_PASSWORD}` placeholder comes from the
+`<fullname>-postgres` Secret via `toolkit-common.deployment`. Include a
+`templates/secrets.yaml` wrapper; the existing Secret checksum triggers credential
+rollouts. Provision the database/user externally.
+
+Flight-control uses this for its registry; mini-chat reuses `pg_mini_chat`.
+Both enable `toolkit-db/pg`. Api-contracts example charts retain SQLite.
+
 #### Umbrella Chart — `toolkit-platform`
 
 The umbrella chart declares each deployable unit's chart as a conditional dependency:

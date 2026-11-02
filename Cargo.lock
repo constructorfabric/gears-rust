@@ -3132,6 +3132,7 @@ dependencies = [
  "cf-gears-service-discovery",
  "cf-gears-static-authn-plugin",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-db",
  "cf-gears-types-registry",
  "clap",
  "mimalloc",
