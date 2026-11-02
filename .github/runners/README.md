@@ -26,12 +26,10 @@ runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != '
 | any of the above with `GEARS_FORCE_GITHUB_HOSTED=true` (the kill switch) | `ubuntu-latest` |
 
 **Whoever wants the self-hosted runners pushes a branch to this repository;
-forks never reach them.** Pushing a branch takes write access, so a pull
-request from a branch here is trusted by where it comes from, not by who opened
-it. Contributors with write access push branches here instead of opening pull
-requests from their forks. Approval for an outside contributor's workflow is an
-admission gate, not a sandbox, so fork pull requests stay on GitHub-hosted
-runners.
+fork pull requests are routed to GitHub-hosted runners.** Pushing a branch
+takes write access, so a pull request from a branch here is trusted by where it
+comes from, not by who opened it. Contributors with write access push branches
+here instead of opening pull requests from their forks.
 
 A fork with Actions enabled runs its own pushes and pull requests; no runner
 there serves the `gears-*` labels, so those runs go to GitHub-hosted runners
@@ -39,7 +37,14 @@ instead of queueing until they time out.
 
 **Routing is not a security boundary.** A pull request runs the workflow from
 its own merge commit, so its author can rewrite `runs-on`; the runner is picked
-before any step executes.
+before any step executes, and no runner-group setting rejects fork-originated
+workflows. The boundary is GitHub's approval gate for workflow runs from
+outside contributors' fork pull requests: approving such a run admits its
+workflow file, so read the workflow changes, `runs-on` included, before
+approving one. The repository policy must require approval for all outside
+contributors, not only first-time ones. A member's fork needs no approval, but
+a member already holds write access, so that is the same trust as a branch
+pushed here.
 
 Matrix jobs with OS legs route the Linux leg only:
 `${{ matrix.os == 'ubuntu-latest' && (<the rule>) || matrix.os }}`.
