@@ -99,8 +99,12 @@ Local E2E has three cooperating pieces, each with a single responsibility:
   server with the right Cargo features, builds any sidecars, and then dispatches
   to one of two backends depending on the suite's `launcher`.
 - **`tools/scripts/ci.py e2e-local`** — the *orchestration engine*. It starts
-  one server from a config file, waits for `/healthz`, runs pytest against the
-  live HTTP API, and tears the server down. Docker mode uses the same engine.
+  one server from a config file, waits for `/healthz` and for the application
+  group to have started (`tools/scripts/lib/readiness.py`: `/readyz` 200, or
+  `503` `state: starting` without `application/preparation` among
+  `unresolved_deps`; `draining`, a body without that report and `404` wait),
+  both under the gateway's `prefix_path`, runs pytest against the live HTTP
+  API, and tears the server down. Docker mode uses the same engine.
 
 Flow:
 
@@ -139,8 +143,8 @@ sequenceDiagram
         Focus->>Focus: write target/e2e-local-x.yaml (pruned)
         Focus->>CI: e2e-local --config <generated>
         CI->>Server: start (E2E_SERVER_BINARY)
-        CI->>Server: poll /healthz
-        Server-->>CI: 200 OK
+        CI->>Server: poll /healthz, then /readyz
+        Server-->>CI: 200 OK, application group started
         CI->>Pytest: run against base_url
         Pytest->>Server: HTTP requests
         Pytest-->>CI: results

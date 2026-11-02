@@ -10,6 +10,7 @@ from __future__ import annotations
 import atexit
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -52,6 +53,9 @@ class GearTestEnv:
     # Server
     port: int = 8086
     health_path: str = "/healthz"
+    # The application group's readiness (`tools/scripts/lib/readiness.py`);
+    # under the gateway's `prefix_path` like every route.
+    readiness_path: str = "/readyz"
     health_timeout: int = 60
     env: dict[str, str] = field(default_factory=dict)
 
@@ -177,22 +181,48 @@ def _start_server(binary: Path, config: Path, env: GearTestEnv) -> subprocess.Po
     return proc
 
 
-def _wait_healthy(env: GearTestEnv) -> None:
-    """Poll health endpoint until success or timeout."""
+def _load_readiness():
+    """`tools/scripts/lib/readiness.py`: the launchers' shared startup criterion."""
+    import importlib.util
+
+    path = PROJECT_ROOT / "tools" / "scripts" / "lib" / "readiness.py"
+    spec = importlib.util.spec_from_file_location("cf_gears_e2e_readiness", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+_readiness = _load_readiness()
+
+
+def _wait_healthy(env: GearTestEnv, *, poll_interval: float = 1.0) -> None:
+    """Poll `health_path`, then `readiness_path` until the application group
+    started (`tools/scripts/lib/readiness.py`), or fail at `health_timeout`.
+
+    A probe that times out or fails is retried until the deadline.
+    """
     import httpx
 
-    url = f"http://localhost:{env.port}{env.health_path}"
+    base = f"http://localhost:{env.port}"
+    url, readyz = f"{base}{env.health_path}", f"{base}{env.readiness_path}"
     deadline = time.monotonic() + env.health_timeout
+    last = "no answer"
 
     while time.monotonic() < deadline:
         try:
             r = httpx.get(url, timeout=3)
-            if r.status_code == 200:
-                print(f"[orchestrator] Server healthy: {url}")
-                return
-        except httpx.ConnectError:
-            pass
-        time.sleep(1)
+            if r.status_code != 200:
+                last = f"{url}: {r.status_code}"
+            else:
+                ready = httpx.get(readyz, timeout=3)
+                if _readiness.application_started(ready.status_code, ready.content):
+                    print(f"[orchestrator] Server healthy: {url}, application started: {readyz}")
+                    return
+                last = f"{readyz}: {ready.status_code} {ready.content[:300]!r}"
+        except httpx.HTTPError as e:
+            last = f"{type(e).__name__}: {e}"
+        time.sleep(poll_interval)
 
     log = _log_path(env)
     log_tail = ""
@@ -201,6 +231,8 @@ def _wait_healthy(env: GearTestEnv) -> None:
     pytest.fail(
         f"Server did not become healthy within {env.health_timeout}s.\n"
         f"Health URL: {url}\n"
+        f"Readiness URL: {readyz}\n"
+        f"Last observation: {last}\n"
         f"Log tail:\n{log_tail}"
     )
 

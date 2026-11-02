@@ -2,7 +2,8 @@
 """Cross-platform Gears CI utility (fmt, clippy, test, security, fuzz, E2E).
 
 For E2E this is the *orchestration engine*: `e2e-local` / `e2e-docker` build (or
-reuse) the server binary, start it from a config file, wait for `/healthz`, run
+reuse) the server binary, start it from a config file, wait for `/healthz` and the
+application group (`/readyz` without `application/preparation`), run
 pytest against the live HTTP API, then tear the server down. Focused local runs
 are driven by `tools/scripts/run_e2e.py`, which calls this script's
 `e2e-local` subcommand for suites whose `launcher` is `e2e-launcher`.
@@ -17,12 +18,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from urllib.request import urlopen
-from urllib.error import URLError, HTTPError
 
 # Add scripts/ to sys.path so lib.platform is importable
 sys.path.insert(0, os.path.dirname(__file__))
 
+from lib.readiness import application_started, probe, rest_prefix
 from lib.platform import (
     e2e_env_overrides,
     find_binary,
@@ -374,12 +374,24 @@ def _print_log_file(path, label):
 
 
 def wait_for_health(
-    base_url, timeout_secs=30, server_process=None, error_log=None, output_log=None
+    base_url,
+    timeout_secs=30,
+    server_process=None,
+    error_log=None,
+    output_log=None,
+    path_prefix="",
+    poll_interval=1.0,
 ):
-    url = f"{base_url.rstrip('/')}/healthz"
-    step(f"Waiting for API to be ready at {url}")
+    """Wait for liveness, then for the application group (`lib.readiness`).
+
+    `path_prefix` is the gateway's `prefix_path`: both probes live under it.
+    """
+    root = f"{base_url.rstrip('/')}{path_prefix}"
+    healthz, readyz = f"{root}/healthz", f"{root}/readyz"
+    step(f"Waiting for API to be ready at {healthz}, then {readyz}")
     start = time.time()
     attempt = 0
+    last = "no answer"
     while True:
         # Check if the server process crashed before we even connect
         if server_process is not None:
@@ -393,23 +405,27 @@ def wait_for_health(
                 print("Then re-run: make e2e-local")
                 sys.exit(1)
 
-        try:
-            attempt += 1
-            with urlopen(url, timeout=1) as resp:
-                if 200 <= resp.status < 300:
-                    print(f"API is ready (after {attempt} attempts)")
-                    return
-        except (URLError, HTTPError, ConnectionResetError, OSError) as e:
-            # Server may be starting up or restarting
-            if attempt % 10 == 0:  # Log every 10 attempts
-                print(f"Still waiting... (attempt {attempt}, error: {type(e).__name__})")
+        attempt += 1
+        live = probe(healthz, timeout=1)
+        if live is None or not 200 <= live[0] < 300:
+            last = f"{healthz}: {live[0] if live else 'no answer'}"
+        else:
+            ready = probe(readyz)
+            if ready is not None and application_started(*ready):
+                print(f"API is ready (after {attempt} attempts)")
+                return
+            last = (
+                f"{readyz}: {ready[0]} {ready[1][:300]!r}" if ready else f"{readyz}: no answer"
+            )
+        if attempt % 10 == 0:  # Log every 10 attempts
+            print(f"Still waiting... (attempt {attempt}, last: {last})")
 
         if time.time() - start > timeout_secs:
-            print(f"ERROR: The API readiness check timed out after {attempt} attempts")
+            print(f"ERROR: The API readiness check timed out after {attempt} attempts; last: {last}")
             _print_log_file(output_log, "server stdout")
             _print_log_file(error_log, "server stderr")
             sys.exit(1)
-        time.sleep(1)
+        time.sleep(poll_interval)
 
 
 def check_pytest():
@@ -646,6 +662,7 @@ def cmd_e2e(args):
                 server_process=server_process,
                 error_log=server_error_file,
                 output_log=server_log_file,
+                path_prefix=rest_prefix(Path(PROJECT_ROOT) / config_path),
             )
             print("Server started successfully and passed health check")
 

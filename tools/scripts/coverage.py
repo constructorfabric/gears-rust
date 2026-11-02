@@ -14,13 +14,12 @@ import time
 import shlex
 from pathlib import Path
 from typing import Optional
-from urllib.request import urlopen
-from urllib.error import URLError, HTTPError
 
 import yaml
 
 # Import prereq gear for environment validation
 from lib.prereq import check_environment_ready
+from lib.readiness import application_started, probe, rest_prefix
 from lib.platform import (
     e2e_env_overrides,
     find_binary,
@@ -146,30 +145,35 @@ def ensure_coverage_disk_space():
     sys.exit(1)
 
 
-def wait_for_health(base_url, timeout_secs=30, log_path: Optional[Path] = None):
-    """Wait for the server to be healthy.
+def wait_for_health(
+    base_url, timeout_secs=30, log_path: Optional[Path] = None, path_prefix: str = ""
+):
+    """Wait for liveness (/healthz or /health), then for the application group.
 
-    Tries both /healthz and /health. On timeout, prints tail of server logs
-    if a log_path is provided.
+    Both probes live under `path_prefix`, the gateway's `prefix_path`; see
+    `lib.readiness`. On timeout, prints tail of server logs if a log_path is
+    provided.
     """
+    root = f"{base_url.rstrip('/')}{path_prefix}"
     paths = ["/healthz", "/health"]
     step(
-        f"Waiting for API to be ready at {base_url} (paths: {', '.join(paths)})"
+        f"Waiting for API to be ready at {root} (paths: {', '.join(paths)}, then /readyz)"
     )
     start = time.time()
+    last = "no answer"
     while True:
-        for p in paths:
-            url = f"{base_url.rstrip('/')}{p}"
-            try:
-                with urlopen(url, timeout=2) as resp:
-                    if 200 <= resp.status < 300:
-                        print("OK. API is ready")
-                        return
-            except (URLError, HTTPError):
-                pass
+        live = any(
+            (r := probe(f"{root}{p}")) is not None and 200 <= r[0] < 300 for p in paths
+        )
+        if live:
+            ready = probe(f"{root}/readyz")
+            if ready is not None and application_started(*ready):
+                print("OK. API is ready")
+                return
+            last = f"/readyz: {ready[0]} {ready[1][:300]!r}" if ready else "/readyz: no answer"
 
         if time.time() - start > timeout_secs:
-            print("ERROR: API did not become ready in time", file=sys.stderr)
+            print(f"ERROR: API did not become ready in time; last: {last}", file=sys.stderr)
             # Best-effort: print last lines of server logs to help debugging
             if log_path and Path(log_path).exists():
                 try:
@@ -941,7 +945,7 @@ def collect_e2e_local_coverage(
     try:
         # Wait for server to be ready (TCP first, then HTTP health)
         wait_for_tcp("127.0.0.1", desired_port, timeout_secs=30, log_path=log_file)
-        wait_for_health(base_url, timeout_secs=90, log_path=log_file)
+        wait_for_health(base_url, timeout_secs=90, log_path=log_file, path_prefix=rest_prefix(config_file))
 
         # Run e2e tests
         pytest_result = run_e2e_tests(base_url, test_filter)
@@ -1209,7 +1213,7 @@ def cmd_coverage_combined(args):
     try:
         # Wait for server to be ready
         wait_for_tcp("127.0.0.1", port, timeout_secs=30, log_path=log_file)
-        wait_for_health(base_url, timeout_secs=60, log_path=log_file)
+        wait_for_health(base_url, timeout_secs=60, log_path=log_file, path_prefix=rest_prefix(config_file))
 
         # Run E2E tests
         pytest_result = run_e2e_tests(base_url, e2e_target)
