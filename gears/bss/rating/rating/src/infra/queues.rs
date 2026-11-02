@@ -1,5 +1,5 @@
-//! The outbox work queues (DESIGN §3.7; feature 01 §5.1): `rating.child_work`, `rating.rollup` and
-//! one `rating.delivery.e{feed_epoch}` queue per feed epoch, in the `toolkit_db::outbox` tables
+//! The outbox work queues (DESIGN §3.7; feature 01 §5.1): `rating.child_work`, `rating.rollup`,
+//! `rating.fact_bind` (feature 06) and one `rating.delivery.e{feed_epoch}` queue per feed epoch, in the `toolkit_db::outbox` tables
 //! created with the consumer-owned prefix `bss_rating__outbox` (database ADR-0001).
 //!
 //! A work item carries `tenant_id` and the object id only; its worker re-reads every decision from
@@ -25,6 +25,9 @@ pub const CHILD_WORK_QUEUE: &str = "rating.child_work";
 /// The parent roll-up queue (partition `hash(fact_id)`).
 pub const ROLLUP_QUEUE: &str = "rating.rollup";
 
+/// The queue of pending usage facts to bind again (partition `hash(fact_id)`; feature 06 §2.1).
+pub const FACT_BIND_QUEUE: &str = "rating.fact_bind";
+
 /// The delivery queue of feed epoch `epoch` (partition `hash(tenant_id) mod n`).
 #[must_use]
 pub fn delivery_queue(epoch: u32) -> String {
@@ -46,6 +49,8 @@ pub struct QueuePartitions {
     pub rollup: Partitions,
     /// Each `rating.delivery.e{n}`.
     pub delivery: Partitions,
+    /// `rating.fact_bind`.
+    pub fact_bind: Partitions,
 }
 
 /// The queues of one gear instance and their partition counts. Built only through
@@ -94,6 +99,12 @@ impl QueueLayout {
         &self.feed_epochs
     }
 
+    /// The partition counts.
+    #[must_use]
+    pub const fn partitions(&self) -> QueuePartitions {
+        self.partitions
+    }
+
     /// Every queue name with its partitions.
     #[must_use]
     pub fn queues(&self) -> Vec<(String, Partitions)> {
@@ -101,6 +112,7 @@ impl QueueLayout {
         let mut queues = vec![
             (CHILD_WORK_QUEUE.to_owned(), partitions.child_work),
             (ROLLUP_QUEUE.to_owned(), partitions.rollup),
+            (FACT_BIND_QUEUE.to_owned(), partitions.fact_bind),
         ];
         queues.extend(
             self.feed_epochs

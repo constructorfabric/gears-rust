@@ -4,11 +4,16 @@
 
 pub mod audit;
 pub mod backoff;
+pub mod child;
+pub mod declaration;
 pub mod digest;
 pub mod error;
 pub mod exception;
+pub mod fact;
 pub mod inbox;
 pub mod leadership;
 pub mod operation;
 pub mod ports;
+pub mod pricing;
 pub mod usage;
+pub mod work;

@@ -79,7 +79,7 @@ on proven evidence (T-D-52, T-D-62, T-D-63, T-D-65, T-D-67).
 - **Consumers**: [Parent Roll-up and Billing Delivery](09-rollup-delivery.md) rolls up current final results; [Corrections, Replay and Administrative Re-rate](08-corrections-rerate.md) sets the requested target this feature honours.
 - **Upstream**: `cpt-cf-bss-rating-upreq-subscriptions-scope-proofs`, `cpt-cf-bss-rating-upreq-coverage-declarations`, `cpt-cf-bss-rating-upreq-resource-history`, `cpt-cf-bss-rating-upreq-accepted-binding-naming`, `cpt-cf-bss-rating-upreq-subscriptions-one-time-rating`, `cpt-cf-bss-rating-upreq-delay-only-acceptance` ([UPSTREAM_REQS](../UPSTREAM_REQS.md) §2.2, §2.6, §2.9); Pricing's `PricingReadV1::{resolve, price}` (CURRENT on `main`, T-D-73) and the Products derived-declaration read (R-31).
 
-**Pricing input**: the rater prices the bindings Pricing's `resolve` returned for the fact's pins (T-D-73), stored verbatim ([Commercial Facts and Window Scheduling](06-fact-scheduling.md)); a provisional evaluation may use the answer stored at fact intake, but a child's first final uses an answer fetched on or after the UTC day of its window's last second, since an approved price can gain an `ends_on` after intake (DESIGN §4.1, V78); the binding a child is first finalized with is its **binding of record** and is never re-resolved by a correction. There is no catalog version, frontier, plan document or overlay document.
+**Pricing input**: the rater prices each slice by the accepted binding the fact version carries for it (T-D-73 as amended by T-D-87), stored verbatim at fact intake ([Commercial Facts and Window Scheduling](06-fact-scheduling.md)); a provisional evaluation uses it as is, but a child's first final first proves it fresh with a `resolve` answer fetched on or after the UTC day of its window's last second, since an approved price can gain an `ends_on` after the fact was published — a discrepancy is `pending(terms_stale)`, never a successor price (DESIGN §4.1, V78); the binding a child is first finalized with is its **binding of record** and is never re-resolved by a correction. There is no catalog version, frontier, plan document or overlay document.
 
 **UI applicability**: none. The two read routes (`bss_rating.windows.list`, `bss_rating.snapshots.get`) are API only and follow the REST table in [DESIGN §3.3](../DESIGN.md#33-api-contracts).
 
@@ -138,11 +138,11 @@ The flows of the former slice documents that this feature implements are defined
 
 **Input**: the unlocked child row.
 
-**Output**: `(binding_of_record, engine)` and every input stored locally, or `pending(pins_unavailable)` / `pending(pricing_unavailable)` with a requeue.
+**Output**: `(binding_of_record, engine)` and every input stored locally, or `pending(terms_unresolved)` / `pending(terms_stale)` / `pending(pricing_unavailable)` with a requeue.
 
-1. [ ] - `p1` - Choose `(binding_of_record, engine)`: with `requested_rebind`, or when the fact version's pricing query (revision, period or pins) differs from the one the binding of record was resolved for, a fresh `resolve` with the fact's current pins at the period start and again at each `ends_on` at or before the child's window end (one `bss_rating__pricing_resolve` row per query and fetch day; `binding_of_record` = digest of the ordered per-resolve digests, listed in `binding_resolves`) and the requested or current engine; else the binding and engine of record; else (no binding of record yet) the stored answers of the period's queries and the current engine generation — for a provisional evaluation any stored answer, for a **first final** only an answer fetched on or after the UTC day of the window's last second, resolving again when none is stored, because Pricing can end an approved price after intake and the answer then gains an `ends_on` (DESIGN §4.1) - `inst-pf-pair`
+1. [ ] - `p1` - Choose `(binding_of_record, engine)`: with `requested_rebind`, or when the current fact version names other bindings for the slices of the child's window, those bindings (`binding_of_record` = digest of the ordered per-slice `binding_digest`s, listed in `binding_resolves`) and the requested or current engine; else the binding and engine of record; else (no binding of record yet) the bindings the current fact version names for the window's slices and the current engine generation (T-D-87). For a **first final** each binding is first proven fresh: `resolve` with the slice's accepted pins on the slice start and on each `ends_on` inside the window, using an answer fetched on or after the UTC day of the window's last second and resolving when none is stored, because Pricing can end an approved price after the fact was published (DESIGN §4.1); the answer's per-cell digest must equal the fact's - `inst-pf-pair`
 2. [ ] - `p1` - Ensure the subscription version, the `bss_rating__pricing_binding` rows for that digest, the derived declarations of its usage bindings (`bss_rating__derived_declaration`), the usage-policy projection and the slice layout; a layout change re-materializes in its own transaction and re-enqueues the child - `inst-pf-ensure`
-3. [ ] - `p1` - **IF** no binding is available, requeue with backoff as `pending(pins_unavailable)` when the fact carries no pins, or `pending(pricing_unavailable)` when Pricing is unavailable - `inst-pf-no-pin`
+3. [ ] - `p1` - **IF** a slice of the window is `unresolved`, requeue as `pending(terms_unresolved)` until a new fact version; **IF** the freshness proof names another binding or an `ends_on` the fact did not cut at, `pending(terms_stale)` with an exception that requests reconciliation, never pricing the successor (SUB-D-41); **IF** Pricing is unavailable, `pending(pricing_unavailable)` with backoff; a refusal (any 4xx) is `failed(pricing_refused(<code>))` - `inst-pf-no-pin`
 
 Details: [14 §4.3](#contract-14-4-3), [11 §3.6](#contract-11-3-6).
 
@@ -336,16 +336,17 @@ The following sections keep the runtime procedures of these namespaces — their
   **Ensure inputs for one evaluation** (outside the rating transaction):
 
   ```text
-  (binding, engine) = child.requested_rebind or pricing_query(fact) ≠ child.binding_resolves.query
-                      ? (resolve(revision_id, period_start, fact.current_pins) and again at each ends_on,
-                         child.requested_engine ?? engine_of_record)
+  (binding, engine) = child.requested_rebind or slice_bindings(fact, window) ≠ child.binding_resolves
+                      ? (slice_bindings(fact, window), child.requested_engine ?? engine_of_record)
                     : child.*_of_record
-                    ?? (period binding stored at fact intake, EngineRegistry.current())
-                    -- 14 §3.6; no pins on the fact → pending(pins_unavailable);
-                    -- Pricing 503 / unavailable → pending(pricing_unavailable)
+                    ?? (slice_bindings(fact, window), EngineRegistry.current())
+                    -- T-D-87: the accepted bindings the fact version carries per slice;
+                    -- an unresolved slice → pending(terms_unresolved)
                     -- the rater re-derives (binding, engine) under the child lock and restarts on mismatch
-  PricingBindingStore.ensure(tenant, binding_digest)       -- resolve as bss-rating.system for subject tenant = seller, plan:read;
-                                                           -- AcceptedBindings stored verbatim
+  first final → PricingBindingStore.prove_fresh(slices, fresh_from = utc_day(window_end − 1 s))
+                    -- resolve as bss-rating.system for subject tenant = seller, plan:read (D-523);
+                    -- another binding or an uncut ends_on → pending(terms_stale) + reconciliation exception
+                    -- Pricing 503 / unavailable → pending(pricing_unavailable)
   DerivedDeclarationStore.ensure(tenant, meter)            -- usage bindings; Products read (R-31)
   SubscriptionVersionStore.ensure(tenant, subscription_id, latest)
   → the rater opens its transaction with every input present locally
@@ -375,28 +376,24 @@ The following sections keep the runtime procedures of these namespaces — their
   c0 = SELECT binding_of_record, engine_of_record, requested_rebind, requested_engine FROM child  -- no lock
   f  = the child's current fact version: query = (revision_id, period_start, pins)
   engine = c0.requested_engine ?? c0.engine_of_record ?? EngineRegistry.current()
-  f has no pins, revision or quantity → pending(pins_unavailable); requeue on the next fact version
-  if c0.binding_of_record is set, its query = f.query and not c0.requested_rebind:
+  f has an unresolved slice in the window → pending(terms_unresolved); requeue on the next fact version
+  if c0.binding_of_record is set, it equals slice_bindings(f, window) and not c0.requested_rebind:
        B = PricingBindingStore.get(c0.binding_resolves)                        -- stored copies only
-  else:                                                                        -- outside tx
-       fresh_from = max(first final due ? utc_day(window_end − 1 s) : none,     -- DESIGN §4.1
-                        c0.requested_rebind ? utc_day(rebind_as_of) : none)
-       B = []; date = period_start
-       loop:
-         stored = newest bss_rating__pricing_resolve row of (revision_id, date, item_id, pins)
-         stored and (fresh_from is none or stored.fetched_on ≥ fresh_from) → r = stored; skip the call
+  else:
+       B = [(slice.from, slice.binding_digest) for each slice of f in the window]  -- T-D-87
+  first final due and B not yet proven fresh:                                  -- outside tx
+       fresh_from = utc_day(window_end − 1 s)                                  -- DESIGN §4.1
+       for each slice s in B, on s.from and on each ends_on inside the window:
+         stored = newest bss_rating__pricing_resolve row of (revision_id, date, item_id, s.pins)
+         stored and stored.fetched_on ≥ fresh_from → r = stored; skip the call
          r = PricingReadV1.resolve(ctx = per-work-item context of the seller tenant (D-523),
-                ResolveQuery{catalog: {tenant_id = seller},
-                revision_id, date, item_id, pins})                             -- T-D-73, D-424
+                ResolveQuery{catalog: {tenant_id = seller}, revision_id, date, item_id, s.pins})
              503 REGISTRY_UNAVAILABLE / unavailable → pending(pricing_unavailable), retry
              PIN_FOREIGN, PIN_DUPLICATE, REVISION_NOT_PUBLISHED, … → failed(pricing_refused(code))
              INCOMPLETE_COMMERCIAL_INPUTS → failed(incomplete_commercial_inputs)
          PricingBindingStore.put(tenant, answer (binding_digest), question (query_digest, today))
-         B += (date, query_digest, fetched_on, r.binding_digest)               -- one entry per resolve
-         the child's binding has an ends_on inside the period and before the window end
-                                       → date = ends_on; continue  -- same pin; an hourly child after
-                                                                   -- an earlier ends_on needs it too
-         else break                                     -- each resolve covers one slice (D-397, D-425)
+         cell_digest(r, s.cell) ≠ s.binding_digest or r names an ends_on inside the window that f
+           does not cut at → pending(terms_stale), exception; never price the successor (SUB-D-41)
   b = digest(B)                                         -- the binding of record of this evaluation
   usage child → DerivedDeclarationStore.ensure(b.meter)    -- R-31; absent → pending(derived_declaration_unavailable)
   SubscriptionVersionStore.ensure(…)
@@ -456,14 +453,14 @@ The following sections keep the runtime procedures of these namespaces — their
 In order, outside the transaction (a **prefetch**; the transaction re-checks it):
 
 1. Read the child row without a lock and derive `(binding_of_record, engine)`: with
-   `requested_rebind`, or when the fact version's pricing query (revision, period or pins) changed,
-   a fresh `resolve(revision_id, period_start, fact.current_pins)` (again at each `ends_on` at or
-   before the window end) and `requested_engine`; else `(binding_of_record, engine_of_record)` if
-   set; else the stored answers of the period's queries — for a first final only one fetched on or
-   after the UTC day of the window's last second, resolving again otherwise (DESIGN §4.1) — and
-   `EngineRegistry::current()` (no pins on the fact ⇒ requeue with
-   backoff, `pending(pins_unavailable)`; Pricing unavailable ⇒ `pending(pricing_unavailable)`). The work item carries no reason that could
-   override this.
+   `requested_rebind`, or when the current fact version names other bindings for the window's
+   slices, those bindings and `requested_engine`; else `(binding_of_record, engine_of_record)` if
+   set; else the bindings the fact version names and `EngineRegistry::current()` (T-D-87). A first
+   final proves each binding fresh with `resolve` on the slice start and each `ends_on` inside the
+   window, using an answer fetched on or after the UTC day of the window's last second (DESIGN
+   §4.1). An `unresolved` slice ⇒ `pending(terms_unresolved)`; a freshness answer that disagrees ⇒
+   `pending(terms_stale)` with a reconciliation exception; Pricing unavailable ⇒
+   `pending(pricing_unavailable)`. The work item carries no reason that could override this.
 2. `SubscriptionVersionStore.ensure(latest)` → `subscription_version`.
 3. `PricingBindingStore.ensure(binding_digest)`: the `AcceptedBinding`s stored verbatim
    (`bss_rating__pricing_binding`); for usage children `DerivedDeclarationStore.ensure(meter)`

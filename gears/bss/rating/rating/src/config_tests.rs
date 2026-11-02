@@ -28,13 +28,29 @@ fn the_default_configuration_is_valid_and_disables_every_event_source() {
 }
 
 #[test]
-fn the_default_queues_are_child_work_rollup_and_one_delivery_epoch() {
+fn the_default_queues_are_child_work_rollup_fact_bind_and_one_delivery_epoch() {
     let layout = RatingConfig::default().queue_layout().unwrap();
     let names: Vec<String> = layout.queues().into_iter().map(|(name, _)| name).collect();
     assert_eq!(
         names,
-        ["rating.child_work", "rating.rollup", "rating.delivery.e1"]
+        [
+            "rating.child_work",
+            "rating.rollup",
+            "rating.fact_bind",
+            "rating.delivery.e1"
+        ]
     );
+}
+
+#[test]
+fn the_shard_count_is_bounded() {
+    for shards in [0_u16, 1025] {
+        let config = parse(serde_json::json!({ "scheduling": { "shards": shards } }));
+        assert!(config.resolve().is_err(), "{shards}");
+    }
+    let config = parse(serde_json::json!({ "scheduling": { "shards": 64 } }));
+    assert_eq!(config.resolve().unwrap().shards, 64);
+    assert_eq!(RatingConfig::default().resolve().unwrap().shards, 16);
 }
 
 #[test]

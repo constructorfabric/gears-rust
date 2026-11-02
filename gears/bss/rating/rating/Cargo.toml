@@ -14,11 +14,20 @@ workspace = true
 # ClientHub provider test doubles (DESIGN 11 §4.12): fakes of the upstream contracts that exist on
 # `main`, so every feature can be accepted against them before the providers do. Never linked into
 # a production build; a double never stands in for a production contract.
-test-providers = ["dep:bss-pricing-sdk"]
+test-providers = []
 
 [dependencies]
 bss-rating-sdk = { workspace = true }
-bss-pricing-sdk = { workspace = true, optional = true }
+# The pure evaluation core: the expected child windows (`window_geometry`) and the frozen input
+# types a fact's bindings and derived declarations are stored as (feature 06).
+bss-rating-core = { workspace = true }
+# `PricingReadV1` (the freshness proof, T-D-73/T-D-87), `AcceptedBinding` and its digest.
+bss-pricing-sdk = { workspace = true }
+# Products' derived usage declaration and its canonical digest (R-31).
+bss-products-sdk = { workspace = true }
+# `CurrencySpec`, which Pricing's `ImmutablePrice` carries.
+bss-money = { workspace = true }
+rust_decimal = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -70,7 +79,7 @@ opentelemetry = { workspace = true, features = ["metrics"] }
 bss-rating = { package = "cf-gears-bss-rating", path = ".", features = ["test-providers"] }
 # The additive-only golden-fixture checker of `tests/golden_rest.rs`.
 bss-rating-golden = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "test-util"] }
 tower = { workspace = true }
 tempfile = { workspace = true }
 proptest = { workspace = true }

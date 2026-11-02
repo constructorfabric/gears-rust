@@ -330,7 +330,7 @@ matrix).
 |---|---|---|---|
 | `cpt-cf-bss-rating-fr-level-aggregation` (`Peak` / `TimeWeighted` input folds) | p1 | R-06 (usage-collector / Product) | `unsupported_input_fold`; only `Sum` inputs of a derived usage type are rated |
 | `cpt-cf-bss-rating-fr-composite-meter-eval` | p1 | R-31 (a Products typed read of a derived usage declaration) | `derived_declaration_unavailable`; usage children stay pending |
-| Every usage and recurring requirement | p1 | Subscriptions carries the period's pins, plan revision, quantity and `BillingTerms` on each fact (SUB-D-29; R-03; UPSTREAM_REQS §2.6) | no fact ⇒ no child; a fact without pins, revision or quantity ⇒ its children wait `pending(pins_unavailable)`; `price_uncovered` for an uncovered cell |
+| Every usage and recurring requirement | p1 | Subscriptions carries each slice's frozen accepted bindings, the lots and the `BillingTerms` on each versioned fact (Subscriptions PR #5516; `…-upreq-subscriptions-fact-pricing-inputs`; R-03; DECISIONS T-D-87) | no fact ⇒ no child; an `unresolved` slice ⇒ its children wait `pending(terms_unresolved)`; a fact that breaks the profile is quarantined `payload_invalid` |
 | `cpt-cf-bss-rating-fr-dimensional-pricing` (several dimension values per item and line) | p1 | R-16 (dimension-key encoding) | the one value pinned at sale per item is rated; more than one value per item and line is `unsupported_primitive` |
 | `cpt-cf-bss-rating-fr-tier-aggregation-window` (`resource` aggregation scope) | p1 | R-21 (scope proofs that list resources) | `resource_scope_not_supported`; `subscription_line` scope only |
 | `cpt-cf-bss-rating-fr-pre-purchase-evaluation` | p1 | R-24 (the SDK provider, grants and supported-profile declaration Orders D-197 lists; contract T-D-85) | `OrderEvaluationV1` returns `ServiceUnavailable` |
@@ -1061,10 +1061,9 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
   - the `collectionPaused` marker.
 
   The stream is consumed as the **synthesis trigger for every period-driven unit** (T-D-33; Rating never derives a recurring period itself).
-- **Required on each fact for the PriceBook adapter** (SUB-D-29; UPSTREAM_REQS §2.6):
-  - the plan revision;
-  - the period's **pins** (`PricePin`s; Subscriptions holds them per period — the first period from the accepted order's bindings, Orders D-162);
-  - the committed quantity (`QuantityInterval`) for `per_unit`;
+- **Required on each fact for the PriceBook adapter** (`…-upreq-subscriptions-fact-pricing-inputs`; proposed by Subscriptions PR #5516; DECISIONS T-D-87):
+  - per slice, the frozen accepted bindings with their plan revision (the first period from the accepted order's bindings, Orders D-162);
+  - the committed quantity as complete purchase-lot allocations, for `per_unit`;
   - the billing period from Subscriptions' `BillingTerms` (cycle `Month`/`Year`, anchor `Calendar`/`SubscriptionStart`, UTC).
 - **Plan change.** The plan-change `(changeEffectiveAt, changeMode)` policy.
 - **One-time dedup.** One-time charges are deduplicated by Subscriptions per phase-entry occurrence (SUB-D-28).
@@ -1409,7 +1408,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 | Products (SKU registry, derived usage types) | SKU versions; usage SKUs sell derived usage types (`products.derived/<code>@<n>`, P-D-259) that Rating evaluates with `bss_products_sdk::derived` (P-D-229). A typed read of a stored declaration is **missing** (DECISIONS R-31) | `p1` |
 | OSS metering / Rating (usage dimension population) | Dimension values on each usage record; normalized usage quantity (values NOT produced here — recorded here) | `p1` |
 | **Usage-collector usage feed (launch-gating)** | The usage-collector documents a replay-safe pull feed (`cpt-cf-usage-collector-fr-billing-usage-feed`; on upstream `main`: `read_usage_feed` with an opaque cursor, interval entries, invalidation entries — DESIGN §3.3, ADR-0011); its code does not implement it yet. Gates usage rating (UPSTREAM_REQS U-1, DECISIONS R-01) | `p1` |
-| **Subscriptions pins on facts (launch-gating)** | Each commercial fact must carry the period's plan revision, pins, committed quantity and `BillingTerms` (SUB-D-29 decides the PriceBook adapter but defers it; Subscriptions has no code). Gates every rated line (DECISIONS R-03; UPSTREAM_REQS §2.6) | `p1` |
+| **Subscriptions terms on facts (launch-gating)** | Each commercial fact must carry its slices' frozen accepted bindings, lots and `BillingTerms` (proposed by Subscriptions PR #5516, open; on `main` SUB-D-29 decides the PriceBook adapter but defers it; Subscriptions has no code). Gates every rated line (DECISIONS R-03, T-D-87; UPSTREAM_REQS §2.6) | `p1` |
 | Contracts & Agreements | Account-specific price terms, commitments, true-up clauses (first-draft PRD; deferred, §5.4) | `p1` |
 | Subscriptions | Effective-dated Plan/Add-on links, subscription state, billing periods and `BillingTerms`, committed quantity, pins per period, `(changeEffectiveAt, changeMode)`; commercial facts; resource → subscription attribution (not specified by Subscriptions today — DECISIONS R-25) | `p1` |
 | ~~Rating & Charging (downstream gear)~~ | **Not a dependency — intra-gear since ADR-0002 / T-D-16.** The Usage → RatedCharge pipeline, dedup, windowed `Q`, unit synthesis, rated-output persistence and Billing handoff are **this gear's own** design contracts 12–16 (authored 2026-07-15); the core↔pipeline contract is in-process, not an external integration. The upstream `PRD-rating-engine-202604031200` is legacy provenance (§2.2), not a live counterpart | — |
@@ -1429,7 +1428,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 - OSS metering will emit dimension values on usage; until then each item is rated on the one value bound at sale, and several values per item need per-combination SKUs.
 - Pricing supplies the GL code, tax category and invoice-line template with each binding (`InvoiceInputs`, pricing D-421) and Rating freezes them in the binding of record; Contracts/Finance supply SSP/PO and FX policy pointers once they exist; Rating consumes, never recomputes, supplied evidence.
 - Promotions (a deferred Pricing concern, D-409) will provide a frozen coupon snapshot contract before production coupon rating; until then §17.2 is the Rating-side stub.
-- Subscriptions will carry each period's pins, plan revision, quantity and billing period on its facts (SUB-D-29); until then nothing is rated end to end.
+- Subscriptions will carry each slice's accepted bindings, lots and billing period on its versioned facts (Subscriptions PR #5516; DECISIONS T-D-87); until then nothing is rated end to end.
 
 ## 15. Open Questions
 
@@ -1454,7 +1453,7 @@ Explicit dispositions for domains not owned by this PRD (no silent omissions):
 | (Architecture + Pricing + Subscriptions + Billing) Reconcile the Seam Atlas v2 baseline (2026-09-30) with this repository: usage parent facts, attribution owner, one-time rating and finalization evidence; its Pricing model is now this repository's (PriceBook, T-D-37), the price-binding authority is decided by T-D-37, the floor executor by T-D-38, and Rating's pricing adapter by T-D-73…T-D-78 (R-17 closed) | Architecture with the named owners | Before Atlas contracts are implemented | Open (DECISIONS R-19…R-25). | — |
 | (Pricing + Finance) Recurring proration basis: Rating proposes covered UTC seconds / period UTC seconds (T-D-77); Pricing's unbuilt slice-07 note says calendar days | Pricing + Finance | Before recurring rating launches | Open (DECISIONS R-30). | — |
 | (Products) A typed read of a stored derived usage declaration for Rating (`DerivedUsageTypeReadV1`); today only REST `GET /bss-products/v1/derived-usage-types/{code}/versions/{n}` exists | Products | Before usage rating launches | Open (DECISIONS R-31). | — |
-| (Subscriptions) Carry each period's plan revision, pins, committed quantity and `BillingTerms` on the commercial facts; who cuts a period at an `ends_on` (Orders records it as unagreed) | Subscriptions + Rating | Before any line is rated end to end | Open (SUB-D-29 adapter deferred; DECISIONS R-03). | — |
+| (Subscriptions) Carry each slice's accepted bindings, lots and `BillingTerms` on versioned commercial facts; cut at an `ends_on` or publish an `unresolved` interval | Subscriptions + Rating | Before any line is rated end to end | Proposed in Subscriptions PR #5516 (open; SUB-D-41, SUB-D-42); DECISIONS R-03, T-D-87. | — |
 | (Finance + Legal) Financial-record retention and the correction cut-off: Rating defaults to at least 7 years after the later of `window_end` and the fact's last revision, and replays usage within the collector's retention floor (default 125 days). Is there a regulatory period per jurisdiction, and a shorter business cut-off for corrections? | Finance + Legal | Before the first invoice | Open: Rating's defaults apply (DESIGN §4.12). | — |
 | (Finance) Launch without FX conversion — billing currency must equal the price row's currency (per-market rows cover multi-currency catalogs) | Finance | Before cross-currency billing is sold | Deferred with price adjustments (DECISIONS R-07, T-D-81); no pinnable FX source exists. | — |
 

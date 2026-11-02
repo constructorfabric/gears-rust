@@ -37,7 +37,27 @@ pub struct RatingConfig {
     pub exception_sweep: ExceptionSweepConfig,
     /// The usage feed readers (feature 04).
     pub usage_feed: UsageFeedConfig,
+    /// The shards facts are scanned in (feature 06).
+    pub scheduling: SchedulingConfig,
 }
+
+/// The shards the scheduler and the wake scanner work in (DESIGN 14 §3.8).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulingConfig {
+    /// The shard count `S`, 1–1024: a fact's shard is `hash(fact_id) mod S`, stored at insert, so
+    /// changing it is a migration, never a runtime re-hash.
+    pub shards: u16,
+}
+
+impl Default for SchedulingConfig {
+    fn default() -> Self {
+        Self { shards: 16 }
+    }
+}
+
+/// The most shards a deployment may configure.
+pub const MAX_SHARDS: u16 = 1024;
 
 /// Partition counts of the work queues (powers of two, 1–64).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -49,6 +69,8 @@ pub struct QueueConfig {
     pub rollup_partitions: u16,
     /// Each `rating.delivery.e{n}`.
     pub delivery_partitions: u16,
+    /// `rating.fact_bind`.
+    pub fact_bind_partitions: u16,
     /// The feed epochs whose delivery queues are served (DESIGN §4.9); at most
     /// [`MAX_FEED_EPOCHS`].
     pub feed_epochs: Vec<u32>,
@@ -60,6 +82,7 @@ impl Default for QueueConfig {
             child_work_partitions: 16,
             rollup_partitions: 8,
             delivery_partitions: 8,
+            fact_bind_partitions: 4,
             feed_epochs: vec![1],
         }
     }
@@ -254,8 +277,8 @@ pub enum ConfigError {
         "event_intake.sources.{0}.producer must be 1-255 bytes without surrounding spaces or control characters"
     )]
     ProducerInvalid(String),
-    /// A leadership or sweep duration is zero or longer than its bound, so the job it paces would
-    /// never run or never retry.
+    /// A leadership or sweep duration, or the shard count, is zero or larger than its bound, so the
+    /// job it paces would never run or never retry.
     #[error("{field} must be between 1 and {max}, got {value}")]
     DurationOutOfRange {
         field: &'static str,
@@ -298,6 +321,8 @@ pub struct ResolvedConfig {
     pub election: Option<ElectionConfig>,
     /// The usage feed readers.
     pub usage: UsageFeedSettings,
+    /// The shard count `S`.
+    pub shards: u16,
 }
 
 impl RatingConfig {
@@ -372,11 +397,20 @@ impl RatingConfig {
         } else {
             None
         };
+        let shards = self.scheduling.shards;
+        if !(1..=MAX_SHARDS).contains(&shards) {
+            return Err(ConfigError::DurationOutOfRange {
+                field: "scheduling.shards",
+                value: u64::from(shards),
+                max: u64::from(MAX_SHARDS),
+            });
+        }
         Ok(ResolvedConfig {
             queues,
             producers,
             election,
             usage: self.usage_feed_settings()?,
+            shards,
         })
     }
 
@@ -439,6 +473,7 @@ impl RatingConfig {
             child_work: partitions("child_work_partitions", q.child_work_partitions)?,
             rollup: partitions("rollup_partitions", q.rollup_partitions)?,
             delivery: partitions("delivery_partitions", q.delivery_partitions)?,
+            fact_bind: partitions("fact_bind_partitions", q.fact_bind_partitions)?,
         };
         QueueLayout::new(partitions, q.feed_epochs.clone()).map_err(|_| ConfigError::FeedEpochs)
     }

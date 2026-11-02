@@ -34,6 +34,10 @@ pub enum Dependency {
     TenantHierarchy,
     /// The database.
     Database,
+    /// Pricing's `PricingReadV1` (the freshness proof).
+    Pricing,
+    /// Products' derived-declaration read (R-31).
+    Products,
 }
 
 impl Dependency {
@@ -47,6 +51,8 @@ impl Dependency {
             Self::UsageFeed => "usage_feed",
             Self::TenantHierarchy => "tenant_hierarchy",
             Self::Database => "database",
+            Self::Pricing => "pricing",
+            Self::Products => "products",
         }
     }
 }

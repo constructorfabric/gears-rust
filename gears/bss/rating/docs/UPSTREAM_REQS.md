@@ -521,10 +521,23 @@ where Subscriptions writes only `(currency, region)`), `cohort`, `priceEligibili
 (cohort-based re-binding) is not marked superseded. Rating reads Subscriptions through SUB-D-29 and
 the rows below; it does not rely on the stale body text.
 
+**Target design in PR #5516 (open, 2026-10-27; Rating follows it, T-D-87).** Subscriptions PR #5516
+replaces the body documents (it deletes `SEAMS.md` and `design/`, adds `features/01…09`, and runs the
+decision log to SUB-D-57). Its `subscriptions-rating/1` profile publishes versioned full-replacement
+facts — one per obligation (subscription × component occurrence × item × charge kind × payer
+allocation × period) — carrying served extent, timing, `BillingTerms`, slices with purchase lots and
+the frozen accepted bindings (`DESIGN.md` §3.3.3; `features/08-commercial-facts.md` §3.3; SUB-D-21
+rewritten, SUB-D-32, SUB-D-40…SUB-D-46). Subscriptions cuts at `ends_on` with continuation
+authority or publishes an `unresolved` interval (SUB-D-41, SUB-D-42), publishes the usage parent at
+period opening, and routes one-time valuation to Rating behind S-U08/S-U13. Rating's asks below are
+met by that design once it merges; wire names, the producer digest codec and transport stay open
+(S-U13). Open PR #5131 keeps the unversioned `BillableItemCreated` and conflicts in direction with
+#5516.
+
 | # | Contract | Required fields | Version semantics | Evidence | Status |
 |---|---|---|---|---|---|
 | S-1 | Subscription version (timeline) | `subscription_id, version`, tenant axes (payer/seller/resource/ordering), plan links, add-ons, `QuantityInterval`s, `(currency, region)`, suspensions, `(changeEffectiveAt, changeMode)` | monotonic | `design/01-foundation-lifecycle.md:187`, `design/03-plan-changes.md`, `design/09-consumer-contracts.md:217` | ASSUMED; SUB-R1 field list still names phases and cohort (pre-PriceBook) |
-| S-2 | Recurring period fact `BillableItemCreated(kind = recurring)` per `(subscriptionId, billing period, lineKey)`, money-free, traceability tuple `{subscriptionId, skuId, planId, priceId}` + `pricingSnapshotRef` (the accepted price binding, not Rating's snapshot — R-29), suspended intervals + `pause_recurring\|continue`, period-start `payerTenantId`, `collectionPaused`; cut daily by 00:00 | as listed; **no** `plan_revision_id`, pins or `BillingTerms` | unique key; no fact versions | `design/08-events-billing.md:118, 192, 215, 249-257`; SUB-D-07/19/20/21/27 | ASSUMED; emission timing ambiguous (opening vs end). **CONFLICTING** with Rating's versioned-facts ask: SUB-D-21 (`DECISIONS.md:61, 213-218`) keeps the fact unversioned — an interval closed mid-period "triggers nothing — the standing fact under-covers via derivation", never a retraction (`design/08-events-billing.md:253`); an in-place `changePlan` cuts a new `plan#n+1` fact and nothing for `plan#n`. Rating derives coverage from S-1 until this closes (T-D-82) |
+| S-2 | Recurring period fact `BillableItemCreated(kind = recurring)` per `(subscriptionId, billing period, lineKey)`, money-free, traceability tuple `{subscriptionId, skuId, planId, priceId}` + `pricingSnapshotRef` (the accepted price binding, not Rating's snapshot — R-29), suspended intervals + `pause_recurring\|continue`, period-start `payerTenantId`, `collectionPaused`; cut daily by 00:00 | as listed; **no** `plan_revision_id`, pins or `BillingTerms` | unique key; no fact versions | `design/08-events-billing.md:118, 192, 215, 249-257`; SUB-D-07/19/20/21/27 | ASSUMED; emission timing ambiguous (opening vs end). **CONFLICTING** with Rating's versioned-facts ask: SUB-D-21 (`DECISIONS.md:61, 213-218`) keeps the fact unversioned — an interval closed mid-period "triggers nothing — the standing fact under-covers via derivation", never a retraction (`design/08-events-billing.md:253`). PR #5516 rewrites SUB-D-21 to full successor versions; Rating consumes that (T-D-87, superseding the derivation of T-D-82) |
 | S-3 | Resource → subscription attribution | — | — | none; `PRD.md:360` assumes usage arrives "already keyed by `subscriptionId`" | **ABSENT** — CONFLICTING with UC U-7 (R-25) |
 | S-4 | `lineKey` rule `plan#n`, `addon:{addOnId}#n` | — | immutable | SUB-D-21 | ASSUMED (T-D-34) |
 | S-5 | Ordering key `(orderingTenantId, subscriptionId)` | — | — | SUB-D-06 | ASSUMED |
@@ -533,8 +546,8 @@ the rows below; it does not rely on the stale body text.
 | S-8 | Billing group / sealed composition | — | — | none ("billing group" occurs nowhere) | **ABSENT** (Atlas C04 PROPOSED) |
 | S-9 | Per-period price bindings (pins): renewal sends the current bindings as `pins` to `resolve` with the period start as `date`; signup sends none; first period = the accepted order's bindings (Orders D-162) | price ids, dimension choices, SKU versions/descriptors per period | per period | SUB-D-29 (`DECISIONS.md:275-277`); Orders `DECISIONS.md:3153, 3156` | DOCUMENTED (decision only); **no store, table or fact field names them** |
 | S-10 | Billing periods and anchors: Subscriptions cuts periods (`RecurringEmitter`; SB1, T-D-33/34); `billingAnchor` from Contract terms; SUB-D-27 adopts pricing's `billingAnchorPolicy` | — | — | `SEAMS.md:94`; `DECISIONS.md:67, 258-260`; `PRD.md:134` | **CONFLICTING** — `billingAnchorPolicy` no longer exists in Pricing; pricing-sdk defines `BillingTerms{cycle: Month\|Year, anchor: Calendar\|SubscriptionStart, anchor_at, timezone: Utc, source, digest}` as "Subscriptions-owned invoice terms" (`gears/bss/pricing/pricing-sdk/src/terms.rs:160-198`) |
-| S-11 | Committed quantity: `updateQuantity` transitions stored effective-dated (`QuantityInterval`), `quantity @ t`; `SubscriptionQuantityChanged` rides the existing fact | — | effective-dated | `PRD.md:636`; `design/03-plan-changes.md:247`; `design/02-composition-versioning.md:205` | ASSUMED; still named `quantitySource = subscription_seat_count` (pre-PriceBook). **CONFLICTING** with Rating's "a change is a new fact version": `updateQuantity` "opens no interval and triggers no cut" (SUB-D-21, `design/08-events-billing.md:253`), so Rating slices quantity from S-1's `QuantityInterval`s (T-D-82) |
-| S-12 | Re-resolve at an `ends_on` inside a period: SUB-D-29 says "Subscriptions resolves again with the pin on that date"; Orders records the cut owner as **unagreed** between Subscriptions and Rating | — | — | `DECISIONS.md:276`; Orders `DECISIONS.md:3190`, `UPSTREAM_REQS.md:300-301` | CONFLICTING |
+| S-11 | Committed quantity: `updateQuantity` transitions stored effective-dated (`QuantityInterval`), `quantity @ t`; `SubscriptionQuantityChanged` rides the existing fact | — | effective-dated | `PRD.md:636`; `design/03-plan-changes.md:247`; `design/02-composition-versioning.md:205` | ASSUMED; still named `quantitySource = subscription_seat_count` (pre-PriceBook). **CONFLICTING** with Rating's "a change is a new fact version": `updateQuantity` "opens no interval and triggers no cut" (SUB-D-21, `design/08-events-billing.md:253`), PR #5516 replaces it with lot-aware full versions (SUB-D-46); Rating reads quantity from the fact's lots (T-D-87) |
+| S-12 | Re-resolve at an `ends_on` inside a period: SUB-D-29 says "Subscriptions resolves again with the pin on that date"; Orders records the cut owner as **unagreed** between Subscriptions and Rating | — | — | `DECISIONS.md:276`; Orders `DECISIONS.md:3190`, `UPSTREAM_REQS.md:300-301`; PR #5516 SUB-D-41, SUB-D-42 | PROPOSED in PR #5516: Subscriptions cuts (or publishes an `unresolved` interval); Rating adopts it and only proves freshness (T-D-87) |
 
 The Subscriptions asks below together form the Atlas C04 surface (former J-4); they are split so
 each can be agreed and delivered on its own.
@@ -553,52 +566,56 @@ WHEN; Rating never self-synthesizes a commercial period (T-D-33).
   today's `BillableItemCreated` has no versions, so a re-emission with a different digest can only
   be quarantined.
 - **Source**: `gears/bss/rating` — DESIGN §3.6 Flow C; feature [`06-fact-scheduling`](./features/06-fact-scheduling.md).
-- **Status**: **CONFLICTING** (S-2, S-11) with SUB-D-21, which decides that a fact is the WHEN and
-  identity trigger only and that coverage is derived from the effective-dated read model, never
-  retracted or versioned (`DECISIONS.md:61, 213-218`); ABSENT (S-8); MIGRATION mapping in DESIGN
-  Flow C. Interim: Rating clips served extent and slices quantity from the stored subscription
-  version (S-1), and a newer version re-evaluates the affected children (T-D-82). Open PR #5131
-  (`changeComposition`) covers increases only and does not change this.
+- **Status**: on `main`, **CONFLICTING** (S-2, S-11) with SUB-D-21, which keeps a fact unversioned
+  and derives coverage (`DECISIONS.md:61, 213-218`); ABSENT (S-8). **PROPOSED** in PR #5516 (open):
+  versioned full replacements per obligation with `BillableSetSealed` (SUB-D-21 rewritten, SUB-D-40);
+  Rating builds against it (T-D-87) and its interim derivation (T-D-82) and MIGRATION mapping are
+  withdrawn. Open PR #5131 keeps the unversioned fact.
 - **Register aliases**: J-4; DECISIONS R-03; reconcile SUB-D-07/19/21/28 and AC 27.
-- **Acceptance signal**: either Subscriptions versions facts and Rating's fact intake applies two
-  versions of one fact and produces two parent revisions, or the two owners agree the derived
-  rule; in both cases the joint fixture of V83 (an in-place `changePlan` on 15 October) bills one
-  month, not 1.5.
+- **Acceptance signal**: Subscriptions versions facts and Rating's fact intake applies two versions
+  of one fact and produces two parent revisions; the joint fixture of V83 (a same-component increase
+  on 15 October published as one fact's second version with two lots) bills 10 seats then 12, never
+  10 + 22.
 
 #### Pricing inputs on every fact
 
 - [ ] `p1` - **ID**: `cpt-cf-bss-rating-upreq-subscriptions-fact-pricing-inputs`
 
-Every recurring and usage fact **MUST** carry the inputs Rating resolves prices with (T-D-73): the
-`plan_revision_id`; the period's pins as `[(item_id, dimension_value?, price_id)]` (SUB-D-29; the
-accepted order's bindings for the first period, Orders D-162); the committed quantity per item for
-the period (S-11); and the period's `BillingTerms` (cycle, anchor, `anchor_at`, UTC).
+Every recurring and usage fact **MUST** carry the pricing inputs Rating rates with (T-D-73,
+T-D-87): per slice the frozen accepted bindings (`AcceptedBinding` with `plan_id`, `revision_id`,
+its `UsageRatingPolicy` and invoice inputs; the accepted order's bindings for the first period,
+Orders D-162), the committed quantity as complete purchase-lot allocations (S-11), and the period's
+`BillingTerms` (cycle, anchor, `anchor_at`, UTC, source).
 
 - **Rationale**: Pricing stores no pins (P-19) and SUB-D-29 names no store for them (S-9); without
-  them on the fact Rating cannot call `resolve`, cannot price a per_unit recurring line (no pricing
+  them on the fact Rating cannot price a slice, cannot price a per_unit recurring line (no pricing
   read carries quantity, P-27), and cannot place proration and the floor (T-D-77, T-D-78).
-- **Source**: `gears/bss/rating` — DECISIONS T-D-73, T-D-77; feature [`06-fact-scheduling`](./features/06-fact-scheduling.md).
-- **Status**: DOCUMENTED in SUB-D-29 as a decision; ABSENT as a fact field.
+- **Source**: `gears/bss/rating` — DECISIONS T-D-73, T-D-77, T-D-87; feature [`06-fact-scheduling`](./features/06-fact-scheduling.md).
+- **Status**: on `main` DOCUMENTED in SUB-D-29 as a decision; ABSENT as a fact field. **PROPOSED**
+  in PR #5516 (open): the fact carries frozen accepted terms per slice and lot (`DESIGN.md`
+  §3.3.3); exact names and codec open (S-U13).
 - **Register aliases**: DECISIONS R-03.
-- **Acceptance signal**: Rating resolves a fact's bindings from the fact alone and gets the same
-  `binding_digest` Subscriptions recorded.
+- **Acceptance signal**: Rating stores a fact's bindings from the fact alone, and its freshness
+  `resolve` with the accepted pins returns the same per-cell `binding_digest`.
 
 #### Re-resolve at `ends_on` inside a period
 
 - [ ] `p2` - **ID**: `cpt-cf-bss-rating-upreq-subscriptions-ends-on-cut`
 
-Subscriptions **MUST** confirm who cuts a period at a binding's `ends_on` (S-12). Rating's design
-resolves again with the fact's pin on that date for the rest of the period and slices the child
-there (T-D-73, pricing D-397/D-425); if Subscriptions instead issues a new fact version with the new
-binding, Rating applies that version and the result is the same.
+Subscriptions **MUST** confirm who cuts a period at a binding's `ends_on` (S-12). PR #5516 answers:
+Subscriptions cuts the fact at `ends_on` when an accepted continuation policy authorizes the
+successor, and otherwise publishes the interval `unresolved` (SUB-D-41, SUB-D-42). Rating adopts it
+(T-D-87): it never resolves a successor for its own slicing, and its freshness `resolve` before a
+first final only detects an `ends_on` the fact has not cut at (`pending(terms_stale)`, with a
+reconciliation request).
 
 - **Rationale**: SUB-D-29 gives the re-resolve to Subscriptions, Orders marks it unagreed, and both
   gears doing it independently could disagree on the binding for the rest of the period.
-- **Source**: `gears/bss/rating` — DECISIONS T-D-73.
-- **Status**: CONFLICTING (S-12).
+- **Source**: `gears/bss/rating` — DECISIONS T-D-73, T-D-87.
+- **Status**: PROPOSED in PR #5516 (open); CONFLICTING on `main` (S-12).
 - **Register aliases**: Orders open item "`ends_on` cut owner".
-- **Acceptance signal**: both gears' documents name one owner and a temporary-price fixture
-  (`resolve_nested_pairs`) produces the same slices in both.
+- **Acceptance signal**: a temporary-price fixture (`resolve_nested_pairs`) gives the same slices in
+  Subscriptions' fact versions as in Pricing's answers, and Rating's freshness proof passes on them.
 
 #### Usage parent fact per period
 
@@ -612,10 +629,12 @@ D13).
   current Subscriptions documents have no usage fact kind and SUB-D-07/SUB-D-19 and AC 27 require one
   priced line per `(subscriptionId, period, lineKey)` — a CONTRACT CONFLICT.
 - **Source**: `gears/bss/rating` — DESIGN §3.6 usage parent; feature [`06-fact-scheduling`](./features/06-fact-scheduling.md).
-- **Status**: ABSENT; MIGRATION: Rating derives a usage parent (`parent_origin = derived`).
+- **Status**: ABSENT on `main`. **PROPOSED** in PR #5516 (open): the usage parent is published at
+  commercial-period opening, including the first partial period and lines with no usage
+  (`features/08-commercial-facts.md` §3.3 step 4). Rating's MIGRATION derivation is withdrawn
+  (T-D-87).
 - **Register aliases**: J-4; DECISIONS R-20; Atlas Plus X9.
-- **Acceptance signal**: Rating's MIGRATION derivation is switched off and every usage delivery
-  carries `billing_group_kind = published`.
+- **Acceptance signal**: every usage delivery carries a published billing group.
 
 #### Attribution segments
 

@@ -12,6 +12,7 @@
 // @cpt-dod:cpt-cf-bss-rating-dod-foundation-module:p1
 // @cpt-dod:cpt-cf-bss-rating-dod-foundation-inbox:p1
 // @cpt-dod:cpt-cf-bss-rating-dod-intake-capture:p1
+// @cpt-dod:cpt-cf-bss-rating-dod-schedule-fact-intake:p1
 
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
@@ -39,11 +40,16 @@ use crate::authz::ServiceGrant;
 use crate::config::{MAX_LEADER_STOP_SECS, RatingConfig, UsageFeedSettings};
 use crate::domain::audit::OperatorAudit;
 use crate::domain::backoff::{Backoff, jittered};
+use crate::domain::declaration::{
+    DeclarationSource, DerivedDeclarationRead, DerivedDeclarationStore,
+};
 use crate::domain::error::{Cause, DomainError};
 use crate::domain::exception::{ExceptionRegister, ExceptionSweeper, SweepReport};
-use crate::domain::inbox::{Inbox, InboxParts};
+use crate::domain::fact::intake::{FactIntake, FactIntakeParts};
+use crate::domain::inbox::{Inbox, InboxParts, InboxSource};
 use crate::domain::leadership::{LeaderWork, LeadershipName, LeaseProvider};
 use crate::domain::ports::{Clock, Dependency, RatingMetricsPort, SweepOutcome, TenantGrant};
+use crate::domain::pricing::{PricingBindingStore, PricingClient};
 use crate::domain::usage::NoAttribution;
 use crate::domain::usage::declarations::{DeclarationCache, MeterDeclarations};
 use crate::domain::usage::feed::UsageFeedPort;
@@ -62,9 +68,12 @@ use crate::infra::queues::{self, OUTBOX_TABLE_PREFIX, QueueLayout, UnwiredQueue}
 use crate::infra::storage::migrations::Migrator;
 use crate::infra::storage::repo::audit_repo::OrmAuditRepo;
 use crate::infra::storage::repo::exception_repo::OrmExceptionRepo;
+use crate::infra::storage::repo::fact_repo::OrmFactRepo;
 use crate::infra::storage::repo::inbox_repo::OrmInboxRepo;
+use crate::infra::storage::repo::pricing_repo::OrmPricingRepo;
 use crate::infra::storage::repo::usage_repo::OrmUsageRepo;
 use crate::infra::tenant_hierarchy::ResolverTenantHierarchy;
+use crate::infra::work_queue::{FactBindWorker, OutboxWorkQueue};
 
 /// What `init` builds and `serve` and `register_rest` use.
 struct RatingRuntime {
@@ -79,6 +88,42 @@ struct RatingRuntime {
     leader_timing: Option<ElectionTiming>,
     /// Usage capture and normalization (feature 04).
     usage: UsageRuntime,
+    /// Commercial fact intake (feature 06).
+    facts: FactRuntime,
+}
+
+/// What fact intake runs with: the intake, which the inbox applies `fact` entries through, and
+/// the work queues it enqueues into, started by `serve`.
+struct FactRuntime {
+    intake: FactIntake,
+    queue: Arc<OutboxWorkQueue>,
+}
+
+/// `PricingReadV1` from `ClientHub`, resolved at each call.
+struct HubPricing(Arc<ClientHub>);
+
+impl PricingClient for HubPricing {
+    fn client(&self) -> Result<Arc<dyn bss_pricing_sdk::read::PricingReadV1>, DomainError> {
+        bound::<dyn bss_pricing_sdk::read::PricingReadV1>(
+            &self.0,
+            Dependency::Pricing,
+            "pricing read",
+        )
+    }
+}
+
+/// The derived-declaration read from `ClientHub`, resolved at each call (R-31: Products serves
+/// none yet, so only a test or a later adapter binds one).
+struct HubDeclarations(Arc<ClientHub>);
+
+impl DeclarationSource for HubDeclarations {
+    fn reader(&self) -> Result<Arc<dyn DerivedDeclarationRead>, DomainError> {
+        bound::<dyn DerivedDeclarationRead>(
+            &self.0,
+            Dependency::Products,
+            "derived declaration read",
+        )
+    }
 }
 
 /// What the usage feed readers are built from; the feed, the meter declarations and the tenant
@@ -155,13 +200,14 @@ impl Gear for BssRatingGear {
         let clock: Arc<dyn Clock> = Arc::new(WallClock);
         let metrics = self.metrics_port();
         let grant: Arc<dyn TenantGrant> = Arc::new(ServiceGrant::new(enforcer.clone()));
-        // No pipeline feature is built yet: no inbox source has an applier and no exception kind
-        // a retrier. Each feature registers its own here as it lands.
+        let facts = fact_runtime(&db, &hub, &grant, &clock, &resolved);
+        // Each feature registers its inbox source's applier here as it lands.
+        let appliers = BTreeMap::from([(InboxSource::Fact, facts.intake.applier())]);
         let inbox = Inbox::new(InboxParts {
             db: db.clone(),
             enforcer: enforcer.clone(),
             repo: Arc::new(OrmInboxRepo),
-            appliers: BTreeMap::new(),
+            appliers,
             producers: resolved.producers,
             grant: Arc::clone(&grant),
             exceptions: ExceptionRegister::new(Arc::new(OrmExceptionRepo), Arc::clone(&clock)),
@@ -201,11 +247,53 @@ impl Gear for BssRatingGear {
                 queues: resolved.queues,
                 leader_timing,
                 usage,
+                facts,
             }))
             .map_err(|_| anyhow::anyhow!("bss-rating: initialised twice"))?;
         tracing::info!("bss-rating initialised");
         Ok(())
     }
+}
+
+/// Fact intake over the gear's database, with Pricing and Products resolved from `hub` at each
+/// call (feature 06).
+fn fact_runtime(
+    db: &Db,
+    hub: &Arc<ClientHub>,
+    grant: &Arc<dyn TenantGrant>,
+    clock: &Arc<dyn Clock>,
+    resolved: &crate::config::ResolvedConfig,
+) -> FactRuntime {
+    let queue = Arc::new(OutboxWorkQueue::new(&resolved.queues));
+    let pricing = PricingBindingStore::new(
+        db.clone(),
+        Arc::new(OrmPricingRepo),
+        Arc::new(HubPricing(Arc::clone(hub))),
+        Arc::clone(grant),
+        Arc::clone(clock),
+    );
+    let declarations = DerivedDeclarationStore::new(
+        db.clone(),
+        Arc::new(OrmPricingRepo),
+        Arc::new(HubDeclarations(Arc::clone(hub))),
+        Arc::clone(grant),
+        Arc::clone(clock),
+    );
+    let intake = FactIntake::new(FactIntakeParts {
+        db: db.clone(),
+        facts: Arc::new(OrmFactRepo),
+        children: Arc::new(OrmFactRepo),
+        schedules: Arc::new(OrmFactRepo),
+        projections: Arc::new(OrmFactRepo),
+        pricing,
+        declarations,
+        exceptions: ExceptionRegister::new(Arc::new(OrmExceptionRepo), Arc::clone(clock)),
+        queue: Arc::clone(&queue) as Arc<dyn crate::domain::work::WorkQueue>,
+        grant: Arc::clone(grant),
+        clock: Arc::clone(clock),
+        shards: resolved.shards,
+    });
+    FactRuntime { intake, queue }
 }
 
 /// Registers the stub type schemas of the authz labels; a refused registration fails the boot,
@@ -264,11 +352,17 @@ impl BssRatingGear {
             cancel.cancelled().await;
             return Ok(());
         };
+        let intake = runtime.facts.intake.clone();
         let outbox = queues::start(runtime.db.clone(), &runtime.queues, |queue| {
-            Arc::new(UnwiredQueue::new(queue))
+            if queue == queues::FACT_BIND_QUEUE {
+                Arc::new(FactBindWorker::new(intake.clone()))
+            } else {
+                Arc::new(UnwiredQueue::new(queue))
+            }
         })
         .await
         .context("bss-rating: the outbox work queues failed to start")?;
+        runtime.facts.queue.start(Arc::clone(outbox.outbox()));
         let leaders = AbortOnDrop(tokio::spawn(run_leader_jobs(
             Arc::clone(&runtime),
             cancel.child_token(),

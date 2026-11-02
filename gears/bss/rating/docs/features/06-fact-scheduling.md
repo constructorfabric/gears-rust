@@ -18,7 +18,7 @@
   - [2.4 Write a finalization policy](#24-write-a-finalization-policy)
   - [Migrated namespace flows](#migrated-namespace-flows)
 - [3. Processes / Business Logic (CDSL)](#3-processes--business-logic-cdsl)
-  - [3.1 Map a current fact to a fact identity (MIGRATION)](#31-map-a-current-fact-to-a-fact-identity-migration)
+  - [3.1 Validate a fact version against the profile](#31-validate-a-fact-version-against-the-profile)
   - [3.2 Resolve and pin the finalization policy](#32-resolve-and-pin-the-finalization-policy)
   - [3.3 Compute the expected children of a fact](#33-compute-the-expected-children-of-a-fact)
   - [3.4 Apply a newer fact version](#34-apply-a-newer-fact-version)
@@ -45,13 +45,17 @@
 
 ### 1.1 Overview
 
-Accept commercial facts and their versions through the inbox; bind each fact's prices by calling
-Pricing's `resolve` with the pins the fact carries (date = the period start, again at a binding's
-`ends_on`; T-D-73) and store the bindings, the Products derived usage declarations and the usage
-policy projection of the line; pin the Rating-owned finalization policy for each usage fact; derive
-and create the expected child windows beneath each fact from the binding's `UsageRatingPolicy`
-(T-D-75) on a durable schedule; and wake every child and fact head whose state can change by time
-alone.
+Accept commercial fact versions through the inbox — Subscriptions' versioned, full-replacement
+facts (`subscriptions-rating/1`, Subscriptions PR #5516; T-D-87), each carrying its served extent,
+period, timing, `BillingTerms` and a timeline of slices with the frozen accepted bindings and
+purchase lots in force — and store each version with an ordered head; keep each accepted binding as
+the binding of record (T-D-73 as amended by T-D-87), the Products derived usage declarations and the
+usage policy projection of the line; pin the Rating-owned finalization policy for each usage fact;
+derive and create the expected child windows beneath each fact from the binding's
+`UsageRatingPolicy` (T-D-75) on a durable schedule; and wake every child and fact head whose state
+can change by time alone. Rating never substitutes a term the fact carries: Pricing's `resolve` with
+the accepted pins only proves, before a child's first final, that the binding is still current
+(T-D-87).
 
 ### 1.2 Purpose
 
@@ -69,7 +73,7 @@ further upstream event. The finalization delay is Rating's, versioned and pinned
 
 | Actor | Role in Feature |
 |-------|-----------------|
-| `cpt-cf-bss-rating-actor-subscriptions` | Publishes commercial facts and their versions (CURRENT: documented `BillableItemCreated`, no transport; TARGET: `BillableFactPublished`, PROPOSED) |
+| `cpt-cf-bss-rating-actor-subscriptions` | Publishes commercial fact versions (CURRENT on `main`: the documented, unversioned `BillableItemCreated`, no code or transport; TARGET: `BillableFactPublished` under the `subscriptions-rating/1` profile of Subscriptions PR #5516, open — what this feature consumes, T-D-87) |
 | `cpt-cf-bss-rating-actor-rating` | Runs fact intake, the scheduler and the wake scanner under its service identity |
 | `cpt-cf-bss-rating-actor-platform-operator` | Writes platform-default finalization policies (`platform_finalization_policy × write`, audited). Seller finalization policies are written by a seller operator (`finalization_policy × write`, DESIGN §4.8), a role the PRD does not list as an actor |
 
@@ -80,7 +84,7 @@ further upstream event. The finalization delay is Rating's, versioned and pinned
 - **Decomposition**: [DECOMPOSITION.md](../DECOMPOSITION.md) §2.6.
 - **Dependencies**: [Foundation](01-foundation.md) (inbox, tenancy scopes, Cluster leader election, work queues, contract fakes); [Deterministic Evaluation Core](02-evaluation-core.md) (`window_geometry`).
 - **Consumers**: [Child Evaluation and Finalization](07-child-evaluation.md) evaluates the children this feature creates and wakes, against the pinned policy; [Parent Roll-up and Billing Delivery](09-rollup-delivery.md) rolls up per fact version and is woken by `rollup_due_at`; [Corrections, Replay and Administrative Re-rate](08-corrections-rerate.md) relies on fact versions bumping `input_generation`.
-- **Upstream**: `cpt-cf-bss-rating-upreq-subscriptions-versioned-facts`, `cpt-cf-bss-rating-upreq-subscriptions-usage-fact`, `cpt-cf-bss-rating-upreq-subscriptions-recovery-reads`, `cpt-cf-bss-rating-upreq-delay-only-acceptance`, `cpt-cf-bss-rating-upreq-cluster-coordination-backend` ([UPSTREAM_REQS](../UPSTREAM_REQS.md) §2.6, §2.9, §2.12); the facts must carry the period's pins, plan revision, committed quantity and `BillingTerms` (SUB-D-29; UPSTREAM_REQS §2.6); pricing's `PricingReadV1::resolve` (T-D-73) and the Products derived-declaration read (R-31, UPSTREAM_REQS §2.5). `cpt-cf-bss-rating-upreq-lifetime-settlement-model` is closed: pricing has no lifetime window (R-28).
+- **Upstream**: `cpt-cf-bss-rating-upreq-subscriptions-versioned-facts`, `cpt-cf-bss-rating-upreq-subscriptions-usage-fact`, `cpt-cf-bss-rating-upreq-subscriptions-recovery-reads`, `cpt-cf-bss-rating-upreq-delay-only-acceptance`, `cpt-cf-bss-rating-upreq-cluster-coordination-backend` ([UPSTREAM_REQS](../UPSTREAM_REQS.md) §2.6, §2.9, §2.12); the facts carry their served extent, timing, `BillingTerms`, slices, lots and frozen accepted bindings (Subscriptions PR #5516, T-D-87; UPSTREAM_REQS §2.6); pricing's `PricingReadV1::resolve` for the freshness proof (T-D-73, T-D-87) and the Products derived-declaration read (R-31, UPSTREAM_REQS §2.5). `cpt-cf-bss-rating-upreq-lifetime-settlement-model` is closed: pricing has no lifetime window (R-28).
 
 **UI applicability**: no user interface. The finalization-policy REST routes follow the shared API conventions of DESIGN §3.3 (RFC 9457 problem details, keyset cursors, required `Idempotency-Key` on create); consoles own their UI.
 
@@ -94,22 +98,23 @@ further upstream event. The finalization delay is Rating's, versioned and pinned
 
 **Actor**: `cpt-cf-bss-rating-actor-subscriptions` (through the inbox: event when enabled, pull recovery always)
 
-**Success Scenarios**: a new fact version is stored with its head; its children are created (recurring, usage provisional) or its schedules are created (usage: one per usage item, `(tenant_id, fact_id, item_id)`); children of a newer version get `input_generation + 1`.
+**Success Scenarios**: a new fact version is stored with its head and its accepted bindings; its `period_line` child is created (recurring) or its schedule and expected manifest are created (usage: one schedule per fact, keyed `(tenant_id, fact_id, item_id)`, since a usage fact is one PriceBook item); a newer version bumps `input_generation` of every child of the fact.
 
-**Error Scenarios**: same key with a different digest (`fact_digest_conflict`, quarantined); lower version after a higher one (stored, inbox `applied`, nothing else touched; V81); no matching finalization policy (the schedule waits `policy_pending` with an exception `finalization_policy_missing`, V80); a cell without a binding (an expected child that fails `price_uncovered` in the core's bind step); a sub-second period bound, served extent, quantity or term change (`instant_not_whole_second`, the fact version quarantined; V60); Pricing refuses the resolve (any 4xx: `pricing_refused(PIN_FOREIGN | PIN_DUPLICATE | REVISION_NOT_PUBLISHED | REVISION_NOT_YET_AVAILABLE | PERMISSION_DENIED | …)`, `incomplete_commercial_inputs`) or is unavailable (`pricing_unavailable`) — for a usage fact the head records it as `binding_state` and a pending one is retried (V77); the derived declaration cannot be read (the fact is stored and its usage children wait `pending(derived_declaration_unavailable)`, R-31 — never failed or quarantined at intake); a `resource`-scoped usage policy (LAUNCH-GATED, `resource_scope_not_supported`); a CURRENT fact that carries no pins (a recurring child or the usage head `pending(pins_unavailable)` — Rating never resolves a signup binding for an existing subscription).
+**Error Scenarios**: same key with a different digest (`fact_digest_conflict`, quarantined); lower version after a higher one (stored, inbox `applied`, nothing else touched; V81); a sub-second instant anywhere in the fact (`instant_not_whole_second`, the fact version quarantined; V60); a fact that breaks the profile (§3.1: slices that do not partition the served extent, a chargeable slice without terms, a lot naming a term the fact does not carry, a binding whose `money_digest` or `template_digest` does not verify, a quantity outside canonical decimal text — `payload_invalid`, quarantined); no matching finalization policy (the schedule waits `policy_pending` with an exception `finalization_policy_missing`, V80); a derived declaration that cannot be read (the fact is stored, its head waits `pending(derived_declaration_unavailable)` and is retried on `rating.fact_bind`, R-31 — never failed or quarantined at intake) or that differs from the stored copy (`failed(derived_declaration_conflict)`, exception); a `resource`-scoped usage policy (LAUNCH-GATED, `resource_scope_not_supported`); usage bindings of one fact that disagree on `rating_window`, `aggregation_scope` or `meter` (`usage_policy_mismatch`, V86). An `unresolved` slice is not an intake error: the fact is stored and the children it touches wait at evaluation (V85).
 
 **Steps**:
-1. [ ] - `p1` - Accept the fact into the inbox keyed `(source = fact, fact_id, fact_version)` with its payload digest; **IF** the key exists with another digest, quarantine and stop; **IF** a period bound, served extent, quantity change or term change has a sub-second part, quarantine the fact version `instant_not_whole_second` and stop, never truncating it (DESIGN 09 §4.1, V60) - `inst-af-inbox`
-2. [ ] - `p1` - **IF** the producer has no versioned identity (CURRENT), derive `fact_id` and `fact_version` with the MIGRATION mapping (§3.1) - `inst-af-migrate`
-3. [ ] - `p1` - Insert the fact version (insert-only) and raise the head's `current_version` to the maximum - `inst-af-insert`
-   1. [ ] - `p1` - **IF** the fact version is lower than the head's `current_version` (a late redelivery), mark the inbox entry `applied` and COMMIT: steps 4–8 run only for the head's current version, so an old version never re-binds, never lowers a schedule's `fact_version` and never touches a child (V81) - `inst-af-current-only`
-4. [ ] - `p1` - **IF** kind is `recurring`, insert the `period_line` child if absent with `next_check_at = now` (advance) or `served_to` (arrears) - `inst-af-recurring`
-5. [ ] - `p1` - **IF** kind is `one_time`, store only; a `one_time` child exists only if R-19 is accepted (T-D-18) - `inst-af-one-time`
-6. [ ] - `p1` - **IF** kind is `usage` or `recurring`, bind the fact before its transaction: `PricingBindingStore.ensure` calls `PricingReadV1::resolve(revision_id, date = period start, pins)` as `bss-rating.system` with a `SecurityContext` built for the fact's seller tenant (`subject_tenant_id` = seller = `CatalogRef.tenant_id`; pricing D-523, DESIGN §4.8) (splitting by `item_id` above 1 000 pins), stores each distinct answer verbatim in `bss_rating__pricing_binding` under its `binding_digest` and the question in `bss_rating__pricing_resolve` (DESIGN §3.7), stores each usage binding's derived declaration (`bss_rating__derived_declaration`) and writes the line's `bss_rating__usage_policy_projection`; a binding with an `ends_on` inside the period makes Rating resolve again with the same pin on `ends_on` for the rest of the period (one resolve per date; a child lists those at or before its window end in `binding_resolves`). This intake answer serves the schedule and provisional estimates; a child's first final uses an answer fetched on or after the UTC day of its window's last second (DESIGN §4.1). **IF** kind is `usage`, resolve and pin the finalization policy (§3.2), create one window schedule per usage item, keyed `(tenant_id, fact_id, item_id)`, from that item's binding `rating_window` (entries of one plan may differ, pricing D-504), the expected manifest — including one child over the billing period for each uncovered cell, which fails `price_uncovered` in the core's bind step (§3.3) — and the provisional children of windows that already have counters; set the head `binding_state = bound`; **IF** the policy's `aggregation_scope` is `resource`, create its children `failed(resource_scope_not_supported)` with an exception and no schedule (LAUNCH-GATED, T-D-75) - `inst-af-usage`
-   1. [ ] - `p1` - **IF** kind is `usage` and the bind fails, still store the fact and mark the inbox entry `applied`, but create no schedule, no manifest and no `rollup_due_at`: record the head's `binding_state = pending(pricing_unavailable)` with `binding_next_check_at = now + backoff` (503 `REGISTRY_UNAVAILABLE`, `ServiceUnavailable`), `pending(pins_unavailable)` (no pins: retried on the next fact version), or `failed(pricing_refused(<code>) | incomplete_commercial_inputs)` with an exception (any 4xx; retried on the next fact version). The `ChildWakeScanner` re-enqueues a pending head on `rating.fact_bind`, and the bind steps run again for the head's current version ([14 §3.6](#contract-14-3-6-f06)); roll-up never runs before the binding is stored (V77) - `inst-af-bind-pending`
-7. [ ] - `p1` - **IF** kind is `usage` and the fact is bound, or timing is `arrears`, set the head's `rollup_due_at = served_to` - `inst-af-rollup-due`
-8. [ ] - `p1` - **IF** this is a newer version, apply it to the existing children (§3.4) - `inst-af-new-version`
-9. [ ] - `p1` - Enqueue the affected children, mark the inbox entry `applied`; COMMIT - `inst-af-commit`
+1. [x] - `p1` - Accept the fact into the inbox keyed `(source = fact, fact_id, fact_version)` with Rating's digest of the payload; **IF** the key exists with another digest, quarantine `fact_digest_conflict` and stop; **IF** the fact breaks the profile (§3.1), quarantine the fact version `instant_not_whole_second` or `payload_invalid` and stop, never truncating it (DESIGN 09 §4.1, V60) - `inst-af-inbox`
+2. [x] - `p1` - **IF** kind is `usage`, before the transaction read the derived declaration of the fact's meter through `DerivedDeclarationStore.ensure` (R-31; stored verbatim in `bss_rating__derived_declaration`, its digest verified); a version lower than the stored head reads nothing (V81) - `inst-af-declarations`
+3. [x] - `p1` - Insert the fact version (insert-only) with its timeline and accepted terms, and raise the head's `current_version` to the maximum - `inst-af-insert`
+   1. [x] - `p1` - **IF** the fact version is lower than the head's `current_version` (a late redelivery), mark the inbox entry `applied` and COMMIT: steps 4–9 run only for the head's current version, so an old version never touches a binding, a schedule's `fact_version`, a child or the manifest (V81) - `inst-af-current-only`
+4. [x] - `p1` - Store each accepted binding the version carries in `bss_rating__pricing_binding` under its `binding_digest` (pricing's `selected_bindings_digest` of that one cell; `ON CONFLICT DO NOTHING`, the same digest with other content raises an alarm): it is the binding of record of the slices that name it (T-D-87) - `inst-af-bindings`
+5. [x] - `p1` - **IF** kind is `recurring`, insert the `period_line` child if absent with `next_check_at = now` (advance) or `served_to` (arrears), the fact's `timing` - `inst-af-recurring`
+6. [x] - `p1` - **IF** kind is `one_time`, store only; a `one_time` child exists only once R-19 is accepted and Subscriptions' S-U08/S-U13 gates lift (T-D-18, T-D-87) - `inst-af-one-time`
+7. [ ] - `p1` - **IF** kind is `usage` and its declaration is stored: **IF** the usage bindings disagree on `rating_window`, `aggregation_scope` or `meter`, create each cell's child over the billing period `failed(usage_policy_mismatch)` with an exception and no schedule; **IF** the policy's `aggregation_scope` is `resource`, create its children `failed(resource_scope_not_supported)` with an exception and no schedule (LAUNCH-GATED, T-D-75); otherwise write the line's `bss_rating__usage_policy_projection`, resolve and pin the finalization policy (§3.2), create the fact's window schedule from the binding's `rating_window`, record the expected manifest (§3.3) and create the provisional children of windows that already have counters; set the head `binding_state = bound` - `inst-af-usage`
+   1. [x] - `p1` - **IF** kind is `usage` and its declaration could not be read, still store the fact and mark the inbox entry `applied`, but create no schedule, no manifest and no `rollup_due_at`: record the head's `binding_state = pending(derived_declaration_unavailable)` with `binding_next_check_at = now + backoff`, or `failed(derived_declaration_conflict)` with an exception. The `ChildWakeScanner` re-enqueues a pending head on `rating.fact_bind`, and step 7 runs again for the head's current version ([14 §3.6](#contract-14-3-6-f06)); roll-up never runs before the head is bound - `inst-af-bind-pending`
+8. [x] - `p1` - **IF** kind is `usage` and the fact is bound, or kind is `recurring` and timing is `arrears`, set the head's `rollup_due_at = served_to` - `inst-af-rollup-due`
+9. [x] - `p1` - **IF** this is a newer version, apply it to the existing children (§3.4) - `inst-af-new-version`
+10. [x] - `p1` - Enqueue the affected children, mark the inbox entry `applied`; COMMIT - `inst-af-commit`
 
 Canonical: DESIGN §3.6 Flow C and the usage parent flow; detail in [14 §3.6](#contract-14-3-6-f06).
 
@@ -138,7 +143,7 @@ Runs at least once per minute per shard; after an outage the same loop catches u
 
 **Actor**: `cpt-cf-bss-rating-actor-rating` (`ChildWakeScanner`, leader of one shard, independent of the creation cursor)
 
-**Success Scenarios**: every `pending`, `provisional` or `final_stale` child with `next_check_at ≤ now`, every fact head with `rollup_due_at ≤ now` and every usage fact head whose binding is `pending(pricing_unavailable)` with `binding_next_check_at ≤ now` is enqueued, and its next check is set in the same transaction.
+**Success Scenarios**: every `pending`, `provisional` or `final_stale` child with `next_check_at ≤ now`, every fact head with `rollup_due_at ≤ now` and every usage fact head whose binding is `pending(derived_declaration_unavailable)` with `binding_next_check_at ≤ now` is enqueued, and its next check is set in the same transaction.
 
 **Error Scenarios**: crash before commit (times not advanced; rescanned).
 
@@ -190,20 +195,21 @@ The flows of the former slice documents that this feature implements are defined
 
 ## 3. Processes / Business Logic (CDSL)
 
-### 3.1 Map a current fact to a fact identity (MIGRATION)
+### 3.1 Validate a fact version against the profile
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-migration-mapping`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-validate-fact`
 
-**Input**: a CURRENT `BillableItemCreated(kind = recurring)` per `(subscriptionId, billing period, lineKey)`, or — without any usage fact (R-20) — a subscription version carrying `BillingTerms` and the first attributed record of a line; the derived parent's period comes from that `BillingTerms` (DESIGN [14 §4.2](../DESIGN.md#contract-14-4-2)); without `BillingTerms` no parent is derived.
+**Input**: a `BillableFactPublished` payload of the `subscriptions-rating/1` profile (Subscriptions PR #5516; T-D-87). Rating reads no `BillableItemCreated`: the MIGRATION mappings of the unversioned CURRENT fact and of a derived usage parent are withdrawn, since Subscriptions versions every fact and publishes the usage parent at period opening (R-03, R-20).
 
-**Output**: `(fact_id, fact_version, parent_origin)`.
+**Output**: the fact version Rating stores, or the reason it is quarantined.
 
-1. [ ] - `p1` - **IF** recurring, `fact_id = UUIDv5(NS_RATING_FACT, "{subscription_id}|{period_start}|{lineKey}|recurring")`, every instant in a UUIDv5 name written in the one canonical instant text of DESIGN §3.1 (RFC 3339, UTC, whole seconds, `Z`: `2026-09-15T00:00:00Z`), `fact_version = 1`, `parent_origin = published`; a re-emission with another digest is quarantined `fact_digest_conflict` - `inst-mm-recurring`
-2. [ ] - `p1` - **IF** usage and no usage fact exists, derive one parent per `(subscription_id, sub_line_key, billing period)` whose period comes from the subscription version's Subscriptions-owned `BillingTerms`, never from a recurring fact ([14 §4.2](../DESIGN.md#contract-14-4-2)) (`cycle: Month | Year`, `anchor: Calendar | SubscriptionStart`, `anchor_at`, UTC; pricing-sdk `terms.rs`) — Rating never chooses or shifts an anchor: `fact_id = UUIDv5(NS_RATING_FACT, "{subscription_id}|{period_start}|{sub_line_key}|usage")` (`period_start` in the canonical instant text), `parent_origin = derived`, `billing_group_kind = derived` - `inst-mm-usage`
-3. [ ] - `p1` - Create a derived parent only when the first attributed record or the subscription version names the line; never invent a subscription or a commercial period - `inst-mm-never-invent`
-4. [ ] - `p1` - **IF** a TARGET `BillableFactPublished` exists, use its Subscriptions-assigned `fact_id` and `fact_version` and switch the derivation off - `inst-mm-target`
+1. [x] - `p1` - **IF** any instant of the fact — the period, the served extent, a slice bound, a suspension bound, `BillingTerms.anchor_at` — has a sub-second part, quarantine `instant_not_whole_second`; never truncate it (DESIGN 09 §4.1, V60) - `inst-vf-whole-seconds`
+2. [x] - `p1` - Check the timeline: the period is half-open and contains the served extent; the slices are ordered, half-open and partition the served extent with no gap and no overlap; an `active` obligation has at least one slice and a `zeroed` one has none - `inst-vf-timeline`
+3. [x] - `p1` - Check the slices: a `chargeable` slice names at least one accepted term the fact carries, at most one per dimension value; each lot of a chargeable slice names one of the slice's terms and a positive quantity in canonical decimal text (≤ 60 integer and 28 fractional digits); an `unresolved` slice names its reason and may keep lots without terms; a `nonchargeable` slice names its reason - `inst-vf-slices`
+4. [x] - `p1` - Check each accepted term: its binding is for the fact's item and charge kind, and its `money_digest` and `template_digest` verify, so its `selected_bindings_digest` can be computed - `inst-vf-terms`
+5. [x] - `p1` - **IF** any check of steps 2–4 fails, quarantine `payload_invalid` naming the first failure; the inbox keeps the payload for an operator - `inst-vf-invalid`
 
-Canonical: DESIGN §3.6 Flow C step 1 and usage parent step 4; [14 §4.2](../DESIGN.md#contract-14-4-2).
+Canonical: DESIGN 11 §4.3 and [14 §4.2](../DESIGN.md#contract-14-4-2); T-D-87.
 
 ### 3.2 Resolve and pin the finalization policy
 
@@ -223,31 +229,31 @@ Canonical: DESIGN §3.6 Flow C step 1 and usage parent step 4; [14 §4.2](../DES
 
 ### 3.3 Compute the expected children of a fact
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-expected-children`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-expected-children`
 
-**Input**: a fact version, its served extent, and the line's usage bindings (each with its `usage_rating_policy` and derived `meter`) from the binding of the period.
+**Input**: a fact version: its kind, served extent, period, slices and the accepted bindings they name (each usage binding with its `usage_rating_policy` and derived `meter`).
 
 **Output**: the expected child keys and `expected_manifest_digest` on the fact head.
 
-1. [ ] - `p1` - A `period_line` fact has exactly one child. A `one_time` fact has no child while R-19 is open, because it is stored, not rated and never rolled up, so no zero is delivered; it has exactly one once R-19 is accepted (step `inst-af-one-time`) - `inst-ec-single`
-2. [ ] - `p1` - Usage, `subscription_line` scope: per usage binding, one child per window of `window_geometry(rating_window, served extent)` — the billing period for `BillingCycle`, each UTC hour for `CalendarHour{Utc}` — keyed `wk1` with the binding's derived `meter` (`dimension_key = ""` at launch, R-16); per **uncovered** cell (no binding, so no `rating_window`), one child over the fact's billing period with `meter = ""`, which fails `price_uncovered` in the core's bind step, so roll-up never delivers the fact without it (DESIGN §3.1) - `inst-ec-usage`
-3. [ ] - `p1` - There is no per-event window (pricing offers only `BillingCycle` and `CalendarHour`, T-D-75), so no `ek1` child is ever created - `inst-ec-event`
-4. [ ] - `p1` - Record the expected set as a manifest digest on the head once the fact is bound (a head that is not `bound` has no manifest and is never rolled up); never derive it from the counters that happen to exist - `inst-ec-manifest`
+1. [x] - `p1` - A `period_line` fact has exactly one child. A `one_time` fact has no child while R-19 is open, because it is stored, not rated and never rolled up, so no zero is delivered; it has exactly one once R-19 is accepted (step `inst-af-one-time`). A `zeroed` version expects no child: its result is a complete empty replacement (SUB-D-45, V84) - `inst-ec-single`
+2. [x] - `p1` - Usage, `subscription_line` scope: per cell (each dimension value of the fact's item that a chargeable slice binds), one child per window of `window_geometry(rating_window, served extent)` — the billing period for `BillingCycle`, each UTC hour for `CalendarHour{Utc}` — that holds at least one chargeable or unresolved second, keyed `wk1` with the binding's derived `meter` (`dimension_key = ""` at launch, R-16). A window touching an `unresolved` slice is expected and waits at evaluation (V85); one entirely inside `nonchargeable` slices is not expected, so a fact whose served extent is all nonchargeable expects no usage child, while one with unresolved time but no chargeable term expects one child over the billing period that waits for a version naming the terms. When the bindings disagree on the policy or meter, each cell has one child over the billing period with `meter = ""`, created `failed(usage_policy_mismatch)` (V86) - `inst-ec-usage`
+3. [x] - `p1` - There is no per-event window (pricing offers only `BillingCycle` and `CalendarHour`, T-D-75), so no `ek1` child is ever created - `inst-ec-event`
+4. [x] - `p1` - Record the expected set as a manifest digest on the head once the fact is bound (a head that is not `bound` has no manifest and is never rolled up); never derive it from the counters that happen to exist - `inst-ec-manifest`
 
 Canonical: DESIGN §3.1 "Expected children of a fact"; `resource` scope is expressible in pricing (R-23 closed) but LAUNCH-GATED until scope proofs list resources (T-D-75).
 
 ### 3.4 Apply a newer fact version
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-new-version`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-algo-schedule-new-version`
 
-**Input**: a fact version higher than the head's previous `current_version`, or a newer subscription version that changes a line's open intervals or quantity (T-D-82).
+**Input**: a fact version higher than the head's previous `current_version`.
 
 **Output**: every child of the fact marked for re-evaluation; the expected manifest updated.
 
-1. [ ] - `p1` - Under each child's row lock, increment `input_generation`; a `final` child becomes `final_stale`. **IF** the new version's pricing query (revision, period or pins) differs from the previous one, bind it again (§2.1 step 6) so its children re-bind; otherwise every child keeps its binding of record - `inst-nv-bump`
-2. [ ] - `p1` - Update `expected_manifest_digest`; for each usage schedule (one per usage item) update only `fact_version`, never the pinned policy - `inst-nv-manifest`
-3. [ ] - `p1` - Never delete a child. A removed or shortened obligation does not arrive as a fact version: Subscriptions keeps the standing fact and lets coverage be derived (SUB-D-21), so each child's served extent is clipped to the intervals in which its `lineKey` is open, and its quantity sliced at the `QuantityInterval`s, from the stored subscription version (T-D-82); a newer subscription version that changes either bumps the affected children's `input_generation` like a fact version does (V83). A zero fact version, should Subscriptions ever version facts, produces a zero result - `inst-nv-no-delete`
-4. [ ] - `p1` - Enqueue the children - `inst-nv-enqueue`
+1. [x] - `p1` - Under each child's row lock, increment `input_generation`; a `final` child becomes `final_stale`. The new version's accepted bindings are stored (§2.1 step 4); a child takes its binding of record from the slices of the version it evaluates, so a child whose slices name the same bindings re-evaluates to the same digest (T-D-87) - `inst-nv-bump`
+2. [x] - `p1` - Update `expected_manifest_digest`; for the usage schedule update only `fact_version`, never the pinned policy - `inst-nv-manifest`
+3. [x] - `p1` - Never delete a child. A shortened served extent, a quantity change, a cut at a price's `ends_on` or a removal arrives as a new full version (Subscriptions SUB-D-21 as rewritten by PR #5516; SUB-D-32): a child no longer expected stays, and its next evaluation gives it an empty result, as a `zeroed` version's roll-up gives a complete empty replacement (SUB-D-45, V84). The stored subscription version no longer clips a child (T-D-82 superseded by T-D-87) - `inst-nv-no-delete`
+4. [x] - `p1` - Enqueue the children - `inst-nv-enqueue`
 
 ### 3.5 Coalesce work and back off wake-ups
 
@@ -295,10 +301,10 @@ The normative procedures of the former slice documents that this feature impleme
 **Initial State**: none — a child exists only beneath a known fact.
 
 **Transitions**:
-1. [ ] - `p1` - **FROM** — **TO** `pending` **WHEN** fact intake creates a `period_line` child or the scheduler creates a due expected child - `inst-cc-pending`
+1. [x] - `p1` - **FROM** — **TO** `pending` **WHEN** fact intake creates a `period_line` child or the scheduler creates a due expected child - `inst-cc-pending`
 2. [ ] - `p1` - **FROM** — **TO** `provisional` **WHEN** fact intake creates the child of a window that already has counters (`next_check_at = window_end + delay`) - `inst-cc-provisional`
-3. [ ] - `p1` - **FROM** — **TO** `failed(resource_scope_not_supported)` **WHEN** the binding's `aggregation_scope` is `resource` (LAUNCH-GATED, T-D-75) - `inst-cc-gated`
-4. [ ] - `p1` - **FROM** `final` **TO** `final_stale` **WHEN** a newer fact version bumps `input_generation` - `inst-cc-stale`
+3. [x] - `p1` - **FROM** — **TO** `failed(resource_scope_not_supported)` **WHEN** the binding's `aggregation_scope` is `resource` (LAUNCH-GATED, T-D-75), or `failed(usage_policy_mismatch)` **WHEN** the usage bindings of one fact disagree on the policy or meter (T-D-87) - `inst-cc-gated`
+4. [x] - `p1` - **FROM** `final` **TO** `final_stale` **WHEN** a newer fact version bumps `input_generation` - `inst-cc-stale`
 5. [ ] - `p1` - **FROM** any non-terminal state **TO** `failed` **WHEN** its work item is dead-lettered after 10 attempts - `inst-cc-deadletter`
 
 ### 4.2 Window schedule cursor
@@ -318,15 +324,15 @@ The normative procedures of the former slice documents that this feature impleme
 
 ### 5.1 Versioned fact intake
 
-- [ ] `p1` - **ID**: `cpt-cf-bss-rating-dod-schedule-fact-intake`
+- [x] `p1` - **ID**: `cpt-cf-bss-rating-dod-schedule-fact-intake`
 
-The system **MUST** accept every fact through the inbox in one transaction per fact version, apply the MIGRATION mappings only while the producer offers no versioned identity, store fact versions insert-only with an ordered head, bind each fact through `resolve` with the fact's pins and store the binding of the period, create the children of recurring facts and the schedule and provisional children of usage facts from the binding's `UsageRatingPolicy`, reject `resource`-scoped policies with `resource_scope_not_supported` (LAUNCH-GATED), and apply a newer version to every child of the fact without deleting any.
+The system **MUST** accept every fact through the inbox in one transaction per fact version, validate it against Subscriptions' `subscriptions-rating/1` profile and quarantine any version it cannot hold exactly, store fact versions insert-only with an ordered head, store each accepted binding the fact carries as the binding of record (T-D-87), create the children of recurring facts and the schedule and expected manifest of usage facts from the accepted binding's `UsageRatingPolicy`, reject `resource`-scoped (LAUNCH-GATED) and inconsistent usage policies, and apply a newer version to every child of the fact without deleting any. Its `PricingBindingStore` **MUST** serve the freshness proof: `resolve` with the accepted pins as `bss-rating.system` in the seller tenant's context, each answer stored once per distinct answer and once per query and UTC day.
 
-**Implements**: `cpt-cf-bss-rating-flow-schedule-accept-fact`, `cpt-cf-bss-rating-algo-schedule-migration-mapping`, `cpt-cf-bss-rating-algo-schedule-expected-children`, `cpt-cf-bss-rating-algo-schedule-new-version`, `cpt-cf-bss-rating-state-schedule-child-creation`, `cpt-cf-bss-rating-flow-period-tick-syn`.
+**Implements**: `cpt-cf-bss-rating-flow-schedule-accept-fact`, `cpt-cf-bss-rating-algo-schedule-validate-fact`, `cpt-cf-bss-rating-algo-schedule-expected-children`, `cpt-cf-bss-rating-algo-schedule-new-version`, `cpt-cf-bss-rating-state-schedule-child-creation`, `cpt-cf-bss-rating-flow-period-tick-syn`.
 
 **Constraints**: `cpt-cf-bss-rating-constraint-no-commercial-clock-syn`, `cpt-cf-bss-rating-constraint-synthesis-only-syn`, `cpt-cf-bss-rating-constraint-in-process-contracts`.
 
-**Touches**: `cpt-cf-bss-rating-dbtable-inbox`, `cpt-cf-bss-rating-dbtable-fact`, `cpt-cf-bss-rating-dbtable-child-window`, `cpt-cf-bss-rating-dbtable-window-schedule`, `bss_rating__pricing_binding`, `bss_rating__derived_declaration`, `bss_rating__usage_policy_projection`; `PricingReadV1::resolve` (as `bss-rating.system` with a per-work-item context for the seller tenant, pricing `plan:read`, D-523); queues `rating.child_work`, `rating.rollup`.
+**Touches**: `cpt-cf-bss-rating-dbtable-inbox`, `cpt-cf-bss-rating-dbtable-fact`, `cpt-cf-bss-rating-dbtable-fact-head`, `cpt-cf-bss-rating-dbtable-child-window`, `cpt-cf-bss-rating-dbtable-window-schedule`, `bss_rating__pricing_binding`, `bss_rating__pricing_resolve`, `bss_rating__derived_declaration`, `bss_rating__usage_policy_projection`; `PricingReadV1::resolve` (as `bss-rating.system` with a per-work-item context for the seller tenant, pricing `plan:read`, D-523); the Products derived-declaration read (R-31); queues `rating.child_work`, `rating.rollup`, `rating.fact_bind`.
 
 ### 5.2 Rating-owned finalization policy
 
@@ -369,20 +375,20 @@ Observability: this feature emits `rating_fact_versions_total`, `rating_fact_mis
 ## 6. Acceptance Criteria
 
 - [ ] A fact redelivered with the same id, version and digest is a no-op; the same id and version with another digest is quarantined `fact_digest_conflict`.
-- [ ] A lower fact version arriving after a higher one is stored and its inbox entry `applied`; it re-binds nothing and changes no schedule, child or manifest (V81).
+- [ ] A lower fact version arriving after a higher one is stored and its inbox entry `applied`; it stores no binding and changes no schedule, child or manifest (V81).
 - [ ] A newer fact version bumps `input_generation` of every child of the fact, turns `final` children `final_stale` and deletes none.
 - [ ] An advance recurring fact's `period_line` child is enqueued at acceptance with no further event.
-- [ ] Without a usage fact, the derived parent is keyed per `(subscription_id, sub_line_key, billing period)`, marked `billing_group_kind = derived`, and is created only for a line a record or the subscription version names.
+- [ ] A fact version with a sub-second instant is quarantined `instant_not_whole_second` (V60); one whose slices leave a gap or overlap, whose chargeable slice names no term, whose lot names a term the fact does not carry, or whose binding's `money_digest` does not verify is quarantined `payload_invalid`; neither creates a child.
 - [ ] A usage fact with no seller or platform policy for its `rating_window` gets a `policy_pending` schedule and the exception `finalization_policy_missing`; it is pinned once a policy exists (V80); a policy version written after a schedule is pinned does not change its delay.
-- [ ] A usage fact whose intake resolve fails is stored with `binding_state = pending(pricing_unavailable)` and no schedule, manifest or `rollup_due_at`; it binds when Pricing recovers and every due child is then created (V77).
+- [ ] A usage fact whose derived declaration cannot be read is stored with `binding_state = pending(derived_declaration_unavailable)` and no schedule, manifest or `rollup_due_at`; it binds when the read recovers and every due child is then created (V77).
 - [ ] A seller operator cannot read another seller's policy; a platform default is visible read-only.
 - [ ] A scheduler leader that loses its lease mid-batch does not advance the cursor; the next leader creates the same children with no duplicates.
 - [ ] An enqueue while `queued_at` is set adds no work item; a work item created during a run is enqueued again; a child whose work item fails 10 times is `failed` with an exception.
 - [ ] With no `period_facts` read (CURRENT), an active line with no fact 24 h after period start raises `rating_fact_missing`.
-- [ ] A fact is bound with `resolve(revision_id, period start, the fact's pins)`; a renewal pin walks `all` successors and stops before a `new` one (pricing golden `resolve_renewal_walk`: pinned 10 → `all` 12 → `new` 15 binds 12); a binding with `ends_on` inside the period produces a second resolve on that date and a slice boundary there (pricing D-425).
-- [ ] An uncovered cell is an expected child that fails `price_uncovered` in the core's bind step (for a usage fact, one child over the billing period), so the fact is never delivered without it; a `PIN_FOREIGN` refusal fails the whole fact binding `pricing_refused(PIN_FOREIGN)`; neither produces a charge.
-- [ ] A `one_time` fact has no expected child and is never rolled up while R-19 is open.
-- [ ] A child's first final uses a Pricing answer fetched on or after the UTC day of its window's last second, and lists every resolve at or before its window end (V78, V79); two periods with the same answer are two query rows (V82).
+- [ ] Each accepted binding a fact version carries is stored once under its `binding_digest` (pricing's `selected_bindings_digest` of the cell) and is the binding of record of the slices that name it; intake calls no Pricing read. The freshness proof resolves with the accepted pins on the slice start and each `ends_on`, as `bss-rating.system` in the seller tenant's context (V59), stores the question per UTC day and the answer once (V82), and reports a discrepancy instead of pricing a successor (V78, V79).
+- [ ] A window touching an `unresolved` slice is an expected child that waits `pending(terms_unresolved)` at evaluation, never priced as zero (V85); usage bindings of one fact that disagree on `rating_window`, `aggregation_scope` or `meter` give one `failed(usage_policy_mismatch)` child per cell over the billing period (V86); a `zeroed` version expects no child and keeps every earlier one (V84).
+- [ ] A `one_time` fact has no expected child and is never rolled up while R-19 is open and Subscriptions' S-U08/S-U13 gates are closed (T-D-18, T-D-87).
+- [ ] A child's first final requires a freshness answer fetched on or after the UTC day of its window's last second that names the fact's binding (V78, V79); two periods with the same answer are two query rows (V82).
 - [ ] Every UUIDv5 name with an instant uses the canonical instant text (`2026-09-15T00:00:00Z`).
 - [ ] A `CalendarHour{Utc}` usage binding yields 744 children for October; a `BillingCycle` binding yields one child for the billing period.
 
@@ -394,16 +400,19 @@ Acceptance vectors owned by this feature (DESIGN §4.13 index):
 | V15 | Evidence arrives before the window's deadline | evaluated at `window_end + delay` |
 | V17 | Retired: pricing offers no per-event window (T-D-75) | — |
 | V25 | A seller operator posts a platform-default policy | `400`; no row |
-| V59 | Fact intake for seller tenant A resolves with `CatalogRef.tenant_id` = A; a usage fact work item of seller B that names `CatalogRef.tenant_id` = A (Pricing fake enforcing D-523) | **Rating**: A's resolve succeeds; B's is refused `403 PermissionDenied`, which DESIGN 11 §4.2 maps like every 4xx to a refusal: B's fact head is `failed(pricing_refused(PERMISSION_DENIED))` with an exception, not retried until a new fact version; no binding, schedule or child is stored |
+| V59 | The freshness resolve of seller A's fact runs with `CatalogRef.tenant_id` = A; a work item of seller B that names `CatalogRef.tenant_id` = A (Pricing fake enforcing D-523) | **Rating**: A's resolve succeeds and is stored; B's is refused `403 PermissionDenied`, which DESIGN 11 §4.2 maps like every 4xx to `pricing_refused(PERMISSION_DENIED)`; nothing is stored for B and Rating never retries it with A's context |
 | V60 | A fact version whose period starts `2026-11-01T00:00:00.5Z` (a sub-second `BillingTerms.anchor_at`); the same fact with a quantity change at `2026-11-15T12:00:00.250Z` | **Rating**: each fact version is quarantined `instant_not_whole_second` and gets no child, nothing delivered; neither instant is truncated (DESIGN 09 §4.1) |
 | V55 | `POST /finalization-policies` with `evidence_mode = delay_only` and no `delay_only_acceptance_ref` | `400 InvalidArgument`; no policy version is written; a stored `delay_only` row without a reference is impossible (`ck_…__delay_only_accepted`); a reference to an acceptance the requester recorded, or of another window policy, is `400 FailedPrecondition` |
-| V77 | Pricing answers 503 `REGISTRY_UNAVAILABLE` at the intake of an hourly cloudlet usage fact on 1 October 00:00 and recovers at 02:00 | the fact is stored and its inbox entry `applied`; the head is `pending(pricing_unavailable)` with no schedule, manifest or `rollup_due_at`; the `ChildWakeScanner` re-enqueues it on `rating.fact_bind` until the bind succeeds; then the schedule, manifest and `rollup_due_at = served_to` are written and the scheduler catches up every due hour; at `served_to` roll-up rates all 744 hours, never an empty manifest or a zero |
-| V78 | An hourly usage fact is bound on 1 October with no `ends_on`; on 10 October the operator ends the price effective 20 October (`Change::End`) | children ending before 10 October keep their binding of record; children that reach their first final from 10 October use an answer fetched on or after their window's day, which carries `ends_on = 20 October`; children from 20 October carry the resolves `[1 Oct, 20 Oct]` and are priced by the successor; the `BillingCycle` child of the same line, final on 1 November + delay, splits at 20 October; no final child changes |
-| V79 | A temporary price ends on 10 October; the hourly child of 20 October 15:00 | its `binding_resolves` lists the 1 October and the 10 October resolves (the `ends_on` lies before its window); it is priced by the successor, never at the promotional price |
+| V77 | Products' derived-declaration read is unavailable at the intake of an hourly cloudlet usage fact on 1 October 00:00 and recovers at 02:00 | the fact is stored and its inbox entry `applied`; the head is `pending(derived_declaration_unavailable)` with no schedule, manifest or `rollup_due_at`; the `ChildWakeScanner` re-enqueues it on `rating.fact_bind` until the read succeeds; then the projection, schedule, manifest and `rollup_due_at = served_to` are written and the scheduler catches up every due hour; at `served_to` roll-up rates all 744 hours, never an empty manifest or a zero |
+| V78 | An hourly usage fact v1 carries one chargeable slice for October with no `ends_on`; on 10 October the operator ends the price effective 20 October (`Change::End`) and Subscriptions publishes v2, cut at 20 October with the authorized successor binding (SUB-D-41) | v2 bumps every child; children before 20 October keep the original binding, children from 20 October take the successor's from v2's slice, and the `BillingCycle` child of the same line holds two slices; a child that reaches its first final before v2 arrives and whose freshness answer already shows `ends_on = 20 October` inside its window stays `pending(terms_stale)` with a reconciliation exception, never priced by the successor Rating found itself; no final child changes without a new version |
+| V79 | A temporary price ends on 10 October and Subscriptions' fact cuts its slice there, with the successor binding from 10 October; the hourly child of 20 October 15:00 | its binding of record is the successor slice's binding; it is never priced at the promotional price; were the cut missing (no successor authority), the fact carries an `unresolved` slice from 10 October and the child waits (V85) |
 | V80 | A fresh install: an hourly usage fact is accepted before any seller or platform policy exists; a platform default is written two hours later | the schedule is `policy_pending` with the exception `finalization_policy_missing`; no due child is created and provisional children wait `pending(finalization_policy_missing)`; within 15 minutes of the write the schedule is pinned to that version (`effective_from` at or before the pin), becomes `scheduling`, catches up the due hours with `window_end + delay` deadlines, and the exception closes; nothing was finalized before the pin |
 | V81 | Fact version 1 is redelivered after version 2 was applied | v1 is stored and its inbox entry `applied`; the head stays at version 2; no resolve, no schedule `fact_version` change, no child bump, no manifest change |
 | V82 | September and October periods of one line with the same pin, for which Pricing returns the same answer | two `bss_rating__pricing_resolve` rows (two `resolve_date`s) pointing at one `bss_rating__pricing_binding` row; October's lookup finds its own row before calling Pricing; no same-key alarm; each month's children record their own resolve |
-| V83 | **Joint fixture with Subscriptions**: an advance monthly recurring line; on 15 October an in-place immediate `changePlan` closes `plan#1` and cuts a new `plan#2` fact for `[15 Oct, 1 Nov)`; no version of `plan#1`'s fact arrives (SUB-D-21) | the new subscription version clips `plan#1`'s child to `[1 Oct, 15 Oct)`, which is corrected in a new revision (Billing issues the credit); `plan#2` is rated from 15 October; October bills one month of plan, not 1.5 (T-D-82) |
+| V83 | **Joint fixture with Subscriptions**: an advance monthly per-unit recurring line with lot A = 10 seats; on 15 October purchase B adds 2 seats under its own binding, and Subscriptions publishes v2 of the same fact: `[1 Oct, 15 Oct)` A = 10, `[15 Oct, 1 Nov)` A = 10 and B = 2 (one slice, two lots) | v2 bumps the `period_line` child, whose next evaluation prices both slices in one result revision; October bills 10 seats for the first half and 12 for the second, never 10 + 22; Billing receives one full replacement, not a delta (T-D-87; Subscriptions SUB-D-46) |
+| V84 | A recurring fact v2 is published `zeroed` (the obligation removed) after v1's child was final | v2 bumps the child to `final_stale`; v2 expects no child and the manifest is empty; nothing is deleted; roll-up (feature 09) delivers a complete empty replacement for v2, never a zero-priced line (SUB-D-45) |
+| V85 | An hourly usage fact whose timeline is chargeable for `[1 Oct, 10 Oct)` and `unresolved(continuation_missing)` from 10 October (SUB-D-42) | the fact is stored and bound; every October hour is an expected child; the children from 10 October wait `pending(terms_unresolved)` at evaluation and are never priced at zero or at the earlier price; a later version that resolves the slice bumps them |
+| V86 | A usage fact whose slices bind the cell to a `CalendarHour{Utc}` policy before 15 October and a `BillingCycle` policy after it | one child over the billing period `failed(usage_policy_mismatch)` with an exception, no schedule and no hourly child; nothing is delivered until a version with one policy arrives |
 
 <a id="contract-14-4-7"></a>
 
@@ -438,37 +447,39 @@ The following sections keep the runtime procedures of these namespaces — their
 ### Facts and scheduling: Interactions and Sequences
 
 **Contract**: `cpt-cf-bss-rating-flow-period-tick-syn` (`p1`), defined in [§2 migrated flows](#register-flows).
-  **Fact intake** (one transaction per fact version):
+  **Fact intake** (one transaction per fact version; the `subscriptions-rating/1` profile, T-D-87):
 
   ```text
-  inbox entry source=fact business_id=fact_id version=fact_version digest=d
-  binding (before BEGIN): b = PricingBindingStore.ensure(resolve(revision_id, period_start, fact.pins))
-                       -- as bss-rating.system, SecurityContext for the fact's seller tenant (D-523)
-                       → answer in bss_rating__pricing_binding (binding_digest), question in
-                         bss_rating__pricing_resolve, derived declarations; ends_on inside the period →
-                         resolve again with the same pin on ends_on (one resolve per date)
-                       503 / unavailable → b = pending(pricing_unavailable); no pins → pending(pins_unavailable)
-                       any 4xx → b = failed(pricing_refused(code)); INCOMPLETE_COMMERCIAL_INPUTS → failed(…)
+  inbox entry source=fact business_id=fact_id version=fact_version digest=d (Rating's, over the payload)
+  validate (before BEGIN): whole seconds, timeline partition, slices, lots, terms (§3.1)
+                       sub-second → quarantine instant_not_whole_second; otherwise invalid → payload_invalid
+  declarations (before BEGIN, usage): decl = DerivedDeclarationStore.ensure(meter)  -- Products, R-31
+                       unavailable → decl = pending(derived_declaration_unavailable)
+                       digest ≠ stored copy → decl = failed(derived_declaration_conflict)
   BEGIN
     INSERT bss_rating__inbox … ON CONFLICT DO NOTHING            same key, digest ≠ d → quarantine; COMMIT
-    INSERT bss_rating__fact (fact_id, fact_version, …) ON CONFLICT DO NOTHING
+    INSERT bss_rating__fact (fact_id, fact_version, timeline, accepted terms, …) ON CONFLICT DO NOTHING
     UPSERT bss_rating__fact_head (shard = hash(fact_id) mod S on insert)
            SET current_version = max(current_version, fact_version)
     fact_version < head.current_version → INSERT bss_rating__inbox state = applied; COMMIT  -- stored only (V81)
+    for each accepted term: INSERT bss_rating__pricing_binding (binding_digest = selected_bindings_digest
+                           of the one cell) ON CONFLICT DO NOTHING      -- same digest, other content: alarm
     kind = recurring → INSERT child period_line (wk1|fact|period_start|agg) ON CONFLICT DO NOTHING
-                       next_check_at = timing = advance ? now : served_to   -- binds itself (feature 07)
+                       next_check_at = timing = advance ? now : served_to   -- the fact's timing
     kind = one_time  → R-19 accepted ? INSERT child one_time : store only    -- no manifest, no roll-up
-    kind = usage, b not bound
-                     → UPDATE bss_rating__fact_head SET binding_state = b.state, binding_reason = b.reason,
-                         binding_next_check_at = (pricing_unavailable ? now + 10 s : NULL)
-                       failed → open exception b.reason
-                       -- no schedule, no manifest, no rollup_due_at: nothing can roll up an empty fact
-    kind = usage, b bound
-                     → binding.usage_rating_policy.content.aggregation_scope = resource
+    kind = usage, decl not stored
+                     → UPDATE bss_rating__fact_head SET binding_state = decl.state, binding_reason = decl.reason,
+                         binding_next_check_at = (pending ? now + 10 s : NULL)
+                       failed → open exception decl.reason
+                       -- no schedule, no manifest, no rollup_due_at: nothing can roll up an incomplete fact
+    kind = usage, decl stored
+                     → usage bindings disagree on rating_window, aggregation_scope or meter
+                         → one child per cell over the period failed(usage_policy_mismatch), exception; no schedule
+                       aggregation_scope = resource
                          → children failed(resource_scope_not_supported), exception; no schedule  -- LAUNCH-GATED
-                       write bss_rating__usage_policy_projection from b
-                       for each usage item: INSERT bss_rating__window_schedule
-                         (tenant_id, fact_id, item_id, shard; window = the item's rating_window;
+                       write bss_rating__usage_policy_projection from the bindings and decl
+                       INSERT bss_rating__window_schedule
+                         (tenant_id, fact_id, item_id, shard; window = the binding's rating_window;
                           policy pinned now → state = scheduling, next_due_window_start = first window,
                           next_due_at = its end + delay; no policy → state = policy_pending,
                           next_due_at = now + 15 min, exception finalization_policy_missing)
@@ -479,8 +490,8 @@ The following sections keep the runtime procedures of these namespaces — their
                          next_check_at = window_end + delay (NULL while policy_pending)
                          ON CONFLICT DO NOTHING
                        UPDATE bss_rating__fact_head SET binding_state = bound, bound_version = fact_version,
-                         expected_manifest_digest = …   -- uncovered cells included, one billing-period child each
-    usage bound or arrears → UPDATE bss_rating__fact_head SET rollup_due_at = served_to
+                         expected_manifest_digest = …   -- windows with a chargeable or unresolved second
+    usage bound or recurring arrears → UPDATE bss_rating__fact_head SET rollup_due_at = served_to
     newer version    → UPDATE bss_rating__child_window SET input_generation += 1,
                               status = CASE status WHEN final THEN final_stale ELSE status END
                         WHERE fact_id = ?   -- under each child's row lock; every child of the fact,
@@ -495,20 +506,29 @@ The following sections keep the runtime procedures of these namespaces — their
 
   ```text
   h = SELECT current_version, binding_state FROM bss_rating__fact_head        -- no lock
-  b = PricingBindingStore.ensure(resolve(…)) for h.current_version            -- outside tx
+  decl = DerivedDeclarationStore.ensure(meter of h.current_version)          -- outside tx
   BEGIN
     SELECT … FROM bss_rating__fact_head WHERE (tenant_id, fact_id) = … FOR UPDATE
-    current_version ≠ h.current_version or binding_state ≠ pending → ROLLBACK  -- a newer version re-binds
-    b not bound → UPDATE binding_state/reason, binding_next_check_at (backoff); COMMIT
-    b bound     → the usage branch above: projection, schedules, provisional children, manifest,
-                  binding_state = bound, rollup_due_at = served_to; enqueue; COMMIT
+    current_version ≠ h.current_version or binding_state ≠ pending → ROLLBACK  -- the newer version binds itself
+    decl not stored → UPDATE binding_state/reason, binding_next_check_at (backoff); COMMIT
+    decl stored     → the usage branch above: projection, schedule, provisional children, manifest,
+                      binding_state = bound, rollup_due_at = served_to; enqueue; COMMIT
   ```
 
-  Example (recurring, MIGRATION mapping of the current Subscriptions fact): subscription S42, period
-  `[2026-09-15, 2026-10-15)`, `lineKey = plan#1`, `priceId = P-REC` → `fact_id = UUIDv5(…,
-  "S42|2026-09-15T00:00:00Z|plan#1|recurring")` (the canonical instant text of DESIGN §3.1),
-  `fact_version = 1`, one `period_line` child, bound by
-  `resolve(revision_id, 2026-09-15, pins = [P-REC])`.
+  **Freshness proof** (`PricingBindingStore`, called by the rater before a child's first final,
+  [feature 07](07-child-evaluation.md); T-D-87): for each slice of the child, `resolve(revision_id,
+  slice start, the slice's accepted pins)` and again on each `ends_on` inside the child's window, as
+  `bss-rating.system` in the seller tenant's context (D-523), using a stored answer fetched on or
+  after the UTC day of the window's last second, else calling Pricing; the answer must name the
+  binding the fact carries for the slice. A different binding or an `ends_on` the fact did not cut
+  at leaves the child `pending(terms_stale)` with an exception that requests reconciliation from
+  Subscriptions; Rating never prices the successor itself (SUB-D-41).
+
+  Example (recurring): subscription S42, period `[2026-09-15, 2026-10-15)`, component `plan#1`,
+  item `I-REC`, v1 with one chargeable slice naming the accepted binding of `P-REC` and lot `L1 = 3`
+  → one `period_line` child keyed `wk1|{fact_id}|2026-09-15T00:00:00Z|{agg}` (the canonical instant
+  text of DESIGN §3.1), its binding of record `P-REC`'s `binding_digest`; the freshness proof before
+  its first final is `resolve(revision_id, 2026-09-15, pins = [P-REC])`.
 
 **Contract**: `cpt-cf-bss-rating-flow-scheduler-syn` (`p1`), defined in [§2 migrated flows](#register-flows).
   **Due scan** (`WindowScheduler`, every ≤ 60 s per shard, batches of ≤ 500 schedules):

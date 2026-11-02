@@ -11,3 +11,4 @@ pub mod queue_depth;
 pub mod queues;
 pub mod storage;
 pub mod tenant_hierarchy;
+pub mod work_queue;

@@ -5,6 +5,7 @@
 //! (`pricing/tests/contract/*.json`) into it.
 
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use bss_pricing_sdk::read::{
@@ -35,6 +36,7 @@ pub struct FakePricingCatalog {
     prices: Mutex<Script<PriceQuery, ImmutablePrice>>,
     revisions: Mutex<Script<PlanQuery, RevisionRef>>,
     calls: Mutex<Vec<PricingCall>>,
+    enforce_tenant: AtomicBool,
 }
 
 impl FakePricingCatalog {
@@ -100,6 +102,25 @@ impl FakePricingCatalog {
             .insert(0, (query, answer));
     }
 
+    /// Refuses, as Pricing does (D-523: `TenantMode::RootOnly`), every query whose
+    /// `CatalogRef.tenant_id` is not the caller's subject tenant, with `403 PermissionDenied`.
+    pub fn enforce_catalog_tenant(&self) {
+        self.enforce_tenant.store(true, Ordering::SeqCst);
+    }
+
+    fn refuse_foreign(
+        &self,
+        ctx: &SecurityContext,
+        catalog_tenant: uuid::Uuid,
+    ) -> Result<(), CanonicalError> {
+        if self.enforce_tenant.load(Ordering::SeqCst) && ctx.subject_tenant_id() != catalog_tenant {
+            return Err(UsageResource::permission_denied()
+                .with_reason("PERMISSION_DENIED")
+                .create());
+        }
+        Ok(())
+    }
+
     /// Every call answered so far, in order.
     ///
     /// # Panics
@@ -150,28 +171,31 @@ fn answer<Q: PartialEq, A: Clone>(
 impl PricingReadV1 for FakePricingCatalog {
     async fn resolve(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         query: ResolveQuery,
     ) -> Result<ResolvedBindings, CanonicalError> {
         self.record(PricingCall::Resolve(query.clone()));
+        self.refuse_foreign(ctx, query.catalog.tenant_id)?;
         answer(&self.resolves, &query)
     }
 
     async fn price(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         query: PriceQuery,
     ) -> Result<ImmutablePrice, CanonicalError> {
         self.record(PricingCall::Price(query.clone()));
+        self.refuse_foreign(ctx, query.catalog.tenant_id)?;
         answer(&self.prices, &query)
     }
 
     async fn current_revision(
         &self,
-        _ctx: &SecurityContext,
+        ctx: &SecurityContext,
         query: PlanQuery,
     ) -> Result<RevisionRef, CanonicalError> {
         self.record(PricingCall::CurrentRevision(query.clone()));
+        self.refuse_foreign(ctx, query.catalog.tenant_id)?;
         answer(&self.revisions, &query)
     }
 }

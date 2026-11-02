@@ -145,6 +145,9 @@ pub enum Quarantine {
     },
     /// The payload's schema version is not supported (quarantined, never dropped).
     UnsupportedSchemaVersion,
+    /// The owning feature's adapter cannot hold the payload exactly (quarantined, never
+    /// truncated).
+    Refused(PayloadRefusal),
 }
 
 impl Quarantine {
@@ -154,6 +157,10 @@ impl Quarantine {
         match self {
             Self::DigestConflict { .. } => QuarantineReason::DigestConflict,
             Self::UnsupportedSchemaVersion => QuarantineReason::UnsupportedSchemaVersion,
+            Self::Refused(PayloadRefusal::InstantNotWholeSecond) => {
+                QuarantineReason::InstantNotWholeSecond
+            }
+            Self::Refused(PayloadRefusal::Invalid) => QuarantineReason::PayloadInvalid,
         }
     }
 
@@ -162,7 +169,7 @@ impl Quarantine {
     pub const fn conflict_of(self) -> Option<Uuid> {
         match self {
             Self::DigestConflict { conflict_of } => Some(conflict_of),
-            Self::UnsupportedSchemaVersion => None,
+            Self::UnsupportedSchemaVersion | Self::Refused(_) => None,
         }
     }
 
@@ -178,10 +185,32 @@ impl Quarantine {
             (QuarantineReason::UnsupportedSchemaVersion, None) => {
                 Some(Self::UnsupportedSchemaVersion)
             }
+            (QuarantineReason::InstantNotWholeSecond, None) => {
+                Some(Self::Refused(PayloadRefusal::InstantNotWholeSecond))
+            }
+            (QuarantineReason::PayloadInvalid, None) => {
+                Some(Self::Refused(PayloadRefusal::Invalid))
+            }
             (QuarantineReason::DigestConflict, None)
-            | (QuarantineReason::UnsupportedSchemaVersion, Some(_)) => None,
+            | (
+                QuarantineReason::UnsupportedSchemaVersion
+                | QuarantineReason::InstantNotWholeSecond
+                | QuarantineReason::PayloadInvalid,
+                Some(_),
+            ) => None,
         }
     }
+}
+
+/// Why the owning feature's adapter refuses a payload it reads (DESIGN 09 §4.1; feature 06 §3.1).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PayloadRefusal {
+    /// An instant has a sub-second part: Rating keys on whole UTC seconds and never truncates.
+    InstantNotWholeSecond,
+    /// The payload breaks its profile in another way (a gap in a timeline, a dangling reference,
+    /// a digest that does not verify, text outside its canonical form).
+    Invalid,
 }
 
 /// The reason code of a quarantine: the stored `quarantine_reason` and the exception's
@@ -193,6 +222,10 @@ pub enum QuarantineReason {
     DigestConflict,
     /// The payload's schema version is not supported (quarantined, never dropped).
     UnsupportedSchemaVersion,
+    /// An instant of the payload has a sub-second part.
+    InstantNotWholeSecond,
+    /// The payload breaks its profile.
+    PayloadInvalid,
 }
 
 impl QuarantineReason {
@@ -202,6 +235,8 @@ impl QuarantineReason {
         match self {
             Self::DigestConflict => "digest_conflict",
             Self::UnsupportedSchemaVersion => "unsupported_schema_version",
+            Self::InstantNotWholeSecond => "instant_not_whole_second",
+            Self::PayloadInvalid => "payload_invalid",
         }
     }
 
@@ -211,6 +246,8 @@ impl QuarantineReason {
         match name {
             "digest_conflict" => Some(Self::DigestConflict),
             "unsupported_schema_version" => Some(Self::UnsupportedSchemaVersion),
+            "instant_not_whole_second" => Some(Self::InstantNotWholeSecond),
+            "payload_invalid" => Some(Self::PayloadInvalid),
             _ => None,
         }
     }
@@ -381,8 +418,8 @@ impl ProducerOrigin {
     }
 }
 
-/// Whether the owning feature's adapter supports a payload's schema version. A fact of an
-/// unsupported version is quarantined, never dropped and never applied.
+/// Whether the owning feature's adapter can apply a payload. A fact of an unsupported version,
+/// or one the adapter refuses, is quarantined, never dropped and never applied.
 #[domain_model]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SchemaSupport {
@@ -390,6 +427,9 @@ pub enum SchemaSupport {
     Supported,
     /// The adapter does not read this schema version: the fact is quarantined.
     Unsupported,
+    /// The adapter reads the schema version but refuses this payload: the fact is quarantined
+    /// with the refusal as its reason.
+    Refused(PayloadRefusal),
 }
 
 /// An upstream fact presented to the inbox.
@@ -412,6 +452,7 @@ pub struct InboundFact {
     pub schema: SchemaSupport,
     digest: Sha256Hex,
     payload: Value,
+    refusal_detail: Option<String>,
 }
 
 impl InboundFact {
@@ -430,7 +471,23 @@ impl InboundFact {
             schema,
             digest: Sha256Hex::of_json(&payload),
             payload,
+            refusal_detail: None,
         }
+    }
+
+    /// The fact refused by its adapter for `refusal`, with what failed, which the quarantine's
+    /// exception records for the operator.
+    #[must_use]
+    pub fn refused(mut self, refusal: PayloadRefusal, detail: impl Into<String>) -> Self {
+        self.schema = SchemaSupport::Refused(refusal);
+        self.refusal_detail = Some(detail.into());
+        self
+    }
+
+    /// What the adapter found wrong with a refused payload.
+    #[must_use]
+    pub fn refusal_detail(&self) -> Option<&str> {
+        self.refusal_detail.as_deref()
     }
 
     /// The digest of the payload's canonical JSON text.

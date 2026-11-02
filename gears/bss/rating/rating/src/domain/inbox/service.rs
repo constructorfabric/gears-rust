@@ -11,8 +11,8 @@ use toolkit_security::{AccessScope, SecurityContext};
 use uuid::Uuid;
 
 use super::{
-    AcceptOutcome, Appliers, InboundFact, InboxEntry, InboxRepo, InboxSource, InboxTransition,
-    ProducerPolicy, Quarantine, ReleaseResolution, SchemaSupport,
+    AcceptOutcome, Appliers, InboundFact, InboxApplier, InboxEntry, InboxRepo, InboxSource,
+    InboxTransition, ProducerPolicy, Quarantine, ReleaseResolution, SchemaSupport,
 };
 use crate::authz::{self, Operation, SelectorRead};
 use crate::domain::audit::{AuditEntry, OperatorAudit, OperatorReason};
@@ -179,6 +179,45 @@ impl Inbox {
         scope: &AccessScope,
         fact: &InboundFact,
     ) -> Result<AcceptOutcome, DomainError> {
+        self.accept_through(runner, scope, fact, None).await
+    }
+
+    /// [`Self::accept`] with the apply step `applier` in place of the one registered for the
+    /// fact's source: an owning feature whose apply step needs what it read before the
+    /// transaction (a remote read, never made inside it) hands it in this way. A release applies
+    /// through the registered applier, which must then cope without that read.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::accept`].
+    #[tracing::instrument(
+        name = "rating.inbox.accept",
+        skip_all,
+        fields(
+            tenant_id = %fact.key.tenant_id(),
+            source = %fact.key.source(),
+            business_id = fact.key.business_id(),
+            version = fact.key.version(),
+        )
+    )]
+    pub async fn accept_with(
+        &self,
+        runner: &DbTx<'_>,
+        scope: &AccessScope,
+        fact: &InboundFact,
+        applier: &dyn InboxApplier,
+    ) -> Result<AcceptOutcome, DomainError> {
+        self.accept_through(runner, scope, fact, Some(applier))
+            .await
+    }
+
+    async fn accept_through(
+        &self,
+        runner: &DbTx<'_>,
+        scope: &AccessScope,
+        fact: &InboundFact,
+        applier: Option<&dyn InboxApplier>,
+    ) -> Result<AcceptOutcome, DomainError> {
         // Two reads, each bounded however many conflicts the key gathered: the entry of this
         // arrival by its id, and the id of the key's primary entry.
         // @cpt-begin:cpt-cf-bss-rating-flow-foundation-inbox-accept:p1:inst-ia-accept
@@ -204,13 +243,24 @@ impl Inbox {
             return self.quarantine(runner, scope, fact, quarantine).await;
         }
         // @cpt-end:cpt-cf-bss-rating-flow-foundation-inbox-accept:p1:inst-ia-conflict
-        if fact.schema == SchemaSupport::Unsupported {
-            return self
-                .quarantine(runner, scope, fact, Quarantine::UnsupportedSchemaVersion)
-                .await;
+        match fact.schema {
+            SchemaSupport::Supported => {}
+            SchemaSupport::Unsupported => {
+                return self
+                    .quarantine(runner, scope, fact, Quarantine::UnsupportedSchemaVersion)
+                    .await;
+            }
+            SchemaSupport::Refused(refusal) => {
+                return self
+                    .quarantine(runner, scope, fact, Quarantine::Refused(refusal))
+                    .await;
+            }
         }
         // @cpt-begin:cpt-cf-bss-rating-flow-foundation-inbox-accept:p1:inst-ia-new
-        let applier = self.applier(fact.key.source())?;
+        let applier: &dyn InboxApplier = match applier {
+            Some(applier) => applier,
+            None => self.applier(fact.key.source())?.as_ref(),
+        };
         let now = self.parts.clock.now();
         // @cpt-begin:cpt-cf-bss-rating-state-foundation-inbox:p1:inst-is-accept
         let entry = InboxEntry::arriving(fact, now, None);
@@ -244,16 +294,42 @@ impl Inbox {
     ///
     /// As [`Self::admit`] and [`Self::accept`].
     pub async fn accept_one(&self, fact: InboundFact) -> Result<AcceptOutcome, DomainError> {
+        self.accept_one_through(fact, None).await
+    }
+
+    /// [`Self::accept_one`] through [`Self::accept_with`]: `applier` applies a new key.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::accept_one`].
+    pub async fn accept_one_with(
+        &self,
+        fact: InboundFact,
+        applier: Arc<dyn InboxApplier>,
+    ) -> Result<AcceptOutcome, DomainError> {
+        self.accept_one_through(fact, Some(applier)).await
+    }
+
+    async fn accept_one_through(
+        &self,
+        fact: InboundFact,
+        applier: Option<Arc<dyn InboxApplier>>,
+    ) -> Result<AcceptOutcome, DomainError> {
         let scope = self.admit(&fact).await?;
         let fact = Arc::new(fact);
         let mut retried = false;
         loop {
             let (inbox, scope, arrival) = (self.clone(), scope.clone(), Arc::clone(&fact));
+            let applier = applier.clone();
             let result = self
                 .parts
                 .db
                 .transaction_ref_mapped(move |tx| {
-                    Box::pin(async move { inbox.accept(tx, &scope, &arrival).await })
+                    Box::pin(async move {
+                        inbox
+                            .accept_through(tx, &scope, &arrival, applier.as_deref())
+                            .await
+                    })
                 })
                 .await;
             match result {
@@ -461,6 +537,11 @@ impl Inbox {
             Quarantine::UnsupportedSchemaVersion => {
                 format!("{source} {business_id} v{version}: unsupported schema version")
             }
+            Quarantine::Refused(_) => format!(
+                "{source} {business_id} v{version}: refused ({}): {}",
+                quarantine.reason().as_str(),
+                fact.refusal_detail().unwrap_or("no detail")
+            ),
         };
         self.parts
             .exceptions

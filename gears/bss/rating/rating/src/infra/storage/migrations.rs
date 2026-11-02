@@ -6,6 +6,7 @@ use sea_orm_migration::prelude::*;
 
 mod m20261019_000001_create_rating_foundation;
 mod m20261029_000002_create_usage_intake;
+mod m20261102_000003_create_fact_intake;
 
 /// The statements of one migration step for each supported backend, named so the two dialects
 /// cannot be swapped.
@@ -70,6 +71,7 @@ impl MigratorTrait for Migrator {
         vec![
             Box::new(m20261019_000001_create_rating_foundation::Migration),
             Box::new(m20261029_000002_create_usage_intake::Migration),
+            Box::new(m20261102_000003_create_fact_intake::Migration),
         ]
     }
 }

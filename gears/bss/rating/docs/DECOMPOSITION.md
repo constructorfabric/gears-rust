@@ -494,8 +494,10 @@ generation, a new feature and a new design review.
 - **Depends On**: `cpt-cf-bss-rating-feature-foundation`, `cpt-cf-bss-rating-feature-evaluation-core`
 
 - **Scope**:
-  - `FactIntake`: inbox acceptance of facts, fact versions and heads, the MIGRATION mappings for
-    today's recurring fact and the derived usage parent (R-20), launch-gated window policies.
+  - `FactIntake`: inbox acceptance of Subscriptions' versioned facts (`subscriptions-rating/1`,
+    PR #5516; T-D-87) — validation, versions and heads, the accepted bindings as bindings of record,
+    the derived declarations and usage policy projection, launch-gated window policies — and the
+    `PricingBindingStore` freshness proof.
   - Rating-owned `FinalizationPolicy` resolution and pinning (T-D-59), the seller and platform policy
     write paths.
   - `WindowScheduler`: expected children per `window_geometry`, the `next_due_window_start` cursor,
@@ -1001,7 +1003,7 @@ Each feature can be built and accepted against the contract fakes of
 | deferred (price adjustments, §2.3) | `…-upreq-contracts-inputs`, `…-upreq-promotions-coupon-snapshots` (R-11); `…-upreq-fx-rate-snapshots` (R-07) — deferred, not requested now |
 | 04 usage-intake | `…-upreq-usage-feed-v1` (R-01); `…-upreq-usage-type-declaration-read`; `…-upreq-usage-feed-scope-digest` (narrows the gap of the grant check, not blocking) |
 | 05 attribution-counters | `…-upreq-subscriptions-attribution-segments` (R-25); `resource` scope needs scope proofs (`aggregation_scope` exists in pricing, R-23 closed) |
-| 06 fact-scheduling | `…-upreq-subscriptions-versioned-facts` (R-03; CONFLICTING with SUB-D-21 — coverage is derived from the subscription version meanwhile, T-D-82); `…-upreq-subscriptions-usage-fact` (R-20); `…-upreq-subscriptions-recovery-reads`; `…-upreq-delay-only-acceptance` or coverage (R-21); `…-upreq-subscriptions-fact-pricing-inputs` (pins, plan revision, quantity and `BillingTerms` on facts, SUB-D-29); `…-upreq-subscriptions-ends-on-cut`; `…-upreq-pricing-read-grant` (**p1**: per-seller-tenant pricing read grant, pricing D-523; fact intake binds the facts) |
+| 06 fact-scheduling | `…-upreq-subscriptions-versioned-facts` (R-03; on `main` CONFLICTING with SUB-D-21; proposed by Subscriptions PR #5516, which Rating builds against, T-D-87); `…-upreq-subscriptions-usage-fact` (R-20); `…-upreq-subscriptions-recovery-reads`; `…-upreq-delay-only-acceptance` or coverage (R-21); `…-upreq-subscriptions-fact-pricing-inputs` (accepted bindings, lots and `BillingTerms` on facts, PR #5516); `…-upreq-subscriptions-ends-on-cut`; `…-upreq-pricing-read-grant` (**p1**: per-seller-tenant pricing read grant, pricing D-523; the freshness proof resolves) |
 | 07 child-evaluation | `…-upreq-products-derived-declaration-read` (R-31); `…-upreq-subscriptions-scope-proofs`; `…-upreq-coverage-declarations`, `…-upreq-resource-history` (R-21); `…-upreq-accepted-binding-naming` (R-29); one-time rating `…-upreq-subscriptions-one-time-rating` (R-19) |
 | 08 corrections-rerate | none beyond 07 and 09 |
 | 09 rollup-delivery | `…-upreq-billing-delivery-consumer` (R-05), `…-upreq-billing-invoice-line-contract` (R-32), `…-upreq-billing-period-ownership` (R-04); `…-upreq-billing-ledger-item-granularity` (R-26) |

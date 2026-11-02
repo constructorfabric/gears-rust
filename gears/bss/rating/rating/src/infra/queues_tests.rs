@@ -3,8 +3,8 @@
 use toolkit_db::outbox::{LeasedMessageHandler, MessageResult, OutboxMessage, Partitions};
 
 use super::{
-    CHILD_WORK_QUEUE, LayoutError, OUTBOX_TABLE_PREFIX, QueueLayout, QueuePartitions, ROLLUP_QUEUE,
-    UnwiredQueue, delivery_queue,
+    CHILD_WORK_QUEUE, FACT_BIND_QUEUE, LayoutError, OUTBOX_TABLE_PREFIX, QueueLayout,
+    QueuePartitions, ROLLUP_QUEUE, UnwiredQueue, delivery_queue,
 };
 
 fn partitions(child_work: u16, rollup: u16, delivery: u16) -> QueuePartitions {
@@ -12,6 +12,7 @@ fn partitions(child_work: u16, rollup: u16, delivery: u16) -> QueuePartitions {
         child_work: Partitions::of(child_work),
         rollup: Partitions::of(rollup),
         delivery: Partitions::of(delivery),
+        fact_bind: Partitions::of(2),
     }
 }
 
@@ -62,6 +63,7 @@ fn each_kind_of_queue_gets_its_own_partition_count() {
         vec![
             (CHILD_WORK_QUEUE.to_owned(), Partitions::of(16)),
             (ROLLUP_QUEUE.to_owned(), Partitions::of(8)),
+            (FACT_BIND_QUEUE.to_owned(), Partitions::of(2)),
             (delivery_queue(1), Partitions::of(4)),
             (delivery_queue(2), Partitions::of(4)),
         ]

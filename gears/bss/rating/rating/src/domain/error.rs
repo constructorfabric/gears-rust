@@ -114,6 +114,12 @@ impl DomainError {
             | Self::Internal(..) => None,
         }
     }
+
+    /// Whether a retry may succeed: a dependency that could not answer, or a lost race.
+    #[must_use]
+    pub const fn is_transient(&self) -> bool {
+        self.dependency_failure().is_some() || matches!(self, Self::Concurrent(_))
+    }
 }
 
 /// The failure behind an infrastructure error, kept whole as the error's source so a caller can

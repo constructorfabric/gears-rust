@@ -5,16 +5,19 @@
 //! against it before the provider runs beside Rating. A double never stands in for a production
 //! contract (DESIGN §4.10). Feature 04 adds the usage feed (Rating's `UsageFeedPort` over the
 //! collector's v2 contract, T-D-84), the meter declaration read, the tenant hierarchy and the
-//! queue depth. The doubles of
-//! the contracts still undefined — Subscriptions' facts and reads, coverage, the Billing consumer,
-//! the derived-declaration read and collector reconciliation — land with the feature that designs
-//! their adapter.
+//! queue depth. Feature 06 adds Subscriptions' facts (`FakeSubscriptionsBilling`, Rating's reading
+//! of the `subscriptions-rating/1` profile, T-D-87) and Products' derived-declaration read
+//! (`FakeDerivedDeclarations`, R-31). The doubles of the contracts still undefined — Subscriptions'
+//! reads, coverage, the Billing consumer and collector reconciliation — land with the feature that
+//! designs their adapter.
 
 // @cpt-dod:cpt-cf-bss-rating-dod-foundation-contracts:p2
 
 pub mod authz;
 pub mod cluster;
 pub mod pricing;
+pub mod products;
+pub mod subscriptions;
 pub mod usage;
 
 use std::sync::Mutex;
@@ -23,6 +26,8 @@ use std::time::Duration;
 pub use authz::{AllowShape, EvaluatedSubject, FakePdp};
 pub use cluster::FakeClusterLeaders;
 pub use pricing::{FakePricingCatalog, PricingCall};
+pub use products::FakeDerivedDeclarations;
+pub use subscriptions::FakeSubscriptionsBilling;
 pub use usage::{FakeMeterDeclarations, FakeQueueDepth, FakeTenantHierarchy, FakeUsageFeed};
 
 use crate::domain::exception::SweepReport;

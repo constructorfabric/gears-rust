@@ -48,6 +48,7 @@ use toolkit_security::{AccessScope, SecurityContext};
 use tower::ServiceExt;
 use uuid::Uuid;
 
+pub mod facts;
 pub mod usage;
 
 /// A migrated file-backed SQLite database; the directory goes with the value.
