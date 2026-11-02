@@ -77,20 +77,53 @@ pub struct AccessListing {
     pub root: Uuid,
 }
 
-/// Request-local hierarchy facts resolved before entering the settings transaction.
+/// The tenant hierarchy chains a restriction change reads, resolved by
+/// [`AccessService::authorized_hierarchy_chains`] before the settings
+/// transaction opens.
 ///
-/// Private fields bind the authenticated actor to the authorized target. Only
-/// hierarchy facts are captured: declaration visibility, stored restrictions,
-/// preconditions and audit writes still use the transaction's database runner.
-/// This does not lock Account Management's hierarchy; concurrent hierarchy
-/// changes have the same preflight consistency model as setting value writes.
+/// The tenant resolver opens its own database connection, which the
+/// task-local transaction guard forbids inside another gear's transaction, so
+/// these lookups cannot run in the transaction that changes the restriction.
+/// Only hierarchy facts are kept here: declaration visibility, stored
+/// restrictions, preconditions and audit writes still go through the
+/// transaction's runner.
+///
+/// The chains are a request-local snapshot. Account Management's hierarchy is
+/// not locked: a tenant moved or made standalone after the lookup is seen by
+/// the next request, the same consistency model the value-write gate uses.
+/// The stored row is keyed by declaration and tenant, never by chain, so a
+/// stale chain can only affect the readout returned by this one request.
+///
+/// The fields are private so that only the authorizing lookup can build one;
+/// [`AccessService::set`] and [`AccessService::clear`] refuse chains that do
+/// not end at the actor's tenant and the target they are given.
 #[domain_model]
-pub struct PreparedAccessMutation {
-    actor: AccessActor,
-    target: Uuid,
+pub struct TenantHierarchyChains {
+    /// The caller's ancestry, root first and ending at the caller's tenant:
+    /// what the caller's own visibility of the declaration is judged over.
     caller_chain: Vec<Uuid>,
+    /// The target's ancestry, root first and ending at the target: what the
+    /// returned effective access is computed over.
     target_chain: Vec<Uuid>,
+    /// The platform root tenant.
     root: Uuid,
+}
+
+impl TenantHierarchyChains {
+    /// Refuse chains resolved for a different caller or target than the
+    /// mutation is asked to change. A mismatch is a programming error in the
+    /// caller, never a client error, so it surfaces as an internal error.
+    fn ensure_for(&self, caller: Uuid, target: Uuid) -> Result<(), DomainError> {
+        if self.caller_chain.last() != Some(&caller) || self.target_chain.last() != Some(&target) {
+            return Err(DomainError::Internal {
+                diagnostic: format!(
+                    "tenant hierarchy chains were resolved for another caller or target \
+                     than {caller} -> {target}"
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// The service.
@@ -181,6 +214,9 @@ where
             .await
     }
 
+    /// As [`Self::visible_declaration`], over the caller's chain already
+    /// resolved — the form a transaction uses, since it cannot ask the tenant
+    /// resolver itself.
     async fn visible_declaration_on_chain<C: DBRunner>(
         &self,
         conn: &C,
@@ -206,7 +242,8 @@ where
         Ok(declaration)
     }
 
-    /// Resolve cross-gear hierarchy data without a settings transaction open.
+    /// The root tenant and one tenant's chain from it, root first. Asks the
+    /// tenant resolver, so it must not run inside a settings transaction.
     async fn root_and_chain(&self, tenant: Uuid) -> Result<(Uuid, Vec<Uuid>), DomainError> {
         let root = self.platform.root_tenant().await?;
         let chain = if tenant == root {
@@ -217,28 +254,31 @@ where
         Ok((root, chain))
     }
 
-    /// Authorize the target and gather every hierarchy fact the mutation needs.
-    /// Call this before opening a transaction: the tenant resolver opens its
-    /// own database connection, which the task-local transaction guard forbids
-    /// from inside another gear's transaction.
+    /// Run the strict-descendant target check, then resolve the caller's and
+    /// the target's hierarchy chains for [`Self::set`] or [`Self::clear`].
+    ///
+    /// Call this before opening the transaction: both steps ask the tenant
+    /// resolver, which opens its own database connection, and the task-local
+    /// transaction guard forbids that inside another gear's transaction.
     ///
     /// # Errors
-    /// Unauthorized unless the target is a reachable strict descendant;
-    /// propagates failures resolving the hierarchy or platform root.
-    pub async fn prepare_mutation(
+    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
+    /// descendant of the caller — a caller that could restrict itself could
+    /// lift the restriction again; [`DomainError::NotFound`] for an unknown
+    /// tenant and [`DomainError::Unavailable`] when the tenant resolver or the
+    /// platform root cannot answer.
+    pub async fn authorized_hierarchy_chains(
         &self,
         actor: &AccessActor,
         target: Uuid,
-    ) -> Result<PreparedAccessMutation, DomainError> {
+    ) -> Result<TenantHierarchyChains, DomainError> {
         let caller = actor.ctx.subject_tenant_id();
         if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
             return Err(denied());
         }
         let (_, caller_chain) = self.root_and_chain(caller).await?;
         let (root, target_chain) = self.root_and_chain(target).await?;
-        Ok(PreparedAccessMutation {
-            actor: actor.clone(),
-            target,
+        Ok(TenantHierarchyChains {
             caller_chain,
             target_chain,
             root,
@@ -271,6 +311,8 @@ where
         Ok(())
     }
 
+    /// One tenant's readout, resolving its chain first; for reads, which run
+    /// outside a transaction.
     async fn readout<C: DBRunner>(
         &self,
         conn: &C,
@@ -282,6 +324,10 @@ where
             .await
     }
 
+    /// One tenant's readout over its chain already resolved: the stored row,
+    /// the effective access over the chain, and the tag. The chain is also
+    /// what the upward disclosure boundary reads the path from the reader
+    /// tenant down to the target off.
     async fn readout_on_chain<C: DBRunner>(
         &self,
         conn: &C,
@@ -335,67 +381,32 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-read:p1:inst-ta-read-5
     }
 
-    /// Prepare and store a restriction using a non-transactional runner.
-    /// For atomic mutation and audit writes, resolve [`Self::prepare_mutation`]
-    /// before opening a transaction, then call [`Self::set_prepared`] inside it.
-    ///
-    /// # Errors
-    /// As [`Self::prepare_mutation`] and [`Self::set_prepared`].
-    pub async fn set<C: DBRunner>(
-        &self,
-        conn: &C,
-        actor: &AccessActor,
-        key: &SettingKey,
-        target: Uuid,
-        access: TenantAccess,
-        if_match: Option<&str>,
-    ) -> Result<AccessReadout, DomainError> {
-        let prepared = self.prepare_mutation(actor, target).await?;
-        self.set_prepared(conn, &prepared, key, access, if_match)
-            .await
-    }
-
-    /// Prepare and clear a restriction using a non-transactional runner.
-    /// For atomic mutation and audit writes, resolve [`Self::prepare_mutation`]
-    /// before opening a transaction, then call [`Self::clear_prepared`] inside it.
-    ///
-    /// # Errors
-    /// As [`Self::prepare_mutation`] and [`Self::clear_prepared`].
-    pub async fn clear<C: DBRunner>(
-        &self,
-        conn: &C,
-        actor: &AccessActor,
-        key: &SettingKey,
-        target: Uuid,
-        if_match: Option<&str>,
-    ) -> Result<AccessReadout, DomainError> {
-        let prepared = self.prepare_mutation(actor, target).await?;
-        self.clear_prepared(conn, &prepared, key, if_match).await
-    }
-
     /// Store `read_only` or `hidden` for a strict descendant, inside the
-    /// caller's transaction, using hierarchy facts from [`Self::prepare_mutation`].
+    /// caller's transaction.
+    ///
+    /// `chains` come from [`Self::authorized_hierarchy_chains`] for this
+    /// `actor` and `target`, resolved before the transaction opened; that call
+    /// is also where the strict-descendant target check runs.
     ///
     /// # Errors
-    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
-    /// descendant; [`DomainError::Validation`] for `overridable`;
+    /// [`DomainError::Internal`] for chains resolved for another caller or
+    /// target; [`DomainError::Validation`] for `overridable`;
     /// [`DomainError::NotFound`] for a declaration absent or hidden;
     /// [`DomainError::Retired`] for a retired one;
     /// [`DomainError::PreconditionRequired`] and
     /// [`DomainError::PreconditionFailed`] on the tag.
-    pub async fn set_prepared<C: DBRunner>(
+    #[allow(clippy::too_many_arguments)]
+    pub async fn set<C: DBRunner>(
         &self,
         conn: &C,
-        prepared: &PreparedAccessMutation,
+        actor: &AccessActor,
+        chains: &TenantHierarchyChains,
         key: &SettingKey,
+        target: Uuid,
         access: TenantAccess,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let actor = &prepared.actor;
-        let target = prepared.target;
-        // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
-        // Target authorization was completed by `prepare_mutation`.
-        // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
+        chains.ensure_for(actor.ctx.subject_tenant_id(), target)?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         if access == TenantAccess::Overridable {
             return Err(DomainError::Validation {
@@ -407,7 +418,7 @@ where
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
         let declaration = self
-            .visible_declaration_on_chain(conn, actor, key, &prepared.caller_chain)
+            .visible_declaration_on_chain(conn, actor, key, &chains.caller_chain)
             .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-14
         refuse_retired(&declaration)?;
@@ -474,37 +485,31 @@ where
             .append(conn, &AccessScope::allow_all(), record)
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-11
-        self.readout_on_chain(
-            conn,
-            declaration,
-            target,
-            prepared.root,
-            &prepared.target_chain,
-        )
-        .await
+        self.readout_on_chain(conn, declaration, target, chains.root, &chains.target_chain)
+            .await
     }
 
     /// Delete a strict descendant's row, inside the caller's transaction.
     /// Clearing an already absent row is a no-op that still requires the
     /// absent-state tag.
     ///
+    /// `chains` are as for [`Self::set`].
+    ///
     /// # Errors
     /// As [`Self::set`], without the access validation.
-    pub async fn clear_prepared<C: DBRunner>(
+    pub async fn clear<C: DBRunner>(
         &self,
         conn: &C,
-        prepared: &PreparedAccessMutation,
+        actor: &AccessActor,
+        chains: &TenantHierarchyChains,
         key: &SettingKey,
+        target: Uuid,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let actor = &prepared.actor;
-        let target = prepared.target;
-        // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
-        // Target authorization was completed by `prepare_mutation`.
-        // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
+        chains.ensure_for(actor.ctx.subject_tenant_id(), target)?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
         let declaration = self
-            .visible_declaration_on_chain(conn, actor, key, &prepared.caller_chain)
+            .visible_declaration_on_chain(conn, actor, key, &chains.caller_chain)
             .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-10
         refuse_retired(&declaration)?;
@@ -549,14 +554,8 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-7
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-6
-        self.readout_on_chain(
-            conn,
-            declaration,
-            target,
-            prepared.root,
-            &prepared.target_chain,
-        )
-        .await
+        self.readout_on_chain(conn, declaration, target, chains.root, &chains.target_chain)
+            .await
     }
 
     /// Evict the target and its descendants after an access change; called

@@ -412,14 +412,26 @@ impl FakeHierarchy {
     }
 }
 
-#[async_trait]
-impl TenantHierarchy for FakeHierarchy {
-    async fn chain(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
+impl FakeHierarchy {
+    /// Ask the database for a fresh connection when a guard is installed, as
+    /// the database-backed tenant resolver does on every call. Inside an open
+    /// transaction toolkit-db's task-local guard refuses it, which surfaces
+    /// here as `Unavailable` — the failure a resolver call made from inside a
+    /// settings transaction produces in a deployment.
+    fn check_connection_guard(&self) -> Result<(), DomainError> {
         if let Some(db) = self.connection_guard.lock().expect("lock").as_ref() {
             db.conn().map_err(|error| DomainError::Unavailable {
                 detail: error.to_string(),
             })?;
         }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl TenantHierarchy for FakeHierarchy {
+    async fn chain(&self, tenant: Uuid) -> Result<Vec<Uuid>, DomainError> {
+        self.check_connection_guard()?;
         self.chain_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let transient = self
@@ -444,11 +456,7 @@ impl TenantHierarchy for FakeHierarchy {
     }
 
     async fn is_within_subtree(&self, caller: Uuid, target: Uuid) -> Result<bool, DomainError> {
-        if let Some(db) = self.connection_guard.lock().expect("lock").as_ref() {
-            db.conn().map_err(|error| DomainError::Unavailable {
-                detail: error.to_string(),
-            })?;
-        }
+        self.check_connection_guard()?;
         if caller == target {
             return Ok(true);
         }
@@ -468,21 +476,13 @@ impl TenantHierarchy for FakeHierarchy {
     }
 
     async fn is_standalone(&self, tenant: Uuid) -> Result<bool, DomainError> {
-        if let Some(db) = self.connection_guard.lock().expect("lock").as_ref() {
-            db.conn().map_err(|error| DomainError::Unavailable {
-                detail: error.to_string(),
-            })?;
-        }
+        self.check_connection_guard()?;
         self.path_to_root(tenant)?;
         Ok(self.standalone.lock().expect("lock").contains(&tenant))
     }
 
     async fn subtree(&self, tenant: Uuid, budget: usize) -> Result<Subtree, DomainError> {
-        if let Some(db) = self.connection_guard.lock().expect("lock").as_ref() {
-            db.conn().map_err(|error| DomainError::Unavailable {
-                detail: error.to_string(),
-            })?;
-        }
+        self.check_connection_guard()?;
         self.subtree_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self
