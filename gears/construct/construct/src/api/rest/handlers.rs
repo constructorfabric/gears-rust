@@ -9,11 +9,12 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::api::rest::error::{
-    bad_resolution, bad_text, for_export, for_facts, for_rest, for_reviews, for_settings,
-    no_such_fact, too_long,
+    bad_fact_body, bad_resolution, bad_text, for_admin_facts, for_export, for_facts, for_rest,
+    for_reviews, for_settings, no_such_fact, too_long,
 };
 use crate::api::rest::types::{
-    ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings, ConcreteSubjectControl,
+    ConcreteAdminFacts, ConcreteIntake, ConcreteProfile, ConcreteReviewQueue, ConcreteSettings,
+    ConcreteSubjectControl,
 };
 use crate::domain::plan::NodeKey;
 use crate::domain::planner::manage::ManageFacts;
@@ -21,10 +22,10 @@ use crate::domain::record_intake::IntakeOutcome;
 use crate::domain::review_queue::{Resolution, ReviewText};
 
 use super::dto::{
-    FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery,
-    PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest, ResolutionRequest,
-    ReviewRequestDto, ReviewRequestsPageDto, SubjectExportDto, SubjectFactDto, SubjectFactsPageDto,
-    SubjectSettingsDto,
+    AdminFactRequest, FlagFactRequest, ManageFactsRequest, ManageFactsResponse, ProfileDto,
+    ProfileQuery, PutSubjectSettingsRequest, RecordOutcomeDto, RecordQuery, RecordRequest,
+    ResolutionRequest, ReviewRequestDto, ReviewRequestsPageDto, StoredFactDto, SubjectExportDto,
+    SubjectFactDto, SubjectFactsPageDto, SubjectSettingsDto,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -357,4 +358,103 @@ pub async fn resolve_review_request(
     .instrument(review_span("resolve", &ctx, Some(request_id)))
     .await?;
     Ok(Json(ReviewRequestDto::from(request)))
+}
+
+/// A span that names the administrator and the subject, for the error
+/// mapped and logged in it.
+fn admin_span(name: &'static str, ctx: &SecurityContext, subject_id: Uuid) -> tracing::Span {
+    tracing::info_span!(
+        "admin_facts",
+        operation = name,
+        %subject_id,
+        caller = %ctx.subject_id(),
+        tenant_id = %ctx.subject_tenant_id()
+    )
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-read:p2
+pub async fn admin_list_facts(
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteAdminFacts>>,
+    Path(subject_id): Path<Uuid>,
+    OData(query): OData,
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-parse
+) -> ApiResult<Json<SubjectFactsPageDto>> {
+    let page = async {
+        svc.read(&ctx, subject_id, &query)
+            .await
+            .map_err(|e| for_admin_facts(e, subject_id))
+    }
+    .instrument(admin_span("read", &ctx, subject_id))
+    .await?;
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-return
+    Ok(Json(SubjectFactsPageDto::from(page)))
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-read:p2:inst-read-return
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-change:p2
+pub async fn admin_add_fact(
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteAdminFacts>>,
+    Path(subject_id): Path<Uuid>,
+    Json(body): Json<AdminFactRequest>,
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-parse
+) -> ApiResult<impl IntoResponse> {
+    let fact = async {
+        let (property, value) = body
+            .into_property()
+            .map_err(|mistake| bad_fact_body(&mistake))?;
+        svc.add(&ctx, subject_id, &property, &value)
+            .await
+            .map_err(|e| for_admin_facts(e, subject_id))
+    }
+    .instrument(admin_span("add", &ctx, subject_id))
+    .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(StoredFactDto::administrator(fact)),
+    ))
+}
+
+pub async fn admin_edit_fact(
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteAdminFacts>>,
+    Path((subject_id, fact_id)): Path<(Uuid, String)>,
+    Json(body): Json<AdminFactRequest>,
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-parse
+) -> ApiResult<Json<StoredFactDto>> {
+    let fact = async {
+        let fact_id = fact_key(subject_id, fact_id)?;
+        let (property, value) = body
+            .into_property()
+            .map_err(|mistake| bad_fact_body(&mistake))?;
+        svc.edit(&ctx, subject_id, &fact_id, &property, &value)
+            .await
+            .map_err(|e| for_admin_facts(e, subject_id))
+    }
+    .instrument(admin_span("edit", &ctx, subject_id))
+    .await?;
+    Ok(Json(StoredFactDto::administrator(fact)))
+}
+
+/// @cpt-dod:cpt-cf-construct-dod-admin-facts-delete:p2
+pub async fn admin_delete_fact(
+    // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-parse
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<ConcreteAdminFacts>>,
+    Path((subject_id, fact_id)): Path<(Uuid, String)>,
+    // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-parse
+) -> ApiResult<StatusCode> {
+    async {
+        let fact_id = fact_key(subject_id, fact_id)?;
+        svc.delete(&ctx, subject_id, &fact_id)
+            .await
+            .map_err(|e| for_admin_facts(e, subject_id))
+    }
+    .instrument(admin_span("delete", &ctx, subject_id))
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
 }

@@ -1109,8 +1109,9 @@ pub fn stored_fact(
 
 /// One subject's profile in memory: its version and live facts. It keeps
 /// each read: the subject of the context it was read with, and the key.
-/// Each read takes `delay` first, and fails as larger than one read takes
-/// while `too_large` is set.
+/// With an owner, it is that subject's profile only, and any other key reads
+/// as a subject without a profile. Each read takes `delay` first, and fails
+/// as larger than one read takes while `too_large` is set.
 #[derive(Default)]
 pub struct MemoryProfile {
     pub version: std::sync::Mutex<Option<u64>>,
@@ -1118,6 +1119,7 @@ pub struct MemoryProfile {
     pub reads: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
     pub delay: std::sync::Mutex<std::time::Duration>,
     pub too_large: std::sync::atomic::AtomicBool,
+    pub owner: Option<SubjectKey>,
 }
 
 impl MemoryProfile {
@@ -1128,7 +1130,25 @@ impl MemoryProfile {
             reads: std::sync::Mutex::default(),
             delay: std::sync::Mutex::default(),
             too_large: std::sync::atomic::AtomicBool::new(false),
+            owner: None,
         })
+    }
+
+    /// The profile of `owner` alone.
+    pub fn of(owner: SubjectKey, facts: Vec<crate::domain::profile_read::StoredFact>) -> Arc<Self> {
+        Arc::new(Self {
+            version: std::sync::Mutex::new(Some(1)),
+            facts: std::sync::Mutex::new(facts),
+            reads: std::sync::Mutex::default(),
+            delay: std::sync::Mutex::default(),
+            too_large: std::sync::atomic::AtomicBool::new(false),
+            owner: Some(owner),
+        })
+    }
+
+    /// A subject without a profile yet: no version, no facts.
+    pub fn empty() -> Arc<Self> {
+        Arc::new(Self::default())
     }
 
     pub fn live(&self) -> Vec<crate::domain::profile_read::StoredFact> {
@@ -1156,6 +1176,12 @@ impl crate::domain::profile_writes::SubjectProfiles for MemoryProfile {
                     limit: 999,
                 },
             ));
+        }
+        if self.owner.is_some_and(|owner| owner != key) {
+            return Ok(crate::domain::profile_writes::SubjectFacts {
+                version: None,
+                facts: Vec::new(),
+            });
         }
         Ok(crate::domain::profile_writes::SubjectFacts {
             version: *self.version.lock().unwrap(),
@@ -1198,9 +1224,17 @@ impl MemoryWriter {
         })
     }
 
-    /// Apply the plan's removals, and its entity replaces as a reviewer's
-    /// correction makes them.
+    /// Apply the plan's removals, its entity replaces as a correction or an
+    /// edit makes them, and its added entities, with the plan's origin.
     fn remove(&self, plan: &Plan) {
+        use crate::domain::profile_read::OriginKind;
+        let origin = match plan.origin {
+            crate::domain::plan::Origin::Administrator { .. } => OriginKind::Administrator,
+            crate::domain::plan::Origin::Agent { .. } => OriginKind::Agent,
+            crate::domain::plan::Origin::Connector { .. } => OriginKind::Connector,
+            crate::domain::plan::Origin::Reviewer { .. }
+            | crate::domain::plan::Origin::Subject { .. } => OriginKind::Reviewer,
+        };
         let removed: Vec<&NodeKey> = plan
             .steps
             .iter()
@@ -1228,7 +1262,19 @@ impl MemoryWriter {
                         category,
                         property: property.name.clone(),
                         value: property.value.clone(),
-                        origin: crate::domain::profile_read::OriginKind::Reviewer,
+                        origin,
+                        stored_at: time::OffsetDateTime::now_utc(),
+                        produced_at: None,
+                    })
+                }
+                Change::AddEntity { key, properties } => {
+                    let property = properties.first()?;
+                    Some(crate::domain::profile_read::StoredFact {
+                        node_key: key.clone(),
+                        category: crate::domain::profile::Category::from_name(&step.entity_kind)?,
+                        property: property.name.clone(),
+                        value: property.value.clone(),
+                        origin,
                         stored_at: time::OffsetDateTime::now_utc(),
                         produced_at: None,
                     })
@@ -1401,6 +1447,12 @@ pub struct MemoryReviews {
     pub deleted_before_pend: std::sync::atomic::AtomicBool,
     /// The scope of each read of the facts under review.
     pub under_review_scopes: std::sync::Mutex<Vec<AccessScope>>,
+    /// Find no request by fact this many times, as a flag that came in
+    /// after the read would.
+    pub hide_next: std::sync::atomic::AtomicU32,
+    /// Fail the close of an open request on a fact as unavailable, and
+    /// nothing else.
+    pub close_open_fails: std::sync::atomic::AtomicBool,
     /// What each request's claim recorded, by request id.
     pub pending:
         std::sync::Mutex<std::collections::HashMap<Uuid, crate::domain::review_queue::Closed>>,
@@ -1721,6 +1773,12 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         closed: &crate::domain::review_queue::Closed,
     ) -> Result<Option<crate::domain::review_queue::ReviewRequest>, DomainError> {
         self.check()?;
+        if self
+            .close_open_fails
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(DomainError::Unavailable("the database is down".to_owned()));
+        }
         let now = self.pending.lock().unwrap().get(&key.id).cloned();
         if now.as_ref() != recorded {
             return Ok(None);
@@ -1735,6 +1793,17 @@ impl crate::domain::review_queue::ReviewRequests for MemoryReviews {
         fact_ids: &[crate::domain::plan::NodeKey],
     ) -> Result<Vec<crate::domain::review_queue::ReviewRequest>, DomainError> {
         self.check()?;
+        if self
+            .hide_next
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return Ok(Vec::new());
+        }
         let mut requests: Vec<_> = self
             .all()
             .into_iter()
@@ -1801,6 +1870,24 @@ impl RecordingReviewEvents {
 
 impl crate::domain::review_queue::ReviewQueueEvents for RecordingReviewEvents {
     fn record(&self, event: crate::domain::review_queue::ReviewQueueEvent) {
+        self.events.lock().unwrap().push(event);
+    }
+}
+
+/// Keeps every Administrator Fact Management event.
+#[derive(Default)]
+pub struct RecordingAdminEvents {
+    pub events: std::sync::Mutex<Vec<crate::domain::admin_facts::AdminFactsEvent>>,
+}
+
+impl RecordingAdminEvents {
+    pub fn taken(&self) -> Vec<crate::domain::admin_facts::AdminFactsEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+impl crate::domain::admin_facts::AdminFactsEvents for RecordingAdminEvents {
+    fn record(&self, event: crate::domain::admin_facts::AdminFactsEvent) {
         self.events.lock().unwrap().push(event);
     }
 }

@@ -188,7 +188,7 @@ impl SubjectControlService {
         let (key, scope) = own(&self.policy_enforcer, ctx, subject_id, actions::READ).await?;
         let facts = self.ports.writes.facts(key).await?;
         let Page { items, page_info } = page(facts.facts, query, &SUBJECT_FACTS_LISTING)?;
-        let items = self.with_requests(&scope, key, items).await?;
+        let items = with_requests(self.ports.reviews.as_ref(), &scope, key, items).await?;
         // @cpt-end:cpt-cf-construct-flow-subject-control-view:p1:inst-view-read
         // @cpt-begin:cpt-cf-construct-flow-subject-control-view:p1:inst-view-event
         self.ports.events.record(SubjectControlEvent::Viewed {
@@ -403,34 +403,32 @@ impl SubjectControlService {
             review_requests,
         })
     }
+}
 
-    /// `facts`, each with its latest review request.
-    async fn with_requests(
-        &self,
-        scope: &AccessScope,
-        key: SubjectKey,
-        facts: Vec<StoredFact>,
-    ) -> Result<Vec<SubjectFact>, DomainError> {
-        let ids: Vec<NodeKey> = facts.iter().map(|fact| fact.node_key.clone()).collect();
-        let mut latest: BTreeMap<NodeKey, ReviewRequest> = self
-            .ports
-            .reviews
-            .latest_on(scope, key, &ids)
-            .await?
-            .into_iter()
-            .map(|request| (request.fact_id.clone(), request))
-            .collect();
-        Ok(facts
-            .into_iter()
-            .map(|fact| {
-                let review_request = latest.remove(&fact.node_key);
-                SubjectFact {
-                    fact,
-                    review_request,
-                }
-            })
-            .collect())
-    }
+/// `facts`, each with its latest review request.
+pub(crate) async fn with_requests(
+    reviews: &dyn ReviewRequests,
+    scope: &AccessScope,
+    key: SubjectKey,
+    facts: Vec<StoredFact>,
+) -> Result<Vec<SubjectFact>, DomainError> {
+    let ids: Vec<NodeKey> = facts.iter().map(|fact| fact.node_key.clone()).collect();
+    let mut latest: BTreeMap<NodeKey, ReviewRequest> = reviews
+        .latest_on(scope, key, &ids)
+        .await?
+        .into_iter()
+        .map(|request| (request.fact_id.clone(), request))
+        .collect();
+    Ok(facts
+        .into_iter()
+        .map(|fact| {
+            let review_request = latest.remove(&fact.node_key);
+            SubjectFact {
+                fact,
+                review_request,
+            }
+        })
+        .collect())
 }
 
 fn categories_of(facts: &[StoredFact]) -> BTreeSet<Category> {

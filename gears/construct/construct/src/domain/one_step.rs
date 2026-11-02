@@ -16,7 +16,7 @@ use super::plan::{Change, NodeKey, Origin, Plan, Property, Step};
 use super::planner::catalog::{PropertyCatalog, PropertySpec};
 use super::planner::processing::Written;
 use super::profile::Category;
-use super::profile_writes::{Attempt, ProfileWrites, WriteError};
+use super::profile_writes::{Attempt, ProfileWrites, SubjectFacts, WriteError};
 use super::record_intake::DropReason;
 use super::sensitive_data::{Checked, SensitiveDataChecks};
 use super::subject_settings::SubjectKey;
@@ -54,25 +54,6 @@ pub struct OneStepPath {
     pub catalog: Arc<PropertyCatalog>,
 }
 
-/// The one step to write.
-#[domain_model]
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum OneStep<'a> {
-    /// A new fact holding `property` with `value`.
-    Add { property: &'a str, value: &'a Value },
-    /// A new fact in place of `fact`, holding its property with `value`.
-    Replace { fact: &'a NodeKey, value: &'a Value },
-}
-
-impl OneStep<'_> {
-    const fn what(self) -> &'static str {
-        match self {
-            Self::Add { .. } => "add",
-            Self::Replace { .. } => "edit",
-        }
-    }
-}
-
 /// A fact the one-step path stored: its new key, its category and its
 /// property with the value Admission let through.
 #[domain_model]
@@ -83,23 +64,40 @@ pub struct NewFact {
     pub property: Property,
 }
 
-/// What a one-step write did.
+/// A replace found the fact to replace gone; nothing was stored.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Gone;
+
+/// An add found the value, or a value of its one-valued property, held
+/// already as this fact; nothing was stored.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Held(pub NodeKey);
+
+/// What a one-step write did: stored the new fact, stored nothing for the
+/// step's own reason `E` ([`Gone`] for a replace, [`Held`] for an add), or
+/// stored nothing because the checks or Admission refused it.
 #[domain_model]
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum OneStepDone {
+pub(crate) enum OneStepDone<E> {
     Stored(NewFact),
-    /// The fact to replace is gone; nothing was stored.
-    Gone,
-    /// The subject already holds this value, or a value of this one-valued
-    /// property, as the named fact; nothing was stored.
-    Held(NodeKey),
+    Skipped(E),
     NotStored(NotStored),
 }
 
-/// A plan ready to write, or why there is none.
+/// The step built on a read of the profile, or the step's reason to store
+/// nothing.
 #[domain_model]
-enum Prepared {
-    Done(OneStepDone),
+enum Built<E> {
+    Skipped(E),
+    Step(Category, Change),
+}
+
+/// A plan ready to write, or what was done instead.
+#[domain_model]
+enum Prepared<E> {
+    Done(OneStepDone<E>),
     Write(Box<Plan>, NewFact),
 }
 
@@ -109,7 +107,8 @@ impl OneStepPath {
     /// # Errors
     ///
     /// [`DomainError::InvalidValue`] for a property no person type has, or
-    /// a value its schema does not take.
+    /// a value its schema does not take. The message never repeats the
+    /// caller's property or value.
     pub(crate) fn check(
         &self,
         property: &str,
@@ -120,7 +119,7 @@ impl OneStepPath {
             .get(property)
             .ok_or_else(|| DomainError::InvalidValue {
                 field: "property",
-                rule: format!("no person type has the property `{property}`"),
+                rule: "no person type has this property".to_owned(),
             })?;
         spec.check(value)
             .map_err(|rule| DomainError::InvalidValue {
@@ -130,33 +129,148 @@ impl OneStepPath {
         Ok(spec)
     }
 
-    /// Write `step` for the subject `key` as `origin`: read the profile,
-    /// build the plan with a new node key, run the checks and Admission, call
-    /// `pend` with the new key, and write it against the version read; on a
-    /// conflict, read and write again as [`ProfileWrites::with_reruns`] does.
+    /// Add a fact holding `property` with `value` to the subject `key`'s
+    /// profile, as `origin`. A subject without a profile gets one.
+    ///
+    /// NOT cancel-safe, as [`Self::replace`].
     ///
     /// # Errors
     ///
     /// [`DomainError::InvalidValue`] for a property or value the person types
-    /// do not take; `pend`'s error; unavailable when the profile kept
-    /// changing; may have been written when the writer failed.
-    pub(crate) async fn write<P, PF>(
+    /// do not take; otherwise as [`Self::replace`].
+    pub(crate) async fn add(
         &self,
         writes: &ProfileWrites,
         key: SubjectKey,
         origin: &Origin,
-        step: OneStep<'_>,
+        property: &str,
+        value: &Value,
+        deadline: Instant,
+    ) -> Result<OneStepDone<Held>, WriteError> {
+        let spec = self.check(property, value)?;
+        self.write(
+            writes,
+            key,
+            origin,
+            "add",
+            deadline,
+            |current, new_key| {
+                let held = current.facts.iter().find(|fact| {
+                    fact.property == property
+                        && (spec.cardinality == Cardinality::One || &fact.value == value)
+                });
+                Ok(match held {
+                    Some(held) => Built::Skipped(Held(held.node_key.clone())),
+                    None => Built::Step(
+                        spec.category,
+                        Change::AddEntity {
+                            key: new_key.clone(),
+                            properties: vec![Property::new(property, value.clone())],
+                        },
+                    ),
+                })
+            },
+            |_| std::future::ready(Ok(())),
+        )
+        .await
+    }
+
+    /// Store `value` for `property` in place of the subject `key`'s fact
+    /// `fact`, as `origin`, under a new node key; `what` names the write in
+    /// logs and answers. `pend` is called with the new key before each write.
+    ///
+    /// NOT cancel-safe: a drop after `pend` and before the write leaves what
+    /// `pend` recorded with nothing written, and a drop while the writer runs
+    /// leaves a write that may have landed. The caller's own records, such as
+    /// a claim's pending outcome, settle either.
+    ///
+    /// # Errors
+    ///
+    /// Internal when no person type has `property`, a stored fact's own
+    /// property; [`DomainError::InvalidValue`] for a value its schema does
+    /// not take; `pend`'s error; unavailable when the profile kept changing;
+    /// may have been written when the writer failed.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one write and its two callers' hooks"
+    )]
+    pub(crate) async fn replace<P, PF>(
+        &self,
+        writes: &ProfileWrites,
+        key: SubjectKey,
+        origin: &Origin,
+        what: &'static str,
+        fact: &NodeKey,
+        property: &str,
+        value: &Value,
         deadline: Instant,
         pend: P,
-    ) -> Result<OneStepDone, WriteError>
+    ) -> Result<OneStepDone<Gone>, WriteError>
     where
         P: Fn(&NodeKey) -> PF,
         PF: Future<Output = Result<(), DomainError>>,
     {
+        let spec = self.catalog.get(property).ok_or_else(|| {
+            DomainError::internal(format!(
+                "stored fact {} has property `{property}`, which no person type has",
+                fact.0
+            ))
+        })?;
+        spec.check(value)
+            .map_err(|rule| DomainError::InvalidValue {
+                field: "value",
+                rule,
+            })?;
+        self.write(
+            writes,
+            key,
+            origin,
+            what,
+            deadline,
+            |current, new_key| {
+                let Some(old) = current.facts.into_iter().find(|old| &old.node_key == fact) else {
+                    return Ok(Built::Skipped(Gone));
+                };
+                Ok(Built::Step(
+                    old.category,
+                    Change::ReplaceEntity {
+                        old: old.node_key,
+                        key: new_key.clone(),
+                        properties: vec![Property::new(old.property, value.clone())],
+                    },
+                ))
+            },
+            pend,
+        )
+        .await
+    }
+
+    /// Read the profile, `build` the step on it under a new node key, run
+    /// the checks and Admission, call `pend` with the new key, and write the
+    /// plan against the version read; on a conflict, read and write again as
+    /// [`ProfileWrites::with_reruns`] does.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the step's builder and the caller's hook"
+    )]
+    async fn write<E, B, P, PF>(
+        &self,
+        writes: &ProfileWrites,
+        key: SubjectKey,
+        origin: &Origin,
+        what: &'static str,
+        deadline: Instant,
+        build: B,
+        pend: P,
+    ) -> Result<OneStepDone<E>, WriteError>
+    where
+        B: Fn(SubjectFacts, &NodeKey) -> Result<Built<E>, DomainError>,
+        P: Fn(&NodeKey) -> PF,
+        PF: Future<Output = Result<(), DomainError>>,
+    {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
-        let what = step.what();
         let (construct, scope) = writes.construct(key.tenant_id).await?;
-        let (construct, scope, pend) = (&construct, &scope, &pend);
+        let (construct, scope, build, pend) = (&construct, &scope, &build, &pend);
         // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
         writes
             .with_reruns(deadline, what, move || async move {
@@ -166,49 +280,18 @@ impl OneStepPath {
                     // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-read
                     // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-plan
                     let new_key = NodeKey::new_in(key.tenant_id);
-                    let (category, change) = match step {
-                        OneStep::Add { property, value } => {
-                            let spec = self.check(property, value)?;
-                            let held = current.facts.iter().find(|fact| {
-                                fact.property == property
-                                    && (spec.cardinality == Cardinality::One
-                                        || &fact.value == value)
-                            });
-                            if let Some(held) = held {
-                                return Ok(Prepared::Done(OneStepDone::Held(
-                                    held.node_key.clone(),
-                                )));
-                            }
-                            (
-                                spec.category,
-                                Change::AddEntity {
-                                    key: new_key.clone(),
-                                    properties: vec![Property::new(property, value.clone())],
-                                },
-                            )
+                    let version = current.version;
+                    let (category, change) = match build(current, &new_key)? {
+                        Built::Skipped(why) => {
+                            return Ok(Prepared::Done(OneStepDone::Skipped(why)));
                         }
-                        OneStep::Replace { fact, value } => {
-                            let Some(old) =
-                                current.facts.into_iter().find(|old| &old.node_key == fact)
-                            else {
-                                return Ok(Prepared::Done(OneStepDone::Gone));
-                            };
-                            self.check(&old.property, value)?;
-                            (
-                                old.category,
-                                Change::ReplaceEntity {
-                                    old: old.node_key,
-                                    key: new_key.clone(),
-                                    properties: vec![Property::new(old.property, value.clone())],
-                                },
-                            )
-                        }
+                        Built::Step(category, change) => (category, change),
                     };
                     let plan = Plan {
                         tenant_id: key.tenant_id,
                         subject_id: key.subject_id,
                         origin: origin.clone(),
-                        profile_version: current.version,
+                        profile_version: version,
                         steps: vec![Step {
                             entity_kind: category.name().to_owned(),
                             change,

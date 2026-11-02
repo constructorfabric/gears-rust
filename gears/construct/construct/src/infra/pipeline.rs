@@ -16,6 +16,7 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use crate::config::{CategoryCheckConfig, ValidConfig};
+use crate::domain::admin_facts::{AdminFactsPorts, AdminFactsService};
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
@@ -34,6 +35,7 @@ use crate::domain::review_queue::{ReviewQueueService, ReviewRequests};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
 use crate::domain::subject_settings::SubjectSettingsReader;
+use crate::infra::admin_facts_events::LogAdminFactsEvents;
 use crate::infra::admission_events::LogAdmissionEvents;
 use crate::infra::admission_rules::{ConfigAdmissionRules, warn_open_lists};
 use crate::infra::intake_events::LogIntakeEvents;
@@ -150,6 +152,7 @@ pub struct Pipeline {
     pub profile: Arc<ProfileReadService>,
     pub subject_control: Arc<SubjectControlService>,
     pub review_queue: Arc<ReviewQueueService>,
+    pub admin_facts: Arc<AdminFactsService>,
 }
 
 /// Build the pipeline from the config.
@@ -287,13 +290,28 @@ pub fn assemble(
         })
     });
     let review_queue = Arc::new(ReviewQueueService::new(
-        profile_writes,
+        Arc::clone(&profile_writes),
         Arc::clone(&reviews),
         Arc::new(LogReviewQueueEvents),
-        one_step,
-        policy_enforcer,
+        one_step.clone(),
+        policy_enforcer.clone(),
     ));
     // @cpt-end:cpt-cf-construct-algo-review-queue-wire:p1:inst-wire-review-queue
+
+    // @cpt-begin:cpt-cf-construct-algo-admin-facts-wire:p2:inst-wire-admin-facts
+    // An administrator's add and edit store values through the same path as
+    // a correction, under the same opt-in; a read and a delete need neither.
+    let admin_facts = Arc::new(AdminFactsService::new(
+        AdminFactsPorts {
+            writes: profile_writes,
+            reviews: Arc::clone(&reviews),
+            review_queue: Arc::clone(&review_queue),
+            one_step,
+            events: Arc::new(LogAdminFactsEvents),
+        },
+        policy_enforcer,
+    ));
+    // @cpt-end:cpt-cf-construct-algo-admin-facts-wire:p2:inst-wire-admin-facts
 
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
     // No real sensitive-data check exists yet, so processing runs only where
@@ -307,6 +325,7 @@ pub fn assemble(
             profile,
             subject_control,
             review_queue,
+            admin_facts,
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -356,6 +375,7 @@ pub fn assemble(
         profile,
         subject_control,
         review_queue,
+        admin_facts,
     })
     // @cpt-end:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-processing
 }

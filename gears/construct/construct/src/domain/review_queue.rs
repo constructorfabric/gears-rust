@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use super::error::DomainError;
 pub use super::one_step::NotStored;
-use super::one_step::{NewFact, OneStep, OneStepDone, OneStepPath};
+use super::one_step::{Gone, NewFact, OneStepDone, OneStepPath};
 use super::plan::{NodeKey, Origin};
 use super::profile::Category;
 use super::profile_writes::{
@@ -697,22 +697,51 @@ enum Corrected {
 }
 
 /// Who resolves a request: a reviewer, or a tenant administrator whose own
-/// edit or delete of the fact closes it. Its id closes the request, and its
-/// origin goes with what it writes.
+/// edit or delete of the fact closes it. Its id closes the request, and the
+/// origin it names goes with what it writes.
 #[domain_model]
-#[derive(Debug, Clone)]
-pub(crate) struct Resolver {
-    pub by: Uuid,
-    pub origin: Origin,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Resolver {
+    Reviewer(Uuid),
+    Administrator(Uuid),
 }
 
-/// A request a resolution closed, and the fact its correction stored, when
-/// this resolution stored one.
+impl Resolver {
+    /// Who closes the request.
+    pub(crate) const fn by(self) -> Uuid {
+        match self {
+            Self::Reviewer(id) | Self::Administrator(id) => id,
+        }
+    }
+
+    /// The origin of what the resolution writes.
+    pub(crate) const fn origin(self) -> Origin {
+        match self {
+            Self::Reviewer(reviewer) => Origin::Reviewer { reviewer },
+            Self::Administrator(administrator) => Origin::Administrator { administrator },
+        }
+    }
+}
+
+/// What a resolution wrote itself. An earlier resolution's write it closed
+/// the request as, or a fact it found gone, is nothing.
 #[domain_model]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Wrote {
+    Nothing,
+    /// The correction stored this fact.
+    Corrected(NewFact),
+    /// The delete removed the fact.
+    Removed,
+}
+
+/// What a resolution wrote, and how its close ended: the closed request, or
+/// the conflict that says it was written but not closed.
+#[domain_model]
+#[derive(Debug)]
 pub(crate) struct Settled {
-    pub request: ReviewRequest,
-    pub stored: Option<NewFact>,
+    pub wrote: Wrote,
+    pub closed: Result<ReviewRequest, DomainError>,
 }
 
 /// @cpt-dod:cpt-cf-construct-dod-review-queue-subject:p1
@@ -951,14 +980,9 @@ impl ReviewQueueService {
             )));
         }
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
-        let resolver = Resolver {
-            by: reviewer,
-            origin: Origin::Reviewer { reviewer },
-        };
-        Ok(self
-            .settle(&scope, key, resolver, resolution)
+        self.settle(&scope, key, Resolver::Reviewer(reviewer), resolution)
             .await?
-            .request)
+            .closed
     }
 
     /// Claim the open request `key` for `resolver`, carry out `resolution`
@@ -971,7 +995,9 @@ impl ReviewQueueService {
     ///
     /// # Errors
     ///
-    /// As [`Self::resolve`], after the caller is authorized.
+    /// As [`Self::resolve`], after the caller is authorized, when nothing was
+    /// written or the write may have landed. A written resolution whose
+    /// request did not close answers in [`Settled::closed`].
     pub(crate) async fn settle(
         &self,
         scope: &AccessScope,
@@ -1019,7 +1045,7 @@ impl ReviewQueueService {
             }
         };
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-claim
-        let (closed, stored) = match self
+        let (closed, wrote) = match self
             .decide(&request, &hold, resolution, pending, deadline)
             .await
         {
@@ -1027,14 +1053,18 @@ impl ReviewQueueService {
             // Nothing was written, so another resolution may take it now.
             Err(WriteError::NotWritten(err)) => {
                 hold.release().await;
-                if let DomainError::NotStored(reason) = &err {
+                // An administrator's refused edit is recorded by its own
+                // service, once.
+                if let (DomainError::NotStored(reason), Resolver::Reviewer(by)) =
+                    (&err, hold.resolver)
+                {
                     self.events.record(ReviewQueueEvent::CorrectionRefused {
                         tenant_id: request.tenant_id,
                         subject_id: request.subject_id,
                         request_id,
                         fact_id: request.fact_id.clone(),
                         reason: *reason,
-                        by: hold.resolver.by,
+                        by,
                     });
                 }
                 return Err(err);
@@ -1060,8 +1090,10 @@ impl ReviewQueueService {
             }
         };
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
-        let request = self.close(&hold, closed).await?;
-        Ok(Settled { request, stored })
+        Ok(Settled {
+            wrote,
+            closed: self.close(&hold, closed).await,
+        })
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-return
     }
 
@@ -1156,7 +1188,7 @@ impl ReviewQueueService {
         resolution: Resolution,
         pending: Option<Closed>,
         deadline: Instant,
-    ) -> Result<(Closed, Option<NewFact>), WriteError> {
+    ) -> Result<(Closed, Wrote), WriteError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-settle
         if let Some(pending) = pending {
             let facts = ProfileWrites::before_write(
@@ -1172,7 +1204,7 @@ impl ReviewQueueService {
                     "construct: an earlier resolution's write is in the profile; the request \
                      closes as that one"
                 );
-                return Ok((pending, None));
+                return Ok((pending, Wrote::Nothing));
             }
         }
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-settle
@@ -1190,10 +1222,16 @@ impl ReviewQueueService {
                     .iter()
                     .any(|fact| fact.node_key == request.fact_id)
                 {
-                    (hold.closing(ReviewOutcome::Rejected, Some(reason)), None)
+                    (
+                        hold.closing(ReviewOutcome::Rejected, Some(reason)),
+                        Wrote::Nothing,
+                    )
                 } else {
                     found_gone(request);
-                    (hold.closing(ReviewOutcome::Deleted, Some(reason)), None)
+                    (
+                        hold.closing(ReviewOutcome::Deleted, Some(reason)),
+                        Wrote::Nothing,
+                    )
                 }
             }
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-reject
@@ -1201,9 +1239,15 @@ impl ReviewQueueService {
             Resolution::Deleted { reason } => {
                 let closing = hold.closing(ReviewOutcome::Deleted, reason);
                 hold.pend(&closing).await?;
-                self.remove(request, &hold.resolver.origin, deadline)
-                    .await?;
-                (closing, None)
+                let wrote = if self
+                    .remove(request, &hold.resolver.origin(), deadline)
+                    .await?
+                {
+                    Wrote::Removed
+                } else {
+                    Wrote::Nothing
+                };
+                (closing, wrote)
             }
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-delete
             // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-correct
@@ -1217,11 +1261,11 @@ impl ReviewQueueService {
             {
                 Corrected::Stored(fact) => (
                     hold.closing(ReviewOutcome::Corrected(fact.node_key.clone()), reason),
-                    Some(fact),
+                    Wrote::Corrected(fact),
                 ),
                 Corrected::Gone => {
                     found_gone(request);
-                    (hold.closing(ReviewOutcome::Deleted, reason), None)
+                    (hold.closing(ReviewOutcome::Deleted, reason), Wrote::Nothing)
                 }
             },
             // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-correct
@@ -1255,13 +1299,14 @@ impl ReviewQueueService {
     }
 
     /// Delete the fact under review, as the subject's delete does, with the
-    /// resolver as origin. A fact already gone is done.
+    /// resolver as origin. A fact already gone is done. Whether this delete
+    /// removed it.
     async fn remove(
         &self,
         request: &ReviewRequest,
         origin: &Origin,
         deadline: Instant,
-    ) -> Result<(), WriteError> {
+    ) -> Result<bool, WriteError> {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-read
         let key = request.subject();
         let (construct, _) = self.writes.construct(key.tenant_id).await?;
@@ -1272,10 +1317,12 @@ impl ReviewQueueService {
             .remove(&construct, key, &request.fact_id, origin, deadline)
             .await?
         {
-            Removed::Removed(_) => {}
-            Removed::Gone => found_gone(request),
+            Removed::Removed(_) => Ok(true),
+            Removed::Gone => {
+                found_gone(request);
+                Ok(false)
+            }
         }
-        Ok(())
         // @cpt-end:cpt-cf-construct-algo-review-queue-remove:p1:inst-remove-write
     }
 
@@ -1313,14 +1360,14 @@ impl ReviewQueueService {
             .into());
         }
         let done = one_step
-            .write(
+            .replace(
                 &self.writes,
                 request.subject(),
-                &hold.resolver.origin,
-                OneStep::Replace {
-                    fact: &request.fact_id,
-                    value,
-                },
+                &hold.resolver.origin(),
+                "correction",
+                &request.fact_id,
+                property,
+                value,
                 deadline,
                 |new_key| {
                     let pending =
@@ -1331,12 +1378,112 @@ impl ReviewQueueService {
             .await?;
         match done {
             OneStepDone::Stored(fact) => Ok(Corrected::Stored(fact)),
-            OneStepDone::Gone => Ok(Corrected::Gone),
+            OneStepDone::Skipped(Gone) => Ok(Corrected::Gone),
             OneStepDone::NotStored(why) => Err(DomainError::NotStored(why).into()),
-            OneStepDone::Held(_) => {
-                Err(DomainError::internal("a replace found its value held").into())
+        }
+    }
+
+    /// Close the open request on a fact `by` deleted outside a resolution,
+    /// as deleted, whether a reviewer holds it or not, as the subject's
+    /// delete does; `removed` when `by`'s own delete removed it. Whether
+    /// there was one, and it was closed.
+    ///
+    /// # Errors
+    ///
+    /// When the request store or the profile cannot be read.
+    pub(crate) async fn close_on_delete(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        fact_id: &NodeKey,
+        by: Uuid,
+        removed: bool,
+    ) -> Result<bool, DomainError> {
+        close_on_change(
+            self.requests.as_ref(),
+            self.events.as_ref(),
+            &self.writes,
+            scope,
+            key,
+            fact_id,
+            by,
+            ReviewOutcome::Deleted,
+            removed,
+        )
+        .await
+    }
+
+    /// Close the open request on a fact `by` replaced outside a resolution
+    /// as `outcome`, when no resolution holds it or recorded a write on it.
+    /// A request a reviewer holds is left to its resolution, which finds the
+    /// fact gone. Whether one closed.
+    ///
+    /// # Errors
+    ///
+    /// When the request store cannot be reached.
+    pub(crate) async fn close_unclaimed(
+        &self,
+        scope: &AccessScope,
+        key: SubjectKey,
+        fact_id: &NodeKey,
+        by: Uuid,
+        outcome: ReviewOutcome,
+    ) -> Result<bool, DomainError> {
+        let Some(request) = self
+            .requests
+            .latest_on(scope, key, std::slice::from_ref(fact_id))
+            .await?
+            .into_iter()
+            .find(ReviewRequest::is_open)
+        else {
+            return Ok(false);
+        };
+        let claim = ClaimId(Uuid::new_v4());
+        let request_key = request.key();
+        let claimed = self
+            .requests
+            .claim(
+                scope,
+                request_key,
+                claim,
+                OffsetDateTime::now_utc(),
+                CLAIM_HOLD,
+            )
+            .await?;
+        match claimed {
+            Claimed::Taken { pending: None, .. } => {}
+            Claimed::Taken {
+                pending: Some(_), ..
+            } => {
+                // An earlier resolution's write may be in the profile; the
+                // next resolution settles it.
+                self.requests.release(scope, request_key, claim).await?;
+                return Ok(false);
+            }
+            Claimed::Closed | Claimed::Held => {
+                tracing::info!(
+                    request_id = %request.id,
+                    "construct: a request on a replaced fact is left to the resolution that holds it"
+                );
+                return Ok(false);
             }
         }
+        let closed = Closed {
+            outcome,
+            by,
+            at: OffsetDateTime::now_utc(),
+            reason: None,
+        };
+        let Some(closed_request) = self
+            .requests
+            .close(scope, request_key, claim, &closed)
+            .await?
+        else {
+            return Ok(false);
+        };
+        self.events
+            .record(ReviewQueueEvent::resolved(&closed_request, &closed));
+        Ok(true)
     }
 }
 
@@ -1358,7 +1505,7 @@ impl Hold<'_> {
     fn closing(&self, outcome: ReviewOutcome, reason: Option<ReviewText>) -> Closed {
         Closed {
             outcome,
-            by: self.resolver.by,
+            by: self.resolver.by(),
             at: OffsetDateTime::now_utc(),
             reason,
         }

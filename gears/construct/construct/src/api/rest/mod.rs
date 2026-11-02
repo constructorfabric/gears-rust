@@ -5,6 +5,8 @@ pub mod routes;
 pub mod types;
 
 #[cfg(test)]
+mod admin_facts_routes_test;
+#[cfg(test)]
 mod error_test;
 
 #[cfg(test)]
