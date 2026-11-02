@@ -84,6 +84,8 @@ jobs:
               - 'gears-rust.mk'
               - 'rust-toolchain.toml'
               - '.cargo/**'
+              - 'tools/scripts/check_crypto_facade.py'
+              - 'tools/scripts/tests/test_crypto_facade.py'
               # Input to `make check-release-config` in the repo-checks job: a config-only
               # edit must still get the release configuration validated.
               - 'release-plz.toml'
@@ -99,6 +101,8 @@ jobs:
               # silently never runs on exactly the diff it exists to catch.
               - 'testing/e2e/lib/sidecars.py'
             fips:
+              - 'libs/toolkit-security/**'
+              - 'libs/toolkit-auth/**'
               - 'libs/toolkit/**'
               - 'libs/toolkit-http/**'
               - 'libs/toolkit-http-proxy/**'
@@ -165,7 +169,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -181,7 +185,7 @@ jobs:
           rustup show
 
       - name: Install cargo-hack
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-hack
 
@@ -218,6 +222,11 @@ jobs:
       # step in this job.
       - name: No unpinned database container images
         run: cargo xtask check-test-container-pins
+
+      - name: Application crypto stays behind the facade
+        run: |
+          python3 tools/scripts/check_crypto_facade.py
+          python3 -m unittest discover -s tools/scripts/tests -p test_crypto_facade.py
 
       # The wrapper turns compiler/lint errors into annotations titled by
       # their code (E0308, DE0904, clippy::...) when the command fails.
@@ -312,7 +321,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -328,7 +337,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -481,6 +490,10 @@ jobs:
         if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
         run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-db
 
+      - name: Test oagw (cluster feature)
+        if: ${{ !cancelled() && steps.setup.outcome == 'success' }}
+        run: tools/scripts/with_rust_annotations.sh make test-integration LANE=oagw-cluster
+
       # Published as GitHub Checks by test-report.yml (workflow_run), which has
       # the `checks: write` this job lacks on fork PRs. `!cancelled()` so a
       # failing run still ships its report; a missing report (build failure)
@@ -540,7 +553,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -558,7 +571,7 @@ jobs:
           rustup show
 
       - name: Install nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: nextest
 
@@ -590,18 +603,33 @@ jobs:
         if: runner.os == 'macOS'
         shell: bash
         run: |
+          cargo test -p cf-gears-toolkit-security --features fips,jwt,internal-auth-cache --lib --test jwt_no_backend_fallback
+          cargo test -p cf-gears-toolkit-auth --features toolkit-security/fips --lib providers::jwks
           cargo test -p cf-gears-rustls-corecrypto-provider --features fips
           cargo test -p cf-gears-toolkit-http --features fips
           cargo test -p cf-gears-toolkit-http-proxy --features fips --no-run
 
-      # Windows: build-verify the CNG provider path. Compile-only is sufficient —
-      # runtime FIPS execution depends on host FIPS-mode policy (see ADR 0003).
-      - name: FIPS build check (Windows / CNG)
+      # Windows: execute native CNG operations through internal test injection.
+      # This does not establish a FIPS witness on the hosted runner (ADR 0003).
+      - name: CNG operations and FIPS build check (Windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
+          cargo test --locked -p cf-gears-toolkit-security --features fips,jwt --lib crypto::windows_tests::native_cng_operations
+          cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-security --all-targets --features fips,jwt,internal-auth-cache
           cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http --features fips
           cargo check --target x86_64-pc-windows-msvc -p cf-gears-toolkit-http-proxy --features fips
+
+      - name: Check FIPS sidecar configuration
+        shell: bash
+        run: cargo check --locked -p cf-gears-file-storage --bin sidecar --features toolkit/fips
+
+      - name: Test native FIPS consumers
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          cargo test --locked -p cf-gears-file-storage --features toolkit/fips --lib --bin sidecar
+          cargo test --locked -p cf-gears-credstore --features toolkit-security/fips --lib domain::secret::fence
 
       - name: Save compilation metrics
         if: always() && runner.os == 'Linux' && steps.sccache.outputs.enabled == 'true'
@@ -671,7 +699,7 @@ jobs:
       # cargo-llvm-cov 0.8.5, which on nightly-2026-08-21 ran every test and
       # then found no object files to report on.
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -780,7 +808,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov and nextest
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -1005,7 +1033,7 @@ jobs:
 
       # Install tools via prebuilt binaries for speed.
       - name: Install cargo-deny
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-deny@0.20.2
 
@@ -1041,7 +1069,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -1065,7 +1093,7 @@ jobs:
           save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: cargo-llvm-cov, nextest
 
@@ -1086,6 +1114,9 @@ jobs:
       #   5. The toolkit-durable-execution PostgreSQL suites behind the integration
       #      feature, including subprocess recovery. A single test binary
       #      shares the workspace-pinned PostgreSQL container.
+      #   6. OAGW with its `cluster` feature, which pass 1 lacks: the proxy
+      #      cache's change log, publisher and watcher. Keep in sync with
+      #      the `oagw-cluster` lane of `make test-integration`.
       #
       # The per-binary k3s loop (one container per binary, cleaned between —
       # nextest's process-per-test would start ~70 of them) lives in the
@@ -1127,6 +1158,9 @@ jobs:
           # (cargo test: no JUnit).
           fresh_report
           "$W" make coverage-durable-execution-pg
+          # Pass 6: OAGW with the `cluster` feature.
+          fresh_report
+          "$W" cargo llvm-cov nextest --no-report -p cf-gears-oagw --features cluster
           # Merge into the single report that gets uploaded.
           cargo llvm-cov report --lcov --output-path lcov.info
 
@@ -1187,7 +1221,7 @@ jobs:
           persist-credentials: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -1214,4 +1248,4 @@ jobs:
           git config --global url."file://$mirror".insteadOf https://github.com/rust-lang/rust-clippy
 
       - name: Run architecture lints
-        run: tools/scripts/with_rust_annotations.sh cargo gears lint --dylint
+        run: tools/scripts/with_rust_annotations.sh make dylint

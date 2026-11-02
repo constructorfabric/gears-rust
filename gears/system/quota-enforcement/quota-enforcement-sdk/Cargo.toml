@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-quota-enforcement-sdk"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -33,7 +33,6 @@ schemars = { workspace = true }
 time = { workspace = true }
 
 # Canonical digests: the idempotency subject key and the request payload hash
-aws-lc-rs = { workspace = true }
 
 # GTS types. `inventory` carries the QE-owned GTS definitions into the
 # process-wide registry seed (`toolkit_gts::InventoryTypeSchema`).

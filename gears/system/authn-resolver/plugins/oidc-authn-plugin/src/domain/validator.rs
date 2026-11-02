@@ -197,34 +197,41 @@ impl JwtValidator {
             validation.set_required_spec_claims(&["aud"]);
         }
 
-        let token_data = jsonwebtoken::decode::<JwtClaims>(token, &decoding_key, &validation)
-            .map_err(|e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                    self.metrics
-                        .increment_token_rejected(TOKEN_REJECTION_REASON_EXPIRED);
-                    AuthNError::TokenExpired
-                }
-                jsonwebtoken::errors::ErrorKind::InvalidAudience => {
-                    self.metrics
-                        .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_AUDIENCE);
-                    AuthNError::InvalidAudience
-                }
-                jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
-                    self.metrics
-                        .increment_token_rejected(TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER);
-                    AuthNError::UntrustedIssuer
-                }
-                jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => {
-                    self.metrics
-                        .increment_token_rejected(TOKEN_REJECTION_REASON_MISSING_AUDIENCE);
-                    AuthNError::MissingClaim("aud".to_owned())
-                }
-                _ => {
-                    self.metrics
-                        .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_SIG);
-                    AuthNError::SignatureInvalid
-                }
-            })?;
+        let token_data = toolkit_security::jwt::decode::<JwtClaims>(
+            token,
+            &decoding_key,
+            &validation,
+        )
+        .map_err(|e| match e.kind() {
+            jsonwebtoken::errors::ErrorKind::Provider(cause) => {
+                AuthNError::CryptoUnavailable(cause.clone())
+            }
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
+                self.metrics
+                    .increment_token_rejected(TOKEN_REJECTION_REASON_EXPIRED);
+                AuthNError::TokenExpired
+            }
+            jsonwebtoken::errors::ErrorKind::InvalidAudience => {
+                self.metrics
+                    .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_AUDIENCE);
+                AuthNError::InvalidAudience
+            }
+            jsonwebtoken::errors::ErrorKind::InvalidIssuer => {
+                self.metrics
+                    .increment_token_rejected(TOKEN_REJECTION_REASON_UNTRUSTED_ISSUER);
+                AuthNError::UntrustedIssuer
+            }
+            jsonwebtoken::errors::ErrorKind::MissingRequiredClaim(claim) if claim == "aud" => {
+                self.metrics
+                    .increment_token_rejected(TOKEN_REJECTION_REASON_MISSING_AUDIENCE);
+                AuthNError::MissingClaim("aud".to_owned())
+            }
+            _ => {
+                self.metrics
+                    .increment_token_rejected(TOKEN_REJECTION_REASON_INVALID_SIG);
+                AuthNError::SignatureInvalid
+            }
+        })?;
 
         let claims = token_data.claims;
 

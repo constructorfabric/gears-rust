@@ -415,7 +415,7 @@ The system **MUST** validate `secret_ref` accessibility via `cred_store` for the
 
 ## 7. Non-Applicable Concerns
 
-- **Performance (PERF)**: Not applicable for initial specification — hierarchy walk is bounded by tenant tree depth (typically ≤ 5 levels). Performance-critical caching of effective configuration belongs to Feature 8 (Observability & Security Hardening) multi-layer cache.
+- **Performance (PERF)**: Not applicable for initial specification — hierarchy walk is bounded by tenant tree depth (typically ≤ 5 levels). With a database, the proxy configuration cache ([ADR: Proxy Configuration Cache](../ADR/0020-proxy-config-cache.md), `cpt-cf-oagw-algo-obs-proxy-config-cache` in Feature 8) caches the upstream candidates per alias and tenant chain and the routes per upstream; the hierarchy walk, the sharing rules and the merge still run on every request, so this feature's semantics do not change. An ancestor's write evicts the entries whose tenant chains contain it. Effective configuration is not cached.
 - **States (CDSL)**: Not applicable — sharing modes are static configuration, not lifecycle states. See Section 4.
 - **Reliability — Fault Tolerance (REL-FDESIGN-002)**: Partially addressed — `cred_store` unavailability is handled fail-closed (503 ServiceUnavailable) in the bind flow. Retry logic and circuit breaker patterns for `cred_store` calls are scoped to Feature 6 (Rate Limiting & Resilience). Tenant hierarchy resolution failures are a platform responsibility; OAGW receives the resolved ancestor chain as input.
 - **Security — Audit Trail (SEC-FDESIGN-005)**: Not applicable — audit logging for configuration changes is scoped to Feature 8 (Observability & Security Hardening).

@@ -7,6 +7,7 @@ use super::{
     dto::{PricingPriceCreate, PricingPriceCreated, PricingPriceDto, PricingPricePatch},
     support::{self, DoorError},
 };
+use crate::infra::reference_work::Clock;
 use crate::{
     domain::{
         RuleError,
@@ -396,25 +397,28 @@ pub async fn create(
     digest: Vec<u8>,
     input: PricingPriceCreate,
     scales: Arc<CurrencyScales>,
+    clock: Arc<dyn Clock>,
 ) -> Result<Response, CanonicalError> {
     let mut attempt = 1;
     loop {
-        let (scope, ctx, key, digest, input, scales) = (
+        let (scope, ctx, key, digest, input, scales, clock) = (
             scope.clone(),
             ctx.clone(),
             key.clone(),
             digest.clone(),
             input.clone(),
             scales.clone(),
+            clock.clone(),
         );
         let result = support::transaction_door(db, move |tx| {
-            let (scope, ctx, key, digest, input, scales) = (
+            let (scope, ctx, key, digest, input, scales, clock) = (
                 scope.clone(),
                 ctx.clone(),
                 key.clone(),
                 digest.clone(),
                 input.clone(),
                 scales.clone(),
+                clock.clone(),
             );
             Box::pin(async move {
                 create_in(
@@ -427,6 +431,7 @@ pub async fn create(
                     &digest,
                     input,
                     &scales,
+                    &*clock,
                 )
                 .await
             })
@@ -456,6 +461,7 @@ async fn create_in(
     digest: &[u8],
     input: PricingPriceCreate,
     scales: &CurrencyScales,
+    clock: &dyn Clock,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let endpoint = format!("/bss-pricing/v1/price-book-entries/{price_book_entry_id}/prices");
@@ -468,7 +474,8 @@ async fn create_in(
         &live_entry(tx, scope, tenant, price_book_entry_id).await?,
     )
     .await?;
-    let now = crate::infra::storage::stored_now();
+    // The state's clock (the wall clock, or a test's): the date the window is judged on.
+    let now = crate::infra::storage::stored_instant(clock.now());
     // D-427: the money is judged against the entry's model; a price carries none of its own.
     let model = pc.model;
     // A new price, and the return a temporary one makes (a copy of it), take today's scale.
@@ -567,16 +574,38 @@ pub async fn patch(
     version: u64,
     input: PricingPricePatch,
     scales: Arc<CurrencyScales>,
+    clock: Arc<dyn Clock>,
 ) -> Result<Response, CanonicalError> {
     let mut attempt = 1;
     loop {
-        let (scope, ctx, input, scales) =
-            (scope.clone(), ctx.clone(), input.clone(), scales.clone());
+        let (scope, ctx, input, scales, clock) = (
+            scope.clone(),
+            ctx.clone(),
+            input.clone(),
+            scales.clone(),
+            clock.clone(),
+        );
         let result = support::transaction_door(db, move |tx| {
-            let (scope, ctx, input, scales) =
-                (scope.clone(), ctx.clone(), input.clone(), scales.clone());
+            let (scope, ctx, input, scales, clock) = (
+                scope.clone(),
+                ctx.clone(),
+                input.clone(),
+                scales.clone(),
+                clock.clone(),
+            );
             Box::pin(async move {
-                patch_in(tx, &scope, &ctx, correlation, id, version, input, &scales).await
+                patch_in(
+                    tx,
+                    &scope,
+                    &ctx,
+                    correlation,
+                    id,
+                    version,
+                    input,
+                    &scales,
+                    &*clock,
+                )
+                .await
             })
         })
         .await;
@@ -614,6 +643,7 @@ async fn patch_in(
     version: u64,
     input: PricingPricePatch,
     scales: &CurrencyScales,
+    clock: &dyn Clock,
 ) -> Result<Response, DoorError> {
     let tenant = ctx.subject_tenant_id();
     let m = price_repo::find(tx, scope, tenant, id)
@@ -669,7 +699,8 @@ async fn patch_in(
     if let Some(eligibility) = input.eligibility.as_deref() {
         r.eligibility = parse_eligibility(eligibility)?;
     }
-    let now = crate::infra::storage::stored_now();
+    // The state's clock (the wall clock, or a test's): the date the window is judged on.
+    let now = crate::infra::storage::stored_instant(clock.now());
     let siblings = pc.domain_prices()?;
     let mut next = m.clone();
     if let Some(note) = input.note {

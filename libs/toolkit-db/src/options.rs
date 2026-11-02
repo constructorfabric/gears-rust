@@ -11,9 +11,13 @@ use crate::{DbError, DbHandle, Result};
 /// Database connection options using typed sqlx `ConnectOptions`.
 #[derive(Debug, Clone)]
 pub(crate) enum DbConnectOptions {
-    /// Connect options for a SQLite database.
+    /// Connect options for a SQLite database, and how its transactions that may write begin
+    /// (`transaction_mode`).
     #[cfg(feature = "sqlite")]
-    Sqlite(sqlx::sqlite::SqliteConnectOptions),
+    Sqlite(
+        sqlx::sqlite::SqliteConnectOptions,
+        crate::sqlite::pragmas::TransactionMode,
+    ),
     /// Connect options for a PostgreSQL database.
     #[cfg(feature = "pg")]
     Postgres(sqlx::postgres::PgConnectOptions),
@@ -26,7 +30,7 @@ impl std::fmt::Display for DbConnectOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(feature = "sqlite")]
-            DbConnectOptions::Sqlite(opts) => {
+            DbConnectOptions::Sqlite(opts, _) => {
                 let filename = opts.get_filename().display().to_string();
                 if filename.is_empty() {
                     write!(f, "sqlite://memory")
@@ -89,7 +93,7 @@ impl DbConnectOptions {
         let _ = lock_keepalive;
         match self {
             #[cfg(feature = "sqlite")]
-            DbConnectOptions::Sqlite(opts) => {
+            DbConnectOptions::Sqlite(opts, transaction_mode) => {
                 let mut pool_opts = pool.apply_sqlite(sqlx::sqlite::SqlitePoolOptions::new());
 
                 if is_memory_filename(opts.get_filename()) {
@@ -110,6 +114,8 @@ impl DbConnectOptions {
                     dsn,
                     sea,
                     locks,
+                    sqlite_begin_immediate: *transaction_mode
+                        == crate::sqlite::pragmas::TransactionMode::Immediate,
                 };
 
                 Ok(handle)
@@ -139,6 +145,7 @@ impl DbConnectOptions {
                     dsn: format!("postgresql://<redacted>@{host}:{port}/{database}"),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 };
 
                 Ok(handle)
@@ -167,6 +174,7 @@ impl DbConnectOptions {
                     dsn: format!("mysql://<redacted>@{host}:{port}/{database}"),
                     sea,
                     locks,
+                    sqlite_begin_immediate: false,
                 };
 
                 Ok(handle)
@@ -183,11 +191,18 @@ impl DbConnectOptions {
 #[cfg(feature = "sqlite")]
 pub mod sqlite_pragma {
     use crate::DbError;
+    use crate::sqlite::pragmas::TransactionMode;
     use std::collections::HashMap;
     use std::hash::BuildHasher;
 
     /// Whitelisted `SQLite` PRAGMA parameters.
-    const ALLOWED_PRAGMAS: &[&str] = &["wal", "synchronous", "busy_timeout", "journal_mode"];
+    const ALLOWED_PRAGMAS: &[&str] = &[
+        "wal",
+        "synchronous",
+        "busy_timeout",
+        "journal_mode",
+        "transaction_mode",
+    ];
 
     /// Validate and apply `SQLite` PRAGMA parameters to connection options.
     ///
@@ -222,11 +237,39 @@ pub mod sqlite_pragma {
                     let timeout = validate_busy_timeout_pragma(value)?;
                     opts = opts.pragma("busy_timeout", timeout.to_string());
                 }
+                // Not a PRAGMA: toolkit-db reads it (`transaction_mode`), the driver never sees it.
+                "transaction_mode" => {
+                    parse_transaction_mode(value)?;
+                }
                 _ => unreachable!("Checked against whitelist above"),
             }
         }
 
         Ok(opts)
+    }
+
+    /// How the database's transactions that may write begin: `params`' `transaction_mode`
+    /// (any key case), deferred when absent.
+    ///
+    /// # Errors
+    /// Returns `DbError::InvalidSqlitePragma` if the value is neither `deferred` nor `immediate`.
+    pub(crate) fn transaction_mode<S: BuildHasher>(
+        params: &HashMap<String, String, S>,
+    ) -> crate::Result<TransactionMode> {
+        params
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("transaction_mode"))
+            .map_or(Ok(TransactionMode::default()), |(_, value)| {
+                parse_transaction_mode(value)
+            })
+    }
+
+    /// Parse a `transaction_mode` value.
+    fn parse_transaction_mode(value: &str) -> crate::Result<TransactionMode> {
+        TransactionMode::parse(value).ok_or_else(|| DbError::InvalidSqlitePragma {
+            key: "transaction_mode".to_owned(),
+            message: format!("must be deferred/immediate, got '{value}'"),
+        })
     }
 
     /// Validate WAL PRAGMA value.
@@ -420,8 +463,14 @@ fn build_sqlite_options(cfg: &DbConnConfig) -> Result<DbConnectOptions> {
     if let Some(params) = &cfg.params {
         opts = sqlite_pragma::apply_pragmas(opts, params)?;
     }
+    let transaction_mode = cfg
+        .params
+        .as_ref()
+        .map(sqlite_pragma::transaction_mode)
+        .transpose()?
+        .unwrap_or_default();
 
-    Ok(DbConnectOptions::Sqlite(opts))
+    Ok(DbConnectOptions::Sqlite(opts, transaction_mode))
 }
 
 #[cfg(not(feature = "sqlite"))]
@@ -858,6 +907,38 @@ pub fn redact_credentials_in_dsn(dsn: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `transaction_mode` is a toolkit-db parameter: validated with the pragmas, never handed to
+    /// the driver, and parsed (any case) into the mode the database's writers begin with.
+    #[cfg(feature = "sqlite")]
+    #[test]
+    fn transaction_mode_is_validated_and_read_by_toolkit_db() {
+        use crate::sqlite::pragmas::TransactionMode;
+        let params = |value: &str| {
+            std::collections::HashMap::from([("transaction_mode".to_owned(), value.to_owned())])
+        };
+        let opts = sqlx::sqlite::SqliteConnectOptions::new();
+        for value in ["immediate", "Deferred"] {
+            assert!(sqlite_pragma::apply_pragmas(opts.clone(), &params(value)).is_ok());
+        }
+        assert_eq!(
+            sqlite_pragma::transaction_mode(&params("IMMEDIATE")).unwrap(),
+            TransactionMode::Immediate
+        );
+        assert_eq!(
+            sqlite_pragma::transaction_mode(&params("deferred")).unwrap(),
+            TransactionMode::Deferred
+        );
+        assert_eq!(
+            sqlite_pragma::transaction_mode(&std::collections::HashMap::<String, String>::new())
+                .unwrap(),
+            TransactionMode::Deferred
+        );
+        assert!(matches!(
+            sqlite_pragma::apply_pragmas(opts, &params("exclusive")),
+            Err(DbError::InvalidSqlitePragma { key, .. }) if key == "transaction_mode"
+        ));
+    }
 
     /// A well-formed placeholder resolves to the variable's value, and an
     /// unset one is `DbError::EnvVar` naming the variable. The value and

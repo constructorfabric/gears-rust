@@ -1,7 +1,6 @@
 //! S2-04 on real PostgreSQL: the transition engine composing the PEP over the policy fake (S2-03,
-//! D-227), the
-//! registry gate (S2-05), the sealed v3 audit writer (S2-06), step-17 claims (S2-07) and the
-//! real Event Broker managed producer (S2-08), through the restricted runtime role.
+//! D-227), the registry gate (S2-05), the sealed v3 audit writer (S2-06), step-17 claims (S2-07)
+//! and the real Event Broker managed producer (S2-08), through the restricted runtime role.
 //!
 //! Slice guard predicates and contributions are test bindings: the engine owns when and in
 //! what order they run, and the slices that own their logic are later packages.
@@ -24,7 +23,7 @@ use crate::infra::engine::documents::EventDetail;
 use crate::infra::engine::{
     Abort, ChildDocuments, CreateRequest, DocumentWriter, Engine, EngineError, EngineOutcome,
     EngineParts, EventSpec, FaultHook, FaultPoint, OutcomeKind, Preparation, PreparationView,
-    PrepareError, Prepared, PreparedExecution, Registries, TransitionRequest,
+    PrepareError, Prepared, PreparedExecution, Recovery, Registries, TransitionRequest,
 };
 use crate::infra::events::payload::{
     Assertion, CompensationEvidence, LineRef, LineSubscription, OperatorAttestation,
@@ -536,16 +535,13 @@ pub(super) fn prepared(row: u8, order: Uuid, from: S, candidate: Option<i32>) ->
     p.inputs = resolved(row);
     p.event = event(row, from, candidate.unwrap_or(version_of(from)));
     if matches!(row, 4 | 18 | 19 | 20) {
-        p.claims = Some(
-            ProposedClaims::new(
-                ClaimParties {
-                    payer_tenant_id: u(30),
-                    resource_tenant_id: u(10),
-                },
-                [OverlapScopeKey::try_from(format!("sku-{order}")).unwrap()],
-            )
-            .unwrap(),
-        );
+        p.claims = Some(ProposedClaims::new(
+            ClaimParties {
+                payer_tenant_id: u(30),
+                resource_tenant_id: u(10),
+            },
+            [OverlapScopeKey::try_from(format!("sku-{order}")).unwrap()],
+        ));
     }
     if row == 3 {
         p.admin_changes = vec![AdminChange {
@@ -580,7 +576,7 @@ pub(super) async fn reserve_with_dates(
     date_policy_basis: Value,
 ) -> (i32, TransitionRequest) {
     let inputs = AttemptInputs {
-        prepared_draft_revision: (req.trigger == Trigger::Submit).then_some(0),
+        prepared_draft_revision: req.expected_draft_revision.map(i64::from),
         proposed_arrangement: json!({"payer": s(u(30))}),
         authorization_fact_fingerprint: "facts".into(),
         original_principal: json!({"subject": s(u(BUYER.0))}),
@@ -591,7 +587,7 @@ pub(super) async fn reserve_with_dates(
         commercial_subject_tenant_id: u(BUYER.1),
     };
     let PreparedExecution::Execution(execution) = engine
-        .prepare_commercial_attempt(caller, req, inputs, json!({}))
+        .prepare_commercial_attempt(caller, req, inputs, |_| Ok(json!({})))
         .await
         .unwrap()
     else {
@@ -1901,16 +1897,13 @@ async fn claims_collide_before_version_append_and_terminal_rows_release() {
     let engine = t.engine(&[]);
     let shared = OverlapScopeKey::try_from("sku-shared".to_owned()).unwrap();
     let claims = || {
-        Some(
-            ProposedClaims::new(
-                ClaimParties {
-                    payer_tenant_id: u(30),
-                    resource_tenant_id: u(10),
-                },
-                [shared.clone()],
-            )
-            .unwrap(),
-        )
+        Some(ProposedClaims::new(
+            ClaimParties {
+                payer_tenant_id: u(30),
+                resource_tenant_id: u(10),
+            },
+            [shared.clone()],
+        ))
     };
     // The holder submits first and keeps its claim.
     let req = request(holder, Trigger::Submit, "s-holder", 1);
@@ -1944,7 +1937,7 @@ async fn claims_collide_before_version_append_and_terminal_rows_release() {
         commercial_subject_tenant_id: u(BUYER.1),
     };
     let err = engine
-        .prepare_commercial_attempt(&buyer(), &changed, inputs, json!({}))
+        .prepare_commercial_attempt(&buyer(), &changed, inputs, |_| Ok(json!({})))
         .await
         .unwrap_err();
     assert_eq!(err, EngineError::Refused(Reason::IdempotencyMismatch));
@@ -2250,16 +2243,13 @@ async fn a_collision_never_names_the_holder_to_a_caller_without_read_authority()
     let order = create(&t, &engine, "nr-contender").await;
     let shared = OverlapScopeKey::try_from("sku-no-read".to_owned()).unwrap();
     let claims = || {
-        Some(
-            ProposedClaims::new(
-                ClaimParties {
-                    payer_tenant_id: u(30),
-                    resource_tenant_id: u(10),
-                },
-                [shared.clone()],
-            )
-            .unwrap(),
-        )
+        Some(ProposedClaims::new(
+            ClaimParties {
+                payer_tenant_id: u(30),
+                resource_tenant_id: u(10),
+            },
+            [shared.clone()],
+        ))
     };
     let req = request(holder, Trigger::Submit, "nr-s-holder", 1);
     let (candidate, req) = reserve(&engine, &buyer(), &req).await;
@@ -2459,7 +2449,7 @@ async fn durable_preparation_maps_stale_facts_to_conflict_and_lost_access_to_not
         &t,
         order,
         &payer_moved(order),
-        engine.prepare_commercial_attempt(&buyer(), &req, commercial_inputs(), json!({})),
+        engine.prepare_commercial_attempt(&buyer(), &req, commercial_inputs(), |_| Ok(json!({}))),
     )
     .await
     .unwrap_err();
@@ -2486,7 +2476,7 @@ async fn durable_preparation_maps_stale_facts_to_conflict_and_lost_access_to_not
         &t,
         order2,
         &tenant_moved(order2),
-        engine.prepare_commercial_attempt(&buyer(), &req2, commercial_inputs(), json!({})),
+        engine.prepare_commercial_attempt(&buyer(), &req2, commercial_inputs(), |_| Ok(json!({}))),
     )
     .await
     .unwrap_err();
@@ -2500,7 +2490,7 @@ async fn durable_preparation_maps_stale_facts_to_conflict_and_lost_access_to_not
     assert_eq!(unresolved(order2, "authorization-context-changed").await, 0);
     // The hidden target stays hidden on a fresh attempt: the same answer, still nothing durable.
     let err = engine
-        .prepare_commercial_attempt(&buyer(), &req2, commercial_inputs(), json!({}))
+        .prepare_commercial_attempt(&buyer(), &req2, commercial_inputs(), |_| Ok(json!({})))
         .await
         .unwrap_err();
     assert_eq!(err, EngineError::Refused(Reason::OrderNotFound));
@@ -2621,4 +2611,524 @@ async fn an_outbox_insert_failure_rolls_back_the_business_effect_and_audit() {
     assert_eq!(t.order_row(order).await["state"], json!("on_hold"));
     assert_eq!(t.audits(order).await, audits + 1);
     assert_eq!(t.outbox().await, outbox + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// M2-2 (D-235): the engine writes the gate's diagnostic run inside the transition transaction.
+
+/// A small run: an order-level pass and a line-level failure.
+fn gate_vector() -> crate::domain::gate::vector::Vector {
+    use crate::domain::gate::predicates::PredicateId;
+    use crate::domain::gate::vector::{Applicability, Outcome, OutcomeKey, Vector, Verdict};
+    let outcome = |predicate, line_id, verdict, reason| Outcome {
+        key: OutcomeKey {
+            predicate,
+            line_id,
+            item_id: None,
+            selection: bss_orders_sdk::gate_report::CatalogSelection::NotSelected,
+        },
+        verdict,
+        reason,
+        applicability: Applicability::Required,
+        producer_results: vec![],
+        upstream_detail: None,
+    };
+    Vector::build(vec![
+        outcome(PredicateId::AxisValidity, None, Verdict::Passed, None),
+        outcome(
+            PredicateId::QuantityFloor,
+            Some(u(5000)),
+            Verdict::Failed,
+            Some(Reason::QuantityBelowFloor),
+        ),
+    ])
+    .unwrap()
+}
+/// The buyer's assessed run, as the submit slice hands it to the engine: no subject identity,
+/// which the engine supplies from the caller's context.
+fn gate_run(run_id: Uuid) -> crate::infra::gate::writer::GateRun {
+    crate::infra::gate::writer::GateRun {
+        overlap_keys: std::collections::BTreeMap::new(),
+        run_id,
+        resource_tenant_id: u(10),
+        seller_tenant_id: u(20),
+        payer_tenant_id: u(30),
+        correlation_id: Some(u(777)),
+        evaluated_at: at(),
+        vector: gate_vector(),
+    }
+}
+/// Gate rows of `run_id`, and of those the ones naming `order` at `version` (`None`: NULL).
+async fn gate_rows(t: &T, run_id: Uuid, order: Uuid, version: Option<i32>) -> (i64, i64) {
+    let all = t
+        .n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__gate_outcome WHERE run_id='{run_id}'"
+        ))
+        .await;
+    let version = version.map_or("version IS NULL".to_owned(), |v| format!("version={v}"));
+    let named = t
+        .n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__gate_outcome WHERE run_id='{run_id}' AND order_id='{order}' AND {version}"
+        ))
+        .await;
+    (all, named)
+}
+/// A reserved draft submit whose composite gate refuses, carrying the gate run `run_id`.
+async fn gate_refused_submit(
+    t: &T,
+    text: &str,
+    run_id: Uuid,
+) -> (Engine, Uuid, TransitionRequest, Prepared) {
+    let probe = t.engine(&[]);
+    let order = seed(t, &probe, &format!("seed-{text}"), S::Draft, None).await;
+    let engine = t.engine(&[order]);
+    let (candidate, req) =
+        reserve(&engine, &buyer(), &request(order, Trigger::Submit, text, 1)).await;
+    let mut p = prepared(4, order, S::Draft, Some(candidate));
+    p.guards = guards(4, Some(crate::domain::guards::GATE_COMPOSITE));
+    p.diagnostics = Some(Arc::new(gate_run(run_id)));
+    (engine, order, req, p)
+}
+
+/// (1) A composite-gate refusal persists the run against the order with no version (nothing
+/// was admitted), before the refusal audit and settlement it commits with.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_composite_gate_refusal_persists_its_diagnostic_run_and_settles() {
+    let t = T::new().await;
+    let run_id = Uuid::now_v7();
+    let (engine, order, req, p) = gate_refused_submit(&t, "gate-refused", run_id).await;
+    let out = engine.transition(&buyer(), req, &fixed(p)).await.unwrap();
+    let OutcomeKind::Refused { audit_id, .. } = out.kind else {
+        panic!("{out:?}")
+    };
+    assert_eq!(gate_rows(&t, run_id, order, None).await, (2, 2));
+    // The subject identity is the caller's context, supplied by the engine (the run has none).
+    let caller = buyer();
+    let (tenant, subject) = (caller.ctx().subject_tenant_id(), caller.ctx().subject_id());
+    assert_eq!(
+        t.n(&format!("SELECT count(*) AS n FROM bss_orders__gate_outcome WHERE run_id='{run_id}' AND subject_tenant_id='{tenant}' AND subject_id='{subject}'")).await,
+        2
+    );
+    assert_eq!(
+        t.n(&format!("SELECT count(*) AS n FROM bss_orders__idempotency WHERE status='settled' AND outcome='refused' AND audit_id='{audit_id}'")).await,
+        1
+    );
+    let audit: Value = t
+        .json(&format!(
+            "SELECT to_jsonb(a) AS j FROM bss_orders__transition_audit a WHERE audit_id='{audit_id}'"
+        ))
+        .await;
+    assert_eq!(audit["outcome"], json!("refused"));
+}
+
+/// (2) An engine-only refusal (a stale draft revision: version conflict, decided before any
+/// guard) never calls the hook, though the preparation carries a run.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_engine_only_refusal_persists_no_diagnostic_run() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "seed-gate-stale").await;
+    let run_id = Uuid::now_v7();
+    let mut p = Prepared::new(AggregateContribution::DraftEdit(DraftHeaderEdit::default()));
+    p.guards = guards(2, None);
+    p.diagnostics = Some(Arc::new(gate_run(run_id)));
+    let mut req = request(order, Trigger::DraftMutate, "gate-stale", 1);
+    req.expected_draft_revision = Some(DraftRevision::try_from(5).unwrap());
+    let out = engine.transition(&buyer(), req, &fixed(p)).await.unwrap();
+    let OutcomeKind::Refused {
+        reason: Reason::VersionConflict,
+        audit_id,
+    } = out.kind
+    else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        t.n(&format!("SELECT count(*) AS n FROM bss_orders__idempotency WHERE status='settled' AND outcome='refused' AND audit_id='{audit_id}'")).await,
+        1
+    );
+    assert_eq!(gate_rows(&t, run_id, order, None).await, (0, 0));
+}
+
+/// (3') On admission the run names the version the transition admits: a draft edit appends
+/// none, so it is the locked current version (1). The draft→submitted admission needs the
+/// D-188 attempt and is covered with the submit slice (M2-6).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn an_admission_persists_its_diagnostic_run_with_the_admitted_version() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "seed-gate-admit").await;
+    let run_id = Uuid::now_v7();
+    let mut p = Prepared::new(AggregateContribution::DraftEdit(DraftHeaderEdit::default()));
+    p.guards = guards(2, None);
+    p.diagnostics = Some(Arc::new(gate_run(run_id)));
+    let out = engine
+        .transition(
+            &buyer(),
+            request(order, Trigger::DraftMutate, "gate-admit", 1),
+            &fixed(p),
+        )
+        .await
+        .unwrap();
+    let OutcomeKind::Committed { audit_id, .. } = out.kind else {
+        panic!("{out:?}")
+    };
+    assert_eq!(gate_rows(&t, run_id, order, Some(1)).await, (2, 2));
+    assert_eq!(
+        t.n(&format!("SELECT count(*) AS n FROM bss_orders__idempotency WHERE status='settled' AND outcome='success' AND audit_id='{audit_id}'")).await,
+        1
+    );
+    let audit: Value = t
+        .json(&format!(
+            "SELECT to_jsonb(a) AS j FROM bss_orders__transition_audit a WHERE audit_id='{audit_id}'"
+        ))
+        .await;
+    assert_eq!(audit["outcome"], json!("committed"));
+}
+
+/// (4) A diagnostics write the database refuses aborts the attempt like any storage failure:
+/// no settlement, no audit row and no gate row survive. Every `T::new` starts its own
+/// PostgreSQL container, so the REVOKE cannot leak into another test.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_failed_diagnostics_write_aborts_the_transition() {
+    let t = T::new().await;
+    let run_id = Uuid::now_v7();
+    let (engine, order, req, p) = gate_refused_submit(&t, "gate-abort", run_id).await;
+    let audits = t.audits(order).await;
+    let settled = t
+        .n("SELECT count(*) AS n FROM bss_orders__idempotency WHERE status='settled'")
+        .await;
+    t.env
+        .pg
+        .sql("REVOKE INSERT ON bss_orders__gate_outcome FROM bss_orders_runtime")
+        .await
+        .unwrap();
+    let err = engine
+        .transition(&buyer(), req, &fixed(p))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Internal);
+    assert_eq!(t.audits(order).await, audits, "no refusal audit survives");
+    assert_eq!(
+        t.n("SELECT count(*) AS n FROM bss_orders__idempotency WHERE status='settled'")
+            .await,
+        settled,
+        "nothing was settled"
+    );
+    assert_eq!(
+        t.n(&format!("SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}' AND status='refused'")).await,
+        0
+    );
+    assert_eq!(gate_rows(&t, run_id, order, None).await, (0, 0));
+    t.env
+        .pg
+        .sql("GRANT INSERT ON bss_orders__gate_outcome TO bss_orders_runtime")
+        .await
+        .unwrap();
+}
+
+/// Lapse the lease of every in-flight registry marker and linked attempt of `order`, as after a
+/// crashed worker (the fence is untouched; a same-key retry reclaims it).
+async fn lapse_leases(t: &T, order: Uuid) {
+    t.env
+        .pg
+        .sql(&format!(
+            "UPDATE bss_orders__idempotency SET lease_expires_at = now() - interval '1 minute' \
+             WHERE order_id='{order}' AND status='in_flight'; \
+             UPDATE bss_orders__commercial_attempt SET lease_until = now() - interval '1 minute' \
+             WHERE order_id='{order}' AND status IN ('prepared','running')"
+        ))
+        .await
+        .unwrap();
+}
+
+/// E1 (M2-6): a draft edit that lands between the slice's read and the reservation is found
+/// under the reservation lock: the unsettled `version-conflict` the ordinary path decides, with
+/// unresolved evidence, and nothing durable (no attempt, no registry record, high-water as it
+/// was).
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_draft_edit_before_the_reservation_reserves_nothing_and_conflicts() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "seed-e1").await;
+    let registry = || t.n("SELECT count(*) AS n FROM bss_orders__idempotency");
+    let attempts = || t.n("SELECT count(*) AS n FROM bss_orders__commercial_attempt");
+    let (r0, a0) = (registry().await, attempts().await);
+    // The slice read draft revision 0 and froze it; an edit moves the draft to revision 1.
+    t.env
+        .pg
+        .sql(&format!(
+            "UPDATE bss_orders__order SET draft_revision=1 WHERE order_id='{order}'"
+        ))
+        .await
+        .unwrap();
+    let req = request(order, Trigger::Submit, "e1", 1);
+    let err = engine
+        .prepare_commercial_attempt(&buyer(), &req, commercial_inputs(), |_| Ok(json!({})))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Refused(Reason::VersionConflict));
+    assert_eq!((registry().await, attempts().await), (r0, a0));
+    let row = t.order_row(order).await;
+    assert_eq!(row["version_allocation_high_water"], json!(1));
+    assert_eq!(row["current_version"], json!(1));
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__transition_audit WHERE requested_order_ref='{order}' AND reason='version-conflict' AND outcome='refused' AND sequence IS NULL"
+        ))
+        .await,
+        1
+    );
+    // The caller's current revision reserves.
+    let mut fresh = request(order, Trigger::Submit, "e1-fresh", 1);
+    fresh.expected_draft_revision = Some(DraftRevision::try_from(1).unwrap());
+    let inputs = AttemptInputs {
+        prepared_draft_revision: Some(1),
+        ..commercial_inputs()
+    };
+    assert!(matches!(
+        engine
+            .prepare_commercial_attempt(&buyer(), &fresh, inputs, |_| Ok(json!({})))
+            .await
+            .unwrap(),
+        PreparedExecution::Execution(_)
+    ));
+}
+
+/// E2 (M2-6): recovery probes before any assessment. A key without a record is a miss and writes
+/// nothing; a reserved attempt with a live lease is still processing; a lapsed one is resumed
+/// with its frozen inputs under a rotated fence and allocates nothing; a settled key replays.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn recovery_finds_the_settled_outcome_or_the_reserved_attempt_before_assessing() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "seed-e2").await;
+    let registry = || t.n("SELECT count(*) AS n FROM bss_orders__idempotency");
+    let req = request(order, Trigger::Submit, "e2", 1);
+    let r0 = registry().await;
+    assert!(matches!(
+        engine
+            .recover_commercial_attempt(&buyer(), &req)
+            .await
+            .unwrap(),
+        Recovery::Miss
+    ));
+    assert_eq!(registry().await, r0, "a miss writes nothing");
+
+    let (candidate, owned) = reserve(&engine, &buyer(), &req).await;
+    // Live lease, no presented owner: the unsettled still-processing, nothing stolen.
+    assert_eq!(
+        engine
+            .recover_commercial_attempt(&buyer(), &req)
+            .await
+            .unwrap_err(),
+        EngineError::Refused(Reason::StillProcessing)
+    );
+    lapse_leases(&t, order).await;
+    let Recovery::Existing(existing) = engine
+        .recover_commercial_attempt(&buyer(), &req)
+        .await
+        .unwrap()
+    else {
+        panic!("the reserved attempt is resumed")
+    };
+    let (execution, crate::infra::storage::repo::idempotency::Frozen::Commercial(attempt)) =
+        *existing
+    else {
+        panic!("not a commercial attempt")
+    };
+    assert_eq!(attempt.candidate_version, candidate);
+    assert_ne!(
+        Some(execution.owner()),
+        owned.execution,
+        "the lapsed fence is rotated"
+    );
+    let row = t.order_row(order).await;
+    assert_eq!(
+        row["version_allocation_high_water"],
+        json!(candidate),
+        "no second candidate"
+    );
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}'"
+        ))
+        .await,
+        1
+    );
+    // The resumed owner commits; the same key then replays the settlement.
+    let mut p = prepared(4, order, S::Draft, Some(candidate));
+    p.claims = Some(ProposedClaims::new(
+        ClaimParties {
+            payer_tenant_id: u(30),
+            resource_tenant_id: u(10),
+        },
+        [OverlapScopeKey::try_from(format!("sku-{order}")).unwrap()],
+    ));
+    let committed = engine
+        .transition(
+            &buyer(),
+            req.clone().with_execution(execution.owner()),
+            &fixed(p),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(committed.kind, OutcomeKind::Committed { .. }));
+    let Recovery::Replay(replay) = engine
+        .recover_commercial_attempt(&buyer(), &req)
+        .await
+        .unwrap()
+    else {
+        panic!("the settled key replays")
+    };
+    assert_eq!(replay.response, committed.response);
+}
+
+/// E3 (M2-6): a non-commercial preparation (submit's pre-reservation refusal path) that meets a
+/// reclaimed reserved attempt fails closed instead of settling the refusal over it: the attempt
+/// stays unresolved, the key unsettled, the candidate unconsumed by a refusal.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_refusal_never_settles_over_a_recovered_commercial_attempt() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "seed-e3").await;
+    let req = request(order, Trigger::Submit, "e3", 1);
+    let (_candidate, _owned) = reserve(&engine, &buyer(), &req).await;
+    lapse_leases(&t, order).await;
+    // A refusal with no version contribution: the composite gate fails.
+    let mut p = Prepared::new(AggregateContribution::None);
+    p.guards = guards(4, Some(crate::domain::guards::GATE_COMPOSITE));
+    p.inputs = resolved(4);
+    let err = engine
+        .transition(&buyer(), req, &fixed(p))
+        .await
+        .unwrap_err();
+    assert_eq!(err, EngineError::Integration);
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__commercial_attempt WHERE order_id='{order}' AND status IN ('prepared','running')"
+        ))
+        .await,
+        1
+    );
+    assert_eq!(
+        t.n(&format!(
+            "SELECT count(*) AS n FROM bss_orders__idempotency WHERE order_id='{order}' AND operation='submit' AND status='settled'"
+        ))
+        .await,
+        0
+    );
+}
+
+/// Submit's batched child documents: a row for another order refuses the whole batch before any
+/// statement is sent, so neither the valid sibling nor the foreign row lands (n107).
+struct ForeignBatch {
+    own: Uuid,
+    foreign: Uuid,
+}
+#[async_trait]
+impl DocumentWriter for ForeignBatch {
+    async fn write(&self, docs: &ChildDocuments<'_, '_>) -> Result<(), ScopeError> {
+        let line = |order_id| entity::order_line::Model {
+            order_id,
+            version: 1,
+            line_id: Uuid::new_v4(),
+            commercial_attempt_id: None,
+            pricing_acceptance_id: None,
+            pricing_request_digest: None,
+            pricing_terms_digest: None,
+            plan_id: u(1),
+            plan_revision_id: u(2),
+            selected_items: json!([]),
+            currency: "EUR".into(),
+            contract_effective_date: time::macros::date!(2026 - 12 - 01),
+            service_activation_date: None,
+            acceptance_due_date: None,
+            term_duration: None,
+            term_kind: "rolling".into(),
+            authored_term: json!({}),
+            billing_cycle: "month".into(),
+            order_pin: None,
+            overlap_scope_key: None,
+            overlap_item_keys: None,
+            catalog_subscription_product_key: None,
+            date_policy_switch_state: json!({}),
+        };
+        let total = |order_id| entity::resolved_total::Model {
+            order_id,
+            version: 1,
+            scope: "line".into(),
+            line_id: Uuid::new_v4(),
+            currency: "EUR".into(),
+            assessment_id: u(3),
+            currency_scale: 2,
+            exclusions: json!([]),
+            item_breakdown: json!([]),
+            recurring_by_cycle: json!([]),
+            amount_status: "resolved".into(),
+            amount_basis: "x".into(),
+            period_evidence: json!({}),
+            gross_exact: None,
+            gross_display: None,
+            net_exact: None,
+            net_display: None,
+            discount_status: "none".into(),
+            discount_exact: None,
+            discount_display: None,
+            promotion_ref: None,
+            charge_kind: "recurring".into(),
+            tcv_exact: None,
+            tcv_display: None,
+            tcv_basis: None,
+            tcv_evidence: None,
+        };
+        let lines = docs
+            .insert_order_lines(vec![line(self.own), line(self.foreign)])
+            .await;
+        let totals = docs
+            .insert_resolved_totals(vec![total(self.own), total(self.foreign)])
+            .await;
+        assert!(matches!(lines, Err(ScopeError::Denied(_))), "{lines:?}");
+        assert!(matches!(totals, Err(ScopeError::Denied(_))), "{totals:?}");
+        Err(ScopeError::Denied("batched foreign rows refused"))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn batched_child_documents_refuse_a_foreign_parent_row_and_insert_nothing() {
+    let t = T::new().await;
+    let engine = t.engine(&[]);
+    let order = create(&t, &engine, "batch-seed").await;
+    let mut p = Prepared::new(AggregateContribution::None);
+    p.guards = guards(3, None);
+    p.inputs = resolved(3);
+    p.documents = Some(Arc::new(ForeignBatch {
+        own: order,
+        foreign: Uuid::new_v4(),
+    }));
+    engine
+        .transition(
+            &buyer(),
+            request(order, Trigger::AdministrativeEdit, "batch-1", 1),
+            &fixed(p),
+        )
+        .await
+        .unwrap_err();
+    for table in ["order_line", "resolved_total"] {
+        assert_eq!(
+            t.json(&format!(
+                "SELECT to_jsonb(count(*)) AS j FROM bss_orders__{table}"
+            ))
+            .await,
+            json!(0),
+            "{table}"
+        );
+    }
 }

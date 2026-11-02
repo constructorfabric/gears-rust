@@ -8,16 +8,15 @@
 //! result entry + sequence and flips the status to `POSTED` before COMMIT,
 //! so a concurrent replay reads a complete reference.
 //!
-//! `payload_hash` uses the FIPS-validated `aws-lc-rs` SHA-256 — the same
-//! crypto provider the platform installs at bootstrap — so no non-FIPS
-//! hasher enters the graph (DE0708 clean).
+//! `payload_hash` uses the toolkit-security SHA-256 facade with the platform
+//! backend selected for this build.
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{ActiveValue::Set, ColumnTrait, Condition, DbErr, EntityTrait};
 use toolkit_db::secure::{
     AccessScope, DbTx, ScopeError, SecureEntityExt, SecureInsertExt, SecureUpdateExt,
 };
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 use crate::domain::model::{NewEntry, NewLine, RepoError};
@@ -384,7 +383,7 @@ impl IdempotencyGate {
         Ok(())
     }
 
-    /// FIPS-validated (`aws-lc-rs`) SHA-256 hex digest over the canonical
+    /// SHA-256 through the toolkit-security facade hex digest over the canonical
     /// financial content of an entry — the business key, effective date,
     /// period, and every per-line financial dimension (amount + scale,
     /// functional amount/currency, currency, side, payer/seller, invoice,
@@ -438,7 +437,7 @@ impl IdempotencyGate {
         digest32_hex(&canon)
     }
 
-    /// FIPS-validated (`aws-lc-rs`) SHA-256 hex digest over an arbitrary
+    /// SHA-256 through the toolkit-security facade hex digest over an arbitrary
     /// already-canonical string — the same crypto provider [`Self::payload_hash`]
     /// runs, factored out so a caller that hashes a *request* payload (not an
     /// entry) can reuse it. A queued allocation hashes its request payload here:
@@ -448,7 +447,7 @@ impl IdempotencyGate {
     /// (e.g. a fixed field order) so the same intent always hashes identically.
     #[must_use]
     pub(crate) fn content_hash(canonical: &str) -> String {
-        let digest = sha256(&SHA256, canonical.as_bytes());
+        let digest = Sha256::digest(canonical.as_bytes());
         let mut hex = String::with_capacity(64);
         for byte in digest.as_ref() {
             use std::fmt::Write as _;

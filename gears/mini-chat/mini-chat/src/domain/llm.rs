@@ -177,6 +177,31 @@ pub struct Usage {
     pub reasoning_tokens: i64,
 }
 
+/// Field-wise sum, for a turn that spans several provider calls.
+impl std::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cache_read_input_tokens: self
+                .cache_read_input_tokens
+                .saturating_add(other.cache_read_input_tokens),
+            cache_write_input_tokens: self
+                .cache_write_input_tokens
+                .saturating_add(other.cache_write_input_tokens),
+            reasoning_tokens: self.reasoning_tokens.saturating_add(other.reasoning_tokens),
+        }
+    }
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, other: Self) {
+        *self = *self + other;
+    }
+}
+
 /// A citation extracted from provider annotations.
 #[domain_model]
 #[derive(Debug, Clone, Serialize, ToSchema)]

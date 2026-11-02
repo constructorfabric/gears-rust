@@ -138,7 +138,7 @@ pub async fn add(
         return receipt.response();
     }
     let (judged_scope, judged_ctx, judged) = (scope.clone(), ctx.clone(), input.clone());
-    let admitted = support::transaction(&state.db.db(), move |tx| {
+    let admitted = support::transaction_read(&state.db.db(), move |tx| {
         let (scope, ctx, input) = (judged_scope.clone(), judged_ctx.clone(), judged.clone());
         Box::pin(async move { admit(tx, &scope, &ctx, revision, &input).await })
     })

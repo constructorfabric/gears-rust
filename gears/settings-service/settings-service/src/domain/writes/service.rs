@@ -26,7 +26,9 @@ use crate::domain::access::{AccessRepository, TenantAccess};
 use crate::domain::category::{DomainVisibility, is_visible};
 use crate::domain::declaration::{Declaration, DeclarationRepository};
 use crate::domain::error::DomainError;
-use crate::domain::ports::{ChangePublisher, SecretManager, ValueEvent, WriteMetrics};
+use crate::domain::ports::{
+    ChangePublisher, SecretManager, StepUpOperation, ValueEvent, WriteMetrics,
+};
 use crate::domain::precondition;
 use crate::domain::resolution::{EffectiveValue, ScopeTarget, ValueResolver, scope_class};
 use crate::domain::secrets::pending::{
@@ -463,7 +465,7 @@ where
         key: &SettingKey,
         requested: Option<Uuid>,
         policy: StepUpPolicy,
-        operation: &'static str,
+        operation: StepUpOperation,
     ) -> Result<Gated, DomainError> {
         // @cpt-begin:cpt-cf-settings-service-algo-value-writes-gates:p1:inst-vw-gate-1
         // Authorization was decided by the caller before this point; nothing
@@ -583,7 +585,7 @@ where
     pub async fn verify_step_up(
         &self,
         actor: &WriteActor,
-        operation: &'static str,
+        operation: StepUpOperation,
     ) -> Result<(), DomainError> {
         let subject = actor.step_up_subject();
         match self

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use sea_orm::{ConnectionTrait, FromQueryResult, Statement, TransactionTrait};
+use sea_orm::{ConnectionTrait, FromQueryResult, Statement};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -86,7 +86,7 @@ impl Sequencer {
                 break;
             }
 
-            let txn = conn.begin().await?;
+            let txn = self.db.begin_tx().await?;
 
             // Try to acquire row lock
             if let Some(lock_sql) = store.lock_partition() {

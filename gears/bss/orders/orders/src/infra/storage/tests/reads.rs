@@ -4,7 +4,7 @@
 //! the `orders_read_access_log` served/refused decision table over the restricted runtime role.
 //! Draft orders are authored through the S2-09 capture service and the S2-04 engine.
 use super::capture::{
-    BUYER, T, buyer, create, create_meta, http, line, new_order, result, view, write,
+    BUYER, T, buyer, create, create_meta, http, key, line, new_order, result, view, write,
 };
 use super::*;
 use crate::api::local_client::LocalOrdersClient;
@@ -418,6 +418,35 @@ async fn line_tokens_bind_principal_parent_and_collection() {
         .unwrap_err();
     assert_eq!(refusal(&as_list), Reason::CursorInvalid);
     assert_eq!(r.log_count().await, 0, "input validation appends no row");
+}
+
+/// D-246: a line token `main` issued (no version member) keeps paging the draft it was issued
+/// for: `main` could only have issued it at the creation version.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn a_line_cursor_issued_by_main_continues_the_draft_page() {
+    let r = R::new().await;
+    let (id, lines) = r.draft("p", 3).await;
+    let request = |cursor: Option<Cursor>| LineList {
+        limit: Some(PageSize::try_from(2).unwrap()),
+        cursor,
+    };
+    let first = r
+        .reads
+        .list_lines(&buyer(), id, &request(None))
+        .await
+        .unwrap();
+    let token = first.page_info.next_cursor.expect("a third line follows");
+    let page = r
+        .reads
+        .list_lines(&buyer(), id, &request(Some(main_line_cursor(&token))))
+        .await
+        .unwrap();
+    assert_eq!(
+        page.items.iter().map(|l| l.line_id).collect::<Vec<_>>(),
+        lines[2..]
+    );
+    assert_eq!(i64::from(page.current_version), 1);
 }
 
 /// §4.4 rows 2–3 and the refused row on the point/child reads: a supplied proof on an own-tenant
@@ -1185,9 +1214,9 @@ fn mounted_router(r: &R) -> axum::Router {
         .layer(axum::Extension(buyer().ctx().clone()))
 }
 
-/// The mounted read routes on the wire (in-process router over real PostgreSQL): strong `ETag`,
-/// `snake_case` bodies, query validation precedence with problem+json refusals and no access-log
-/// rows, the masked 404, the proof header carrier and page walking.
+/// The mounted read routes on the wire (in-process router over real PostgreSQL, not the S2-12
+/// live E2E): strong `ETag`, `snake_case` bodies, query validation precedence with problem+json
+/// refusals and no access-log rows, the masked 404, the proof header carrier and page walking.
 #[tokio::test]
 #[ignore = "requires Docker (testcontainers)"]
 async fn the_mounted_read_routes_carry_etag_pages_and_problems_on_the_wire() {
@@ -1426,7 +1455,7 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
     r.t.env
         .pg
         .sql(&format!(
-            "UPDATE bss_orders__order SET state='submitted' WHERE order_id='{id}'"
+            "UPDATE bss_orders__order SET state='cancelled' WHERE order_id='{id}'"
         ))
         .await
         .unwrap();
@@ -1442,7 +1471,7 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         .list(buyer().ctx(), list_all(), meta(None))
         .await
         .unwrap();
-    assert_eq!(summaries.items[0].order.state, OrderState::Submitted);
+    assert_eq!(summaries.items[0].order.state, OrderState::Cancelled);
     assert_eq!(summaries.items[0].draft_revision, None);
     let before = r.log_count().await;
     assert!(matches!(
@@ -1456,6 +1485,52 @@ async fn sdk_reads_match_the_service_and_undelivered_compositions_fail_closed() 
         before,
         "nothing disclosed, nothing logged"
     );
+}
+
+/// Preview and submit are undelivered outside the development delivery: the SDK client answers
+/// `Unavailable` before any authorization, so the PDP is never asked (08 §3.5). Docker/PG tier.
+#[tokio::test]
+#[ignore = "requires Docker (testcontainers)"]
+async fn sdk_preview_and_submit_are_unavailable_when_undelivered() {
+    use bss_orders_sdk::models::{CallMeta, DraftRevision, OrderVersion};
+    use bss_orders_sdk::preview::PreviewBasket;
+    let r = R::new().await;
+    let pdp = ScriptedPdp::new(|_| None);
+    let client = LocalOrdersClient::new(
+        Arc::new(T::service_with(r.t.engine(pdp.clone()), 200)),
+        Arc::new(r.reads_with(pdp.clone())),
+    );
+    let line = json!({
+        "plan_id": u(1), "plan_revision_id": u(2),
+        "selected_items": [{"item_id": u(3), "quantity": "1"}],
+        "currency": "EUR", "term_duration": {"kind": "rolling"}, "billing_cycle": "month",
+    });
+    let basket: PreviewBasket = serde_json::from_value(json!({
+        "resource_tenant_id": u(10), "payer_tenant_id": u(30), "seller_tenant_id": u(20),
+        "lines": [line],
+    }))
+    .unwrap();
+    let error = client
+        .preview(buyer().ctx(), basket, meta(None))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OrdersError::Unavailable), "{error:?}");
+    let error = client
+        .submit(
+            buyer().ctx(),
+            u(99),
+            DraftRevision::try_from(0).unwrap(),
+            CallMeta {
+                expected_version: OrderVersion::try_from(1).unwrap(),
+                idempotency_key: key("u-1"),
+                correlation_id: None,
+                delegation_proof_ref: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OrdersError::Unavailable), "{error:?}");
+    assert!(pdp.requests.lock().is_empty(), "{:?}", pdp.calls());
 }
 
 /// 08 §3.6 *Prefetch and authorized snapshot* and *Read One Order* step 3: a row that leaves
@@ -1543,7 +1618,7 @@ async fn undelivered_compositions_answer_the_documented_unavailable_problem_on_t
     r.t.env
         .pg
         .sql(&format!(
-            "UPDATE bss_orders__order SET state='submitted' WHERE order_id='{id}'"
+            "UPDATE bss_orders__order SET state='cancelled' WHERE order_id='{id}'"
         ))
         .await
         .unwrap();
@@ -1572,7 +1647,7 @@ async fn undelivered_compositions_answer_the_documented_unavailable_problem_on_t
     let list = http(&router, "GET", "/bss-orders/v1/orders", &[], None).await;
     assert_eq!(list.0, 200, "{:?}", list.2);
     assert_eq!(list.2["items"][0]["order"]["order_id"], json!(s(id)));
-    assert_eq!(list.2["items"][0]["order"]["state"], json!("submitted"));
+    assert_eq!(list.2["items"][0]["order"]["state"], json!("cancelled"));
     assert_eq!(list.2["items"][0]["current_version"], json!(1));
     assert!(list.2["items"][0].get("draft_revision").is_none());
 }

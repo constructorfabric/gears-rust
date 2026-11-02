@@ -27,6 +27,7 @@ use crate::api::rest::value_dto::{
 };
 use crate::domain::category::{DomainVisibility, domain_visibility};
 use crate::domain::error::DomainError;
+use crate::domain::ports::StepUpOperation;
 use crate::domain::validation::guards;
 use crate::domain::writes::{Change, ImpactPage, WriteActor};
 use crate::field;
@@ -182,7 +183,7 @@ pub async fn set_value(
             tenant,
             Change::Set(checked_value(&body.value)?),
             if_match(&headers),
-            "set",
+            StepUpOperation::Set,
         )
         .await;
     // @cpt-begin:cpt-cf-settings-service-flow-value-writes-set:p1:inst-vw-set-6
@@ -203,7 +204,7 @@ async fn fall_back(
     params: TenantParam,
     headers: HeaderMap,
     change: Change,
-    operation: &'static str,
+    operation: StepUpOperation,
 ) -> ApiResult<Response> {
     let key = parse_key(&key)?;
     let tenant = parse_tenant(params.tenant.as_deref())?;
@@ -271,7 +272,7 @@ pub async fn revert_value(
         params,
         headers,
         Change::Revert,
-        "revert",
+        StepUpOperation::Revert,
     )
     .await
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-revert:p1:inst-vw-rev-4
@@ -302,7 +303,7 @@ pub async fn remove_value(
         params,
         headers,
         Change::Remove,
-        "remove",
+        StepUpOperation::Remove,
     )
     .await
     // @cpt-end:cpt-cf-settings-service-flow-value-writes-remove:p1:inst-vw-rm-3

@@ -56,6 +56,26 @@ pub struct CategoryService<R, S> {
     sink: S,
 }
 
+/// The refusal for a category that declarations still reference, shared by the
+/// advisory check and the foreign-key path so both word the count alike.
+fn still_referenced(count: u64) -> DomainError {
+    DomainError::Conflict {
+        detail: format!("the category still has {count} declaration(s) referencing it"),
+    }
+}
+
+/// The refusal a delete answers once the best-effort recount is in.
+///
+/// The `409` is the floor: a recount that finds nothing, or failed (`None`),
+/// leaves the original refusal as it was. An enrichment must never turn a
+/// correct refusal into a `500`.
+pub(crate) fn refusal_with_count(original: DomainError, count: Option<u64>) -> DomainError {
+    match count {
+        Some(n) if n > 0 => still_referenced(n),
+        _ => original,
+    }
+}
+
 impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
     /// Build the service over a repository and an audit sink.
     ///
@@ -282,12 +302,29 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         Ok(updated)
     }
 
+    /// How many declarations reference the category, retired ones included.
+    ///
+    /// For a caller that wants the number after a refused delete, on a
+    /// connection that is not the refused transaction.
+    ///
+    /// # Errors
+    /// [`DomainError::Internal`] / [`DomainError::Unavailable`] as the
+    /// repository reports them.
+    pub async fn blocking_declarations<C: DBRunner>(
+        &self,
+        conn: &C,
+        id: Uuid,
+    ) -> Result<u64, DomainError> {
+        self.repo.count_referencing_declarations(conn, id).await
+    }
+
     /// Delete a category, guarded by `If-Match` and the no-orphan rule.
     ///
     /// # Errors
     /// [`DomainError::PreconditionRequired`] / [`DomainError::PreconditionFailed`]
     /// as for [`Self::update`], [`DomainError::NotFound`] when not visible, and
     /// [`DomainError::Conflict`] while any declaration still references it.
+    // @cpt-dod:cpt-cf-settings-service-dod-category-management-no-orphan:p1
     pub async fn delete<C: DBRunner>(
         &self,
         conn: &C,
@@ -326,15 +363,14 @@ impl<R: CategoryRepository, S: AuditSink> CategoryService<R, S> {
         // the category first is told how much is in the way, not merely that
         // something is.
         if referencing > 0 {
-            return Err(DomainError::Conflict {
-                detail: format!(
-                    "the category still has {referencing} declaration(s) referencing it"
-                ),
-            });
+            return Err(still_referenced(referencing));
         }
         // @cpt-end:cpt-cf-settings-service-algo-category-management-no-orphan-guard:p1:inst-cat-orphan-3
         // @cpt-end:cpt-cf-settings-service-flow-category-management-delete:p1:inst-cat-delete-9
 
+        // Nothing may follow a refused delete on this connection: PostgreSQL
+        // aborts the transaction on a failed statement, so the foreign-key
+        // refusal goes out as it is and the caller counts after the rollback.
         self.repo
             .delete(conn, scope, id, current.updated_at)
             .await?;

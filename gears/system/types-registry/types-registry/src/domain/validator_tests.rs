@@ -98,13 +98,13 @@ fn a_streamed_selection_digests_as_its_canonical_form() {
         select(&["content"]),
         select(&["content", "origin", "provenance", "effective_traits"]),
     ] {
-        let mut streamed = Context::new(&SHA256);
+        let mut streamed = Sha256::new();
         update_selection(&mut streamed, selection);
-        let mut joined = Context::new(&SHA256);
+        let mut joined = Sha256::new();
         update_prefixed(&mut joined, selection.canonical().as_bytes());
         assert_eq!(
-            streamed.finish().as_ref(),
-            joined.finish().as_ref(),
+            streamed.finalize(),
+            joined.finalize(),
             "{}",
             selection.canonical()
         );

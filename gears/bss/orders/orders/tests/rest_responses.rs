@@ -23,7 +23,9 @@ use bss_orders_sdk::authoring::{
 };
 use bss_orders_sdk::catalog::OrderState;
 use bss_orders_sdk::models::{DraftRevision, OrderVersion};
-use bss_orders_sdk::reads::{Cursor, LinePage, OrderPage, OrderSummary, PageInfo, PageSize};
+use bss_orders_sdk::reads::{
+    CommittedTotal, Cursor, LinePage, OrderPage, OrderSummary, PageInfo, PageSize,
+};
 use serde::Serialize;
 use time::{Date, Month, OffsetDateTime};
 use uuid::Uuid;
@@ -180,6 +182,7 @@ fn lines() -> Vec<DraftLine> {
     for (i, term) in terms().into_iter().enumerate() {
         for (j, selected) in items().into_iter().enumerate() {
             out.push(DraftLine {
+                committed: None,
                 line_id: u(1000 + (i * 10 + j) as u128),
                 plan_id: u(2),
                 plan_revision_id: u(3),
@@ -233,13 +236,64 @@ fn page_infos() -> Vec<PageInfo> {
     ]
 }
 
+/// Committed totals at the scale edges and in both shapes (usage rows carry no amounts), so
+/// `same_wire` covers `OrdersCommittedTotal` (`currency_scale` is `u8` on both sides).
+fn committed_totals() -> Vec<Vec<CommittedTotal>> {
+    let total = |scope: &str, scale: u8, usage: bool| CommittedTotal {
+        scope: scope.to_owned(),
+        line_id: if scope == "order" {
+            Uuid::nil()
+        } else {
+            u(0xc)
+        },
+        currency: "EUR".to_owned(),
+        assessment_id: u(0x1e),
+        currency_scale: scale,
+        exclusions: serde_json::json!([]),
+        item_breakdown: serde_json::json!([{"item": 1}]),
+        recurring_by_cycle: serde_json::json!([]),
+        amount_status: if usage {
+            "uncommitted_usage"
+        } else {
+            "committed"
+        }
+        .to_owned(),
+        amount_basis: "contracted".to_owned(),
+        period_evidence: serde_json::json!({}),
+        gross_exact: (!usage).then(|| "12.5".to_owned()),
+        gross_display: (!usage).then(|| "12.50".to_owned()),
+        net_exact: (!usage).then(|| "12.5".to_owned()),
+        net_display: (!usage).then(|| "12.50".to_owned()),
+        discount_status: "unavailable".to_owned(),
+        discount_exact: None,
+        discount_display: None,
+        promotion_ref: None,
+        charge_kind: if usage { "usage" } else { "recurring" }.to_owned(),
+        tcv_exact: None,
+        tcv_display: None,
+        tcv_basis: None,
+        tcv_evidence: None,
+    };
+    vec![
+        Vec::new(),
+        vec![total("line", 2, false)],
+        vec![total("line", 0, true), total("order", 28, false)],
+        vec![total("line", u8::MAX, false)],
+    ]
+}
+
 #[test]
 fn order_views_serialize_exactly_as_the_sdk_model() {
+    let totals = committed_totals();
     let lines = lines();
     let mut count = 0;
     for (i, order) in headers().into_iter().enumerate() {
         for (j, version) in versions().into_iter().enumerate() {
             let view = OrderView {
+                resolved_totals: match (i * 7 + j) % 5 {
+                    0 => None,
+                    k => Some(totals[k - 1].clone()),
+                },
                 order: order.clone(),
                 version,
                 lines: match (i + j) % 3 {
@@ -304,6 +358,7 @@ fn line_pages_serialize_exactly_as_the_sdk_model() {
 #[test]
 fn values_without_an_sdk_spelling_are_refused_by_both() {
     let mut view = OrderView {
+        resolved_totals: None,
         order: headers()[0].clone(),
         version: versions()[0].clone(),
         lines: vec![lines()[0].clone()],

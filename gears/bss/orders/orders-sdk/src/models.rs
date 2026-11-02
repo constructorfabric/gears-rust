@@ -144,6 +144,9 @@ pub struct TransitionResult {
     /// The server-reserved identity of an inserted line (line `POST` only; 02 *Author Line*).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub line_id: Option<Uuid>,
+    /// The frozen commercial assessment of a successful submit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assessment_id: Option<Uuid>,
 }
 
 /// Server-issued D-198 grant; a generation never substitutes for a commercial version.

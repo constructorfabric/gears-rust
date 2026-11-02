@@ -1,0 +1,185 @@
+{
+  "profile": "protected_full_tuple_v1",
+  "status": "Orders-only proposal; not Workflow or provider adoption",
+  "vectors": [
+    {
+      "id": "exact-reserved-conversion-at-limit",
+      "patch": [],
+      "expect": "proceed"
+    },
+    {
+      "id": "exact-reserved-conversion-above-reduced-limit",
+      "patch": [
+        [
+          "/max_concurrent_active",
+          0
+        ],
+        [
+          "/active_count",
+          2
+        ]
+      ],
+      "expect": "proceed"
+    },
+    {
+      "id": "complete-empty-new-demand-at-full-limit",
+      "patch": [
+        [
+          "/own_membership/rights",
+          []
+        ]
+      ],
+      "expect": "collision"
+    },
+    {
+      "id": "complete-empty-new-demand-free",
+      "patch": [
+        [
+          "/own_membership/rights",
+          []
+        ],
+        [
+          "/order_reserved_count",
+          0
+        ]
+      ],
+      "expect": "proceed"
+    },
+    {
+      "id": "complete-empty-reserved-foreign-capacity",
+      "patch": [
+        [
+          "/own_membership/rights",
+          []
+        ],
+        [
+          "/max_concurrent_active",
+          0
+        ]
+      ],
+      "expect": "collision"
+    },
+    {
+      "id": "null-membership",
+      "patch": [
+        [
+          "/own_membership",
+          null
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "incomplete-membership",
+      "patch": [
+        [
+          "/own_membership/complete",
+          false
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "active-own-right-no-conversion-mapping",
+      "patch": [
+        [
+          "/own_membership/rights/0/state",
+          "active"
+        ],
+        [
+          "/active_count",
+          1
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "suspended-own-right-no-conversion-mapping",
+      "patch": [
+        [
+          "/own_membership/rights/0/state",
+          "retained_suspended"
+        ],
+        [
+          "/retained_suspended_count",
+          1
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "wrong-version",
+      "patch": [
+        [
+          "/own_membership/context/version",
+          1
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "unknown-member-even-unlimited",
+      "patch": [
+        [
+          "/max_concurrent_active",
+          null
+        ],
+        [
+          "/own_membership/rights/0/line_id",
+          "00000000-0000-0000-0000-000000000009"
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "wrong-resource",
+      "patch": [
+        [
+          "/scope/resource_tenant_id",
+          "00000000-0000-0000-0000-000000000009"
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "nil-order",
+      "patch": [
+        [
+          "/own_membership/context/order_id",
+          "00000000-0000-0000-0000-000000000000"
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "zero-version",
+      "patch": [
+        [
+          "/own_membership/context/version",
+          0
+        ]
+      ],
+      "expect": "defer"
+    },
+    {
+      "id": "unlimited-valid-complete-empty",
+      "patch": [
+        [
+          "/max_concurrent_active",
+          null
+        ],
+        [
+          "/own_membership/rights",
+          []
+        ]
+      ],
+      "expect": "proceed"
+    },
+    {
+      "id": "missing-trusted-order",
+      "patch": [],
+      "expect": "defer",
+      "missing_stored_identity": true
+    }
+  ]
+}

@@ -1,0 +1,29 @@
+suite: bss-orders
+# Self-managed (`launcher: pytest`): the suite starts its own PostgreSQL container, applies the
+# Orders migrations with an admin login (`cf-gears-example-server migrate`), provisions the
+# restricted runtime and worker-class logins, and runs the server under the runtime login. The
+# shared `make e2e-local` server is SQLite-backed and carries no AuthZ policy for Orders, so this
+# suite cannot share it. Run with `make e2e-orders` (or
+# `make e2e-local SUITE=bss-orders`).
+#
+# `bss-orders-test-authz` links the declarative test-host policy plugin `bss-orders-test-authz-plugin`, the
+# fail-closed PDP the Orders permission matrix is evaluated against. It is selected because its
+# priority (10) is lower than `static-authz`'s (100); `static-authz` stays linked and is never
+# selected. The Orders feature links Event Broker, the standalone cluster cache and the
+# SQLite event-log backend.
+#
+# `bss_orders/gate-dev-stubs` is the development delivery (D-235): the nine undelivered gate ports
+# answer from the per-run fixture `conftest.py` writes between the two boots; Pricing and Products
+# are real and seeded per run (D-238). The feature is enabled by this build line only, never by the
+# example server's manifest. `bss-pricing` links `bss-products`.
+features:
+  - bss-orders
+  - bss-pricing
+  - bss-orders-test-authz
+  - static-tenants
+  - static-authn
+  - static-authz
+  - bss_orders/gate-dev-stubs
+launcher: pytest
+pytest_args:
+  - -vv

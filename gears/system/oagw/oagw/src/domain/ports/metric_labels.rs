@@ -9,6 +9,8 @@
 //! dashboard and alert templates. OAGW-specific concerns (upstream alias,
 //! pipeline phase, error variant) keep short gear-local names.
 
+use toolkit_macros::domain_model;
+
 /// Metric label (attribute) key names shared by all OAGW instruments.
 pub mod key {
     /// Upstream alias (stable, low-cardinality identifier of the destination service).
@@ -25,7 +27,7 @@ pub mod key {
     pub const STATUS_CODE: &str = "http.response.status_code";
     /// `DomainError` variant name.
     pub const ERROR_TYPE: &str = "error_type";
-    /// Pipeline phase for duration histogram (`total`, future: `auth`, `guard`, `upstream`, …).
+    /// Pipeline phase for duration histogram (`total`, `resolve`, `auth`; future: `guard`, `upstream`, …).
     pub const PHASE: &str = "phase";
     /// Registry instance kind (`upstream`, `route`).
     pub const KIND: &str = "kind";
@@ -33,6 +35,18 @@ pub mod key {
     pub const REASON: &str = "reason";
     /// How a registry reconcile run ended.
     pub const OUTCOME: &str = "outcome";
+    /// The proxy configuration cache section (`alias`, `route`).
+    pub const MAP: &str = "map";
+    /// How a proxy configuration cache lookup was served.
+    pub const RESULT: &str = "result";
+    /// Where a proxy configuration change came from.
+    pub const SOURCE: &str = "source";
+    /// Why the proxy configuration cache was emptied.
+    #[cfg_attr(
+        all(not(feature = "cluster"), not(test)),
+        expect(dead_code, reason = "recorded by the change log watcher")
+    )]
+    pub const CAUSE: &str = "cause";
 }
 
 /// Registry instance kinds (`kind` label).
@@ -103,6 +117,133 @@ pub mod provisioning_outcome {
     pub const FAILED: &str = "failed";
 }
 
+/// Proxy configuration cache sections (`map` label). A type, not a string,
+/// so it cannot be passed where another label goes.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheMap {
+    /// Upstream candidates by alias and tenant chain.
+    Alias,
+    /// The enabled HTTP routes of an upstream.
+    Route,
+}
+
+impl CacheMap {
+    /// The label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Alias => "alias",
+            Self::Route => "route",
+        }
+    }
+}
+
+/// How a proxy configuration cache lookup was served (`result` label of
+/// `proxy_cache_lookups_total`).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLookup {
+    /// A fresh stored entry.
+    Hit,
+    /// A new load.
+    Miss,
+    /// A load another request started.
+    Joined,
+}
+
+impl CacheLookup {
+    /// The label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::Miss => "miss",
+            Self::Joined => "joined",
+        }
+    }
+}
+
+/// Why proxy configuration cache entries were evicted (`reason` label of
+/// `proxy_cache_evictions_total`).
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheEviction {
+    /// A configuration change (including emptying the whole cache).
+    Change,
+    /// The entry outlived the TTL.
+    Ttl,
+    /// The section was full.
+    Capacity,
+}
+
+impl CacheEviction {
+    /// The label value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Change => "change",
+            Self::Ttl => "ttl",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+/// Where a proxy configuration change came from (`source` label of
+/// `proxy_cache_changes_total`).
+pub mod cache_change_source {
+    /// A write on this replica.
+    pub const LOCAL: &str = "local";
+    /// Another replica's write, through the cluster change log.
+    #[cfg_attr(
+        all(not(feature = "cluster"), not(test)),
+        expect(dead_code, reason = "recorded by the change log watcher")
+    )]
+    pub const REMOTE: &str = "remote";
+}
+
+/// Why the whole proxy configuration cache was emptied (`cause` label of
+/// `proxy_cache_flushes_total`). Recorded by the change log watcher
+/// (the `cluster` feature).
+#[cfg_attr(
+    all(not(feature = "cluster"), not(test)),
+    expect(dead_code, reason = "recorded by the change log watcher")
+)]
+pub mod cache_flush {
+    /// The change log watch started, was re-established, or fell behind.
+    pub const WATCH_RESET: &str = "watch_reset";
+    /// Changes dropped from the log before they were read.
+    pub const LOG_GAP: &str = "log_gap";
+    /// Another log, or the log was deleted, expired or gone.
+    pub const LOG_RESET: &str = "log_reset";
+    /// The log could not be read, or is a version this build does not read.
+    pub const LOG_UNREADABLE: &str = "log_unreadable";
+    /// The watch closed for good.
+    pub const WATCH_CLOSED: &str = "watch_closed";
+}
+
+/// Why proxy configuration changes were not appended to the cluster change
+/// log (`reason` label of `proxy_cache_publish_failures_total`). Recorded by
+/// the change log publisher and the write hook (the `cluster` feature).
+#[cfg_attr(
+    not(feature = "cluster"),
+    expect(
+        dead_code,
+        reason = "recorded by the change log publisher and the write hook's publishing"
+    )
+)]
+pub mod cache_publish_failure {
+    /// The append failed for good: every attempt conflicted, failed or
+    /// timed out, or the cluster refused it.
+    pub const APPEND_FAILED: &str = "append_failed";
+    /// The log is of a newer format, written by a newer build during a
+    /// rolling upgrade; this build leaves it alone.
+    pub const NEWER_LOG: &str = "newer_log";
+    /// No publisher was running: it had stopped, or stopped before the
+    /// change's append.
+    pub const PUBLISHER_STOPPED: &str = "publisher_stopped";
+}
+
 // ── Label values ─────────────────────────────────────────────────────────
 
 /// Pipeline phase labels (`phase` label).
@@ -111,6 +252,8 @@ pub mod phase {
     pub const TOTAL: &str = "total";
     /// Time spent inside the auth plugin (`execute_auth_plugin`).
     pub const AUTH: &str = "auth";
+    /// Time spent resolving the upstream and route (`resolve_proxy_target`).
+    pub const RESOLVE: &str = "resolve";
 }
 
 /// Sentinel for sites that observe a request before host/path resolution.

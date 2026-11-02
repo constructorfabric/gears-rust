@@ -16,14 +16,13 @@
 //! `(original_entry_id, reversal_entry_id)` so the same correction always keys
 //! identically (retries replay, never double-post).
 //!
-//! `correction_id` reuses the foundation's hashing primitive — the FIPS-
-//! validated `aws-lc-rs` SHA-256 that already fingerprints the idempotency
-//! payload — rather than adding a `sha2` dependency.
+//! `correction_id` reuses the foundation's hashing primitive — the toolkit-security
+//! SHA-256 facade that already fingerprints the idempotency payload.
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
 use bss_ledger_sdk::money::{MoneyError, PostedMoney};
 use bss_ledger_sdk::{AccountClass, EntryView, PostEntry, PostLine, Side, SourceDocType};
 use toolkit_macros::domain_model;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 use crate::domain::error::DomainError;
@@ -171,7 +170,7 @@ pub fn build_mapping_correction(
 #[must_use]
 pub fn correction_id(original_entry_id: Uuid, reversal_entry_id: Uuid) -> String {
     let canon = format!("{original_entry_id}:{reversal_entry_id}");
-    let digest = sha256(&SHA256, canon.as_bytes());
+    let digest = Sha256::digest(canon.as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest.as_ref() {
         use std::fmt::Write as _;

@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-toolkit"
-version = "0.11.1"
+version = "0.12.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,40 +18,12 @@ name = "toolkit"
 [lints]
 workspace = true
 
-# Pulled in only to trigger Cargo feature unification (rustls/hyper-rustls
-# `fips`); never referenced in code by design.
-[package.metadata.cargo-shear]
-ignored = ["rustls-fips-shim"]
-
 [features]
 # Enable the runner and the runtime integration by default.
 default = ["otel", "db"]
 coverage_nightly = []
-# FIPS-140-3: install a FIPS-validated crypto provider at bootstrap.
-#
-# - `cf-gears-rustls-fips-shim` is an empty crate whose ONLY purpose is to pull
-#   `rustls` (and `hyper-rustls`) with the `fips` feature, but **only** on
-#   targets where AWS-LC FIPS is the intended backend — i.e. NOT on macOS
-#   (Apple corecrypto) and NOT on Windows (CNG). On those targets its
-#   target-gated deps are absent, so `rustls/fips` is NOT activated →
-#   `aws-lc-fips-sys` is excluded from the build graph entirely.
-# - `cf-gears-rustls-corecrypto-provider` is the Apple corecrypto-backed provider,
-#   used on macOS+fips.
-# - `rustls-cng-crypto` is the Windows CNG-backed provider, used on
-#   Windows+fips. Listed under `[target.'cfg(target_os = "windows")']`
-#   below; `dep:rustls-cng-crypto` is a no-op on non-Windows hosts.
-fips = [
-    "dep:rustls-fips-shim",
-    "dep:rustls-corecrypto-provider",
-    # Forward the feature so `corecrypto::default_provider()` automatically
-    # becomes the TLS-1.3-only FIPS-claim variant on macOS — mirrors how
-    # rustls-cng-crypto routes `default_provider` to `fips_provider` under
-    # its own `fips` feature.
-    "rustls-corecrypto-provider/fips",
-    # Windows CNG provider — target-conditional dep (see below), so this
-    # activator is a no-op on non-Windows hosts.
-    "dep:rustls-cng-crypto",
-]
+# Use the facade's per-OS policy for TLS and application primitives.
+fips = ["toolkit-security/fips", "dep:toolkit-http", "toolkit-http/fips"]
 
 # Database integration (toolkit-db, migrations, DbManager/DbHandle in contexts/runtime)
 db = ["dep:toolkit-db", "dep:sea-orm-migration"]
@@ -103,6 +75,7 @@ bootstrap = [
 ]
 
 [dependencies]
+toolkit-http = { workspace = true, optional = true }
 # Project-local crates
 toolkit-macros = { workspace = true }
 toolkit-canonical-errors = { workspace = true, features = ["axum", "utoipa"] }
@@ -189,26 +162,9 @@ opentelemetry-otlp = { workspace = true, optional = true }
 # gRPC support only for otel (optional)
 tonic = { workspace = true, optional = true }
 
-# Apple corecrypto-backed rustls CryptoProvider. The crate's `lib.rs` is gated
-# on `cfg(target_os = "macos")` so on Linux/Windows it compiles to an empty
-# lib with no transitive deps — safe to list unconditionally. Activated by
-# the `fips` feature.
-rustls-corecrypto-provider = { workspace = true, optional = true }
-
-# Workspace-feature-unification shim — see crate docs. Empty lib on all
-# targets; on non-macOS its transitive deps add `rustls/fips` +
-# `hyper-rustls/fips` via Cargo feature unification.
-rustls-fips-shim = { workspace = true, optional = true }
-
 # Unix-specific dependencies for graceful process termination
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
-
-# Windows CNG-backed rustls CryptoProvider. Activated by the `fips` feature.
-# Listed target-conditionally because the crate links against Windows CNG
-# (`bcrypt.dll` / `ncrypt.dll`) and is meaningless on other targets.
-[target.'cfg(target_os = "windows")'.dependencies]
-rustls-cng-crypto = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

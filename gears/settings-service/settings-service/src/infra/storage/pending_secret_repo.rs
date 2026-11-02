@@ -1,5 +1,7 @@
 //! `PendingSecretRepository` over `pending_secrets`.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use time::OffsetDateTime;
@@ -10,6 +12,9 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::secrets::pending::{PendingSecret, PendingSecretDraft, PendingSecretRepository};
 use crate::infra::storage::entity::pending_secret::{self, Entity as PendingEntity};
+
+/// How many references one `IN` list carries.
+const REFERENCE_CHUNK: usize = 500;
 
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
@@ -106,6 +111,44 @@ impl PendingSecretRepository for PendingSecretRepo {
         Ok(outcome.rows_affected > 0)
     }
 
+    async fn list_for_declaration<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<PendingSecret>, DomainError> {
+        // Unscoped: the cascade removes every row of the declaration whatever
+        // the caller's scope, so the collect must see them all.
+        let rows = PendingEntity::find()
+            .filter(pending_secret::Column::DeclarationId.eq(declaration_id))
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn references_held_by_others<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<HashSet<String>, DomainError> {
+        let mut held = HashSet::new();
+        for chunk in refs.chunks(REFERENCE_CHUNK) {
+            let rows = PendingEntity::find()
+                .filter(pending_secret::Column::DeclarationId.ne(declaration_id))
+                .filter(pending_secret::Column::SecretRef.is_in(chunk.iter().cloned()))
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+                .all(conn)
+                .await
+                .map_err(db_error)?;
+            held.extend(rows.into_iter().map(|row| row.secret_ref));
+        }
+        Ok(held)
+    }
+
     async fn list_expired<C: DBRunner>(
         &self,
         conn: &C,
@@ -125,3 +168,7 @@ impl PendingSecretRepository for PendingSecretRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 }
+
+#[cfg(test)]
+#[path = "pending_secret_repo_tests.rs"]
+mod pending_secret_repo_tests;

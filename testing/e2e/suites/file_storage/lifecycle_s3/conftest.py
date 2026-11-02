@@ -101,7 +101,7 @@ import pytest
 # rather than forking avoids duplicating a second copy to keep in sync.
 from ..lifecycle.conftest import (
     FileStorageSidecar,
-    _SIGNING_KEY_SEED_B64,
+    _SIGNING_KEY_PKCS8_B64,
     _assert_port_available,
     _derive_sidecar_public_key_b64,
 )
@@ -140,7 +140,7 @@ def _patch_file_storage_s3_config(config_text: str, env) -> str:
 
     Applies the same four substitutions `lifecycle/`'s
     `_patch_file_storage_config` does (storage_root/sidecar_base_url/
-    signing_key_seed/bind_addr — `storage_root` is unused by this suite since
+    signing_key_pkcs8/bind_addr — `storage_root` is unused by this suite since
     every backend here is S3, but the control plane still parses it, so it is
     still pointed at a private temp dir for hygiene/isolation), THEN appends
     an `s3_backends:` entry plus `default_backend_id` under the
@@ -182,8 +182,8 @@ def _patch_file_storage_s3_config(config_text: str, env) -> str:
         count=1,
     )
     config_text = re.sub(
-        r"(signing_key_seed\s*:\s*).*",
-        rf'\1"{_SIGNING_KEY_SEED_B64}"',
+        r"(signing_key_pkcs8\s*:\s*).*",
+        rf'\1"{_SIGNING_KEY_PKCS8_B64}"',
         config_text,
         count=1,
     )
@@ -289,12 +289,12 @@ def fs_s3_storage_root() -> str:
 
 
 @pytest.fixture(scope="session")
-def fs_s3_signing_seed() -> str:
-    return _SIGNING_KEY_SEED_B64
+def fs_s3_signing_key() -> str:
+    return _SIGNING_KEY_PKCS8_B64
 
 
 @pytest.fixture(scope="session")
-def _lifecycle_s3_test_env(fs_s3_storage_root, fs_s3_signing_seed):
+def _lifecycle_s3_test_env(fs_s3_storage_root, fs_s3_signing_key):
     """Private, S3-lifecycle-scoped server+sidecar orchestration.
 
     Mirrors `lifecycle/conftest.py`'s `_lifecycle_test_env` almost exactly;
@@ -306,7 +306,7 @@ def _lifecycle_s3_test_env(fs_s3_storage_root, fs_s3_signing_seed):
     """
     from lib.orchestrator import GearTestEnv, RunningTestEnv, _log_path, _wait_healthy
 
-    pub_key_b64 = _derive_sidecar_public_key_b64(fs_s3_signing_seed)
+    pub_key_b64 = _derive_sidecar_public_key_b64(fs_s3_signing_key)
     print(f"[file-storage lifecycle_s3] sidecar public key: {pub_key_b64}")
 
     control_base_url = f"http://localhost:{_SERVER_PORT}"
