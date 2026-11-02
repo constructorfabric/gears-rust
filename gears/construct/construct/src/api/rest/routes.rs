@@ -175,12 +175,20 @@ pub fn register_manage_route(
         .description(
             "Decide how what the subject told an agent changes the subject's profile, store it, and answer what \
              changed, or why nothing was stored. The recent conversation only shows what the message refers to. \
-             A subject the caller may not act for answers 404.",
+             The caller is the subject itself, or an application or agent the platform lets manage the subject's \
+             facts. The tenant is the caller's own, or the one named in `tenant`. A subject the caller may not act \
+             for answers 404, like one that does not exist.",
         )
         .tag(SUBJECT_FACTS_TAG)
         .authenticated()
         .require_license_features::<License>([])
-        .path_param("subject_id", "The subject: the caller's own subject id")
+        .path_param("subject_id", "The subject whose facts change")
+        .query_param_typed(
+            "tenant",
+            false,
+            "Tenant of the subject, when not the caller's own",
+            "string",
+        )
         .json_request::<dto::ManageFactsRequest>(openapi, "What the subject said")
         .handler(handlers::manage_facts)
         .json_response_with_schema::<dto::ManageFactsResponse>(

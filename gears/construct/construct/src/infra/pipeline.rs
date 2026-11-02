@@ -247,7 +247,7 @@ pub fn assemble(
             hand_off: Arc::new(DroppingHandOff::new(Arc::new(LogIntakeEvents))),
             worker: None,
             profile,
-            manage: Arc::new(ManageFacts::not_configured(policy_enforcer)),
+            manage: Arc::new(ManageFacts::not_configured(contexts, policy_enforcer)),
         });
     };
     let (hand_off, queue) = record_queue(cfg.config().processing.queue_capacity);
@@ -295,7 +295,7 @@ pub fn assemble(
         checks,
         admission,
         ProcessingPorts {
-            contexts,
+            contexts: Arc::clone(&contexts),
             profiles: reader,
             writer: Arc::new(writer),
             events: Arc::clone(&events),
@@ -305,6 +305,7 @@ pub fn assemble(
     // @cpt-begin:cpt-cf-construct-algo-profile-reader-wire:p1:inst-wire-manage
     let manage = Arc::new(ManageFacts::new(
         Arc::clone(&processing),
+        contexts,
         policy_enforcer,
         MANAGE_BUDGET,
     ));

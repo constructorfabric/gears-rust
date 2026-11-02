@@ -240,11 +240,11 @@ impl ConfigProvider for NoConfig {
 }
 
 /// The router the gear registers, with its services built from `cfg` and
-/// `model` as `init` builds them, and the caller `subject_id` authenticated.
+/// `model` as `init` builds them, and `caller` authenticated.
 async fn router_of(
     cfg: ConstructConfig,
     model: Option<Arc<dyn ModelClient>>,
-    subject_id: Uuid,
+    caller: Uuid,
 ) -> Router {
     let db = inmem_db().await;
     let settings = Arc::new(settings_service(&db, Arc::new(AllowResolver), true));
@@ -274,13 +274,18 @@ async fn router_of(
     );
     gear.register_rest(&ctx, Router::new(), &OpenApiRegistryImpl::new())
         .unwrap()
-        .layer(Extension(context_of(subject_id, Uuid::new_v4())))
+        .layer(Extension(context_of(caller, Uuid::new_v4())))
 }
 
-async fn manage(router: Router, subject_id: Uuid) -> (StatusCode, Value) {
+/// Manage-facts for `subject_id`, in `tenant` when one is named.
+async fn manage(router: Router, subject_id: Uuid, tenant: Option<Uuid>) -> (StatusCode, Value) {
+    let query = tenant.map(|tenant| format!("?tenant={tenant}"));
     let request = Request::builder()
         .method(Method::POST)
-        .uri(format!("/construct/v1/subjects/{subject_id}/facts/manage"))
+        .uri(format!(
+            "/construct/v1/subjects/{subject_id}/facts/manage{}",
+            query.unwrap_or_default()
+        ))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(
             json!({ "message": "I also know Rust.", "conversation": "" }).to_string(),
@@ -296,39 +301,50 @@ async fn manage(router: Router, subject_id: Uuid) -> (StatusCode, Value) {
     )
 }
 
+/// The subject calling for itself, and an application calling for it in the
+/// subject's tenant: the caller, and the tenant it names.
+fn callers(subject: Uuid) -> [(Uuid, Option<Uuid>); 2] {
+    [(subject, None), (Uuid::new_v4(), Some(Uuid::new_v4()))]
+}
+
 #[tokio::test]
 async fn the_gear_routes_manage_facts_to_the_processing_chain() {
     let subject = Uuid::new_v4();
-    let cfg = ConstructConfig {
-        processing_identity: Some(Uuid::new_v4()),
-        processing: unchecked_processing(),
-        profile_category_check: Some(CategoryCheckConfig::OneCall),
-        ..ConstructConfig::default()
-    };
+    for (caller, tenant) in callers(subject) {
+        let cfg = ConstructConfig {
+            processing_identity: Some(Uuid::new_v4()),
+            processing: unchecked_processing(),
+            profile_category_check: Some(CategoryCheckConfig::OneCall),
+            ..ConstructConfig::default()
+        };
 
-    let (status, body) = manage(
-        router_of(cfg, Some(Arc::new(Unused)), subject).await,
-        subject,
-    )
-    .await;
+        let (status, body) = manage(
+            router_of(cfg, Some(Arc::new(Unused)), caller).await,
+            subject,
+            tenant,
+        )
+        .await;
 
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (&body["outcome"], &body["reason"]),
-        (&json!("nothing_changed"), &json!("model_failed")),
-        "the call reached the planner's model"
-    );
+        assert_eq!(status, StatusCode::OK, "{tenant:?}: {body}");
+        assert_eq!(
+            (&body["outcome"], &body["reason"]),
+            (&json!("nothing_changed"), &json!("model_failed")),
+            "{tenant:?}: the call reached the planner's model"
+        );
+    }
 }
 
 #[tokio::test]
 async fn without_processing_the_gear_answers_manage_facts_not_configured() {
     let subject = Uuid::new_v4();
+    for (caller, tenant) in callers(subject) {
+        let (status, body) = manage(
+            router_of(ConstructConfig::default(), None, caller).await,
+            subject,
+            tenant,
+        )
+        .await;
 
-    let (status, body) = manage(
-        router_of(ConstructConfig::default(), None, subject).await,
-        subject,
-    )
-    .await;
-
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+        assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{tenant:?}: {body}");
+    }
 }

@@ -295,7 +295,7 @@ fn policy_failure(err: EnforcerError) -> PolicyFailure {
 
 /// A failed policy call on the profile: a refusal as a subject that is not
 /// visible, any other failure as the gear's own error.
-fn not_visible(err: EnforcerError) -> DomainError {
+pub(crate) fn not_visible(err: EnforcerError) -> DomainError {
     match policy_failure(err) {
         PolicyFailure::Denied(reason) | PolicyFailure::Uncompilable(reason) => {
             DomainError::NotVisible(reason)

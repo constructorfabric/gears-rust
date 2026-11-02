@@ -252,8 +252,10 @@ deployment configuration.
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-algo-planner-manage`
 
-1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record, under the caller's own security
-   context and scope, and answers at once - `inst-manage-chain`
+1. [ ] - `p1` - What a subject told an agent runs through the same chain as a record and answers at once. For the
+   subject itself it runs under the caller's own security context and scope; for an application or agent acting for
+   the subject it runs as Construct, under the processing context and scope of the subject's tenant, as a record does
+   - `inst-manage-chain`
 2. [ ] - `p1` - A deadline bounds the steps before the write: the profile read, the agent loop, the checks and
    Admission. Past it, nothing is stored and the answer is `timeout`. A write that started is awaited, so the answer
    never says nothing was stored while the write lands - `inst-manage-deadline`
@@ -439,9 +441,17 @@ before the write at the deadline.
 
 The system **MUST** offer `POST /api/construct/v1/subjects/{subject_id}/facts/manage`, which takes `message` and
 `conversation` and answers `200` with `outcome` (`stored` or `nothing_changed`), `reason`, and the counts `added`,
-`replaced` and `removed`. It **MUST** answer `404`, as for a subject that does not exist, when the caller may not act
-for the subject: another subject, no "manage facts" permission from the AuthZ resolver, or a policy scope that leaves
-the subject's settings out. It **MUST** answer `400`
+`replaced` and `removed`. The caller is the subject itself, or an application or agent acting for it; the tenant is the
+caller's own, or the one named in the optional `tenant` query parameter, as for the profile read. Another caller **MUST**
+have the "manage facts" permission: the route asks the AuthZ resolver for `gts.cf.construct.subject.facts.v1~` with the
+action `manage`, the subject as the resource id and the tenant as the context tenant (root only) and as the owner
+tenant, with constraints required. One constraint of the answer must name the tenant, and may narrow the grant to named
+subjects with a resource id filter: a constraint that names only the tenant covers every subject in it, and one that
+names no tenant, or a property Construct cannot decide, grants nothing. Its facts are then written as Construct's
+processing identity, and without one the call answers `501`. It **MUST** answer `404`, as for a subject that does not
+exist, when the caller may not act for the subject: no "manage facts" permission from the AuthZ resolver, a policy
+scope that does not reach the subject in the tenant, or one that leaves the subject's settings out. It **MUST** answer
+`400`
 naming the field, without a model call, for a `message` longer than 4 000 characters or a `conversation` longer than
 16 000. A blank message stores nothing without a model call. A failed dependency answers `503`. The agent in the plan's origin is the caller the
 platform authenticated, and the steps before the write have a deadline inside the gateway's request timeout. The gear
@@ -453,10 +463,18 @@ without record processing answers `501`.
 
 **Touches**:
 - Code: `domain::planner::manage::ManageFacts`, `api::rest::routes::register_manage_route`, `gear::ConstructGear`,
-  `api::rest::dto::{ManageFactsRequest, ManageFactsResponse}`, `api::rest::error::{for_facts, too_long}`
+  `api::rest::dto::{ManageFactsRequest, ManageFactsResponse, TenantQuery}`, `api::rest::error::{for_facts, too_long}`
 
 **Verified by**: `the_subject_gets_what_was_stored`,
 `a_subject_the_caller_may_not_act_for_answers_as_one_that_does_not_exist`,
+`an_application_with_the_permission_manages_the_facts_of_a_subject_in_the_named_tenant`,
+`a_grant_that_names_only_the_tenant_covers_every_subject_in_it`,
+`an_application_without_a_grant_on_the_named_tenant_answers_as_a_subject_that_does_not_exist`,
+`an_application_asks_the_policy_service_about_the_named_tenant`,
+`an_application_without_a_processing_context_stores_nothing`,
+`a_tenant_constraint_reaches_every_subject_in_the_tenant_and_no_other_tenant`,
+`a_resource_id_filter_narrows_the_grant_to_the_subjects_it_names`,
+`a_constraint_without_the_tenant_or_with_another_property_reaches_nothing`,
 `a_text_past_its_limit_is_refused_before_a_model_call`,
 `a_blank_message_stores_nothing_without_a_model_call`, `a_call_with_personalization_off_says_so`,
 `an_unreachable_profile_answers_unavailable`, `the_gear_routes_manage_facts_to_the_processing_chain` and

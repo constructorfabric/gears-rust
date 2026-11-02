@@ -13,8 +13,8 @@ use crate::domain::planner::manage::ManageFacts;
 use crate::domain::record_intake::IntakeOutcome;
 
 use super::dto::{
-    ManageFactsRequest, ManageFactsResponse, ProfileDto, ProfileQuery, PutSubjectSettingsRequest,
-    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto,
+    ManageFactsRequest, ManageFactsResponse, ProfileDto, PutSubjectSettingsRequest,
+    RecordOutcomeDto, RecordQuery, RecordRequest, SubjectSettingsDto, TenantQuery,
 };
 
 /// The answer's status: 202 for a received record, which is processed later,
@@ -96,13 +96,20 @@ pub async fn manage_facts(
     Extension(ctx): Extension<SecurityContext>,
     Extension(manage): Extension<Arc<ManageFacts>>,
     Path(subject_id): Path<Uuid>,
+    Query(query): Query<TenantQuery>,
     Json(req): Json<ManageFactsRequest>,
 ) -> ApiResult<impl IntoResponse> {
     if let Some((field, limit)) = req.field_past_its_limit() {
         return Err(too_long(field, limit));
     }
     let managed = manage
-        .manage(&ctx, subject_id, req.message, req.conversation)
+        .manage(
+            &ctx,
+            query.tenant,
+            subject_id,
+            req.message,
+            req.conversation,
+        )
         .await
         .map_err(|error| for_facts(error, subject_id))?;
     Ok(Json(ManageFactsResponse::from(managed)))
@@ -114,7 +121,7 @@ pub async fn get_profile(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteProfile>>,
     Path(subject_id): Path<Uuid>,
-    Query(query): Query<ProfileQuery>,
+    Query(query): Query<TenantQuery>,
     // @cpt-end:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-parse
 ) -> ApiResult<impl IntoResponse> {
     // @cpt-begin:cpt-cf-construct-flow-profile-reader-read:p1:inst-profile-serve
