@@ -425,6 +425,38 @@ async fn a_tenant_and_a_subject_from_two_different_constraints_do_not_make_a_gra
 }
 
 #[tokio::test]
+async fn a_constraint_that_names_no_tenant_grants_nothing() {
+    let db = inmem_db().await;
+    let (tenant, subject) = (Uuid::new_v4(), Uuid::new_v4());
+    let read_under = |constraint: Vec<Predicate>| {
+        let service = profile_service(
+            &db,
+            Arc::new(FixedScope(vec![constraint])),
+            facts(),
+            Arc::default(),
+            CategoryCheck::OneCall,
+        );
+        async move {
+            service
+                .read(&caller_in(tenant), Some(tenant), subject)
+                .await
+        }
+    };
+
+    let categories_only = read_under(vec![category_is("skill")]).await;
+    let subject_only = read_under(vec![subject_is(subject)]).await;
+    let with_the_tenant = read_under(vec![tenant_is(tenant), category_is("skill")]).await;
+
+    for refused in [categories_only, subject_only] {
+        assert!(
+            matches!(refused, Err(DomainError::NotVisible(_))),
+            "{refused:?}"
+        );
+    }
+    assert!(with_the_tenant.is_ok(), "{with_the_tenant:?}");
+}
+
+#[tokio::test]
 async fn categories_come_only_from_the_constraints_that_reach_the_subject() {
     let db = inmem_db().await;
     let (tenant, other_tenant, subject) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
