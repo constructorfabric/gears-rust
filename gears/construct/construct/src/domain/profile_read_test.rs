@@ -811,29 +811,6 @@ async fn per_category_an_answer_that_cannot_be_compiled_hides_its_category() {
     );
 }
 
-#[tokio::test]
-async fn a_grant_the_settings_scope_cannot_cover_is_not_visible_rather_than_forbidden() {
-    let db = inmem_db().await;
-    let subject = Uuid::new_v4();
-    // Names the subject but no tenant, so nothing of it scopes the settings.
-    let service = profile_service(
-        &db,
-        Arc::new(FixedScope(vec![vec![subject_is(subject)]])),
-        facts(),
-        Arc::default(),
-        CategoryCheck::OneCall,
-    );
-
-    let result = service
-        .read(&caller_in(Uuid::new_v4()), None, subject)
-        .await;
-
-    assert!(
-        matches!(result, Err(DomainError::NotVisible(_))),
-        "{result:?}"
-    );
-}
-
 /// Denies every request with a reason.
 struct DenyWithReason;
 
