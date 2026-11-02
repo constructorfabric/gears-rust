@@ -1,79 +1,129 @@
-//! Every GTS entity the gear owns is accepted by the real types registry:
-//! the SDK's inventory (resource types, permission catalog) and the engine
-//! plugin instance the gear registers at init, beside the platform's
-//! inventory, validated when the registry switches to ready.
+//! The runtime publishes the SDK catalog and configured instance before init.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+mod common;
 
 use std::sync::Arc;
 
+use policy_engine::PolicyEngine;
 use policy_engine::domain::engine_plugin;
 use policy_engine_sdk::gts::permissions::Capability;
-use policy_engine_sdk::{ASSIGNMENT_RESOURCE, BUNDLE_RESOURCE, BUNDLE_VERSION_RESOURCE};
-use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::TypesRegistryService;
-use types_registry::infra::InMemoryGtsRepository;
-use types_registry_sdk::RegisterResult;
+use policy_engine_sdk::{
+    ASSIGNMENT_RESOURCE, BUNDLE_RESOURCE, BUNDLE_VERSION_RESOURCE, PolicyManagementClientV1,
+};
+use serde_json::{Value, json};
+use tokio_util::sync::CancellationToken;
+use toolkit::Gear;
+use toolkit::gts_publication::{
+    GtsPublicationCapability as _, GtsPublicationError, PreparedGtsPublication,
+};
+use types_registry_sdk::AdmissionFailureReason;
+use types_registry_sdk::testing_platform::{Call, Fault};
 
-/// A ready registry holding the platform inventory and the engine plugin
-/// instance, as the gear registers it.
-fn ready_registry() -> TypesRegistryService {
-    // Linked so their inventory entries (the plugin spec the instance
-    // derives from, the event and topic bases) exist.
-    use admission_control_sdk as _;
-    use event_broker_sdk as _;
-
-    let config = TypesRegistryConfig::default();
-    let service = TypesRegistryService::new(
-        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
-        config,
-    );
-    let mut entities = toolkit_gts::all_inventory_type_schemas().unwrap();
-    entities.extend(toolkit_gts::all_inventory_instances().unwrap());
-    let (_, plugin) = engine_plugin::registration("constructorfabric", 100).unwrap();
-    entities.push(plugin);
-    for result in service.register(entities) {
-        if let RegisterResult::Err { gts_id, error } = result {
-            panic!("{gts_id:?} rejected: {error:?}");
-        }
-    }
-    service.switch_to_ready().expect("every entity validates");
-    service
+fn config() -> Value {
+    json!({ "engine_plugin": { "vendor": "constructorfabric", "priority": 100 } })
 }
 
-#[test]
-fn the_resource_types_are_registered() {
-    let registry = ready_registry();
-    for type_id in [
+#[tokio::test]
+async fn the_owned_resource_types_permissions_and_configured_instance_are_published_before_init() {
+    let registry = common::registry();
+    let hub = Arc::new(toolkit::ClientHub::new());
+    registry.install(&hub);
+    let config = config();
+    let provider = common::MockConfigProvider::new(&config);
+    let manifest = PolicyEngine::default()
+        .descriptor()
+        .build_gts_manifest(&provider)
+        .unwrap();
+    assert_eq!(manifest.documents().len(), 7);
+    PreparedGtsPublication::prepare(PolicyEngine::default().descriptor(), &provider, &hub)
+        .unwrap()
+        .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
+        .await
+        .unwrap();
+    for id in [
         BUNDLE_RESOURCE,
         BUNDLE_VERSION_RESOURCE,
         ASSIGNMENT_RESOURCE,
     ] {
-        let entity = registry
-            .get(type_id)
-            .unwrap_or_else(|e| panic!("{type_id}: {e:?}"));
-        assert!(entity.is_type_schema, "{type_id} is a type schema");
+        assert!(registry.content(id).is_some(), "missing resource {id}");
     }
-}
-
-#[test]
-fn the_permission_catalog_is_registered() {
-    let registry = ready_registry();
     for capability in Capability::ALL {
-        let id = capability.permission_id();
-        let entity = registry.get(id).unwrap_or_else(|e| panic!("{id}: {e:?}"));
-        assert!(!entity.is_type_schema, "{id} is an instance");
-        assert_eq!(entity.content["resource_type"], BUNDLE_RESOURCE);
+        let content = registry.content(capability.permission_id()).unwrap();
+        assert_eq!(content["resource_type"], BUNDLE_RESOURCE);
+        assert_eq!(content["action"], capability.action());
     }
+    let (instance, expected) = engine_plugin::registration("constructorfabric", 100).unwrap();
+    assert_eq!(registry.content(instance.as_ref()).unwrap(), expected);
+    let writes = registry.calls(Call::Register);
+    let ctx = common::gear_ctx_over(&config, Arc::clone(&hub)).await;
+    PolicyEngine::default().init(&ctx).await.unwrap();
+    assert_eq!(
+        registry.calls(Call::Register),
+        writes,
+        "init binds without republishing"
+    );
+    assert!(
+        hub.try_get_local::<dyn PolicyManagementClientV1>()
+            .is_some()
+    );
 }
 
-#[test]
-fn the_engine_plugin_instance_is_registered() {
-    let registry = ready_registry();
+#[tokio::test]
+async fn a_refused_plugin_instance_prevents_publication_completion_and_binding() {
+    let registry = common::registry();
     let (id, _) = engine_plugin::registration("constructorfabric", 100).unwrap();
-    let entity = registry
-        .get(id.as_ref())
-        .unwrap_or_else(|e| panic!("{id}: {e:?}"));
-    assert!(!entity.is_type_schema);
-    assert_eq!(entity.content["vendor"], "constructorfabric");
-    assert_eq!(entity.content["priority"], 100);
+    registry.reject(id.as_ref(), AdmissionFailureReason::InvalidSchema);
+    let hub = toolkit::ClientHub::new();
+    registry.install(&hub);
+    let error = PreparedGtsPublication::prepare(
+        PolicyEngine::default().descriptor(),
+        &common::MockConfigProvider::new(&config()),
+        &hub,
+    )
+    .unwrap()
+    .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(error, GtsPublicationError::Refused { .. }),
+        "{error}"
+    );
+    assert!(
+        hub.try_get_local::<dyn PolicyManagementClientV1>()
+            .is_none()
+    );
+    assert!(
+        hub.try_get_scoped::<dyn admission_control_sdk::AdmissionEnginePluginClientV1>(
+            &toolkit::client_hub::ClientScope::gts_id(&id),
+        )
+        .is_none()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_unreachable_registry_keeps_publication_pending_until_cancelled() {
+    let registry = common::registry();
+    registry.inject(
+        Fault::on(Call::Register)
+            .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
+    );
+    let hub = toolkit::ClientHub::new();
+    registry.install(&hub);
+    let publication = PreparedGtsPublication::prepare(
+        PolicyEngine::default().descriptor(),
+        &common::MockConfigProvider::new(&config()),
+        &hub,
+    )
+    .unwrap();
+    let cancel = CancellationToken::new();
+    let publishing = publication.publish(&cancel, Arc::new(|_: &str| {}));
+    tokio::pin!(publishing);
+    tokio::select! {
+        result = &mut publishing => panic!("unreachable registry admitted: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 2) => {}
+    }
+    assert!(registry.calls(Call::Register) > 1);
+    cancel.cancel();
+    assert!(publishing.await.is_err());
 }

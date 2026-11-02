@@ -14,6 +14,9 @@
 #![deny(rust_2018_idioms)]
 #![deny(missing_docs)]
 
+// Published by the policy-engine manifest before application initialization.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod error;
 pub mod gts;
 pub mod management;

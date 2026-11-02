@@ -48,7 +48,7 @@ pub type ApiResult<T> = Result<T, ApiError>;
 
 /// No security context, or an anonymous one: the request never reached
 /// [`PolicyManagementClientV1`](policy_engine_sdk::management::PolicyManagementClientV1),
-/// which cannot represent the absence of a caller.
+/// whose typed request always carries a caller context.
 #[must_use]
 pub fn unauthenticated() -> CanonicalError {
     CanonicalError::unauthenticated()

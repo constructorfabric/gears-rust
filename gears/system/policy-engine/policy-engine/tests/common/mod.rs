@@ -1,9 +1,5 @@
-//! Shared fixture of the gear-level integration tests: a config provider, a
-//! types-registry fake (which, unlike `MockTypesRegistryClient`, accepts
-//! `register` calls instead of panicking on them), a single-tenant
-//! tenant-resolver fake,
-//! an allow-all authz stub, and a `GearCtx` wired with them over a migrated
-//! in-memory `SQLite` database.
+//! Gear fixtures using the canonical Types Registry SDK mock, a single-tenant
+//! hierarchy, allow-all `AuthZ` and migrated in-memory SQLite storage.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
 use std::collections::HashMap;
@@ -25,15 +21,13 @@ use tenant_resolver_sdk::{
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::DatabaseCapability;
+use toolkit::gts_publication::GtsPublicationCapability as _;
 use toolkit::{ClientHub, GearCtx};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_db::migration_runner::run_migrations_for_gear;
 use toolkit_db::{ConnectOpts, DBProvider, Db, DbError, connect_db};
 use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties};
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_type_schema};
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 pub const GEAR: &str = "policy-engine";
@@ -68,106 +62,19 @@ impl ConfigProvider for MockConfigProvider {
     }
 }
 
-/// A types-registry fake that knows [`WIDGET`] and accepts registration
-/// (delegating every other call to a wrapped `MockTypesRegistryClient`,
-/// which panics if `register` reaches it directly - this fake exists so
-/// `register` does not panic in these tests).
-pub struct FakeTypesRegistry {
-    inner: MockTypesRegistryClient,
-}
-
-impl FakeTypesRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: MockTypesRegistryClient::new()
-                .with_type_schemas([make_test_type_schema(WIDGET)]),
-        }
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for FakeTypesRegistry {
-    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        Ok(entities
-            .iter()
-            .map(|entity| {
-                let id = entity["$id"].as_str().unwrap_or_default().to_owned();
-                RegisterResult::Ok { gts_id: id }
-            })
-            .collect())
-    }
-
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_type_schemas(type_schemas).await
-    }
-
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema(type_id).await
-    }
-
-    async fn get_type_schema_by_uuid(&self, id: Uuid) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema_by_uuid(id).await
-    }
-
-    async fn get_type_schemas(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas(ids).await
-    }
-
-    async fn get_type_schemas_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas_by_uuid(ids).await
-    }
-
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        self.inner.list_type_schemas(query).await
-    }
-
-    async fn register_instances(
-        &self,
-        instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_instances(instances).await
-    }
-
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance(id).await
-    }
-
-    async fn get_instance_by_uuid(&self, id: Uuid) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance_by_uuid(id).await
-    }
-
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances(ids).await
-    }
-
-    async fn get_instances_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances_by_uuid(ids).await
-    }
-
-    async fn list_instances(
-        &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        self.inner.list_instances(query).await
-    }
+/// SDK registry mock seeded with the platform declarations and test resource.
+pub fn registry() -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.seed_inventory();
+    registry.seed(
+        WIDGET,
+        json!({
+            "$id": format!("gts://{WIDGET}"),
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+        }),
+    );
+    registry
 }
 
 /// A single non-root, non-self-managed tenant ([`TENANT`]), reachable from
@@ -323,7 +230,7 @@ pub const TEST_EVALUATION_TIMEOUT: &str = "1s";
 /// migrated in-memory `SQLite` database.
 pub async fn gear_ctx(config: &Value) -> (GearCtx, Arc<ClientHub>) {
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(Arc::new(FakeTypesRegistry::new()));
+    registry().install(&hub);
     let ctx = gear_ctx_over(config, Arc::clone(&hub)).await;
     (ctx, hub)
 }
@@ -355,12 +262,18 @@ pub async fn gear_ctx_over(config: &Value, hub: Arc<ClientHub>) -> GearCtx {
     hub.register::<dyn TenantResolverClient>(Arc::new(FakeTenantResolver::new(TENANT)));
     hub.register::<dyn AuthZResolverApi>(Arc::new(AllowAllAuthz));
 
+    let provider = Arc::new(MockConfigProvider::new(&config));
+    let manifest = PolicyEngine::default()
+        .descriptor()
+        .build_gts_manifest(provider.as_ref())
+        .expect("valid publication manifest");
     GearCtx::new(
         GEAR,
         Uuid::new_v4(),
-        Arc::new(MockConfigProvider::new(&config)),
+        provider,
         hub,
         CancellationToken::new(),
     )
     .with_db(dbp)
+    .with_gts_publication_manifest(Arc::new(manifest))
 }

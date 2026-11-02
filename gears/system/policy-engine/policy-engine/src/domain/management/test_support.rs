@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::domain::model::{
     BundleId, BundleVersion, ContentLimits, Document, VersionId, VersionState,
 };
-use crate::domain::ports::{PortError, TypeCatalogPort};
+use crate::domain::ports::{PortError, TypeCatalogPort, TypeCatalogScope};
 
 /// A one-shot action the fake PDP awaits before answering.
 pub type Hook = Pin<Box<dyn Future<Output = ()> + Send>>;
@@ -221,7 +221,11 @@ pub struct FakeTypes;
 
 #[async_trait]
 impl TypeCatalogPort for FakeTypes {
-    async fn known_types(&self, ids: &[String]) -> Result<HashSet<String>, PortError> {
+    async fn known_types(
+        &self,
+        _scope: TypeCatalogScope<'_>,
+        ids: &[String],
+    ) -> Result<HashSet<String>, PortError> {
         Ok(ids.iter().filter(|i| *i == WIDGET).cloned().collect())
     }
 }

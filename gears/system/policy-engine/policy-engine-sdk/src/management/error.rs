@@ -213,6 +213,16 @@ pub enum ManagementError {
     #[error_code("TENANT_BOUNDARY")]
     #[canonical(PermissionDenied)]
     TenantBoundary,
+    /// The request caller could not authenticate to the types registry.
+    #[error("the types registry requires authentication")]
+    #[error_code("UNAUTHENTICATED")]
+    #[canonical(Unauthenticated)]
+    Unauthenticated,
+    /// The types registry refused the caller's catalog read.
+    #[error("the types registry denied the caller's read")]
+    #[error_code("REGISTRY_READ_DENIED")]
+    #[canonical(PermissionDenied)]
+    RegistryReadDenied,
     /// A dependency (authorisation, tenant hierarchy, types registry) could
     /// not answer; retry later.
     #[error("a dependency of policy management is unavailable")]

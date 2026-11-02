@@ -15,6 +15,9 @@
 #![forbid(unsafe_code)]
 #![deny(rust_2018_idioms)]
 
+// The gate owns and publishes these declarations before application init.
+toolkit_gts::declare_gts_inventory!();
+
 pub mod api;
 pub mod error;
 pub mod gts;

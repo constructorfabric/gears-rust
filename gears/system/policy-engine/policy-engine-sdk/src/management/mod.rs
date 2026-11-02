@@ -24,6 +24,10 @@
 //! take read or, for dormant assignments at the caller's tenants, publish. No
 //! capability implies another.
 
+/// Registry reads during validate and activate keep the request caller's identity.
+/// A refused catalog read is `RegistryReadDenied` (403), a registry authentication
+/// refusal is `Unauthenticated` (401), and an outage remains `Unavailable` (503).
+/// Neither refusal is retried with platform credentials.
 pub mod client;
 pub mod error;
 pub mod models;

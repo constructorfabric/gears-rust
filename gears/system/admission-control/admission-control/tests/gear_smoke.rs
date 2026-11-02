@@ -15,9 +15,7 @@ use admission_control_sdk::{
     PolicyReference, RefusalCause, Verdict,
 };
 use async_trait::async_trait;
-use common::{
-    Registration, TestRegistry, WIDGET, config, gear_ctx, gear_ctx_raw, gear_ctx_with, tenant_user,
-};
+use common::{WIDGET, config, gear_ctx, gear_ctx_raw, gear_ctx_with, tenant_user};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use toolkit::Gear;
@@ -25,7 +23,7 @@ use toolkit::client_hub::ClientScope;
 use toolkit::lifecycle::ReadySignal;
 use toolkit_gts::PluginV1;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::make_test_instance;
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 /// Engine selection by `vendor` alone.
@@ -79,7 +77,7 @@ async fn serve(
 
 #[tokio::test]
 async fn init_registers_the_client_and_refuses_fail_closed_without_an_engine() {
-    let (ctx, hub) = gear_ctx(&config(), Registration::Accept);
+    let (ctx, hub) = gear_ctx(&config());
     let gear = Arc::new(AdmissionControl::default());
     assert!(gear.admission_service().is_none(), "no service before init");
     gear.init(&ctx).await.expect("init");
@@ -128,10 +126,8 @@ async fn a_configured_engine_is_resolved_and_consulted() {
             PluginV1::<AdmissionEnginePluginSpecV1>::build_registration(SEGMENT, "acme", 1)
                 .unwrap();
         let instance_id = AsRef::<str>::as_ref(&id).to_owned();
-        let registry = TestRegistry::with_instances(
-            Registration::Accept,
-            [make_test_instance(&instance_id, content)],
-        );
+        let registry = MockTypesRegistry::new();
+        registry.seed(&instance_id, content);
         let mut with_engine = config();
         with_engine.engine = Some(engine("acme"));
         let (ctx, hub) = gear_ctx_with(&with_engine, registry);
@@ -177,10 +173,8 @@ async fn a_call_before_serve_reaches_the_configured_engine() {
     )
     .unwrap();
     let instance_id = AsRef::<str>::as_ref(&id).to_owned();
-    let registry = TestRegistry::with_instances(
-        Registration::Accept,
-        [make_test_instance(&instance_id, content)],
-    );
+    let registry = MockTypesRegistry::new();
+    registry.seed(&instance_id, content);
     let mut with_engine = config();
     with_engine.engine = Some(engine("acme"));
     let (ctx, hub) = gear_ctx_with(&with_engine, registry);
@@ -204,34 +198,40 @@ async fn a_call_before_serve_reaches_the_configured_engine() {
 async fn zero_numeric_settings_fail_startup() {
     let mut zero_timeout = config();
     zero_timeout.engine_timeout_ms = 0;
-    let (ctx, _hub) = gear_ctx(&zero_timeout, Registration::Accept);
+    let (ctx, _hub) = gear_ctx(&zero_timeout);
     let err = AdmissionControl::default().init(&ctx).await.unwrap_err();
     assert!(format!("{err:#}").contains("engine_timeout_ms"), "{err:#}");
 }
 
 #[tokio::test]
-async fn an_unreachable_registry_does_not_block_startup() {
-    let (ctx, _hub) = gear_ctx(&config(), Registration::Unreachable);
-    let gear = Arc::new(AdmissionControl::default());
-    gear.init(&ctx).await.expect("init");
-    let cancel = CancellationToken::new();
-    let serving = serve(&gear, &cancel).await;
-    cancel.cancel();
-    serving.await.unwrap().expect("clean stop");
+async fn init_requires_an_admitted_manifest_and_does_not_bind_without_it() {
+    let hub = Arc::new(toolkit::ClientHub::new());
+    let registry = Arc::new(MockTypesRegistry::new());
+    registry.install(&hub);
+    let ctx = toolkit::GearCtx::new(
+        common::GEAR,
+        Uuid::new_v4(),
+        Arc::new(common::MockConfigProvider::new(&json!({}))),
+        Arc::clone(&hub),
+        CancellationToken::new(),
+    );
+    let err = AdmissionControl::default().init(&ctx).await.unwrap_err();
+    assert!(
+        format!("{err:#}").contains("admitted GTS manifest"),
+        "{err:#}"
+    );
+    assert!(hub.try_get::<dyn AdmissionClientV1>().is_none());
+    assert_eq!(
+        registry.calls(types_registry_sdk::testing_platform::Call::Register),
+        0
+    );
 }
 
 #[tokio::test]
-async fn init_fails_on_a_rejected_event_type_or_bad_configuration() {
-    let (ctx, _hub) = gear_ctx(&config(), Registration::Reject);
-    let err = AdmissionControl::default().init(&ctx).await.unwrap_err();
-    assert!(
-        format!("{err:#}").contains("registration rejected"),
-        "{err:#}"
-    );
-
+async fn bad_configuration_fails_init() {
     let (ctx, _hub) = gear_ctx_raw(
         &json!({ "admit_on_failure": true }),
-        TestRegistry::new(Registration::Accept),
+        MockTypesRegistry::new(),
     );
     assert!(AdmissionControl::default().init(&ctx).await.is_err());
 }
@@ -240,7 +240,7 @@ async fn init_fails_on_a_rejected_event_type_or_bad_configuration() {
 async fn serve_fails_startup_when_the_configured_engine_is_unresolvable() {
     let mut with_engine = config();
     with_engine.engine = Some(engine("nobody"));
-    let (ctx, _hub) = gear_ctx(&with_engine, Registration::Accept);
+    let (ctx, _hub) = gear_ctx(&with_engine);
     let gear = Arc::new(AdmissionControl::default());
     gear.init(&ctx).await.expect("init");
 

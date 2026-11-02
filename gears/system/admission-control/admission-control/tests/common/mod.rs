@@ -1,23 +1,18 @@
 //! Shared fixture of the gear-level integration tests: a config provider, a
-//! types registry whose registration outcome is chosen per test, and a
-//! `GearCtx` wired with them.
+//! platform registry fake and a context carrying the admitted manifest.
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use admission_control::config::AdmissionControlConfig;
-use async_trait::async_trait;
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 use toolkit::config::ConfigProvider;
+use toolkit::gts_publication::GtsPublicationCapability as _;
 use toolkit::{ClientHub, GearCtx};
-use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery, TypesRegistryClient,
-};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 pub const GEAR: &str = "admission-control";
@@ -57,148 +52,33 @@ impl ConfigProvider for MockConfigProvider {
     }
 }
 
-/// Outcome of the audit event-type registration.
-#[derive(Clone, Copy)]
-pub enum Registration {
-    Accept,
-    Reject,
-    Unreachable,
+/// A context carrying the manifest admitted by the runtime before `init`.
+pub fn gear_ctx(config: &AdmissionControlConfig) -> (GearCtx, Arc<ClientHub>) {
+    gear_ctx_with(config, MockTypesRegistry::new())
 }
 
-/// The mock registry with a chosen registration outcome; the mock itself
-/// panics on registration.
-pub struct TestRegistry {
-    inner: MockTypesRegistryClient,
-    registration: Registration,
-}
-
-impl TestRegistry {
-    pub fn new(registration: Registration) -> Self {
-        Self::with_instances(registration, [])
-    }
-
-    /// The registry, also listing `instances` (engine plugin registrations).
-    pub fn with_instances(
-        registration: Registration,
-        instances: impl IntoIterator<Item = GtsInstance>,
-    ) -> Self {
-        Self {
-            inner: MockTypesRegistryClient::new().with_instances(instances),
-            registration,
-        }
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for TestRegistry {
-    async fn register(&self, entities: Vec<Value>) -> Result<Vec<RegisterResult>, CanonicalError> {
-        match self.registration {
-            Registration::Unreachable => Err(CanonicalError::service_unavailable().create()),
-            Registration::Accept => Ok(entities
-                .iter()
-                .map(|schema| RegisterResult::Ok {
-                    gts_id: schema["$id"].as_str().unwrap_or_default().to_owned(),
-                })
-                .collect()),
-            Registration::Reject => Ok(entities
-                .iter()
-                .map(|schema| RegisterResult::Err {
-                    gts_id: schema["$id"].as_str().map(str::to_owned),
-                    error: CanonicalError::internal("conflicting schema").create(),
-                })
-                .collect()),
-        }
-    }
-    async fn register_type_schemas(
-        &self,
-        type_schemas: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_type_schemas(type_schemas).await
-    }
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema(type_id).await
-    }
-    async fn get_type_schema_by_uuid(&self, id: Uuid) -> Result<GtsTypeSchema, CanonicalError> {
-        self.inner.get_type_schema_by_uuid(id).await
-    }
-    async fn get_type_schemas(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas(ids).await
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        self.inner.get_type_schemas_by_uuid(ids).await
-    }
-    async fn list_type_schemas(
-        &self,
-        query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        self.inner.list_type_schemas(query).await
-    }
-    async fn register_instances(
-        &self,
-        instances: Vec<Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        self.inner.register_instances(instances).await
-    }
-    async fn get_instance(&self, id: &str) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance(id).await
-    }
-    async fn get_instance_by_uuid(&self, id: Uuid) -> Result<GtsInstance, CanonicalError> {
-        self.inner.get_instance_by_uuid(id).await
-    }
-    async fn get_instances(
-        &self,
-        ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances(ids).await
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        ids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        self.inner.get_instances_by_uuid(ids).await
-    }
-    async fn list_instances(
-        &self,
-        query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        self.inner.list_instances(query).await
-    }
-}
-
-/// A `GearCtx` for the gear over a fresh hub holding the registry.
-pub fn gear_ctx(
-    config: &AdmissionControlConfig,
-    registration: Registration,
-) -> (GearCtx, Arc<ClientHub>) {
-    gear_ctx_with(config, TestRegistry::new(registration))
-}
-
-/// A `GearCtx` for the gear over a fresh hub holding `registry`.
 pub fn gear_ctx_with(
     config: &AdmissionControlConfig,
-    registry: TestRegistry,
+    registry: MockTypesRegistry,
 ) -> (GearCtx, Arc<ClientHub>) {
-    let raw = serde_json::to_value(config).expect("the config serializes");
-    gear_ctx_raw(&raw, registry)
+    gear_ctx_raw(&serde_json::to_value(config).expect("config"), registry)
 }
 
-/// A `GearCtx` over raw config JSON, for configs the typed form cannot
-/// express (unknown keys).
-pub fn gear_ctx_raw(config: &Value, registry: TestRegistry) -> (GearCtx, Arc<ClientHub>) {
+pub fn gear_ctx_raw(config: &Value, registry: MockTypesRegistry) -> (GearCtx, Arc<ClientHub>) {
     let hub = Arc::new(ClientHub::new());
-    hub.register::<dyn TypesRegistryClient>(Arc::new(registry));
+    Arc::new(registry).install(&hub);
+    let provider = Arc::new(MockConfigProvider::new(config));
+    let manifest = admission_control::AdmissionControl::default()
+        .descriptor()
+        .build_gts_manifest(provider.as_ref())
+        .expect("manifest");
     let ctx = GearCtx::new(
         GEAR,
         Uuid::new_v4(),
-        Arc::new(MockConfigProvider::new(config)),
+        provider,
         Arc::clone(&hub),
         CancellationToken::new(),
-    );
+    )
+    .with_gts_publication_manifest(Arc::new(manifest));
     (ctx, hub)
 }

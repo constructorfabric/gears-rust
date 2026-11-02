@@ -1,11 +1,10 @@
 //! GTS types and well-known instances owned by the policy engine: the
 //! resource types and the management permission catalog, all registered
-//! through the `toolkit-gts` inventory. The engine plugin instance is not
-//! here: its vendor and priority come from configuration, so the gear
-//! registers it at init.
+//! through the gear's pre-init publication manifest. The engine plugin
+//! instance uses the same manifest with vendor and priority from configuration.
 
 use gts::{GtsInstanceId, GtsSchema};
-use toolkit_gts::gts_type_schema;
+use toolkit_gts::local::gts_type_schema;
 
 /// Resource type of a policy bundle.
 pub const BUNDLE_RESOURCE: &str = PolicyBundleV1::TYPE_ID;
@@ -70,7 +69,8 @@ pub const POLICY_ENTRYPOINT: &str = "deny";
 ///
 /// Instance id layout: `gts.cf.toolkit.authz.permission.v1~cf.core.policy_engine.<name>.v1`.
 pub mod permissions {
-    use toolkit_gts::{AuthzPermissionV1, gts_id, gts_instance};
+    use toolkit_gts::local::gts_instance;
+    use toolkit_gts::{AuthzPermissionV1, gts_id};
 
     use super::BUNDLE_RESOURCE;
 

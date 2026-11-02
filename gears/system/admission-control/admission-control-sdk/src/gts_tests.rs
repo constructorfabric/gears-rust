@@ -156,3 +156,26 @@ fn resource_type_schema_is_in_inventory_under_its_constant() {
             .contains(ADMISSION_CONTROL_RESOURCE)
     );
 }
+
+/// The managed catalogue and the broker's inventory catalogue are independent.
+/// Both must receive the same static schema without an init-time registry write.
+#[test]
+fn refusal_schema_is_declared_in_both_owned_and_process_inventories() {
+    let declared = crate::gts_declarations();
+    let owned: Value = serde_json::from_str(
+        &declared
+            .iter()
+            .find(|(id, _)| id == REFUSAL_EVENT_TYPE)
+            .expect("owned refusal declaration")
+            .1,
+    )
+    .unwrap();
+    let global = toolkit_gts::all_inventory_type_schemas().unwrap();
+    let schema = refusal_event_type_schema();
+    assert_eq!(owned, schema);
+    let broker_schema = global
+        .iter()
+        .find(|candidate| candidate["$id"] == schema["$id"])
+        .expect("broker inventory contains refusal schema");
+    assert_eq!(broker_schema, &schema);
+}
