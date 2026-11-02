@@ -86,7 +86,7 @@ The gear is in this repository under `gears/construct`, and it is not built into
    cargo run --bin cf-gears-example-server --no-default-features --features construct,graph-storage,static-tenants,static-authn,static-authz -- --config config/quickstart.yaml run
    ```
 
-The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids` and `m004_record_ids_key_only`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
+The log shows `Applying migration gear="construct"` for `initial_001`, `m002_subject_settings`, `m003_record_ids`, `m004_record_ids_key_only` and `m005_review_requests`, after graph storage's own migrations. The types registry is part of every example server, so the record types are there.
 
 ## Configuration
 

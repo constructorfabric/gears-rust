@@ -344,7 +344,7 @@ The system **MUST** log each view, delete and export as an event with the tenant
 - [ ] A subject sees all its facts with origin, also while personalization is off (`the_owner_sees_every_fact_newest_first_with_the_version_also_while_off_and_erasing`, `the_owner_lists_its_facts_newest_first_with_kind_origin_and_version`).
 - [ ] A deleted fact is not served from the next read (`a_record_is_planned_checked_admitted_written_read_back_and_deleted_by_its_subject`, `the_owner_reads_one_fact_deletes_it_and_then_it_is_not_found`).
 - [ ] The export is refused without its permission, and with it reaches any subject of the caller's tenant, not only the caller; a subject of another tenant answers as if there were no profile (`the_export_is_a_json_attachment_and_403_without_its_permission`, `the_export_needs_its_permission_not_the_owner_and_holds_the_settings_and_every_fact`).
-- [ ] Every operation asks for its own permission, and Construct declares it (`each_operation_asks_for_its_own_action_on_the_subject_facts`, `every_enforced_permission_is_declared_once`).
+- [ ] Every operation asks for its own permission, and Construct declares it (`each_operation_asks_for_its_own_action_on_the_subject_facts`, `every_enforced_permission_is_declared_once_on_its_resource_and_action`).
 - [ ] Every answer is `no-store` with the security headers (`every_answer_is_no_store_with_the_security_headers`).
 - [ ] The tests named in this document pass.
 
