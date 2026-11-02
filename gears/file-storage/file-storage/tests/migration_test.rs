@@ -32,9 +32,36 @@ async fn run(db: &DatabaseConnection, sql: impl Into<String>) {
         .unwrap_or_else(|e| panic!("`{sql}` failed: {e}"));
 }
 
-/// Runs a statement a constraint must reject.
-async fn rejected(db: &DatabaseConnection, sql: impl Into<String>) -> bool {
-    exec(db, sql).await.is_err()
+/// The kind of constraint a statement is expected to violate (`SQLite` error prefix).
+#[derive(Clone, Copy, Debug)]
+enum Constraint {
+    Check,
+    Unique,
+}
+
+impl Constraint {
+    fn prefix(self) -> &'static str {
+        match self {
+            Self::Check => "CHECK constraint failed",
+            Self::Unique => "UNIQUE constraint failed",
+        }
+    }
+}
+
+/// Runs a statement the given constraint must reject; any other failure panics.
+async fn rejected(db: &DatabaseConnection, kind: Constraint, sql: impl Into<String>) -> bool {
+    let sql = sql.into();
+    match exec(db, sql.as_str()).await {
+        Ok(()) => false,
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains(kind.prefix()),
+                "`{sql}` failed for a reason other than a {kind:?} constraint: {msg}"
+            );
+            true
+        }
+    }
 }
 
 /// Fresh in-memory `SQLite`; foreign keys are enforced only when asked (`SQLite` defaults to off,
@@ -287,6 +314,7 @@ async fn upload_flow_down_folds_completing_session_into_aborted() {
     assert!(
         rejected(
             &db,
+            Constraint::Check,
             format!(
                 "UPDATE multipart_uploads SET state = 'completing' WHERE upload_id = '{UPLOAD}'"
             )
@@ -367,6 +395,7 @@ async fn upload_flow_up_backfills_and_preserves_existing_rows() {
     assert!(
         rejected(
             &db,
+            Constraint::Check,
             format!("UPDATE multipart_uploads SET state = 'bogus' WHERE upload_id = '{UPLOAD}'")
         )
         .await,
@@ -462,7 +491,10 @@ async fn check_constraints_reject_invalid_rows() {
         ),
     ];
     for (name, sql) in cases {
-        assert!(rejected(&db, sql).await, "CHECK must reject {name}");
+        assert!(
+            rejected(&db, Constraint::Check, sql).await,
+            "CHECK must reject {name}"
+        );
     }
     assert_eq!(
         count(&db, "SELECT COUNT(*) AS c FROM file_versions").await,
@@ -480,7 +512,7 @@ async fn file_versions_current_is_unique_per_file() {
     insert_file(&db, FILE2).await;
     insert_version(&db, FILE, VERSION, 1).await;
     assert!(
-        rejected(&db, version_insert(FILE, VERSION2, 1)).await,
+        rejected(&db, Constraint::Unique, version_insert(FILE, VERSION2, 1)).await,
         "two current versions of one file must violate the unique index"
     );
     insert_version(&db, FILE, VERSION2, 0).await;
@@ -504,7 +536,7 @@ async fn custom_metadata_rejects_duplicate_key_per_file() {
     };
     run(&db, insert("a")).await;
     assert!(
-        rejected(&db, insert("b")).await,
+        rejected(&db, Constraint::Unique, insert("b")).await,
         "(file_id, key) PK must reject duplicate key"
     );
 }
@@ -553,12 +585,22 @@ async fn policies_unique_indexes_reject_duplicates_and_allow_distinct_scopes() {
 
     run(&db, insert(&id(1), TENANT, "user", Some(owner2))).await;
     assert!(
-        rejected(&db, insert(&id(2), TENANT, "user", Some(owner2))).await,
+        rejected(
+            &db,
+            Constraint::Unique,
+            insert(&id(2), TENANT, "user", Some(owner2))
+        )
+        .await,
         "duplicate (tenant_id, 'user', scope_owner_id) must violate the user-scope index"
     );
     run(&db, insert(&id(3), TENANT, "tenant", None)).await;
     assert!(
-        rejected(&db, insert(&id(4), TENANT, "tenant", None)).await,
+        rejected(
+            &db,
+            Constraint::Unique,
+            insert(&id(4), TENANT, "tenant", None)
+        )
+        .await,
         "duplicate (tenant_id, 'tenant') with NULL scope_owner_id must violate the tenant-scope index"
     );
 

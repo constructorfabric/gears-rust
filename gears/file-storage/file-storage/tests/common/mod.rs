@@ -522,8 +522,10 @@ pub fn owned_file(owner_id: Uuid) -> NewFile {
     new_file_for(owner_id, "victim.bin", "application/octet-stream")
 }
 
-/// Capturing `UsageReporter`. Production reports from a spawned task, so a test awaits the
-/// expected number of reports on a channel instead of sleeping.
+/// Capturing `UsageReporter`. Production reports from a task it spawns and never awaits
+/// (`report_usage`), but spawns it before the call under test returns, and `report` here is one
+/// synchronous send. On the current-thread test runtime a single `yield_now` therefore lands
+/// every report, so `reports` never waits for one that may not come.
 pub struct FakeUsageReporter {
     tx: tokio::sync::mpsc::UnboundedSender<UsageDelta>,
     rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<UsageDelta>>,
@@ -540,19 +542,22 @@ impl FakeUsageReporter {
         })
     }
 
-    /// Waits until at least `at_least` deltas have been reported in total, then yields once so
-    /// the other already spawned report tasks land too, and returns every delta in arrival order.
-    /// `reports(0)` is the "nothing (more) was reported" check.
+    /// Every delta reported so far, in arrival order, after one yield that lets the report tasks
+    /// already spawned run. Fails at once if fewer than `at_least` arrived; `reports(0)` is the
+    /// "nothing (more) was reported" check.
     pub async fn reports(&self, at_least: usize) -> Vec<UsageDelta> {
+        tokio::task::yield_now().await;
         let mut rx = self.rx.lock().await;
         let mut seen = self.seen.lock().await;
-        while seen.len() < at_least {
-            seen.push(rx.recv().await.expect("reporter channel closed"));
-        }
-        tokio::task::yield_now().await;
         while let Ok(delta) = rx.try_recv() {
             seen.push(delta);
         }
+        assert!(
+            seen.len() >= at_least,
+            "expected at least {at_least} usage reports, got {}: {:?}",
+            seen.len(),
+            *seen
+        );
         seen.clone()
     }
 }

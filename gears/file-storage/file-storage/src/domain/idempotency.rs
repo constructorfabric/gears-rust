@@ -104,6 +104,26 @@ mod tests {
                 compute_request_hash("user", u(2), "n", "gts", "mime", &meta(&[("k", "v1")])),
             ),
             (
+                "owner_kind",
+                compute_request_hash("tenant", u(1), "n", "gts", "mime", &meta(&[("k", "v1")])),
+            ),
+            (
+                "name",
+                compute_request_hash("user", u(1), "n2", "gts", "mime", &meta(&[("k", "v1")])),
+            ),
+            (
+                "gts_file_type",
+                compute_request_hash("user", u(1), "n", "gts2", "mime", &meta(&[("k", "v1")])),
+            ),
+            (
+                "mime_type",
+                compute_request_hash("user", u(1), "n", "gts", "mime2", &meta(&[("k", "v1")])),
+            ),
+            (
+                "metadata key",
+                compute_request_hash("user", u(1), "n", "gts", "mime", &meta(&[("k2", "v1")])),
+            ),
+            (
                 "metadata value",
                 compute_request_hash("user", u(1), "n", "gts", "mime", &meta(&[("k", "v2")])),
             ),
