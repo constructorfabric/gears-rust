@@ -1,0 +1,6 @@
+use toolkit_macros::gear;
+
+#[gear(name = "x", gts(crates = [crate], crates = [crate], publisher = some::adapter))]
+pub struct X;
+
+fn main() {}

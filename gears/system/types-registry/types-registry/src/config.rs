@@ -24,6 +24,10 @@ const MAX_DELIVERY_ATTEMPTS: u32 = i16::MAX as u32 - 1;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct TypesRegistryConfig {
+    /// Which contracts this registry provides; see [`RegistryMode`].
+    #[serde(default)]
+    pub mode: RegistryMode,
+
     /// Fields to check for GTS entity ID (in order of priority).
     /// Default: `["$id", "gtsId", "id"]`
     pub entity_id_fields: Vec<String>,
@@ -64,6 +68,23 @@ pub struct TypesRegistryConfig {
     /// Metrics naming configuration.
     #[serde(default)]
     pub metrics: MetricsConfig,
+}
+
+/// Which contracts a types-registry instance provides.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryMode {
+    /// The legacy `TypesRegistryClient` and its v1 routes, plus — with a database bound —
+    /// `PlatformTypesRegistryApi` and `TypesRegistryApi`, locally and over REST.
+    #[default]
+    Full,
+    /// Only the legacy `TypesRegistryClient` and its v1 routes, for local legacy
+    /// consumers in a host whose new-API consumers use a remote registry: neither new
+    /// contract is registered locally or routed, a bound database gets its migrations but
+    /// no seeding or database-backed admission, and the gear is not advertised in the
+    /// service directory, so discovery of either new contract can only find the remote
+    /// registry.
+    LegacyOnly,
 }
 
 /// Metrics configuration.
@@ -291,6 +312,7 @@ impl SingleCacheSettings {
 impl Default for TypesRegistryConfig {
     fn default() -> Self {
         Self {
+            mode: RegistryMode::default(),
             entity_id_fields: vec!["$id".to_owned(), "gtsId".to_owned(), "id".to_owned()],
             schema_id_fields: vec!["$schema".to_owned(), "gtsTid".to_owned(), "type".to_owned()],
             entities: Vec::new(),

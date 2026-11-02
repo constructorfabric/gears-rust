@@ -66,7 +66,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-fr-registry-federation`, `cpt-cf-types-registry-fr-registry-source-routing` | Managed-first resolution followed by deterministic, non-overlapping Source Claims; plugins are read-only and bound to the total federation contract. See *Federation Router* and *Registry Source Plugin registration* in §3.2. |
 | `cpt-cf-types-registry-fr-cache-freshness-metadata` | Per-request opaque validators for exact reads, never discovery pages; inputs in §3.3, *What a validator is made of*. |
 | `cpt-cf-types-registry-fr-client-cache` | Bounded per-client representation cache with batched conditional revalidation and fail-closed expiry handling. See *The client-side cache* in §3.3. |
-| `cpt-cf-types-registry-fr-two-phase-init` | Caller-side inventory reconciliation, dependency-aware batches, and per-registrant readiness without a global startup barrier. See *Inventory and startup reconciliation* in §3.3. |
+| `cpt-cf-types-registry-fr-two-phase-init` | Caller-side reconciliation and concurrent application publication before application initialization; infrastructure serves independently. See *Inventory and startup reconciliation* in §3.3. |
 | `cpt-cf-types-registry-fr-validation-hooks` | P2 hook execution and declaration semantics remain open; D1 records the required control-plane type decision. |
 | `cpt-cf-types-registry-fr-aliasing` | P2 Alias projection remains open; D2 records the construction decision while PRD question 6 retains chaining and retargeting policy. |
 | `cpt-cf-types-registry-fr-tenant-enablement` | P2 adds stored managed enablement as an availability input; external enablement already remains source-owned. ADR-0010 fixes the semantic propagation and the implementation consequence. |
@@ -256,7 +256,7 @@ Reverse-impact queries use a repository-owned recursive CTE over `dependency`, b
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-constraint-boot-path`
 
-Types Registry becomes ready when its storage and seed set are ready; it never waits for registrants or an expected registration set. Registrants retry in the background and gate only their own readiness (§3.3, *Inventory and startup reconciliation*). Standalone deployments require high availability (§4); replicas share only the database.
+Types Registry becomes ready when its storage and seed set are ready; it never waits for registrants or an expected registration set. The runtime retries application publications concurrently and gates the application group until admission (§3.3, *Inventory and startup reconciliation*). Standalone deployments require high availability (§4); replicas share only the database.
 
 **ADRs**: `cpt-cf-types-registry-adr-write-path-admission-protocol`
 
@@ -612,7 +612,7 @@ Inside the commit transaction, after the `entity_write_order` claim and **before
 
 `superseded` carries `stored_version` and `offered_version`. Comparison uses SemVer precedence (prerelease counts, build metadata does not); a different publisher yields `publisher_mismatch`. Under the write-order claim, check the stamp before preconditions and any final refusal, including compatibility or tombstone refusal, and on both `unchanged` paths. Metadata-only confirmation changes no revision, `resource_version`, `updated_at`, artifact or validator, including for minor-bearing Type Schemas (ADR-0004). Failed, refused and dry-run candidates never advance the stamp; deletion commits tombstone and stamp together.
 
-Required publisher metadata prevents unversioned bypasses. Equal-version updates support configuration-built Instances without a rebuild, but differently configured replicas of one release may overwrite each other. Per-entity stamps allow partial admission; older releases may still create identifiers absent from newer publications. Manifest omissions never delete entities.
+Required publisher metadata prevents unversioned bypasses. Equal-version updates support configuration-built Instances without a rebuild, but differently configured replicas of one release may overwrite each other. Per-entity stamps allow partial admission; older releases may still create identifiers absent from newer publications. Omitting a previously published schema or instance does not delete it.
 
 There is no override of `publisher_version`. Reverting content takes a newer release; a hotfix on an older line is released above the last published version. A rolled-back binary is `superseded`, and the registry is not rewound.
 
@@ -1802,21 +1802,57 @@ Content duplicates across Context Tenants even when only availability and owners
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
 
-Declaring crates use `#[gts_type_schema(...)]` / `gts_instance!` and call `toolkit_gts::declare_gts_inventory!()` once to expose plain-data `gts_declarations()`. The owning gear lists its crates and publisher in `#[toolkit::gear(…, gts(crates = [crate, some_sdk], publisher = types_registry_sdk::publish_gts))]`. The macro records ownership and publishes those declarations after wiring with the gear’s `PublisherContext`; configuration-built Instances use the same hook. Linking a crate publishes nothing, and incompatible `toolkit-gts` versions cannot hide declarations.
+Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::gts_publisher` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
 
-The SDK provides the reconciliation workflow for gear startup:
+Infrastructure (registry, discovery, cluster, REST and gRPC hosts) starts serving first. After application DB migrations and client wiring, the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, before any application `init`. Pending admission holds `application/preparation` and `/readyz`; a terminal refusal fails application preparation. Plugins bind their clients in `init` using their declared instances after admission. `SystemCapability::post_init` remains system-only. Business bootstrap still runs in `serve`; a separate business-availability gate is future work (#5547, #5562).
 
-1. batch-get every desired exact identifier;
-2. omit authored content equal to the corresponding current snapshot — **except on the platform plane**, where every call carries a `PublisherContext` and every document is submitted so that a higher version can be confirmed (§3.2, *Publication ordering*);
-3. leave `expected_resource_version` unset for missing entities and set it from the read for differing ones;
-4. return `UpToDate` without a POST when no candidates remain — this, and not a server-side inline response, is where the no-op is handled;
-5. otherwise submit once with one idempotency key, poll the operation, and return the terminal per-GTS-ID result.
+**Stateless services** reconcile on every publication: read current entities, compare authored content, submit missing/changed documents with observed versions, and poll admission. Retryable failures retain operation identity while polling; rejection is not success. `cf-gears-example-server publish-gts` publishes the same GTS Type Schemas and Instances as a deployment step without starting gears.
 
-One generated idempotency key spans retries and polling for an invocation. Cross-process-loss resumption requires the caller to persist it; a new cycle rereads and generates another. A `superseded` or permanently rejected candidate stops retrying; a new cycle never raises its own version.
+**Stateful services (planned)** use `types-registry-sdk` tables in the service's own database to remember confirmed registrations. A matching receipt for the registry target, publisher/version and a digest of the declared GTS Type Schemas and Instances lets a restart satisfy publication without contacting Types Registry again. New or changed schemas and instances reconcile first; partial or failed admission never records successful publication of the complete set. Replicas coordinate through a fenced lease, and force resync/invalidation handles registry reset, restore or target changes. This journal is separate from the SDK read cache and registry-owned storage; implementation is tracked in [P0 T46–T49](p0/todo.md#phase-10--service-local-publication-journal).
 
-Publication is supervised, starts after wiring and never blocks startup. Per-identifier status is *pending*, *admitted*, *rejected* or *superseded*. P0 readiness is `Required`: admitted and superseded-live satisfy it; superseded-deleted holds it. Admitted is sticky. Supersession emits a warning and metric; supporting newer contracts on older readers is the release’s N−1 obligation. `ReportOnly` and runtime overrides are P1. Registry-dependent work in `init`, `post_init`, `start` and bootstrap runs in supervised tasks awaiting prerequisites. Plugin selection is not cached while a locally registered instance of the same contract/vendor remains invisible.
+Registry control-plane/base/configured seeds remain inline in registry `init`; P0 requires every `cfg.entities` dependency to close within that seed set. During migration, global inventory and legacy clients remain for unmigrated gears. AM can use a remote registry while an embedded `legacy_only` registry serves RG's sealed local bootstrap; the catalogues are not mirrored. Full-fleet legacy removal and the real remote AM process proof remain open in T38/T41–T43.
 
-vNext replaces `register(Vec<Value>) -> Vec<RegisterResult>` without compatibility adapters, sequential local loops or kind-specific duplicates, and removes internal inventory seeding and **ready mode** (`cpt-cf-types-registry-fr-two-phase-init`, `cpt-cf-types-registry-constraint-boot-path`). Inline seeds contain only registry control-plane types, `toolkit-gts` bases and configured entities whose dependencies are in that set. Configured entities depending on other gears publish after wiring to avoid a cold-database bootstrap cycle.
+Publisher-version ordering and superseded-live readiness remain the T44/T45 target (§3.2, *Publication ordering*). Once activated, platform reconciliation must submit equal content too to confirm a higher publisher version; a journal receipt must never infer that confirmation from content equality alone. Omitting a previously published schema or instance does not delete it.
+
+##### Deployment preparation
+
+Application `init` starts only after its prerequisites are confirmed: the required DB schema
+is available and all declared GTS Type Schemas and Instances are admitted. Either the runtime
+or a deployment Job may prepare these prerequisites. Gears use the same declarations and
+`init` contract in both cases; their own business readiness remains separate.
+
+Today, the runtime runs migrations and publication reconciliation even after a successful Job.
+The planned deployment-managed mode replaces those writes with startup verification; it is
+not implemented yet.
+
+These prerequisites can be prepared before rollout using the existing commands:
+
+```text
+Registry and DB available → migrate → publish-gts → Roll out application pods
+```
+
+- `migrate` runs `pre_init` and DB migrations, then exits.
+- `publish-gts --registry <url> --deadline-secs 300` publishes the linked gears’ GTS Type Schemas and Instances
+  without running their lifecycle. It requires a platform credential and exits unsuccessfully
+  on refusal or timeout. Success means admission, not just request acceptance.
+- The job and application must use the same image and effective publication configuration.
+
+**Helm:** a `pre-install,pre-upgrade` Job can run these commands sequentially. Registry, DB
+and job configuration/credentials must already be available. A registry created as a regular
+resource of the same release is unavailable to its first `pre-install` hook: use a separate
+platform release or retain runtime bootstrap for the embedded composition. A `post-install`
+publication hook with `--wait` creates a cycle if pod readiness depends on that publication.
+See [Helm hook ordering](https://docs.helm.sh/docs/topics/charts_hooks/).
+
+During upgrade, old pods still run while the job prepares the new release. DB and GTS changes
+must support both versions during rollout. Hook failure or Helm rollback does not undo completed
+migrations or partial GTS admission; preparation must be safe to retry.
+
+**Planned deployment-managed mode (not implemented):** the job owns migrations and publication;
+pods verify the required DB schema and GTS state before application `init`, without performing
+those writes or silently falling back to them. Verification must match the running image and
+effective configuration; a flag that merely skips publication is insufficient. Read-only
+registry verification can establish this contract without a durable publication journal.
 
 ##### `publisher_name`
 

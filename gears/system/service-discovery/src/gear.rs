@@ -46,6 +46,8 @@ use crate::server;
 #[toolkit::gear(
     name = "service-discovery",
     capabilities = [grpc, system, rest],
+    // Children find the directory before the application group is prepared.
+    stage = infrastructure,
     client = cf_system_sdks::directory::DirectoryClient,
     one_per_installation = true
 )]

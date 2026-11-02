@@ -76,26 +76,39 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Build OoP spawn configuration
     let oop_options = build_oop_spawn_options(&config, oop_backend)?;
 
+    // The platform-plane credential of this process, when
+    // `oop_http.internal_auth` configures one. Co-hosted dependencies resolve to
+    // LOCAL trait objects through the `ClientHub` and never use it. A dependency
+    // resolved in another process does: the application group publishes its
+    // GTS documents to a registry that may run in a configured child unit or
+    // elsewhere, and the resolving client's platform-plane calls carry
+    // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`). Without one,
+    // such calls are refused by the remote side rather than sent unauthenticated.
+    let internal_token_provider = match config
+        .oop_http
+        .as_ref()
+        .and_then(|http| http.internal_auth.as_ref())
+    {
+        Some(internal_auth) => {
+            super::oop::build_platform_credentials(internal_auth, &cancel)
+                .await?
+                .1
+        }
+        None => None,
+    };
+
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
-    // OoP gears are spawned after the start phase (once grpc-hub has bound its port).
-    //
-    // No `internal_token_provider` is set here on purpose: this is the
-    // in-process (Profile 1) host. Gear-to-gear calls resolve to LOCAL trait
-    // objects through the `ClientHub` — there is no transport, so no
-    // `X-ToolKit-Internal-Token` header/metadata is ever emitted and no outbound
-    // platform credential is needed. The provider is only consulted inside the
-    // generated REST/gRPC transport clients, which the monolith does not use for
-    // co-hosted dependencies. A genuinely remote (directory-resolved) dependency
-    // is the resolving-client path, which threads its own provider
-    // (`cpt-cf-adr-two-plane-auth`).
+    // OoP gears are spawned once the infrastructure (grpc-hub among it) is up,
+    // before the application group waits for its GTS admission.
     let run_options = RunOptions::new(
         Arc::new(config),
         db_options,
         ShutdownOptions::Token(cancel.clone()),
         instance_id,
     )
-    .with_oop(oop_options);
+    .with_oop(oop_options)
+    .with_internal_token_provider(internal_token_provider);
 
     let result = run(run_options).await;
 
@@ -182,6 +195,80 @@ pub async fn run_migrate(config: AppConfig) -> Result<()> {
     result?;
 
     tracing::info!("All migrations completed successfully");
+    Ok(())
+}
+
+/// Options of [`run_publish_gts`].
+#[derive(Debug, Clone)]
+pub struct PublishGtsOptions {
+    /// Base URI of the remote registry, e.g. `https://registry:8443`.
+    pub registry_endpoint: String,
+    /// The overall deadline for every publication.
+    pub deadline: std::time::Duration,
+}
+
+/// Publish the GTS manifests of every linked gear to a remote registry and exit:
+/// a deployment step.
+///
+/// No gear runs: no `init`, database, bootstrap or plugin binding. Manifests
+/// come from the effective configuration (file, environment overrides,
+/// defaults), as at application startup. Requests carry the platform
+/// credential of `oop_http.internal_auth`. All publications run concurrently;
+/// see [`crate::gts_publication::deployment`].
+///
+/// # Errors
+/// No platform credential is configured, setup fails (manifest, ownership,
+/// wiring), or any publisher is refused or misses the deadline: the report is
+/// in the error, naming each publisher and its GTS ids.
+pub async fn run_publish_gts(config: AppConfig, options: PublishGtsOptions) -> Result<()> {
+    init_procedure(&config).map_err(|e| {
+        tracing::error!(error = %e, "Initialization failed");
+        e
+    })?;
+    // SIGTERM/SIGINT end the job, reported as cancelled. Dropping this future
+    // cancels too: the guard also ends the credential watcher.
+    let cancel = CancellationToken::new();
+    spawn_signal_handler(cancel.clone(), "publish-gts");
+    let _cancel_on_drop = cancel.clone().drop_guard();
+    let internal_auth = config
+        .oop_http
+        .as_ref()
+        .and_then(|http| http.internal_auth.as_ref())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "publish-gts needs a platform credential: configure oop_http.internal_auth"
+            )
+        })?;
+    let (_, provider) = super::oop::build_platform_credentials(internal_auth, &cancel).await?;
+    let provider = provider.ok_or_else(|| {
+        anyhow::anyhow!("oop_http.internal_auth gives no outbound platform credential")
+    })?;
+    let tuning = toolkit_contract::wiring::ClientTuning::default()
+        .with_internal_token_provider(Some(provider));
+    let descriptors = crate::gts_publication::linked_descriptors();
+    tracing::info!(
+        publishers = descriptors.len(),
+        registry = %options.registry_endpoint,
+        "publishing GTS manifests"
+    );
+    let report = crate::gts_publication::deployment::publish(
+        &descriptors,
+        &config,
+        &options.registry_endpoint,
+        &tuning,
+        options.deadline,
+        &cancel,
+    )
+    .await;
+    let report = report?;
+
+    #[cfg(feature = "otel")]
+    tracing_shutdown().await;
+
+    if !report.succeeded() {
+        anyhow::bail!("GTS publication failed:\n{report}");
+    }
+    tracing::info!("GTS publication complete:\n{report}");
     Ok(())
 }
 

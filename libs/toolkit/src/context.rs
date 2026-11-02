@@ -26,6 +26,8 @@ pub struct GearCtx {
     client_hub: Arc<crate::client_hub::ClientHub>,
     cancellation_token: CancellationToken,
     internal_token_provider: Option<InternalTokenProvider>,
+    /// This gear's admitted GTS manifest; see [`GearCtx::gts_publication_manifest`].
+    gts_publication_manifest: Option<Arc<crate::gts_publication::GtsManifest>>,
     #[cfg(feature = "db")]
     db: Option<DbProvider>,
 }
@@ -41,6 +43,9 @@ pub struct GearContextBuilder {
     client_hub: Arc<crate::client_hub::ClientHub>,
     root_token: CancellationToken,
     internal_token_provider: Option<InternalTokenProvider>,
+    /// Admitted manifests by gear, filled once the application group's
+    /// publication is admitted and before any application `init`.
+    gts_publication_manifests: GtsAdmittedManifests,
     #[cfg(feature = "db")]
     db_manager: Option<Arc<DbManager>>, // internal only, never exposed to gears
 }
@@ -58,6 +63,7 @@ impl GearContextBuilder {
             client_hub,
             root_token,
             internal_token_provider: None,
+            gts_publication_manifests: GtsAdmittedManifests::default(),
             #[cfg(feature = "db")]
             db_manager: None,
         }
@@ -68,6 +74,13 @@ impl GearContextBuilder {
     pub fn with_internal_token_provider(mut self, provider: Option<InternalTokenProvider>) -> Self {
         self.internal_token_provider = provider;
         self
+    }
+
+    /// The store the runtime fills with each gear's admitted manifest; every
+    /// context built afterwards reads its gear's manifest from it.
+    #[must_use]
+    pub(crate) fn gts_admitted_manifests(&self) -> GtsAdmittedManifests {
+        self.gts_publication_manifests.clone()
     }
 
     /// Attach a `DbManager` used by [`for_gear`](Self::for_gear) to resolve
@@ -111,6 +124,10 @@ impl GearContextBuilder {
             self.root_token.child_token(),
         )
         .with_internal_token_provider(self.internal_token_provider.clone());
+        let ctx = match self.gts_publication_manifests.get(gear_name) {
+            Some(manifest) => ctx.with_gts_publication_manifest(manifest),
+            None => ctx,
+        };
         #[cfg(feature = "db")]
         let ctx = if let Some(mgr) = &self.db_manager
             && let Some(handle) = mgr.get(gear_name).await?
@@ -120,6 +137,33 @@ impl GearContextBuilder {
             ctx
         };
         Ok(ctx)
+    }
+}
+
+/// Each gear's admitted GTS manifest, by gear name. Written once by the
+/// runtime when the application group's publication is admitted; the
+/// manifests are never rebuilt from the configuration afterwards.
+#[derive(Clone, Default)]
+pub(crate) struct GtsAdmittedManifests(
+    Arc<
+        parking_lot::RwLock<
+            std::collections::HashMap<String, Arc<crate::gts_publication::GtsManifest>>,
+        >,
+    >,
+);
+
+impl GtsAdmittedManifests {
+    /// Record `manifest` as admitted for its publisher gear.
+    pub(crate) fn insert(&self, manifest: Arc<crate::gts_publication::GtsManifest>) {
+        self.0
+            .write()
+            .insert(manifest.publisher_name().to_owned(), manifest);
+    }
+
+    /// The admitted manifest of `gear`, if any.
+    #[must_use]
+    fn get(&self, gear: &str) -> Option<Arc<crate::gts_publication::GtsManifest>> {
+        self.0.read().get(gear).cloned()
     }
 }
 
@@ -141,6 +185,7 @@ impl GearCtx {
             client_hub,
             cancellation_token,
             internal_token_provider: None,
+            gts_publication_manifest: None,
             #[cfg(feature = "db")]
             db: None,
         }
@@ -177,6 +222,34 @@ impl GearCtx {
     #[must_use]
     pub fn internal_token_provider(&self) -> Option<InternalTokenProvider> {
         self.internal_token_provider.clone()
+    }
+
+    /// Attach this gear's admitted GTS manifest.
+    pub fn with_gts_publication_manifest(
+        mut self,
+        manifest: Arc<crate::gts_publication::GtsManifest>,
+    ) -> Self {
+        self.gts_publication_manifest = Some(manifest);
+        self
+    }
+
+    /// This gear's GTS manifest, as the registry admitted it before this
+    /// gear's `init`: the documents of its `gts(...)` declaration. A plugin
+    /// binds its scoped clients to the instances it lists. It is the manifest
+    /// that was published, not rebuilt from the configuration.
+    ///
+    /// # Errors
+    /// The gear declares no `gts(...)`, or `init` runs outside the runtime.
+    pub fn gts_publication_manifest(
+        &self,
+    ) -> anyhow::Result<Arc<crate::gts_publication::GtsManifest>> {
+        self.gts_publication_manifest.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "gear '{}' has no admitted GTS manifest: it declares no `gts(...)`, or the \
+                 runtime did not publish it",
+                self.gear_name
+            )
+        })
     }
 
     /// Attach the per-gear database entrypoint.
@@ -390,6 +463,7 @@ impl GearCtx {
             client_hub: self.client_hub.clone(),
             cancellation_token: self.cancellation_token.clone(),
             internal_token_provider: self.internal_token_provider.clone(),
+            gts_publication_manifest: self.gts_publication_manifest.clone(),
             #[cfg(feature = "db")]
             db: None,
         }

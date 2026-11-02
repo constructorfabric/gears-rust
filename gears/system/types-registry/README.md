@@ -9,3 +9,5 @@ GTS schema storage service.
 ## Documentation
 
 - [PRD.md](docs/PRD.md)
+- [GTS publication design — stateless and database-backed gears](docs/DESIGN.md#inventory-and-startup-reconciliation)
+- [GTS publication sequence diagrams](docs/diagrams/gts-publication-sequences.html)

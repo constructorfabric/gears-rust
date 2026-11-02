@@ -101,12 +101,16 @@ Other quick start examples:
 # Option 1: Run with SQLite database (recommended for development)
 cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run
 
-# Option 2: Run without database (no-db mode)
-cargo run --bin cf-gears-example-server -- --config config/no-db.yaml run
-
-# Option 3: Run with mock in-memory database for testing
-cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml --mock run
+# Option 2: Parse/load a configuration without a database and exit
+# (does not initialize gears or validate startup prerequisites)
+cargo run --bin cf-gears-example-server -- --config config/no-db.yaml check
 ```
+
+`run` needs a database with the default features: they link the full types registry, and
+gears that publish GTS documents to it (the AuthN/AuthZ/tenant resolvers, among others). An
+embedded registry without its database cannot admit them, so `config/no-db.yaml run` stops at
+startup with a configuration error instead of waiting forever. A composition without GTS
+publishers still runs without a database.
 
 ### Example Configuration (config/quickstart.yaml)
 

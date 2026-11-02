@@ -14,6 +14,7 @@ mod api_dto;
 mod domain_model;
 mod expand_vars;
 mod grpc_client;
+mod gts_publication;
 mod temporary;
 /// Implementation of the `temporary` attribute macro.
 mod utils;
@@ -26,6 +27,8 @@ struct GearConfig {
     ctor: Option<Expr>,           // arbitrary constructor expression
     client: Option<Path>,         // trait path for client DX helpers
     lifecycle: Option<LcGearCfg>, // optional lifecycle config (on type)
+    gts: Option<gts_publication::GtsCfg>,
+    infrastructure: bool, // `stage = infrastructure`
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -210,6 +213,8 @@ impl Parse for GearConfig {
         let mut ctor: Option<Expr> = None;
         let mut client: Option<Path> = None;
         let mut lifecycle: Option<LcGearCfg> = None;
+        let mut gts: Option<gts_publication::GtsCfg> = None;
+        let mut stage: Option<bool> = None;
 
         let mut seen_name = false;
         let mut seen_deps = false;
@@ -428,6 +433,39 @@ impl Parse for GearConfig {
                     seen_lifecycle = true;
                     lifecycle = Some(parse_lifecycle_list(&list)?);
                 }
+                // `stage = infrastructure | application`: when the gear runs during
+                // startup (`toolkit::registry::StartupStage`).
+                Meta::NameValue(nv) if nv.path.is_ident("stage") => {
+                    if stage.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            nv.path,
+                            "duplicate `stage` parameter",
+                        ));
+                    }
+                    let ident = match &nv.value {
+                        Expr::Path(p) => p.path.get_ident().map(ToString::to_string),
+                        _ => None,
+                    };
+                    stage = Some(match ident.as_deref() {
+                        Some("infrastructure") => true,
+                        Some("application") => false,
+                        _ => {
+                            return Err(syn::Error::new_spanned(
+                                nv.value,
+                                "stage must be `infrastructure` or `application`",
+                            ));
+                        }
+                    });
+                }
+                Meta::List(list) if list.path.is_ident("gts") => {
+                    if gts.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            list.path,
+                            "duplicate `gts(...)` parameter",
+                        ));
+                    }
+                    gts = Some(gts_publication::parse(&list)?);
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
@@ -451,6 +489,8 @@ impl Parse for GearConfig {
             ctor,
             client,
             lifecycle,
+            gts,
+            infrastructure: stage.unwrap_or(false),
         })
     }
 }
@@ -572,6 +612,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctor_expr_opt: Option<Expr> = config.ctor.clone();
     let client_trait_opt: Option<Path> = config.client.clone();
     let lifecycle_cfg_opt: Option<LcGearCfg> = config.lifecycle;
+    let gts_cfg = config.gts;
 
     // Prepare string literals for name/deps
     let name_lit = LitStr::new(&name_owned, Span::call_site());
@@ -673,6 +714,35 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         cap_asserts.push(q);
     }
+
+    let gts_items = match &gts_cfg {
+        Some(_) if !input.generics.params.is_empty() => {
+            return syn::Error::new_spanned(
+                &input.generics,
+                "`gts(...)` is not supported on a generic gear struct",
+            )
+            .to_compile_error()
+            .into();
+        }
+        Some(cfg) => gts_publication::expand(cfg, &struct_ident, &name_lit),
+        None => proc_macro2::TokenStream::new(),
+    };
+    let gts_registration = if gts_cfg.is_some() {
+        quote! {
+            b.register_gts_publication_with_meta(#name_lit,
+                gear.clone() as ::std::sync::Arc<dyn ::toolkit::gts_publication::GtsPublicationCapability>);
+        }
+    } else {
+        proc_macro2::TokenStream::new()
+    };
+
+    let stage_registration = if config.infrastructure {
+        quote! {
+            b.register_startup_stage(#name_lit, ::toolkit::registry::StartupStage::Infrastructure);
+        }
+    } else {
+        proc_macro2::TokenStream::new()
+    };
 
     // Registrator name (avoid lowercasing to reduce collisions)
     let struct_name_snake = struct_ident.to_string().to_snake_case();
@@ -888,6 +958,8 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // capabilities
             #(#capability_registrations)*
+            #gts_registration
+            #stage_registration
         }
 
         ::toolkit::inventory::submit! {
@@ -898,6 +970,9 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Top-level extras for lifecycle-enabled types (impl Runnable, ready shim, into_gear)
         #extra_top_level
+
+        // GTS publication capability (`gts(...)`)
+        #gts_items
     };
 
     TokenStream::from(expanded)

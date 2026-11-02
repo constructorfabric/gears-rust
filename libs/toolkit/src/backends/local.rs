@@ -189,34 +189,98 @@ type InstanceMap = HashMap<Uuid, LocalInstance>;
 pub struct LocalProcessBackend {
     instances: Arc<RwLock<InstanceMap>>,
     cancel: CancellationToken,
+    /// The one shutdown of this backend, run by a task of its own: the
+    /// cancellation watcher, a drop and every [`stop_all`](Self::stop_all)
+    /// await the same run, and abandoning a wait never abandons the run.
+    shutdown: Arc<Shutdown>,
+    /// Cancelled on drop: the watcher then stops the children, although the
+    /// caller's token, which the backend only borrows, stays live.
+    dropped: CancellationToken,
+}
+
+/// See [`LocalProcessBackend::shutdown`].
+struct Shutdown {
+    instances: Arc<RwLock<InstanceMap>>,
+    /// Set, under the instances lock, when the run takes the instances: a
+    /// spawn racing it is refused rather than left running.
+    stopping: std::sync::atomic::AtomicBool,
+    started: std::sync::atomic::AtomicBool,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Shutdown {
+    /// Start the run once, on a task of its own, and wait until it ended.
+    async fn run(self: &Arc<Self>) {
+        let mut done = self.done.subscribe();
+        if !self.started.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let shutdown = Arc::clone(self);
+            tokio::spawn(async move {
+                LocalProcessBackend::shutdown_all_instances(&shutdown).await;
+                shutdown.done.send_replace(true);
+            });
+        }
+        drop(done.wait_for(|done| *done).await);
+    }
+}
+
+impl Drop for LocalProcessBackend {
+    fn drop(&mut self) {
+        self.dropped.cancel();
+    }
 }
 
 impl LocalProcessBackend {
     /// Create a new `LocalProcessBackend` with the given cancellation token.
     ///
-    /// When the token is cancelled, all spawned processes will be gracefully stopped.
+    /// When the token is cancelled, or the backend is dropped, all spawned
+    /// processes will be gracefully stopped.
     #[must_use]
     pub fn new(cancel: CancellationToken) -> Self {
+        let instances = Arc::new(RwLock::new(HashMap::new()));
         let backend = Self {
-            instances: Arc::new(RwLock::new(HashMap::new())),
+            instances: Arc::clone(&instances),
             cancel: cancel.clone(),
+            shutdown: Arc::new(Shutdown {
+                instances,
+                stopping: std::sync::atomic::AtomicBool::new(false),
+                started: std::sync::atomic::AtomicBool::new(false),
+                done: tokio::sync::watch::Sender::new(false),
+            }),
+            dropped: CancellationToken::new(),
         };
 
         // Spawn background task to handle shutdown
-        let instances = Arc::clone(&backend.instances);
+        let shutdown = Arc::clone(&backend.shutdown);
+        let dropped = backend.dropped.clone();
         tokio::spawn(async move {
-            cancel.cancelled().await;
-            tracing::info!("LocalProcessBackend: shutdown signal received, stopping all processes");
-            Self::shutdown_all_instances(instances).await;
+            tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!("LocalProcessBackend: shutdown signal received, stopping all processes");
+                }
+                () = dropped.cancelled() => {
+                    tracing::info!("LocalProcessBackend: dropped, stopping all processes");
+                }
+            }
+            shutdown.run().await;
         });
 
         backend
     }
 
+    /// Gracefully stop every tracked instance, with the shutdown grace
+    /// period, and wait until each ended — also when the cancellation
+    /// watcher began that shutdown first. Later spawns are refused.
+    pub async fn stop_all(&self) {
+        self.shutdown.run().await;
+    }
+
     /// Gracefully stop all tracked instances with timeout.
-    async fn shutdown_all_instances(instances: Arc<RwLock<InstanceMap>>) {
+    async fn shutdown_all_instances(shutdown: &Shutdown) {
         let mut all_instances: Vec<LocalInstance> = {
-            let mut guard = instances.write();
+            let mut guard = shutdown.instances.write();
+            shutdown
+                .stopping
+                .store(true, std::sync::atomic::Ordering::Release);
             guard.drain().map(|(_, inst)| inst).collect()
         };
 
@@ -284,6 +348,9 @@ impl GearRuntimeBackend for LocalProcessBackend {
         cmd.args(&cfg.args);
         cmd.envs(&cfg.env);
 
+        // A child whose handle is dropped unstopped is killed, never orphaned.
+        cmd.kill_on_drop(true);
+
         // Pipe stdout/stderr for log forwarding
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -348,9 +415,24 @@ impl GearRuntimeBackend for LocalProcessBackend {
             created_at: std::time::Instant::now(),
         };
 
-        // Store in instances map
+        // Store in instances map, unless the backend is shutting down.
         {
             let mut instances = self.instances.write();
+            if self
+                .shutdown
+                .stopping
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                drop(instances);
+                if let Err(e) = child.start_kill() {
+                    tracing::warn!(gear = %cfg.name, error = %e, "failed to kill a process spawned during shutdown");
+                }
+                drop(child.wait().await);
+                bail!(
+                    "LocalProcessBackend is shutting down; {} was not started",
+                    cfg.name
+                );
+            }
             instances.insert(
                 instance_id,
                 LocalInstance {
@@ -649,5 +731,112 @@ mod tests {
             assert!(result.is_ok(), "Normal PID should convert to i32");
             assert_eq!(result.unwrap(), 12345);
         }
+    }
+
+    /// A process ignoring SIGTERM, for the grace-period paths.
+    #[cfg(unix)]
+    fn stubborn() -> OopGearConfig {
+        let mut cfg = OopGearConfig::new("stubborn", BackendKind::LocalProcess);
+        cfg.binary = Some(PathBuf::from("/bin/sh"));
+        // `exec`: the tracked process is the one ignoring SIGTERM, with no
+        // untracked grandchild left behind by a kill.
+        cfg.args = vec!["-c".to_owned(), "trap '' TERM; exec sleep 60".to_owned()];
+        cfg
+    }
+
+    #[cfg(unix)]
+    fn alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    /// `stop_all` racing the cancellation watcher returns only once the child
+    /// ended, though the watcher took the instances first.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_all_waits_for_a_shutdown_the_watcher_began() {
+        let cancel = CancellationToken::new();
+        let backend = LocalProcessBackend::new(cancel.clone());
+        let handle = backend.spawn_instance(&stubborn()).await.expect("spawn");
+        let pid = handle.pid.expect("a pid");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        cancel.cancel();
+        while backend.instances.read().contains_key(&handle.instance_id) {
+            tokio::task::yield_now().await;
+        }
+        backend.stop_all().await;
+
+        assert!(!alive(pid), "the child ended before stop_all returned");
+        assert!(
+            backend.spawn_instance(&stubborn()).await.is_err(),
+            "no spawn after shutdown"
+        );
+    }
+
+    /// Dropping the backend stops its children though the caller's token,
+    /// which it only borrows, stays live.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_backend_stops_its_children() {
+        let cancel = CancellationToken::new();
+        let backend = LocalProcessBackend::new(cancel.clone());
+        let mut cfg = OopGearConfig::new("sleeper", BackendKind::LocalProcess);
+        cfg.binary = Some(PathBuf::from("/bin/sleep"));
+        cfg.args = vec!["60".to_owned()];
+        let pid = backend
+            .spawn_instance(&cfg)
+            .await
+            .expect("spawn")
+            .pid
+            .expect("a pid");
+
+        drop(backend);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child outlived the backend"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!cancel.is_cancelled());
+    }
+
+    /// A `stop_all` abandoned mid-run — its future dropped while the stubborn
+    /// child sits in its grace period — and then the backend dropped: the run
+    /// belongs to its own task, so the child still ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_abandoned_stop_all_still_stops_the_child() {
+        let cancel = CancellationToken::new();
+        let backend = LocalProcessBackend::new(cancel.clone());
+        let handle = backend.spawn_instance(&stubborn()).await.expect("spawn");
+        let pid = handle.pid.expect("a pid");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let stopping = tokio::time::timeout(Duration::from_millis(200), backend.stop_all()).await;
+        assert!(
+            stopping.is_err(),
+            "abandoned while the child ignores SIGTERM"
+        );
+        assert!(
+            backend.instances.read().is_empty(),
+            "the run took the instances"
+        );
+        drop(backend);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        while alive(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the child outlived the abandoned stop"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(!cancel.is_cancelled());
     }
 }

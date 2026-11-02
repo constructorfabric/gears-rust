@@ -4661,6 +4661,7 @@ dependencies = [
  "opentelemetry_sdk",
  "parking_lot",
  "rustls",
+ "schemars 1.2.3",
  "sea-orm-migration",
  "secrecy",
  "serde",
@@ -4950,6 +4951,7 @@ name = "cf-gears-toolkit-gts"
 version = "0.1.7"
 dependencies = [
  "anyhow",
+ "cf-gears-toolkit-gts-declarations-fixture",
  "cf-gears-toolkit-gts-macros",
  "gts",
  "gts-macros",
@@ -4960,15 +4962,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "cf-gears-toolkit-gts-declarations-fixture"
+version = "0.1.0"
+dependencies = [
+ "cf-gears-toolkit-gts",
+ "gts",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "cf-gears-toolkit-gts-macros"
 version = "0.1.6"
 dependencies = [
+ "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-gts-declarations-fixture",
  "gts",
  "gts-id",
  "proc-macro-crate",
  "proc-macro2",
  "quote",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
  "syn 3.0.9",
+ "trybuild",
 ]
 
 [[package]]
@@ -5090,8 +5109,13 @@ dependencies = [
  "async-trait",
  "cf-gears-toolkit",
  "cf-gears-toolkit-macros",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
  "tokio-util",
  "trybuild",
+ "uuid",
 ]
 
 [[package]]

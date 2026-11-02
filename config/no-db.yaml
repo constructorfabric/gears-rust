@@ -1,5 +1,12 @@
 # CF/Gears Example Server Configuration
 # Updated to use the new configuration structure
+#
+# No database. With the default features this profile is for `check` only, which
+# parses/loads the configuration and exits (it does not initialize gears or
+# validate startup prerequisites): the embedded types registry needs its database
+# to admit the GTS documents its co-hosted resolvers publish, so `run` stops at
+# startup with a configuration error. Use config/quickstart.yaml (SQLite), or a
+# remote managed registry for the Registry APIs.
 
 # Core server configuration (global section)
 server:

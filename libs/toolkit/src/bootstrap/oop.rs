@@ -183,9 +183,36 @@ fn build_oop_config_and_db(
     rendered_config: Option<&RenderedGearConfig>,
 ) -> Result<(AppConfig, LoggingConfig, DbOptions)> {
     let home_dir = PathBuf::from(&local_config.server.home_dir);
+    let final_config = effective_oop_config(local_config, gear_name, rendered_config);
 
-    // Build final_config for gear's "config" section
-    let final_config = if let Some(rendered) = rendered_config {
+    // Merge logging: master logging (base) + local logging (override by key)
+    let final_logging = merge_logging_configs(
+        rendered_config.as_ref().and_then(|r| r.logging.as_ref()),
+        &local_config.logging,
+    );
+
+    // Build DbOptions using Figment merge + DbManager
+    // This allows field-by-field merge: master db config (base) -> local db config (override)
+    let db_options = build_merged_db_options(
+        &home_dir,
+        gear_name,
+        rendered_config.as_ref().and_then(|r| r.database.as_ref()),
+        local_config,
+    )?;
+
+    Ok((final_config, final_logging, db_options))
+}
+
+/// The effective gear configuration of an `OoP` unit: the master's rendered
+/// `config` as base, the local file's section as override. Pure: no database,
+/// logging or directory. The runtime and the deployment publication job both
+/// use it, so they build the same GTS manifests.
+fn effective_oop_config(
+    local_config: &AppConfig,
+    gear_name: &str,
+    rendered_config: Option<&RenderedGearConfig>,
+) -> AppConfig {
+    if let Some(rendered) = rendered_config {
         // TOOLKIT_MODULE_CONFIG exists: use rendered config as BASE, local config as OVERRIDE
         let mut config = local_config.clone();
 
@@ -220,24 +247,50 @@ fn build_oop_config_and_db(
             "No rendered config from master, using local config entirely (standalone mode)"
         );
         local_config.clone()
-    };
+    }
+}
 
-    // Merge logging: master logging (base) + local logging (override by key)
-    let final_logging = merge_logging_configs(
-        rendered_config.as_ref().and_then(|r| r.logging.as_ref()),
-        &local_config.logging,
-    );
+/// The effective configuration of the `OoP` unit `opts` describes, as its
+/// runtime sees it — the local file with CLI overrides, merged with the
+/// master's rendered configuration from `TOOLKIT_MODULE_CONFIG` — without
+/// starting anything. For the deployment publication job
+/// ([`run_publish_gts`](super::run_publish_gts)).
+///
+/// # Errors
+/// The configuration file does not load, or a rendered configuration is
+/// present but invalid.
+pub fn oop_publication_config(opts: &OopRunOptions) -> Result<AppConfig> {
+    oop_publication_config_from(opts, rendered_config_from_env()?.as_ref())
+}
 
-    // Build DbOptions using Figment merge + DbManager
-    // This allows field-by-field merge: master db config (base) -> local db config (override)
-    let db_options = build_merged_db_options(
-        &home_dir,
-        gear_name,
-        rendered_config.as_ref().and_then(|r| r.database.as_ref()),
-        local_config,
-    )?;
+/// The master's rendered configuration from `TOOLKIT_MODULE_CONFIG`: `None`
+/// when the variable is absent. The `OoP` runtime and the deployment job share
+/// it, so both fail on the same invalid value.
+///
+/// # Errors
+/// The variable is present but not a valid rendered configuration.
+fn rendered_config_from_env() -> Result<Option<RenderedGearConfig>> {
+    parse_rendered_config(std::env::var(TOOLKIT_MODULE_CONFIG_ENV).ok().as_deref())
+}
 
-    Ok((final_config, final_logging, db_options))
+fn parse_rendered_config(value: Option<&str>) -> Result<Option<RenderedGearConfig>> {
+    value
+        .map(RenderedGearConfig::from_json)
+        .transpose()
+        .with_context(|| format!("{TOOLKIT_MODULE_CONFIG_ENV} is set but invalid"))
+}
+
+fn oop_publication_config_from(
+    opts: &OopRunOptions,
+    rendered: Option<&RenderedGearConfig>,
+) -> Result<AppConfig> {
+    let mut config = AppConfig::load_or_default(opts.config_path.as_ref())?;
+    config.apply_cli_overrides(opts.verbose);
+    Ok(effective_oop_config(
+        &config,
+        opts.config_gear_name(),
+        rendered,
+    ))
 }
 
 /// Merges logging configurations: master as base, local as override (by key).
@@ -268,9 +321,8 @@ fn build_merged_db_options(
     let has_local_db = local_config.database.is_some()
         || local_config
             .gears
-            .get(gear_name)
-            .and_then(|m| m.get("database"))
-            .is_some();
+            .values()
+            .any(|m| m.get("database").is_some());
 
     if !has_rendered_db && !has_local_db {
         debug!(
@@ -322,17 +374,19 @@ fn build_merged_db_options(
         }
     }
 
-    // Local gear database config
-    if let Some(local_gear) = local_config.gears.get(gear_name)
-        && let Some(local_gear_db) = local_gear.get("database")
-    {
+    // Local gear database config: the unit's own gear, and every gear it co-hosts
+    // that names a database in the local config (the master renders only its own).
+    for (local_gear_name, local_gear) in &local_config.gears {
+        let Some(local_gear_db) = local_gear.get("database") else {
+            continue;
+        };
         let gears = merged_config
             .entry("gears".to_owned())
             .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
 
         if let Some(gears_obj) = gears.as_object_mut() {
             let gear_entry = gears_obj
-                .entry(gear_name.to_owned())
+                .entry(local_gear_name.clone())
                 .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
 
             if let Some(gear_obj) = gear_entry.as_object_mut() {
@@ -491,12 +545,10 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     let mut config = AppConfig::load_or_default(opts.config_path.as_ref())?;
     config.apply_cli_overrides(args.verbose);
 
-    // Try to read rendered gear config from master host via env var BEFORE logging init
-    // so we can use the tracing config from master for OTEL
-    let rendered_config = match std::env::var(TOOLKIT_MODULE_CONFIG_ENV) {
-        Ok(json) => RenderedGearConfig::from_json(&json).ok(),
-        Err(_) => None,
-    };
+    // Read rendered gear config from master host via env var BEFORE logging init
+    // so we can use the tracing config from master for OTEL. Present but invalid
+    // fails startup, as it fails the deployment publication job.
+    let rendered_config = rendered_config_from_env()?;
 
     // Build final config by merging:
     // 1. Rendered config from master host (base)
@@ -571,11 +623,6 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
             has_logging = rc.logging.is_some(),
             has_opentelemetry = rc.opentelemetry.is_some(),
             "Received rendered config from master host"
-        );
-    } else if std::env::var(TOOLKIT_MODULE_CONFIG_ENV).is_ok() {
-        warn!(
-            env_var = TOOLKIT_MODULE_CONFIG_ENV,
-            "Failed to parse rendered config from master host, using local config only"
         );
     } else {
         debug!(
@@ -895,7 +942,7 @@ async fn build_directory_client(
 ///
 /// The `match` is exhaustive so a future variant fails to compile here rather
 /// than silently downgrading to no outbound credential.
-async fn build_platform_credentials(
+pub(super) async fn build_platform_credentials(
     cfg: &toolkit_security::InternalAuthConfig,
     cancel: &CancellationToken,
 ) -> Result<(

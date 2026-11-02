@@ -69,6 +69,18 @@ The GTS identifier types the models use (`GtsId`, `GtsTypeId`, `GtsInstanceId`,
 `GtsIdPattern`, `GtsIdSegment`) are re-exported, so building a request needs no direct
 `gts` dependency.
 
+**Intermediate AM topology (implemented for the current execution slice).** An embedded
+registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for RG:
+it registers neither new API locally, routes neither, runs no seeding or admission over a
+bound database and is not advertised in the service directory, so AM and its selected
+publishers reach a remote registry through the wiring that `gts(...)` generates. The runtime
+publishes all application GTS Type Schemas and Instances before any application `init`; readiness waits for
+that barrier. `am-host publish-gts --registry <url>` publishes the same
+GTS Type Schemas and Instances as a deployment step. RG's sealed local
+`ResourceGroupTypeBootstrap` is unchanged. The composition is
+`apps/cf-gears-am-host` with flight-control as the remote registry (`config/am-remote-*.yaml`,
+`make e2e-am-remote`); see the [current execution slice](../docs/p0/todo.md).
+
 ## Publishing from a gear
 
 A gear publishes the documents it owns from its own `init()` through the in-process
@@ -78,9 +90,11 @@ crate to keep its registration linked, and orders the two `init()` calls.
 
 Ordinary gears can omit the registry dependency: its system-gear init runs first.
 The host must then link a database-backed registry or consumer init fails.
-Existing AM, `AuthN` and AuthZ/TR consumers still use the legacy registry in this
-foundation. Their [consumer-migration follow-up](https://github.com/aviator5/gears-rust/pull/1)
-adopts this local-only path; T41/T42 later move publication after wiring.
+This consumer-migration branch moves
+AM and AuthZ/TR publishers onto this local-only path. AM request-path reads use
+`TypesRegistryApi` with the caller’s context; `AuthN` plugins consume the platform
+contract and publish in `post_init`. T41/T42 retain full remote publication and
+readiness work; the remaining legacy consumers move in T38.
 
 ```rust,no_run
 # // This doctest cannot depend on the registry gear; stand the SDK in for it.
@@ -163,6 +177,37 @@ with the stop reason and machine-readable cause. `canonical_error()` and the err
 chain stays intact. Cancellation still names the requested identifiers even without a report.
 For custom budgets, batching or security contexts, call `reconcile_entities_and_await` directly.
 
+**Supervised publication.** `publish_until_admitted` repeats `publish_startup_entities` until
+every identifier is admitted, pausing per `PublicationRetry` (1 s doubling to 30 s by default)
+after a transient failure, reported to its `on_retry` callback. `PublicationError::is_transient`
+decides per identifier from the decoded report — the outer `FailedPrecondition` says nothing:
+pending on a dependency, a concurrent write or availability is transient; a rejection, a
+call-level refusal (authentication, permission, invalid request), invalid input and
+cancellation are not. An identifier admitted by one attempt stays admitted: later attempts
+submit only the rest, and every error covers the whole desired set, in `report()` and in the
+canonical error alike. Caller cancellation, whenever it comes, is a `Cancelled` error.
+
+A gear does not call it directly. `#[toolkit::gear(..., gts(...))]` uses the
+[`gts_publisher`](src/gts_publisher.rs) adapter, which calls `publish_until_admitted` from the
+runtime's application preparation, before any application `init`:
+
+```rust,ignore
+#[toolkit::gear(
+    name = "my-gear",
+    gts(
+        crates = [crate, my_gear_sdk],      // crates with `declare_gts_inventory!()`
+        entities = Self::configured,        // optional: config-only documents
+    ),
+)]
+pub struct MyGear { /* ... */ }
+```
+
+`init` uses `GearCtx::gts_publication_manifest()` to bind plugin clients from declared instances
+after admission. The returned `GtsManifest` holds publisher name/version and authored
+GTS Type Schemas and Instances; it is a ToolKit data structure, not a GTS entity.
+The gear crate depends on this SDK, as `types_registry_sdk`, with the `rest-client` feature.
+See [GTS publication by gears](../docs/DESIGN.md#inventory-and-startup-reconciliation).
+
 The examples use vendor `cf`, the only one a registry admits without configuration. Another
 vendor needs a `registration_policy` entry for its region in the registry's configuration:
 
@@ -181,8 +226,11 @@ gears:
 in `ClientHub`. Missing database or failed seeding leaves neither registered;
 `ClientHub::get` fails without legacy fallback.
 
-- `deps` orders `init()`; remote clients are wired afterwards. T41/T42 move
-  publication from local init to a post-wiring hook.
+- `deps` orders `init()`; remote clients are wired afterwards. AM, the `AuthN`, `AuthZ` and
+  tenant resolvers, and the static `AuthN`, `AuthZ`, TR and `IdP` plugins and the OIDC `AuthN`
+  plugin publish with `gts(...)`; the remaining publishers move in T41/T42.
+- The synchronous `publish_startup_entities` helper above runs in its caller's task; it
+  does not perform the lifecycle migration by itself.
 - `PublisherContext` is required but only forwarded/enforced in T44/T45;
   mixed-version publishers have no earlier guarantee.
 - Local clients trust both context types without validation or tenant scope (C2/C6).

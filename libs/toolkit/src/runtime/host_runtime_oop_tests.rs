@@ -71,6 +71,7 @@ struct RecordingDirectory {
     register_calls: AtomicUsize,
     deregister_calls: AtomicUsize,
     registered_endpoint: Mutex<Option<String>>,
+    registered_gears: Mutex<Vec<String>>,
 }
 
 #[async_trait]
@@ -94,6 +95,7 @@ impl DirectoryClient for RecordingDirectory {
         if let Some(ep) = &info.rest_endpoint {
             *self.registered_endpoint.lock() = Some(ep.uri.clone());
         }
+        self.registered_gears.lock().push(info.gear);
         self.register_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
@@ -610,4 +612,774 @@ async fn a_worker_with_a_hub_tenant_authenticator_starts_and_checks_bearers() {
         .expect("finishes after cancel")
         .expect("does not panic");
     assert!(result.is_ok(), "{result:?}");
+}
+
+/// Holds a publication until notified: the registry is absent until then.
+/// `dropped` is set when a held publication future is dropped unfinished.
+#[derive(Default)]
+struct HeldRegistry {
+    release: tokio::sync::Notify,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Sets its flag when dropped.
+struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for DropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+fn held_backend(hub: &ClientHub) -> anyhow::Result<crate::gts_publication::GtsPublicationBackend> {
+    let held = hub.get::<HeldRegistry>()?;
+    Ok(crate::gts_publication::GtsPublicationBackend::new(
+        move |_| {
+            let held = Arc::clone(&held);
+            async move {
+                let flag = DropFlag(Arc::clone(&held.dropped));
+                held.release.notified().await;
+                std::mem::forget(flag);
+                Ok(())
+            }
+        },
+    ))
+}
+
+fn publishing_ping_documents() -> Vec<crate::gts_publication::DeclarationSource> {
+    vec![crate::gts_publication::DeclarationSource::new(
+        "test",
+        vec![("gts.cf.test.ping.v1~".to_owned(), "{}".to_owned())],
+    )]
+}
+
+static PUBLISHING_PING: crate::gts_publication::GtsPublicationDescriptor =
+    crate::gts_publication::GtsPublicationDescriptor {
+        gear: "publishing-ping",
+        publisher_version: "1.0.0",
+        declarations: publishing_ping_documents,
+        entities: None,
+        backend: held_backend,
+        provider: "held-registry",
+        wire: no_wire,
+    };
+
+/// An `OoP` root gear that publishes: its route counts handler calls.
+#[derive(Default)]
+struct PublishingPing {
+    handled: AtomicUsize,
+}
+
+#[async_trait]
+impl Gear for PublishingPing {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl crate::gts_publication::GtsPublicationCapability for PublishingPing {
+    fn descriptor(&self) -> &'static crate::gts_publication::GtsPublicationDescriptor {
+        &PUBLISHING_PING
+    }
+}
+
+impl RestApiCapability for PublishingPing {
+    fn register_rest(
+        &self,
+        ctx: &GearCtx,
+        router: Router,
+        _openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        let gear = ctx
+            .client_hub()
+            .get::<PublishingPing>()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(router.route(
+            "/published",
+            get(move || async move {
+                gear.handled.fetch_add(1, Ordering::SeqCst);
+                "pong"
+            }),
+        ))
+    }
+}
+
+/// Before admission an `OoP` publishing root is live (`/healthz`), not ready,
+/// not initialized, its handler is not reached, and the directory has no
+/// presence for it. After admission it serves and registers.
+#[tokio::test]
+async fn an_oop_publishing_gear_is_neither_served_nor_advertised_before_admission() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let gear = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("publishing-ping", &[], gear.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        gear.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        gear.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&gear));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "publishing-ping".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: None,
+        auth_disabled: true,
+        labels: std::collections::BTreeMap::new(),
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+
+    assert!(poll_status(addr, "/healthz", 200, Duration::from_secs(5)).await);
+    // Routes not attached yet: 503 from the toolkit, not the handler.
+    assert!(poll_status(addr, "/published", 503, Duration::from_secs(5)).await);
+    assert_eq!(http_get(addr, "/readyz").await.map(|r| r.0), Some(503));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(gear.handled.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        directory.register_calls.load(Ordering::SeqCst),
+        0,
+        "no presence yet"
+    );
+
+    held.release.notify_one();
+    assert!(poll_status(addr, "/published", 200, Duration::from_secs(5)).await);
+    assert!(gear.handled.load(Ordering::SeqCst) >= 1);
+    assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while directory.register_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "presence after admission"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+}
+
+/// An infrastructure root serves its platform-plane and anonymous routes and
+/// is present in the directory while its co-hosted application group waits
+/// for admission: other processes must still discover it (a registry, say)
+/// to publish what the group waits for. The group's routes are not served
+/// before; afterwards they are, on the same listener.
+#[tokio::test]
+async fn an_infrastructure_root_serves_and_is_present_while_the_application_group_waits() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let root = Arc::new(AxisGear);
+    let side = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("axis-gear", &[], root.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("axis-gear", root as Arc<dyn RestApiCapability>);
+    builder.register_startup_stage("axis-gear", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&side));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "axis-gear".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(&directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: Some(toolkit_security::DynInternalAuthenticator::new(
+            AxisInternal,
+        )),
+        auth_disabled: true,
+        labels: std::collections::BTreeMap::new(),
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+
+    assert!(poll_status(addr, "/anon", 200, Duration::from_secs(5)).await);
+    assert_eq!(
+        http_status(addr, "/platform", &[("X-ToolKit-Internal-Token", AXIS_SA)]).await,
+        Some(200),
+        "the platform plane is served before the application group"
+    );
+    assert_eq!(
+        http_status(addr, "/platform", &[]).await,
+        Some(401),
+        "and still refuses a caller without a credential"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while directory.register_calls.load(Ordering::SeqCst) == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "root presence while the application group waits"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(http_get(addr, "/published").await.map(|r| r.0), Some(503));
+    assert_eq!(side.handled.load(Ordering::SeqCst), 0);
+    // The process-wide readiness still reports the pending group.
+    assert_eq!(http_get(addr, "/readyz").await.map(|r| r.0), Some(503));
+
+    held.release.notify_one();
+    assert!(poll_status(addr, "/published", 200, Duration::from_secs(5)).await);
+    assert_eq!(
+        http_status(addr, "/platform", &[("X-ToolKit-Internal-Token", AXIS_SA)]).await,
+        Some(200),
+        "the same listener keeps the platform routes"
+    );
+    assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+}
+
+/// Dropping the `OoP` lifecycle future while the root's publication is pending
+/// ends the publication and closes the listener: nothing outlives the runtime,
+/// without any cancellation from outside.
+#[tokio::test]
+async fn dropping_the_oop_runtime_ends_a_pending_publication_and_the_listener() {
+    let addr = free_addr();
+    let gear = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("publishing-ping", &[], gear.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        gear.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        gear.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&gear));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        CancellationToken::new(),
+        Uuid::new_v4(),
+        None,
+    );
+    let options = OopServeOptions {
+        gear_name: "publishing-ping".to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::new(RecordingDirectory::default()) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: None,
+        internal_authenticator: None,
+        auth_disabled: true,
+        labels: std::collections::BTreeMap::new(),
+    };
+    let server = tokio::spawn(host.run_oop_serving(options));
+    assert!(poll_status(addr, "/healthz", 200, Duration::from_secs(5)).await);
+    assert!(poll_status(addr, "/published", 503, Duration::from_secs(5)).await);
+    assert!(
+        !held.dropped.load(Ordering::SeqCst),
+        "the publication is pending"
+    );
+
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let closed = tokio::net::TcpStream::connect(addr).await.is_err();
+        if held.dropped.load(Ordering::SeqCst) && closed {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "publication dropped: {}, listener closed: {closed}",
+            held.dropped.load(Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn oop_options(
+    gear: &str,
+    addr: SocketAddr,
+    directory: &Arc<RecordingDirectory>,
+    bearer: Option<toolkit_security::DynBearerAuthenticator>,
+) -> OopServeOptions {
+    OopServeOptions {
+        gear_name: gear.to_owned(),
+        instance_id: "i-1".to_owned(),
+        version: None,
+        advertise_uri: format!("http://{addr}"),
+        listen_addr: addr,
+        probe_bind_addr: None,
+        drain_timeout: Duration::from_secs(5),
+        heartbeat_interval: Duration::from_secs(30),
+        healthcheck_timeout: Duration::from_millis(500),
+        directory: Arc::clone(directory) as Arc<dyn DirectoryClient>,
+        bearer_authenticator: bearer,
+        internal_authenticator: Some(toolkit_security::DynInternalAuthenticator::new(
+            AxisInternal,
+        )),
+        auth_disabled: true,
+        labels: std::collections::BTreeMap::new(),
+    }
+}
+
+/// An infrastructure gear serving REST that stays out of the directory, as a
+/// `legacy_only` registry does.
+struct Unadvertised;
+
+#[async_trait]
+impl Gear for Unadvertised {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for Unadvertised {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        _openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        Ok(router)
+    }
+
+    fn advertised_in_directory(&self) -> bool {
+        false
+    }
+}
+
+/// An application root co-hosting an infrastructure provider: the provider is
+/// discoverable at this listener while the application group waits, the
+/// root only once the group started, an unadvertised infrastructure gear
+/// never.
+#[tokio::test]
+async fn a_co_hosted_infrastructure_provider_is_discoverable_under_an_application_root() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let root = Arc::new(PingGear);
+    let infra = Arc::new(AxisGear);
+    let hidden = Arc::new(Unadvertised);
+    let side = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("ping-gear", &[], root.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("ping-gear", root as Arc<dyn RestApiCapability>);
+    builder.register_core_with_meta("axis-gear", &[], infra.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("axis-gear", infra as Arc<dyn RestApiCapability>);
+    builder.register_startup_stage("axis-gear", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("hidden", &[], hidden.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("hidden", hidden as Arc<dyn RestApiCapability>);
+    builder.register_startup_stage("hidden", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&side));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let server =
+        tokio::spawn(host.run_oop_serving(oop_options("ping-gear", addr, &directory, None)));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !directory
+        .registered_gears
+        .lock()
+        .contains(&"axis-gear".to_owned())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the infrastructure provider is present"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        directory.registered_endpoint.lock().clone(),
+        Some(format!("http://{addr}")),
+        "at this listener"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(
+        directory.registered_gears.lock().clone(),
+        ["axis-gear"],
+        "neither the waiting root nor the unadvertised gear"
+    );
+
+    held.release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !directory
+        .registered_gears
+        .lock()
+        .contains(&"ping-gear".to_owned())
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the root once started"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !directory
+            .registered_gears
+            .lock()
+            .contains(&"hidden".to_owned())
+    );
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+    assert_eq!(
+        directory.deregister_calls.load(Ordering::SeqCst),
+        2,
+        "root and provider"
+    );
+}
+
+/// An infrastructure gear with a tenant-plane route.
+struct TenantAxis;
+
+#[async_trait]
+impl Gear for TenantAxis {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for TenantAxis {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        use crate::api::OperationBuilder;
+        Ok(OperationBuilder::get("/tenant")
+            .operation_id("axis.tenant")
+            .authenticated()
+            .no_license_required()
+            .handler(|| async { "tenant" })
+            .text_response(http::StatusCode::OK, "OK", "text/plain")
+            .register(router, openapi))
+    }
+}
+
+/// Accepts `good-bearer` only.
+struct AcceptingBearer;
+
+impl toolkit_security::BearerAuthenticator for AcceptingBearer {
+    async fn authenticate(
+        &self,
+        token: &str,
+    ) -> Result<toolkit_security::SecurityContext, toolkit_security::AuthNError> {
+        if token == "good-bearer" {
+            Ok(toolkit_security::SecurityContext::builder()
+                .subject_id(Uuid::from_u128(1))
+                .subject_tenant_id(Uuid::from_u128(2))
+                .build()
+                .expect("a tenant context"))
+        } else {
+            Err(toolkit_security::AuthNError::InvalidToken)
+        }
+    }
+}
+
+/// An application gear registering the tenant-plane bridge in its `init`, as
+/// a linked authn-resolver does.
+struct BearerBridge;
+
+#[async_trait]
+impl Gear for BearerBridge {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        ctx.client_hub()
+            .register::<toolkit_security::DynBearerAuthenticator>(Arc::new(
+                toolkit_security::DynBearerAuthenticator::new(AcceptingBearer),
+            ));
+        Ok(())
+    }
+}
+
+/// An infrastructure tenant route is `503` before the application group —
+/// no authenticator exists yet, and it is not served unauthenticated — then
+/// authenticated by the bridge the group's `init` registered, on the same URL.
+#[tokio::test]
+async fn an_infrastructure_tenant_route_is_authenticated_once_the_bridge_exists() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let infra = Arc::new(TenantAxis);
+    let side = Arc::new(PublishingPing::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("tenant-axis", &[], infra.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("tenant-axis", infra as Arc<dyn RestApiCapability>);
+    builder.register_startup_stage("tenant-axis", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("bridge", &[], Arc::new(BearerBridge) as Arc<dyn Gear>);
+    builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn RestApiCapability>,
+    );
+    builder.register_gts_publication_with_meta(
+        "publishing-ping",
+        side.clone() as Arc<dyn crate::gts_publication::GtsPublicationCapability>,
+    );
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<PublishingPing>(Arc::clone(&side));
+    let held = Arc::new(HeldRegistry::default());
+    hub.register::<HeldRegistry>(Arc::clone(&held));
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        hub,
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let server =
+        tokio::spawn(host.run_oop_serving(oop_options("tenant-axis", addr, &directory, None)));
+    let good = [("Authorization", "Bearer good-bearer")];
+
+    assert!(poll_status(addr, "/healthz", 200, Duration::from_secs(5)).await);
+    assert!(poll_status(addr, "/tenant", 503, Duration::from_secs(5)).await);
+    assert_eq!(http_status(addr, "/tenant", &good).await, Some(503));
+
+    held.release.notify_one();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while http_status(addr, "/tenant", &good).await != Some(200) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tenant plane after the group"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        http_status(addr, "/tenant", &[("Authorization", "Bearer nope")]).await,
+        Some(401)
+    );
+    assert_eq!(http_status(addr, "/tenant", &[]).await, Some(401));
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
+}
+
+/// A root whose `/slow` route blocks until released.
+struct Slow {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Gear for Slow {
+    async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl RestApiCapability for Slow {
+    fn register_rest(
+        &self,
+        _ctx: &GearCtx,
+        router: Router,
+        _openapi: &dyn OpenApiRegistry,
+    ) -> anyhow::Result<Router> {
+        let (entered, release) = (Arc::clone(&self.entered), Arc::clone(&self.release));
+        Ok(router.route(
+            "/slow",
+            get(move || {
+                let (entered, release) = (Arc::clone(&entered), Arc::clone(&release));
+                async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    "done"
+                }
+            }),
+        ))
+    }
+}
+
+/// Shutdown flips readiness to draining first: while an in-flight request
+/// still holds the HTTP drain, the process already reports draining.
+#[tokio::test]
+async fn shutdown_reports_draining_before_in_flight_requests_drain() {
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let gear = Arc::new(Slow {
+        entered: Arc::new(tokio::sync::Notify::new()),
+        release: Arc::new(tokio::sync::Notify::new()),
+    });
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("slow", &[], gear.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("slow", gear.clone() as Arc<dyn RestApiCapability>);
+    let cancel = CancellationToken::new();
+    let host = HostRuntime::new(
+        builder.build_topo_sorted().unwrap(),
+        Arc::new(EmptyConfigProvider) as Arc<dyn ConfigProvider>,
+        DbOptions::None,
+        Arc::new(ClientHub::new()),
+        cancel.clone(),
+        Uuid::new_v4(),
+        None,
+    );
+    let readiness = Arc::clone(&host.dep_checker);
+    let server = tokio::spawn(host.run_oop_serving(oop_options("slow", addr, &directory, None)));
+    assert!(poll_status(addr, "/readyz", 200, Duration::from_secs(5)).await);
+
+    let in_flight = tokio::spawn(http_get(addr, "/slow"));
+    gear.entered.notified().await;
+    cancel.cancel();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    while !readiness.is_draining() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "draining while the request is in flight"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        !in_flight.is_finished(),
+        "the request still holds the drain"
+    );
+
+    gear.release.notify_one();
+    assert_eq!(in_flight.await.unwrap().map(|r| r.0), Some(200));
+    tokio::time::timeout(Duration::from_secs(10), server)
+        .await
+        .expect("ends after the drain")
+        .expect("no panic")
+        .expect("clean shutdown");
+}
+
+#[allow(
+    clippy::unnecessary_wraps,
+    clippy::needless_pass_by_value,
+    reason = "must match the WireFn signature the gear macro emits"
+)]
+fn no_wire(
+    _hub: &ClientHub,
+    _resolver: Arc<dyn crate::discovery::EndpointResolver>,
+    _tuning: toolkit_contract::wiring::ClientTuning,
+) -> anyhow::Result<crate::discovery::WireOutcome> {
+    Ok(crate::discovery::WireOutcome::Local)
+}
+
+/// The `OoP` path runs the groups like the in-process one: the infrastructure
+/// complete, then the application group, with the legacy finalization once
+/// between its `init` and its `post_init`.
+#[tokio::test]
+async fn the_oop_path_runs_each_group_and_the_legacy_finalization_in_order() {
+    use super::host_runtime_preparation_tests::{
+        Events, FakeRegistry, GROUPED_STARTUP, grouped_gears, runtime,
+    };
+    let events: Events = Arc::default();
+    let cancel = CancellationToken::new();
+    let host = runtime(
+        grouped_gears(&events).build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &cancel,
+    );
+    let checker = Arc::clone(&host.dep_checker);
+    let addr = free_addr();
+    let directory = Arc::new(RecordingDirectory::default());
+    let server = tokio::spawn(host.run_oop_serving(oop_options("a", addr, &directory, None)));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !checker.unresolved_deps().is_empty() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the application group starts: {:?}",
+            events.lock()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(*events.lock(), GROUPED_STARTUP);
+
+    cancel.cancel();
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("ends after cancel")
+        .expect("no panic")
+        .expect("clean shutdown");
 }

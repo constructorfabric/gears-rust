@@ -1,0 +1,5 @@
+error: `on_admitted` is removed: the runtime admits the manifest before `init`; bind plugin clients in `init` from `GearCtx::gts_publication_manifest()`
+ --> tests/ui/fail/gts_on_admitted_removed.rs:3:42
+  |
+3 | #[gear(name = "x", gts(crates = [crate], on_admitted = Self::bind))]
+  |                                          ^^^^^^^^^^^

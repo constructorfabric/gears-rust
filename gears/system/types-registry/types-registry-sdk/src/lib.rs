@@ -7,6 +7,7 @@ pub mod error;
 pub mod ext;
 pub mod field;
 pub mod gts;
+pub mod gts_publisher;
 pub mod item_failure;
 pub mod models;
 #[cfg(any(feature = "rest-client", feature = "rest-server"))]
@@ -46,7 +47,9 @@ pub use models::{
     RegistrationOutcome, TypeSchema, Validator,
 };
 
-pub use publication::{PublicationError, publish_startup_entities};
+pub use publication::{
+    PublicationError, PublicationRetry, publish_startup_entities, publish_until_admitted,
+};
 pub use reconcile::{
     ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport, ReconcileStop,
     Reconciliation, STARTUP_PUBLICATION_DEADLINE,

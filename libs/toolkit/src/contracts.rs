@@ -12,7 +12,8 @@ pub use crate::api::openapi_registry::OpenApiRegistry;
 pub trait SystemCapability: Send + Sync {
     /// Optional pre-init hook for system gears.
     ///
-    /// This runs BEFORE `init()` has completed for ALL gears, and only for system gears.
+    /// This runs before the migrations and `init()` of the gear's startup
+    /// group (infrastructure, then application), and only for system gears.
     ///
     /// Default implementation is a no-op so most gears don't need to implement it.
     ///
@@ -24,10 +25,26 @@ pub trait SystemCapability: Send + Sync {
 
     /// Optional post-init hook for system gears.
     ///
-    /// This runs AFTER `init()` has completed for ALL gears, and only for system gears.
+    /// This runs after `init()` and proxy wiring of the gear's startup group,
+    /// before that group's routes and `start`, and only for system gears. An
+    /// infrastructure gear's `post_init` therefore runs before any application
+    /// `init`. It must not wait for a remote service.
     ///
     /// Default implementation is a no-op so most gears don't need to implement it.
     async fn post_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// **Legacy, temporary**: runs once, after every application `init` and
+    /// the remaining proxy wiring, before the application `post_init`.
+    ///
+    /// Exists only for the types registry's in-memory ready mode, which
+    /// validates what every gear registered during `init` in one commit. It
+    /// goes away with that ready mode; nothing else should implement it.
+    async fn legacy_finalize_after_application_init(
+        &self,
+        _sys: &crate::runtime::SystemContext,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -84,6 +101,14 @@ pub trait RestApiCapability: Send + Sync {
     ) -> Option<std::sync::Arc<dyn crate::healthcheck::Healthcheck>> {
         None
     }
+
+    /// Whether the in-process host advertises this gear as a REST provider in the
+    /// service directory, under its gear name. Asked after `init`. `false` keeps a gear
+    /// that serves only part of its contracts here from being discovered as their
+    /// provider; its routes are still served. Defaults to `true`.
+    fn advertised_in_directory(&self) -> bool {
+        true
+    }
 }
 
 /// API Gateway capability: handles gateway hosting with prepare/finalize phases.
@@ -119,6 +144,26 @@ pub trait ApiGatewayCapability: Send + Sync + 'static {
 
     // Return OpenAPI registry of the gear, e.g., to register endpoints
     fn as_registry(&self) -> &dyn OpenApiRegistry;
+
+    /// Serve the routes of the infrastructure gears before the application
+    /// group is prepared: probes, and platform-plane calls with the
+    /// platform credential; every other request gets `503`. Called once,
+    /// after [`rest_prepare`](Self::rest_prepare) and before the host starts;
+    /// [`rest_finalize`](Self::rest_finalize) later replaces these routes on
+    /// the same listener with the full surface.
+    ///
+    /// A host that cannot replace its routes while serving cannot be an
+    /// infrastructure gear; the default refuses.
+    ///
+    /// # Errors
+    /// The host does not support early serving, or the routes do not build.
+    fn rest_bootstrap(
+        &self,
+        _ctx: &crate::context::GearCtx,
+        _router: Router,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("this REST host cannot serve routes before the application group starts")
+    }
 
     /// The bound REST base URL (e.g. `http://127.0.0.1:8080`) once the gateway's
     /// server is listening, or `None` before the listener binds.
