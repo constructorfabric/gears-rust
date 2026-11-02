@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use parking_lot::Mutex;
 
 use crate::domain::ports::OagwMetricsPort;
-use crate::domain::ports::metric_labels::{CacheEviction, CacheLookup, CacheMap};
+use crate::domain::ports::metric_labels::{CacheEviction, CacheLookup, CacheMap, CacheStale};
 
 #[cfg(feature = "cluster")]
 mod cluster;
@@ -94,6 +94,9 @@ impl OagwMetricsPort for CacheMetrics {
     }
     fn record_proxy_cache_load_discarded(&self, map: CacheMap) {
         self.add(format!("discarded {}", map.as_str()), 1);
+    }
+    fn record_proxy_cache_stale_served(&self, map: CacheMap, cause: CacheStale) {
+        self.add(format!("stale {} {}", map.as_str(), cause.as_str()), 1);
     }
     fn record_proxy_cache_publish_failures(&self, reason: &str, count: u64) {
         self.add(format!("publish_failures {reason}"), count);

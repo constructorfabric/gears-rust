@@ -2417,6 +2417,12 @@ mod tests {
             _: crate::domain::ports::metric_labels::CacheMap,
         ) {
         }
+        fn record_proxy_cache_stale_served(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheStale,
+        ) {
+        }
         fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
     }
 
@@ -2554,6 +2560,12 @@ mod tests {
         fn record_proxy_cache_load_discarded(
             &self,
             _: crate::domain::ports::metric_labels::CacheMap,
+        ) {
+        }
+        fn record_proxy_cache_stale_served(
+            &self,
+            _: crate::domain::ports::metric_labels::CacheMap,
+            _: crate::domain::ports::metric_labels::CacheStale,
         ) {
         }
         fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}

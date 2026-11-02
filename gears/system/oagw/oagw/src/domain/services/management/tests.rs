@@ -6179,6 +6179,7 @@ fn cached_and_uncached(
         inner: CachedProxyConfigReader::new(
             Arc::new(ProxyConfigCache::new(
                 std::time::Duration::from_secs(60),
+                std::time::Duration::ZERO,
                 100,
                 Arc::new(crate::domain::ports::NoopMetrics),
             )),
@@ -6914,6 +6915,7 @@ async fn a_cached_upstream_whose_host_is_denied_later_is_rejected() {
     let reader: Arc<dyn ProxyConfigReader> = Arc::new(CachedProxyConfigReader::new(
         Arc::new(ProxyConfigCache::new(
             std::time::Duration::from_secs(60),
+            std::time::Duration::ZERO,
             100,
             Arc::new(crate::domain::ports::NoopMetrics),
         )),

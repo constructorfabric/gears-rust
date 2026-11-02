@@ -313,16 +313,29 @@ impl CachedPlanes {
         Self::with_ttl(stores, recorder, tenants, Duration::from_secs(60))
     }
 
-    /// [`over`](Self::over), with cache entries living for `ttl`.
+    /// [`over`](Self::over), with cache entries living for `ttl` and no
+    /// stale entries served.
     pub(crate) fn with_ttl(
         stores: Stores,
         recorder: QueryRecorder,
         tenants: Arc<dyn TenantResolverClient>,
         ttl: Duration,
     ) -> Self {
+        Self::with_lifetimes(stores, recorder, tenants, ttl, Duration::ZERO)
+    }
+
+    /// [`over`](Self::over), with cache entries fresh for `ttl` and served
+    /// stale for `max_stale` more when their reload fails.
+    pub(crate) fn with_lifetimes(
+        stores: Stores,
+        recorder: QueryRecorder,
+        tenants: Arc<dyn TenantResolverClient>,
+        ttl: Duration,
+        max_stale: Duration,
+    ) -> Self {
         let credstore: Arc<dyn CredStoreClientV1> = Arc::new(MockCredStoreClient::empty());
         let metrics = Arc::new(CacheMetrics::default());
-        let cache = Arc::new(ProxyConfigCache::new(ttl, 100, metrics.clone()));
+        let cache = Arc::new(ProxyConfigCache::new(ttl, max_stale, 100, metrics.clone()));
         let reader = CachedProxyConfigReader::new(
             Arc::clone(&cache),
             stores.upstreams.clone(),
