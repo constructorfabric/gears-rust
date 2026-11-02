@@ -18,7 +18,9 @@ use super::plan::{NodeKey, Origin};
 use super::profile::Category;
 use super::profile_read::{StoredFact, settings_scope};
 use super::profile_writes::{ProfileWrites, Removed, WriteError};
-use super::review_queue::{ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_delete};
+use super::review_queue::{
+    ReviewOutcome, ReviewQueueEvents, ReviewRequest, ReviewRequests, close_on_change,
+};
 use super::subject_access::{authorize, own};
 use super::subject_settings::{SubjectKey, SubjectSettings, SubjectSettingsReader};
 
@@ -318,13 +320,15 @@ impl SubjectControlService {
         // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-close
         // A fact already gone may still have an open request left by an
         // earlier delete whose close failed; this closes it.
-        let closed = close_on_delete(
+        let closed = close_on_change(
             self.ports.reviews.as_ref(),
             self.ports.review_events.as_ref(),
             &self.ports.writes,
             &scope,
             key,
             fact_id,
+            subject_id,
+            ReviewOutcome::Deleted,
             matches!(removed, Removed::Removed(_)),
         )
         .await

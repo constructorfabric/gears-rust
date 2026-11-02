@@ -13,6 +13,7 @@ pub mod admission;
 pub mod error;
 pub mod local_client;
 pub mod model_client;
+pub mod one_step;
 pub mod pagination;
 pub mod plan;
 pub mod planner;

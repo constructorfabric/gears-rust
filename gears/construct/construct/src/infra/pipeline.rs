@@ -19,6 +19,7 @@ use crate::config::{CategoryCheckConfig, ValidConfig};
 use crate::domain::admission::{Admission, AdmissionPorts};
 use crate::domain::error::DomainError;
 use crate::domain::model_client::ModelClient;
+use crate::domain::one_step::OneStepPath;
 use crate::domain::planner::agent::{Planner, PlannerCaps};
 use crate::domain::planner::catalog::PropertyCatalog;
 use crate::domain::planner::processing::{
@@ -29,7 +30,7 @@ use crate::domain::profile_writes::ProfileWrites;
 use crate::domain::record_intake::{
     DropEvent, DropReason, DropStage, IntakeEvents, RecordHandOff, RecordKey,
 };
-use crate::domain::review_queue::{Corrections, ReviewQueueService, ReviewRequests};
+use crate::domain::review_queue::{ReviewQueueService, ReviewRequests};
 use crate::domain::sensitive_data::SensitiveDataChecks;
 use crate::domain::subject_control::{SubjectControlPorts, SubjectControlService};
 use crate::domain::subject_settings::SubjectSettingsReader;
@@ -276,20 +277,20 @@ pub fn assemble(
     if stores_unchecked {
         warn_unchecked(cfg);
     }
-    let corrections = stores_unchecked.then(|| {
+    let one_step = stores_unchecked.then(|| {
         let (checks, admission) =
             value_stages(cfg, Arc::clone(&settings), Arc::new(LogIntakeEvents));
-        Corrections {
+        Arc::new(OneStepPath {
             checks,
             admission,
             catalog: Arc::clone(&catalog),
-        }
+        })
     });
     let review_queue = Arc::new(ReviewQueueService::new(
         profile_writes,
         Arc::clone(&reviews),
         Arc::new(LogReviewQueueEvents),
-        corrections,
+        one_step,
         policy_enforcer,
     ));
     // @cpt-end:cpt-cf-construct-algo-review-queue-wire:p1:inst-wire-review-queue
