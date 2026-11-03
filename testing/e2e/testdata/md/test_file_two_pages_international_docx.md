@@ -39,46 +39,45 @@ Common Typographic Symbols
 
 Dashes:
 
-  - Hyphen: -
+- Hyphen: -
 
-  - En dash: –
+- En dash: –
 
-  - Em dash: —
+- Em dash: —
 
-  - Long dash: ——  
+- Long dash: ——
 
 Quotes:
 
-  - “Double quotes”
+- “Double quotes”
 
-  - ‘Single quotes’
+- ‘Single quotes’
 
-Punctuation & Marks:
+Punctuation  Marks:
 
-  - Ellipsis: …
+- Ellipsis: …
 
-  - Middle dot: ·
+- Middle dot: ·
 
-  - Bullet: •
+- Bullet: •
 
-  - Section: §
+- Section: §
 
-  - Copyright: ©
+- Copyright: ©
 
-  - Trademark: ™
+- Trademark: ™
 
-  - Registered: ®
+- Registered: ®
 
-Math & Symbols:
+Math  Symbols:
 
-  - Not equal: ≠
+- Not equal: ≠
 
-  - Plus-minus: ±
+- Plus-minus: ±
 
-  - Infinity: ∞
+- Infinity: ∞
 
-  - Degree: °
+- Degree: °
 
-  - Arrow: →
-
+- Arrow: →
 
