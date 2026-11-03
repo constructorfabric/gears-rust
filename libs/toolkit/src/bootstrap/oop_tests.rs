@@ -1291,12 +1291,18 @@ mod publication_config_tests {
         assert_eq!(&deploy.documents()[0].1, expected);
     }
 
+    // `AppConfig::load_or_default` reads the process `APP__` environment, which
+    // the `#[serial]` config tests set.
     #[test]
+    #[serial_test::serial]
     fn the_master_config_reaches_the_manifest_when_the_unit_has_none() {
         check("    {}\n", &json!({ "vendor": "master", "priority": 3 }));
     }
 
+    // `AppConfig::load_or_default` reads the process `APP__` environment, which
+    // the `#[serial]` config tests set.
     #[test]
+    #[serial_test::serial]
     fn a_local_config_section_overrides_the_master_one_in_both_paths() {
         check(
             "    config:\n      vendor: \"local\"\n",
