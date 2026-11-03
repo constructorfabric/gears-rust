@@ -85,7 +85,6 @@ tokio-util = { workspace = true, optional = true }
 # MIME type parsing
 mime = { workspace = true }
 
-docx-rust = { workspace = true }
 
 # Local dependencies
 toolkit = { workspace = true }

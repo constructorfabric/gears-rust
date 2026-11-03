@@ -19,6 +19,7 @@ use super::ir_convert::result_to_blocks;
 /// |------------------------|------------------------------------------------------------------------------|
 /// | `pdf`                  | `application/pdf`                                                            |
 /// | `html`, `htm`          | `text/html`                                                                  |
+/// | `docx`                 | `application/vnd.openxmlformats-officedocument.wordprocessingml.document`    |
 /// | `xlsx`                 | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`          |
 /// | `xls`                  | `application/vnd.ms-excel`                                                   |
 /// | `xlsm`                 | `application/vnd.ms-excel.sheet.macroEnabled.12`                             |
@@ -28,8 +29,9 @@ pub struct KreuzbergParser;
 
 /// Extensions this backend can extract; standalone so `mime_for_ext` can
 /// filter against it too.
-const SUPPORTED_EXTENSIONS: &[&str] =
-    &["pdf", "html", "htm", "xlsx", "xls", "xlsm", "xlsb", "pptx"];
+const SUPPORTED_EXTENSIONS: &[&str] = &[
+    "pdf", "html", "htm", "docx", "xlsx", "xls", "xlsm", "xlsb", "pptx",
+];
 
 impl KreuzbergParser {
     #[must_use]
@@ -215,6 +217,7 @@ mod tests {
         let exts = parser.supported_extensions();
         assert!(exts.contains(&"pdf"));
         assert!(exts.contains(&"html"));
+        assert!(exts.contains(&"docx"));
         assert!(exts.contains(&"xlsx"));
         assert!(exts.contains(&"pptx"));
     }
@@ -227,6 +230,10 @@ mod tests {
         );
         assert_eq!(KreuzbergParser::mime_for_ext("html"), Some("text/html"));
         assert_eq!(KreuzbergParser::mime_for_ext("htm"), Some("text/html"));
+        assert_eq!(
+            KreuzbergParser::mime_for_ext("docx"),
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        );
         assert_eq!(
             KreuzbergParser::mime_for_ext("xlsx"),
             Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

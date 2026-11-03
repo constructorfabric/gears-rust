@@ -1,7 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::use_debug)]
 
 use file_parser::domain::parser::FileParserBackend;
-use file_parser::infra::parsers::docx_parser::DocxParser;
+use file_parser::infra::parsers::KreuzbergParser;
 use std::path::PathBuf;
 
 mod common;
@@ -12,15 +12,15 @@ fn get_test_file_path(filename: &str) -> PathBuf {
 
 #[tokio::test]
 async fn test_docx_parser_basic_info() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
 
-    assert_eq!(parser.id(), "docx");
-    assert_eq!(parser.supported_extensions(), &["docx"]);
+    assert_eq!(parser.id(), "kreuzberg");
+    assert!(parser.supported_extensions().contains(&"docx"));
 }
 
 #[tokio::test]
 async fn test_docx_parser_with_working_file() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
     // Skip test if file doesn't exist (not all test files may be available)
@@ -47,7 +47,7 @@ async fn test_docx_parser_with_working_file() {
 
 #[tokio::test]
 async fn test_docx_parser_with_two_page_file() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_2pages_multilingual.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -72,7 +72,7 @@ async fn test_docx_parser_with_two_page_file() {
 
 #[tokio::test]
 async fn test_docx_parser_with_big_english_file() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_big_english.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -97,7 +97,7 @@ async fn test_docx_parser_with_big_english_file() {
 
 #[tokio::test]
 async fn test_docx_parser_with_edge_cases_file_returns_error() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_edge_cases.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -119,7 +119,7 @@ async fn test_docx_parser_with_edge_cases_file_returns_error() {
 async fn test_docx_parser_with_image_multilingual_file() {
     // This file is 1,812,664 bytes and contains images.
     // With our fixes to docx-rust, it now parses successfully.
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_image_multilingual.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -144,7 +144,7 @@ async fn test_docx_parser_with_image_multilingual_file() {
 #[tokio::test]
 async fn test_docx_parser_parse_bytes() {
     // Test parsing from bytes instead of file path
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -174,8 +174,10 @@ async fn test_docx_parser_parse_bytes() {
 
 #[tokio::test]
 async fn test_docx_parser_parse_bytes_without_filename() {
-    // Test parsing from bytes without filename hint
-    let parser = DocxParser::new();
+    // Test parsing from bytes without filename hint. Kreuzberg needs a MIME type
+    // when there is no filename to infer one from (the old docx-rust parser
+    // assumed DOCX), so the content type is supplied.
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -183,7 +185,13 @@ async fn test_docx_parser_parse_bytes_without_filename() {
     let file_bytes = std::fs::read(&test_file).expect("Failed to read test file");
     let bytes = bytes::Bytes::from(file_bytes);
 
-    let result = parser.parse_bytes(None, None, bytes).await;
+    let result = parser
+        .parse_bytes(
+            None,
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+            bytes,
+        )
+        .await;
 
     assert!(
         result.is_ok(),
@@ -193,16 +201,18 @@ async fn test_docx_parser_parse_bytes_without_filename() {
 
     let document = result.unwrap();
     assert!(!document.blocks.is_empty(), "Document should have blocks");
-    // When no filename hint is provided, original_filename is not set
+    // KreuzbergParser falls back to the "unknown" placeholder when no filename
+    // hint is provided (the old docx-rust parser left it unset)
     assert_eq!(
-        document.meta.original_filename, None,
-        "Without filename hint, original_filename should be None"
+        document.meta.original_filename.as_deref(),
+        Some("unknown"),
+        "Without filename hint, original_filename should be the placeholder"
     );
 }
 
 #[tokio::test]
 async fn test_docx_parser_nonexistent_file() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let nonexistent = PathBuf::from("/nonexistent/path/to/file.docx");
 
     let result = parser.parse_local_path(&nonexistent, None).await;
@@ -215,6 +225,7 @@ async fn test_docx_parser_nonexistent_file() {
         error_msg.contains("Failed to read file")
             || error_msg.contains("No such file")
             || error_msg.contains("Failed to open DOCX file")
+            || error_msg.contains("File does not exist")
             || error_msg.contains("cannot find the path"),
         "Error should mention file reading issue, got: {error_msg}"
     );
@@ -222,7 +233,7 @@ async fn test_docx_parser_nonexistent_file() {
 
 #[tokio::test]
 async fn test_docx_parser_invalid_docx_bytes() {
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let invalid_bytes = bytes::Bytes::from("This is not a valid DOCX file");
 
     let result = parser
@@ -235,7 +246,8 @@ async fn test_docx_parser_invalid_docx_bytes() {
     let error_msg = error.to_string();
     assert!(
         error_msg.contains("Failed to parse DOCX")
-            || error_msg.contains("Failed to open DOCX file"),
+            || error_msg.contains("Failed to open DOCX file")
+            || error_msg.contains("DOCX parsing failed"),
         "Error should mention DOCX parsing failure, got: {error_msg}"
     );
 }
@@ -244,7 +256,7 @@ async fn test_docx_parser_invalid_docx_bytes() {
 async fn test_docx_parser_extracts_tables() {
     use file_parser::domain::ir::ParsedBlock;
 
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_multilingual.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");
@@ -305,7 +317,7 @@ async fn test_docx_parser_extracts_tables() {
 async fn test_docx_parser_table_edge_cases() {
     use file_parser::domain::ir::ParsedBlock;
 
-    let parser = DocxParser::new();
+    let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("test_file_1table_edge_cases.docx");
 
     assert!(test_file.exists(), "test fixture missing: {test_file:?}");

@@ -10,9 +10,7 @@ use file_parser_sdk::FileParserClientV1;
 use crate::config::FileParserConfig;
 use crate::domain::local_client::FileParserLocalClient;
 use crate::domain::service::{FileParserService, ServiceConfig};
-use crate::infra::parsers::{
-    DocxParser, ImageParser, KreuzbergParser, PlainTextParser, StubParser,
-};
+use crate::infra::parsers::{ImageParser, KreuzbergParser, PlainTextParser, StubParser};
 
 /// Main gear struct for file parsing
 #[toolkit::gear(
@@ -203,7 +201,6 @@ impl Gear for FileParserGear {
         let parsers: Vec<Arc<dyn crate::domain::parser::FileParserBackend>> = vec![
             Arc::new(PlainTextParser::new().with_max_bytes(max_file_size_bytes)),
             Arc::new(KreuzbergParser::new()),
-            Arc::new(DocxParser::new()),
             Arc::new(ImageParser::new()),
             Arc::new(StubParser::new().with_max_bytes(max_file_size_bytes)),
         ];

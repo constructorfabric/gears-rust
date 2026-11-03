@@ -3,7 +3,7 @@
 
 // === PUBLIC API (from SDK) ===
 // Other gears should prefer depending on `cf-gears-file-parser-sdk` directly
-// rather than this implementation crate (it pulls in kreuzberg/docx-rust
+// rather than this implementation crate (it pulls in kreuzberg
 // transitively); these re-exports exist for convenience/back-compat only.
 pub use file_parser_sdk::{
     Detection, FileParserClientError, FileParserClientV1, ParseBytesRequest, ParsedText,

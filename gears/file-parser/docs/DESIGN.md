@@ -61,8 +61,7 @@ Parser Gateway       (src/domain/service.rs — FileParserService)
 │  FileParserBackend plugins  (src/infra/parsers/)                    │
 │                                                                     │
 │  PlainTextParser   txt, log, md          (internal)                 │
-│  KreuzbergParser   pdf, html, xlsx, pptx (kreuzberg =4.10.4)       │
-│  DocxParser        docx                  (docx-rust)                │
+│  KreuzbergParser   pdf, html, docx, xlsx, pptx (kreuzberg =4.10.4) │
 │  ImageParser       png, jpg, webp, gif   (internal / base64)        │
 │  StubParser        doc, rtf, odt, …      (fallback stub)            │
 └─────────────────────────────────────────────────────────────────────┘
@@ -128,8 +127,7 @@ Supported extensions are determined by the registered plugins. Requests for exte
 
 Currently supported:
 - `PlainTextParser`: `txt`, `log`, `md`
-- `KreuzbergParser`: `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx`
-- `DocxParser`: `docx`
+- `KreuzbergParser`: `pdf`, `html`, `htm`, `docx`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx`
 - `ImageParser`: `png`, `jpg`, `jpeg`, `webp`, `gif`
 - `StubParser` (fallback): `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx`
 
@@ -205,10 +203,9 @@ Each plugin implements `FileParserBackend` (`src/domain/parser.rs`) and is regis
 | # | Plugin | Handled extensions | Backend library |
 |---|---|---|---|
 | 1 | `PlainTextParser` | `txt`, `log`, `md` | internal |
-| 2 | `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` | `kreuzberg =4.10.4` (MIT) |
-| 3 | `DocxParser` | `docx` | `docx-rust` |
-| 4 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` | internal (base64 encoding) |
-| 5 | `StubParser` | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` | stub fallback |
+| 2 | `KreuzbergParser` | `pdf`, `html`, `htm`, `docx`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` | `kreuzberg =4.10.4` (MIT) |
+| 3 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` | internal (base64 encoding) |
+| 4 | `StubParser` | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` | stub fallback |
 
 Future plugins implement `FileParserBackend` and are added to the `vec![]` in `gear.rs` — no changes to the gateway or REST API are required.
 
@@ -290,9 +287,8 @@ Plugin registration is done at gear startup in `src/gear.rs`. The gateway select
 
 | Dependency | Version | License | Role |
 |---|---|---|---|
-| `kreuzberg` | `=4.10.4` | MIT (no `deny.toml` exception) | Document extraction for PDF, HTML, XLSX, PPTX (used by `KreuzbergParser`) |
+| `kreuzberg` | `=4.10.4` | MIT (no `deny.toml` exception) | Document extraction for PDF, HTML, DOCX, XLSX, PPTX (used by `KreuzbergParser`) |
 | `pdfium` | bundled via kreuzberg | BSD-3 | PDF rendering (bundled, no separate install) |
-| `docx-rust` | workspace | MIT | DOCX parsing (used by `DocxParser`) |
 
 ### 3.5 Interactions & Sequences
 

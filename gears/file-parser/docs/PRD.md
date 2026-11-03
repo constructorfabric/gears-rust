@@ -53,7 +53,7 @@ Platform gears — most notably the Chat Engine and LLM Gateway — need to proc
 
 The gear was designed from the start with extensibility in mind: the `FileParserBackend` trait defines the plugin contract, and `FileParserService` acts as the gateway that routes requests to the correct plugin.
 
-The previous implementation had four separate format-specific plugins (`HtmlParser`, `PdfParser`, `XlsxParser`, `PptxParser`) each backed by different libraries (`tl`, `pdf-extract`, `calamine`, `pptx-to-md`), resulting in fragmented logic, inconsistent output quality, and no support for DOCX or images. The current version consolidates the four PDF/HTML/spreadsheet/presentation plugins into a single `KreuzbergParser`, adds `DocxParser` and `ImageParser`, and retains `PlainTextParser` and `StubParser` — all within the same gateway+plugin architecture.
+The previous implementation had four separate format-specific plugins (`HtmlParser`, `PdfParser`, `XlsxParser`, `PptxParser`) each backed by different libraries (`tl`, `pdf-extract`, `calamine`, `pptx-to-md`), resulting in fragmented logic, inconsistent output quality, and no support for DOCX or images. The current version consolidates the four PDF/HTML/spreadsheet/presentation plugins into a single `KreuzbergParser`, adds `ImageParser`, and retains `PlainTextParser` and `StubParser` — all within the same gateway+plugin architecture.
 
 ### 1.3 Goals (Business Outcomes)
 
@@ -148,8 +148,7 @@ Currently registered plugins (in priority order):
 | Plugin | Extensions |
 |---|---|
 | `PlainTextParser` | `txt`, `log`, `md` |
-| `KreuzbergParser` | `pdf`, `html`, `htm`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` |
-| `DocxParser` | `docx` |
+| `KreuzbergParser` | `pdf`, `html`, `htm`, `docx`, `xlsx`, `xls`, `xlsm`, `xlsb`, `pptx` |
 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` |
 | `StubParser` (fallback) | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` |
 
@@ -233,7 +232,7 @@ REST endpoints exposed by the gear:
 
 ### 7.2 External Integration Contracts
 
-No external service contracts. The gear depends only on in-process Rust libraries (`kreuzberg`, `docx-rust`) and the host filesystem for `parse-local` endpoints.
+No external service contracts. The gear depends only on in-process Rust libraries (`kreuzberg`) and the host filesystem for `parse-local` endpoints.
 
 ## 8. Use Cases
 
@@ -277,7 +276,6 @@ Consumer gear requests parsing of a file already present on the server filesyste
 |---|---|---|
 | `kreuzberg =4.10.4` | External library (MIT, no `deny.toml` exception) | Pinned with `=` to prevent silent upgrades, since upstream has changed license before; any bump must re-check the license. Used by `KreuzbergParser`. |
 | `pdfium` | Bundled native library | Included via `bundled-pdfium` feature; no separate install required |
-| `docx-rust` | External library (MIT) | Used by `DocxParser` for DOCX extraction |
 | Host filesystem | Runtime | Required for `parse-local` endpoints |
 | toolkit HTTP framework | Internal | REST endpoint registration and body-size enforcement |
 
@@ -298,7 +296,6 @@ Consumer gear requests parsing of a file already present on the server filesyste
 | PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; the PDFium build is pinned by `PDFIUM_VERSION` in `.cargo/config.toml` — bump it there, then run `cargo clean -p kreuzberg` (its build script does not rerun on `PDFIUM_VERSION` changes and reuses the cached PDFium in `OUT_DIR`) and regenerate the e2e goldens with `testing/e2e/suites/file_parser/generate_file_parser_golden.py` in the same commit |
 | Large document OOM under concurrency | Low | Medium | Configurable size limit enforced before any plugin is invoked; monitor memory usage in production |
 | Plugin registration order conflict (two plugins claim same extension) | Low | Low | First-match semantics are deterministic; document registration order in `gear.rs` |
-| `docx-rust` does not support all DOCX features | Medium | Low | Known limitation; `DocxParser` extracts text and basic structure; rich formatting may be lost |
 
 ## Appendix
 
