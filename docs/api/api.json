@@ -4596,61 +4596,6 @@
         ],
         "type": "object"
       },
-      "DeploymentDto": {
-        "description": "GitHub-shaped deployment.",
-        "properties": {
-          "created_at": {
-            "format": "date-time",
-            "type": "string"
-          },
-          "creator": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/ActorDto"
-              }
-            ]
-          },
-          "description": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "environment": {
-            "type": "string"
-          },
-          "id": {
-            "format": "int64",
-            "type": "integer"
-          },
-          "ref": {
-            "type": "string"
-          },
-          "sha": {
-            "type": "string"
-          },
-          "task": {
-            "type": "string"
-          },
-          "updated_at": {
-            "format": "date-time",
-            "type": "string"
-          }
-        },
-        "required": [
-          "id",
-          "ref",
-          "sha",
-          "environment",
-          "task",
-          "created_at",
-          "updated_at"
-        ],
-        "type": "object"
-      },
       "DeploymentModeDto": {
         "description": "Deployment mode of a gear",
         "enum": [

@@ -172,3 +172,104 @@ async fn issue_comments_are_tenant_scoped() {
         "another tenant must not even learn the repository is mirrored"
     );
 }
+
+async fn service_with_repo_comments(ctx: &SecurityContext) -> Arc<ConcreteService> {
+    let service = common::service("https://api.github.com").await;
+    service
+        .upsert_repo(ctx, repo_record())
+        .await
+        .expect("repo seed must succeed");
+    for record in [
+        comment_record(2, 7, "2026-08-20T00:00:00Z"),
+        comment_record(1, 7, "2026-08-18T00:00:00Z"),
+        comment_record(3, 8, "2026-08-19T00:00:00Z"),
+    ] {
+        service
+            .upsert_comment(ctx, "acme", "widget", record)
+            .await
+            .expect("comment seed must succeed");
+    }
+    service
+}
+
+#[tokio::test]
+async fn repo_comments_cover_every_issue_oldest_first_by_default() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = service_with_repo_comments(&ctx).await;
+
+    let response = get(router_for(service, ctx), "/repos/acme/widget/issues/comments").await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let json = body_json(response).await;
+    let items = json.as_array().expect("items");
+    let ids: Vec<i64> = items.iter().map(|c| c["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, [1, 3, 2]);
+    assert_eq!(
+        items[1]["issue_url"],
+        "https://api.github.com/repos/acme/widget/issues/8"
+    );
+}
+
+#[tokio::test]
+async fn repo_comments_follow_sort_direction_and_since() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = service_with_repo_comments(&ctx).await;
+    let router = router_for(service, ctx);
+
+    let newest_first = body_json(
+        get(
+            router.clone(),
+            "/repos/acme/widget/issues/comments?sort=created&direction=desc",
+        )
+        .await,
+    )
+    .await;
+    let ids: Vec<i64> = newest_first
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|c| c["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [2, 3, 1]);
+
+    let since = body_json(
+        get(
+            router,
+            "/repos/acme/widget/issues/comments?since=2026-08-19T00:00:00Z",
+        )
+        .await,
+    )
+    .await;
+    let ids: Vec<i64> = since
+        .as_array()
+        .expect("items")
+        .iter()
+        .map(|c| c["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, [3, 2], "comments updated before `since` must be left out");
+}
+
+#[tokio::test]
+async fn repo_comments_of_unknown_repository_return_404() {
+    let ctx = common::caller_in(Uuid::new_v4());
+    let service = common::service("https://api.github.com").await;
+
+    let response = get(router_for(service, ctx), "/repos/acme/nope/issues/comments").await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn repo_comments_are_tenant_scoped() {
+    let owner = common::caller_in(Uuid::new_v4());
+    let service = service_with_repo_comments(&owner).await;
+
+    let stranger = common::caller_in(Uuid::new_v4());
+    let response = get(
+        router_for(service, stranger),
+        "/repos/acme/widget/issues/comments",
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

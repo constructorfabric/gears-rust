@@ -490,6 +490,7 @@ pub async fn list_comments(
     Ok(respond(&page, &path, comment_dtos(items, &owner, &name)))
 }
 
+/// Serves `GET /repos/{owner}/{name}/issues/comments` (comments of every issue) from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_repo_comments(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -737,6 +738,7 @@ pub async fn list_workflow_runs(
     Ok(workflow_runs_page(&page, &path, items.items, total))
 }
 
+/// Serves `GET /repos/{owner}/{name}/actions/workflows/{workflow_id}/runs` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_workflow_runs_of_workflow(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -772,6 +774,7 @@ fn workflow_runs_page(
     )
 }
 
+/// Serves `GET /repos/{owner}/{name}/actions/workflows`, built from the mirrored workflow runs, with GitHub-style pagination and a `Link` header.
 pub async fn list_workflows(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,
@@ -796,6 +799,7 @@ pub async fn list_workflows(
     ))
 }
 
+/// Serves `GET /repos/{owner}/{name}/actions/artifacts` from the mirror with GitHub-style pagination and a `Link` header.
 pub async fn list_artifacts(
     Extension(ctx): Extension<SecurityContext>,
     Extension(svc): Extension<Arc<ConcreteService>>,

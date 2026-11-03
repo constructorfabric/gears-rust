@@ -404,6 +404,7 @@ pub(crate) const DEPLOYMENT_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
+/// Authorization resource type `github_mirror.artifact` (the mirrored workflow artifact).
 pub(crate) const ARTIFACT_RESOURCE: ResourceType = ResourceType::from_static(
     "github_mirror.artifact",
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
