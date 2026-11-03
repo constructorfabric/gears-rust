@@ -189,9 +189,8 @@ type InstanceMap = HashMap<Uuid, LocalInstance>;
 pub struct LocalProcessBackend {
     instances: Arc<RwLock<InstanceMap>>,
     cancel: CancellationToken,
-    /// The one shutdown of this backend, run by a task of its own: the
-    /// cancellation watcher, a drop and every [`stop_all`](Self::stop_all)
-    /// await the same run, and abandoning a wait never abandons the run.
+    /// Shared shutdown task: cancellation and `stop_all` await it;
+    /// dropping the backend triggers it. Dropping a waiter does not stop it.
     shutdown: Arc<Shutdown>,
     /// Cancelled on drop: the watcher then stops the children, although the
     /// caller's token, which the backend only borrows, stays live.
@@ -201,8 +200,7 @@ pub struct LocalProcessBackend {
 /// See [`LocalProcessBackend::shutdown`].
 struct Shutdown {
     instances: Arc<RwLock<InstanceMap>>,
-    /// Set, under the instances lock, when the run takes the instances: a
-    /// spawn racing it is refused rather than left running.
+    /// Set under the instances lock when shutdown takes them; refuses racing spawns.
     stopping: std::sync::atomic::AtomicBool,
     started: std::sync::atomic::AtomicBool,
     done: tokio::sync::watch::Sender<bool>,
@@ -236,8 +234,7 @@ impl Shutdown {
     }
 }
 
-/// Marks the shutdown run ended when dropped: also when the run panics, so no
-/// waiter of [`Shutdown::run`] is left pending.
+/// Wake shutdown waiters on completion or panic.
 struct RunEnded(Arc<Shutdown>);
 
 impl Drop for RunEnded {

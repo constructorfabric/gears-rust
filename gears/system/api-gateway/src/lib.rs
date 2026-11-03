@@ -24,10 +24,3 @@ mod web;
 
 // === RE-EXPORTS ===
 pub use config::{ApiGatewayConfig, CorsConfig};
-
-// Linked wherever the gateway is: its tenant plane uses the AuthN resolver.
-// Not a startup dependency: the gateway serves before the application group,
-// the resolver among it, is initialized.
-#[cfg(not(test))]
-#[doc(hidden)]
-pub use authn_resolver as _gear_dep_authn_resolver;

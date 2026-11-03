@@ -172,12 +172,10 @@ pub(super) async fn presence_loop(
 type RegistrationFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>;
 
-/// [`presence_loop`] whose registration info `updates` may replace (a new
-/// `OpenAPI` document, say). An update is registered once, at once, beside the
-/// heartbeats, which keep their schedule while it is in flight; a later update
-/// replaces one still in flight. Neither the periodic re-registration nor the
-/// heartbeat self-heal starts beside it. When it fails, the periodic
-/// re-registration, which carries the latest info, retries it.
+/// [`presence_loop`] with replaceable registration info (e.g. updated `OpenAPI`).
+/// Updates register immediately alongside heartbeats and replace any update in
+/// flight. Periodic registration and heartbeat self-heal wait for that attempt;
+/// if it fails, periodic registration retries with the latest info.
 pub(super) async fn presence_loop_with_updates(
     directory: Arc<dyn DirectoryClient>,
     mut updates: tokio::sync::watch::Receiver<RegisterInstanceInfo>,

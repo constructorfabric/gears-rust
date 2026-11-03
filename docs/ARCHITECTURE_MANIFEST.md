@@ -69,8 +69,8 @@ Constructor Fabric Gears organizes its codebase into three tiers:
 - **Service gears** (`gears/`) — Ready-to-use and vendor-developed business gears built on top of the platform: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and domain-specific services.
 
 The `gears/system/` category does not imply the runtime `system` capability. Only Types Registry,
-Service Discovery, Cluster, API Gateway and gRPC Hub belong to the early system group;
-resolvers and other platform gears belong to the application group.
+Service Discovery, Cluster and gRPC Hub belong to the early system group;
+the API Gateway, resolvers and other platform gears belong to the application group.
 
 See: [GEARS.md](GEARS.md)
 

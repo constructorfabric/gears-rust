@@ -101,11 +101,8 @@ use crate::config::{ConfigError, ConfigProvider, gear_config_or_default, gear_co
 use toolkit_gts::local::DeclarationMerge;
 pub use toolkit_gts::local::DeclarationSource;
 
-/// Config-only inputs of an `entities` function.
-///
-/// It gives the effective gear configuration and nothing else: no initialized
-/// gear state, database or remote client. Equal effective configuration gives
-/// an equal manifest, in the runtime and in a deployment job.
+/// Effective gear configuration for `entities`, without gear state, DB or clients.
+/// The same configuration must produce the same runtime and deployment manifest.
 pub struct GtsPublicationInputs<'a> {
     gear: &'a str,
     config: &'a dyn ConfigProvider,
@@ -198,12 +195,11 @@ impl GtsManifest {
     }
 }
 
-/// Check that no GTS id is in the manifests of two publishers. One process,
-/// or one deployment job, gives each id one owner; equal content does not
-/// make a second owner valid.
+/// Require one publisher per GTS id across this process or deployment job,
+/// even for identical content.
 ///
 /// # Errors
-/// Lists every id with its publishers.
+/// Lists every conflicting id with its publishers.
 pub fn check_ownership<'a>(
     manifests: impl IntoIterator<Item = &'a GtsManifest>,
 ) -> anyhow::Result<()> {
@@ -234,7 +230,7 @@ pub fn check_ownership<'a>(
     }
 }
 
-/// A gear's publication policy: `gears.<gear>.config.gts_publication`.
+/// Per-publisher policy at `gears.<gear>.config.gts_publication`.
 ///
 /// ```yaml
 /// gears:
@@ -247,18 +243,15 @@ pub fn check_ownership<'a>(
 ///         batch_size: 100          # default 100
 /// ```
 ///
-/// The section belongs to the runtime: the typed gear configuration does not see it
-/// ([`crate::config::GTS_PUBLICATION_CONFIG_KEY`]). It is read once per gear when the
-/// manifests are built, is not part of the [`GtsManifest`] (a policy change never changes
-/// the documents or their ownership), and is forwarded to the publisher adapter
-/// unchanged. The policy is per publication: publishers sharing one registry client keep
-/// their own, and it applies alike to a local and a remote registry. The registry client's
-/// URL, HTTP timeout and HTTP retries stay in `consumer_wiring`.
+/// Read once with the manifest and forwarded unchanged to the adapter. Hidden
+/// from typed gear config ([`crate::config::GTS_PUBLICATION_CONFIG_KEY`]) and
+/// excluded from [`GtsManifest`], so policy changes do not affect ownership.
+/// Applies per publication, with local or shared remote clients alike; client
+/// URL, HTTP timeout and HTTP retries remain in `consumer_wiring`.
 ///
-/// `timeout` caps the publication from the start of `publish`; it never extends a
-/// caller's absolute deadline (a deployment job's). Without it, a startup publication
-/// has the adapter's default budget (120 s for `types_registry_sdk::publication`), and
-/// a deployment job's deadline replaces that default, even when it is longer.
+/// `timeout` caps the budget from `publish` and never extends a caller's deadline.
+/// Without it, startup uses the adapter's default (120 s for the registry SDK);
+/// a deployment deadline replaces that default, even when longer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GtsPublicationOptions {
     timeout: Option<Duration>,

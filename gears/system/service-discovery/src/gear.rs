@@ -363,9 +363,7 @@ mod tests {
 
     #[tokio::test]
     async fn init_fails_without_a_wired_gear_manager() {
-        // `init` builds the gear catalog and then needs the `GearManager` that
-        // `wire_runtime` injects. If that wiring is skipped, `init` must surface a
-        // clear error rather than panic on the empty `OnceLock`.
+        // Missing runtime wiring must fail `init` instead of panicking on the `OnceLock`.
         let mut wrapped = serde_json::Map::new();
         wrapped.insert("config".to_owned(), serde_json::json!({}));
         let ctx = GearCtx::new(

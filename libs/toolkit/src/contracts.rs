@@ -4,22 +4,16 @@ use tokio_util::sync::CancellationToken;
 
 pub use crate::api::openapi_registry::OpenApiRegistry;
 
-/// System capability: the gear belongs to the **system group**.
+/// Infrastructure that starts before application preparation: types registry,
+/// service discovery, cluster and gRPC hub.
 ///
-/// Only the platform gears the application group's preparation needs carry it:
-/// the types registry, service discovery, cluster, and the REST and gRPC
-/// hosts. The system group runs its whole startup (`pre_init`, migrations,
-/// `init`, wiring, `post_init`, transport, `start`) before the application
-/// group is prepared, so it serves while the application group waits for its
-/// GTS admission. A system gear therefore:
+/// The system group completes startup before application preparation and serves
+/// during GTS admission. System gears cannot publish via `gts_publication(...)`
+/// or depend on/consume local application gears. Early `OoP` HTTP routes allow
+/// only platform-plane and anonymous calls; tenant auth is not wired yet.
 ///
-/// - does not publish GTS documents with `gts_publication(...)`;
-/// - does not depend on (`deps`) or consume a local application gear;
-/// - serves its bootstrap routes with platform-plane auth only (public probes
-///   aside), since the tenant plane is not wired yet.
-///
-/// The general lifecycle hooks live on [`Gear`]; this trait only carries the
-/// runtime internals the platform gears are wired with.
+/// The in-process REST host starts in the application group with the full router.
+/// Lifecycle hooks live on [`Gear`]; this trait receives runtime internals.
 #[async_trait]
 pub trait SystemCapability: Send + Sync {
     /// Receive runtime internals, once, before the gear's `pre_init`.
@@ -33,12 +27,9 @@ pub trait SystemCapability: Send + Sync {
         Ok(())
     }
 
-    /// **Legacy, temporary**: runs once, after every application `init` and
-    /// the remaining proxy wiring, before the application `post_init`.
-    ///
-    /// Exists only for the types registry's in-memory ready mode, which
-    /// validates what every gear registered during `init` in one commit. It
-    /// goes away with that ready mode; nothing else should implement it.
+    /// Temporary hook for the legacy registry's in-memory ready mode only.
+    /// Validates all legacy registrations once, after application `init` and proxy
+    /// wiring, before application `post_init`. Removed with that ready mode.
     async fn legacy_finalize_after_application_init(
         &self,
         _sys: &crate::runtime::SystemContext,
@@ -47,35 +38,23 @@ pub trait SystemCapability: Send + Sync {
     }
 }
 
-/// Core gear: lifecycle hooks and DI/wiring.
-///
-/// Every gear passes through `pre_init`, `init` and `post_init` once, within
-/// its startup group (the system group first, then the application group):
+/// Core lifecycle and dependency wiring, once per gear within its startup group.
+/// The system group completes before the application group begins.
 ///
 /// 1. [`pre_init`](Self::pre_init), before the group's DB migrations;
-/// 2. [`init`](Self::init), after the group's migrations (and, in the
-///    application group, after the GTS admission of every publication);
-/// 3. [`post_init`](Self::post_init), after every `init` of the group and the
-///    proxy wiring of its consumed clients, before its routes and `start`.
+/// 2. [`init`](Self::init), after migrations and, for applications, GTS admission;
+/// 3. [`post_init`](Self::post_init), after all group `init`s and consumed-client
+///    wiring, before routes and `start`.
 ///
-/// For a gear with a configured database handle, DB migrations have already
-/// run when `init` is called, so such a gear may rely on its own migrated
-/// schema there. Gears without a configured database get no such guarantee.
-/// Use `init` to build the gear's own state and register its own client(s).
-/// Do **not** call other gears there: ordinary consumed-contract clients
-/// (`#[toolkit::consumes]`) are wired *after* all `init`s of the group
-/// complete, so resolve them lazily on first use or in `post_init`. The one
-/// exception is the registry clients the application group's GTS publication
-/// needs, wired before its `init`.
+/// `init` can use its configured, migrated database and register local clients.
+/// Ordinary `#[toolkit::consumes]` clients may be absent until proxy wiring;
+/// resolve them in `post_init` or lazily. System-provider and publication registry
+/// clients are wired earlier; `deps` can order local client registration.
 #[async_trait]
 pub trait Gear: Send + Sync + 'static {
-    /// Optional hook before the DB migrations of the gear's group; also run
-    /// in migration-only mode.
-    ///
-    /// Its context carries no database handle and no admitted GTS manifest:
-    /// nothing is migrated or published yet, and no other gear of the group
-    /// has initialized, so it must not rely on any provider of its group.
-    /// Default: nothing.
+    /// Optional hook before this group's migrations; also runs in migration-only mode.
+    /// The context has no DB handle or admitted manifest. No gear in this group has
+    /// initialized yet, so do not rely on its providers. Default: no-op.
     ///
     /// # Errors
     /// Returns an error to fail startup.
@@ -85,13 +64,10 @@ pub trait Gear: Send + Sync + 'static {
 
     async fn init(&self, ctx: &crate::context::GearCtx) -> anyhow::Result<()>;
 
-    /// Optional hook after every `init` of the gear's group and the proxy
-    /// wiring of its consumed clients, before the group's routes and `start`.
-    /// In the application group it also follows the legacy registry
-    /// finalization.
-    ///
-    /// It must not wait for a remote service: the group's listeners are not
-    /// serving its routes yet. Default: nothing.
+    /// Optional hook after the group's `init`s and proxy wiring, before routes and
+    /// `start`. Application hooks also follow legacy registry finalization.
+    /// Do not wait for remote services: this group's routes are not served yet.
+    /// Default: no-op.
     ///
     /// # Errors
     /// Returns an error to fail startup.
@@ -181,26 +157,6 @@ pub trait ApiGatewayCapability: Send + Sync + 'static {
 
     // Return OpenAPI registry of the gear, e.g., to register endpoints
     fn as_registry(&self) -> &dyn OpenApiRegistry;
-
-    /// Serve the routes of the system gears before the application
-    /// group is prepared: probes, and platform-plane calls with the
-    /// platform credential; every other request gets `503`. Called once,
-    /// after [`rest_prepare`](Self::rest_prepare) and before the host starts;
-    /// [`rest_finalize`](Self::rest_finalize) later replaces these routes on
-    /// the same listener with the full surface.
-    ///
-    /// A host that cannot replace its routes while serving cannot be a
-    /// system gear; the default refuses.
-    ///
-    /// # Errors
-    /// The host does not support early serving, or the routes do not build.
-    fn rest_bootstrap(
-        &self,
-        _ctx: &crate::context::GearCtx,
-        _router: Router,
-    ) -> anyhow::Result<()> {
-        anyhow::bail!("this REST host cannot serve routes before the application group starts")
-    }
 
     /// The bound REST base URL (e.g. `http://127.0.0.1:8080`) once the gateway's
     /// server is listening, or `None` before the listener binds.

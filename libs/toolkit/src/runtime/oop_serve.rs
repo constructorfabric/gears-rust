@@ -890,23 +890,17 @@ impl OopHttpServer {
         Ok(())
     }
 
-    /// Publish the system gears' routes before the application group
-    /// started: platform-plane and anonymous calls are served, a
-    /// tenant-plane call (and any unknown path) gets `503`. No tenant
-    /// authenticator is installed yet, and a tenant route must not be served
-    /// without one. Startup is not complete and nothing is advertised: see
-    /// [`start_presence`](Self::start_presence).
+    /// Serve system platform-plane and anonymous routes before application startup;
+    /// tenant routes and unknown paths return `503` until tenant auth is installed.
+    /// Does not mark startup complete or advertise; see [`start_presence`](Self::start_presence).
     pub(super) fn publish_bootstrap_routes(
         &mut self,
         gear_router: Router,
         openapi_json: String,
         route_auth: RouteAuthPolicy,
     ) {
-        // Only platform and anonymous routes pass the gate, so the auth stack
-        // inside it has no tenant plane: an anonymous route keeps its anonymous
-        // `SecurityContext`, whatever `auth_disabled` says, and no tenant route
-        // reaches it to be refused or warned about. Tenant authentication is
-        // installed with the final routes.
+        // The outer gate blocks tenant calls. Keep anonymous contexts anonymous,
+        // even with `auth_disabled`; install tenant auth with the final routes.
         let authenticated = layer_route_auth_with(
             gear_router,
             route_auth.without_tenant_routes(),
@@ -957,13 +951,10 @@ impl OopHttpServer {
         Ok(())
     }
 
-    /// Start background directory presence (registration + heartbeat +
-    /// self-heal) of the advertised gear, carrying the `OpenAPI` document
-    /// published so far. Called again once that document changed — a system
-    /// root's, when its application group attached — it hands the running
-    /// presence the new one, which it registers without disturbing the
-    /// heartbeats, so the directory, and the gateway proxying from it, see the
-    /// routes now served; otherwise it does nothing.
+    /// Start directory registration, heartbeats and self-heal with the current
+    /// `OpenAPI` document. Later calls register a changed document without
+    /// interrupting heartbeats, so gateway discovery sees the newly served routes.
+    /// An unchanged document is a no-op.
     pub(super) fn start_presence(&mut self) {
         let openapi = self.late.openapi();
         if let Some(updates) = &self.presence_updates {
@@ -1008,11 +999,8 @@ impl OopHttpServer {
         registration_info
     }
 
-    /// Present `gear`, a provider co-hosted with the advertised gear, in the
-    /// directory at this listener's URL, with the same instance id: other
-    /// processes resolve it while the advertised gear may still be starting
-    /// (a registry the application group waits for, say). Through the
-    /// directory client, with its usual retry, heartbeat and permissions.
+    /// Advertise a co-hosted provider at this listener's URL and instance id,
+    /// even while the root starts. Uses normal directory retries and heartbeats.
     pub(super) fn start_provider_presence(&mut self, gear: String) {
         if gear == self.options.gear_name
             || self.provider_presence.iter().any(|(name, _)| *name == gear)

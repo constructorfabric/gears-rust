@@ -78,14 +78,9 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
     // Build OoP spawn configuration
     let oop_options = build_oop_spawn_options(&config, oop_backend)?;
 
-    // The platform-plane credential of this process, when
-    // `oop_http.internal_auth` configures one. Co-hosted dependencies resolve to
-    // LOCAL trait objects through the `ClientHub` and never use it. A dependency
-    // resolved in another process does: the application group publishes its
-    // GTS documents to a registry that may run in a configured child unit or
-    // elsewhere, and the resolving client's platform-plane calls carry
-    // `X-ToolKit-Internal-Token` (`cpt-cf-adr-two-plane-auth`). Without one,
-    // such calls are refused by the remote side rather than sent unauthenticated.
+    // Remote platform-plane calls carry `X-ToolKit-Internal-Token` from
+    // `oop_http.internal_auth` (cpt-cf-adr-two-plane-auth); without it they fail.
+    // Co-hosted dependencies use local ClientHub objects and need no credential.
     let internal_token_provider = match config
         .oop_http
         .as_ref()
@@ -101,8 +96,8 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
 
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
-    // OoP gears are spawned once the system group (grpc-hub among it) is up,
-    // before the application group waits for its GTS admission.
+    // OoP gears are spawned after parent publication, application startup and
+    // REST provider registration, so the parent's complete API is available.
     let run_options = RunOptions::new(
         Arc::new(config),
         db_options,
@@ -318,7 +313,7 @@ fn resolve_db_options(config: &AppConfig) -> Result<DbOptions> {
 /// Build `OoP` spawn configuration from `AppConfig`.
 ///
 /// This collects all gears with `type=oop` and prepares their spawn configuration.
-/// The actual spawning happens in the `HostRuntime` after the start phase.
+/// The actual spawning happens in the `HostRuntime` after parent startup.
 fn build_oop_spawn_options(
     config: &AppConfig,
     backend: LocalProcessBackend,

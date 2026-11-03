@@ -1,9 +1,6 @@
-//! Publish a gear's declared documents through reconciliation.
-//!
-//! The runtime wires [`Registry`] from [`PROVIDER`] and publishes each manifest with
-//! [`Publication`]. This module prepares the publisher and documents, supplies the platform context and
-//! budget, and formats publication diagnostics. The reconciliation layer owns admission,
-//! progress and retries. This module does not depend on `toolkit`.
+//! Publish gear manifests through reconciliation, using [`Registry`] from [`PROVIDER`].
+//! Supplies publisher identity, platform context, budget and diagnostics;
+//! reconciliation owns admission and retries. Independent of `toolkit`.
 
 use std::error::Error;
 use std::fmt;
@@ -30,27 +27,23 @@ pub const PROVIDER: &str = "types-registry";
 #[cfg(feature = "rest-client")]
 pub use crate::PlatformTypesRegistryApiRestResolvingClient as ResolvingClient;
 
-/// One publisher's documents, reconciled until every one is admitted.
+/// Reconcile one publisher's documents until all are admitted.
 ///
-/// The required data — registry, publisher and documents — go to [`Self::new`] or
-/// [`Self::from_manifest`]; the rest is optional. [`Self::publish`] retries retryable
-/// conditions (an absent dependency, a conflict, an unavailable registry) with jittered
-/// exponential backoff, by default from 1 s up to 30 s ([`Self::retry_backoff`]), in
-/// batches of the [`ReconcileOptions`] default size ([`Self::batch_size`]), until the
-/// publication budget ends. It uses the platform outbound marker and runs in the current
-/// task.
+/// Uses the platform outbound marker in the current task. Missing dependencies,
+/// conflicts and registry outages retry with jittered exponential backoff
+/// (default 1–30 s) and [`ReconcileOptions`]' default batch size.
+/// See [`Self::retry_backoff`] and [`Self::batch_size`].
 ///
-/// The budget, with `start` the instant `publish` starts, the absolute
-/// [`Self::deadline`] `D` and the [`Self::timeout`] duration `T`:
+/// With `start` the time `publish` begins, deadline `D` and timeout `T`:
 ///
-/// | `D`  | `T`  | the publication ends at                                    |
-/// |------|------|------------------------------------------------------------|
-/// | none | none | `start + `[`STARTUP_PUBLICATION_DEADLINE`]                 |
-/// | `D`  | none | `D`, even past `start + STARTUP_PUBLICATION_DEADLINE`      |
-/// | none | `T`  | `start + T`                                                |
-/// | `D`  | `T`  | `min(D, start + T)`                                        |
+/// | `D` | `T` | Publication ends at |
+/// |-----|-----|---------------------|
+/// | none | none | `start + `[`STARTUP_PUBLICATION_DEADLINE`] |
+/// | `D` | none | `D`, even beyond the default budget |
+/// | none | `T` | `start + T` |
+/// | `D` | `T` | `min(D, start + T)` |
 ///
-/// `D` is never renewed; `T` only caps it.
+/// Retries never renew the deadline.
 ///
 /// ```ignore
 /// Publication::new(registry, publisher, documents)
@@ -120,29 +113,25 @@ impl<'a> Publication<'a> {
 }
 
 impl<'a, F> Publication<'a, F> {
-    /// End the publication at the caller's absolute `deadline` instead of the default
-    /// budget. It covers every pass and may exceed the default; it is never renewed on
-    /// a retry. `None` keeps the default.
+    /// Use an absolute deadline for all passes, replacing the default budget
+    /// even when longer. Retries never renew it. `None` restores the default.
     pub fn deadline(mut self, deadline: impl Into<Option<tokio::time::Instant>>) -> Self {
         self.deadline = deadline.into();
         self
     }
 
-    /// End the publication `timeout` after the start of `publish`, or at the
-    /// [`Self::deadline`] if that comes first: the timeout caps the caller's deadline and
-    /// never extends it. `None` keeps no cap. Without a deadline, a `timeout` no clock can
-    /// represent fails `publish` before any request; with one, the deadline applies.
+    /// Limit publication to `timeout` from `publish`, capped by [`Self::deadline`].
+    /// `None` removes this cap. An unrepresentable timeout uses the caller's deadline
+    /// if supplied; otherwise `publish` fails before any request.
     pub fn timeout(mut self, timeout: impl Into<Option<Duration>>) -> Self {
         self.timeout = timeout.into();
         self
     }
 
-    /// Pause `initial` before the first retrying pass, then double the pause with jitter
-    /// up to `max`.
+    /// Retry with jittered exponential pauses from `initial` up to `max`.
     ///
-    /// These are the raw reconciliation values: an `initial` above `max` is clamped to
-    /// `max`, and a zero pause retries at once, as often as the budget allows. The
-    /// `gts_publication` runtime configuration rejects both before it gets here.
+    /// Unlike runtime configuration, this accepts zero pauses (immediate retries)
+    /// and clamps `initial` to `max`.
     pub fn retry_backoff(mut self, initial: Duration, max: Duration) -> Self {
         self.retry_backoff = initial;
         self.retry_backoff_max = max;
@@ -313,13 +302,12 @@ impl PublicationError {
         self.report.as_ref()
     }
 
-    /// Whether a later attempt could succeed with nothing changed on the publisher's
-    /// side: every identifier not admitted waits on a dependency, a concurrent write or
-    /// the registry's availability. A rejection, a call-level refusal (authentication,
-    /// permission, an invalid request), invalid input and cancellation are not transient.
+    /// Whether every unresolved identifier could succeed unchanged after a dependency,
+    /// concurrent-write or availability issue clears. Rejections, call-level refusals,
+    /// invalid input and cancellation are terminal.
     ///
-    /// Decided per identifier from the [`report`](Self::report): the error's own
-    /// category (`FailedPrecondition` for every incomplete reconciliation) says nothing.
+    /// Uses per-identifier [`report`](Self::report) outcomes: the shared
+    /// `FailedPrecondition` category cannot distinguish these cases.
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match &self.report {
@@ -333,9 +321,8 @@ impl PublicationError {
 }
 
 impl PublicationError {
-    /// Whether the publication stopped because its budget ran out — the caller's
-    /// deadline or the configured `timeout` — rather than on a refusal: the
-    /// report's stop reason is [`ReconcileStop::Deadline`](crate::ReconcileStop::Deadline).
+    /// Whether the budget expired: the report's stop is
+    /// [`ReconcileStop::Deadline`](crate::ReconcileStop::Deadline).
     #[must_use]
     pub fn is_expired(&self) -> bool {
         self.report

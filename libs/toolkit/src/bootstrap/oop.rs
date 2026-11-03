@@ -203,10 +203,8 @@ fn build_oop_config_and_db(
     Ok((final_config, final_logging, db_options))
 }
 
-/// The effective gear configuration of an `OoP` unit: the master's rendered
-/// `config` as base, the local file's section as override. Pure: no database,
-/// logging or directory. The runtime and the deployment publication job both
-/// use it, so they build the same GTS manifests.
+/// Merge the master's rendered gear config with local overrides, without I/O.
+/// Shared by runtime and deployment publication to produce identical manifests.
 fn effective_oop_config(
     local_config: &AppConfig,
     gear_name: &str,
@@ -250,15 +248,12 @@ fn effective_oop_config(
     }
 }
 
-/// The effective configuration of the `OoP` unit `opts` describes, as its
-/// runtime sees it — the local file with CLI overrides, merged with the
-/// master's rendered configuration from `TOOLKIT_MODULE_CONFIG` — without
-/// starting anything. For the deployment publication job
-/// ([`run_publish_gts`](super::run_publish_gts)).
+/// Load the `OoP` unit's effective config: local file and CLI overrides merged
+/// with `TOOLKIT_MODULE_CONFIG`, as for runtime startup, without starting gears.
+/// Used by [`run_publish_gts`](super::run_publish_gts).
 ///
 /// # Errors
-/// The configuration file does not load, or a rendered configuration is
-/// present but invalid.
+/// The file cannot be loaded or the rendered configuration is invalid.
 pub fn oop_publication_config(opts: &OopRunOptions) -> Result<AppConfig> {
     oop_publication_config_from(opts, rendered_config_from_env()?.as_ref())
 }

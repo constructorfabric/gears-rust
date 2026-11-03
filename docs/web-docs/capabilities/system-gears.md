@@ -10,7 +10,7 @@ System gears (`gears/system/`) are the control plane. Each is an ordinary gear b
 SDK, so it can be replaced.
 
 This repository category is broader than the runtime `system` capability. Only Types Registry,
-Service Discovery, Cluster, API Gateway and gRPC Hub start in the system group. Resolvers,
+Service Discovery, Cluster and gRPC Hub start in the system group. The API Gateway, resolvers,
 plugins and the other gears listed here run in the application group; see
 [Runtime and lifecycle](../../concepts/runtime-and-lifecycle/).
 

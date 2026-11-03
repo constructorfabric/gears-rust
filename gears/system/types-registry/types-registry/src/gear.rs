@@ -288,10 +288,8 @@ impl Gear for TypesRegistryGear {
             configured_count = static_entities.len(),
             "types_registry seed set"
         );
-        // The same declarations seed the database path; until T38 the two catalogues
-        // are independent and nothing mirrors later writes between them. Copied only
-        // when a database is bound, before the legacy catalogue consumes them.
-        // Legacy-only leaves a bound database alone: nothing here may provide a new API.
+        // Until T38, legacy and database catalogues share seeds but not later writes.
+        // Copy before legacy consumes them, only with a database in full mode.
         let db = match (mode, ctx.db()) {
             (RegistryMode::LegacyOnly, Some(_)) => {
                 tracing::warn!(
@@ -394,11 +392,8 @@ impl Gear for TypesRegistryGear {
 
 #[async_trait]
 impl SystemCapability for TypesRegistryGear {
-    /// Legacy ready mode: validate what every gear registered during `init()`
-    /// and enter ready mode, once, after the application group's `init`. The
-    /// registry is a system gear, so its ordinary `post_init` would run
-    /// before any application registration. Goes away with the in-memory
-    /// ready mode.
+    /// Validate legacy registrations and enter ready mode after all application
+    /// `init`s. Ordinary system `post_init` is too early. Removed with in-memory mode.
     async fn legacy_finalize_after_application_init(
         &self,
         _sys: &toolkit::runtime::SystemContext,

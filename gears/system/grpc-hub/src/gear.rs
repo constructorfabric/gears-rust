@@ -994,11 +994,8 @@ impl GrpcHub {
             .await
     }
 
-    /// Run `server` with the registration retries beside it, and the
-    /// installation of late batches when `late` gives the served routes and
-    /// the directory endpoint. A server that ends -- an accept error, or
-    /// shutdown -- ends the rest with it and reports at once; retries and
-    /// installations that finish leave the server running.
+    /// Run the server alongside registration retries and late-service installs.
+    /// Server completion ends both; background completion leaves it running.
     async fn serve_beside_registration<E>(
         &self,
         server: impl std::future::Future<Output = Result<(), E>>,
@@ -1025,11 +1022,9 @@ impl GrpcHub {
         outcome.context("gRPC hub server ended")
     }
 
-    /// Install each late batch of the store on the served routes, then
-    /// acknowledge it; once the store is closed, register the late gears in
-    /// the directory: they are advertised only after they are callable. A
-    /// batch whose service names are taken is refused, the served routes
-    /// unchanged.
+    /// Install and acknowledge late batches, refusing duplicate service names
+    /// without changing routes. Once the store closes, advertise the added gears;
+    /// they are callable before registration.
     async fn install_late_batches(
         &self,
         late: Option<(&DynamicRoutes, Option<String>)>,

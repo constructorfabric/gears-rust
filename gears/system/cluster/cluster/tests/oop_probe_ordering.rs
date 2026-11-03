@@ -68,21 +68,9 @@ static GATE_REACHED_START: tokio::sync::Semaphore = tokio::sync::Semaphore::cons
 static CLUSTER_WAS_STARTED_BEFORE_INIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// A gear whose only behaviour is to make the start phase observably long.
-///
-/// It is not a stand-in for cluster — cluster's own gear starts in this same
-/// process, from this same config, and publishes its profiles before this gear is
-/// reached (cluster runs in the system group).
-/// This gear exists only to keep the *phase* from finishing, so the pre-attach
-/// probe assertions are taken at a known point rather than a lucky one.
-/// It also carries a second observation, cheap because this gear is already in the
-/// right place to make it: **cluster's `start` runs before an application gear's
-/// `init` with no `deps` edge anywhere in this process.** The system group
-/// starts before the application group initializes. That lets a consumer omit
-/// `deps = [cluster]` — which it must, because `deps` naming an unlinked gear is a
-/// hard `RegistryError::UnknownDependency` and a Profile 3 consumer links no cluster
-/// gear (`tests/consumer_wiring.rs`). The claim is load-bearing enough to measure
-/// rather than cite.
+/// Holds application `start` open for deterministic probe assertions.
+/// Its `init` also checks that the real cluster gear has bound its profiles,
+/// relying on system-group ordering without a `deps` edge (see `consumer_wiring.rs`).
 #[toolkit::gear(name = "d1-start-gate", capabilities = [stateful])]
 #[derive(Default)]
 struct StartGate;
@@ -104,11 +92,8 @@ impl toolkit::Gear for StartGate {
 #[async_trait]
 impl toolkit::contracts::RunnableCapability for StartGate {
     async fn start(&self, _cancel: CancellationToken) -> anyhow::Result<()> {
-        // Announce that `init` has run and the observation is recorded, so the
-        // test can read `CLUSTER_WAS_STARTED_BEFORE_INIT` with a happens-before rather
-        // than racing the spawned lifecycle task to it. Posted before the block
-        // below, so the test's ordering assertion is unblocked while the phase is
-        // still held open here.
+        // Publish the init observation before blocking, so the test can read it
+        // while application startup remains held open.
         GATE_REACHED_START.add_permits(1);
 
         // Blocks until the test grants a permit. `forget` so a second start (there
@@ -364,22 +349,15 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
 
     let lifecycle = tokio::spawn(run_oop_serving(run, serve));
 
-    // 0. Wait until the application start phase has reached the gate gear (after
-    //    the system group, including cluster, has started). This
-    //    is the happens-before every "during startup" assertion below relies on:
-    //    the gate gear is now parked inside its `start`, holding the phase open, so
-    //    the probe states are a genuine mid-startup snapshot and
-    //    `CLUSTER_WAS_STARTED_BEFORE_INIT` is recorded rather than at its default.
+    // 0. Wait for application `start`: cluster has started and the init
+    //    observation is recorded; the gate holds this snapshot stable.
     tokio::time::timeout(Duration::from_secs(10), GATE_REACHED_START.acquire())
         .await
         .expect("the start phase must reach the gate gear within 10s")
         .expect("the gate-reached semaphore is never closed")
         .forget();
 
-    // 1. Liveness answers while the start phase is still blocked on the gate. This
-    //    is the criterion's "binds probes before `start`", and it is checked
-    //    against a phase that provably has not returned rather than against a
-    //    stopwatch.
+    // 1. Liveness answers while application `start` is still blocked.
     let body = await_status(addr, "/healthz", 200, Duration::from_secs(10)).await;
     assert_eq!(body.trim(), "ok", "/healthz body");
     assert_eq!(
@@ -426,12 +404,8 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
         "the system endpoint must serve an OpenAPI document, got: {body}"
     );
 
-    // 4. The Profile 1 ordering fact, observed by the gate gear rather than cited:
-    //    cluster had already published its profiles before the application gear's
-    //    `init`, with no `deps` edge in this process. This is what
-    //    makes `deps = [cluster]` unnecessary - and it must be unnecessary, because
-    //    it is fatal in Profile 3 (`tests/consumer_wiring.rs`). The read is safe
-    //    because step 0 already synchronized on the gate gear having recorded it.
+    // 4. Cluster profiles were bound before application `init`, without `deps`.
+    //    Step 0 synchronized this read with the gate gear's observation.
     assert!(
         CLUSTER_WAS_STARTED_BEFORE_INIT.load(Ordering::SeqCst),
         "cluster's system-group `start` must precede application `init`, \

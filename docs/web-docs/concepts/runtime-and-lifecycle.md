@@ -23,16 +23,15 @@ registry from the declared `deps`, and wires the system from those declarations.
 
 The runtime (`HostRuntime`) drives gears in two groups. The **system group** — the few
 platform gears with the `system` capability (types registry, service discovery, cluster,
-API gateway, gRPC hub) — runs its whole startup first; the **application group** (every
+gRPC hub) — runs its whole startup first; the **application group** (every
 other gear) follows. Each group runs the same ordered phases, every gear's hooks once, in
 dependency order:
 
 ```text
-system group:      pre_init → DB migration → init → client wiring → post_init → REST/gRPC → start
-                   → OoP spawn
+system group:      pre_init → DB migration → init → client wiring → post_init → gRPC → start
 application group: pre_init → DB migration → GTS publication (admission barrier) → init
                    → client wiring → post_init → REST/gRPC → start
-                   → wait for cancellation → stop (application group, then system group)
+                   → OoP spawn → wait for cancellation → stop (application group, then system group)
 ```
 
 - **`pre_init`** — optional hook of any gear before its group's migrations run.
@@ -46,8 +45,10 @@ application group: pre_init → DB migration → GTS publication (admission barr
   after every `init` of the group completed and its consumed clients are wired.
 - **REST / gRPC wiring** — routes and gRPC services are registered.
 - **`start`** — background work starts for stateful gears.
-- **`OoP spawn`** — out-of-process gears are spawned once the system group started, so they
-  can connect to the directory endpoint.
+- **`OoP spawn`** — out-of-process gears are spawned after the parent has completed
+  application startup and advertised its REST endpoints. Parent GTS publication must use
+  a local or already available external registry and must not depend on its children.
+  The API gateway starts in the application group, once, with the complete router.
 - **Wait for cancellation** — the runtime blocks until a cancellation signal is received
   (Ctrl-C, SIGTERM, or programmatic).
 - **`stop`** — shutdown runs in **reverse dependency order** with a platform deadline.

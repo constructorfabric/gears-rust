@@ -249,27 +249,21 @@ where
     Ok(())
 }
 
-/// [`choose_plugin_instance`] restricted to candidates with a scoped `C` client
-/// in `hub` under [`ClientScope::gts_id`]. This checks registration, not health.
+/// [`choose_plugin_instance`] among entries with a scoped `C` client in `hub`
+/// under [`ClientScope::gts_id`]. Checks registration, not health.
 ///
-/// Accepts `(gts_id, content)` pairs. Unregistered entries are skipped without
-/// validation, allowing stale catalogue entries with absent or malformed content.
+/// Skips unregistered entries without validation, tolerating stale catalogue data.
 /// Registered entries retain listing order; the first wins a priority tie.
+/// Select after all plugins bind in `init` so every local candidate is visible.
 ///
-/// Every plugin of the process binds its client in its `init`, after its
-/// instance was admitted and before anything is served, so a selection made
-/// once the process is up sees every local candidate; a listed instance that
-/// no client was bound for here is never chosen.
-///
-/// Callers must pair `C` with the listing's `P` and the later scoped lookup;
-/// the types do not enforce this. Each registered entry must have content that
-/// decodes as `PluginV1<P>` with `id == gts_id`.
+/// Callers must pair `C` with the listing's `P` and subsequent scoped lookup;
+/// types do not enforce this. Registered content must decode as `PluginV1<P>`
+/// with `id == gts_id`.
 ///
 /// # Errors
-///
 /// - [`ChoosePluginError::InvalidPluginInstance`] for missing registered content
-///   (checked for all candidates before decoding) or as [`choose_plugin_instance`] reports.
-/// - [`ChoosePluginError::PluginNotFound`] when no registered instance matches the vendor.
+///   (checked before decoding), or as [`choose_plugin_instance`] reports.
+/// - [`ChoosePluginError::PluginNotFound`] if no registered instance matches the vendor.
 pub fn choose_registered_plugin_instance<'a, P, C>(
     hub: &ClientHub,
     vendor: &str,

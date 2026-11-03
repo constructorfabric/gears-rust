@@ -1,11 +1,8 @@
-//! The hub's service dispatcher: a [`Routes`] snapshot that later batches
-//! extend on the running listener.
+//! Extensible gRPC route snapshots on one running listener.
 //!
-//! A request clones the current snapshot and releases the lock before it is
-//! served, so a stream in flight keeps the snapshot it started with and an
-//! installation never waits for one. An installation builds the next snapshot
-//! from the current one plus the new installers only: installers already run
-//! are never run again.
+//! Requests clone a snapshot and serve without the lock, so installs never
+//! wait for in-flight streams. Each install extends the current snapshot
+//! using only new installers; earlier installers are not rerun.
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -32,8 +29,7 @@ impl DynamicRoutes {
         }
     }
 
-    /// Add the services of `gears` to the served routes. Under the write lock
-    /// from the read to the store: a concurrent install cannot drop them.
+    /// Add `gears` under one write lock to prevent lost concurrent installs.
     pub fn install(&self, gears: &[GearInstallers]) {
         let mut current = self.current.write();
         let mut builder = RoutesBuilder::from(current.clone());

@@ -20,9 +20,9 @@ publication retry loop or wait for admission inside a lifecycle hook.
 The runtime starts gears in two groups:
 
 - **System** (`capabilities = [system]`): Types Registry, Service Discovery, Cluster,
-  API Gateway and gRPC Hub, and nothing else. These provide the services needed during
+  and gRPC Hub, and nothing else. These provide the services needed during
   startup.
-- **Application**: all other gears, including resolvers and plugins.
+- **Application**: all other gears, including the API Gateway, resolvers and plugins.
 
 ```text
 Collect GTS declarations → Start system group → Admit schemas and instances → Start applications
@@ -38,19 +38,27 @@ finalization.
 
 1. **Validate.** Collect GTS Type Schemas and Instances from declarations and configuration.
    Reject conflicting GTS ownership or invalid startup dependencies before initializing any gear.
-2. **Start the system group.** Run its lifecycle and expose probes and platform APIs.
-   Spawn configured OoP children without waiting for their readiness.
+2. **Start the system group.** Run its lifecycle and start the system gRPC services.
+   In-process REST routes are composed after application initialization.
 3. **Publish.** Prepare application gears (`pre_init` and DB migrations), wire registry
    clients, then run all publishers concurrently. Every declared GTS Type Schema and Instance
    must be admitted before any application `init` runs.
 4. **Start applications.** Run `init`, remaining client wiring, legacy registry finalization
    and `post_init`; install final REST/gRPC services, call `start`, then register providers
    in the directory. Only then clear the `application/preparation` readiness gate.
+5. **Spawn children.** Start configured OoP executables after the parent has initialized
+   and started every gear and advertised its REST endpoints. Do not wait for child readiness.
+
+The parent must complete GTS publication without its children: its registry must be local
+or already available externally, and referenced types must be published independently.
+A registry or prerequisite type supplied only by a child cannot unblock the parent startup.
+This ordering lets the API Gateway start once with the full router and initialized AuthN
+resolver, so children can use the parent's APIs immediately.
 
 A system gear cannot declare `deps` or `consumes` on an application gear in the same process
-(bootstrap edges), nor declare `gts_publication(...)`; its bootstrap routes use platform-plane auth only
-(public probes aside). Outside bootstrap it may look up an application client per request
-through `toolkit::LazyClient` (the API Gateway resolves the AuthN resolver this way).
+(bootstrap edges), nor declare `gts_publication(...)`. Early system routes on an OoP
+listener use platform-plane auth only (public probes aside). The in-process API Gateway
+belongs to the application group and depends on the AuthN resolver.
 A non-empty publication cannot target an application provider in the same process either:
 that provider has not initialized yet.
 
@@ -64,23 +72,23 @@ See [`HostRuntime`](../../libs/toolkit/src/runtime/host_runtime.rs) for the full
 
 - **Retryable publication failure:** retry within one publication budget (120 seconds for
   ordinary startup). Reads, submissions, polling and pauses share the same deadline.
-  The system group continues serving; application initialization waits.
-- **Terminal publication failure or exhausted budget:** leave applications uninitialized and serve the system
-  group until shutdown, then return the failure, so the process exits with an error. Shutdown also
+  The system group keeps running; application initialization waits.
+- **Terminal publication failure or exhausted budget:** leave applications uninitialized and keep the system
+  group running until shutdown, then return the failure, so the process exits with an error. Shutdown also
   cancels pending publications.
 - **Invalid publication input or duplicate GTS owner:** fail before the system group starts.
 - **Other startup errors:** return an error and stop gears already started.
 
 ### Routes and readiness
 
-`/healthz` reports liveness. `/readyz` stays `503` until application startup completes and
-its dependency gates and gear healthchecks pass. While waiting for GTS admission, the bootstrap
-router serves probes and platform calls; tenant requests receive `503` with `Retry-After`.
+The in-process API Gateway starts after GTS admission and application initialization,
+with the complete REST router. It serves `/healthz` (liveness), `/readyz` (aggregated
+readiness) and `/health` (check details). There is no intermediate bootstrap router.
+A launcher can wait for `/healthz` before issuing application requests; individual gears
+may still have asynchronous business preparation or unresolved remote dependencies.
 
-Routes and readiness are separate: in-process REST routes go live before application `start`.
-The `application/preparation` gate remains set until the entire startup sequence finishes.
-An E2E launcher may wait for just this gate to clear, leaving other readiness checks to its suite;
-[`readiness.py`](../../tools/scripts/lib/readiness.py) implements this check and rejects draining servers.
+The `application/preparation` readiness gate clears after application startup and
+REST provider registration, before children spawn. It does not wait for their readiness.
 
 **OoP:** the same admission barrier applies, but the unit binds its probe server before lifecycle
 hooks. It attaches system routes after the system group's `start` and final routes after

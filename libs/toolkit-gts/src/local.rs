@@ -1,36 +1,24 @@
-//! Crate-local GTS declaration collectors.
-//!
-//! The crate-root macros (`toolkit_gts::{gts_type_schema, gts_instance,
-//! gts_instance_raw}`) submit into one process-wide inventory: whoever reads
-//! it sees every declaration linked into the process, whichever crate made
-//! it. A gear publishing its own declarations to a remote types-registry
-//! needs to know which ones are its own, so a crate opts into a collector of
-//! its own:
+//! Crate-local GTS declaration collectors for publishing a gear's own documents.
+//! Crate-root macros collect all linked declarations process-wide; `local` macros
+//! additionally submit to the declaring crate's collector, using the same inputs.
 //!
 //! ```ignore
 //! // At the crate root:
 //! toolkit_gts::declare_gts_inventory!();
 //!
-//! // Anywhere in the crate, instead of the crate-root macros:
+//! // Anywhere in that crate:
 //! #[toolkit_gts::local::gts_type_schema(/* same arguments */)]
 //! pub struct MySpecV1 { /* ... */ }
 //! toolkit_gts::local::gts_instance_raw!({ "id": "...", /* ... */ });
 //! ```
 //!
-//! The `local` macros take the same input as the crate-root ones and submit
-//! each declaration twice: into the crate's own collector, read by the
-//! generated `gts_declarations()`, and into the process-wide inventory, so
-//! readers of the latter — an embedded types-registry — keep seeing it.
-//!
-//! `declare_gts_inventory!()` defines the collector (`__toolkit_gts_inventory`)
-//! and `pub fn gts_declarations() -> Vec<(String, String)>` at the crate root:
-//! the crate's declarations as `(GTS id, JSON text)`, std types only, so no
-//! `toolkit_gts` or `gts` type crosses the crate boundary. A `local` macro in
-//! a crate without the declaration fails to compile with
-//! "could not find `__toolkit_gts_inventory` in the crate root".
-//!
-//! A gear merges its own crates' declarations with [`DeclarationMerge`]
-//! ([`merge_declarations`]).
+//! `declare_gts_inventory!()` defines `__toolkit_gts_inventory` and
+//! `pub fn gts_declarations() -> Vec<(String, String)>`: `(GTS id, JSON text)`
+//! pairs using only std types across crate boundaries. A `local` macro without
+//! that declaration fails to compile because the collector is missing.
+//! Process-wide readers, including an embedded types-registry, still see every
+//! declaration. Merge a gear's crate collectors with [`merge_declarations`]
+//! or [`DeclarationMerge`].
 
 use std::collections::BTreeMap;
 
@@ -114,15 +102,12 @@ impl DeclarationSource {
     }
 }
 
-/// Merges declarations into one list of `(GTS id, content)` sorted by id: crate
-/// collectors' `(GTS id, JSON text)` ([`Self::add_source`]) and typed documents a gear
-/// builds at runtime ([`Self::add_documents`]).
+/// Merge crate collectors ([`Self::add_source`]) and typed runtime documents
+/// ([`Self::add_documents`]) into `(GTS id, content)` pairs sorted by id.
 ///
-/// Each id is parsed once, where it enters: a [`GtsId`] keeps its spelling and accepts
-/// one spelling per identifier, so ids compare as text. An id declared more than once
-/// with the same canonical content (see [`same_canonical_content`]) is kept once.
-/// [`Self::finish`] reports every problem together: an invalid id or JSON text, naming
-/// its origin, and ids declared with different content, naming both origins.
+/// Collector ids are parsed once and compared as text. Equal duplicates collapse
+/// by [`same_canonical_content`]. [`Self::finish`] reports all invalid ids/JSON
+/// and content conflicts together, naming their origins.
 #[derive(Debug, Default)]
 pub struct DeclarationMerge {
     merged: BTreeMap<String, (GtsId, serde_json::Value, String)>,

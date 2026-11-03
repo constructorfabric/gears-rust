@@ -70,14 +70,9 @@ struct ClusterGear {
     hub: OnceLock<Arc<ClientHub>>,
     /// Parsed operator config, captured in `init` and consumed in `start`.
     config: OnceLock<ClusterConfig>,
-    /// The profile index: created **empty** in `init` and populated by `start`
-    /// (DESIGN §5.2).
-    ///
-    /// The split matters. Services and the healthcheck are collected before
-    /// `start` runs, so they must capture this registry rather than a backend
-    /// (§4.2's lifecycle constraint) — and a request arriving in the window
-    /// between the two resolves to `ProfileNotBound`, which is the correct answer
-    /// and needs no new error variant (invariant I3).
+    /// Created empty in `init`, populated in `start` (DESIGN §5.2).
+    /// gRPC services capture this live registry before `start`; requests before
+    /// binding return `ProfileNotBound` (§4.2, invariant I3).
     profiles: OnceLock<Arc<ProfileRegistry>>,
     /// The election subscription table — the only server-side coordination state
     /// (§5.4).
@@ -220,8 +215,7 @@ impl Gear for ClusterGear {
         self.config
             .set(config)
             .map_err(|_| anyhow!("{} already initialized", Self::MODULE_NAME))?;
-        // Created here, empty, because the gear's services and healthcheck are
-        // collected before `start` populates it (DESIGN §4.2, §5.2).
+        // gRPC services and healthchecks share this registry; `start` populates it.
         self.profiles
             .set(Arc::new(ProfileRegistry::new()))
             .map_err(|_| anyhow!("{} already initialized", Self::MODULE_NAME))?;

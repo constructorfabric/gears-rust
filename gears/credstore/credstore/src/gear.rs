@@ -29,9 +29,7 @@ use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::tenant_resolver::TenantResolverDir;
 use crate::infra::types_registry::GtsSecretTypeResolver;
 
-// Consumers like `oagw` resolve `CredStoreClientV1` from the ClientHub during
-// their `init`; they name `credstore` in their `deps`, so it registers its
-// client first.
+// `deps = [credstore]` ensures consumers such as `oagw` find its client during `init`.
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "credstore",

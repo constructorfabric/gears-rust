@@ -93,14 +93,6 @@ async fn finalize_main_router(
 /// Build the standalone health router (`rest_prepare` + `health_router`). This is the router
 /// the framework serves on the separate health listener in `separate`/`both` mode.
 async fn build_standalone_health_router(setup: impl FnOnce(&RestHealthcheckRegistry)) -> Router {
-    build_health_router_in(Arc::new(ClientHub::new()), setup).await
-}
-
-/// [`build_standalone_health_router`] in a runtime whose `ClientHub` is `hub`.
-async fn build_health_router_in(
-    hub: Arc<ClientHub>,
-    setup: impl FnOnce(&RestHealthcheckRegistry),
-) -> Router {
     use api_gateway::ApiGateway;
     use toolkit::Gear;
 
@@ -113,7 +105,7 @@ async fn build_health_router_in(
         "api-gateway",
         Uuid::new_v4(),
         Arc::new(JsonConfigProvider(config)),
-        hub,
+        Arc::new(ClientHub::new()),
         CancellationToken::new(),
     );
 
@@ -550,57 +542,4 @@ async fn readyz_reflects_process_readiness_state() {
     })
     .await;
     assert_eq!(get(router, "/readyz").await.status(), StatusCode::OK);
-}
-
-/// `/readyz` carries the same body as an `OoP` unit's: the lifecycle state and
-/// the runtime's unresolved readiness gates, so a client tells a process whose
-/// application group is still preparing from one draining or merely waiting
-/// for a consumed dependency.
-#[tokio::test]
-async fn readyz_reports_the_state_and_the_unresolved_gates() {
-    use toolkit::{DependencyChecker, ReadinessHealthcheck};
-
-    async fn readyz_in(deps: &Arc<DependencyChecker>) -> (StatusCode, serde_json::Value) {
-        let hub = Arc::new(ClientHub::new());
-        hub.register::<DependencyChecker>(Arc::clone(deps));
-        let router = build_health_router_in(hub, |reg| {
-            reg.register(
-                "readiness",
-                Arc::new(ReadinessHealthcheck::new(Arc::clone(deps))),
-            );
-        })
-        .await;
-        let response = get(router, "/readyz").await;
-        let status = response.status();
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (status, serde_json::from_slice(&body).expect("a JSON body"))
-    }
-
-    let preparing = Arc::new(DependencyChecker::new());
-    preparing.register_dep("application/preparation");
-    preparing.register_dep("billing");
-    let (status, body) = readyz_in(&preparing).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["state"], "starting");
-    assert_eq!(body["ready"], false);
-    let mut unresolved: Vec<String> =
-        serde_json::from_value(body["unresolved_deps"].clone()).unwrap();
-    unresolved.sort();
-    assert_eq!(unresolved, ["application/preparation", "billing"]);
-
-    let draining = Arc::new(DependencyChecker::new());
-    draining.set_draining(true);
-    let (status, body) = readyz_in(&draining).await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["state"], "draining");
-    assert_eq!(body["ready"], false);
-
-    let ready = Arc::new(DependencyChecker::new());
-    let (status, body) = readyz_in(&ready).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["state"], "ready");
-    assert_eq!(body["ready"], true);
-    assert!(body.get("unresolved_deps").is_none(), "{body}");
 }

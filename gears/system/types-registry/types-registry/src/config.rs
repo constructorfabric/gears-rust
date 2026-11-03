@@ -78,12 +78,9 @@ pub enum RegistryMode {
     /// `PlatformTypesRegistryApi` and `TypesRegistryApi`, locally and over REST.
     #[default]
     Full,
-    /// Only the legacy `TypesRegistryClient` and its v1 routes, for local legacy
-    /// consumers in a host whose new-API consumers use a remote registry: neither new
-    /// contract is registered locally or routed, a bound database gets its migrations but
-    /// no seeding or database-backed admission, and the gear is not advertised in the
-    /// service directory, so discovery of either new contract can only find the remote
-    /// registry.
+    /// Serve only the legacy client and v1 routes; new-API consumers resolve remotely.
+    /// A bound database is migrated but not seeded or used for admission.
+    /// Directory advertisement is disabled to keep new-API discovery remote.
     LegacyOnly,
 }
 

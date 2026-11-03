@@ -1,18 +1,10 @@
-//! The policy-engine gear: wiring and readiness.
+//! Policy-engine wiring and readiness.
 //!
-//! `init` validates the configuration, resolves the types-registry,
-//! tenant-resolver and authz-resolver clients, validates and compiles the
-//! built-in policies (any finding fails startup), builds the decision and
-//! management services, registers `dyn PolicyManagementClientV1` in
-//! `ClientHub`, registers the admission engine plugin in the types registry
-//! and scopes `dyn AdmissionEnginePluginClientV1` to its instance id.
-//!
-//! The types registry answers type lookups only once it is ready, after
-//! every `init`: `init` validates the built-ins in everything but whether
-//! their concrete resource types are known, and `post_init` (after
-//! the registry's legacy finalization) completes that check, failing
-//! startup on a finding. Nothing is served before `post_init`. The gear runs
-//! no background tasks; it is ready once initialised.
+//! `init` validates configuration, compiles built-ins, builds services and
+//! registers the management client and scoped admission plugin. Resource-type
+//! validation waits for `post_init`, after legacy registry finalization.
+//! Any validation finding fails startup. No background tasks run; the gear
+//! is ready after `post_init`.
 
 use std::sync::{Arc, OnceLock};
 

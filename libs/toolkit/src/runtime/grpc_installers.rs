@@ -37,13 +37,9 @@ impl LateBatch {
     }
 }
 
-/// Runtime-owned store for gRPC service installers.
-///
-/// The runtime sets the initial batch (the system gears' services)
-/// before the hub starts; the hub [`take`](Self::take)s it when it starts
-/// serving. Services of the application group follow as a late batch that
-/// the hub installs on the same listener and acknowledges. Each batch is
-/// installed once; earlier installers are never run again.
+/// Runtime-owned gRPC installers: the hub takes system services before serving,
+/// then installs and acknowledges application services on the same listener.
+/// Each batch runs once; earlier installers are never rerun.
 pub struct GrpcInstallerStore {
     inner: Mutex<Inner>,
     late_published: Notify,

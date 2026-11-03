@@ -364,8 +364,14 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
     register(&mut builder, PubGear::new("nil", Some(&PUB_NIL), &events));
     let fake = FakeRegistry::with(&[("a", Answer::HoldUntil(Arc::clone(&release_a)))]);
     let cancel = CancellationToken::new();
-    let runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
+    let mut runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
     let checker = Arc::clone(&runtime.dep_checker);
+    let backend = Arc::new(FakeBackend {
+        events: Some(Arc::clone(&events)),
+        readiness: Some(Arc::clone(&checker)),
+        ..FakeBackend::default()
+    });
+    runtime.oop_options = Some(children(&backend));
 
     let running = tokio::spawn(runtime.run_gear_phases());
 
@@ -374,6 +380,11 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
     })
     .await;
     assert!(has(&events, "init:registry") && has(&events, "start:registry"));
+    let spawned = backend.spawned.lock().clone();
+    assert!(
+        spawned.is_empty(),
+        "no children before admission: {spawned:?}"
+    );
     assert!(
         any_app_event(&events, &["a", "b", "c", "nil"]).is_empty(),
         "no application init before admission: {:?}",
@@ -385,16 +396,22 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
     );
 
     release_a.notify_one();
-    until("the application group to start", || {
-        checker.unresolved_deps().is_empty()
+    until("the application group and its children to start", || {
+        backend.spawned.lock().len() == 2
     })
     .await;
+    let prepared = backend.prepared_at_spawn.lock().clone();
+    assert_eq!(prepared, [true, true], "preparation completed before spawn");
     let log = events.lock().clone();
     let pos = |e: &str| log.iter().position(|x| x == e).unwrap();
     for gear in ["a", "b", "c", "nil"] {
         assert!(
             pos("start:registry") < pos(&format!("init:{gear}")),
             "{log:?}"
+        );
+        assert!(
+            pos(&format!("start:{gear}")) < pos("spawn:first"),
+            "application gears start before children: {log:?}"
         );
     }
     assert!(has(&events, "manifest1:a") && has(&events, "manifest0:nil"));
@@ -430,8 +447,10 @@ async fn a_refused_publication_fails_the_application_group_only() {
     register(&mut builder, PubGear::new("c", None, &events));
     let fake = FakeRegistry::with(&[("a", Answer::Refuse)]);
     let cancel = CancellationToken::new();
-    let runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
+    let mut runtime = runtime(builder.build_topo_sorted().unwrap(), &fake, &cancel);
     let checker = Arc::clone(&runtime.dep_checker);
+    let backend = Arc::new(FakeBackend::default());
+    runtime.oop_options = Some(children(&backend));
     let running = tokio::spawn(runtime.run_gear_phases().in_current_span());
     until("the terminal refusal to be reported", || {
         logs_contain("the application group did not start")
@@ -461,6 +480,11 @@ async fn a_refused_publication_fails_the_application_group_only() {
         events.lock()
     );
     assert!(has(&events, "stop:registry"));
+    let spawned = backend.spawned.lock().clone();
+    assert!(
+        spawned.is_empty(),
+        "a refused publication spawns no children"
+    );
 }
 
 /// A startup failing in a later start stops what started — the
@@ -774,29 +798,114 @@ async fn a_publication_policy_on_a_non_publisher_is_refused() {
     assert!(events.lock().is_empty(), "no hook ran: {:?}", events.lock());
 }
 
-/// Composing REST routes before the host prepared its router is refused, not
-/// composed onto an empty router without the host's layers.
+/// Provider routes extend the host's prepared router, and the caller receives
+/// the finalized router rather than an earlier intermediate value.
 #[tokio::test]
-async fn rest_composition_needs_the_prepared_router() {
+async fn rest_composition_preserves_the_prepared_and_finalized_host_routes() {
+    use axum::Router;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use tower::ServiceExt as _;
+
+    use crate::api::OpenApiRegistryImpl;
+    use crate::contracts::{ApiGatewayCapability, OpenApiRegistry, RestApiCapability};
+    use crate::healthcheck::RestHealthcheckRegistry;
+
+    struct Host {
+        registry: OpenApiRegistryImpl,
+        phases: Events,
+    }
+
+    #[async_trait]
+    impl Gear for Host {
+        async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ApiGatewayCapability for Host {
+        fn rest_prepare(
+            &self,
+            _ctx: &GearCtx,
+            router: Router,
+            _hc_registry: Arc<RestHealthcheckRegistry>,
+        ) -> anyhow::Result<Router> {
+            self.phases.lock().push("prepare".to_owned());
+            Ok(router.route("/prepared", get(|| async { "prepared" })))
+        }
+
+        fn rest_finalize(
+            &self,
+            _ctx: &GearCtx,
+            router: Router,
+            _hc_registry: Arc<RestHealthcheckRegistry>,
+        ) -> anyhow::Result<Router> {
+            self.phases.lock().push("finalize".to_owned());
+            Ok(router.route("/finalized", get(|| async { "finalized" })))
+        }
+
+        fn as_registry(&self) -> &dyn OpenApiRegistry {
+            &self.registry
+        }
+    }
+
+    struct Provider(Events);
+
+    #[async_trait]
+    impl Gear for Provider {
+        async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RestApiCapability for Provider {
+        fn register_rest(
+            &self,
+            _ctx: &GearCtx,
+            router: Router,
+            _openapi: &dyn OpenApiRegistry,
+        ) -> anyhow::Result<Router> {
+            self.0.lock().push("register".to_owned());
+            Ok(router.route("/provider", get(|| async { "provider" })))
+        }
+    }
+
+    let phases = Events::default();
+    let host = Arc::new(Host {
+        registry: OpenApiRegistryImpl::new(),
+        phases: Arc::clone(&phases),
+    });
+    let provider = Arc::new(Provider(Arc::clone(&phases)));
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("host", &[], host.clone() as Arc<dyn Gear>);
+    builder.register_rest_host_with_meta("host", host as Arc<dyn ApiGatewayCapability>);
+    builder.register_core_with_meta("provider", &[], provider.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("provider", provider as Arc<dyn RestApiCapability>);
     let runtime = runtime(
-        RegistryBuilder::default().build_topo_sorted().unwrap(),
+        builder.build_topo_sorted().unwrap(),
         &FakeRegistry::with(&[]),
         &CancellationToken::new(),
     );
 
-    let err = runtime
-        .compose_rest(
-            &[],
-            &crate::api::OpenApiRegistryImpl::new(),
-            &Arc::new(crate::healthcheck::RestHealthcheckRegistry::new()),
-        )
-        .await
-        .unwrap_err();
+    let router = runtime.run_rest_phase().await.unwrap();
 
-    assert!(
-        matches!(err, crate::registry::RegistryError::RestNotPrepared),
-        "{err}"
-    );
+    let phases_seen = phases.lock().clone();
+    assert_eq!(phases_seen, ["prepare", "register", "finalize"]);
+    for (path, expected) in [
+        ("/prepared", "prepared"),
+        ("/provider", "provider"),
+        ("/finalized", "finalized"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "route {path} survived");
+        let body = to_bytes(response.into_body(), 1024).await.unwrap();
+        assert_eq!(body.as_ref(), expected.as_bytes(), "route {path}");
+    }
 }
 
 /// The client [`WIRED_CLIENT`] puts in the hub.
@@ -1171,6 +1280,9 @@ struct FakeBackend {
     fail: Option<&'static str>,
     /// `shutdown_all` never returns, as with a child that cannot be reaped.
     hang: bool,
+    events: Option<Events>,
+    readiness: Option<Arc<crate::runtime::DependencyChecker>>,
+    prepared_at_spawn: Mutex<Vec<bool>>,
 }
 
 #[async_trait]
@@ -1181,6 +1293,17 @@ impl crate::backends::OopBackend for Arc<FakeBackend> {
             "{} did not spawn",
             config.gear_name
         );
+        if let Some(readiness) = &self.readiness {
+            self.prepared_at_spawn.lock().push(
+                !readiness
+                    .unresolved_deps()
+                    .iter()
+                    .any(|dep| dep == crate::runtime::PREPARATION_GATE),
+            );
+        }
+        if let Some(events) = &self.events {
+            events.lock().push(format!("spawn:{}", config.gear_name));
+        }
         self.spawned.lock().push(config.gear_name);
         Ok(())
     }
@@ -1221,8 +1344,8 @@ async fn a_hung_child_shutdown_does_not_block_the_gears_stop() {
     .with_shutdown_deadline(std::time::Duration::from_millis(200));
     let run = tokio::spawn(runtime.run_gear_phases());
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !events.lock().iter().any(|e| e == "start:app") {
-        assert!(tokio::time::Instant::now() < deadline, "app started");
+    while backend.spawned.lock().is_empty() {
+        assert!(tokio::time::Instant::now() < deadline, "child spawned");
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 
@@ -1249,57 +1372,113 @@ fn child(name: &str) -> crate::runtime::OopGearSpawnConfig {
     }
 }
 
-/// Children spawn before the application group; when its startup then fails
-/// — an `init` error, or a later child that does not spawn — the spawned
-/// children are stopped before the error returns, without cancelling the
-/// caller's token.
-#[tokio::test]
-async fn a_failed_startup_stops_the_children_it_spawned() {
-    for (fail_child, fail_init) in [(None, true), (Some("second"), false)] {
-        struct Failing;
-        #[async_trait]
-        impl Gear for Failing {
-            async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
-                anyhow::bail!("init refused")
-            }
-        }
-        let backend = Arc::new(FakeBackend {
-            fail: fail_child,
-            ..FakeBackend::default()
-        });
-        let mut builder = RegistryBuilder::default();
-        if fail_init {
-            builder.register_core_with_meta("app", &[], Arc::new(Failing) as Arc<dyn Gear>);
-        }
-        let cancel = CancellationToken::new();
-        let hub = Arc::new(ClientHub::new());
-        let runtime = HostRuntime::new(
-            builder.build_topo_sorted().unwrap(),
-            Arc::new(NoConfig) as Arc<dyn ConfigProvider>,
-            DbOptions::None,
-            hub,
-            cancel.clone(),
-            Uuid::new_v4(),
-            Some(crate::runtime::OopSpawnOptions {
-                gears: vec![child("first"), child("second")],
-                backend: Box::new(Arc::clone(&backend)),
-            }),
-        );
-
-        let err = runtime.run_gear_phases().await.unwrap_err();
-
-        let expected = if fail_init { "init refused" } else { "second" };
-        assert!(format!("{err:#}").contains(expected), "{err:#}");
-        assert!(backend.spawned.lock().contains(&"first".to_owned()));
-        assert!(
-            backend.stopped.load(std::sync::atomic::Ordering::SeqCst),
-            "spawned children stopped before the error returned"
-        );
-        assert!(
-            !cancel.is_cancelled(),
-            "the caller's token is not cancelled"
-        );
+fn children(backend: &Arc<FakeBackend>) -> crate::runtime::OopSpawnOptions {
+    crate::runtime::OopSpawnOptions {
+        gears: vec![child("first"), child("second")],
+        backend: Box::new(Arc::clone(backend)),
     }
+}
+
+/// An application that cannot initialize never launches its children.
+#[tokio::test]
+async fn an_application_init_failure_does_not_spawn_children() {
+    struct Failing;
+    #[async_trait]
+    impl Gear for Failing {
+        async fn init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+            anyhow::bail!("init refused")
+        }
+    }
+    let backend = Arc::new(FakeBackend::default());
+    let mut builder = RegistryBuilder::default();
+    builder.register_core_with_meta("app", &[], Arc::new(Failing) as Arc<dyn Gear>);
+    let cancel = CancellationToken::new();
+    let mut runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &cancel,
+    );
+    runtime.oop_options = Some(children(&backend));
+
+    let err = runtime.run_gear_phases().await.unwrap_err();
+
+    assert!(format!("{err:#}").contains("init refused"), "{err:#}");
+    let spawned = backend.spawned.lock().clone();
+    assert!(
+        spawned.is_empty(),
+        "an init failure spawns no children: {spawned:?}"
+    );
+    assert!(
+        !cancel.is_cancelled(),
+        "the caller's token is not cancelled"
+    );
+}
+
+/// A failed application start also holds back its children.
+#[tokio::test]
+async fn an_application_start_failure_does_not_spawn_children() {
+    let events = Events::default();
+    let backend = Arc::new(FakeBackend::default());
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear {
+            fail_start: true,
+            ..PubGear::new("app", None, &events)
+        },
+    );
+    let cancel = CancellationToken::new();
+    let mut runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &cancel,
+    );
+    runtime.oop_options = Some(children(&backend));
+
+    let err = runtime.run_gear_phases().await.unwrap_err();
+
+    assert!(format!("{err:#}").contains("start refused"), "{err:#}");
+    let spawned = backend.spawned.lock().clone();
+    assert!(
+        spawned.is_empty(),
+        "a start failure spawns no children: {spawned:?}"
+    );
+    assert!(has(&events, "stop:app"), "the failed start is cleaned up");
+}
+
+/// A later child failing to spawn stops the children and application gears
+/// already started, without cancelling the caller's token.
+#[tokio::test]
+async fn a_failed_child_spawn_stops_the_children_and_gears_it_started() {
+    let events = Events::default();
+    let backend = Arc::new(FakeBackend {
+        fail: Some("second"),
+        ..FakeBackend::default()
+    });
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::new("app", None, &events));
+    let cancel = CancellationToken::new();
+    let mut runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &cancel,
+    );
+    runtime.oop_options = Some(children(&backend));
+
+    let err = runtime.run_gear_phases().await.unwrap_err();
+
+    assert!(format!("{err:#}").contains("second"), "{err:#}");
+    let spawned = backend.spawned.lock().clone();
+    assert_eq!(spawned, ["first"]);
+    assert!(
+        backend.stopped.load(std::sync::atomic::Ordering::SeqCst),
+        "spawned children stopped before the error returned"
+    );
+    assert!(has(&events, "start:app") && has(&events, "stop:app"));
+    assert!(
+        !cancel.is_cancelled(),
+        "the caller's token is not cancelled"
+    );
 }
 
 #[allow(

@@ -263,9 +263,8 @@ enum Collector {
     GlobalAndLocal,
 }
 
-/// `inventory::submit!` of `record` (a `toolkit_gts::Inventory*` value) into
-/// the global collector and, for [`Collector::GlobalAndLocal`], wrapped in the
-/// declaring crate's `newtype` (`TypeSchema` / `Instance`) too.
+/// Submit `record` globally and, for [`Collector::GlobalAndLocal`], also
+/// wrapped in the declaring crate's `TypeSchema` or `Instance` newtype.
 fn submit(
     crate_path: &TokenStream2,
     collector: Collector,

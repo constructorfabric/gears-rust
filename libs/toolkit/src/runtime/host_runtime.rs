@@ -1,65 +1,33 @@
-//! Host Runtime - orchestrates the full `ToolKit` lifecycle
+//! Host runtime lifecycle, shared by in-process and `OoP` execution.
 //!
-//! This gear contains the `HostRuntime` type that owns and coordinates
-//! the execution of all lifecycle phases.
+//! Startup order:
+//! 1. Build manifests and policies; check GTS ownership and wiring groups
+//!    before any gear runs or writes to the registry.
+//! 2. System group: runtime wiring, `pre_init`, migrations, `init`, client
+//!    wiring, `post_init`, initial gRPC services, `start`.
+//! 3. Application preparation: `pre_init`, migrations, registry-client wiring,
+//!    then concurrent GTS publication. All manifests must be admitted before
+//!    any application `init`; the system group keeps serving if admission fails.
+//! 4. Application `init`, remaining client wiring, legacy registry finalization,
+//!    `post_init`, REST composition, late gRPC installation, `start`.
+//! 5. In-process host: advertise REST providers, then spawn configured children
+//!    without waiting for readiness. Parent publication cannot depend on them.
 //!
-//! High-level phase order:
-//! - the GTS manifest of every `gts_publication(...)` gear, built from the configuration
-//!   and checked for ownership conflicts, and the startup group of every
-//!   consumed client checked, before any gear runs or anything is written
-//! - **system group** (`capabilities = [system]`: the types registry,
-//!   service discovery, cluster, the REST and gRPC hosts), complete: runtime
-//!   wiring and `pre_init`, DB migrations, `init`, the clients a system gear
-//!   owns or provides, `post_init`, the initial REST routes (probes and
-//!   platform-plane calls) and gRPC services, `start`, directory
-//!   registration; then the configured `OoP` children spawn, without waiting
-//!   for their readiness
-//! - **application group**, prepared as a whole: `pre_init`, DB migrations,
-//!   the registry clients the publications need, then the concurrent GTS
-//!   publication of every manifest until all are admitted. No application
-//!   `init` runs before that barrier; the system group keeps serving while
-//!   it is pending or failed.
-//! - application `init`, remaining proxy-wiring (`#[toolkit::consumes]`
-//!   clients), the legacy finalization (temporary: the types registry's
-//!   in-memory ready mode), application `post_init`, the final REST routes
-//!   and the late gRPC services on the running listeners, `start`, directory
-//!   registration.
-//! - migration-only mode: runtime wiring, `pre_init` and DB migrations of
-//!   every gear (the system group first), nothing else: no `init`,
-//!   `post_init` or publication.
-//! - wait for shutdown, then stop: the application group, then the system
-//!   group, each in reverse order
+//! Hooks run once per gear, in topological order within each group. Migration-only
+//! mode runs runtime wiring, `pre_init` and migrations for all gears, system first.
+//! Shutdown stops applications before system gears, reversing each group's order.
+//! `oop_serve` owns HTTP serving, directory presence and drain in the `OoP` path;
+//! that path has no REST host, directory-register or child-spawn phases.
 //!
-//! Every gear's `pre_init`, `init` and `post_init` run once, within its own
-//! group, in topological order.
+//! # `deps` and `#[toolkit::consumes]`
 //!
-//! Both lifecycle paths — in-process (`run_phases_internal`) and `OoP`
-//! (`run_oop_serving`) — run these in the same relative order. Proxy-wiring in
-//! particular must stay before `start`: a gear resolving a consumed contract
-//! during its own `start` has to find the client in the `ClientHub` regardless
-//! of profile. The `OoP` path has no REST host, directory-register or spawn
-//! phases (`oop_serve` owns those concerns).
+//! - `deps` orders same-process `init`s and requires linked gears; an unknown
+//!   dependency fails registry construction. It cannot order remote providers.
+//! - `#[toolkit::consumes(contract, from)]` wires a local client or a resolving
+//!   proxy and gates `/readyz`, without adding an ordering edge. Wiring precedes
+//!   `post_init` and `start` in both profiles.
 //!
-//! # `deps` vs `#[toolkit::consumes]` — two different relationships
-//!
-//! These are often confused; they do different jobs (cf. systemd `After=` vs
-//! `Requires=`/`Wants=`):
-//!
-//! - **`deps = [...]`** controls **`init` ordering within one process**, and
-//!   requires the named gears to be *linked into this binary* (an unknown dep is a
-//!   build-time error). It is therefore an **in-process** concern only: in `OoP`
-//!   mode a `dep` can only name a gear in the same process. Use it solely when one
-//!   gear's `init` must run after another's in the same binary.
-//! - **`#[toolkit::consumes(contract, from)]`** declares a **runtime dependency**
-//!   that may be satisfied **locally or remotely**. It adds **no ordering** edge;
-//!   it is wired in the proxy-wiring phase (local impl wins, else a
-//!   directory-resolving proxy) and gates `/readyz` until the provider resolves.
-//!   This is the parity-safe way to depend on another gear — it behaves
-//!   identically in- and out-of-process.
-//!
-//! Rule of thumb: reach for `#[toolkit::consumes]`; use `deps` only for genuine
-//! same-process `init` ordering, never as an inter-gear-call or cross-profile
-//! guarantee.
+//! Prefer `consumes` for inter-gear calls; use `deps` for local init ordering.
 
 use axum::Router;
 use std::collections::HashSet;
@@ -158,17 +126,6 @@ fn startup_failure(outcome: AppStartup) -> Option<RegistryError> {
     }
 }
 
-/// The REST router composed so far against the in-process host.
-#[derive(Default)]
-struct RestComposition {
-    /// The shared healthcheck registry, created when the host is prepared.
-    hc_registry: Option<Arc<crate::healthcheck::RestHealthcheckRegistry>>,
-    /// Routes of the gears registered so far, before the host's middleware.
-    router: Option<Router>,
-    /// Gears whose routes are registered: each one exactly once.
-    composed: HashSet<&'static str>,
-}
-
 /// Owns the lifecycle orchestration for `ToolKit`: encapsulates all runtime
 /// state and drives gears through the full lifecycle (see gear docs).
 pub struct HostRuntime {
@@ -202,8 +159,6 @@ pub struct HostRuntime {
     /// binary links none, and submitting one would wire it in every test.
     #[cfg(test)]
     consumer_registrations: Option<Vec<&'static crate::discovery::ConsumerRegistration>>,
-    /// The in-process REST router composed so far.
-    rest: parking_lot::Mutex<RestComposition>,
     cancel: CancellationToken,
     /// Ends the runtime's own background tasks (readiness probes, the drain
     /// watcher) when startup fails or the runtime is dropped, without
@@ -276,7 +231,6 @@ impl HostRuntime {
             wired: parking_lot::Mutex::new(HashSet::new()),
             #[cfg(test)]
             consumer_registrations: None,
-            rest: parking_lot::Mutex::new(RestComposition::default()),
             owned,
             _owned_on_drop: owned_on_drop,
             cancel,
@@ -357,11 +311,8 @@ impl HostRuntime {
         self.run_pre_init_phase_for(&self.by_group()).await
     }
 
-    /// `PRE_INIT` phase of `entries`, before their migrations and `init`:
-    /// first the runtime internals into each system gear
-    /// ([`SystemCapability::wire_runtime`](crate::contracts::SystemCapability::wire_runtime)),
-    /// then every gear's `pre_init`, in the given order. The `pre_init`
-    /// context has no database handle and no admitted GTS manifest.
+    /// Wire system runtime internals, then run `entries`' `pre_init`s in order,
+    /// before their migrations. Contexts have no DB handle or admitted manifest.
     async fn run_pre_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
         tracing::info!(gears = entries.len(), "Phase: pre_init");
 
@@ -620,17 +571,10 @@ impl HostRuntime {
         self
     }
 
-    /// The body of the proxy-wiring phase, taking the registrations so tests can
-    /// drive it with a locally-built registration instead of the link-time-global
-    /// `inventory` set from [`Self::consumer_registrations`] (which would leak a
-    /// dep onto other tests).
-    ///
-    /// A registration already wired (the registry clients are wired before
-    /// the application group, the rest after its `init`) is skipped: each one
-    /// is wired once. Registrations are told apart by address, so two
-    /// contracts of one provider are two registrations.
-    ///
-    /// Sync, not `async`: the readiness probe is `tokio::spawn`ed, not awaited.
+    /// Wire registrations once, deduplicated by address so contracts sharing a
+    /// provider remain distinct. Registry clients may already be wired early.
+    /// Explicit `regs` let tests avoid process-wide inventory registrations.
+    /// Readiness probes are spawned, not awaited.
     fn wire_consumer_registrations(
         &self,
         regs: &[&crate::discovery::ConsumerRegistration],
@@ -645,8 +589,7 @@ impl HostRuntime {
         self.wire_untracked(&regs)
     }
 
-    /// The body of [`Self::wire_consumer_registrations`], wiring every one of
-    /// `regs` once more.
+    /// Wire `regs` without deduplication; callers manage which registrations run.
     fn wire_untracked(
         &self,
         regs: &[&crate::discovery::ConsumerRegistration],
@@ -885,10 +828,8 @@ impl HostRuntime {
         Ok(outcomes)
     }
 
-    /// Build the GTS manifest of every publishing gear from the effective
-    /// configuration and check that no GTS id has two publishers, before any
-    /// gear runs. A manifest is never rebuilt afterwards: the admitted one is
-    /// what an application `init` reads.
+    /// Build manifests and policies once, checking ownership before any gear runs.
+    /// Application `init` reads the admitted manifest without rebuilding it.
     fn build_gts_manifests(&self) -> Result<Vec<GtsPublicationPlan>, RegistryError> {
         let mut manifests = Vec::new();
         for entry in self.registry.gears() {
@@ -946,21 +887,14 @@ impl HostRuntime {
         Ok(manifests)
     }
 
-    /// Wire the registry clients the publications need, in the application
-    /// group after its migrations and before the GTS barrier: the publisher
-    /// client of every non-empty manifest, then every consumer
-    /// registration of a provider such a manifest publishes to (a consumed
-    /// tenant API of the same registry, say). A local provider wins; otherwise
-    /// a resolving client with the platform credential. The other
-    /// registrations are wired after application `init`, so a local
-    /// application provider is never shadowed by a proxy. An empty manifest
-    /// needs no registry: its publisher client is not wired, and nothing
-    /// waits for its provider.
+    /// Before the GTS barrier, wire non-empty manifests' registry clients and
+    /// consumed contracts of those providers. Prefer local clients; otherwise use
+    /// resolving proxies with platform credentials. Other consumers wait for
+    /// application `init` so proxies cannot shadow local application providers.
+    /// Empty manifests need no publisher client or readiness dependency.
     ///
-    /// A provider gear in this process that advertises itself but does not
-    /// provide the contract locally would make the publication call itself
-    /// forever; that is a configuration error (an embedded registry without
-    /// its database, say).
+    /// Refuse a local advertised provider missing the contract: discovery would
+    /// route publication back to itself (e.g. an embedded registry without a DB).
     fn wire_registry_clients(&self, manifests: &[GtsPublicationPlan]) -> Result<(), RegistryError> {
         self.wire_registry_clients_over(manifests, &self.consumer_registrations())
     }
@@ -1031,10 +965,9 @@ impl HostRuntime {
             .map(GearEntry::is_system)
     }
 
-    /// Refuse, before any gear runs, a client the runtime would wire before
-    /// its provider in this process initialized, where the proxy would shadow
-    /// the local client for good: a system gear consuming an application
-    /// gear, or a non-empty publication to an application gear.
+    /// Reject early wiring to a local application provider before any gear runs:
+    /// a system consumer or non-empty publication would cache a proxy before the
+    /// provider registers its local client.
     fn check_wiring_groups(
         &self,
         manifests: &[GtsPublicationPlan],
@@ -1070,12 +1003,9 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Wire, after the system group's `init`, every consumer registration a
-    /// system gear of this process owns or provides: a local system provider
-    /// is in the hub by then, so it wins, and a system consumer has its
-    /// client before its `post_init` and `start`. The others wait for the
-    /// application group's `init`, so a local application provider is never
-    /// shadowed by a proxy.
+    /// After system `init`, wire registrations owned or provided by system gears.
+    /// Local system clients now win over proxies and are ready for `post_init`.
+    /// Others wait for application `init` to avoid shadowing its local providers.
     fn wire_system_clients(
         &self,
         all: &[&'static crate::discovery::ConsumerRegistration],
@@ -1124,10 +1054,8 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Legacy finalization, once: after every application `init` and the
-    /// remaining proxy wiring, before the application `post_init`. Temporary:
-    /// it serves only the types registry's in-memory ready mode, which commits
-    /// what the gears registered during `init` at once.
+    /// Finalize legacy in-memory registrations once, after all application `init`s
+    /// and proxy wiring, before application `post_init`. Removed with ready mode.
     async fn run_legacy_finalization(&self) -> Result<(), RegistryError> {
         let sys_ctx = self.system_context();
         for entry in self.registry.gears() {
@@ -1144,13 +1072,9 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// The GTS barrier: publish every manifest of the application group
-    /// concurrently and wait until each one is admitted. Then record the
-    /// admitted manifests for the application contexts.
-    ///
-    /// A backend that does not bind is a local configuration error. A
-    /// refusal or an expiry fails the preparation ([`AppStartup::Failed`]): no
-    /// application `init` runs, and it is not retried.
+    /// Await all manifests' admission concurrently, then store them for application contexts.
+    /// Backend binding errors fail startup. Refusal or expiry returns
+    /// [`AppStartup::Failed`] without application `init` or a startup retry.
     async fn run_gts_publication_barrier(
         &self,
         manifests: &[GtsPublicationPlan],
@@ -1215,136 +1139,10 @@ impl HostRuntime {
             .find_map(|e| e.caps.query::<ApiGatewayCap>().map(|host| (e, host)))
     }
 
-    /// Prepare the REST host once and return the shared healthcheck registry.
-    fn prepare_rest_host(
-        &self,
-        host_entry: &GearEntry,
-        host: &Arc<dyn crate::contracts::ApiGatewayCapability>,
-        host_ctx: &crate::context::GearCtx,
-    ) -> Result<Arc<crate::healthcheck::RestHealthcheckRegistry>, RegistryError> {
-        let mut rest = self.rest.lock();
-        if let Some(hc_registry) = &rest.hc_registry {
-            return Ok(Arc::clone(hc_registry));
-        }
-        // Healthcheck registry, passed explicitly to the REST host and providers below
-        // (not via ClientHub). Seeded with the host's shutdown token so in-flight checks
-        // are aborted on shutdown.
-        let hc_registry = Arc::new(
-            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
-                host_ctx.cancellation_token().clone(),
-            ),
-        );
-
-        // Bridge the process-level eventual-readiness state into the served
-        // probe: while any consumed dependency is unresolved, the application
-        // group is not started (or the process is draining) this synthetic
-        // check reports Unhealthy, so the gateway's `/readyz` returns 503.
-        // (`/healthz` is a static liveness handler and is unaffected.)
-        hc_registry.register(
-            "readiness",
-            Arc::new(super::readiness::ReadinessHealthcheck::new(
-                self.dep_checker.clone(),
-            )),
-        );
-
-        // Host prepare: base Router / global middlewares / basic OAS meta
-        let router = host
-            .rest_prepare(host_ctx, Router::new(), hc_registry.clone())
-            .map_err(|source| RegistryError::RestPrepare {
-                gear: host_entry.name,
-                source,
-            })?;
-        rest.hc_registry = Some(Arc::clone(&hc_registry));
-        rest.router = Some(router);
-        Ok(hc_registry)
-    }
-
-    /// Register the REST routes of `entries` not registered yet onto the
-    /// composed router, in the given order.
-    async fn compose_rest(
-        &self,
-        entries: &[&GearEntry],
-        registry: &dyn crate::contracts::OpenApiRegistry,
-        hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
-    ) -> Result<Router, RegistryError> {
-        let mut router = self
-            .rest
-            .lock()
-            .router
-            .take()
-            .ok_or(RegistryError::RestNotPrepared)?;
-        for e in entries {
-            let Some(rest) = e.caps.query::<RestApiCap>() else {
-                continue;
-            };
-            if !self.rest.lock().composed.insert(e.name) {
-                continue;
-            }
-            let ctx = self.ctx_builder.for_gear(e.name).await.map_err(|err| {
-                RegistryError::RestRegister {
-                    gear: e.name,
-                    source: err,
-                }
-            })?;
-
-            router = rest
-                .register_rest(&ctx, router, registry)
-                .map_err(|source| RegistryError::RestRegister {
-                    gear: e.name,
-                    source,
-                })?;
-
-            // Register the gear's readiness healthcheck after successful route registration.
-            if let Some(hc) = rest.healthcheck(&ctx) {
-                hc_registry.register(e.name, hc);
-            }
-        }
-        self.rest.lock().router = Some(router.clone());
-        Ok(router)
-    }
-
-    /// Early REST phase: when the REST host is a system gear, serve the
-    /// routes of the system gears before the application group is prepared
-    /// (probes and platform-plane calls; everything else `503`).
-    async fn run_rest_bootstrap_phase(&self, system: &[&GearEntry]) -> Result<(), RegistryError> {
-        let Some((host_entry, host)) = self.rest_host() else {
-            return Ok(());
-        };
-        if !host_entry.is_system() {
-            return Ok(());
-        }
-        tracing::info!("Phase: rest (bootstrap routes)");
-        let host_ctx = self
-            .ctx_builder
-            .for_gear(host_entry.name)
-            .await
-            .map_err(|e| RegistryError::RestPrepare {
-                gear: host_entry.name,
-                source: e,
-            })?;
-        let hc_registry = self.prepare_rest_host(host_entry, &host, &host_ctx)?;
-        let in_order: Vec<&GearEntry> = self
-            .registry
-            .gears()
-            .iter()
-            .filter(|e| system.iter().any(|i| i.name == e.name))
-            .collect();
-        let router = self
-            .compose_rest(&in_order, host.as_registry(), &hc_registry)
-            .await?;
-        host.rest_bootstrap(&host_ctx, router)
-            .map_err(|source| RegistryError::RestPrepare {
-                gear: host_entry.name,
-                source,
-            })
-    }
-
     /// REST phase: compose the full router against the REST host.
     ///
-    /// Prepares the host unless the bootstrap phase did, registers the routes
-    /// of every gear not registered yet (the system gears' are kept),
-    /// then finalizes with `OpenAPI` endpoints. A host serving already swaps
-    /// the new routes in on its listener.
+    /// Prepares the host, registers every gear's routes, then finalizes with
+    /// `OpenAPI` endpoints before the application group's REST host starts.
     async fn run_rest_phase(&self) -> Result<Router, RegistryError> {
         tracing::info!("Phase: rest (sync)");
 
@@ -1384,13 +1182,50 @@ impl HostRuntime {
                 gear: host_entry.name,
                 source: e,
             })?;
-        let hc_registry = self.prepare_rest_host(host_entry, &host, &host_ctx)?;
+        let hc_registry = Arc::new(
+            crate::healthcheck::RestHealthcheckRegistry::with_cancellation(
+                host_ctx.cancellation_token().clone(),
+            ),
+        );
+        // Include unresolved consumed dependencies, application preparation and
+        // draining in the gateway's aggregated readiness report.
+        hc_registry.register(
+            "readiness",
+            Arc::new(super::readiness::ReadinessHealthcheck::new(Arc::clone(
+                &self.dep_checker,
+            ))),
+        );
+        let mut router = host
+            .rest_prepare(&host_ctx, Router::new(), Arc::clone(&hc_registry))
+            .map_err(|source| RegistryError::RestPrepare {
+                gear: host_entry.name,
+                source,
+            })?;
 
-        // Register all REST providers (in the current discovery order)
-        let all: Vec<&GearEntry> = self.registry.gears().iter().collect();
-        let router = self
-            .compose_rest(&all, host.as_registry(), &hc_registry)
-            .await?;
+        // The router stays local to this single composition phase: the host's
+        // prepared routes and layers are the base for every provider's routes.
+        for entry in self.registry.gears() {
+            let Some(rest) = entry.caps.query::<RestApiCap>() else {
+                continue;
+            };
+            let ctx = self
+                .ctx_builder
+                .for_gear(entry.name)
+                .await
+                .map_err(|source| RegistryError::RestRegister {
+                    gear: entry.name,
+                    source,
+                })?;
+            router = rest
+                .register_rest(&ctx, router, host.as_registry())
+                .map_err(|source| RegistryError::RestRegister {
+                    gear: entry.name,
+                    source,
+                })?;
+            if let Some(check) = rest.healthcheck(&ctx) {
+                hc_registry.register(entry.name, check);
+            }
+        }
 
         // Host finalize: attach /openapi.json and /docs, persist Router if needed (no server start)
         host.rest_finalize(&host_ctx, router, hc_registry)
@@ -1728,11 +1563,9 @@ impl HostRuntime {
         self.owned.cancel();
         self.grpc_installers.close();
         if let Some(oop) = &self.oop_options {
-            // Bounded: the started gears' stop below must not wait on a child
-            // that cannot be reaped. Giving up drops the `shutdown_all` future and
-            // does not claim every child ended; `LocalProcessBackend` runs its
-            // shutdown on a task of its own, which goes on. Another backend must
-            // tolerate this future being dropped.
+            // Bound child shutdown so in-process gears still stop if reaping hangs.
+            // A timeout drops this wait; LocalProcessBackend's own shutdown task continues.
+            // Other backends must also tolerate a dropped shutdown future.
             if tokio::time::timeout(self.shutdown_deadline, oop.backend.shutdown_all())
                 .await
                 .is_err()
@@ -1746,10 +1579,10 @@ impl HostRuntime {
         self.run_stop_phase_guarded().await
     }
 
-    /// `OoP` SPAWN phase: spawn every configured out-of-process gear once,
-    /// as soon as the directory endpoint is bound. Their readiness is not
-    /// awaited: a child may publish what this process's application group
-    /// waits for.
+    /// `OoP` SPAWN phase: spawn configured children after parent preparation,
+    /// application start and REST provider registration. Children can use the
+    /// parent's full API; parent publication must not depend on its children.
+    /// Child readiness is not awaited.
     async fn run_oop_spawn_phase(&self) -> Result<(), RegistryError> {
         let oop_opts = match &self.oop_options {
             Some(opts) if !opts.gears.is_empty() => opts,
@@ -1872,20 +1705,10 @@ impl HostRuntime {
         }
     }
 
-    /// Directory-register phase (eventual readiness, provider side).
-    ///
-    /// After the REST server has bound, advertise the in-process REST provider
-    /// gears of `entries` in the service directory under their own gear name,
-    /// pointing at the shared gateway endpoint. Consumers resolving a provider
-    /// gear name then receive this endpoint and the gateway routes to the
-    /// provider's handlers. The system gears are advertised before the
-    /// application group is prepared, the application gears once it started.
-    ///
-    /// No-op when there is no REST host or no REST provider gears, so non-REST
-    /// deployments and existing tests are unaffected. Registers through the
-    /// `DirectoryClient` in the `ClientHub`, which uniformly targets the
-    /// in-process directory (`LocalDirectoryClient`) or the central directory
-    /// (`DirectoryGrpcClient` for `OoP`) depending on what the host wired.
+    /// Advertise `entries`' REST providers by gear name at the shared gateway URL,
+    /// after application/REST-host startup and before child spawning. Covers both
+    /// groups, through the local or remote `DirectoryClient` in `ClientHub`.
+    /// No-op without a REST host or REST providers.
     async fn run_directory_register_phase(
         &self,
         entries: &[&GearEntry],
@@ -1980,17 +1803,8 @@ impl HostRuntime {
         self.run_phases_internal(RunMode::MigrateOnly).await
     }
 
-    /// Internal implementation that runs gear phases based on the mode.
-    ///
-    /// This private method contains the actual phase execution logic and is called
-    /// by both `run_gear_phases()` and `run_migration_phases()`.
-    ///
-    /// # Modes
-    ///
-    /// - `RunMode::Full`: Executes all phases and waits for shutdown signal
-    /// - `RunMode::MigrateOnly`: Executes only pre-init and DB migration phases
-    ///   of every gear, then exits: no `init`, worker, listener, child or
-    ///   publication
+    /// Run full startup and wait for shutdown, or run only `pre_init` and migrations
+    /// for every gear in migration-only mode. Shared by both public phase runners.
     async fn run_phases_internal(self, mode: RunMode) -> anyhow::Result<()> {
         // Log execution mode
         match mode {
@@ -2043,10 +1857,8 @@ impl HostRuntime {
         }
     }
 
-    /// Draining watcher: the moment shutdown begins, flip readiness to
-    /// Draining (`/readyz` reports 503 and the orchestrator drains the pod out
-    /// of the load balancer) while in-flight requests finish. Both profiles
-    /// start it first; it ends with the runtime's owned tasks.
+    /// Mark readiness Draining as soon as shutdown begins, before requests finish.
+    /// Started first in both profiles; ends with the runtime's owned tasks.
     fn spawn_drain_watcher(&self) {
         let readiness = Arc::clone(&self.dep_checker);
         let cancel = self.cancel.clone();
@@ -2084,18 +1896,11 @@ impl HostRuntime {
         self.wire_system_clients(&regs)?;
         self.run_post_init_phase_for(&system).await?;
 
-        // Initial routes, then start: the listeners serve probes and
-        // platform-plane calls while the application group is prepared.
+        // System gRPC services run during application preparation. The REST
+        // host starts later, once every application's routes can be composed.
         let mut grpc_seen = HashSet::new();
-        self.run_rest_bootstrap_phase(&system).await?;
         self.run_grpc_initial_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&system).await?;
-
-        self.run_directory_register_phase(&system).await?;
-
-        // Children spawn now, once: one of them may host the registry or
-        // publish a base type the application group waits for.
-        self.run_oop_spawn_phase().await?;
 
         // Application group: pre-init, migrations, the registry clients, then
         // the GTS barrier.
@@ -2116,12 +1921,18 @@ impl HostRuntime {
         self.run_legacy_finalization().await?;
         self.run_post_init_phase_for(&app).await?;
 
-        // Final routes on the running listeners, then start.
+        // Compose the full REST surface before its host starts. Install the
+        // application gRPC services on the system hub, then start applications.
         let _router = self.run_rest_phase().await?;
         self.run_grpc_late_phase(&mut grpc_seen).await?;
         self.run_start_phase_for(&app).await?;
-        self.run_directory_register_phase(&app).await?;
+        let all: Vec<&GearEntry> = self.registry.gears().iter().collect();
+        self.run_directory_register_phase(&all).await?;
         self.dep_checker.mark_resolved(PREPARATION_GATE);
+
+        // Children only start once the parent can serve them. Neither the
+        // registry nor GTS prerequisites of this process may rely on a child.
+        self.run_oop_spawn_phase().await?;
         Ok(AppStartup::Started)
     }
 }
@@ -2129,7 +1940,8 @@ impl HostRuntime {
 /// Advertises in-process REST providers in the directory, each at most once.
 ///
 /// The directory-register phase enables it with the gateway endpoint, for the
-/// system group and then for the application group. Only the in-process host path enables it: in `OoP` serving, `oop_serve` owns
+/// system and application groups together, after the REST host starts. Only
+/// the in-process host path enables it: in `OoP` serving, `oop_serve` owns
 /// presence + deregister, so nothing is advertised or deregistered here.
 struct RestAdvertiser {
     instance_id: String,

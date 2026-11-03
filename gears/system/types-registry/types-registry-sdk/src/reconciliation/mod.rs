@@ -60,10 +60,9 @@ pub struct ReconcileOptions {
     pub deadline: Duration,
     /// An adapter's caller-owned deadline; never reconstructed from a remaining duration.
     pub(crate) absolute_deadline: Option<Instant>,
-    /// End the call once a pass admits nothing new and every identifier still wanted
-    /// waits on a dependency: only another writer could store that dependency. For a
-    /// caller whose desired set is complete, so a missing dependency fails at once;
-    /// conflicts and unavailability still retry under the remaining passes.
+    /// Stop when a pass admits nothing and only missing dependencies remain:
+    /// progress requires another writer. Use for a complete desired set;
+    /// conflicts and unavailability still retry.
     pub stop_when_stalled: bool,
 }
 
@@ -81,10 +80,8 @@ impl Default for ReconcileOptions {
     }
 }
 
-/// The [`ReconcileOptions::deadline`] for a gear that publishes its own entities at
-/// startup — a plugin's instance, a root type — and waits for their admission before it
-/// binds anything. With several registry instances on one database an admission can wait
-/// up to a minute for another instance's outbox, so this is twice the default deadline.
+/// Startup publication budget, twice the default, to allow for cross-instance
+/// outbox scheduling on a shared database.
 pub const STARTUP_PUBLICATION_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Successful reconciliation: all desired identifiers are admitted.

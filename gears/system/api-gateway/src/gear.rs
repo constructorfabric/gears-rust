@@ -65,12 +65,8 @@ use crate::web;
 /// typed operation specs to emit a single `OpenAPI` document.
 #[toolkit::gear(
 	name = "api-gateway",
-    // `system`: binds before the application group is prepared: probes and
-    // the system gears' platform-plane routes are served first; the full
-    // surface replaces them on the same listener (`rest_bootstrap`). The
-    // AuthN resolver client is looked up only then, in `rest_finalize`.
-	capabilities = [system, rest_host, rest, stateful],
-    deps = [grpc_hub],
+	capabilities = [rest_host, rest, stateful],
+    deps = [grpc_hub, authn_resolver],
 	lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct ApiGateway {
@@ -82,8 +78,7 @@ pub struct ApiGateway {
     pub(crate) router_cache: RouterCache<axum::Router>,
     /// Store the finalized router from REST phase for serving
     pub(crate) final_router: Mutex<Option<axum::Router>>,
-    /// `AuthN` Resolver client (resolved in `rest_finalize`, once the
-    /// application group initialized; `None` when `auth_disabled`)
+    /// `AuthN` Resolver client (resolved during init, `None` when `auth_disabled`)
     pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
     /// Inbound platform-plane authenticator (built in init from
     /// `config.internal_auth`, None in Profile 1). When present, the stack layers
@@ -92,9 +87,6 @@ pub struct ApiGateway {
     pub(crate) internal_authenticator: Mutex<Option<DynInternalAuthenticator>>,
     /// Readiness registry, set once from `rest_prepare`; `OnceLock` = lock-free reads.
     pub(crate) healthcheck_registry: OnceLock<Arc<toolkit::RestHealthcheckRegistry>>,
-    /// The runtime's readiness gates, from the `ClientHub` in `rest_prepare`;
-    /// `/readyz` reports their state like an `OoP` unit. Unset outside a runtime.
-    pub(crate) readiness_deps: OnceLock<Arc<toolkit::DependencyChecker>>,
     /// Built-once standalone health router. Served on the separate health listener in
     /// `separate`/`both` mode and merged onto the main router in `main`/`both` mode. Cached
     /// so repeat `health_router()`/`build_health_router()` calls are cheap.
@@ -113,16 +105,6 @@ pub struct ApiGateway {
     /// `gateway_proxy` is disabled.
     pub(crate) proxy_registry: Arc<toolkit_gateway::ProxyRegistry>,
 
-    /// The router the listener serves, swapped atomically: the bootstrap
-    /// routes first, the full surface after `rest_finalize`. `None` until
-    /// either is built; `serve` then builds a default router.
-    pub(crate) live_router: arc_swap::ArcSwapOption<axum::Router>,
-    /// The lifecycle token of a running `serve`, to bind the throttling key
-    /// pruner of a router swapped in later.
-    pub(crate) serve_cancel: OnceLock<CancellationToken>,
-    /// Stops the pruner paired with the router served now.
-    pub(crate) pruner_cancel: Mutex<Option<CancellationToken>>,
-
     /// Base URL other pods use to reach this gateway, published once the main
     /// listener binds (from `serve`). Read by the runtime's directory-register
     /// phase (via `ApiGatewayCapability::bound_endpoint`) to advertise in-process
@@ -130,9 +112,6 @@ pub struct ApiGateway {
     /// matching `healthcheck_registry`/`health_router`; unset until the server binds.
     pub(crate) bound_endpoint: OnceLock<String>,
 }
-
-/// The REST host of the system group; it takes no runtime internals.
-impl toolkit::contracts::SystemCapability for ApiGateway {}
 
 impl Default for ApiGateway {
     fn default() -> Self {
@@ -145,15 +124,11 @@ impl Default for ApiGateway {
             authn_client: Mutex::new(None),
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
-            readiness_deps: OnceLock::new(),
             health_router: OnceLock::new(),
             throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
-            live_router: arc_swap::ArcSwapOption::empty(),
-            serve_cancel: OnceLock::new(),
-            pruner_cancel: Mutex::new(None),
             bound_endpoint: OnceLock::new(),
         }
     }
@@ -209,11 +184,7 @@ impl ApiGateway {
         if let Some(cached) = self.health_router.get() {
             return cached.clone();
         }
-        let built = Self::health_routes(
-            hc_registry,
-            healthcheck_timeout,
-            self.readiness_deps.get().cloned(),
-        );
+        let built = Self::health_routes(hc_registry, healthcheck_timeout);
         // First build wins; a concurrent racer's `set` is a no-op (builds are sequential
         // during lifecycle setup, so this is a belt-and-braces guard).
         drop(self.health_router.set(built.clone()));
@@ -226,7 +197,6 @@ impl ApiGateway {
     fn health_routes(
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
         healthcheck_timeout: Duration,
-        readiness_deps: Option<Arc<toolkit::DependencyChecker>>,
     ) -> Router {
         Router::new()
             .route(HEALTH_DETAIL_PATH, get(web::health_detail))
@@ -234,7 +204,6 @@ impl ApiGateway {
             .route(READYZ_PATH, get(web::readyz_check))
             .layer(Extension(hc_registry))
             .layer(Extension(web::HealthcheckTimeout(healthcheck_timeout)))
-            .layer(Extension(web::ReadinessDeps(readiness_deps)))
     }
 
     /// Create a new `ApiGateway` instance with the given configuration
@@ -249,15 +218,11 @@ impl ApiGateway {
             authn_client: Mutex::new(None),
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
-            readiness_deps: OnceLock::new(),
             health_router: OnceLock::new(),
             throttle_key_pruner: Mutex::new(None),
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
-            live_router: arc_swap::ArcSwapOption::empty(),
-            serve_cancel: OnceLock::new(),
-            pruner_cancel: Mutex::new(None),
             bound_endpoint: OnceLock::new(),
         }
     }
@@ -413,21 +378,8 @@ impl ApiGateway {
     /// actually being served.
     pub(crate) fn apply_middleware_stack(
         &self,
-        router: Router,
-        authn_client: Option<Arc<dyn AuthNResolverClient>>,
-    ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
-        self.apply_middleware_stack_for(router, authn_client, false)
-    }
-
-    /// [`Self::apply_middleware_stack`]; `bootstrap` builds the stack served
-    /// before the application group started: no tenant authenticator exists
-    /// yet, so a tenant-plane request gets `503` while platform-plane and
-    /// public ones pass as in the final stack.
-    pub(crate) fn apply_middleware_stack_for(
-        &self,
         mut router: Router,
         authn_client: Option<Arc<dyn AuthNResolverClient>>,
-        bootstrap: bool,
     ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         // Build route policy once
         let route_policy = self.build_route_policy_from_specs()?;
@@ -514,9 +466,7 @@ impl ApiGateway {
         let plane_policy = route_policy.clone();
 
         // 10) Auth
-        if bootstrap {
-            router = Self::bootstrap_auth_layer(router, route_policy);
-        } else if config.auth_disabled {
+        if config.auth_disabled {
             // Build security contexts for compatibility during migration
             let default_security_context = SecurityContext::builder()
                 .subject_id(DEFAULT_SUBJECT_ID)
@@ -707,39 +657,6 @@ impl ApiGateway {
         Ok((router, throttle_key_pruner))
     }
 
-    /// The auth layer of the bootstrap stack: no tenant authenticator exists
-    /// yet, so a tenant-plane request gets `503`; public requests get an
-    /// anonymous `SecurityContext`, platform ones pass to the platform plane.
-    fn bootstrap_auth_layer(router: Router, policy: auth::GatewayRoutePolicy) -> Router {
-        router.layer(from_fn(
-            move |mut req: axum::extract::Request, next: axum::middleware::Next| {
-                let requirement = policy.requirement_of(&req);
-                req.extensions_mut()
-                    .insert(auth::ResolvedRequirement(requirement));
-                async move {
-                    match requirement {
-                        auth::AuthRequirement::Required => {
-                            use axum::response::IntoResponse as _;
-                            toolkit_canonical_errors::CanonicalError::service_unavailable()
-                                .with_retry_after_seconds(1)
-                                .with_detail(
-                                    "tenant-plane routes are served once the application \
-                                     group has started",
-                                )
-                                .create()
-                                .into_response()
-                        }
-                        auth::AuthRequirement::None => {
-                            req.extensions_mut().insert(SecurityContext::anonymous());
-                            next.run(req).await
-                        }
-                        auth::AuthRequirement::Platform => next.run(req).await,
-                    }
-                }
-            },
-        ))
-    }
-
     /// Build the HTTP router from registered routes and operations.
     ///
     /// The pruner paired with the freshly built router is dropped: this entry
@@ -874,25 +791,36 @@ impl ApiGateway {
     ) -> anyhow::Result<()> {
         let cfg = self.get_cached_config();
         let addr = Self::parse_bind_address(&cfg.bind_addr)?;
-        // A router built by `rest_bootstrap`/`rest_finalize` is served through
-        // the live dispatcher, so a later swap needs no second bind.
-        let router = if self.live_router.load().is_some() {
-            self.live_dispatcher()
-        } else {
-            self.get_or_build_router()?
-        };
+        let router = self.get_or_build_router()?;
 
         // Bound the throttling keyed stores: spawn the periodic pruner produced
         // during middleware build, tied to the lifecycle token so it stops on
         // shutdown. Without this the keyed stores grow one entry per distinct
         // (attacker-influenced) key with no eviction, and pruning off the hot
         // path avoids per-request all-shard write-locking scans under a flood.
-        // A pruner of a router swapped in later is spawned by the swap.
-        if self.serve_cancel.set(cancel.clone()).is_err() {
-            anyhow::bail!("api-gateway serve started twice");
-        }
         if let Some(pruner) = self.throttle_key_pruner.lock().take() {
-            self.spawn_pruner(pruner, &cancel);
+            // The sweep task self-terminates when `cancel` fires; a supervisor
+            // respawns it after a panic, because a dead pruner silently stops
+            // all key eviction and new keys are refused once `max_keys` is
+            // reached.
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                while !cancel.is_cancelled() {
+                    let Some(handle) = pruner.clone().spawn(cancel.clone()) else {
+                        break;
+                    };
+                    match handle.await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::error!(
+                                error = %e,
+                                "throttling key pruner task panicked; restarting (until then new keys are refused once max_keys is reached)"
+                            );
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
         }
 
         // Bind the main socket.
@@ -934,135 +862,6 @@ impl ApiGateway {
         } else {
             main_server.await.map_err(|e| anyhow::anyhow!(e))
         }
-    }
-
-    /// Resolve the `AuthN` Resolver client, now that the application group,
-    /// which provides it, initialized.
-    fn resolve_authn_client(&self, ctx: &toolkit::context::GearCtx) -> anyhow::Result<()> {
-        let authn_client = ctx.client_hub().get::<dyn AuthNResolverClient>()?;
-        *self.authn_client.lock() = Some(authn_client);
-        tracing::info!("AuthN Resolver client resolved from ClientHub");
-        Ok(())
-    }
-
-    /// A router dispatching each request to the router currently in
-    /// `live_router`, so routes swap on the bound listener.
-    fn live_dispatcher(self: &Arc<Self>) -> Router {
-        use tower::ServiceExt as _;
-        let gateway = Arc::clone(self);
-        Router::new().fallback_service(tower::service_fn(move |req: axum::extract::Request| {
-            let current = gateway.live_router.load_full();
-            async move {
-                use axum::response::IntoResponse as _;
-                let Some(router) = current else {
-                    return Ok::<_, std::convert::Infallible>(
-                        toolkit_canonical_errors::CanonicalError::service_unavailable()
-                            .with_retry_after_seconds(1)
-                            .create()
-                            .into_response(),
-                    );
-                };
-                // `Router`'s service error is `Infallible`.
-                Ok(router
-                    .as_ref()
-                    .clone()
-                    .oneshot(req)
-                    .await
-                    .unwrap_or_else(|e| match e {}))
-            }
-        }))
-    }
-
-    /// Serve `router` from now on, with `pruner` bounding its throttling
-    /// keyed stores: spawned now when `serve` runs (the previous router's
-    /// pruner stops), by `serve` otherwise. Rate limits restart with the
-    /// router's own zone instances.
-    fn install_serving_router(
-        &self,
-        router: Router,
-        pruner: middleware::throttling::ThrottleKeyPruner,
-    ) {
-        self.live_router.store(Some(Arc::new(router)));
-        match self.serve_cancel.get() {
-            Some(cancel) => self.spawn_pruner(pruner, cancel),
-            None => *self.throttle_key_pruner.lock() = Some(pruner),
-        }
-    }
-
-    /// Run `pruner` until `cancel` or the next router's pruner replaces it.
-    /// The sweep task self-terminates when its token fires; a supervisor
-    /// respawns it after a panic, because a dead pruner silently stops all
-    /// key eviction and new keys are refused once `max_keys` is reached.
-    fn spawn_pruner(
-        &self,
-        pruner: middleware::throttling::ThrottleKeyPruner,
-        cancel: &CancellationToken,
-    ) {
-        let cancel = cancel.child_token();
-        if let Some(previous) = self.pruner_cancel.lock().replace(cancel.clone()) {
-            previous.cancel();
-        }
-        tokio::spawn(async move {
-            while !cancel.is_cancelled() {
-                let Some(handle) = pruner.clone().spawn(cancel.clone()) else {
-                    break;
-                };
-                match handle.await {
-                    Ok(()) => break,
-                    Err(e) => {
-                        tracing::error!(
-                            error = %e,
-                            "throttling key pruner task panicked; restarting (until then new keys are refused once max_keys is reached)"
-                        );
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        });
-    }
-
-    /// The health probes, the proxy fallback, the middleware stack and the
-    /// prefix around `router`, as served.
-    fn surface(
-        &self,
-        mut router: Router,
-        hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
-        authn_client: Option<Arc<dyn AuthNResolverClient>>,
-        bootstrap: bool,
-    ) -> anyhow::Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
-        let config = self.get_cached_config();
-        // Health probes (`main`/`both` mode): merge them onto the main router BEFORE the
-        // middleware stack, so they share the gateway's unified surface (request id, tracing,
-        // metrics, error mapping, ...). They are marked public in the route policy (see
-        // `build_route_policy_from_specs`), so the auth layer lets them through without a bearer
-        // token. Like every other route they inherit `prefix_path` via the nesting below.
-        // `separate` mode omits them here; `serve()` binds them on the dedicated health listener.
-        if matches!(
-            config.health.serve,
-            HealthServeMode::Main | HealthServeMode::Both
-        ) {
-            let health = Self::health_routes(
-                hc_registry,
-                Duration::from_millis(config.healthcheck_timeout_ms),
-                self.readiness_deps.get().cloned(),
-            );
-            router = router.merge(health);
-        }
-
-        // Embedded-edge reverse proxy: mount the Forwarder as the router fallback so any
-        // request that doesn't match a gateway-owned route is proxied to the owning OoP
-        // gear pod. The route table is kept current by the directory-sync task started in
-        // `serve()`. Mounted BEFORE the middleware stack so proxied requests traverse the
-        // same auth / tracing / error-mapping layers as native routes.
-        if config.gateway_proxy.enabled {
-            router = self.mount_proxy_fallback(router)?;
-        }
-
-        // Middleware on the main router before nesting (auth matching keyed on
-        // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
-        let (router, pruner) = self.apply_middleware_stack_for(router, authn_client, bootstrap)?;
-        let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
-        Ok((Self::apply_prefix(router, &prefix), pruner))
     }
 
     /// Publish the endpoint other pods use to reach this gateway, so the
@@ -1446,10 +1245,12 @@ impl toolkit::Gear for ApiGateway {
                 tenant_id = %DEFAULT_TENANT_ID,
                 "Auth-disabled mode enabled with default tenant"
             );
+        } else {
+            // Resolve AuthN Resolver client from ClientHub
+            let authn_client = ctx.client_hub().get::<dyn AuthNResolverClient>()?;
+            *self.authn_client.lock() = Some(authn_client);
+            tracing::info!("AuthN Resolver client resolved from ClientHub");
         }
-        // The AuthN resolver client is resolved in `rest_finalize`: the
-        // gateway initializes with the system group, before the application
-        // group (the resolver among it) exists.
 
         // Build the inbound platform-plane authenticator (None in Profile 1).
         // Done here so a misconfigured `internal_auth` fails init rather than
@@ -1469,7 +1270,7 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
 
     fn rest_prepare(
         &self,
-        ctx: &toolkit::context::GearCtx,
+        _ctx: &toolkit::context::GearCtx,
         router: axum::Router,
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
@@ -1478,52 +1279,65 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         if self.healthcheck_registry.set(hc_registry).is_err() {
             anyhow::bail!("healthcheck_registry already set; rest_prepare called more than once");
         }
-        if let Some(deps) = ctx.client_hub().try_get::<toolkit::DependencyChecker>() {
-            drop(self.readiness_deps.set(deps));
-        }
 
         tracing::debug!("REST host prepared base router");
         Ok(router)
     }
 
-    fn rest_bootstrap(
-        &self,
-        _ctx: &toolkit::context::GearCtx,
-        router: axum::Router,
-    ) -> anyhow::Result<()> {
-        let hc_registry = self.healthcheck_registry.get().cloned().ok_or_else(|| {
-            anyhow::anyhow!("healthcheck_registry not set; call rest_prepare before rest_bootstrap")
-        })?;
-        let (router, pruner) = self.surface(router, hc_registry, None, true)?;
-        self.install_serving_router(router, pruner);
-        tracing::info!("REST host serving bootstrap routes (platform plane and probes)");
-        Ok(())
-    }
-
     fn rest_finalize(
         &self,
-        ctx: &toolkit::context::GearCtx,
+        _ctx: &toolkit::context::GearCtx,
         mut router: axum::Router,
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
         let config = self.get_cached_config();
 
-        if !config.auth_disabled {
-            self.resolve_authn_client(ctx)?;
-        }
-
         if config.enable_docs {
             router = self.add_openapi_routes(router)?;
         }
 
+        // Health probes (`main`/`both` mode): merge them onto the main router BEFORE the
+        // middleware stack, so they share the gateway's unified surface (request id, tracing,
+        // metrics, error mapping, ...). They are marked public in the route policy (see
+        // `build_route_policy_from_specs`), so the auth layer lets them through without a bearer
+        // token. Like every other route they inherit `prefix_path` via the nesting below.
+        // `separate` mode omits them here; `serve()` binds them on the dedicated health listener.
+        if matches!(
+            config.health.serve,
+            HealthServeMode::Main | HealthServeMode::Both
+        ) {
+            let health = Self::health_routes(
+                hc_registry,
+                Duration::from_millis(config.healthcheck_timeout_ms),
+            );
+            router = router.merge(health);
+        }
+
+        // Embedded-edge reverse proxy: mount the Forwarder as the router fallback so any
+        // request that doesn't match a gateway-owned route is proxied to the owning OoP
+        // gear pod. The route table is kept current by the directory-sync task started in
+        // `serve()`. Mounted BEFORE the middleware stack so proxied requests traverse the
+        // same auth / tracing / error-mapping layers as native routes.
+        if config.gateway_proxy.enabled {
+            router = self.mount_proxy_fallback(router)?;
+        }
+
+        // Middleware on the main router before nesting (auth matching keyed on
+        // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
         tracing::debug!("Applying middleware stack to finalized router");
         let authn_client = self.authn_client.lock().clone();
-        let (router, pruner) = self.surface(router, hc_registry, authn_client, false)?;
+        let (stacked, pruner) = self.apply_middleware_stack(router, authn_client)?;
+        router = stacked;
+        // Hand the keyed-store pruner paired with this router to `serve`,
+        // which owns the lifecycle CancellationToken needed to bound the
+        // background prune task.
+        *self.throttle_key_pruner.lock() = Some(pruner);
 
-        // Keep the finalized router to be used by `serve()`, and serve it
-        // from now on when `serve` already runs.
+        let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
+        router = Self::apply_prefix(router, &prefix);
+
+        // Keep the finalized router to be used by `serve()`.
         *self.final_router.lock() = Some(router.clone());
-        self.install_serving_router(router.clone(), pruner);
 
         tracing::info!("REST host finalized router with OpenAPI endpoints and auth middleware");
         Ok(router)
@@ -1703,48 +1517,6 @@ fn enrich_openapi_with_zone_limits(
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::*;
-
-    /// A router installed before `serve` parks its pruner for `serve`; one
-    /// swapped in while serving replaces the running pruner, whose token is
-    /// cancelled, and its own stops with `serve`.
-    #[tokio::test]
-    async fn a_router_swapped_in_while_serving_replaces_the_running_pruner() {
-        let gateway = ApiGateway::default();
-        let pruner = || {
-            middleware::throttling::build_maps(&[], &ApiGatewayConfig::default())
-                .expect("no zones")
-                .2
-        };
-
-        gateway.install_serving_router(Router::new(), pruner());
-        assert!(
-            gateway.throttle_key_pruner.lock().is_some(),
-            "parked for serve"
-        );
-        assert!(gateway.pruner_cancel.lock().is_none(), "nothing runs yet");
-
-        // What `serve` does once it runs.
-        let serving = CancellationToken::new();
-        gateway
-            .serve_cancel
-            .set(serving.clone())
-            .expect("first serve");
-        let parked = gateway.throttle_key_pruner.lock().take().expect("parked");
-        gateway.spawn_pruner(parked, &serving);
-        let first = gateway.pruner_cancel.lock().clone().expect("running");
-
-        gateway.install_serving_router(Router::new(), pruner());
-        let second = gateway.pruner_cancel.lock().clone().expect("running");
-
-        assert!(first.is_cancelled(), "the replaced router's pruner stops");
-        assert!(!second.is_cancelled(), "the new one runs");
-        assert!(
-            gateway.throttle_key_pruner.lock().is_none(),
-            "spawned at once, not parked"
-        );
-        serving.cancel();
-        assert!(second.is_cancelled(), "and stops with serve");
-    }
 
     #[test]
     fn enrich_openapi_adds_zone_limits_by_zone_name() {

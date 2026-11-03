@@ -838,10 +838,6 @@ pub enum RegistryError {
     RestHostNotFoundAfterValidation,
     #[error("REST host missing from entry")]
     RestHostMissingFromEntry,
-    /// Routes composed before the REST host prepared its router: a runtime
-    /// ordering bug, refused rather than composed onto an empty router.
-    #[error("REST routes composed before the REST host prepared its router")]
-    RestNotPrepared,
 
     // gRPC-related errors
     #[error("gRPC registration failed for gear '{gear}'")]

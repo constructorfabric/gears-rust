@@ -9,7 +9,7 @@ gdl_version = "1.0"
 # src/gear.rs; deps below is an exact checked mirror:
 #
 #   id             <- name = "api-gateway"
-#   runtime_caps   <- capabilities = [system, rest_host, rest, stateful]
+#   runtime_caps   <- capabilities = [rest_host, rest, stateful]
 #   colocated_deps <- deps = [grpc_hub, authn_resolver]   (link-time; uncuttable)
 #   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 #

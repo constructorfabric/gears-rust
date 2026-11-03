@@ -8,8 +8,7 @@ use chrono::{SecondsFormat, Utc};
 use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
-use toolkit::runtime::{ReadinessLifecycle, ReadinessReport};
-use toolkit::{DependencyChecker, HealthcheckStatus, RestHealthcheckRegistry};
+use toolkit::RestHealthcheckRegistry;
 
 /// Per-check timeout (from `ApiGatewayConfig::healthcheck_timeout_ms`), injected as an
 /// `Extension`. A newtype avoids colliding with any other `Duration` extension.
@@ -50,38 +49,14 @@ pub async fn health_detail(
     (status_code, body).into_response()
 }
 
-/// The runtime's readiness gates, injected as an `Extension`; `None` outside a
-/// runtime (an embedder serving the health router itself).
-#[derive(Clone)]
-pub struct ReadinessDeps(
-    /// The runtime's dependency checker, when the gateway is hosted by a runtime.
-    pub Option<Arc<DependencyChecker>>,
-);
-
-/// `GET /readyz`: runs all checks, public. 200 (Healthy/Degraded), 503
-/// (Unhealthy), with the same [`ReadinessReport`] body as an `OoP` unit's
-/// `/readyz`: the lifecycle state and the unresolved readiness gates, no
-/// per-check detail (that is `/health`).
+/// `GET /readyz`: runs all checks, public, status code only (no detail).
+/// 200 (Healthy/Degraded), 503 (Unhealthy).
 pub async fn readyz_check(
     Extension(registry): Extension<Arc<RestHealthcheckRegistry>>,
     Extension(timeout): Extension<HealthcheckTimeout>,
-    Extension(ReadinessDeps(deps)): Extension<ReadinessDeps>,
-) -> Response {
+) -> StatusCode {
     let report = registry.report(timeout.0).await;
-    let ready = report.is_ready();
-    let draining = deps.as_ref().is_some_and(|d| d.is_draining());
-    let state = match (draining, ready, report.status) {
-        (true, _, _) => ReadinessLifecycle::Draining,
-        (false, true, HealthcheckStatus::Degraded) => ReadinessLifecycle::Degraded,
-        (false, true, _) => ReadinessLifecycle::Ready,
-        (false, false, _) => ReadinessLifecycle::Starting,
-    };
-    let body = ReadinessReport {
-        state,
-        ready: ready && !draining,
-        unresolved_deps: deps.map(|d| d.unresolved_deps()).unwrap_or_default(),
-    };
-    (status_for_report(body.ready), Json(body)).into_response()
+    status_for_report(report.is_ready())
 }
 
 fn status_for_report(report_ready: bool) -> StatusCode {
