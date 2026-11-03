@@ -275,7 +275,7 @@ async fn migrate(
 
 /// The plugin's own client for `cfg`, as `Gear::init` builds it.
 fn plugin_client(cfg: &ClickHousePluginConfig) -> clickhouse::Client {
-    drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+    drop(toolkit_security::tls::configured_provider().install_default());
     build_client(cfg).expect("build the plugin client")
 }
 
@@ -1105,7 +1105,7 @@ mod gear_init {
             Arc::clone(&hub),
             CancellationToken::new(),
         );
-        drop(rustls::crypto::aws_lc_rs::default_provider().install_default());
+        drop(toolkit_security::tls::configured_provider().install_default());
         ClickHouseUsageCollectorPlugin.init(&ctx).await?;
         Ok(hub)
     }
