@@ -91,10 +91,12 @@ pub use context::{GearContextBuilder, GearCtx};
 
 // Gear system implementations for macro code
 pub mod client_hub;
+pub mod lazy_client;
 pub mod registry;
 
 // Re-export main types
 pub use client_hub::ClientHub;
+pub use lazy_client::{LazyClient, LazyClientError};
 pub use registry::GearRegistry;
 
 // Re-export the macros from the proc-macro crate
