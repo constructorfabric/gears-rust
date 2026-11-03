@@ -369,8 +369,8 @@ pre_init → DB migration → init → post_init(barrier)
         → REST wiring → gRPC wiring → start → ... → stop
 ```
 
-- System gears run first where required
-- `post_init` begins only after **all** `init` hooks complete
+- The system group (platform gears) completes first, then the application group
+- `post_init` begins only after **all** `init` hooks of its group complete
 - Shutdown runs in **reverse dependency order** with a graceful-stop deadline
 - **Cancellation tokens** propagate so background work cooperates with shutdown
 

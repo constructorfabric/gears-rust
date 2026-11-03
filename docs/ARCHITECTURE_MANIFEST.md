@@ -68,6 +68,10 @@ Constructor Fabric Gears organizes its codebase into three tiers:
 - **System gears** (`gears/system/`) — Pre-built system gears that form the control plane: inbound/outbound API gateway, authn/authz resolvers, tenant resolver, resource groups, type registry, node registry, usage collection, and related cross-cutting services.
 - **Service gears** (`gears/`) — Ready-to-use and vendor-developed business gears built on top of the platform: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and domain-specific services.
 
+The `gears/system/` category does not imply the runtime `system` capability. Only Types Registry,
+Service Discovery, Cluster, API Gateway and gRPC Hub belong to the early system group;
+resolvers and other platform gears belong to the application group.
+
 See: [GEARS.md](GEARS.md)
 
 #### 3.2.1. DDD-light layer isolation
@@ -90,7 +94,7 @@ Constructor Fabric Gears composes systems by declaration and discovery rather th
 
 Gears do not invent their own startup and shutdown semantics. The platform defines an explicit lifecycle with ordered phases, barrier points, and dependency-aware teardown, and gears integrate into that lifecycle through capabilities.
 
-**How.** `HostRuntime` runs a shared sequence of phases including `pre_init`, DB migration, `init`, `post_init`, REST wiring, gRPC wiring, start/stop, and OoP orchestration. System gears run first where required, `post_init` is a barrier phase that begins only after all `init` hooks complete, and shutdown runs in reverse dependency order with a platform deadline for graceful stop. Cancellation tokens propagate through the runtime so background work cooperates with shutdown rather than outliving the host.
+**How.** `HostRuntime` runs a shared sequence of phases including `pre_init`, DB migration, `init`, `post_init`, REST wiring, gRPC wiring, start/stop, and OoP orchestration. The few platform gears with the `system` capability form the system group, which completes its startup before the application group is prepared; within each group `post_init` is a barrier phase that begins only after all of the group's `init` hooks complete, and shutdown runs in reverse dependency order (the application group first) with a platform deadline for graceful stop. Cancellation tokens propagate through the runtime so background work cooperates with shutdown rather than outliving the host.
 
 **Why.** This gives all gears one predictable operational model. Contributors can rely on stable ordering guarantees, shared cancellation semantics, and consistent startup/shutdown behavior instead of encoding lifecycle assumptions ad hoc in each gear.
 

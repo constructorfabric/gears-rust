@@ -207,7 +207,7 @@ Keeping secret metadata in the gear's own database (rather than in the backend) 
 
 - The gear is a **stateful** gear: it requires a database (PostgreSQL or SQLite; MySQL is rejected at migration time)
 - Exactly one value-store plugin is active per deployment (selected by GTS `vendor` configuration)
-- The gear depends on `authz-resolver`, `tenant-resolver`, and `types-registry`, and initializes at system priority (its consumers, e.g. OAGW, resolve the client during their own init)
+- The gear depends on `authz-resolver`, `tenant-resolver`, and `types-registry`, and its consumers that resolve the client during their own init (e.g. OAGW) name it in their `deps`
 - No background task runs inside the gear: there is no reaper and no maintenance job ([ADR-0006](./ADR/0006-cpt-cf-credstore-adr-immutable-value-versions.md)). The process runs no background work at all: no background workers or tasks, no timers, no database polling, no deferred tasks and no work at startup. Store cleanup (removal of superseded, removed and orphaned secret versions and the purge of a deleted record's store key) is recorded as a debt in the gear's database in the transaction that makes the content dead, executed by the very request that caused it after a confirmed commit, and, when left over for a live record or a failed create, healed by a later request that touches it; a failed purge of a deleted record's key stays recorded until a possible external job; no correctness property depends on its promptness
 
 ## 4. Scope

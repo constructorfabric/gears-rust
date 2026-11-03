@@ -9,6 +9,11 @@ sidebar:
 System gears (`gears/system/`) are the control plane. Each is an ordinary gear behind an
 SDK, so it can be replaced.
 
+This repository category is broader than the runtime `system` capability. Only Types Registry,
+Service Discovery, Cluster, API Gateway and gRPC Hub start in the system group. Resolvers,
+plugins and the other gears listed here run in the application group; see
+[Runtime and lifecycle](../../concepts/runtime-and-lifecycle/).
+
 | Gear | What it does | Status |
 | --- | --- | --- |
 | **API Gateway** | Public ingress: routing, auth middleware, rate limiting, OpenAPI publication, health endpoints | ✓ |

@@ -8,6 +8,140 @@ ToolKit provides lifecycle management for gears with background tasks, graceful 
 - **Rule**: Use `WithLifecycle<T>` for stateful gears with background tasks.
 - **Rule**: Pass child tokens to background tasks for cooperative shutdown.
 - **Rule**: Implement `RunnableCapability` for custom lifecycle (rare).
+- **Rule**: Never wait for a remote service in a lifecycle hook (`pre_init`, `init`, `post_init`, `start`).
+- **Rule**: A gear that publishes GTS documents declares them with `gts_publication(...)`; the runtime handles publication retries and the admission barrier.
+
+## Runtime startup
+
+Application gears declare no group. The runtime runs DB migrations and waits for admission
+of all declared GTS Type Schemas and Instances before application `init`. Do not implement a
+publication retry loop or wait for admission inside a lifecycle hook.
+
+The runtime starts gears in two groups:
+
+- **System** (`capabilities = [system]`): Types Registry, Service Discovery, Cluster,
+  API Gateway and gRPC Hub, and nothing else. These provide the services needed during
+  startup.
+- **Application**: all other gears, including resolvers and plugins.
+
+```text
+Collect GTS declarations → Start system group → Admit schemas and instances → Start applications
+```
+
+Every gear may implement the optional `Gear::pre_init` and `Gear::post_init` hooks; each runs
+once per gear, within its own group, in dependency order. `pre_init` runs before the group's
+migrations: its context has no database handle or admitted manifest, and no other gear of the
+group has initialized. `post_init` runs after every `init` of the group and its client wiring.
+`SystemCapability` adds no general hook: it marks the system group, hands runtime internals to
+service discovery and the gRPC hub (`wire_runtime`), and carries the temporary legacy registry
+finalization.
+
+1. **Validate.** Collect GTS Type Schemas and Instances from declarations and configuration.
+   Reject conflicting GTS ownership or invalid startup dependencies before initializing any gear.
+2. **Start the system group.** Run its lifecycle and expose probes and platform APIs.
+   Spawn configured OoP children without waiting for their readiness.
+3. **Publish.** Prepare application gears (`pre_init` and DB migrations), wire registry
+   clients, then run all publishers concurrently. Every declared GTS Type Schema and Instance
+   must be admitted before any application `init` runs.
+4. **Start applications.** Run `init`, remaining client wiring, legacy registry finalization
+   and `post_init`; install final REST/gRPC services, call `start`, then register providers
+   in the directory. Only then clear the `application/preparation` readiness gate.
+
+A system gear cannot declare `deps` or `consumes` on an application gear in the same process
+(bootstrap edges), nor declare `gts_publication(...)`; its bootstrap routes use platform-plane auth only
+(public probes aside). Outside bootstrap it may look up an application client per request
+through `toolkit::LazyClient` (the API Gateway resolves the AuthN resolver this way).
+A non-empty publication cannot target an application provider in the same process either:
+that provider has not initialized yet.
+
+On shutdown, call `stop` for gears whose `start` was called: applications first, the system group
+last, in reverse order within each group. Migration-only mode runs just the runtime wiring,
+`pre_init` and migrations of every gear (system group first): no `init`, `post_init` or
+publication.
+See [`HostRuntime`](../../libs/toolkit/src/runtime/host_runtime.rs) for the full hook and wiring order.
+
+### Pending publication and failures
+
+- **Retryable publication failure:** retry within one publication budget (120 seconds for
+  ordinary startup). Reads, submissions, polling and pauses share the same deadline.
+  The system group continues serving; application initialization waits.
+- **Terminal publication failure or exhausted budget:** leave applications uninitialized and serve the system
+  group until shutdown. Shutdown also cancels pending publications.
+- **Invalid publication input or duplicate GTS owner:** fail before the system group starts.
+- **Other startup errors:** return an error and stop gears already started.
+
+### Routes and readiness
+
+`/healthz` reports liveness. `/readyz` stays `503` until application startup completes and
+its dependency gates and gear healthchecks pass. While waiting for GTS admission, the bootstrap
+router serves probes and platform calls; tenant requests receive `503` with `Retry-After`.
+
+Routes and readiness are separate: in-process REST routes go live before application `start`.
+The `application/preparation` gate remains set until the entire startup sequence finishes.
+An E2E launcher may wait for just this gate to clear, leaving other readiness checks to its suite;
+[`readiness.py`](../../tools/scripts/lib/readiness.py) implements this check and rejects draining servers.
+
+**OoP:** the same admission barrier applies, but the unit binds its probe server before lifecycle
+hooks. It attaches system routes after the system group's `start` and final routes after
+application `start`. Its HTTP server manages directory presence; it does not spawn child processes.
+
+For deployment preparation and the proposed deployment-managed mode, see
+[Types Registry deployment design](../../gears/system/types-registry/docs/DESIGN.md#deployment-preparation).
+The current runtime still runs migrations and publication reconciliation after a deployment job.
+
+## Publishing GTS documents
+
+Declare `gts_publication(...)`; the runtime handles publication, retries and admission. Use `crates` for
+static declarations and `entities` for documents built from configuration:
+
+```rust
+#[toolkit::gear(
+    name = "static-authz-plugin",
+    gts_publication(
+        crates = [crate, my_sdk],          // crates with `toolkit_gts::declare_gts_inventory!()`
+        entities = Self::plugin_instance,  // optional: config-only documents
+    ),
+)]
+pub struct StaticAuthZPlugin { /* ... */ }
+
+impl StaticAuthZPlugin {
+    fn plugin_instance(inputs: &GtsPublicationInputs<'_>) -> anyhow::Result<Vec<(String, Value)>> {
+        let cfg: Config = inputs.config_or_default()?;
+        /* build the instance from cfg */
+    }
+}
+
+#[async_trait]
+impl Gear for StaticAuthZPlugin {
+    async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        let service: Arc<dyn Client> = /* ... */;
+        // All declared schemas and instances were admitted before `init`.
+        toolkit::plugins::bind_plugin_instances::<Spec, _>(
+            &ctx.client_hub(), ctx.gts_publication_manifest()?.documents(), &service)
+    }
+}
+```
+
+The default publisher, `types_registry_sdk::publication`, requires `types-registry-sdk`
+with the `rest-client` feature and wires its registry client automatically. Add `#[toolkit::consumes]` if your own code also uses that contract.
+A gear with no GTS Type Schemas or Instances to publish needs no registry for publication.
+
+In `init`, `ctx.gts_publication_manifest()` returns a `GtsManifest`: the publisher name/version
+and authored GTS Type Schemas and Instances, all admitted before `init`. This ToolKit data
+structure is available only to gears declaring `gts_publication(...)`. Plugins bind their scoped clients
+from these documents.
+`choose_registered_plugin_instance` selects the best-ranked instance with a bound client;
+a plugin whose `init` has not run is not selectable. Declare `deps` when initialization order matters.
+
+## A gear's own readiness
+
+For work such as AM bootstrap, use `lifecycle(..., await_ready)`: perform the work in `serve`
+and call `ready.notify()` when done. This changes that gear's lifecycle state to `Running`.
+It does **not** block `start`, other gears, route publication or the application readiness gate.
+
+Callers must handle a gear that is still bootstrapping. To expose this condition through
+`/readyz`, provide a REST healthcheck; `Unhealthy` keeps the response at `503`, with or without
+`gts_publication(...)`.
 
 ## Declarative lifecycle with `#[toolkit::gear(...)]`
 
@@ -405,3 +539,4 @@ async fn test_background_task_cancellation() {
 - [ ] Use `tokio::select!` for cooperative shutdown.
 - [ ] Implement graceful shutdown with timeout handling.
 - [ ] Test lifecycle with manual cancellation.
+- [ ] Publish GTS documents with `gts_publication(...)`; notify `ReadySignal` only when the gear can serve.
