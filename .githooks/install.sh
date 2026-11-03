@@ -7,6 +7,7 @@
 # Installs missing links and refreshes stale copies of our own hooks; never overwrites a foreign
 # file. No-op when GEARS_NO_HOOKS=1, in CI, or outside a git work tree. --quiet never fails (the gears-rust.mk auto-install runs it).
 mode=${1:-}
+case "$mode" in --quiet) quiet=1 ;; *) quiet= ;; esac
 [ -z "${GEARS_NO_HOOKS:-}" ] && [ -z "${CI:-}" ] || [ "$mode" = "--uninstall" ] || exit 0
 top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 cd "$top" || exit 0
@@ -18,17 +19,17 @@ case "$hooks" in
 esac
 [ -f .githooks/lib.sh ] || exit 0
 # Explicit opt-out (make uninstall-hooks): the auto-install must not undo it.
-[ "$mode" != "--quiet" ] || [ "$(git config --local --bool --get gears.hooks 2>/dev/null)" != false ] || exit 0
+[ -z "$quiet" ] || [ "$(git config --local --bool --get gears.hooks 2>/dev/null)" != false ] || exit 0
 
 fail=0
 # failed <link>: report (unless --quiet) and remember the failure.
 failed() {
-    [ "$mode" = "--quiet" ] || echo "install.sh: failed to install $1" >&2
+    [ -n "$quiet" ] || echo "install.sh: failed to install $1" >&2
     fail=1
 }
 
 # is_ours <file>: a regular file carrying our hook markers, current or stale (Git Bash's ln -s copies).
-is_ours() { [ -f "$1" ] && [ ! -L "$1" ] && grep -q GEARS_HOOK_SELF "$1" && grep -q '\.githooks/lib\.sh' "$1"; }
+is_ours() ( file=$1; [ -f "$file" ] && [ ! -L "$file" ] && grep -q GEARS_HOOK_SELF "$file" && grep -q '\.githooks/lib\.sh' "$file" )
 
 if [ "$mode" = "--uninstall" ]; then
     git config --local gears.hooks false || failed "gears.hooks marker"
@@ -66,30 +67,30 @@ for h in pre-commit pre-push; do
     fi
     if [ -e "$link" ] && [ ! -L "$link" ]; then
         if ! is_ours "$link"; then
-            [ "$mode" = "--quiet" ] || echo "SKIP: $link exists and is not a symlink; call $top/.githooks/$h from it manually"
+            [ -n "$quiet" ] || echo "SKIP: $link exists and is not a symlink; call $top/.githooks/$h from it manually"
             continue
         elif cmp -s "$link" "$top/.githooks/$h"; then
-            [ "$mode" = "--quiet" ] || echo "ok: $link"
+            [ -n "$quiet" ] || echo "ok: $link"
             continue
         fi
         # stale copy of an older hook: replace it
         if ln -sf "$top/.githooks/$h" "$link"; then
-            [ "$mode" = "--quiet" ] || echo "updated $link"
+            [ -n "$quiet" ] || echo "updated $link"
         else
             failed "$link"
         fi
         continue
     fi
     # Present (live) link: leave it; dangling link (clone removed): replace.
-    [ -e "$link" ] && { [ "$mode" = "--quiet" ] || echo "ok: $link"; continue; }
+    [ -e "$link" ] && { [ -n "$quiet" ] || echo "ok: $link"; continue; }
     if mkdir -p "$hooks" && ln -sf "$top/.githooks/$h" "$link"; then
         installed=1
-        [ "$mode" = "--quiet" ] || echo "installed $link"
+        [ -n "$quiet" ] || echo "installed $link"
     else
         failed "$link"
     fi
 done
-[ "$mode" != "--quiet" ] || [ -z "${installed:-}" ] ||
+[ -z "$quiet" ] || [ -z "${installed:-}" ] ||
     echo "git hooks installed (.githooks); bypass with --no-verify, opt out with GEARS_NO_HOOKS=1"
-[ "$mode" = "--quiet" ] && exit 0
+[ -n "$quiet" ] && exit 0
 exit "$fail"

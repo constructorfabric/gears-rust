@@ -72,12 +72,12 @@ hook() {
     (cd "$hr" && sh ".githooks/$hh" "$@") > "$T/out" 2>&1 || rc=$?
 }
 # marker <repo>: print the repo's local gears.hooks config value (empty if unset).
-marker() { git -C "$1" config --local --get gears.hooks; }
-is_true() { [ "$(marker "$1")" = true ]; }
+marker() ( repo=$1; git -C "$repo" config --local --get gears.hooks )
+is_true() ( repo=$1; [ "$(marker "$repo")" = true ] )
 # is_false <repo>: succeed if the repo's gears.hooks marker is exactly false.
-is_false() { [ "$(marker "$1")" = false ]; }
+is_false() ( repo=$1; [ "$(marker "$repo")" = false ] )
 # link_hook <hook> <where>: symlink to the source hook, falling back to a copy (Git Bash).
-link_hook() { ln -sf "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
+link_hook() ( hook_src=$1 hook_dst=$2; ln -sf "$hook_src" "$hook_dst" 2>/dev/null || cp "$hook_src" "$hook_dst" )
 
 # ---- install ----
 mkrepo i1; mkdir "$r/sub"
@@ -261,8 +261,9 @@ git -C "$r" checkout -qb feat0
 zeros=0000000000000000000000000000000000000000
 # push <sha>: runs pre-push as git would; output in $T/out, cargo calls in $STUB_LOG.
 push() {
+    push_sha=$1
     : > "$STUB_LOG"; rc=0
-    echo "refs/heads/feat $1 refs/heads/feat $zeros" |
+    echo "refs/heads/feat $push_sha refs/heads/feat $zeros" |
         (cd "$r" && sh .githooks/pre-push) > "$T/out" 2>&1 || rc=$?
 }
 # head_sha: print the HEAD commit SHA of the test repo $r.
