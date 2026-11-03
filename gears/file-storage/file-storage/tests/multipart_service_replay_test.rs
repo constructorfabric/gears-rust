@@ -1,8 +1,6 @@
-#![allow(clippy::expect_used, clippy::unwrap_used, clippy::doc_markdown)]
+#![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::sync::Arc;
-
-use sea_orm::{ConnectionTrait, Database, Statement};
+use sea_orm::{ConnectionTrait, Database, Statement, TransactionTrait};
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
@@ -10,45 +8,30 @@ use file_storage::domain::audit::{AuditEntry, AuditOperation};
 use file_storage::domain::error::DomainError;
 use file_storage::domain::etag;
 use file_storage::domain::multipart::{
-    BindState, CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPlan,
+    BindState, CompletedMultipartUpload, MultipartCompleteOutcome, MultipartPart, MultipartPlan,
+    MultipartUploadSession, MultipartUploadState,
 };
-use file_storage::domain::multipart_service::MultipartService;
-use file_storage::domain::ports::MultipartStore;
-use file_storage::domain::service::FileService;
-use file_storage::infra::backend::StorageBackend;
 use file_storage::infra::content::hash_mode::HashMode;
-use file_storage::infra::signed_url::Issuer;
-use file_storage::infra::storage::Store;
-use file_storage_sdk::VersionStatus;
+use file_storage_sdk::{FileVersion, VersionStatus};
 
 mod common;
-use common::{CompleteOutcomeExt, ctx, new_file, new_file_for, uuid_blob};
+use common::{
+    CompleteOutcomeExt, Stack, StackBuilder, bare_file, ctx, new_file_for, token_of, uuid_blob,
+};
 
 struct Env {
-    svc: Arc<FileService>,
-    msvc: Arc<MultipartService>,
-    multipart_store: Arc<dyn MultipartStore>,
-    backend: Arc<dyn StorageBackend>,
-    store: Store,
+    stack: Stack,
     ctx: SecurityContext,
-    dsn: String,
 }
 
 async fn build_env() -> Env {
-    let s = common::build_stack(
-        "mp-replay",
-        Arc::new(Issuer::generate(3600).expect("issuer")),
-        Some(90),
-    )
-    .await;
+    let stack = StackBuilder::new("mp-replay")
+        .tweak_msvc(|msvc| msvc.with_complete_lease_secs(90))
+        .build()
+        .await;
     Env {
-        svc: s.svc,
-        msvc: s.msvc,
-        multipart_store: s.multipart_store,
-        backend: s.backend,
-        store: s.store,
+        stack,
         ctx: ctx(Uuid::now_v7()),
-        dsn: s.dsn,
     }
 }
 
@@ -59,12 +42,7 @@ impl Env {
         data: &'static [u8],
         auto_bind: bool,
     ) -> (Uuid, MultipartPlan) {
-        let file_id = self
-            .svc
-            .create_file(&self.ctx, new_file("upload.bin"), None, false)
-            .await
-            .unwrap()
-            .file_id;
+        let file_id = bare_file(&self.stack.svc, &self.ctx).await;
         let plan = self.add_session_with_part(file_id, data, auto_bind).await;
         (file_id, plan)
     }
@@ -77,9 +55,9 @@ impl Env {
         auto_bind: bool,
     ) -> MultipartPlan {
         common::session_with_part(
-            &self.msvc,
-            &self.multipart_store,
-            &self.backend,
+            &self.stack.msvc,
+            &self.stack.multipart_store,
+            &self.stack.backend,
             &self.ctx,
             file_id,
             data,
@@ -94,7 +72,8 @@ impl Env {
         upload_id: Uuid,
         if_match: Option<&str>,
     ) -> Result<CompletedMultipartUpload, DomainError> {
-        self.msvc
+        self.stack
+            .msvc
             .complete_multipart_upload(&self.ctx, file_id, upload_id, if_match)
             .await
             .map(MultipartCompleteOutcome::unwrap_completed)
@@ -103,30 +82,43 @@ impl Env {
     async fn complete(&self, file_id: Uuid, upload_id: Uuid) -> CompletedMultipartUpload {
         self.try_complete(file_id, upload_id, None).await.unwrap()
     }
-}
 
-/// Run one raw-SQL statement against an independent connection to `dsn` and assert it hit exactly
-/// the row the test set up — a silent no-op tamper would make the rest of the test meaningless.
-async fn exec_expect_one_row(dsn: &str, label: &'static str, sql: &str) {
-    let conn = Database::connect(dsn).await.expect("raw connect");
-    let res = conn
-        .execute_raw(Statement::from_string(
-            conn.get_database_backend(),
-            sql.to_owned(),
-        ))
-        .await
-        .unwrap_or_else(|e| panic!("tamper `{label}` failed: {e}"));
-    assert_eq!(
-        res.rows_affected(),
-        1,
-        "tamper `{label}` must hit exactly the one row the test prepared"
-    );
+    /// The single uploaded part of a one-part session.
+    async fn only_part(&self, upload_id: Uuid) -> MultipartPart {
+        let parts = self
+            .stack
+            .store
+            .list_multipart_parts(upload_id)
+            .await
+            .unwrap();
+        parts.into_iter().next().expect("one part")
+    }
+
+    async fn version(&self, file_id: Uuid, version_id: Uuid) -> FileVersion {
+        let v = self
+            .stack
+            .store
+            .get_version(file_id, version_id)
+            .await
+            .unwrap();
+        v.expect("version row")
+    }
+
+    async fn session(&self, upload_id: Uuid) -> MultipartUploadSession {
+        let s = self
+            .stack
+            .multipart_store
+            .get_multipart_upload(upload_id)
+            .await
+            .unwrap();
+        s.expect("session row")
+    }
 }
 
 /// Force `replay_completed` to fall through the persisted-snapshot fast path to its version-row
 /// fallback, by wiping the snapshot the real `complete` just persisted.
 async fn null_complete_result(dsn: &str, upload_id: Uuid) {
-    exec_expect_one_row(
+    common::exec_expect_one_row(
         dsn,
         "null_complete_result",
         &format!(
@@ -137,83 +129,240 @@ async fn null_complete_result(dsn: &str, upload_id: Uuid) {
     .await;
 }
 
+async fn set_hash_mode_bypassing_check(dsn: &str, version_id: Uuid, value: &str) {
+    let conn = Database::connect(dsn).await.expect("raw connect");
+    let backend = conn.get_database_backend();
+    let txn = conn.begin().await.expect("begin txn");
+    txn.execute_raw(Statement::from_string(
+        backend,
+        "PRAGMA ignore_check_constraints = ON;".to_owned(),
+    ))
+    .await
+    .expect("disable CHECK enforcement for this connection");
+    let res = txn
+        .execute_raw(Statement::from_string(
+            backend,
+            format!(
+                "UPDATE file_versions SET hash_mode = '{value}' WHERE version_id = {}",
+                uuid_blob(version_id)
+            ),
+        ))
+        .await
+        .expect("tamper hash_mode");
+    assert_eq!(
+        res.rows_affected(),
+        1,
+        "tamper UPDATE must hit exactly the one row the test prepared"
+    );
+    txn.commit().await.expect("commit tamper txn");
+}
+
 /// With the snapshot wiped, `replay_completed` rebuilds the result from the version row: every
-/// field equals the first complete's, and the bind state follows the session's `auto_bind`.
+/// field equals the first complete's, and the bind state follows the session's `auto_bind`, not
+/// the live pointer (a manual session stays manual even after the version was bound by hand).
 #[tokio::test]
 async fn replay_completed_fallback_rebuilds_result_from_version_row() {
-    // (auto_bind, expected bind_state, expects the content ETag derived from (file, version))
-    for (auto_bind, expected_state, expects_etag) in [
-        (false, BindState::Manual, false),
-        (true, BindState::Bound, true),
-    ] {
-        let row = format!("auto_bind={auto_bind}");
+    // (row, auto_bind, bound by hand after complete, expected bind_state)
+    let rows = [
+        ("manual", false, false, BindState::Manual),
+        ("auto", true, false, BindState::Bound),
+        ("manual, then bound by hand", false, true, BindState::Manual),
+    ];
+    for (row, auto_bind, bind_by_hand, expected_state) in rows {
         let env = build_env().await;
         let (file_id, plan) = env.session_with_part(b"Hello, World!", auto_bind).await;
         let first = env.complete(file_id, plan.upload_id).await;
         assert_eq!(first.bind_state, expected_state, "{row}: first complete");
+        let own_etag = auto_bind.then(|| etag::content_etag(file_id, plan.version_id));
+        assert_eq!(
+            common::content_id_of(&env.stack.store, file_id).await,
+            auto_bind.then_some(plan.version_id),
+            "{row}: only an auto-bind session binds on complete"
+        );
+        if bind_by_hand {
+            let bound = env
+                .stack
+                .svc
+                .bind(&env.ctx, file_id, plan.version_id, None)
+                .await;
+            bound.unwrap();
+        }
 
-        null_complete_result(&env.dsn, plan.upload_id).await;
-        let replay = env
-            .try_complete(file_id, plan.upload_id, None)
-            .await
-            .unwrap_or_else(|e| panic!("{row}: fallback replay must succeed: {e:?}"));
+        null_complete_result(&env.stack.dsn, plan.upload_id).await;
+        let replay = env.complete(file_id, plan.upload_id).await;
 
         assert_eq!(replay.version_id, first.version_id, "{row}");
         assert_eq!(replay.size, first.size, "{row}");
         assert_eq!(replay.hash_algorithm, first.hash_algorithm, "{row}");
         assert_eq!(replay.content_hash, first.content_hash, "{row}");
-        assert_eq!(replay.hash_mode, first.hash_mode, "{row}");
-        assert_eq!(
-            replay.hash_mode,
-            HashMode::WholeSha256,
-            "{row}: single part degenerates to whole-sha256"
-        );
+        assert_eq!(replay.hash_mode, HashMode::WholeSha256, "{row}");
         assert_eq!(replay.part_count, first.part_count, "{row}");
         assert_eq!(replay.manifest, first.manifest, "{row}");
         assert_eq!(replay.bind_state, expected_state, "{row}");
-        let expected_etag = expects_etag.then(|| etag::content_etag(file_id, plan.version_id));
         assert_eq!(
-            replay.etag, expected_etag,
-            "{row}: Bound derives the content ETag from (file_id, version_id), Manual has none"
+            replay.etag, own_etag,
+            "{row}: Bound derives the ETag from (file, version)"
         );
         assert_eq!(replay.current_etag, None, "{row}");
     }
 }
 
-/// A manual session never reports a bind outcome from the fallback either, even after the version
-/// was bound by hand (the pointer then equals the session's version).
+/// Snapshot wiped AND the version row mutated: each row must fail with its own error.
 #[tokio::test]
-async fn replay_completed_fallback_of_a_manual_session_stays_manual_after_manual_bind() {
-    let env = build_env().await;
-    let (file_id, plan) = env.session_with_part(b"Hello, World!", false).await;
-    let first = env.complete(file_id, plan.upload_id).await;
-    assert_eq!(first.bind_state, BindState::Manual);
-    env.svc
-        .bind(&env.ctx, file_id, plan.version_id, None)
-        .await
-        .unwrap();
+async fn replay_completed_fallback_errors_on_unusable_version_row() {
+    for row in [
+        "version row is gone",
+        "version not available",
+        "unrecognized hash mode",
+    ] {
+        let env = build_env().await;
+        let (file_id, plan) = env.session_with_part(b"AAAAA", false).await;
+        env.complete(file_id, plan.upload_id).await;
+        null_complete_result(&env.stack.dsn, plan.upload_id).await;
+        let version = uuid_blob(plan.version_id);
+        let dsn = &env.stack.dsn;
+        match row {
+            "version row is gone" => {
+                let sql = format!("DELETE FROM file_versions WHERE version_id = {version}");
+                common::exec_expect_one_row(dsn, row, &sql).await;
+            }
+            "version not available" => {
+                let sql = format!(
+                    "UPDATE file_versions SET status = 'pending' WHERE version_id = {version}"
+                );
+                common::exec_expect_one_row(dsn, row, &sql).await;
+            }
+            _ => set_hash_mode_bypassing_check(dsn, plan.version_id, "bogus-mode").await,
+        }
 
-    null_complete_result(&env.dsn, plan.upload_id).await;
-    let replay = env.complete(file_id, plan.upload_id).await;
-    assert_eq!(replay.bind_state, BindState::Manual);
-    assert_eq!(replay.etag, None);
-    assert_eq!(replay.current_etag, None);
+        let err = env
+            .try_complete(file_id, plan.upload_id, None)
+            .await
+            .expect_err("replay must fail");
+        match (row, err) {
+            (
+                "version row is gone",
+                DomainError::VersionNotFound {
+                    file_id: f,
+                    version_id: v,
+                },
+            ) => {
+                assert_eq!((f, v), (file_id, plan.version_id));
+            }
+            ("version not available", DomainError::MultipartUploadNotInProgress { state, .. }) => {
+                assert_eq!(
+                    state, "completed",
+                    "reported state is the SESSION's own state"
+                );
+            }
+            ("unrecognized hash mode", DomainError::Database { .. }) => {}
+            (_, other) => panic!("{row}: unexpected error {other:?}"),
+        }
+    }
+}
+
+/// A session completed (and auto-bound) before the file was rebound to another version: a bind won
+/// at finalize is sticky, so both the persisted snapshot and the version-row fallback (snapshot
+/// wiped, `bound_on_finalize` read from the version) keep reporting `Bound` with the original `ETag`.
+#[tokio::test]
+async fn replay_after_a_later_rebind_keeps_reporting_the_won_bind() {
+    let env = build_env().await;
+    let (file_id, plan_a) = env.session_with_part(b"AAAAA", true).await;
+    let completed_a = env.complete(file_id, plan_a.upload_id).await;
+    let original_etag = completed_a
+        .etag
+        .clone()
+        .expect("a Bound completion carries an etag");
+    let plan_b = env.add_session_with_part(file_id, b"BBBBB", false).await;
+    env.complete(file_id, plan_b.upload_id).await;
+    let rebound = env
+        .stack
+        .svc
+        .bind(&env.ctx, file_id, plan_b.version_id, Some("*"))
+        .await;
+    rebound.expect("rebind to version B");
+
+    for wiped in [false, true] {
+        if wiped {
+            null_complete_result(&env.stack.dsn, plan_a.upload_id).await;
+        }
+        let replay = env.complete(file_id, plan_a.upload_id).await;
+        assert_eq!(
+            replay.bind_state,
+            BindState::Bound,
+            "snapshot wiped={wiped}"
+        );
+        assert_eq!(
+            replay.etag.as_deref(),
+            Some(original_etag.as_str()),
+            "wiped={wiped}"
+        );
+        assert_eq!(replay.version_id, plan_a.version_id, "wiped={wiped}");
+        assert_eq!(replay.current_etag, None, "wiped={wiped}");
+    }
+}
+
+/// The finalize transaction loses its own session CAS (a trigger completes the session the moment
+/// the version flips to `available`): the result still reports THIS transaction's bind decision.
+#[tokio::test]
+async fn complete_reports_transaction_bind_outcome_when_own_session_cas_is_lost() {
+    let env = build_env().await;
+    let (file_id, plan) = env.session_with_part(b"Hello, World!", true).await;
+    common::raw_exec(
+        &env.stack.dsn,
+        "CREATE TRIGGER session_completed_out_from_under AFTER UPDATE OF status ON file_versions \
+         WHEN NEW.status = 'available' BEGIN \
+         UPDATE multipart_uploads SET state = 'completed', complete_result = NULL, \
+         lease_owner = NULL, lease_until = NULL \
+         WHERE version_id = NEW.version_id AND state = 'completing'; END",
+    )
+    .await;
+
+    let completed = env.complete(file_id, plan.upload_id).await;
+
+    assert_eq!(
+        completed.bind_state,
+        BindState::Bound,
+        "this transaction's own bind decision"
+    );
+    let expected = etag::content_etag(file_id, plan.version_id);
+    assert_eq!(completed.etag.as_deref(), Some(expected.as_str()));
+    assert_eq!(completed.current_etag, None);
+    let content_id = common::content_id_of(&env.stack.store, file_id).await;
+    assert_eq!(content_id, Some(plan.version_id));
+    let session = env.session(plan.upload_id).await;
+    assert_eq!(session.state, MultipartUploadState::Completed);
+}
+
+#[tokio::test]
+async fn replay_completed_snapshot_404s_when_its_composite_version_is_deleted() {
+    let env = build_env().await;
+    let (file_id, plan, _full) = common::composite_session(&env.stack, &env.ctx).await;
+    env.complete(file_id, plan.upload_id).await;
+    let sql = format!(
+        "DELETE FROM file_versions WHERE version_id = {}",
+        uuid_blob(plan.version_id)
+    );
+    common::exec_expect_one_row(&env.stack.dsn, "delete_version_row", &sql).await;
+
+    // The snapshot is still there but its version is gone: 404, never a response with `manifest: null`.
+    let err = env
+        .try_complete(file_id, plan.upload_id, None)
+        .await
+        .expect_err("replay of a completed session whose version was since deleted must fail");
+    assert!(
+        matches!(&err, DomainError::VersionNotFound { file_id: f, version_id: v }
+            if (*f, *v) == (file_id, plan.version_id)),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
 async fn complete_takeover_finishes_without_reassembly_when_version_already_available() {
     let env = build_env().await;
     let (file_id, plan) = env.session_with_part(b"AAAAA", false).await;
-    let part = env
-        .store
-        .list_multipart_parts(plan.upload_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .expect("one part");
-
-    let finalize_audit = AuditEntry::success(
+    let part = env.only_part(plan.upload_id).await;
+    let audit = AuditEntry::success(
         env.ctx.subject_tenant_id(),
         "user",
         env.ctx.subject_id(),
@@ -222,6 +371,7 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
         serde_json::json!({ "version_id": plan.version_id }),
     );
     let outcome = env
+        .stack
         .multipart_store
         .finalize_version(
             file_id,
@@ -232,7 +382,7 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
             None,
             None,
             Some("application/octet-stream".to_owned()),
-            finalize_audit,
+            audit,
             None,
         )
         .await
@@ -241,53 +391,30 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
         outcome.updated,
         "the pending version row must have been finalized"
     );
+    common::plant_lease(
+        &env.stack.multipart_store,
+        plan.upload_id,
+        "dead-completer",
+        -5,
+    )
+    .await;
 
-    let now = time::OffsetDateTime::now_utc();
-    let acquired = env
-        .multipart_store
-        .acquire_multipart_complete_lease(
-            plan.upload_id,
-            "dead-completer",
-            now - time::Duration::seconds(5),
-            now,
-        )
-        .await
-        .unwrap();
-    assert!(
-        acquired,
-        "the dead-completer lease must attach to the still in_progress session"
-    );
-
-    let completed = env
-        .try_complete(file_id, plan.upload_id, None)
-        .await
-        .expect("takeover onto an already-finalized version must succeed");
-    assert_eq!(completed.version_id, plan.version_id);
-    assert_eq!(completed.size, part.size);
-
-    let finished_session = env
-        .multipart_store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("session still exists");
+    let completed = env.complete(file_id, plan.upload_id).await;
     assert_eq!(
-        finished_session.state,
-        file_storage::domain::multipart::MultipartUploadState::Completed,
-        "finish_session must flip completing -> completed"
-    );
-    assert!(
-        finished_session.complete_result.is_some(),
-        "finish_session must persist the response snapshot"
+        (completed.version_id, completed.size),
+        (plan.version_id, part.size)
     );
 
-    let version = env
-        .store
-        .get_version(file_id, plan.version_id)
-        .await
-        .unwrap()
-        .expect("version");
-    assert_eq!(version.status, VersionStatus::Available);
+    let session = env.session(plan.upload_id).await;
+    assert_eq!(session.state, MultipartUploadState::Completed);
+    assert!(
+        session.complete_result.is_some(),
+        "finish_session persists the response snapshot"
+    );
+    assert_eq!(
+        env.version(file_id, plan.version_id).await.status,
+        VersionStatus::Available
+    );
 }
 
 /// The object is already assembled (the handle is consumed) but the session is still `in_progress`,
@@ -297,24 +424,14 @@ async fn complete_takeover_finishes_without_reassembly_when_version_already_avai
 async fn complete_recovers_from_assembled_object_without_takeover() {
     let env = build_env().await;
     let (file_id, plan) = env.session_with_part(b"AAAAA", false).await;
-    let session = env
-        .multipart_store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("session");
-    let part = env
-        .store
-        .list_multipart_parts(plan.upload_id)
-        .await
-        .unwrap()
-        .into_iter()
-        .next()
-        .expect("one part");
+    let session = env.session(plan.upload_id).await;
+    assert_eq!(session.state, MultipartUploadState::InProgress);
+    let part = env.only_part(plan.upload_id).await;
 
     // Assemble behind the service's back, with the same parts it would use.
     let digest: [u8; 32] = part.part_hash.clone().try_into().expect("32-byte digest");
-    env.backend
+    env.stack
+        .backend
         .complete_multipart(
             &session.backend_path,
             &session.backend_upload_handle,
@@ -322,47 +439,20 @@ async fn complete_recovers_from_assembled_object_without_takeover() {
         )
         .await
         .expect("out-of-band assembly");
-    assert!(env.backend.exists(&session.backend_path).await.unwrap());
-    assert_eq!(
-        session.state,
-        file_storage::domain::multipart::MultipartUploadState::InProgress
-    );
-    // A second assembly now fails on the consumed handle.
-    assert!(
-        env.backend
-            .complete_multipart(
-                &session.backend_path,
-                &session.backend_upload_handle,
-                &[(1, 0, digest, part.backend_etag.clone())],
-            )
-            .await
-            .is_err()
-    );
 
-    let completed = env
-        .try_complete(file_id, plan.upload_id, None)
-        .await
-        .expect("complete must recover from the already assembled object");
-    assert_eq!(completed.version_id, plan.version_id);
-    assert_eq!(completed.size, part.size);
-
-    let finished = env
-        .multipart_store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .unwrap()
-        .expect("session");
+    let completed = env.complete(file_id, plan.upload_id).await;
     assert_eq!(
-        finished.state,
-        file_storage::domain::multipart::MultipartUploadState::Completed
+        (completed.version_id, completed.size),
+        (plan.version_id, part.size)
     );
-    let version = env
-        .store
-        .get_version(file_id, plan.version_id)
-        .await
-        .unwrap()
-        .expect("version");
-    assert_eq!(version.status, VersionStatus::Available);
+    assert_eq!(
+        env.session(plan.upload_id).await.state,
+        MultipartUploadState::Completed
+    );
+    assert_eq!(
+        env.version(file_id, plan.version_id).await.status,
+        VersionStatus::Available
+    );
 }
 
 /// A session an old instance wrote after the upload-flow migration has NULL `backend_id` and
@@ -371,43 +461,39 @@ async fn complete_recovers_from_assembled_object_without_takeover() {
 async fn session_with_null_backend_columns_reads_lists_and_completes() {
     let env = build_env().await;
     let (file_id, plan) = env.session_with_part(b"AAAAA", false).await;
-    exec_expect_one_row(
-        &env.dsn,
+    common::exec_expect_one_row(
+        &env.stack.dsn,
         "null_backend_pair",
         &format!(
-            "UPDATE multipart_uploads SET backend_id = NULL, backend_path = NULL WHERE upload_id = {}",
+            "UPDATE multipart_uploads SET backend_id = NULL, backend_path = NULL \
+             WHERE upload_id = {}",
             uuid_blob(plan.upload_id)
         ),
     )
     .await;
 
-    let session = env
-        .multipart_store
-        .get_multipart_upload(plan.upload_id)
-        .await
-        .expect("session with NULL pair must still map")
-        .expect("session exists");
+    let session = env.session(plan.upload_id).await;
     assert_eq!(session.backend_id, None);
     assert_eq!(
         session.backend_path,
         format!("/{file_id}/{}", plan.version_id),
         "a NULL path falls back to the layout every version is written under"
     );
-
     let status = env
+        .stack
         .msvc
         .introspect_multipart_upload(&env.ctx, file_id, plan.upload_id)
         .await
         .expect("introspect a session with NULL pair");
     assert_eq!(status.upload_id, plan.upload_id);
-
     let later = time::OffsetDateTime::now_utc() + time::Duration::days(3650);
-    let expired = env
-        .store
-        .list_expired_multipart_uploads(later)
-        .await
-        .expect("list_expired must not fail on a NULL pair");
-    assert!(expired.iter().any(|s| s.upload_id == plan.upload_id));
+    let expired = env.stack.store.list_expired_multipart_uploads(later).await;
+    assert!(
+        expired
+            .expect("list_expired")
+            .iter()
+            .any(|s| s.upload_id == plan.upload_id)
+    );
 
     let done = env.complete(file_id, plan.upload_id).await;
     assert_eq!(done.version_id, plan.version_id);
@@ -418,20 +504,17 @@ async fn session_with_null_backend_columns_reads_lists_and_completes() {
 #[tokio::test]
 async fn legacy_idempotency_ticket_without_auto_bind_replays_manual() {
     let env = build_env().await;
-    let key = "legacy-key".to_owned();
     let owner = Uuid::now_v7();
+    let file = || new_file_for(owner, "legacy.bin", "application/octet-stream");
+    let key = Some("legacy-key".to_owned());
     let first = env
+        .stack
         .svc
-        .create_file(
-            &env.ctx,
-            new_file_for(owner, "legacy.bin", "application/octet-stream"),
-            Some(key.clone()),
-            true,
-        )
+        .create_file(&env.ctx, file(), key.clone(), true)
         .await
-        .expect("initial create");
-    exec_expect_one_row(
-        &env.dsn,
+        .unwrap();
+    common::exec_expect_one_row(
+        &env.stack.dsn,
         "strip_auto_bind",
         "UPDATE idempotency_keys SET response_body = json_remove(response_body, '$.auto_bind') \
          WHERE idempotency_key = 'legacy-key'",
@@ -440,28 +523,62 @@ async fn legacy_idempotency_ticket_without_auto_bind_replays_manual() {
 
     for auto in [true, false] {
         let replay = env
+            .stack
             .svc
-            .create_file(
-                &env.ctx,
-                new_file_for(owner, "legacy.bin", "application/octet-stream"),
-                Some(key.clone()),
-                auto,
-            )
+            .create_file(&env.ctx, file(), key.clone(), auto)
             .await
             .unwrap_or_else(|e| panic!("legacy replay with auto_bind={auto} must succeed: {e:?}"));
-        assert_eq!(replay.file_id, first.file_id);
-        assert_eq!(replay.version_id, first.version_id);
-
-        let token = &replay.upload_url
-            [replay.upload_url.find("fs-token=").expect("fs-token") + "fs-token=".len()..];
+        assert_eq!(
+            (replay.file_id, replay.version_id),
+            (first.file_id, first.version_id)
+        );
         let claims = env
+            .stack
             .svc
             .verifier()
-            .verify(token, time::OffsetDateTime::now_utc())
+            .verify(
+                token_of(&replay.upload_url),
+                time::OffsetDateTime::now_utc(),
+            )
             .expect("re-signed token verifies");
         assert!(
             !claims.bind_on_finalize,
             "a legacy ticket is replayed in manual mode"
         );
+    }
+}
+
+/// `complete` replays a `completed` session before it evaluates `If-Match`, so a retry gets the
+/// persisted result whether it carries the now-stale precondition or none.
+#[tokio::test]
+async fn complete_replay_of_completed_session_ignores_stale_if_match() {
+    let env = build_env().await;
+    let initial = common::bound_file(&env.stack.svc, &env.stack.dp, &env.ctx, b"initial").await;
+    let current = env
+        .stack
+        .svc
+        .get_file(&env.ctx, initial.file_id)
+        .await
+        .unwrap();
+    let stale = etag::etag_for(&current).expect("bound file must have an etag");
+    let plan = env
+        .add_session_with_part(initial.file_id, b"0123456789", true)
+        .await;
+    let first = env
+        .try_complete(initial.file_id, plan.upload_id, Some(&stale))
+        .await
+        .expect("first complete: If-Match matches the initial content pointer");
+    assert_eq!(first.bind_state, BindState::Bound);
+
+    // The first complete moved the file's ETag, so the initial one is now stale.
+    for (row, if_match) in [
+        ("stale If-Match", Some(stale.as_str())),
+        ("no If-Match", None),
+    ] {
+        let retry = env
+            .try_complete(initial.file_id, plan.upload_id, if_match)
+            .await;
+        let retry = retry.unwrap_or_else(|e| panic!("{row}: a retry must replay: {e:?}"));
+        assert_eq!(retry.version_id, first.version_id, "{row}");
     }
 }
