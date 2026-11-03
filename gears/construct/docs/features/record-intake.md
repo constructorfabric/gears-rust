@@ -38,7 +38,7 @@
 
 ### 1.1 Overview
 
-Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Processing runs where the deployment configures a processing identity and a model (Profile Reader, `cpt-cf-construct-feature-profile-reader`); elsewhere a stub drops every received record with a content-free drop event.
+Record Intake is the single entry for connectors (`cpt-cf-construct-component-results-api`). A connector sends one record per request for one tenant. Intake checks the record against its GTS type and the types it derives from, checks that the connector is on and, for a record about a subject, that personalization is on with no erasure under way. It then keeps the record's identity, so that a resend is a repeat, hands the record to background processing, and answers received, repeat or refused at once. Processing runs where the deployment configures a processing identity and a model and opts in to processing without sensitive-data checks (Profile Reader, `cpt-cf-construct-feature-profile-reader`); elsewhere a stub drops every received record with a content-free drop event.
 
 ### 1.2 Purpose
 
