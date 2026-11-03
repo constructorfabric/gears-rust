@@ -32,7 +32,7 @@ Every scenario has a test. Scenarios proved by one workflow share a test functio
 | 20 | [Consistency across read routes](scenarios/reading.md#consistency-across-read-routes) | `TR-READ-201`–`TR-READ-299` | [test_reading.py](test_reading.py) | Implemented |
 | 21 | [Conditional reads](scenarios/reading.md#conditional-reads) | `TR-READ-301`–`TR-READ-399` | [test_reading.py](test_reading.py) | Implemented |
 | 22 | [Paged discovery and returned fields](scenarios/discovery.md#paged-discovery-and-returned-fields) | `TR-DISC-001`–`TR-DISC-099` | [test_discovery.py](test_discovery.py) | Implemented |
-| 23 | [Filters](scenarios/discovery.md#filters) | `TR-DISC-101`–`TR-DISC-199` | [test_discovery.py](test_discovery.py) | Implemented |
+| 23 | [Filters](scenarios/discovery.md#filters) | `TR-DISC-101`–`TR-DISC-199` | [test_discovery.py](test_discovery.py), [test_discovery_patterns.py](test_discovery_patterns.py) | Implemented; identifier matching TR-DISC-104–109 follows GTS §10 (33 separate selector cases) |
 | 24 | [Cursor continuation](scenarios/discovery.md#cursor-continuation) | `TR-DISC-201`–`TR-DISC-299` | [test_discovery.py](test_discovery.py) | Implemented |
 | 25 | [Read discovered entities with batchGet](scenarios/discovery.md#read-discovered-entities-with-batchget) | `TR-DISC-301`–`TR-DISC-399` | [test_discovery.py](test_discovery.py) | Implemented |
 | 26 | [Plane separation](scenarios/planes.md#plane-separation) | `TR-PLANE-001`–`TR-PLANE-099` | [test_planes.py](test_planes.py) | Implemented |
