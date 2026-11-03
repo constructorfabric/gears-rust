@@ -518,15 +518,43 @@ fn cluster_insert_quorum_accepts_auto_or_a_positive_count() {
     }
 }
 
-/// Async inserts into a `Distributed` table bypass the shard's dedup token and
-/// durability ack, so the default `async_insert = true` must be turned off
-/// explicitly rather than silently ignored.
+/// Async inserts are supported on a cluster: the flushed block goes through
+/// the `Distributed` table in the foreground (`distributed_foreground_insert =
+/// 1`) and `wait_for_async_insert = 1` waits for that delivery, so the default
+/// `async_insert = true` stays on and validation accepts it.
 #[test]
-fn cluster_rejects_async_insert() {
+fn cluster_accepts_async_insert() {
     let json = r#"{ "database_url": "https://u:p@h/db", "cluster": { "name": "uc" } }"#;
     let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    assert!(
+        cfg.async_insert,
+        "the default must be what is under test here"
+    );
+    cfg.validate()
+        .expect("a cluster topology with async inserts is a valid configuration");
+}
+
+/// The explicit form, as the README's cluster example spells it, together
+/// with a quorum — the full supported cluster ingest configuration.
+#[test]
+fn cluster_accepts_explicit_async_insert_with_a_quorum() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "async_insert": true,
+                    "cluster": { "name": "uc", "insert_quorum": "auto" } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
+    cfg.validate()
+        .expect("async_insert + insert_quorum must validate");
+    assert!(cfg.async_insert);
+}
+
+/// The async-insert timeout floor applies on a cluster exactly as on a single
+/// node: the flush wait and the foreground shard delivery share one budget.
+#[test]
+fn cluster_keeps_the_async_insert_timeout_floor() {
+    let json = r#"{ "database_url": "https://u:p@h/db", "request_timeout_secs": 1,
+                    "cluster": { "name": "uc" } }"#;
+    let cfg: ClickHousePluginConfig = serde_json::from_str(json).unwrap();
     let err = cfg.validate().unwrap_err();
-    assert!(err.contains("async_insert = false"), "{err}");
+    assert!(err.contains("async_insert"), "{err}");
 }
 
 #[test]

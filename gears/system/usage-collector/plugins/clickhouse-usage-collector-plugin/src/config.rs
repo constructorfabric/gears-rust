@@ -96,8 +96,10 @@ pub struct ClickHousePluginConfig {
     /// the server-side async-insert buffer flush, which is why [`Self::validate`]
     /// enforces a floor of `MIN_ASYNC_INSERT_TIMEOUT_SECS` in that case.
     pub request_timeout_secs: u64,
-    /// Send **single-row** `usage_records` `INSERT`s with the `ClickHouse`
-    /// settings `async_insert = 1` and `wait_for_async_insert = 1`, applied
+    /// Send the **record-create** `usage_records` `INSERT`s — the single-row
+    /// write of `create_usage_record` and the multi-row write of
+    /// `create_usage_records` — with the `ClickHouse` settings
+    /// `async_insert = 1` and `wait_for_async_insert = 1`, applied
     /// per-statement via `clickhouse::insert::Insert::with_setting` rather than
     /// on the shared `Client`, so no `SELECT` is affected — not even the
     /// table-metadata read the `clickhouse` crate performs inside
@@ -106,24 +108,30 @@ pub struct ClickHousePluginConfig {
     /// `async_insert = 1` moves part formation from the request into a
     /// server-side buffer that coalesces concurrent inserts sharing one
     /// (query, settings, format) triple into shared parts. That is the whole
-    /// point here: `create_usage_record` issues one `INSERT` per record, so a
-    /// request-shaped ingest stream otherwise writes one small part per request
-    /// and drives `ReplacingMergeTree` part count and merge pressure up. Every
-    /// such `INSERT` this plugin emits is identical in SQL text, settings, and
+    /// point here: `create_usage_record` issues one `INSERT` per record and
+    /// `create_usage_records` one per request, so a request-shaped ingest
+    /// stream otherwise writes one small part per request and drives
+    /// `ReplacingMergeTree` part count and merge pressure up. Every such
+    /// `INSERT` this plugin emits is identical in SQL text, settings, and
     /// format, so the whole ingest stream lands in one queue.
     ///
-    /// **Scope.** This setting governs the single-row path only. Multi-row
-    /// `usage_records` `INSERT`s — `create_usage_records` and the deactivation
-    /// cascade — stay synchronous whatever this says, because the async buffer
-    /// does not guarantee that one statement's rows become visible in a single
-    /// commit and both depend on that (the cascade's marker rows must flip
-    /// together). `usage_type_catalog` writes are likewise always synchronous:
-    /// that table is control-plane (written only by `create_usage_type`, never
-    /// deleted, unpartitioned, tens of rows), so there is no concurrent insert
-    /// stream for the buffer to coalesce and no part count to reduce. Nothing
-    /// is given up by either exclusion — a multi-row statement already carries
-    /// its rows in one part, and the part explosion this setting exists to fix
-    /// is specific to one-row-per-request writes.
+    /// **Scope.** Only the two record-create writes are buffered. Deactivation
+    /// markers and `usage_type_catalog` writes are sent with an explicit
+    /// `async_insert = 0` whatever this says — explicit, so a server or user
+    /// settings profile that enables `async_insert` cannot buffer them either.
+    /// The deactivation cascade writes one marker per affected row and needs
+    /// them to flip together, which one synchronous statement gives per
+    /// partition and a shared buffer does not; the catalog is a tiny
+    /// control-plane table with no insert stream to coalesce.
+    ///
+    /// **Cluster mode.** The buffer lives on the initiator the plugin is
+    /// connected to. The flushed block is inserted into the `Distributed`
+    /// table with the flushing statement's own settings, so
+    /// `distributed_foreground_insert = 1` (and `insert_quorum`, when
+    /// configured — see [`ClickHouseClusterConfig::insert_quorum`]) apply to
+    /// it: the flush completes only once every shard the block touches has
+    /// committed its rows. `wait_for_async_insert = 1` then makes the
+    /// `INSERT` — and so the API response — wait for that whole chain.
     ///
     /// `wait_for_async_insert = 1` is pinned, not separately configurable.
     /// Two properties depend on it:
@@ -135,43 +143,52 @@ pub struct ClickHousePluginConfig {
     /// * **Read-your-writes.** `create_usage_record` reads (the dedup
     ///   point-lookup) and then writes, and a retry of the same request must
     ///   observe the earlier insert or it inserts a second time under an
-    ///   idempotency key already in use. Only `1` makes the row queryable by
-    ///   the time the call returns.
+    ///   idempotency key already in use. Only `1` makes the row queryable on
+    ///   the committing replica by the time the call returns.
     ///
-    /// The cost is latency: the `INSERT` blocks until the buffer flushes,
-    /// bounded by the server-side `async_insert_busy_timeout_ms` (adaptive on
-    /// `ClickHouse` 24.x+: `async_insert_busy_timeout_min_ms` 50ms →
-    /// `async_insert_busy_timeout_max_ms` 200ms) plus the part commit. That
-    /// budget is deliberately left to the server rather than mirrored into a
-    /// config field — it is a property of the cluster's whole insert workload,
-    /// not of this plugin, the server adapts it automatically, and a
-    /// plugin-pinned value would defeat that adaptation. An operator who must
-    /// pin it should do so in a `ClickHouse` settings profile for the plugin's
-    /// DB user, the same mechanism the README already recommends for bounding
-    /// read cost.
+    /// The cost is latency: the `INSERT` blocks until the buffer flushes and
+    /// the flushed block commits. The flush is triggered by the server-side
+    /// `async_insert_busy_timeout_ms` (adaptive on `ClickHouse` 24.x+:
+    /// `async_insert_busy_timeout_min_ms` 50ms →
+    /// `async_insert_busy_timeout_max_ms` 200ms); the part commit, the
+    /// foreground shard delivery and any quorum wait come after it, so that
+    /// timeout is a floor on the added latency, not a ceiling on the
+    /// `INSERT`'s. The flush trigger is deliberately left to the server rather
+    /// than mirrored into a config field — it is a property of the cluster's
+    /// whole insert workload, not of this plugin, the server adapts it
+    /// automatically, and a plugin-pinned value would defeat that adaptation.
+    /// An operator who must pin it should do so in a `ClickHouse` settings
+    /// profile for the plugin's DB user, the same mechanism the README already
+    /// recommends for bounding read cost.
     ///
-    /// Because the flush wait is charged against the request budget,
+    /// Because the whole wait is charged against the request budget,
     /// [`Self::validate`] requires
     /// `request_timeout_secs >= MIN_ASYNC_INSERT_TIMEOUT_SECS` while this is
     /// enabled.
     ///
-    /// **Insert dedup token.** Every `usage_records` `INSERT` carries an
+    /// **Atomicity.** A flushed block commits one part per partition
+    /// (calendar month of `created_at`) per shard, exactly like a synchronous
+    /// statement; a batch spanning two months, or two shards, is two commits
+    /// either way. A timeout or a failed delivery may therefore have committed
+    /// some of a batch's rows; the deterministic record ids make the retry
+    /// safe (see `record_store`).
+    ///
+    /// **Duplicates.** Every `usage_records` `INSERT` still carries an
     /// `insert_deduplication_token` (see `record_store::insert_dedup_token`),
     /// and `configure_insert` adds `async_insert_deduplicate = 1` when this is
-    /// on. `ClickHouse` enforces the token on synchronous inserts against the
-    /// table's `non_replicated_deduplication_window`; for *asynchronous*
-    /// inserts it enforces it only on `Replicated*` engines. On the shipped
-    /// non-replicated table, therefore, a racing duplicate single-record
-    /// create is collapsed by `optimize_on_insert` when both land in one
-    /// flush and by the background merge otherwise — visible twice to
-    /// `list`/`aggregate` (which no longer resolve versions at read time) until
-    /// then, while `get` resolves it immediately. Batches and deactivation
-    /// markers are always synchronous and always engine-deduplicated.
+    /// on, so the engine drops an exact retry where it can (`Replicated*`
+    /// tables for asynchronous inserts; any engine for synchronous ones). That
+    /// is a write-amplification safeguard, not a correctness dependency: a
+    /// token is not guaranteed to survive the buffer and the `Distributed`
+    /// forwarding, and two concurrent creates of one record can land as two
+    /// physical rows. The reads resolve that — point reads with
+    /// `ORDER BY version DESC LIMIT 1 BY <sort key>`, range reads with
+    /// `FINAL` (see `query::dedup`) — so an API result never shows a logical
+    /// record twice, whether or not the engine caught the twin.
     ///
-    /// Set to `false` for the pre-async behaviour (one synchronous part write
-    /// per request) on a deployment whose `ClickHouse` version or settings
-    /// profile makes async inserts unavailable — or to make the engine-side
-    /// dedup of single-record creates deterministic.
+    /// Set to `false` for one synchronous part write per request on a
+    /// deployment whose `ClickHouse` version or settings profile makes async
+    /// inserts unavailable.
     pub async_insert: bool,
     /// `usage_records` retention window in seconds; rows older are deleted via
     /// `ClickHouse` TTL. Must be in `(0, MAX_RETENTION_SECS]`.
@@ -359,13 +376,17 @@ pub(crate) const CLIENT_DEADLINE_GRACE_SECS: u64 = 5;
 /// Floor on `request_timeout_secs` while
 /// [`ClickHousePluginConfig::async_insert`] is enabled.
 ///
-/// `wait_for_async_insert = 1` blocks the `INSERT` until the server flushes
-/// its async-insert buffer — up to `async_insert_busy_timeout_ms` (server
-/// default; adaptive 50-200ms on `ClickHouse` 24.x+) plus the part commit. A 1s
-/// server-side budget leaves under 800ms of headroom for the commit and
-/// surfaces under load as intermittent `Transient` insert timeouts, which read
-/// as backend flakiness rather than as the misconfiguration they are. Failing
-/// at startup with both values named is strictly better.
+/// `wait_for_async_insert = 1` blocks the `INSERT` until the server has
+/// flushed its async-insert buffer and committed the flushed block. The flush
+/// is *triggered* by `async_insert_busy_timeout_ms` (server default; adaptive
+/// 50-200ms on `ClickHouse` 24.x+), but that value is not a bound on the
+/// `INSERT`'s latency: the part commit, and on a cluster the foreground
+/// delivery to the owning shard plus any `insert_quorum` wait, come after it
+/// and are all charged to the same request budget. A 1s budget leaves well
+/// under a second for all of that and surfaces under load as intermittent
+/// `Transient` insert timeouts, which read as backend flakiness rather than as
+/// the misconfiguration they are. Failing at startup with both values named
+/// is strictly better.
 ///
 /// The default `request_timeout_secs` of 30 clears this by more than an order
 /// of magnitude; only a deliberately tiny configured budget trips it.
@@ -448,15 +469,17 @@ impl ClickHousePluginConfig {
             return Err("request_timeout_secs must be > 0".to_owned());
         }
         // Ordered after the zero check so a zero value keeps the clearer error.
-        // `wait_for_async_insert = 1` charges the server-side buffer flush
+        // `wait_for_async_insert = 1` charges the server-side buffer flush —
+        // and, on a cluster, the foreground delivery to the owning shard —
         // against the request budget, so too small a budget turns every insert
         // into an intermittent timeout that reads as backend flakiness.
         if self.async_insert && self.request_timeout_secs < MIN_ASYNC_INSERT_TIMEOUT_SECS {
             return Err(format!(
                 "request_timeout_secs = {} is too small with async_insert = true: \
-                 wait_for_async_insert = 1 blocks each INSERT until the server flushes its \
-                 async-insert buffer (async_insert_busy_timeout_ms, server default), so the \
-                 request budget must be at least {MIN_ASYNC_INSERT_TIMEOUT_SECS}s; raise \
+                 wait_for_async_insert = 1 blocks each INSERT until the server has flushed its \
+                 async-insert buffer (triggered by async_insert_busy_timeout_ms, server default) \
+                 and committed the flushed block (on every shard it touches, in cluster mode), \
+                 so the request budget must be at least {MIN_ASYNC_INSERT_TIMEOUT_SECS}s; raise \
                  request_timeout_secs or set async_insert = false",
                 self.request_timeout_secs
             ));
@@ -492,20 +515,6 @@ impl ClickHousePluginConfig {
         }
         if let Some(cluster) = &self.cluster {
             cluster.validate()?;
-            // An async insert into a `Distributed` table is buffered on the
-            // initiator, not on the shard that commits it, so neither the
-            // `wait_for_async_insert` durability ack nor the insert dedup
-            // token reaches the replicated table the way `async_insert`'s
-            // contract assumes. Refuse the combination rather than weaken it.
-            if self.async_insert {
-                return Err(
-                    "async_insert = true is not supported with a cluster topology: inserts go \
-                     through Distributed tables synchronously (distributed_foreground_insert = 1) \
-                     so the insert dedup token reaches the replicated shard table; set \
-                     async_insert = false"
-                        .to_owned(),
-                );
-            }
         }
         Ok(())
     }

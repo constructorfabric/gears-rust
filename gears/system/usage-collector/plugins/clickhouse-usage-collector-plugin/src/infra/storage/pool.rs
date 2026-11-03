@@ -276,6 +276,82 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::
     Ok(client)
 }
 
+/// What an `INSERT` is for — the explicit write intent every insert site
+/// states, which decides whether the statement may go through the server-side
+/// async-insert buffer.
+///
+/// The buffer exists for the one-INSERT-per-request record writes; nothing
+/// else may ever be buffered, and that is pinned here per intent rather than
+/// by a bare `bool` so a call site cannot enable it indiscriminately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InsertIntent {
+    /// A record-create write (`create` or `create_batch`) on a store with
+    /// [`crate::config::ClickHousePluginConfig::async_insert`] enabled: goes
+    /// through the async-insert buffer, and waits for the flush.
+    AsyncRecords,
+    /// A record-create write on a store with `async_insert` disabled: one
+    /// synchronous part per statement.
+    SyncRecords,
+    /// Deactivation markers written by the cascade. Always synchronous: the
+    /// cascade needs one statement's markers to flip together (per
+    /// partition), which a shared buffer flushing on its own schedule does
+    /// not give.
+    Marker,
+    /// A `usage_type_catalog` write. Always synchronous: a tiny control-plane
+    /// table with no insert stream to coalesce, whose request latency is
+    /// directly observed.
+    Catalog,
+}
+
+impl InsertIntent {
+    /// The record-create intent for a store configured with `async_insert`.
+    pub(crate) fn records(async_insert: bool) -> Self {
+        if async_insert {
+            Self::AsyncRecords
+        } else {
+            Self::SyncRecords
+        }
+    }
+
+    /// Whether this intent goes through the server-side async-insert buffer.
+    pub(crate) fn is_async(self) -> bool {
+        matches!(self, Self::AsyncRecords)
+    }
+}
+
+/// The `ClickHouse` settings an `INSERT` with `intent` carries, in the order
+/// they are applied.
+///
+/// A pure function of its inputs so the list is unit-testable: the
+/// `clickhouse` crate sends `INSERT` settings in the request URL, where the
+/// crate's own mock server cannot observe them.
+///
+/// * [`InsertIntent::AsyncRecords`] — `async_insert = 1`,
+///   `wait_for_async_insert = 1`, `async_insert_deduplicate = 1`.
+/// * Every other intent — **`async_insert = 0`, explicitly.** The server
+///   default is `0`, but a server or user settings profile may set `1`, and a
+///   buffered marker set or catalog row would silently break the guarantees
+///   the intent docs state. Sending the value pins it.
+/// * `insert_deduplication_token` when `dedup_token` is `Some`.
+pub(crate) fn insert_settings(
+    intent: InsertIntent,
+    dedup_token: Option<&str>,
+) -> Vec<(&'static str, String)> {
+    let mut settings: Vec<(&'static str, String)> = if intent.is_async() {
+        vec![
+            ("async_insert", "1".to_owned()),
+            ("wait_for_async_insert", "1".to_owned()),
+            ("async_insert_deduplicate", "1".to_owned()),
+        ]
+    } else {
+        vec![("async_insert", "0".to_owned())]
+    };
+    if let Some(token) = dedup_token {
+        settings.push(("insert_deduplication_token", token.to_owned()));
+    }
+    settings
+}
+
 /// Apply this plugin's per-`INSERT` `ClickHouse` configuration to a freshly
 /// acquired `Insert` handle.
 ///
@@ -286,9 +362,11 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::
 /// * **Timeouts** — `with_timeouts` bounds the subsequent `write` / `end`
 ///   awaits natively (yielding `ChError::TimedOut`, already classified
 ///   retryable), which the crate documents as far cheaper than wrapping each
-///   of them in `tokio::time::timeout`.
-/// * **`async_insert`** — when `async_insert` is `true`, `async_insert = 1`
-///   plus `wait_for_async_insert = 1` plus `async_insert_deduplicate = 1`. Set
+///   of them in `tokio::time::timeout`. With an asynchronous intent that wait
+///   covers the buffer flush, the part commit and — on a cluster — the
+///   foreground shard delivery and quorum, since `wait_for_async_insert = 1`
+///   holds the request open for all of them.
+/// * **Settings** — [`insert_settings`] for `intent` and `dedup_token`, set
 ///   here, on the `Insert`'s own cloned client, rather than on the shared
 ///   `Client` in [`build_client`]: that client also serves every `SELECT` —
 ///   including the table-metadata read the crate issues inside
@@ -298,11 +376,13 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::
 /// * **`dedup_token`** — when `Some`, sent as `insert_deduplication_token`, so
 ///   the engine drops the inserted block if a block with the same token landed
 ///   within the table's dedup window (`non_replicated_deduplication_window`,
-///   see [`ensure_insert_dedup_window`]). Enforced on synchronous inserts. On
-///   asynchronous inserts it is enforced only for `Replicated*` tables (which
-///   is what `async_insert_deduplicate = 1` requests, and why it is set — it
-///   is accepted and inert on the shipped non-replicated engine); the token
-///   is still carried so the same call site is correct on either engine.
+///   see [`ensure_insert_dedup_window`]; `replicated_deduplication_window` on
+///   a cluster). Enforced on synchronous inserts; on asynchronous inserts only
+///   for `Replicated*` tables (what `async_insert_deduplicate = 1` requests —
+///   accepted and inert on a non-replicated engine), and not guaranteed to
+///   survive the buffer plus a `Distributed` forward. It is a safeguard against
+///   write amplification; the reads resolve whatever it misses (see
+///   `query::dedup`).
 ///
 /// `with_setting` rather than the crate's `with_option`: the latter is
 /// `#[deprecated(since = "0.14.3")]`, and the workspace lints deprecation.
@@ -319,18 +399,12 @@ pub fn build_client(cfg: &ClickHousePluginConfig) -> anyhow::Result<clickhouse::
 pub(crate) fn configure_insert<T>(
     insert: clickhouse::insert::Insert<T>,
     request_timeout: Duration,
-    async_insert: bool,
+    intent: InsertIntent,
     dedup_token: Option<&str>,
 ) -> clickhouse::insert::Insert<T> {
     let mut insert = insert.with_timeouts(Some(request_timeout), Some(request_timeout));
-    if async_insert {
-        insert = insert
-            .with_setting("async_insert", "1")
-            .with_setting("wait_for_async_insert", "1")
-            .with_setting("async_insert_deduplicate", "1");
-    }
-    if let Some(token) = dedup_token {
-        insert = insert.with_setting("insert_deduplication_token", token);
+    for (name, value) in insert_settings(intent, dedup_token) {
+        insert = insert.with_setting(name, value);
     }
     insert
 }

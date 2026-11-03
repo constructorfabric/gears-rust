@@ -2,7 +2,9 @@ use std::time::Duration;
 
 use secrecy::ExposeSecret;
 
-use super::{DEFAULT_RETENTION_SECS, parse_endpoint, parse_ttl_seconds};
+use super::{
+    DEFAULT_RETENTION_SECS, InsertIntent, insert_settings, parse_endpoint, parse_ttl_seconds,
+};
 use crate::config::is_plaintext_url;
 use crate::infra::storage::migrator::render_ddl;
 use crate::infra::storage::topology::Topology;
@@ -388,23 +390,108 @@ async fn configure_insert_applies_settings_before_the_first_write() {
     let insert = super::configure_insert(
         offline_insert().await,
         std::time::Duration::from_secs(5),
-        true,
+        InsertIntent::AsyncRecords,
         Some("token"),
     );
     drop(insert);
 }
 
-/// The disabled arm must still yield a usable handle — it is the escape hatch
-/// for a deployment whose `ClickHouse` cannot do async inserts.
+/// The synchronous intents must still yield a usable handle — `SyncRecords`
+/// is the escape hatch for a deployment whose `ClickHouse` cannot do async
+/// inserts, and markers and catalog rows always take it.
 #[tokio::test]
-async fn configure_insert_with_async_insert_disabled_applies_only_timeouts() {
-    let insert = super::configure_insert(
-        offline_insert().await,
-        std::time::Duration::from_secs(5),
-        false,
-        None,
-    );
-    drop(insert);
+async fn configure_insert_with_a_synchronous_intent_yields_a_usable_handle() {
+    for intent in [
+        InsertIntent::SyncRecords,
+        InsertIntent::Marker,
+        InsertIntent::Catalog,
+    ] {
+        let insert = super::configure_insert(
+            offline_insert().await,
+            std::time::Duration::from_secs(5),
+            intent,
+            None,
+        );
+        drop(insert);
+    }
+}
+
+// ── insert_settings ───────────────────────────────────────────────────────────
+//
+// The `clickhouse` crate sends INSERT settings in the request URL, which its
+// mock server cannot observe, so the settings list is pinned here as a pure
+// function and verified end-to-end against `system.query_log` in the Docker
+// integration tests (`ch_usage_records_insert_carries_the_async_insert_settings`
+// and friends).
+
+fn setting<'a>(settings: &'a [(&'static str, String)], name: &str) -> Option<&'a str> {
+    settings
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// Record creates on an async store go through the buffer *and* wait for the
+/// flush: `wait_for_async_insert = 1` is what turns the API's `Ok` into a
+/// durability ack rather than a fire-and-forget.
+#[test]
+fn async_record_inserts_carry_async_insert_and_wait_for_the_flush() {
+    let s = insert_settings(InsertIntent::AsyncRecords, Some("tok"));
+    assert_eq!(setting(&s, "async_insert"), Some("1"));
+    assert_eq!(setting(&s, "wait_for_async_insert"), Some("1"));
+    assert_eq!(setting(&s, "async_insert_deduplicate"), Some("1"));
+    assert_eq!(setting(&s, "insert_deduplication_token"), Some("tok"));
+}
+
+/// Every synchronous intent sends `async_insert = 0` *explicitly*, so a server
+/// or user settings profile that enables async inserts cannot buffer a marker
+/// set or a catalog row behind the plugin's back.
+#[test]
+fn synchronous_intents_pin_async_insert_off_explicitly() {
+    for intent in [
+        InsertIntent::SyncRecords,
+        InsertIntent::Marker,
+        InsertIntent::Catalog,
+    ] {
+        let s = insert_settings(intent, None);
+        assert_eq!(setting(&s, "async_insert"), Some("0"), "{intent:?}");
+        assert_eq!(setting(&s, "wait_for_async_insert"), None, "{intent:?}");
+        assert_eq!(setting(&s, "async_insert_deduplicate"), None, "{intent:?}");
+        assert_eq!(
+            setting(&s, "insert_deduplication_token"),
+            None,
+            "{intent:?}"
+        );
+    }
+}
+
+/// The dedup token rides on whichever intent supplies one — markers and
+/// synchronous record writes keep the engine-side safeguard.
+#[test]
+fn a_dedup_token_is_carried_by_any_intent_that_supplies_one() {
+    for intent in [
+        InsertIntent::AsyncRecords,
+        InsertIntent::SyncRecords,
+        InsertIntent::Marker,
+    ] {
+        let s = insert_settings(intent, Some("tok"));
+        assert_eq!(
+            setting(&s, "insert_deduplication_token"),
+            Some("tok"),
+            "{intent:?}"
+        );
+    }
+}
+
+/// `records(async_insert)` is the only place the config bit becomes an intent.
+#[test]
+fn records_intent_follows_the_async_insert_setting() {
+    assert_eq!(InsertIntent::records(true), InsertIntent::AsyncRecords);
+    assert_eq!(InsertIntent::records(false), InsertIntent::SyncRecords);
+    assert!(InsertIntent::AsyncRecords.is_async());
+    assert!(!InsertIntent::SyncRecords.is_async());
+    assert!(!InsertIntent::Marker.is_async());
+    assert!(!InsertIntent::Catalog.is_async());
 }
 
 // ── insert dedup window ───────────────────────────────────────────────────────

@@ -146,15 +146,15 @@ The load-bearing difference from the reference plugin's decomposition is that **
 
 - [x] `p1` - **ID**: `cpt-cf-uc-ch-plugin-feature-query-aggregation`
 
-- **Purpose**: Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both single-level scans that anti-join the deactivation-marker id set instead of resolving `ReplacingMergeTree` versions (DESIGN.md §3.8). This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
+- **Purpose**: Provide the backend read plane, pushing aggregation into ClickHouse's vectorized execution and paginating raw reads via keyset seeking — both single-level scans over `usage_records FINAL`, so the engine resolves `ReplacingMergeTree` versions before the `WHERE`, `LIMIT` and `GROUP BY` run (DESIGN.md §3.8). This is the allocation target for the aggregation query-latency NFR and the workload-isolation NFR.
 
 - **Depends On**: `cpt-cf-uc-ch-plugin-feature-foundation`, `cpt-cf-uc-ch-plugin-feature-record-persistence`
 
 - **Scope**:
-  - Pushed-down aggregation (SUM/COUNT/MIN/MAX/AVG with grouping) as a single-level scan over the marker-anti-joined active-row set, honoring the compensation-partition rule (SUM nets compensations; other ops exclude them), capped server-side to `MAX_AGGREGATION_BUCKETS + 1` (100,001) grouped rows via `LIMIT` (DESIGN.md §3.6).
-  - Marker-anti-joined keyset-paginated raw list honoring the supplied order and cursor, one-row look-ahead, next-cursor encoding.
+  - Pushed-down aggregation (SUM/COUNT/MIN/MAX/AVG with grouping) as a single-level scan over the `FINAL`-resolved active rows, honoring the compensation-partition rule (SUM nets compensations; other ops exclude them), capped server-side to `MAX_AGGREGATION_BUCKETS + 1` (100,001) grouped rows via `LIMIT` (DESIGN.md §3.6).
+  - `FINAL`-resolved keyset-paginated list honoring the supplied order and cursor, one-row look-ahead, next-cursor encoding.
   - Injection-safe translation: bound parameters for values, allowlisted identifiers, adapted to the `clickhouse` crate's parameter API.
-  - Aggregation query-latency NFR allocation through ClickHouse's columnar execution, explicitly measured **with** the marker anti-join included in the budget, not around it (DESIGN.md §3.8).
+  - Aggregation query-latency NFR allocation through ClickHouse's columnar execution, explicitly measured **with** `FINAL` included in the budget, not around it (DESIGN.md §3.8).
   - Workload-isolation NFR allocation: the documented, accepted shared-client contention point between ingestion and aggregation (DESIGN.md §3.5). There is deliberately **no** pool-size config field — the `clickhouse` crate exposes no pool bound one could drive (DESIGN.md §3.5) — so this feature owns the burst-query-vs-ingestion contention analysis and its README-documented **operational** mitigation guidance (server-side quotas, separate instances), not merely a DESIGN-only aside.
 
 - **Out of scope**:

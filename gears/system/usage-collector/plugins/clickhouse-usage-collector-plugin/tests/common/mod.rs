@@ -28,6 +28,7 @@ use usage_collector_sdk::{
 
 use clickhouse_usage_collector_plugin::infra::metrics::Metrics;
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
+use clickhouse_usage_collector_plugin::infra::storage::entity::UsageRecordRow;
 use clickhouse_usage_collector_plugin::infra::storage::migrator::{
     MigrationOptions, run_migrations,
 };
@@ -231,9 +232,10 @@ pub fn record_store_with_metrics(
 ///
 /// On the shipped non-replicated `ReplacingMergeTree`, `ClickHouse` enforces
 /// `insert_deduplication_token` on synchronous inserts only, so this is the
-/// tier that proves the engine-side dedup of racing single-record creates
-/// deterministically. The async tier relies on `optimize_on_insert` coalescing
-/// within one flush and on merges otherwise (see `config.rs`).
+/// tier that proves the engine-side dedup safeguard deterministically. The
+/// async tier makes no such promise — a twin may be stored — and is where the
+/// reads' own resolution is what keeps API results correct (see `config.rs`
+/// and `query/dedup.rs`).
 #[must_use]
 pub fn record_store_sync(h: &ChHarness) -> ChRecordStore {
     ChRecordStore::new(h.client.clone(), metrics(), TEST_REQUEST_TIMEOUT, false)
@@ -251,8 +253,8 @@ pub async fn stop_merges(h: &ChHarness) {
         .expect("SYSTEM STOP MERGES must succeed");
 }
 
-/// Raw physical row count for one `id`, with no version resolution and no
-/// marker anti-join — what the engine actually stores.
+/// Raw physical row count for one `id`, with no version resolution (no
+/// `FINAL`, no `LIMIT 1 BY`) — what the engine actually stores.
 pub async fn raw_rows_for_id(h: &ChHarness, id: Uuid) -> u64 {
     h.client
         .query("SELECT count() FROM usage_records WHERE id = ?")
@@ -260,6 +262,55 @@ pub async fn raw_rows_for_id(h: &ChHarness, id: Uuid) -> u64 {
         .fetch_one::<u64>()
         .await
         .expect("raw count must be readable")
+}
+
+/// The highest `version` the engine holds for one `id`, read raw.
+pub async fn raw_version_for_id(h: &ChHarness, id: Uuid) -> u64 {
+    h.client
+        .query("SELECT max(version) FROM usage_records WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .expect("raw version must be readable")
+}
+
+/// Store `rows` as one physical part, bypassing the store entirely: a plain
+/// synchronous `INSERT` with no `insert_deduplication_token`, so the engine
+/// keeps it whatever it already holds. This is what a duplicate create the
+/// engine did not catch — a concurrent instance, a retry after a timeout, an
+/// async flush whose token did not take — looks like on disk, and what the
+/// reads must resolve. Call [`stop_merges`] first so the part stays.
+///
+/// With `optimize_on_insert` off, a block holding two versions of one sort
+/// key is stored with both, as a single level-0 part — the one shape
+/// `do_not_merge_across_partitions_select_final` must still resolve.
+pub async fn seed_raw_rows(h: &ChHarness, rows: &[UsageRecordRow], optimize_on_insert: bool) {
+    let mut insert = h
+        .client
+        .insert::<UsageRecordRow>("usage_records")
+        .await
+        .expect("acquire a raw Insert handle")
+        .with_setting("async_insert", "0")
+        .with_setting(
+            "optimize_on_insert",
+            if optimize_on_insert { "1" } else { "0" },
+        );
+    for row in rows {
+        insert.write(row).await.expect("write raw row");
+    }
+    insert.end().await.expect("commit raw rows");
+}
+
+/// [`seed_raw_rows`] for one row.
+pub async fn seed_raw_row(h: &ChHarness, row: &UsageRecordRow) {
+    seed_raw_rows(h, std::slice::from_ref(row), true).await;
+}
+
+/// A physical row for `record` at `version`, as the store would write it
+/// (active, the record's own value).
+#[must_use]
+pub fn raw_row(record: &UsageRecord, version: u64) -> UsageRecordRow {
+    UsageRecordRow::from((record, version))
 }
 
 /// Build a [`ChCatalogStore`] with its own metric handle.

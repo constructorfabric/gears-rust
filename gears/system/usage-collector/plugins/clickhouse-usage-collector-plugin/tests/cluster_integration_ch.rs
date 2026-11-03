@@ -14,10 +14,13 @@
 //!
 //! What only a cluster can show:
 //! - rows of different tenants land on different shards;
-//! - the survivor anti-join (`id NOT IN (SELECT id … 'inactive')`) is exact
-//!   with `distributed_product_mode = 'local'`, i.e. markers are colocated
-//!   with the rows they mark;
-//! - the insert dedup token is honoured through a `Distributed` insert;
+//! - `FINAL` forwarded through the `Distributed` table resolves each shard's
+//!   rows completely, i.e. markers and duplicate creates are colocated with
+//!   the rows they supersede (`cityHash64(tenant_id)`);
+//! - async record inserts go through the `Distributed` table in the
+//!   foreground and are acknowledged only once committed on the owning shard;
+//! - the insert dedup token is honoured through a synchronous `Distributed`
+//!   insert;
 //! - catalog deletes reach every shard (`ON CLUSTER` mutation);
 //! - startup validation rejects a deviating operator schema;
 //! - the plugin-managed cluster migrations provision a bare cluster.
@@ -40,6 +43,7 @@ use usage_collector_sdk::{AggregationOp, AggregationSpec, UsageCollectorPluginEr
 use clickhouse_usage_collector_plugin::config::ClickHousePluginConfig;
 use clickhouse_usage_collector_plugin::domain::ports::{CatalogStore, RecordStore};
 use clickhouse_usage_collector_plugin::infra::storage::catalog_store::ChCatalogStore;
+use clickhouse_usage_collector_plugin::infra::storage::entity::UsageRecordRow;
 use clickhouse_usage_collector_plugin::infra::storage::migrator::{
     MIGRATIONS_TRACKER, MigrationOptions, migration_client, render_ddl, run_migrations,
 };
@@ -210,8 +214,18 @@ fn skip(why: &str) -> Option<Cluster> {
     None
 }
 
+/// Cluster config with synchronous record inserts.
 fn cluster_config(c: &Cluster) -> ClickHousePluginConfig {
     config(c, &format!(r#", "cluster": {{ "name": "{CLUSTER}" }}"#))
+}
+
+/// Cluster config with the shipped default, `async_insert = true`.
+fn async_cluster_config(c: &Cluster) -> ClickHousePluginConfig {
+    config_with(
+        c,
+        true,
+        &format!(r#", "cluster": {{ "name": "{CLUSTER}" }}"#),
+    )
 }
 
 /// Cluster config with the plugin managing the schema.
@@ -226,9 +240,13 @@ fn managed_config(c: &Cluster) -> ClickHousePluginConfig {
 }
 
 fn config(c: &Cluster, extra: &str) -> ClickHousePluginConfig {
+    config_with(c, false, extra)
+}
+
+fn config_with(c: &Cluster, async_insert: bool, extra: &str) -> ClickHousePluginConfig {
     let cfg: ClickHousePluginConfig = serde_json::from_str(&format!(
         r#"{{ "database_url": "http://default:{PASSWORD}@127.0.0.1:{port}/{DATABASE}",
-              "allow_insecure_http": true, "async_insert": false{extra} }}"#,
+              "allow_insecure_http": true, "async_insert": {async_insert}{extra} }}"#,
         port = c.port
     ))
     .expect("valid test config");
@@ -383,7 +401,7 @@ async fn ch_cluster_records_round_trip_across_shards() {
     }
 
     // Deactivate four rows spread over the tenants. Each marker must land on
-    // its row's shard for the shard-local anti-join to exclude the row.
+    // its row's shard for the shard-local `FINAL` to resolve the row to it.
     for r in recs.iter().step_by(4) {
         records.deactivate(r.id).await.expect("deactivate");
     }
@@ -438,6 +456,269 @@ async fn common_raw_rows(client: &clickhouse::Client, id: Uuid) -> u64 {
         .fetch_one::<u64>()
         .await
         .expect("raw count")
+}
+
+async fn common_raw_version(client: &clickhouse::Client, id: Uuid) -> u64 {
+    client
+        .query("SELECT max(version) FROM usage_records WHERE id = ?")
+        .bind(id.to_string())
+        .fetch_one::<u64>()
+        .await
+        .expect("raw version")
+}
+
+/// Store `row` through the `Distributed` table as its own part on the owning
+/// shard, bypassing the store: no dedup token, synchronous. What an uncaught
+/// duplicate create looks like on disk.
+async fn seed_raw_row_through_distributed(client: &clickhouse::Client, row: &UsageRecordRow) {
+    let mut insert = client
+        .insert::<UsageRecordRow>("usage_records")
+        .await
+        .expect("raw Insert handle")
+        .with_setting("async_insert", "0");
+    insert.write(row).await.expect("write raw row");
+    insert.end().await.expect("commit raw row");
+}
+
+/// `(async_insert, wait_for_async_insert, distributed_foreground_insert)` of
+/// every `usage_records` INSERT the initiator logged for this database, newest
+/// first. `query_log.Settings` holds only values that differ from the server
+/// default.
+async fn logged_insert_settings(client: &clickhouse::Client) -> Vec<(String, String, String)> {
+    let sql = "SELECT Settings['async_insert'], Settings['wait_for_async_insert'], \
+                      Settings['distributed_foreground_insert'] \
+               FROM system.query_log \
+               WHERE type = 'QueryFinish' AND query_kind = 'Insert' \
+                 AND current_database = currentDatabase() \
+                 AND positionCaseInsensitive(query, 'usage_records') > 0 \
+               ORDER BY event_time_microseconds DESC";
+    for _ in 0..20 {
+        client
+            .query("SYSTEM FLUSH LOGS")
+            .execute()
+            .await
+            .expect("flush logs");
+        let rows = client
+            .query(sql)
+            .fetch_all::<(String, String, String)>()
+            .await
+            .expect("read query_log");
+        if !rows.is_empty() {
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("no usage_records INSERT appeared in the initiator's system.query_log");
+}
+
+/// The shipped configuration on a cluster: record inserts go through the
+/// async-insert buffer on the initiator, are forwarded through the
+/// `Distributed` table in the foreground, and are acknowledged only once the
+/// owning shard committed them — which the immediate point reads prove.
+/// Markers stay synchronous.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_async_inserts_round_trip() {
+    let Some(cluster) = boot_or_skip().await else {
+        return;
+    };
+    let cfg = async_cluster_config(&cluster);
+    assert!(cfg.async_insert, "the shipped default is under test");
+    let (client, records, catalog) = stores(&cfg);
+
+    validate_cluster_schema(
+        &client,
+        &Topology::from_config(&cfg),
+        cfg.retention_period_secs,
+        common::TEST_REQUEST_TIMEOUT,
+    )
+    .await
+    .expect("startup validation");
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type");
+
+    // 8 single creates + 1 batch, every one acknowledged only after its flush
+    // committed on the owning shard: the rows are readable the moment the
+    // call returns, through the Distributed table, from either shard.
+    let recs = ingest_sixteen_tenants(&records).await;
+    for r in &recs {
+        assert_eq!(records.get(r.id).await.expect("get").id, r.id);
+    }
+    let shards = rows_per_shard(&client, "usage_records_local").await;
+    assert_eq!(shards.len(), 2, "both shards hold rows: {shards:?}");
+    assert_eq!(shards.iter().map(|(_, n)| n).sum::<u64>(), 16);
+
+    // An exact retry is absorbed from the stored row (read-your-writes on the
+    // initiator), so it sends no INSERT at all.
+    records
+        .create(recs[0].clone())
+        .await
+        .expect("retry is idempotent");
+
+    for r in recs.iter().step_by(4) {
+        records.deactivate(r.id).await.expect("deactivate");
+    }
+    let (sum, count) = sum_and_count(&records).await;
+    assert_eq!(sum, Some(BigDecimal::from(108_i64)));
+    assert_eq!(count, Some(BigDecimal::from(12_i64)));
+
+    // What the initiator actually ran: 9 record INSERTs through the buffer
+    // (async_insert = 1, wait_for_async_insert at its default of 1,
+    // distributed_foreground_insert = 1 from the cluster client settings) and
+    // 4 marker INSERTs with async_insert pinned off.
+    let logged = logged_insert_settings(&client).await;
+    let (async_inserts, sync_inserts): (Vec<_>, Vec<_>) =
+        logged.iter().partition(|(a, _, _)| a == "1");
+    assert_eq!(
+        async_inserts.len(),
+        9,
+        "8 single creates + 1 batch go through the buffer: {logged:?}"
+    );
+    assert_eq!(
+        sync_inserts.len(),
+        4,
+        "4 marker sets stay synchronous: {logged:?}"
+    );
+    for (_, wait, foreground) in &async_inserts {
+        assert!(
+            wait.is_empty() || wait == "1",
+            "wait_for_async_insert must stay at 1: {logged:?}"
+        );
+        assert_eq!(
+            foreground, "1",
+            "a buffered insert must still be delivered to its shard in the foreground: {logged:?}"
+        );
+    }
+    for (a, _, foreground) in &sync_inserts {
+        assert!(
+            a.is_empty() || a == "0",
+            "markers must be synchronous: {logged:?}"
+        );
+        assert_eq!(foreground, "1", "{logged:?}");
+    }
+}
+
+/// `FINAL` through the `Distributed` table resolves each shard's rows: a
+/// duplicate create stored twice on its shard (raw, no token) and a
+/// deactivation marker both collapse to one resolved row per logical record in
+/// `list` and `aggregate`, before any merge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires Docker (testcontainers)"]
+async fn ch_cluster_final_collapses_duplicates_per_shard() {
+    let Some(cluster) = boot_or_skip().await else {
+        return;
+    };
+    let cfg = cluster_config(&cluster);
+    let (client, records, catalog) = stores(&cfg);
+    catalog
+        .create(common::fixture_usage_type(VCPU_GTS, "counter", &[]))
+        .await
+        .expect("register usage type");
+    client
+        .query(&format!(
+            "SYSTEM STOP MERGES ON CLUSTER {CLUSTER} {DATABASE}.usage_records_local"
+        ))
+        .execute()
+        .await
+        .expect("stop merges on every shard");
+
+    let recs = ingest_sixteen_tenants(&records).await;
+
+    // A higher-version twin with a different value for the first and the last
+    // tenant (values 1 → 101 and 16 → 116), routed by the Distributed table
+    // to the shard that already holds the original.
+    for (r, value) in [(&recs[0], 101_i64), (&recs[15], 116)] {
+        let version = common_raw_version(&client, r.id).await + 1;
+        let mut twin = UsageRecordRow::from((r, version));
+        twin.value = Decimal::new(value, 0);
+        seed_raw_row_through_distributed(&client, &twin).await;
+        assert_eq!(
+            common_raw_rows(&client, r.id).await,
+            2,
+            "precondition: twin stored"
+        );
+    }
+    // Deactivate the second and the second-to-last (values 2 and 15).
+    for r in [&recs[1], &recs[14]] {
+        records.deactivate(r.id).await.expect("deactivate");
+    }
+    let shards = rows_per_shard(&client, "usage_records_local").await;
+    assert_eq!(
+        shards.iter().map(|(_, n)| n).sum::<u64>(),
+        20,
+        "16 rows + 2 twins + 2 markers stay physical with merges stopped: {shards:?}"
+    );
+
+    // 136 - 1 - 16 + 101 + 116 - 2 - 15 = 319 over 14 active logical rows.
+    let (sum, count) = sum_and_count(&records).await;
+    assert_eq!(sum, Some(BigDecimal::from(319_i64)));
+    assert_eq!(count, Some(BigDecimal::from(14_i64)));
+
+    let order = ODataOrderBy(vec![
+        OrderKey {
+            field: "created_at".to_owned(),
+            dir: SortDir::Asc,
+        },
+        OrderKey {
+            field: "id".to_owned(),
+            dir: SortDir::Asc,
+        },
+    ]);
+    let page = records
+        .list(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new().with_limit(100).with_order(order.clone()),
+            &[],
+        )
+        .await
+        .expect("list across shards");
+    let listed: Vec<Uuid> = page.items.iter().map(|r| r.id).collect();
+    let expected: Vec<Uuid> = recs.iter().map(|r| r.id).collect();
+    assert_eq!(
+        listed, expected,
+        "one resolved row per logical record, in order"
+    );
+    assert_eq!(
+        page.items[0].value,
+        Decimal::new(101, 0),
+        "highest version wins"
+    );
+    assert_eq!(
+        page.items[15].value,
+        Decimal::new(116, 0),
+        "highest version wins"
+    );
+    assert_eq!(
+        page.items
+            .iter()
+            .filter(|r| r.status == usage_collector_sdk::UsageRecordStatus::Inactive)
+            .count(),
+        2
+    );
+
+    // A tenant-pinned read goes to one shard (`optimize_skip_unused_shards`)
+    // and still resolves there.
+    let tenant_filter = toolkit_odata::ast::Expr::Compare(
+        Box::new(toolkit_odata::ast::Expr::Identifier("tenant_id".to_owned())),
+        toolkit_odata::ast::CompareOperator::Eq,
+        Box::new(toolkit_odata::ast::Expr::Value(
+            toolkit_odata::ast::Value::Uuid(recs[0].tenant_id),
+        )),
+    );
+    let page = records
+        .list(
+            common::fixture_gts_id(VCPU_GTS),
+            &ODataQuery::new()
+                .with_order(order)
+                .with_filter(tenant_filter),
+            &[],
+        )
+        .await
+        .expect("tenant-pinned list");
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].value, Decimal::new(101, 0));
 }
 
 /// A catalog delete is an `ON CLUSTER` mutation on the local table: it must

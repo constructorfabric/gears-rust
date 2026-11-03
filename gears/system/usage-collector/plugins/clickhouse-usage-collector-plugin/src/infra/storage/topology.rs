@@ -10,11 +10,14 @@
 //!
 //! **Shard-colocation invariant.** `usage_records` is sharded by
 //! `cityHash64(tenant_id)`. A deactivation marker clones its source row
-//! (`mapper::make_inactive_marker`), and a compensation row belongs to the
-//! tenant of the row it corrects, so every version of a row — and every row an
-//! `id NOT IN (SELECT id … status = 'inactive')` anti-join must see — lives on
-//! one shard. That is what makes `distributed_product_mode = 'local'` (see
-//! [`Topology::client_settings`]) exact rather than an approximation.
+//! (`mapper::make_inactive_marker`), a duplicate create shares its
+//! `tenant_id`, and a compensation row belongs to the tenant of the row it
+//! corrects, so every version of a row lives on one shard. That is what makes
+//! the `FINAL` the `Distributed` table forwards to each shard-local
+//! `ReplicatedReplacingMergeTree` complete rather than an approximation: a
+//! shard resolves every version it has, and it has them all. The same
+//! invariant keeps a shard-local `IN` subquery exact, should one be needed
+//! (`distributed_product_mode = 'local'`, see [`Topology::client_settings`]).
 
 use crate::config::ClickHousePluginConfig;
 
@@ -66,11 +69,12 @@ impl Topology {
     /// Settings attached to the shared client — and therefore to every request
     /// — in this topology. Empty on a single node.
     ///
-    /// * `distributed_product_mode = 'local'` — rewrites the `IN` subqueries
-    ///   over `usage_records` to the shard-local table, so each shard
-    ///   anti-joins against its own markers. Exact by the shard-colocation
-    ///   invariant (module docs); without it `ClickHouse` rejects the
-    ///   subquery (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
+    /// * `distributed_product_mode = 'local'` — rewrites any `IN` subquery
+    ///   over `usage_records` to the shard-local table. The request path
+    ///   currently issues none (the range reads resolve with `FINAL`), but
+    ///   the setting is kept: it is exact by the shard-colocation invariant
+    ///   (module docs), and without it `ClickHouse` rejects such a subquery
+    ///   outright (`DISTRIBUTED_IN_JOIN_SUBQUERY_DENIED`).
     /// * `optimize_skip_unused_shards = 1` — a query pinning `tenant_id`
     ///   reads only the owning shard.
     /// * `skip_unavailable_shards = 0` — pinned so a server settings profile
@@ -79,10 +83,17 @@ impl Topology {
     ///   part of the data, `get` / `deactivate` would report `NotFound`, and
     ///   the catalog existence check would reject records of a known type.
     /// * `distributed_foreground_insert = 1` — an `INSERT` into a
-    ///   `Distributed` table returns only once the target shard committed it,
-    ///   so errors surface to the caller and the `insert_deduplication_token`
-    ///   is enforced by the replicated table's dedup window.
-    /// * `insert_quorum` — when configured.
+    ///   `Distributed` table returns only once every shard it touches has
+    ///   committed its rows, so errors surface to the caller and the ack is a
+    ///   durability ack. An asynchronous insert's buffer flush runs the
+    ///   `INSERT` with the flushing statement's settings, so this applies to
+    ///   it too: with `wait_for_async_insert = 1` the request — and the API
+    ///   response — waits for the flush *and* the foreground delivery. It
+    ///   also lets the replicated table's dedup window see the
+    ///   `insert_deduplication_token` on a synchronous insert (a safeguard;
+    ///   the reads do not depend on it, see `query::dedup`).
+    /// * `insert_quorum` — when configured; applies to the flushed block the
+    ///   same way.
     ///
     /// The insert settings ride on `SELECT`s too, where the server ignores
     /// them; one client-wide list keeps every call site topology-agnostic.

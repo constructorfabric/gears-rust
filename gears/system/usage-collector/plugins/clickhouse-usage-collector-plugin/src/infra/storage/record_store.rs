@@ -13,10 +13,12 @@
 //!   against each other. Two concurrent creates for one dedup key can both
 //!   pass the pre-read; the engine then drops the second *block* when both
 //!   carry the same `insert_deduplication_token` ([`insert_dedup_token`],
-//!   honoured on synchronous inserts against the table's
-//!   `non_replicated_deduplication_window`) — **first-writer-wins** at the
-//!   engine — and otherwise `ReplacingMergeTree(version)` collapses the twin
-//!   rows at the next merge. Consequences: (a) the dedup pre-read is
+//!   honoured where the engine supports it — always on a synchronous insert,
+//!   on `Replicated*` tables for an asynchronous one, and not guaranteed
+//!   through the async buffer plus a `Distributed` forward); otherwise both
+//!   rows land, and every read resolves them to the **highest `version`**
+//!   (not the first writer) until `ReplacingMergeTree(version)` collapses
+//!   them at the next merge. Consequences: (a) the dedup pre-read is
 //!   best-effort; (b) `IdempotencyConflict` is raised only when the earlier row
 //!   is already visible at pre-read time; (c) `UsageTypeNotFound` comes from a
 //!   catalog read with no ordering guarantee against a concurrent
@@ -30,17 +32,17 @@
 //! - **No `UPDATE`**: deactivation uses versioned marker rows (INSERT with
 //!   `status = 'inactive'` and a higher `version`, same `id`) rather than
 //!   `ALTER TABLE … UPDATE` (an async mutation unsuitable for the request path).
-//! - **No `FINAL`, and no resolution on the range reads**: `get`, the
-//!   deactivation cascade and the create-path dedup lookups resolve
+//! - **Every read resolves versions before it filters, pages or aggregates**:
+//!   `get`, the deactivation cascade and the create-path dedup lookups resolve
 //!   `ReplacingMergeTree` versions themselves over a tiny candidate set —
-//!   `ORDER BY version DESC LIMIT 1 BY <sort key>`, see [`query::dedup`]. `list`
-//!   and `aggregate` do not resolve at all: they scan raw rows and anti-join
-//!   the ids that carry a deactivation marker (`dedup::resolved_survivors` /
-//!   `dedup::active_survivors`), which is exact for deactivation before any
-//!   merge and costs one hash probe per row instead of a sort or hash
-//!   aggregation over the whole scan. Unmerged duplicate creates the engine
-//!   did not catch are visible to those two reads until the merge; the module
-//!   docs of `query::dedup` carry the full argument.
+//!   `ORDER BY version DESC LIMIT 1 BY <sort key>` — while the range reads
+//!   `list` and `aggregate` read `FROM usage_records FINAL`, so the engine
+//!   collapses each sort key to its highest version before the single `WHERE`,
+//!   the keyset `ORDER BY` / `LIMIT` and the `GROUP BY` run. Physical
+//!   duplicates — markers, and duplicate creates the engine-side dedup token
+//!   did not catch — are therefore allowed on disk and never surface twice in
+//!   an API result. The module docs of [`query::dedup`] carry the argument,
+//!   the placements `FINAL` relies on, and what resolution does not promise.
 //!
 //!   [`query::dedup`]: crate::infra::storage::query::dedup
 //! - **`?` placeholders**: `ClickHouse` uses positional `?` (not `$N`).
@@ -74,19 +76,19 @@ use crate::infra::storage::mapper::{
     canonical_equal, current_merge_version, make_inactive_marker, record_row_key,
     version_higher_than,
 };
-use crate::infra::storage::pool::configure_insert;
+use crate::infra::storage::pool::{InsertIntent, configure_insert};
 use crate::infra::storage::query::aggregate::{
     agg_select_expr, aggregate_limit_clause, corrects_id_partition_clause, dimension_select_expr,
 };
 use crate::infra::storage::query::dedup::{
-    RECORD_DEDUP_KEY, active_survivors, latest_by, resolved_survivors, split_version_invariant,
+    ACTIVE_ONLY, RECORD_DEDUP_KEY, RECORDS_FINAL, latest_by, with_final_read_settings,
 };
 use crate::infra::storage::query::effective_page_size;
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate, render_order_by,
 };
 use crate::infra::storage::query::translate::{
-    SqlBind, SqlCtx, bind_one, record_column, translate_record_filter,
+    SqlBind, SqlCtx, and_conjuncts, bind_one, record_column, translate_record_filter,
 };
 
 /// Static column list for every `usage_records` SELECT, in [`UsageRecordRow`]
@@ -152,9 +154,10 @@ pub struct ChRecordStore {
     client: clickhouse::Client,
     metrics: Arc<Metrics>,
     request_timeout: Duration,
-    /// Whether `usage_records` `INSERT`s carry `async_insert = 1` /
-    /// `wait_for_async_insert = 1`
-    /// ([`crate::config::ClickHousePluginConfig::async_insert`]).
+    /// Whether record-create `usage_records` `INSERT`s (single and batch)
+    /// carry `async_insert = 1` / `wait_for_async_insert = 1`
+    /// ([`crate::config::ClickHousePluginConfig::async_insert`]). Deactivation
+    /// markers are synchronous regardless.
     async_insert: bool,
 }
 
@@ -363,12 +366,13 @@ impl ChRecordStore {
         // Insert-time timeouts and settings both come from `configure_insert`,
         // so this site cannot drift from the batch and catalog ones.
         //
-        // The dedup token makes a racing retry of this very row a no-op at the
-        // engine — on a synchronous insert. With `async_insert = 1` on the
-        // shipped non-replicated table the token is carried but not enforced
-        // (async dedup is a `Replicated*` feature); twins that land in one
-        // flush still collapse through `optimize_on_insert`, and the rest at
-        // merge. See `config::ClickHousePluginConfig::async_insert`.
+        // The dedup token lets the engine drop an exact racing retry of this
+        // very row where it can (synchronous inserts; asynchronous ones on
+        // `Replicated*` tables). It is a safeguard against write
+        // amplification, not what keeps the reads correct: a twin the engine
+        // misses is one more physical row under the same sort key, which the
+        // point reads and the `FINAL` range reads resolve to the highest
+        // `version`. See `config::ClickHousePluginConfig::async_insert`.
         let token = insert_dedup_token(std::slice::from_ref(row), InsertKind::Record);
         let mut insert: clickhouse::insert::Insert<UsageRecordRow> = configure_insert(
             {
@@ -380,7 +384,7 @@ impl ChRecordStore {
                 .await?
             },
             self.request_timeout,
-            self.async_insert,
+            InsertIntent::records(self.async_insert),
             Some(&token),
         );
         self.metrics
@@ -405,18 +409,27 @@ impl ChRecordStore {
 
     /// Insert multiple rows into `usage_records` in a single INSERT statement.
     ///
-    /// Always synchronous, regardless of the store's `async_insert` setting:
-    /// both callers depend on the statement's rows becoming visible together,
-    /// which the server-side async-insert buffer does not guarantee. The body
-    /// carries the full argument.
+    /// `kind` states the write intent: record creates (`create_batch`) go
+    /// through the server-side async-insert buffer when the store's
+    /// `async_insert` is on, exactly like the single-row path; deactivation
+    /// markers are always synchronous, with `async_insert = 0` sent
+    /// explicitly, because the cascade depends on one statement's markers
+    /// flipping together and a shared buffer flushing on its own schedule does
+    /// not give that.
     ///
-    /// Atomicity is **per partition**, not per statement. `usage_records` is
-    /// `PARTITION BY toYYYYMM(created_at)` and a `ClickHouse` INSERT commits one
-    /// part per partition it touches, so rows landing in one month are visible
-    /// all-or-nothing while a statement spanning two months is two commits — a
-    /// version-resolving reader can observe one part without the other. The one
-    /// caller that depends on the all-or-nothing reading, the deactivation
-    /// cascade, states the resulting window at its own call site.
+    /// Atomicity is **per partition** (and, on a cluster, per shard), not per
+    /// statement, whichever way the rows are sent. `usage_records` is
+    /// `PARTITION BY toYYYYMM(created_at)` and a `ClickHouse` INSERT — or the
+    /// flush of the async-insert buffer the statement joined — commits one part
+    /// per partition it touches, so rows landing in one month on one shard are
+    /// visible all-or-nothing while a statement spanning two months is two
+    /// commits — a version-resolving reader can observe one part without the
+    /// other, and a timeout or a failed `Distributed` delivery may have
+    /// committed some of the rows. The one caller that depends on the
+    /// all-or-nothing reading, the deactivation cascade, states the resulting
+    /// window at its own call site; a batch create relies on its deterministic
+    /// ids instead, which make the caller's retry converge on the rows that
+    /// did land.
     ///
     /// A statement whose block spans more than `max_partitions_per_insert_block`
     /// partitions (server default 100, i.e. 100 distinct months) is rejected by
@@ -440,34 +453,33 @@ impl ChRecordStore {
             return Ok(());
         }
         let pool_start = Instant::now();
-        // Synchronous, so the engine enforces this token: an identical racing
-        // batch, or a repeated cascade for the same ids, is dropped as a block.
-        // `kind` keeps a marker set from being mistaken for the create that
-        // wrote the same ids (see `InsertKind`).
+        // The token lets the engine drop an identical racing batch, or a
+        // repeated cascade for the same ids, as a block where it can (always
+        // on a synchronous insert; on `Replicated*` tables for an asynchronous
+        // one). `kind` keeps a marker set from being mistaken for the create
+        // that wrote the same ids (see `InsertKind`). A twin the engine misses
+        // is resolved by the reads, not relied upon here.
         let token = insert_dedup_token(rows, kind);
-        // Deliberately **synchronous**, whatever `self.async_insert` says — the
-        // one place this store departs from the configured setting, and the
-        // reason is the per-statement atomicity both callers of this method
-        // rely on.
+        // The write intent decides the buffering: a record batch follows the
+        // store's `async_insert` — a request-shaped batch stream is the same
+        // part-per-request problem the single-row path has — while markers
+        // are always synchronous, with `async_insert = 0` sent explicitly so
+        // a server-side settings profile cannot buffer them either.
         //
         // `async_insert = 1` hands the rows to a server-side buffer that
         // coalesces across statements and flushes on its own schedule, and one
         // statement's rows are not guaranteed to land in a single commit. That
-        // is harmless for independent rows but not here:
-        //
-        // * the deactivation cascade writes one marker row per affected id and
-        //   requires them to flip together (see the ATOMICITY NOTE on
-        //   `deactivate`); async inserts made a concurrent resolved read
-        //   observe a flipped compensation under a still-active target, which
-        //   `ch_deactivation_cascade_is_atomic` catches; and
-        // * `create_batch` is documented as a whole-batch write (DESIGN.md
-        //   §3.6 Batch Ingest).
-        //
-        // Nothing is given up by staying synchronous: async inserts exist here
-        // to stop the *one-INSERT-per-request* path writing a part per record,
-        // and a batch statement already carries up to the SPI's batch cap of
-        // rows in a single part. `insert_record` is the site that needs the
-        // buffer, and it has no cross-row invariant to lose.
+        // is the same per-partition visibility a synchronous batch has (see
+        // the method docs), so `create_batch` loses nothing it had. The
+        // deactivation cascade does: it writes one marker row per affected id
+        // and requires them to flip together (see the ATOMICITY NOTE on
+        // `deactivate`); a buffered marker set let a concurrent resolved read
+        // observe a flipped compensation under a still-active target, which
+        // `ch_deactivation_cascade_is_atomic` catches.
+        let intent = match kind {
+            InsertKind::Record => InsertIntent::records(self.async_insert),
+            InsertKind::Marker => InsertIntent::Marker,
+        };
         let mut insert: clickhouse::insert::Insert<UsageRecordRow> = configure_insert(
             {
                 with_deadline(
@@ -478,7 +490,7 @@ impl ChRecordStore {
                 .await?
             },
             self.request_timeout,
-            false,
+            intent,
             Some(&token),
         );
         self.metrics
@@ -608,122 +620,90 @@ impl ChRecordStore {
         }
     }
 
-    /// Translate a caller `$filter` into its two halves: the version-invariant
-    /// conjuncts join the scan predicate (which is also repeated inside the
-    /// marker subquery, so they prune both), the `status`-naming rest is
-    /// appended after the survivor predicate, where it reads the raw `status`
-    /// that on every surviving row equals the resolved one.
+    /// Translate a caller `$filter` into `WHERE` clauses, one per top-level
+    /// `AND` conjunct ([`and_conjuncts`]), appended to `clauses` in the
+    /// caller's order with their binds appended to `ctx` in the same order.
     ///
-    /// The split itself, and why it is sound for `OR`/`NOT`, is
-    /// [`split_version_invariant`]. Two things this call order guarantees:
-    ///
-    /// - **Bind order.** `ClickHouse` `?` is positional left-to-right and the
-    ///   scan predicate (twice) precedes the trailing conjuncts in the emitted
-    ///   text, so the invariant half must be translated first — its binds are
-    ///   applied first too.
-    /// - **Clause order within the scan half.** Callers push the metadata
-    ///   side-channel before calling this, so `inner_ctx` already holds those
-    ///   binds and the appended conjuncts land after them in both the text and
-    ///   the bind list.
-    fn push_split_filter(
+    /// Every conjunct — `status`-naming ones included — lands in the one
+    /// `WHERE` the range reads have, because that `WHERE` runs over rows
+    /// `FINAL` has already resolved (see `query::dedup`). `ClickHouse` `?` is
+    /// positional left-to-right, so text order and bind order are the same
+    /// order by construction: callers push the metadata side-channel before
+    /// calling this, and the keyset predicate after.
+    fn push_filter(
         node: &FilterNode<UsageRecordFilterField>,
-        inner_ctx: &mut SqlCtx,
-        inner_clauses: &mut Vec<String>,
-        outer_ctx: &mut SqlCtx,
-        outer_clauses: &mut Vec<String>,
+        ctx: &mut SqlCtx,
+        clauses: &mut Vec<String>,
     ) -> Result<(), UsageCollectorPluginError> {
-        let (invariant, version_dependent) = split_version_invariant(node);
-        for conjunct in invariant {
-            let fragment = translate_record_filter(conjunct, inner_ctx)
+        for conjunct in and_conjuncts(node) {
+            let fragment = translate_record_filter(conjunct, ctx)
                 .map_err(UsageCollectorPluginError::internal)?;
-            inner_clauses.push(fragment);
-        }
-        for conjunct in version_dependent {
-            let fragment = translate_record_filter(conjunct, outer_ctx)
-                .map_err(UsageCollectorPluginError::internal)?;
-            outer_clauses.push(fragment);
+            clauses.push(fragment);
         }
         Ok(())
     }
 
-    /// Assemble the single-level aggregate query text.
+    /// Assemble the aggregate query text.
     ///
     /// Split out of [`RecordStore::aggregate`] so the text is unit-testable
     /// without a live `ClickHouse`.
     ///
     /// ```text
-    /// SELECT <aliased_select> FROM usage_records
-    /// WHERE <scan> AND status = 'active' AND id NOT IN (SELECT id FROM usage_records WHERE <scan> AND status = 'inactive')
-    ///   [AND <outer_clauses>]
+    /// SELECT <aliased_select> FROM usage_records FINAL
+    /// WHERE <clauses joined with AND>
     /// [GROUP BY 1, …] [LIMIT …]
     /// ```
     ///
-    /// One `WHERE`, in three parts:
+    /// One level, one `WHERE`. `FINAL` resolves every sort key to its highest
+    /// `version` before the `WHERE` runs, so `clauses` may mix the pruning
+    /// predicates (`gts_id`, the `corrects_id` partition, metadata
+    /// side-channel, the caller `$filter` with `tenant_id` and `created_at`,
+    /// subject guards) with the liveness predicate [`ACTIVE_ONLY`] and any
+    /// caller `status` conjunct: all of them read the resolved row. One
+    /// resolved row per active logical row is what gets aggregated, so the
+    /// only `GROUP BY` in the text is the caller's dimension grouping and the
+    /// bucket cap applies after it.
     ///
-    /// 1. `scan` — `inner_clauses` joined, every version-invariant predicate
-    ///    (`gts_id`, the `corrects_id` partition, metadata side-channel, the
-    ///    invariant half of `$filter`, subject guards). It prunes the scan.
-    /// 2. the survivor predicate (`dedup::active_survivors`), which embeds the
-    ///    *same* `scan` text so the marker subquery prunes identically. That is
-    ///    why the caller binds `gts_id` and the scan binds twice, and why the
-    ///    aggregate no longer needs a version-resolving level at all — one
-    ///    physical row per active logical row survives, and the only `GROUP BY`
-    ///    is the caller's dimension grouping.
-    /// 3. `outer_clauses` — the `status`-naming half of `$filter`, which is
-    ///    sound on the raw column here because every survivor's raw `status`
-    ///    equals its resolved status. Empty for the common call.
-    ///
-    /// The `WHERE` is never empty (`gts_id = ?` is always the first scan
-    /// clause), so no branch omits it.
+    /// Each `?` in `clauses` is bound exactly once, in text order. The `WHERE`
+    /// is never empty (`gts_id = ?` is always the first clause), so no branch
+    /// omits it.
     fn build_aggregate_sql(
         aliased_select: &str,
-        inner_clauses: &[String],
-        outer_clauses: &[String],
+        clauses: &[String],
         group_by: &str,
         limit_clause: &str,
     ) -> String {
-        let scan = inner_clauses.join(" AND ");
-        let mut where_parts = vec![scan.clone(), active_survivors(&scan)];
-        where_parts.extend(outer_clauses.iter().cloned());
         format!(
-            "SELECT {aliased_select} FROM usage_records WHERE {}{group_by}{limit_clause}",
-            where_parts.join(" AND ")
+            "SELECT {aliased_select} FROM {RECORDS_FINAL} WHERE {}{group_by}{limit_clause}",
+            clauses.join(" AND ")
         )
     }
 
-    /// Assemble the single-level keyset-list query text.
+    /// Assemble the keyset-list query text.
     ///
     /// Split out of [`RecordStore::list`] for the same reason as
     /// [`Self::build_aggregate_sql`].
     ///
     /// ```text
-    /// SELECT <RECORD_COLUMNS> FROM usage_records
-    /// WHERE <scan> AND (status = 'inactive' OR id NOT IN (SELECT id FROM usage_records WHERE <scan> AND status = 'inactive'))
-    ///   [AND <outer_clauses>]
+    /// SELECT <RECORD_COLUMNS> FROM usage_records FINAL
+    /// WHERE <clauses joined with AND>
     /// ORDER BY <order_sql> LIMIT <limit>
     /// ```
     ///
-    /// Same three-part `WHERE` as the aggregate, with `dedup::resolved_survivors`
-    /// as the survivor predicate because `list` returns inactive rows too: a
-    /// marker survives as the resolved row it is, an active row survives iff
-    /// no marker exists for its id. `outer_clauses` carries the `status`-naming
-    /// half of `$filter` and the keyset tuple predicate (which may name
-    /// `status`); both read the raw column, which on every survivor equals the
-    /// resolved value. `limit` is the caller's look-ahead `LIMIT` (page size
-    /// plus one) and applies after every predicate, so a filtered page is never
-    /// short.
-    fn build_list_sql(
-        inner_clauses: &[String],
-        outer_clauses: &[String],
-        order_sql: &str,
-        limit: u64,
-    ) -> String {
-        let scan = inner_clauses.join(" AND ");
-        let mut where_parts = vec![scan.clone(), resolved_survivors(&scan)];
-        where_parts.extend(outer_clauses.iter().cloned());
+    /// Same one-level shape as the aggregate, without a liveness predicate
+    /// because `list` returns inactive rows too: after `FINAL` a deactivated
+    /// record *is* its marker row, with the resolved `status = 'inactive'`.
+    /// `clauses` carries the pruning predicates, the whole caller `$filter`
+    /// (`status` conjuncts included) and the keyset tuple predicate (which may
+    /// name `status`); every one reads the resolved row. `limit` is the
+    /// caller's look-ahead `LIMIT` (page size plus one) and applies after
+    /// resolution and every predicate, so it counts logical rows: a filtered
+    /// page is never short, and an unmerged duplicate cannot repeat a row
+    /// across two pages.
+    fn build_list_sql(clauses: &[String], order_sql: &str, limit: u64) -> String {
         format!(
-            "SELECT {RECORD_COLUMNS} FROM usage_records WHERE {} ORDER BY {order_sql} LIMIT {limit}",
-            where_parts.join(" AND ")
+            "SELECT {RECORD_COLUMNS} FROM {RECORDS_FINAL} WHERE {} ORDER BY {order_sql} LIMIT {limit}",
+            clauses.join(" AND ")
         )
     }
 }
@@ -1215,10 +1195,10 @@ impl RecordStore for ChRecordStore {
         // Resolving per key and taking the first row is what `FINAL` plus
         // `fetch_optional` did.
         //
-        // The `use_skip_indexes_if_final*` settings that used to accompany this
-        // query are gone with `FINAL`: `idx_records_id` is consulted for this
-        // non-sort-key-prefix `id` predicate by default once no merge-on-read
-        // is involved.
+        // This point read resolves in SQL rather than under `FINAL` (see
+        // `query::dedup`), so `idx_records_id` is consulted for this
+        // non-sort-key-prefix `id` predicate by default: no merge-on-read is
+        // involved.
         let resolve_latest = latest_by(RECORD_DEDUP_KEY);
         let sql =
             format!("SELECT {RECORD_COLUMNS} FROM usage_records WHERE id = ?{resolve_latest}");
@@ -1253,46 +1233,31 @@ impl RecordStore for ChRecordStore {
         let limit =
             effective_page_size(query.limit, crate::infra::storage::query::DEFAULT_PAGE_SIZE);
 
-        // The `WHERE` has two halves (see `Self::build_list_sql`), so the binds
-        // are collected in two contexts and applied scan-then-trailing to
-        // match the order the `?`s appear in the text.
+        // One `WHERE` over `FINAL`-resolved rows (see `Self::build_list_sql`
+        // and `query::dedup`), so one bind context: clauses are pushed in the
+        // order their `?`s appear in the text, and the binds are applied in
+        // that same order, once each.
         //
-        // The scan half takes every predicate over version-invariant columns:
-        // `gts_id`, the metadata side-channel, and the version-invariant half
-        // of the caller `$filter` (`Self::push_split_filter`) — which is where
-        // `tenant_id` and `created_at`, two thirds of the key prefix, arrive.
-        // It is rendered twice — as the scan predicate and inside the marker
-        // subquery — so its binds are applied twice.
+        // Clause order: `gts_id`, the metadata side-channel, the caller
+        // `$filter` conjunct by conjunct — which is where `tenant_id` and
+        // `created_at`, two thirds of the key prefix, arrive, and where a
+        // `status` conjunct reads the resolved status — then the keyset
+        // predicate, which stays whole (a lexicographic tuple over the sort
+        // order, possibly naming `status`).
         //
-        // The trailing half takes the `status`-naming half of the `$filter`
-        // and the whole keyset predicate, after the survivor predicate. Both
-        // read the raw `status` column, which on every surviving row equals the
-        // resolved status (`dedup::resolved_survivors`). The keyset predicate
-        // stays whole — it is a lexicographic tuple over the sort order, not a
-        // conjunction that can be split, and it may name `status`.
-        //
-        // `gts_id = ?` is bound separately and is the first `?` in each copy.
-        let mut inner_ctx = SqlCtx::new();
-        let mut inner_clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
-        let mut outer_ctx = SqlCtx::new();
-        let mut outer_clauses: Vec<String> = Vec::new();
+        // `gts_id = ?` is bound separately and is the first `?`.
+        let mut ctx = SqlCtx::new();
+        let mut clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
 
-        // Metadata side-channel — pushed before `$filter` so the inner binds
-        // precede the outer ones.
-        Self::push_metadata_filters(metadata_filter, &mut inner_ctx, &mut inner_clauses);
+        // Metadata side-channel — pushed before `$filter` so its binds precede
+        // the filter's.
+        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
 
-        // `$filter` (validated AST → typed node → parameterised fragments),
-        // split inner/outer on version-invariance.
+        // `$filter` (validated AST → typed node → parameterised fragments).
         if let Some(expr) = query.filter() {
             let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
                 .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            Self::push_split_filter(
-                &node,
-                &mut inner_ctx,
-                &mut inner_clauses,
-                &mut outer_ctx,
-                &mut outer_clauses,
-            )?;
+            Self::push_filter(&node, &mut ctx, &mut clauses)?;
         }
 
         // Keyset continuation (forward only).
@@ -1320,32 +1285,21 @@ impl RecordStore for ChRecordStore {
                 record_column,
                 |name| UsageRecordFilterField::from_name(name).map(|f| f.kind()),
                 is_keyset_safe_record_field,
-                &mut outer_ctx,
+                &mut ctx,
             )
             .map_err(UsageCollectorPluginError::internal)?;
-            outer_clauses.push(predicate);
+            clauses.push(predicate);
         }
 
         let order_sql = render_order_by(&query.order, record_column)
             .map_err(UsageCollectorPluginError::internal)?;
 
-        let sql = Self::build_list_sql(
-            &inner_clauses,
-            &outer_clauses,
-            &order_sql,
-            limit.saturating_add(1),
-        );
+        let sql = Self::build_list_sql(&clauses, &order_sql, limit.saturating_add(1));
 
-        // Scan binds twice (scan predicate, then the marker subquery), then the
-        // trailing binds — the order the `?`s appear in `build_list_sql`.
-        let mut q = self.client.query(&sql);
-        for _ in 0..2 {
-            q = q.bind(gts_id.as_ref());
-            for b in &inner_ctx.binds {
-                q = bind_one(q, b);
-            }
-        }
-        for b in &outer_ctx.binds {
+        // `gts_id`, then every clause bind once — the order the `?`s appear in
+        // `build_list_sql`. The `FINAL` read settings ride on this query only.
+        let mut q = with_final_read_settings(self.client.query(&sql)).bind(gts_id.as_ref());
+        for b in &ctx.binds {
             q = bind_one(q, b);
         }
 
@@ -1412,54 +1366,39 @@ impl RecordStore for ChRecordStore {
         );
         self.metrics.inc_query_request(QueryKind::Aggregated);
 
-        // Same two-half `WHERE` as `list` (see `Self::build_aggregate_sql`):
-        // the version-invariant predicates form the scan half, rendered twice
-        // (scan and marker subquery); the survivor predicate
-        // (`dedup::active_survivors`) keeps one raw row per *active* logical
-        // row, so no version-resolving level is needed and aggregating the
-        // survivors directly counts neither a deactivated row nor its marker;
-        // only the `status`-naming half of the caller `$filter` — which may be
-        // an unsplittable `OR` / `NOT` over any allowlisted column — trails,
-        // reading the raw `status` that on every survivor equals the resolved
-        // one.
+        // Same one-level `WHERE` over `FINAL`-resolved rows as `list` (see
+        // `Self::build_aggregate_sql`): the pruning predicates, the liveness
+        // predicate `ACTIVE_ONLY` — which after resolution keeps exactly the
+        // active logical rows, counting neither a deactivated row nor its
+        // marker — and the caller `$filter` conjunct by conjunct, `status`
+        // ones included, since every clause reads the resolved row.
         //
-        // Pushing the invariant half of the `$filter` into the scan half
-        // matters most here: `tenant_id` and `created_at` reach this method
-        // only through `$filter`, and with `gts_id` they are the whole key
-        // prefix, so an aggregate over one tenant's time window is a key-range
-        // scan (twice — the marker subquery prunes on the same range).
+        // `tenant_id` and `created_at` reach this method only through
+        // `$filter`, and with `gts_id` they are the whole key prefix, so an
+        // aggregate over one tenant's time window is a key-range scan under
+        // `FINAL`, which resolves only the parts that range touches.
         //
-        // Binds are collected in two contexts and applied scan-twice-then-
-        // trailing to match the `?` order in the emitted text; the SELECT-list
-        // metadata binds precede both (see below).
-        let mut inner_ctx = SqlCtx::new();
-        let mut inner_clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
-        let mut outer_ctx = SqlCtx::new();
-        // Only the `status`-naming half of the caller `$filter` can land here,
-        // so this vector is empty for the common call.
-        let mut outer_clauses: Vec<String> = Vec::new();
+        // One bind context, applied once in text order; the SELECT-list
+        // metadata binds precede it (see below).
+        let mut ctx = SqlCtx::new();
+        let mut clauses: Vec<String> = vec!["gts_id = ?".to_owned()];
 
-        // `corrects_id` partition (plugin-spi.md §Method 3). `corrects_id` is
-        // version-invariant, so this prunes the scan.
+        // `corrects_id` partition (plugin-spi.md §Method 3), then liveness —
+        // both bare literals, pushed ahead of any clause that binds.
         if let Some(clause) = corrects_id_partition_clause(spec.op) {
-            inner_clauses.push(clause.to_owned());
+            clauses.push(clause.to_owned());
         }
+        clauses.push(ACTIVE_ONLY.to_owned());
 
-        // Metadata side-channel — pushed before `$filter` so the inner binds
-        // precede the outer ones.
-        Self::push_metadata_filters(metadata_filter, &mut inner_ctx, &mut inner_clauses);
+        // Metadata side-channel — pushed before `$filter` so its binds precede
+        // the filter's.
+        Self::push_metadata_filters(metadata_filter, &mut ctx, &mut clauses);
 
-        // `$filter`, split inner/outer on version-invariance.
+        // `$filter` (validated AST → typed node → parameterised fragments).
         if let Some(expr) = query.filter() {
             let node = convert_expr_to_filter_node::<UsageRecordFilterField>(expr)
                 .map_err(|e| UsageCollectorPluginError::internal(format!("invalid filter: {e}")))?;
-            Self::push_split_filter(
-                &node,
-                &mut inner_ctx,
-                &mut inner_clauses,
-                &mut outer_ctx,
-                &mut outer_clauses,
-            )?;
+            Self::push_filter(&node, &mut ctx, &mut clauses)?;
         }
 
         // Dimension SELECT exprs + subject-not-null guards.
@@ -1470,13 +1409,11 @@ impl RecordStore for ChRecordStore {
         let mut select_binds: Vec<SqlBind> = Vec::new();
         for dim in &spec.group_by {
             match dim {
-                // Both guards are over version-invariant columns, so they
-                // belong in the scan half with the rest of the pruning.
                 AggregationDimension::SubjectId => {
-                    inner_clauses.push("subject_id IS NOT NULL".to_owned());
+                    clauses.push("subject_id IS NOT NULL".to_owned());
                 }
                 AggregationDimension::SubjectType => {
-                    inner_clauses.push("subject_type IS NOT NULL".to_owned());
+                    clauses.push("subject_type IS NOT NULL".to_owned());
                 }
                 _ => {}
             }
@@ -1518,32 +1455,21 @@ impl RecordStore for ChRecordStore {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let sql = Self::build_aggregate_sql(
-            &aliased_select,
-            &inner_clauses,
-            &outer_clauses,
-            &group_by,
-            &limit_clause,
-        );
+        let sql = Self::build_aggregate_sql(&aliased_select, &clauses, &group_by, &limit_clause);
 
         // Bind order matches left-to-right `?` in `sql`: SELECT metadata keys,
-        // then `gts_id` and the scan binds for the scan predicate, then
-        // `gts_id` and the scan binds again for the marker subquery, then the
-        // trailing (`$filter` status half) binds.
-        let mut q = self
-            .client
-            .query(&sql)
-            .with_setting("output_format_json_quote_decimals", "1");
+        // then `gts_id`, then every `WHERE` clause bind once. The `FINAL` read
+        // settings ride on this query only.
+        let mut q = with_final_read_settings(
+            self.client
+                .query(&sql)
+                .with_setting("output_format_json_quote_decimals", "1"),
+        );
         for b in &select_binds {
             q = bind_one(q, b);
         }
-        for _ in 0..2 {
-            q = q.bind(gts_id.as_ref());
-            for b in &inner_ctx.binds {
-                q = bind_one(q, b);
-            }
-        }
-        for b in &outer_ctx.binds {
+        q = q.bind(gts_id.as_ref());
+        for b in &ctx.binds {
             q = bind_one(q, b);
         }
 

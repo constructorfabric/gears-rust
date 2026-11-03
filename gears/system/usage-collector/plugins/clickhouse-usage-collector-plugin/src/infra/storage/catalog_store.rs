@@ -53,7 +53,7 @@ use crate::infra::metrics::Metrics;
 use crate::infra::storage::entity::{UsageTypeKindCode, UsageTypeRow};
 use crate::infra::storage::error::{tracked_ch_err, with_deadline};
 use crate::infra::storage::mapper::current_merge_version;
-use crate::infra::storage::pool::configure_insert;
+use crate::infra::storage::pool::{InsertIntent, configure_insert};
 use crate::infra::storage::query::dedup::{LATEST_ONE, latest_by};
 use crate::infra::storage::query::keyset::{
     encode_next_cursor, ensure_forward_cursor, keyset_predicate,
@@ -288,17 +288,16 @@ impl ChCatalogStore {
             )
             .await?,
             self.request_timeout,
-            // Deliberately synchronous, independent of the record store's
-            // `async_insert` setting, and therefore a literal rather than a
-            // config-threaded field. `usage_type_catalog` is a control-plane
-            // table: writes come only from `create_usage_type` and
-            // `delete_usage_type`, and the table is unpartitioned and tiny —
-            // so there is no
-            // concurrent insert stream for the server-side buffer to coalesce
-            // and no part count to reduce. Enabling it would add the
-            // buffer-flush wait to a request whose latency is directly
-            // observed, for nothing.
-            false,
+            // Deliberately synchronous (`async_insert = 0`, sent explicitly),
+            // independent of the record store's `async_insert` setting, and
+            // therefore a literal intent rather than a config-threaded field.
+            // `usage_type_catalog` is a control-plane table: writes come only
+            // from `create_usage_type` and `delete_usage_type`, and the table
+            // is unpartitioned and tiny — so there is no concurrent insert
+            // stream for the server-side buffer to coalesce and no part count
+            // to reduce. Buffering it would add the flush wait to a request
+            // whose latency is directly observed, for nothing.
+            InsertIntent::Catalog,
             // No insert dedup token: the catalog has no dedup window, and the
             // create-type race it would guard is already resolved by the
             // `ReplacingMergeTree` version on this table (see the module docs).
