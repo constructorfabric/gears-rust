@@ -48,6 +48,7 @@ async fn timeout_to_canonical(err: BoxError) -> axum::response::Response {
 }
 
 use authn_resolver_sdk::AuthNResolverClient;
+use toolkit::LazyClient;
 
 use cf_system_sdks::directory::{DirectoryClient, DirectoryGrpcClient};
 
@@ -68,7 +69,7 @@ use crate::web;
     // `system`: binds before the application group is prepared: probes and
     // the system gears' platform-plane routes are served first; the full
     // surface replaces them on the same listener (`rest_bootstrap`). The
-    // AuthN resolver client is looked up only then, in `rest_finalize`.
+    // AuthN resolver client is looked up per request, on first tenant auth.
 	capabilities = [system, rest_host, rest, stateful],
     deps = [grpc_hub],
 	lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
@@ -82,9 +83,10 @@ pub struct ApiGateway {
     pub(crate) router_cache: RouterCache<axum::Router>,
     /// Store the finalized router from REST phase for serving
     pub(crate) final_router: Mutex<Option<axum::Router>>,
-    /// `AuthN` Resolver client (resolved in `rest_finalize`, once the
-    /// application group initialized; `None` when `auth_disabled`)
-    pub(crate) authn_client: Mutex<Option<Arc<dyn AuthNResolverClient>>>,
+    /// `AuthN` Resolver client: the hub is bound in `init`, the client looked
+    /// up on the first tenant authentication and cached once found. Shared by
+    /// every router built, so all of them see the one cached client.
+    pub(crate) authn_client: Arc<LazyClient<dyn AuthNResolverClient>>,
     /// Inbound platform-plane authenticator (built in init from
     /// `config.internal_auth`, None in Profile 1). When present, the stack layers
     /// `internal_auth_middleware` ahead of the tenant plane so co-hosted internal
@@ -142,7 +144,7 @@ impl Default for ApiGateway {
             openapi_registry: Arc::new(OpenApiRegistryImpl::new()),
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
-            authn_client: Mutex::new(None),
+            authn_client: Arc::new(LazyClient::new()),
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             readiness_deps: OnceLock::new(),
@@ -246,7 +248,7 @@ impl ApiGateway {
             openapi_registry: Arc::new(OpenApiRegistryImpl::new()),
             router_cache: RouterCache::new(default_router),
             final_router: Mutex::new(None),
-            authn_client: Mutex::new(None),
+            authn_client: Arc::new(LazyClient::new()),
             internal_authenticator: Mutex::new(None),
             healthcheck_registry: OnceLock::new(),
             readiness_deps: OnceLock::new(),
@@ -414,9 +416,8 @@ impl ApiGateway {
     pub(crate) fn apply_middleware_stack(
         &self,
         router: Router,
-        authn_client: Option<Arc<dyn AuthNResolverClient>>,
     ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
-        self.apply_middleware_stack_for(router, authn_client, false)
+        self.apply_middleware_stack_for(router, false)
     }
 
     /// [`Self::apply_middleware_stack`]; `bootstrap` builds the stack served
@@ -426,7 +427,6 @@ impl ApiGateway {
     pub(crate) fn apply_middleware_stack_for(
         &self,
         mut router: Router,
-        authn_client: Option<Arc<dyn AuthNResolverClient>>,
         bootstrap: bool,
     ) -> Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         // Build route policy once
@@ -544,17 +544,14 @@ impl ApiGateway {
                     }
                 },
             ));
-        } else if let Some(client) = authn_client {
+        } else {
+            // Installed whether or not a resolver exists yet: a tenant request
+            // gets `503` until one registers, never anonymous access.
             let auth_state = auth::AuthState {
-                authn_client: client,
+                authn_client: Arc::clone(&self.authn_client),
                 route_policy,
             };
             router = router.layer(from_fn_with_state(auth_state, auth::authn_middleware));
-        } else {
-            return Err(anyhow::anyhow!(
-                "auth is enabled but no AuthN Resolver client is available; \
-                 ensure `authn_resolver` gear is loaded or set `auth_disabled: true`"
-            ));
         }
 
         if let Some(internal) = self.internal_authenticator.lock().clone() {
@@ -774,7 +771,6 @@ impl ApiGateway {
         // No "main" routes here — the empty router is tolerated (`has_routes` guard).
         // Health probes are not part of this router; see `health_router`.
         let config = self.get_cached_config();
-        let authn_client = self.authn_client.lock().clone();
         let mut router = Router::new();
 
         // Embedded-edge reverse proxy: mount the Forwarder as the fallback BEFORE the
@@ -785,7 +781,7 @@ impl ApiGateway {
             router = self.mount_proxy_fallback(router)?;
         }
 
-        let (router, pruner) = self.apply_middleware_stack(router, authn_client)?;
+        let (router, pruner) = self.apply_middleware_stack(router)?;
 
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         let router = Self::apply_prefix(router, &prefix);
@@ -936,15 +932,6 @@ impl ApiGateway {
         }
     }
 
-    /// Resolve the `AuthN` Resolver client, now that the application group,
-    /// which provides it, initialized.
-    fn resolve_authn_client(&self, ctx: &toolkit::context::GearCtx) -> anyhow::Result<()> {
-        let authn_client = ctx.client_hub().get::<dyn AuthNResolverClient>()?;
-        *self.authn_client.lock() = Some(authn_client);
-        tracing::info!("AuthN Resolver client resolved from ClientHub");
-        Ok(())
-    }
-
     /// A router dispatching each request to the router currently in
     /// `live_router`, so routes swap on the bound listener.
     fn live_dispatcher(self: &Arc<Self>) -> Router {
@@ -1027,7 +1014,6 @@ impl ApiGateway {
         &self,
         mut router: Router,
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
-        authn_client: Option<Arc<dyn AuthNResolverClient>>,
         bootstrap: bool,
     ) -> anyhow::Result<(Router, middleware::throttling::ThrottleKeyPruner)> {
         let config = self.get_cached_config();
@@ -1060,7 +1046,7 @@ impl ApiGateway {
 
         // Middleware on the main router before nesting (auth matching keyed on
         // unprefixed OperationBuilder paths; layers run before nest() strips the prefix).
-        let (router, pruner) = self.apply_middleware_stack_for(router, authn_client, bootstrap)?;
+        let (router, pruner) = self.apply_middleware_stack_for(router, bootstrap)?;
         let prefix = Self::normalize_prefix_path(&config.prefix_path)?;
         Ok((Self::apply_prefix(router, &prefix), pruner))
     }
@@ -1447,9 +1433,10 @@ impl toolkit::Gear for ApiGateway {
                 "Auth-disabled mode enabled with default tenant"
             );
         }
-        // The AuthN resolver client is resolved in `rest_finalize`: the
-        // gateway initializes with the system group, before the application
-        // group (the resolver among it) exists.
+        // Only the hub is bound: the gateway initializes with the system
+        // group, before the application group (the resolver among it)
+        // exists; the client is looked up on the first tenant authentication.
+        self.authn_client.bind(ctx.client_hub());
 
         // Build the inbound platform-plane authenticator (None in Profile 1).
         // Done here so a misconfigured `internal_auth` fails init rather than
@@ -1494,7 +1481,7 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
         let hc_registry = self.healthcheck_registry.get().cloned().ok_or_else(|| {
             anyhow::anyhow!("healthcheck_registry not set; call rest_prepare before rest_bootstrap")
         })?;
-        let (router, pruner) = self.surface(router, hc_registry, None, true)?;
+        let (router, pruner) = self.surface(router, hc_registry, true)?;
         self.install_serving_router(router, pruner);
         tracing::info!("REST host serving bootstrap routes (platform plane and probes)");
         Ok(())
@@ -1502,23 +1489,18 @@ impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
 
     fn rest_finalize(
         &self,
-        ctx: &toolkit::context::GearCtx,
+        _ctx: &toolkit::context::GearCtx,
         mut router: axum::Router,
         hc_registry: Arc<toolkit::RestHealthcheckRegistry>,
     ) -> anyhow::Result<axum::Router> {
         let config = self.get_cached_config();
-
-        if !config.auth_disabled {
-            self.resolve_authn_client(ctx)?;
-        }
 
         if config.enable_docs {
             router = self.add_openapi_routes(router)?;
         }
 
         tracing::debug!("Applying middleware stack to finalized router");
-        let authn_client = self.authn_client.lock().clone();
-        let (router, pruner) = self.surface(router, hc_registry, authn_client, false)?;
+        let (router, pruner) = self.surface(router, hc_registry, false)?;
 
         // Keep the finalized router to be used by `serve()`, and serve it
         // from now on when `serve` already runs.
@@ -1879,7 +1861,7 @@ mod tests {
         };
         let api = ApiGateway::new(config);
         let _router = api
-            .apply_middleware_stack(Router::new(), None)
+            .apply_middleware_stack(Router::new())
             .expect("stack builds without a platform-plane authenticator");
     }
 
@@ -1903,7 +1885,7 @@ mod tests {
         *api.internal_authenticator.lock() = Some(auth);
 
         let _router = api
-            .apply_middleware_stack(Router::new(), None)
+            .apply_middleware_stack(Router::new())
             .expect("stack builds with the platform-plane layer");
     }
 
@@ -2157,9 +2139,8 @@ mod tests {
 
         // Binding to `:0` lets the OS pick a free port; `serve` must publish the
         // actual bound address (via `listener.local_addr()`), not the configured
-        // `:0`. Auth is disabled because this test exercises the fallback
-        // router build (no `rest_finalize`), which fails fast when auth is
-        // enabled but no AuthN Resolver client is available.
+        // `:0`. Auth is disabled: this test exercises the fallback router
+        // build (no `rest_finalize`) and needs no tenant auth.
         let cfg = ApiGatewayConfig {
             bind_addr: "127.0.0.1:0".to_owned(),
             auth_disabled: true,

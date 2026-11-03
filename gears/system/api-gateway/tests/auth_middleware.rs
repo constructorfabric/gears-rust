@@ -2068,7 +2068,8 @@ async fn listener_status(endpoint: &str, path: &str, headers: &[(&str, &str)]) -
 /// The gateway serves before the application group exists: probes and
 /// platform-plane routes over the bootstrap stack, tenant routes `503` with
 /// no `AuthN` resolver in the hub. `rest_finalize` then swaps in the full
-/// surface on the same listener: no second bind, no second start.
+/// surface on the same listener (no second bind, no second start); its
+/// tenant routes look the resolver up once it registers.
 #[tokio::test]
 async fn the_bootstrap_routes_are_replaced_on_the_same_listener() {
     use toolkit::contracts::RunnableCapability as _;
@@ -2135,15 +2136,10 @@ async fn the_bootstrap_routes_are_replaced_on_the_same_listener() {
         "no tenant route before the AuthN resolver exists"
     );
 
-    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
-        AXIS_BEARER,
-        Uuid::new_v4(),
-        Uuid::new_v4(),
-    )));
     let _final = gear
         .inner()
         .rest_finalize(&api_ctx, routes, hc_registry)
-        .expect("finalize");
+        .expect("finalize needs no AuthN resolver");
 
     assert_eq!(
         gear.inner().bound_endpoint().as_deref(),
@@ -2151,8 +2147,18 @@ async fn the_bootstrap_routes_are_replaced_on_the_same_listener() {
     );
     assert_eq!(
         listener_status(&endpoint, AXIS_PATH, &tenant).await,
+        503,
+        "the final surface, before the AuthN resolver registers"
+    );
+    hub.register::<dyn AuthNResolverClient>(Arc::new(mock_accepting_token(
+        AXIS_BEARER,
+        Uuid::new_v4(),
+        Uuid::new_v4(),
+    )));
+    assert_eq!(
+        listener_status(&endpoint, AXIS_PATH, &tenant).await,
         200,
-        "the tenant plane after finalize, same listener"
+        "the tenant plane once the resolver registers, same listener"
     );
     assert_eq!(
         listener_status(&endpoint, AXIS_PATH, &[("authorization", "Bearer nope")]).await,
@@ -2166,4 +2172,225 @@ async fn the_bootstrap_routes_are_replaced_on_the_same_listener() {
     gear.stop(tokio_util::sync::CancellationToken::new())
         .await
         .unwrap();
+}
+
+// Lazy AuthN resolver lookup: the gateway initializes and finalizes before
+// the resolver exists and looks it up on the first tenant authentication.
+
+/// An auth-enabled gateway serving [`TestAxisGear`] (CORS on), finalized over
+/// a hub without an `AuthN` resolver; the hub is returned to register one later.
+async fn axis_gateway_without_authn() -> (Arc<ClientHub>, api_gateway::ApiGateway, Router) {
+    let mut config = axis_config(true);
+    config["cors_enabled"] = json!(true);
+    let hub = Arc::new(ClientHub::new());
+    let api_ctx = GearCtx::new(
+        "api-gateway",
+        Uuid::new_v4(),
+        Arc::new(TestConfigProvider {
+            config: json!({ "api-gateway": { "config": config } }),
+        }),
+        Arc::clone(&hub),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    let gateway = api_gateway::ApiGateway::default();
+    gateway
+        .init(&api_ctx)
+        .await
+        .expect("init needs no AuthN resolver");
+    let axis = TestAxisGear
+        .register_rest(&create_test_gear_ctx(), Router::new(), &gateway)
+        .expect("routes");
+    let finalized = gateway
+        .rest_finalize(
+            &api_ctx,
+            axis,
+            Arc::new(toolkit::RestHealthcheckRegistry::new()),
+        )
+        .expect("finalize needs no AuthN resolver");
+    (hub, gateway, finalized)
+}
+
+/// A resolver accepting [`AXIS_BEARER`] that counts its `authenticate` calls.
+fn counting_mock(calls: &Arc<std::sync::atomic::AtomicUsize>) -> Arc<dyn AuthNResolverClient> {
+    let calls = Arc::clone(calls);
+    let inner = mock_accepting_token(AXIS_BEARER, Uuid::new_v4(), Uuid::new_v4());
+    Arc::new(MockAuthNResolverClient {
+        handler: Arc::new(move |token| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            (inner.handler)(token)
+        }),
+    })
+}
+
+fn calls(counter: &Arc<std::sync::atomic::AtomicUsize>) -> usize {
+    counter.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+async fn tenant_get(router: Router, bearer: Option<&str>) -> Response {
+    let mut builder = Request::builder().method(Method::GET).uri(AXIS_PATH);
+    if let Some(value) = bearer {
+        builder = builder.header(header::AUTHORIZATION, format!("Bearer {value}"));
+    }
+    router
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .expect("Request failed")
+}
+
+async fn assert_resolver_unavailable(response: Response) {
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok()),
+        Some("5")
+    );
+    assert!(
+        www_authenticate_all(&response).is_empty(),
+        "not a credential rejection"
+    );
+    let problem = problem_from(response).await;
+    assert_eq!(problem.problem_type, SERVICE_UNAVAILABLE_TYPE);
+    assert_eq!(problem.context["retry_after_seconds"], 5);
+}
+
+#[tokio::test]
+async fn a_tenant_request_gets_503_until_the_authn_resolver_registers() {
+    let (hub, _gateway, router) = axis_gateway_without_authn().await;
+
+    // Absent resolver: unavailable, and not negatively cached.
+    assert_resolver_unavailable(tenant_get(router.clone(), Some(AXIS_BEARER)).await).await;
+    assert_resolver_unavailable(tenant_get(router.clone(), Some(AXIS_BEARER)).await).await;
+
+    // Missing bearer stays 401 and never needs the resolver.
+    let response = tenant_get(router.clone(), None).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        www_authenticate_all(&response),
+        vec![r#"Bearer realm="api""#]
+    );
+
+    let counter = Arc::default();
+    hub.register::<dyn AuthNResolverClient>(counting_mock(&counter));
+
+    // The same router recovers once the resolver registers.
+    let (status, body, _) = axis_call(
+        router.clone(),
+        Method::GET,
+        AXIS_PATH,
+        Some(AXIS_BEARER),
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let response = tenant_get(router, Some("forged")).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        problem_from(response).await.context["reason"],
+        "AUTHN_FAILED"
+    );
+    assert_eq!(calls(&counter), 2);
+}
+
+#[tokio::test]
+async fn public_platform_and_preflight_routes_need_no_authn_resolver() {
+    let (hub, _gateway, router) = axis_gateway_without_authn().await;
+
+    let probe = router
+        .clone()
+        .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::OK, "probes");
+    let preflight = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri(AXIS_PATH)
+                .header(header::ORIGIN, "https://example.com")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        preflight.status().is_success(),
+        "preflight: {}",
+        preflight.status()
+    );
+    let cases = [
+        (AXIS_PUBLIC_PATH, Some(AXIS_BEARER), None, StatusCode::OK),
+        (
+            AXIS_PLATFORM_PATH,
+            None,
+            Some(AXIS_INTERNAL_SECRET),
+            StatusCode::OK,
+        ),
+        (AXIS_PLATFORM_PATH, None, None, StatusCode::UNAUTHORIZED),
+        (
+            AXIS_PLATFORM_PATH,
+            Some(AXIS_BEARER),
+            None,
+            StatusCode::UNAUTHORIZED,
+        ),
+    ];
+    for (path, bearer, token, want) in cases {
+        let (status, body, _) = axis_call(router.clone(), Method::GET, path, bearer, token).await;
+        assert_eq!(status, want, "{path} without a resolver: {body}");
+    }
+
+    // With a resolver registered, the platform path still never runs it.
+    let counter = Arc::default();
+    hub.register::<dyn AuthNResolverClient>(counting_mock(&counter));
+    for (path, bearer, token, want) in cases {
+        let (status, body, _) = axis_call(router.clone(), Method::GET, path, bearer, token).await;
+        assert_eq!(status, want, "{path} with a resolver: {body}");
+    }
+    assert_eq!(
+        calls(&counter),
+        0,
+        "only tenant-required routes authenticate"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_resolved_authn_client_is_cached_and_shared_by_every_router() {
+    let (hub, gateway, router) = axis_gateway_without_authn().await;
+    // The standalone/fallback build shares the gateway's lazy client.
+    let fallback = gateway.build_router().expect("fallback router");
+    assert_resolver_unavailable(tenant_get(fallback.clone(), Some(AXIS_BEARER)).await).await;
+
+    let (first, second) = (Arc::default(), Arc::default());
+    hub.register::<dyn AuthNResolverClient>(counting_mock(&first));
+    // Concurrent first lookups (on worker threads), racing a replacement
+    // registration: whichever client wins the cache serves every request.
+    let requests: Vec<_> = (0..16)
+        .map(|_| tokio::spawn(tenant_get(router.clone(), Some(AXIS_BEARER))))
+        .collect();
+    hub.register::<dyn AuthNResolverClient>(counting_mock(&second));
+    for request in requests {
+        assert_eq!(request.await.unwrap().status(), StatusCode::OK);
+    }
+    let winner = if calls(&first) > 0 { &first } else { &second };
+    assert_eq!(
+        calls(winner),
+        16,
+        "every request used the one cached client"
+    );
+
+    // Cached: the hub no longer matters, for this router and the fallback one.
+    hub.remove::<dyn AuthNResolverClient>();
+    assert_eq!(
+        tenant_get(router, Some(AXIS_BEARER)).await.status(),
+        StatusCode::OK
+    );
+    // The fallback router has no handlers: passing auth reaches its 404.
+    assert_eq!(
+        tenant_get(fallback, Some(AXIS_BEARER)).await.status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(calls(winner), 18);
 }

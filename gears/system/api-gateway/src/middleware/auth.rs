@@ -8,6 +8,8 @@ use std::{
 use crate::middleware::common;
 
 use authn_resolver_sdk::{AuthNResolverClient, AuthNResolverError};
+use toolkit::client_hub::ClientHubError;
+use toolkit::{LazyClient, LazyClientError};
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gateway::ProxyRegistry;
 use toolkit_http_middleware::{admit_platform, retain_route_plane};
@@ -199,7 +201,9 @@ impl GatewayRoutePolicy {
 /// Shared state for the authentication middleware.
 #[derive(Clone)]
 pub struct AuthState {
-    pub authn_client: Arc<dyn AuthNResolverClient>,
+    /// Looked up on the first tenant authentication; every clone shares the
+    /// one cached client.
+    pub authn_client: Arc<LazyClient<dyn AuthNResolverClient>>,
     pub route_policy: GatewayRoutePolicy,
 }
 
@@ -365,7 +369,12 @@ pub async fn authn_middleware(
                 return response;
             };
 
-            match state.authn_client.authenticate(token).await {
+            // Resolve (or reuse) the client; no lock is held past this call.
+            let client = match state.authn_client.get() {
+                Ok(client) => client,
+                Err(err) => return lazy_client_error_to_response(&err),
+            };
+            match client.authenticate(token).await {
                 Ok(result) => {
                     log_auth_succeeded(req.method(), path.as_str(), &result.security_context);
                     req.extensions_mut().insert(result.security_context);
@@ -421,6 +430,27 @@ fn authn_error_to_response(err: &AuthNResolverError) -> axum::response::Response
                 .into_response()
         }
         AuthNResolverError::TokenAcquisitionFailed(_) | AuthNResolverError::Internal(_) => {
+            CanonicalError::internal("authentication infrastructure failure")
+                .create()
+                .into_response()
+        }
+    }
+}
+
+/// The resolver client is not available: `503` while it is not registered
+/// (a later request looks it up again); `500` for a wiring bug no retry fixes
+/// (hub never bound, or a mistyped registration).
+fn lazy_client_error_to_response(err: &LazyClientError) -> axum::response::Response {
+    match err {
+        LazyClientError::Resolve(ClientHubError::NotFound { .. }) => {
+            tracing::warn!("AuthN Resolver client not available yet: {err}");
+            CanonicalError::service_unavailable()
+                .with_retry_after_seconds(5)
+                .create()
+                .into_response()
+        }
+        LazyClientError::NotBound | LazyClientError::Resolve(_) => {
+            tracing::error!("AuthN Resolver client lookup failed: {err}");
             CanonicalError::internal("authentication infrastructure failure")
                 .create()
                 .into_response()
