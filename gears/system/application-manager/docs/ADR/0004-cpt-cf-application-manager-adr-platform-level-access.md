@@ -48,7 +48,7 @@ Chosen option: "Allowed callers for seeding actions, PDP for operator reads", be
 
 * Seed, uninstall, the discovery reads, and the operation read are platform-plane routes. The platform validates the caller's workload credential and gives the gear its platform identity.
 * The `allowed_callers` setting lists platform identities, each with its actions from `seed`, `uninstall`, `read_schema`, and `read_operation`. A Kubernetes service account matches by namespace and service-account name, ignoring the pod; a SPIFFE identity matches by trust domain and name, ignoring the version. Any other identity kind never matches.
-* `init` rejects an entry with no action or an unknown action, and a duplicate identity. An empty list starts and allows nobody.
+* `init` rejects an entry with no action, an unknown action, or an identity kind other than these two, and a duplicate identity. An empty list starts and allows nobody.
 * The check is in memory and cannot be unavailable. A caller not allowed for the action is refused as not permitted before any plugin call.
 * The history read and the application list are tenant-plane routes, decided by the PDP as platform-level permissions with no context tenant; decision handling is in [DESIGN §3.3](../DESIGN.md#33-api-contracts).
 * Operation records, history rows, and application records are unrestricted secure-ORM entities with no tenant column.
