@@ -13,6 +13,9 @@ so nothing carries over between jobs.
 
 ## The rule
 
+The expression below selects `gears-large`. In every other job, `'gears-large'`
+is replaced with that job's `gears-*` label from the table above.
+
 ```yaml
 runs-on: ${{ (vars.GEARS_FORCE_GITHUB_HOSTED == 'true' || github.repository != 'constructorfabric/gears-rust' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository)) && 'ubuntu-latest' || 'gears-large' }}
 ```
@@ -46,9 +49,12 @@ contributors, not only first-time ones. That gate does not cover organisation
 members: a member's fork run needs no approval, whatever the member's access to
 this repository, so a member can route a fork pull request onto these runners
 by editing the workflow. Organisation members are the trust scope the runners
-are provided for; the runners are ephemeral and carry nothing beyond the
-read-only cache key. Outside contributors are the ones the approval gate keeps
-out.
+are provided for. Each runner is a fresh machine destroyed after its one job;
+while the job runs the machine holds whatever that job holds: its
+`GITHUB_TOKEN`, any secret the job is given, the read-only cache key, and on a
+push to `main` the read-write key. A fork pull request gets a read-only
+`GITHUB_TOKEN`, no job secrets and never the read-write key. Outside
+contributors are the ones the approval gate keeps out.
 
 Matrix jobs with OS legs route the Linux leg only:
 `${{ matrix.os == 'ubuntu-latest' && (<the rule>) || matrix.os }}`.
