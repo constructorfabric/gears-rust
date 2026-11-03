@@ -1,6 +1,6 @@
 """When a started server may receive E2E traffic.
 
-The listener and `/healthz` come up with the infrastructure gears, before the
+The listener and `/healthz` come up with the system gears, before the
 application group is prepared; its routes reply `503` until then. A launcher
 therefore waits for the application group to have started, read from
 `/readyz` (in-process gateway and `OoP` unit alike):

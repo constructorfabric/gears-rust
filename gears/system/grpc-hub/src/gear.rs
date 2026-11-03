@@ -286,10 +286,10 @@ fn validate_exempt_method(entry: &str) -> anyhow::Result<()> {
 /// This gear is responsible for hosting the gRPC server and managing the gRPC services.
 #[toolkit::gear(
     name = "grpc-hub",
+    // `system`: serves the directory before the application group is
+    // prepared; the application's services are installed on the same
+    // listener later.
     capabilities = [stateful, system, grpc_hub],
-    // Serves the directory before the application group is prepared; the
-    // application's services are installed on the same listener later.
-    stage = infrastructure,
     lifecycle(entry = "serve", await_ready)
 )]
 pub struct GrpcHub {
@@ -795,7 +795,7 @@ impl GrpcHub {
 
         let instance_id = self.instance_id.get().ok_or_else(|| {
             anyhow::anyhow!(
-                "GrpcHub instance_id not set: SystemGear::pre_init must run before Directory deregistration"
+                "GrpcHub instance_id not set: SystemCapability::wire_runtime must run before Directory deregistration"
             )
         })?;
 
@@ -1157,7 +1157,7 @@ impl GrpcHub {
         };
         let Some(instance_id) = self.instance_id.get() else {
             tracing::error!(
-                "GrpcHub instance_id not set: SystemGear::pre_init must run before Directory \
+                "GrpcHub instance_id not set: SystemCapability::wire_runtime must run before Directory \
                  registration; not registering"
             );
             pending.clear();
@@ -1312,16 +1312,16 @@ fn jittered(delay: std::time::Duration) -> std::time::Duration {
 
 #[async_trait]
 impl SystemCapability for GrpcHub {
-    fn pre_init(&self, sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
+    fn wire_runtime(&self, sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
         self.installer_store
             .set(Arc::clone(&sys.grpc_installers))
             .map_err(|_| {
-                anyhow::anyhow!("GrpcInstallerStore already set (pre_init called twice?)")
+                anyhow::anyhow!("GrpcInstallerStore already set (wire_runtime called twice?)")
             })?;
 
         self.instance_id
             .set(sys.instance_id().to_string())
-            .map_err(|_| anyhow::anyhow!("instance_id already set (pre_init called twice?)"))?;
+            .map_err(|_| anyhow::anyhow!("instance_id already set (wire_runtime called twice?)"))?;
         Ok(())
     }
 }
@@ -2287,8 +2287,8 @@ mod tests {
             Arc::clone(&installer_store),
         );
 
-        hub.pre_init(&sys_ctx)
-            .expect("pre_init should set installer_store and instance_id");
+        hub.wire_runtime(&sys_ctx)
+            .expect("wire_runtime should set installer_store and instance_id");
         // `serve` requires `auth_layer` to be set (normally by `init`).
         hub.auth_layer
             .set(InternalAuthGrpcLayer::disabled())

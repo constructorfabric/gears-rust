@@ -105,6 +105,20 @@ impl GearContextBuilder {
         self.internal_token_provider.as_ref()
     }
 
+    /// Build the context of a gear's `pre_init`: like [`for_gear`](Self::for_gear),
+    /// but with no database handle and no admitted GTS manifest, since the
+    /// gear's group is neither migrated nor published yet.
+    pub(crate) fn for_gear_before_migrations(&self, gear_name: &str) -> GearCtx {
+        GearCtx::new(
+            Arc::<str>::from(gear_name),
+            self.instance_id,
+            self.config_provider.clone(),
+            self.client_hub.clone(),
+            self.root_token.child_token(),
+        )
+        .with_internal_token_provider(self.internal_token_provider.clone())
+    }
+
     /// Build a gear-scoped context, resolving the `DbHandle` for the given
     /// gear when the `db` feature is enabled.
     ///
@@ -575,6 +589,42 @@ mod tests {
 
         let config = result.unwrap();
         assert_eq!(config, TestConfig::default());
+    }
+
+    /// The `pre_init` context carries neither the database handle nor the
+    /// admitted GTS manifest that the later contexts of the same gear carry.
+    #[tokio::test]
+    async fn the_context_before_migrations_has_no_database_and_no_admitted_manifest() {
+        let builder = GearContextBuilder::new(
+            Uuid::new_v4(),
+            Arc::new(MockConfigProvider::new()),
+            Arc::new(crate::client_hub::ClientHub::default()),
+            CancellationToken::new(),
+        );
+        #[cfg(feature = "db")]
+        let (builder, _dir) = {
+            let dir = tempfile::TempDir::new().unwrap();
+            let dsn = format!("sqlite://{}", dir.path().join("gear.db").display());
+            let figment = figment::Figment::new().merge(figment::providers::Serialized::defaults(
+                json!({ "gears": { "test_gear": { "database": { "dsn": dsn } } } }),
+            ));
+            let manager = DbManager::from_figment(figment, dir.path().to_path_buf()).unwrap();
+            (builder.with_db_manager(Arc::new(manager)), dir)
+        };
+        builder.gts_admitted_manifests().insert(Arc::new(
+            crate::gts_publication::GtsManifest::build("test_gear", "1.0.0", Vec::new()).unwrap(),
+        ));
+
+        let later = builder.for_gear("test_gear").await.unwrap();
+        assert!(later.gts_publication_manifest().is_ok());
+        #[cfg(feature = "db")]
+        assert!(later.db().is_some());
+
+        let early = builder.for_gear_before_migrations("test_gear");
+        assert!(early.gts_publication_manifest().is_err());
+        #[cfg(feature = "db")]
+        assert!(early.db().is_none());
+        assert_eq!(early.gear_name(), "test_gear");
     }
 
     #[tokio::test]

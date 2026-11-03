@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverBearerAuthenticator, AuthNResolverClient};
 use toolkit::Gear;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit_security::DynBearerAuthenticator;
 use tracing::info;
 
@@ -26,7 +25,6 @@ use crate::domain::{AuthNResolverLocalClient, Service};
 /// it happens on the first API call, after every plugin bound its client in `init`.
 #[toolkit::gear(
     name = "authn-resolver",
-    capabilities = [system],
     gts(crates = [authn_resolver_sdk]),
 )]
 pub(crate) struct AuthNResolver {
@@ -40,11 +38,6 @@ impl Default for AuthNResolver {
         }
     }
 }
-
-// Marked as `system` so that init() runs in the system-gear phase.
-// This ensures the AuthNResolver client is available in ClientHub before
-// other system gears that depend on it.
-impl SystemCapability for AuthNResolver {}
 
 #[async_trait]
 impl Gear for AuthNResolver {

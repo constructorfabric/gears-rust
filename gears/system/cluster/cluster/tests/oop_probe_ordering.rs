@@ -72,12 +72,12 @@ static CLUSTER_WAS_STARTED_BEFORE_INIT: std::sync::atomic::AtomicBool =
 ///
 /// It is not a stand-in for cluster — cluster's own gear starts in this same
 /// process, from this same config, and publishes its profiles before this gear is
-/// reached (cluster runs in the infrastructure group).
+/// reached (cluster runs in the system group).
 /// This gear exists only to keep the *phase* from finishing, so the pre-attach
 /// probe assertions are taken at a known point rather than a lucky one.
 /// It also carries a second observation, cheap because this gear is already in the
 /// right place to make it: **cluster's `start` runs before an application gear's
-/// `init` with no `deps` edge anywhere in this process.** The infrastructure group
+/// `init` with no `deps` edge anywhere in this process.** The system group
 /// starts before the application group initializes. That lets a consumer omit
 /// `deps = [cluster]` — which it must, because `deps` naming an unlinked gear is a
 /// hard `RegistryError::UnknownDependency` and a Profile 3 consumer links no cluster
@@ -365,7 +365,7 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
     let lifecycle = tokio::spawn(run_oop_serving(run, serve));
 
     // 0. Wait until the application start phase has reached the gate gear (after
-    //    the infrastructure group, including cluster, has started). This
+    //    the system group, including cluster, has started). This
     //    is the happens-before every "during startup" assertion below relies on:
     //    the gate gear is now parked inside its `start`, holding the phase open, so
     //    the probe states are a genuine mid-startup snapshot and
@@ -390,7 +390,7 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
     );
 
     // 2. The process remains Starting while the application group is held, even
-    //    though cluster's infrastructure group is already healthy.
+    //    though cluster's system group is already healthy.
     let readyz = await_status(addr, "/readyz", 503, Duration::from_secs(5)).await;
     assert!(
         readyz.contains("\"state\":\"starting\"") && readyz.contains("\"ready\":false"),
@@ -400,7 +400,7 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
         readyz.contains(toolkit::runtime::PREPARATION_GATE),
         "application startup must still hold readiness, got: {readyz}"
     );
-    // Cluster's own check is registered with the early infrastructure routes.
+    // Cluster's own check is registered with the early system routes.
     let health = await_body(
         addr,
         "/health",
@@ -414,16 +414,16 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
         "cluster must be healthy before application startup completes, got: {health}"
     );
 
-    // 3. Infrastructure routes and their OpenAPI document are already available.
+    // 3. System routes and their OpenAPI document are already available.
     let (status, body) = http_get(addr, "/openapi.json").await.expect("connects");
     assert_eq!(
         status, 200,
-        "infrastructure OpenAPI must be available before application startup completes"
+        "system OpenAPI must be available before application startup completes"
     );
     let spec: serde_json::Value = serde_json::from_str(&body).expect("OpenAPI JSON");
     assert!(
         spec["openapi"].is_string(),
-        "the infrastructure endpoint must serve an OpenAPI document, got: {body}"
+        "the system endpoint must serve an OpenAPI document, got: {body}"
     );
 
     // 4. The Profile 1 ordering fact, observed by the gate gear rather than cited:
@@ -434,7 +434,7 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
     //    because step 0 already synchronized on the gate gear having recorded it.
     assert!(
         CLUSTER_WAS_STARTED_BEFORE_INIT.load(Ordering::SeqCst),
-        "cluster's infrastructure `start` must precede application `init`, \
+        "cluster's system-group `start` must precede application `init`, \
          without a dependency edge"
     );
 

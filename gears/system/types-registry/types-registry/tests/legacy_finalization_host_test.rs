@@ -3,8 +3,8 @@
     clippy::unwrap_used,
     reason = "integration tests: a failed fixture or assertion step is a test failure"
 )]
-//! The legacy ready mode under `HostRuntime`: the registry is an
-//! infrastructure gear, yet what the application gears register through the
+//! The legacy ready mode under `HostRuntime`: the registry is a system
+//! gear, yet what the application gears register through the
 //! legacy client during `init` is validated at once only after every
 //! application `init` — a document may depend on one a later `init` registers.
 //! A document that never validates fails startup, and what started is stopped.
@@ -20,7 +20,7 @@ use toolkit::client_hub::ClientHub;
 use toolkit::config::ConfigProvider;
 use toolkit::contracts::{Gear, RunnableCapability, SystemCapability};
 use toolkit::lifecycle::{Status, WithLifecycle};
-use toolkit::registry::{RegistryBuilder, StartupStage};
+use toolkit::registry::RegistryBuilder;
 use toolkit::runtime::{DbOptions, HostRuntime};
 use toolkit_gts::{gts_id, gts_uri};
 use types_registry::gear::TypesRegistryGear;
@@ -50,7 +50,7 @@ impl ConfigProvider for NoConfig {
     }
 }
 
-/// The registry without a database, as an infrastructure gear, and the
+/// The registry without a database, as a system gear, and the
 /// `(name, documents)` application registrants, each initialized after the
 /// previous one.
 fn host(
@@ -70,7 +70,6 @@ fn host(
         REGISTRY,
         Arc::clone(&lifecycle) as Arc<dyn RunnableCapability>,
     );
-    builder.register_startup_stage(REGISTRY, StartupStage::Infrastructure);
     let mut previous = REGISTRY;
     for (name, documents) in registrants {
         let deps: &'static [&'static str] = Box::leak(Box::new([previous]));

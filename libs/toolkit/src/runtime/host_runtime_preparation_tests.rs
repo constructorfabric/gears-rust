@@ -1,4 +1,4 @@
-//! Runtime behaviour of the startup groups: the infrastructure starts first,
+//! Runtime behaviour of the startup groups: the system group starts first,
 //! the application group waits for the GTS admission of every manifest before
 //! any `init`, and cleanup.
 
@@ -22,7 +22,7 @@ use crate::gts_publication::{
     DeclarationSource, GtsPublicationBackend, GtsPublicationCapability, GtsPublicationDescriptor,
     GtsPublicationRequest,
 };
-use crate::registry::{GearRegistry, RegistryBuilder, StartupStage};
+use crate::registry::{GearRegistry, RegistryBuilder};
 
 /// How the fake registry answers a publisher.
 #[derive(Clone)]
@@ -148,12 +148,13 @@ pub(super) struct PubGear {
     descriptor: Option<&'static GtsPublicationDescriptor>,
     events: Events,
     fail_start: bool,
-    stage: StartupStage,
     deps: &'static [&'static str],
-    /// Registers the system hooks, which log as `pre_init`, `post_init`
-    /// and `legacy`.
+    /// In the system group: registers `SystemCapability`.
     system: bool,
-    /// The system hook that fails, by its logged name.
+    /// Logs its hooks: `wire` (runtime wiring, system gears), `pre_init`,
+    /// `post_init` and `legacy` (legacy finalization, system gears).
+    hooks: bool,
+    /// The hook that fails, by its logged name.
     fail_hook: Option<&'static str>,
 }
 
@@ -168,31 +169,35 @@ impl PubGear {
             descriptor,
             events: Arc::clone(events),
             fail_start: false,
-            stage: StartupStage::Application,
             deps: &[],
             system: false,
+            hooks: false,
             fail_hook: None,
         }
     }
 
-    /// The same gear with the system hooks.
-    fn system(self, deps: &'static [&'static str]) -> Self {
+    /// The same gear logging its hooks, with `deps`.
+    fn with_hooks(self, deps: &'static [&'static str]) -> Self {
         Self {
-            system: true,
+            hooks: true,
             deps,
             ..self
         }
     }
 
     fn hook(&self, hook: &str) -> anyhow::Result<()> {
+        if !self.hooks {
+            return Ok(());
+        }
         self.log(hook);
         anyhow::ensure!(self.fail_hook != Some(hook), "{hook} refused");
         Ok(())
     }
 
-    fn infrastructure(name: &'static str, events: &Events) -> Self {
+    /// A gear of the system group.
+    fn system_gear(name: &'static str, events: &Events) -> Self {
         Self {
-            stage: StartupStage::Infrastructure,
+            system: true,
             ..Self::new(name, None, events)
         }
     }
@@ -204,6 +209,19 @@ impl PubGear {
 
 #[async_trait]
 impl Gear for PubGear {
+    async fn pre_init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
+        // Nothing is published before the migrations.
+        anyhow::ensure!(
+            ctx.gts_publication_manifest().is_err(),
+            "an admitted manifest before the migrations"
+        );
+        self.hook("pre_init")
+    }
+
+    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        self.hook("post_init")
+    }
+
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
         self.log("init");
         if self.descriptor.is_some() {
@@ -223,12 +241,8 @@ impl GtsPublicationCapability for PubGear {
 
 #[async_trait]
 impl SystemCapability for PubGear {
-    fn pre_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
-        self.hook("pre_init")
-    }
-
-    async fn post_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
-        self.hook("post_init")
+    fn wire_runtime(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+        self.hook("wire")
     }
 
     async fn legacy_finalize_after_application_init(
@@ -256,7 +270,6 @@ impl RunnableCapability for PubGear {
 pub(super) fn register(builder: &mut RegistryBuilder, gear: PubGear) {
     let name = gear.name;
     let publishes = gear.descriptor.is_some();
-    let stage = gear.stage;
     let deps = gear.deps;
     let system = gear.system;
     let gear = Arc::new(gear);
@@ -265,7 +278,6 @@ pub(super) fn register(builder: &mut RegistryBuilder, gear: PubGear) {
     if system {
         builder.register_system_with_meta(name, gear.clone() as Arc<dyn SystemCapability>);
     }
-    builder.register_startup_stage(name, stage);
     if publishes {
         builder.register_gts_publication_with_meta(name, gear as Arc<dyn GtsPublicationCapability>);
     }
@@ -330,14 +342,14 @@ fn any_app_event(events: &Events, gears: &[&str]) -> Vec<String> {
 
 /// A pending publication holds back every application `init` — of its own
 /// gear, of another publisher already admitted and of a gear publishing
-/// nothing — while the infrastructure is initialized, started and stays so.
+/// nothing — while the system group is initialized, started and stays so.
 /// The publications run at once; the admitted manifest is readable in `init`.
 #[tokio::test]
 async fn a_pending_publication_holds_back_the_whole_application_group() {
     let events: Events = Arc::default();
     let release_a = Arc::new(Notify::new());
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("registry", &events));
+    register(&mut builder, PubGear::system_gear("registry", &events));
     register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
     register(&mut builder, PubGear::new("b", Some(&PUB_B), &events));
     register(&mut builder, PubGear::new("c", None, &events));
@@ -393,19 +405,19 @@ async fn a_pending_publication_holds_back_the_whole_application_group() {
     assert_eq!(
         log.last().map(String::as_str),
         Some("stop:registry"),
-        "the infrastructure stops last: {log:?}"
+        "the system group stops last: {log:?}"
     );
 }
 
 /// A refused publication fails the application group: no application gear is
 /// initialized, started or stopped, the refusal is not retried, and the
-/// infrastructure keeps running until shutdown.
+/// system group keeps running until shutdown.
 #[tokio::test]
 #[tracing_test::traced_test]
 async fn a_refused_publication_fails_the_application_group_only() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("registry", &events));
+    register(&mut builder, PubGear::system_gear("registry", &events));
     register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
     register(&mut builder, PubGear::new("c", None, &events));
     let fake = FakeRegistry::with(&[("a", Answer::Refuse)]);
@@ -437,12 +449,12 @@ async fn a_refused_publication_fails_the_application_group_only() {
 }
 
 /// A startup failing in a later start stops what started — the
-/// infrastructure included.
+/// system group included.
 #[tokio::test]
 async fn a_failed_startup_stops_what_started() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("registry", &events));
+    register(&mut builder, PubGear::system_gear("registry", &events));
     register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
     let mut failing = PubGear::new("c", None, &events);
     failing.fail_start = true;
@@ -503,12 +515,12 @@ async fn dropping_the_runtime_ends_a_pending_publication() {
 }
 
 /// Cancelling while the barrier is pending ends startup cleanly: no
-/// application init, the infrastructure stopped.
+/// application init, the system group stopped.
 #[tokio::test]
-async fn cancelling_a_pending_barrier_stops_the_infrastructure() {
+async fn cancelling_a_pending_barrier_stops_the_system_group() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("registry", &events));
+    register(&mut builder, PubGear::system_gear("registry", &events));
     register(&mut builder, PubGear::new("a", Some(&PUB_A), &events));
     let fake = FakeRegistry::with(&[("a", Answer::HoldUntil(Arc::new(Notify::new())))]);
     let cancel = CancellationToken::new();
@@ -548,7 +560,7 @@ async fn a_manifest_error_fails_startup_before_any_init() {
     descriptor!(PUB_BAD, "bad", conflicting);
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("registry", &events));
+    register(&mut builder, PubGear::system_gear("registry", &events));
     register(&mut builder, PubGear::new("bad", Some(&PUB_BAD), &events));
     let runtime = runtime(
         builder.build_topo_sorted().unwrap(),
@@ -615,19 +627,20 @@ async fn empty_manifests_need_no_registry() {
     running.await.unwrap().unwrap();
 }
 
-/// Migration-only mode runs the `pre_init` of every gear and nothing else: no
-/// `init`, publication, `post_init`, legacy finalization or `start`.
+/// Migration-only mode runs the runtime wiring and `pre_init` of every gear
+/// once, the system group first, and nothing else: no `init`, publication,
+/// `post_init`, legacy finalization or `start`.
 #[tokio::test]
 async fn migrate_only_runs_no_init_and_no_publication() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
     register(
         &mut builder,
-        PubGear::infrastructure("registry", &events).system(&[]),
+        PubGear::system_gear("registry", &events).with_hooks(&[]),
     );
     register(
         &mut builder,
-        PubGear::new("a", Some(&PUB_A), &events).system(&["registry"]),
+        PubGear::new("a", Some(&PUB_A), &events).with_hooks(&["registry"]),
     );
     let fake = FakeRegistry::with(&[]);
     let runtime = runtime(
@@ -638,16 +651,19 @@ async fn migrate_only_runs_no_init_and_no_publication() {
 
     runtime.run_migration_phases().await.unwrap();
 
-    assert_eq!(*events.lock(), ["pre_init:registry", "pre_init:a"]);
+    assert_eq!(
+        *events.lock(),
+        ["wire:registry", "pre_init:registry", "pre_init:a"]
+    );
     assert!(fake.sent.lock().is_empty());
 }
 
-/// An infrastructure gear initializes before the barrier: it cannot publish.
+/// A system gear initializes before the barrier: it cannot publish.
 #[tokio::test]
-async fn an_infrastructure_publisher_is_a_composition_error() {
+async fn a_system_publisher_is_a_composition_error() {
     let events: Events = Arc::default();
-    let mut gear = PubGear::new("registry", Some(&PUB_A), &events);
-    gear.stage = StartupStage::Infrastructure;
+    let mut gear = PubGear::new("registry", Some(&PUB_A), &events).with_hooks(&[]);
+    gear.system = true;
     let mut builder = RegistryBuilder::default();
     register(&mut builder, gear);
     let runtime = runtime(
@@ -658,30 +674,73 @@ async fn an_infrastructure_publisher_is_a_composition_error() {
 
     let err = runtime.run_gear_phases().await.unwrap_err();
 
-    assert!(format!("{err:#}").contains("infrastructure"), "{err:#}");
-    assert!(events.lock().is_empty());
+    assert!(format!("{err:#}").contains("a system gear"), "{err:#}");
+    assert!(events.lock().is_empty(), "no hook ran: {:?}", events.lock());
 }
 
-/// An infrastructure gear depending on an application gear is refused when
-/// the registry is built.
+/// A system gear depending on an application gear is refused when the
+/// registry is built; on another system gear it is fine.
 #[test]
-fn an_infrastructure_gear_cannot_depend_on_an_application_gear() {
+fn a_system_gear_cannot_depend_on_an_application_gear() {
     let events: Events = Arc::default();
     let mut builder = RegistryBuilder::default();
     register(&mut builder, PubGear::new("app", None, &events));
-    let infra = Arc::new(PubGear::infrastructure("infra", &events));
-    builder.register_core_with_meta("infra", &["app"], infra as Arc<dyn Gear>);
-    builder.register_startup_stage("infra", StartupStage::Infrastructure);
+    register(
+        &mut builder,
+        PubGear::system_gear("sys", &events).with_hooks(&["app"]),
+    );
 
     let err = builder.build_topo_sorted().unwrap_err();
 
     assert!(
         matches!(
             err,
-            crate::registry::RegistryError::InfrastructureDependsOnApplication { .. }
+            crate::registry::RegistryError::SystemDependsOnApplication { .. }
         ),
         "{err}"
     );
+
+    let mut builder = RegistryBuilder::default();
+    register(&mut builder, PubGear::system_gear("hub", &events));
+    register(
+        &mut builder,
+        PubGear::system_gear("sys", &events).with_hooks(&["hub"]),
+    );
+    register(
+        &mut builder,
+        PubGear::new("app", None, &events).with_hooks(&["sys"]),
+    );
+    builder.build_topo_sorted().unwrap();
+}
+
+/// A pre-cancelled runtime runs no runtime wiring and no `pre_init`.
+#[tokio::test]
+async fn a_cancelled_pre_init_phase_runs_no_hook() {
+    let events: Events = Arc::default();
+    let mut builder = RegistryBuilder::default();
+    register(
+        &mut builder,
+        PubGear::system_gear("registry", &events).with_hooks(&[]),
+    );
+    register(
+        &mut builder,
+        PubGear::new("a", None, &events).with_hooks(&["registry"]),
+    );
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let runtime = runtime(
+        builder.build_topo_sorted().unwrap(),
+        &FakeRegistry::with(&[]),
+        &cancel,
+    );
+
+    let err = runtime.run_pre_init_phase().await.unwrap_err();
+
+    assert!(
+        matches!(err, crate::registry::RegistryError::Cancelled),
+        "{err}"
+    );
+    assert!(events.lock().is_empty(), "{:?}", events.lock());
 }
 
 static EARLY: std::sync::Mutex<Vec<&'static str>> = std::sync::Mutex::new(Vec::new());
@@ -825,6 +884,7 @@ async fn a_publication_that_would_call_this_process_is_refused() {
             Ok(())
         }
     }
+    impl SystemCapability for Advertised {}
     impl crate::contracts::RestApiCapability for Advertised {
         fn register_rest(
             &self,
@@ -840,12 +900,16 @@ async fn a_publication_that_would_call_this_process_is_refused() {
     let mut builder = RegistryBuilder::default();
     register(&mut builder, PubGear::new("a", Some(&PUB_REMOTE), &events));
     let provider = Arc::new(Advertised);
+    let provider_system = Arc::clone(&provider);
     builder.register_core_with_meta("fake-registry", &[], provider.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta(
         "fake-registry",
         provider as Arc<dyn crate::contracts::RestApiCapability>,
     );
-    builder.register_startup_stage("fake-registry", StartupStage::Infrastructure);
+    builder.register_system_with_meta(
+        "fake-registry",
+        provider_system as Arc<dyn SystemCapability>,
+    );
     let runtime = runtime(
         builder.build_topo_sorted().unwrap(),
         &FakeRegistry::with(&[]),
@@ -964,26 +1028,32 @@ fn no_wire(
     Ok(crate::discovery::WireOutcome::Local)
 }
 
-/// The system gears of the group order tests: the infrastructure `registry`,
-/// then the application publisher `a` and `c`, in this topological order.
+/// The gears of the group order tests, logging their hooks: the system gear
+/// `registry`, then the application publisher `a` and `c`, in this
+/// topological order.
 pub(super) fn grouped_gears(events: &Events) -> RegistryBuilder {
     let mut builder = RegistryBuilder::default();
     register(
         &mut builder,
-        PubGear::infrastructure("registry", events).system(&[]),
+        PubGear::system_gear("registry", events).with_hooks(&[]),
     );
     register(
         &mut builder,
-        PubGear::new("a", Some(&PUB_A), events).system(&["registry"]),
+        PubGear::new("a", Some(&PUB_A), events).with_hooks(&["registry"]),
     );
-    register(&mut builder, PubGear::new("c", None, events).system(&["a"]));
+    register(
+        &mut builder,
+        PubGear::new("c", None, events).with_hooks(&["a"]),
+    );
     builder
 }
 
-/// The startup of [`grouped_gears`]: the infrastructure group complete, then
-/// the application group's `pre_init` before its barrier, its `init`, the
-/// legacy finalization of every system gear once, its `post_init`, `start`.
-pub(super) const GROUPED_STARTUP: [&str; 16] = [
+/// The startup of [`grouped_gears`]: the system group complete (runtime
+/// wiring first), then the application group's `pre_init` before its
+/// barrier, its `init`, the legacy finalization of the system gear once, its
+/// `post_init`, `start`. Each hook runs once, within its gear's group.
+pub(super) const GROUPED_STARTUP: [&str; 15] = [
+    "wire:registry",
     "pre_init:registry",
     "init:registry",
     "post_init:registry",
@@ -994,15 +1064,13 @@ pub(super) const GROUPED_STARTUP: [&str; 16] = [
     "manifest1:a",
     "init:c",
     "legacy:registry",
-    "legacy:a",
-    "legacy:c",
     "post_init:a",
     "post_init:c",
     "start:a",
     "start:c",
 ];
 
-/// Each group runs its own hooks, the infrastructure's before anything of the
+/// Each group runs its own hooks, the system group's before anything of the
 /// application group; no application `init` runs while a manifest is pending;
 /// the legacy finalization runs once, between the application `init` and its
 /// `post_init`.
@@ -1027,7 +1095,7 @@ async fn each_group_runs_its_own_hooks_and_the_legacy_finalization_once() {
     .await;
     assert_eq!(
         *events.lock(),
-        GROUPED_STARTUP[..6],
+        GROUPED_STARTUP[..7],
         "no application init while a manifest is pending"
     );
 
@@ -1043,19 +1111,23 @@ async fn each_group_runs_its_own_hooks_and_the_legacy_finalization_once() {
 }
 
 /// A failing group hook fails startup like any other phase, and what started
-/// is stopped: an infrastructure `post_init` before anything started or the
-/// application group began; an application `pre_init`, or the legacy
-/// finalization, after the infrastructure started.
+/// is stopped: a system gear's runtime wiring, `pre_init` or `post_init`
+/// before anything started or the application group began; an application
+/// `pre_init` or `post_init`, or the legacy finalization, after the system
+/// group started.
 #[tokio::test]
 async fn a_failing_group_hook_fails_startup_and_stops_what_started() {
-    for (gear, hook, infrastructure_started) in [
-        ("registry", "post_init", false),
-        ("a", "pre_init", true),
-        ("registry", "legacy", true),
+    for (gear, hook, system_started, app_pre_init, app_init) in [
+        ("registry", "wire", false, false, false),
+        ("registry", "pre_init", false, false, false),
+        ("registry", "post_init", false, false, false),
+        ("a", "pre_init", true, true, false),
+        ("registry", "legacy", true, true, true),
+        ("a", "post_init", true, true, true),
     ] {
         let events: Events = Arc::default();
-        let mut registry = PubGear::infrastructure("registry", &events).system(&[]);
-        let mut app = PubGear::new("a", None, &events).system(&["registry"]);
+        let mut registry = PubGear::system_gear("registry", &events).with_hooks(&[]);
+        let mut app = PubGear::new("a", None, &events).with_hooks(&["registry"]);
         for candidate in [&mut registry, &mut app] {
             if candidate.name == gear {
                 candidate.fail_hook = Some(hook);
@@ -1078,18 +1150,14 @@ async fn a_failing_group_hook_fails_startup_and_stops_what_started() {
             format!("{err:#}").contains(&format!("{hook} refused")),
             "{err:#}"
         );
-        assert_eq!(
-            has(&events, "start:registry"),
-            infrastructure_started,
-            "{log:?}"
-        );
+        assert_eq!(has(&events, "start:registry"), system_started, "{log:?}");
         assert_eq!(
             has(&events, "stop:registry"),
-            infrastructure_started,
+            system_started,
             "what started is stopped: {log:?}"
         );
-        assert_eq!(has(&events, "pre_init:a"), hook != "post_init", "{log:?}");
-        assert_eq!(has(&events, "init:a"), hook == "legacy", "{log:?}");
+        assert_eq!(has(&events, "pre_init:a"), app_pre_init, "{log:?}");
+        assert_eq!(has(&events, "init:a"), app_init, "{log:?}");
         assert!(!has(&events, "start:a"), "{log:?}");
         assert!(
             !cancel.is_cancelled(),
@@ -1098,18 +1166,18 @@ async fn a_failing_group_hook_fails_startup_and_stops_what_started() {
     }
 }
 
-/// An infrastructure consumer of a provider outside this process.
-static INFRA_CONSUMES_EXTERNAL: crate::discovery::ConsumerRegistration =
+/// A system consumer of a provider outside this process.
+static SYSTEM_CONSUMES_EXTERNAL: crate::discovery::ConsumerRegistration =
     crate::discovery::ConsumerRegistration {
-        owner_gear: "infra",
+        owner_gear: "sys",
         dep_gear: "billing",
         wire: remote_wire,
     };
-/// An SDK-submitted registration (no owner gear) of an infrastructure provider.
-static SDK_CONSUMES_INFRA: crate::discovery::ConsumerRegistration =
+/// An SDK-submitted registration (no owner gear) of a system provider.
+static SDK_CONSUMES_SYSTEM: crate::discovery::ConsumerRegistration =
     crate::discovery::ConsumerRegistration {
         owner_gear: "cluster-sdk",
-        dep_gear: "infra",
+        dep_gear: "sys",
         wire: remote_wire,
     };
 /// An SDK-submitted registration of a provider outside this process.
@@ -1128,10 +1196,10 @@ static APP_CONSUMES_APP: crate::discovery::ConsumerRegistration =
             remote_wire(hub, resolver, tuning).map(|_| crate::discovery::WireOutcome::Local)
         },
     };
-/// An infrastructure consumer of an application provider of this process.
-static INFRA_CONSUMES_APP: crate::discovery::ConsumerRegistration =
+/// A system consumer of an application provider of this process.
+static SYSTEM_CONSUMES_APP: crate::discovery::ConsumerRegistration =
     crate::discovery::ConsumerRegistration {
-        owner_gear: "infra",
+        owner_gear: "sys",
         dep_gear: "app-provider",
         wire: remote_wire,
     };
@@ -1157,14 +1225,14 @@ static PUB_TO_APP_EMPTY: GtsPublicationDescriptor = GtsPublicationDescriptor {
     wire: remote_wire,
 };
 
-/// `infra` (infrastructure), `app` and `app-provider` (application), and `a`
+/// `sys` (system), `app` and `app-provider` (application), and `a`
 /// publishing with `publication` when given.
 fn wiring_runtime(
     events: &Events,
     publication: Option<&'static GtsPublicationDescriptor>,
 ) -> HostRuntime {
     let mut builder = RegistryBuilder::default();
-    register(&mut builder, PubGear::infrastructure("infra", events));
+    register(&mut builder, PubGear::system_gear("sys", events));
     register(&mut builder, PubGear::new("app", None, events));
     register(&mut builder, PubGear::new("app-provider", None, events));
     if let Some(publication) = publication {
@@ -1182,56 +1250,56 @@ fn sorted(mut deps: Vec<String>) -> Vec<String> {
     deps
 }
 
-/// With the infrastructure group, the clients an infrastructure gear owns or
-/// provides are wired — an SDK registration without an owner gear by its
-/// provider; every other one after the application `init`, each once, so a
-/// local application provider is not shadowed.
+/// With the system group, the clients a system gear owns or provides are
+/// wired — an SDK registration without an owner gear by its provider; every
+/// other one after the application `init`, each once, so a local application
+/// provider is not shadowed.
 #[tokio::test]
-async fn infrastructure_clients_are_wired_with_their_group_the_rest_after_application_init() {
+async fn system_clients_are_wired_with_their_group_the_rest_after_application_init() {
     let _serial = EARLY_TESTS.lock().await;
     let runtime = wiring_runtime(&Events::default(), None);
     let all = [
-        &INFRA_CONSUMES_EXTERNAL,
-        &SDK_CONSUMES_INFRA,
+        &SYSTEM_CONSUMES_EXTERNAL,
+        &SDK_CONSUMES_SYSTEM,
         &SDK_CONSUMES_EXTERNAL,
         &APP_CONSUMES_APP,
     ];
     EARLY.lock().unwrap().clear();
 
-    runtime.wire_infrastructure_clients(&all).unwrap();
+    runtime.wire_system_clients(&all).unwrap();
     assert_eq!(EARLY.lock().unwrap().len(), 2);
     assert_eq!(
         sorted(runtime.dep_checker.unresolved_deps()),
-        ["application/preparation", "billing", "infra"]
+        ["application/preparation", "billing", "sys"]
     );
 
     runtime.wire_consumer_registrations(&all).unwrap();
     assert_eq!(EARLY.lock().unwrap().len(), 4, "the other two, once each");
     assert_eq!(
         sorted(runtime.dep_checker.unresolved_deps()),
-        ["application/preparation", "billing", "infra", "remote-only"]
+        ["application/preparation", "billing", "remote-only", "sys"]
     );
 }
 
 /// A client the runtime would wire before its application provider of this
-/// process initialized is refused before any gear runs: an infrastructure
-/// consumer of it, or a non-empty publication to it. An empty publication
-/// wires nothing, and other stage combinations are fine.
+/// process initialized is refused before any gear runs: a system consumer
+/// of it, or a non-empty publication to it. An empty publication wires
+/// nothing, and other group combinations are fine.
 #[tokio::test]
 async fn a_client_wired_before_its_application_provider_is_refused() {
     let runtime = wiring_runtime(&Events::default(), None);
     let err = runtime
-        .check_wiring_stages(&[], &[&INFRA_CONSUMES_APP])
+        .check_wiring_groups(&[], &[&SYSTEM_CONSUMES_APP])
         .unwrap_err();
     assert!(
         format!("{:#}", anyhow::Error::from(err)).contains("an application gear of this process")
     );
     runtime
-        .check_wiring_stages(
+        .check_wiring_groups(
             &[],
             &[
-                &INFRA_CONSUMES_EXTERNAL,
-                &SDK_CONSUMES_INFRA,
+                &SYSTEM_CONSUMES_EXTERNAL,
+                &SDK_CONSUMES_SYSTEM,
                 &SDK_CONSUMES_EXTERNAL,
                 &APP_CONSUMES_APP,
             ],
@@ -1240,7 +1308,7 @@ async fn a_client_wired_before_its_application_provider_is_refused() {
 
     let empty = wiring_runtime(&Events::default(), Some(&PUB_TO_APP_EMPTY));
     let manifests = empty.build_gts_manifests().unwrap();
-    empty.check_wiring_stages(&manifests, &[]).unwrap();
+    empty.check_wiring_groups(&manifests, &[]).unwrap();
 
     let events: Events = Arc::default();
     let err = wiring_runtime(&events, Some(&PUB_TO_APP))

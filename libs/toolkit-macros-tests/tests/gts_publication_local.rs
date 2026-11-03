@@ -33,11 +33,13 @@ pub fn gts_declarations() -> Vec<(String, String)> {
     )]
 }
 
-/// Provides the registry in this process: infrastructure, initialized before
+/// Provides the registry in this process: a system gear, initialized before
 /// the application group's publication.
-#[toolkit::gear(name = "fake-registry", stage = infrastructure)]
+#[toolkit::gear(name = "fake-registry", capabilities = [system])]
 #[derive(Default)]
 pub struct FakeRegistryGear;
+
+impl toolkit::contracts::SystemCapability for FakeRegistryGear {}
 
 #[async_trait::async_trait]
 impl Gear for FakeRegistryGear {

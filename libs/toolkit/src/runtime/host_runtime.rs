@@ -5,11 +5,11 @@
 //!
 //! High-level phase order:
 //! - the GTS manifest of every `gts(...)` gear, built from the configuration
-//!   and checked for ownership conflicts, and the startup stage of every
+//!   and checked for ownership conflicts, and the startup group of every
 //!   consumed client checked, before any gear runs or anything is written
-//! - **infrastructure group** (`stage = infrastructure`: the types registry,
-//!   service discovery, cluster, the REST and gRPC hosts), complete:
-//!   `pre_init`, DB migrations, `init`, the clients an infrastructure gear
+//! - **system group** (`capabilities = [system]`: the types registry,
+//!   service discovery, cluster, the REST and gRPC hosts), complete: runtime
+//!   wiring and `pre_init`, DB migrations, `init`, the clients a system gear
 //!   owns or provides, `post_init`, the initial REST routes (probes and
 //!   platform-plane calls) and gRPC services, `start`, directory
 //!   registration; then the configured `OoP` children spawn, without waiting
@@ -17,17 +17,21 @@
 //! - **application group**, prepared as a whole: `pre_init`, DB migrations,
 //!   the registry clients the publications need, then the concurrent GTS
 //!   publication of every manifest until all are admitted. No application
-//!   `init` runs before that barrier; the infrastructure keeps serving while
+//!   `init` runs before that barrier; the system group keeps serving while
 //!   it is pending or failed.
 //! - application `init`, remaining proxy-wiring (`#[toolkit::consumes]`
 //!   clients), the legacy finalization (temporary: the types registry's
 //!   in-memory ready mode), application `post_init`, the final REST routes
 //!   and the late gRPC services on the running listeners, `start`, directory
 //!   registration.
-//! - migration-only mode: `pre_init` and DB migrations of every gear, nothing
-//!   else.
-//! - wait for shutdown, then stop: the application group, then the
-//!   infrastructure, each in reverse order
+//! - migration-only mode: runtime wiring, `pre_init` and DB migrations of
+//!   every gear (the system group first), nothing else: no `init`,
+//!   `post_init` or publication.
+//! - wait for shutdown, then stop: the application group, then the system
+//!   group, each in reverse order
+//!
+//! Every gear's `pre_init`, `init` and `post_init` run once, within its own
+//! group, in topological order.
 //!
 //! Both lifecycle paths — in-process (`run_phases_internal`) and `OoP`
 //! (`run_oop_serving`) — run these in the same relative order. Proxy-wiring in
@@ -71,7 +75,7 @@ use crate::context::{GearContextBuilder, GtsAdmittedManifests};
 use crate::gts_publication::{GtsManifest, GtsPublicationDescriptor, PreparedGtsPublication};
 use crate::registry::{
     ApiGatewayCap, GearEntry, GearRegistry, GrpcHubCap, GtsPublicationCap, RegistryError,
-    RestApiCap, RunnableCap, StartupStage, SystemCap,
+    RestApiCap, RunnableCap, SystemCap,
 };
 use crate::runtime::{
     GearManager, GrpcInstallerStore, OopSpawnOptions, PREPARATION_GATE, SystemContext,
@@ -121,8 +125,8 @@ const LATE_GRPC_INSTALL_TIMEOUT: std::time::Duration = std::time::Duration::from
 enum AppStartup {
     /// Every application gear initialized and started.
     Started,
-    /// A publication was refused: no application `init` ran. The
-    /// infrastructure keeps serving until shutdown.
+    /// A publication was refused: no application `init` ran. The system
+    /// group keeps serving until shutdown.
     Failed,
     /// Shutdown came first.
     Cancelled,
@@ -286,16 +290,24 @@ impl HostRuntime {
         self
     }
 
-    /// The gears of `stage`, system gears first, each part in topological order.
-    fn group(&self, stage: StartupStage) -> Vec<&GearEntry> {
+    /// The system group (`system = true`) or the application group, in
+    /// topological order.
+    fn group(&self, system: bool) -> Vec<&GearEntry> {
         self.registry
-            .gears_by_system_priority()
-            .into_iter()
-            .filter(|entry| entry.stage == stage)
+            .gears()
+            .iter()
+            .filter(|entry| entry.is_system() == system)
             .collect()
     }
 
-    /// The runtime internals handed to the system hooks.
+    /// Every gear, the system group first, each group in topological order.
+    fn by_group(&self) -> Vec<&GearEntry> {
+        let mut gears = self.group(true);
+        gears.extend(self.group(false));
+        gears
+    }
+
+    /// The runtime internals handed to the system gears.
     fn system_context(&self) -> SystemContext {
         SystemContext::new(
             self.instance_id,
@@ -304,20 +316,39 @@ impl HostRuntime {
         )
     }
 
-    /// `PRE_INIT` phase over every gear (migration-only mode).
+    /// `PRE_INIT` phase over every gear, the system group first
+    /// (migration-only mode).
     ///
     /// # Errors
-    /// Returns `RegistryError` if system wiring fails.
-    pub fn run_pre_init_phase(&self) -> Result<(), RegistryError> {
-        self.run_pre_init_phase_for(&self.registry.gears().iter().collect::<Vec<_>>())
+    /// Returns `RegistryError` if runtime wiring or a `pre_init` fails.
+    pub async fn run_pre_init_phase(&self) -> Result<(), RegistryError> {
+        self.run_pre_init_phase_for(&self.by_group()).await
     }
 
-    /// `PRE_INIT` phase: wire runtime internals into the system gears of
-    /// `entries`, before their migrations and `init`.
-    fn run_pre_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
+    /// `PRE_INIT` phase of `entries`, before their migrations and `init`:
+    /// first the runtime internals into each system gear
+    /// ([`SystemCapability::wire_runtime`](crate::contracts::SystemCapability::wire_runtime)),
+    /// then every gear's `pre_init`, in the given order. The `pre_init`
+    /// context has no database handle and no admitted GTS manifest.
+    async fn run_pre_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
         tracing::info!(gears = entries.len(), "Phase: pre_init");
 
         let sys_ctx = self.system_context();
+        for entry in entries {
+            if self.cancel.is_cancelled() {
+                tracing::warn!("Pre-init phase cancelled by signal");
+                return Err(RegistryError::Cancelled);
+            }
+            if let Some(system) = entry.caps.query::<SystemCap>() {
+                tracing::debug!(gear = entry.name, "Wiring runtime internals");
+                system
+                    .wire_runtime(&sys_ctx)
+                    .map_err(|e| RegistryError::PreInit {
+                        gear: entry.name,
+                        source: e.context("runtime wiring"),
+                    })?;
+            }
+        }
 
         for entry in entries {
             // Check for cancellation before processing each gear
@@ -325,16 +356,15 @@ impl HostRuntime {
                 tracing::warn!("Pre-init phase cancelled by signal");
                 return Err(RegistryError::Cancelled);
             }
-
-            if let Some(sys_mod) = entry.caps.query::<SystemCap>() {
-                tracing::debug!(gear = entry.name, "Running system pre_init");
-                sys_mod
-                    .pre_init(&sys_ctx)
-                    .map_err(|e| RegistryError::PreInit {
-                        gear: entry.name,
-                        source: e,
-                    })?;
-            }
+            let ctx = self.ctx_builder.for_gear_before_migrations(entry.name);
+            entry
+                .core
+                .pre_init(&ctx)
+                .await
+                .map_err(|e| RegistryError::PreInit {
+                    gear: entry.name,
+                    source: e,
+                })?;
         }
 
         Ok(())
@@ -436,15 +466,15 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// DB MIGRATION phase over every gear (migration-only mode).
+    /// DB MIGRATION phase over every gear, the system group first
+    /// (migration-only mode).
     #[cfg(feature = "db")]
     async fn run_db_phase(&self) -> Result<(), RegistryError> {
-        self.run_db_phase_for(&self.registry.gears_by_system_priority())
-            .await
+        self.run_db_phase_for(&self.by_group()).await
     }
 
     /// DB MIGRATION phase: run migrations for `entries` with DB capability,
-    /// in the given order (system gears first).
+    /// in the given order.
     ///
     /// Gears provide migrations via `DatabaseCapability::migrations()`.
     /// The runtime executes them with a privileged connection that gears
@@ -484,11 +514,10 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// INIT phase over every gear, system gears first.
+    /// INIT phase over every gear, the system group first.
     #[cfg(test)]
     async fn run_init_phase(&self) -> Result<(), RegistryError> {
-        self.run_init_phase_for(&self.registry.gears_by_system_priority())
-            .await
+        self.run_init_phase_for(&self.by_group()).await
     }
 
     /// INIT phase: initialize `entries` in the given order.
@@ -794,16 +823,16 @@ impl HostRuntime {
         &self,
     ) -> Result<Vec<(&'static GtsPublicationDescriptor, Arc<GtsManifest>)>, RegistryError> {
         let mut manifests = Vec::new();
-        for entry in self.registry.gears_by_system_priority() {
+        for entry in self.registry.gears() {
             let Some(publication) = entry.caps.query::<GtsPublicationCap>() else {
                 continue;
             };
-            if entry.stage == StartupStage::Infrastructure {
+            if entry.is_system() {
                 return Err(RegistryError::Publication {
                     gear: entry.name,
                     source: anyhow::anyhow!(
-                        "an infrastructure gear initializes before the GTS barrier, so it \
-                         cannot publish GTS documents with `gts(...)`"
+                        "a system gear initializes before the GTS barrier, so it cannot \
+                         publish GTS documents with `gts(...)`"
                     ),
                 });
             }
@@ -903,33 +932,31 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// The startup stage of `gear` when it runs in this process.
-    fn stage_of(&self, gear: &str) -> Option<StartupStage> {
+    /// Whether `gear` runs in this process, and in the system group.
+    fn local_group(&self, gear: &str) -> Option<bool> {
         self.registry
             .gears()
             .iter()
             .find(|e| e.name == gear)
-            .map(GearEntry::stage)
+            .map(GearEntry::is_system)
     }
 
     /// Refuse, before any gear runs, a client the runtime would wire before
     /// its provider in this process initialized, where the proxy would shadow
-    /// the local client for good: an infrastructure gear consuming an
-    /// application gear, or a non-empty publication to an application gear.
-    fn check_wiring_stages(
+    /// the local client for good: a system gear consuming an application
+    /// gear, or a non-empty publication to an application gear.
+    fn check_wiring_groups(
         &self,
         manifests: &[(&'static GtsPublicationDescriptor, Arc<GtsManifest>)],
         regs: &[&'static crate::discovery::ConsumerRegistration],
     ) -> Result<(), RegistryError> {
-        let application = |gear: &str| self.stage_of(gear) == Some(StartupStage::Application);
+        let application = |gear: &str| self.local_group(gear) == Some(false);
         for reg in regs {
-            if self.stage_of(reg.owner_gear) == Some(StartupStage::Infrastructure)
-                && application(reg.dep_gear)
-            {
+            if self.local_group(reg.owner_gear) == Some(true) && application(reg.dep_gear) {
                 return Err(RegistryError::ProxyWiring {
                     gear: reg.owner_gear,
                     source: anyhow::anyhow!(
-                        "infrastructure gear '{}' consumes '{}', an application gear of this \
+                        "system gear '{}' consumes '{}', an application gear of this \
                          process: its client is needed before that gear initializes",
                         reg.owner_gear,
                         reg.dep_gear
@@ -953,49 +980,55 @@ impl HostRuntime {
         Ok(())
     }
 
-    /// Wire, after the infrastructure group's `init`, every consumer
-    /// registration an infrastructure gear of this process owns or provides:
-    /// a local infrastructure provider is in the hub by then, so it wins, and
-    /// an infrastructure consumer has its client before its `post_init` and
-    /// `start`. The others wait for the application group's `init`, so a local
-    /// application provider is never shadowed by a proxy.
-    fn wire_infrastructure_clients(
+    /// Wire, after the system group's `init`, every consumer registration a
+    /// system gear of this process owns or provides: a local system provider
+    /// is in the hub by then, so it wins, and a system consumer has its
+    /// client before its `post_init` and `start`. The others wait for the
+    /// application group's `init`, so a local application provider is never
+    /// shadowed by a proxy.
+    fn wire_system_clients(
         &self,
         all: &[&'static crate::discovery::ConsumerRegistration],
     ) -> Result<(), RegistryError> {
-        let infrastructure = |gear: &str| self.stage_of(gear) == Some(StartupStage::Infrastructure);
+        let system = |gear: &str| self.local_group(gear) == Some(true);
         let regs: Vec<&crate::discovery::ConsumerRegistration> = all
             .iter()
             .copied()
-            .filter(|reg| infrastructure(reg.owner_gear) || infrastructure(reg.dep_gear))
+            .filter(|reg| system(reg.owner_gear) || system(reg.dep_gear))
             .collect();
         self.wire_consumer_registrations(&regs).map(drop)
     }
 
-    /// `POST_INIT` phase over every gear, system gears first.
+    /// `POST_INIT` phase over every gear, the system group first.
     #[cfg(test)]
     async fn run_post_init_phase(&self) -> Result<(), RegistryError> {
-        self.run_post_init_phase_for(&self.registry.gears_by_system_priority())
-            .await
+        self.run_post_init_phase_for(&self.by_group()).await
     }
 
-    /// `POST_INIT` phase: the hook of the system gears of `entries`, after
-    /// their group's `init` and proxy wiring, in the given order.
+    /// `POST_INIT` phase: every gear's `post_init` of `entries`, after their
+    /// group's `init` and proxy wiring, in the given order.
     async fn run_post_init_phase_for(&self, entries: &[&GearEntry]) -> Result<(), RegistryError> {
         tracing::info!(gears = entries.len(), "Phase: post_init");
 
-        let sys_ctx = self.system_context();
-
         for entry in entries {
-            if let Some(sys_mod) = entry.caps.query::<SystemCap>() {
-                sys_mod
-                    .post_init(&sys_ctx)
-                    .await
-                    .map_err(|e| RegistryError::PostInit {
-                        gear: entry.name,
-                        source: e,
-                    })?;
+            if self.cancel.is_cancelled() {
+                tracing::warn!("Post-init phase cancelled by signal");
+                return Err(RegistryError::Cancelled);
             }
+            let ctx = self.ctx_builder.for_gear(entry.name).await.map_err(|e| {
+                RegistryError::PostInit {
+                    gear: entry.name,
+                    source: e,
+                }
+            })?;
+            entry
+                .core
+                .post_init(&ctx)
+                .await
+                .map_err(|e| RegistryError::PostInit {
+                    gear: entry.name,
+                    source: e,
+                })?;
         }
 
         Ok(())
@@ -1007,7 +1040,7 @@ impl HostRuntime {
     /// what the gears registered during `init` at once.
     async fn run_legacy_finalization(&self) -> Result<(), RegistryError> {
         let sys_ctx = self.system_context();
-        for entry in self.registry.gears_by_system_priority() {
+        for entry in self.registry.gears() {
             if let Some(sys_mod) = entry.caps.query::<SystemCap>() {
                 sys_mod
                     .legacy_finalize_after_application_init(&sys_ctx)
@@ -1077,7 +1110,7 @@ impl HostRuntime {
         if !refusals.is_empty() {
             tracing::error!(
                 error = %refusals.join("; "),
-                "application group preparation failed; infrastructure keeps running until shutdown"
+                "application group preparation failed; the system group keeps running until shutdown"
             );
             return Ok(AppStartup::Failed);
         }
@@ -1181,14 +1214,14 @@ impl HostRuntime {
         Ok(router)
     }
 
-    /// Early REST phase: when the REST host is an infrastructure gear, serve
-    /// the routes of the infrastructure gears before the application group
-    /// is prepared (probes and platform-plane calls; everything else `503`).
-    async fn run_rest_bootstrap_phase(&self, infra: &[&GearEntry]) -> Result<(), RegistryError> {
+    /// Early REST phase: when the REST host is a system gear, serve the
+    /// routes of the system gears before the application group is prepared
+    /// (probes and platform-plane calls; everything else `503`).
+    async fn run_rest_bootstrap_phase(&self, system: &[&GearEntry]) -> Result<(), RegistryError> {
         let Some((host_entry, host)) = self.rest_host() else {
             return Ok(());
         };
-        if host_entry.stage != StartupStage::Infrastructure {
+        if !host_entry.is_system() {
             return Ok(());
         }
         tracing::info!("Phase: rest (bootstrap routes)");
@@ -1205,7 +1238,7 @@ impl HostRuntime {
             .registry
             .gears()
             .iter()
-            .filter(|e| infra.iter().any(|i| i.name == e.name))
+            .filter(|e| system.iter().any(|i| i.name == e.name))
             .collect();
         let router = self
             .compose_rest(&in_order, host.as_registry(), &hc_registry)
@@ -1220,7 +1253,7 @@ impl HostRuntime {
     /// REST phase: compose the full router against the REST host.
     ///
     /// Prepares the host unless the bootstrap phase did, registers the routes
-    /// of every gear not registered yet (the infrastructure gears' are kept),
+    /// of every gear not registered yet (the system gears' are kept),
     /// then finalizes with `OpenAPI` endpoints. A host serving already swaps
     /// the new routes in on its listener.
     async fn run_rest_phase(&self) -> Result<Router, RegistryError> {
@@ -1278,11 +1311,12 @@ impl HostRuntime {
             })
     }
 
-    /// Collect the gRPC installers of the service gears of `stage`, reject
-    /// duplicate service names, and pin their owners.
+    /// Collect the gRPC installers of the service gears of the system group
+    /// (`system = true`) or the application group, reject duplicate service
+    /// names, and pin their owners.
     async fn collect_grpc_installers(
         &self,
-        stage: StartupStage,
+        system: bool,
         seen: &mut HashSet<&'static str>,
     ) -> Result<Vec<crate::runtime::GearInstallers>, RegistryError> {
         let mut gears_data = Vec::new();
@@ -1292,12 +1326,12 @@ impl HostRuntime {
         let mut owners: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
         for (gear_name, service_gear) in &self.registry.grpc_services {
-            let in_stage = self
+            let in_group = self
                 .registry
                 .gears()
                 .iter()
-                .any(|e| e.name == gear_name.as_str() && e.stage == stage);
-            if !in_stage {
+                .any(|e| e.name == gear_name.as_str() && e.is_system() == system);
+            if !in_group {
                 continue;
             }
             let ctx = self.ctx_builder.for_gear(gear_name).await.map_err(|err| {
@@ -1352,7 +1386,7 @@ impl HostRuntime {
         }
     }
 
-    /// Initial gRPC batch: the services of the infrastructure gears, for the
+    /// Initial gRPC batch: the services of the system gears, for the
     /// hub to serve when it starts. Says whether application services follow.
     async fn run_grpc_initial_phase(
         &self,
@@ -1362,14 +1396,12 @@ impl HostRuntime {
             return Ok(());
         }
         tracing::info!("Phase: grpc (initial services)");
-        let gears = self
-            .collect_grpc_installers(StartupStage::Infrastructure, seen)
-            .await?;
+        let gears = self.collect_grpc_installers(true, seen).await?;
         let more_batches = self.registry.grpc_services.iter().any(|(gear, _)| {
             self.registry
                 .gears()
                 .iter()
-                .any(|e| e.name == gear.as_str() && e.stage == StartupStage::Application)
+                .any(|e| e.name == gear.as_str() && !e.is_system())
         });
         let hub_name = self.registry.grpc_hub.clone().unwrap_or_default();
         self.grpc_installers
@@ -1393,9 +1425,7 @@ impl HostRuntime {
             return Ok(());
         }
         let hub_name = self.registry.grpc_hub.clone().unwrap_or_default();
-        let gears = self
-            .collect_grpc_installers(StartupStage::Application, seen)
-            .await?;
+        let gears = self.collect_grpc_installers(false, seen).await?;
         if gears.is_empty() {
             self.grpc_installers.close();
             return Ok(());
@@ -1438,11 +1468,10 @@ impl HostRuntime {
         }
     }
 
-    /// START phase over every gear, system gears first.
+    /// START phase over every gear, the system group first.
     #[cfg(test)]
     async fn run_start_phase(&self) -> Result<(), RegistryError> {
-        self.run_start_phase_for(&self.registry.gears_by_system_priority())
-            .await
+        self.run_start_phase_for(&self.by_group()).await
     }
 
     /// START phase: start the stateful gears of `entries` in order.
@@ -1453,7 +1482,7 @@ impl HostRuntime {
             if let Some(s) = e.caps.query::<RunnableCap>() {
                 tracing::debug!(
                     gear = e.name,
-                    is_system = e.caps.has::<SystemCap>(),
+                    is_system = e.is_system(),
                     "Starting stateful gear"
                 );
                 self.start_called.lock().insert(e.name);
@@ -1485,7 +1514,7 @@ impl HostRuntime {
     }
 
     /// STOP phase: stop all started gears: the application group, then the
-    /// infrastructure, each in reverse order.
+    /// system group, each in reverse order.
     ///
     /// # Two-Phase Shutdown Contract
     ///
@@ -1518,20 +1547,14 @@ impl HostRuntime {
 
         let deadline = self.shutdown_deadline;
 
-        // The application group first: it may still use the infrastructure.
+        // The application group first: it may still use the system group.
         let in_reverse = self
             .registry
             .gears()
             .iter()
             .rev()
-            .filter(|e| e.stage == StartupStage::Application)
-            .chain(
-                self.registry
-                    .gears()
-                    .iter()
-                    .rev()
-                    .filter(|e| e.stage == StartupStage::Infrastructure),
-            );
+            .filter(|e| !e.is_system())
+            .chain(self.registry.gears().iter().rev().filter(|e| e.is_system()));
         for e in in_reverse {
             let gear_name = e.name;
             // Only a gear whose `start` was called has anything to stop.
@@ -1753,7 +1776,7 @@ impl HostRuntime {
     /// gears of `entries` in the service directory under their own gear name,
     /// pointing at the shared gateway endpoint. Consumers resolving a provider
     /// gear name then receive this endpoint and the gateway routes to the
-    /// provider's handlers. The infrastructure gears are advertised before the
+    /// provider's handlers. The system gears are advertised before the
     /// application group is prepared, the application gears once it started.
     ///
     /// No-op when there is no REST host or no REST provider gears, so non-REST
@@ -1879,8 +1902,8 @@ impl HostRuntime {
 
         // Migration-only: pre-init and migrations of every gear, then exit.
         if mode == RunMode::MigrateOnly {
-            self.run_pre_init_phase()?;
-            // DB migration phase (system gears first)
+            self.run_pre_init_phase().await?;
+            // DB migration phase (the system group first)
             #[cfg(feature = "db")]
             self.run_db_phase().await?;
             tracing::info!("Migration phases completed successfully");
@@ -1900,7 +1923,7 @@ impl HostRuntime {
         };
         if outcome == AppStartup::Failed {
             tracing::error!(
-                "the application group did not start; serving infrastructure only until shutdown"
+                "the application group did not start; serving the system group only until shutdown"
             );
         }
 
@@ -1935,8 +1958,8 @@ impl HostRuntime {
 
     /// Everything from the manifests to the started application group.
     async fn run_startup_phases(&self) -> anyhow::Result<AppStartup> {
-        let infra = self.group(StartupStage::Infrastructure);
-        let app = self.group(StartupStage::Application);
+        let system = self.group(true);
+        let app = self.group(false);
         self.spawn_drain_watcher();
 
         // Local configuration first: a manifest that does not build, or a
@@ -1944,25 +1967,25 @@ impl HostRuntime {
         // gear runs or anything is written.
         let manifests = self.build_gts_manifests()?;
         let regs = Self::consumer_registrations();
-        self.check_wiring_stages(&manifests, &regs)?;
+        self.check_wiring_groups(&manifests, &regs)?;
 
-        // Infrastructure group, complete: pre-init, migrations, init, its
-        // clients, post-init.
-        self.run_pre_init_phase_for(&infra)?;
+        // System group, complete: pre-init, migrations, init, its clients,
+        // post-init.
+        self.run_pre_init_phase_for(&system).await?;
         #[cfg(feature = "db")]
-        self.run_db_phase_for(&infra).await?;
-        self.run_init_phase_for(&infra).await?;
-        self.wire_infrastructure_clients(&regs)?;
-        self.run_post_init_phase_for(&infra).await?;
+        self.run_db_phase_for(&system).await?;
+        self.run_init_phase_for(&system).await?;
+        self.wire_system_clients(&regs)?;
+        self.run_post_init_phase_for(&system).await?;
 
         // Initial routes, then start: the listeners serve probes and
         // platform-plane calls while the application group is prepared.
         let mut grpc_seen = HashSet::new();
-        self.run_rest_bootstrap_phase(&infra).await?;
+        self.run_rest_bootstrap_phase(&system).await?;
         self.run_grpc_initial_phase(&mut grpc_seen).await?;
-        self.run_start_phase_for(&infra).await?;
+        self.run_start_phase_for(&system).await?;
 
-        self.run_directory_register_phase(&infra).await?;
+        self.run_directory_register_phase(&system).await?;
 
         // Children spawn now, once: one of them may host the registry or
         // publish a base type the application group waits for.
@@ -1970,7 +1993,7 @@ impl HostRuntime {
 
         // Application group: pre-init, migrations, the registry clients, then
         // the GTS barrier.
-        self.run_pre_init_phase_for(&app)?;
+        self.run_pre_init_phase_for(&app).await?;
         #[cfg(feature = "db")]
         self.run_db_phase_for(&app).await?;
         self.wire_registry_clients(&manifests)?;
@@ -2000,7 +2023,7 @@ impl HostRuntime {
 /// Advertises in-process REST providers in the directory, each at most once.
 ///
 /// The directory-register phase enables it with the gateway endpoint, for the
-/// infrastructure group and then for the application group. Only the in-process host path enables it: in `OoP` serving, `oop_serve` owns
+/// system group and then for the application group. Only the in-process host path enables it: in `OoP` serving, `oop_serve` owns
 /// presence + deregister, so nothing is advertised or deregistered here.
 struct RestAdvertiser {
     instance_id: String,
@@ -2121,7 +2144,7 @@ impl RestAdvertiser {
 type ComposedOopRouter = (Router, String, toolkit_http_middleware::RouteAuthPolicy);
 
 /// The host-less `OoP` router composed so far: each gear's routes are
-/// registered once, the infrastructure gears' before the application group.
+/// registered once, the system gears' before the application group.
 #[cfg(feature = "bootstrap")]
 #[derive(Default)]
 struct OopComposition {
@@ -2203,10 +2226,10 @@ impl HostRuntime {
     /// self-registration, dependency resolution, and graceful drain, then the
     /// `stop` phase.
     ///
-    /// The listener binds first. The infrastructure group's routes attach as
+    /// The listener binds first. The system group's routes attach as
     /// soon as it started — platform-plane calls only, tenant-plane calls get
     /// `503` — and the process is present in the directory then if its
-    /// advertised gear is infrastructure. The application group's routes
+    /// advertised gear is a system gear. The application group's routes
     /// attach on the same listener once it started.
     ///
     /// # Errors
@@ -2268,7 +2291,7 @@ impl HostRuntime {
             Ok(outcome) => {
                 if outcome == AppStartup::Failed {
                     tracing::error!(
-                        "the application group did not start; serving infrastructure only \
+                        "the application group did not start; serving the system group only \
                          until shutdown"
                     );
                 }
@@ -2303,40 +2326,40 @@ impl HostRuntime {
         hc_registry: &Arc<crate::healthcheck::RestHealthcheckRegistry>,
         composition: &mut OopComposition,
     ) -> anyhow::Result<AppStartup> {
-        let infra = self.group(StartupStage::Infrastructure);
-        let app = self.group(StartupStage::Application);
+        let system = self.group(true);
+        let app = self.group(false);
         let advertised = server.options().gear_name.clone();
-        let advertised_is_infra = infra.iter().any(|e| e.name == advertised.as_str());
+        let advertised_is_system = system.iter().any(|e| e.name == advertised.as_str());
 
         let manifests = self.build_gts_manifests()?;
         let regs = Self::consumer_registrations();
-        self.check_wiring_stages(&manifests, &regs)?;
+        self.check_wiring_groups(&manifests, &regs)?;
 
-        // Infrastructure group, complete before the application group.
-        self.run_pre_init_phase_for(&infra)?;
+        // System group, complete before the application group.
+        self.run_pre_init_phase_for(&system).await?;
         #[cfg(feature = "db")]
-        self.run_db_phase_for(&infra).await?;
-        self.run_init_phase_for(&infra).await?;
-        self.wire_infrastructure_clients(&regs)?;
-        self.run_post_init_phase_for(&infra).await?;
+        self.run_db_phase_for(&system).await?;
+        self.run_init_phase_for(&system).await?;
+        self.wire_system_clients(&regs)?;
+        self.run_post_init_phase_for(&system).await?;
         let mut grpc_seen = HashSet::new();
         self.run_grpc_initial_phase(&mut grpc_seen).await?;
-        self.run_start_phase_for(&infra).await?;
+        self.run_start_phase_for(&system).await?;
 
-        // Infrastructure routes on the bound listener: platform-plane calls
+        // System routes on the bound listener: platform-plane calls
         // only until the application group attached its routes.
-        if infra.iter().any(|e| e.caps.has::<RestApiCap>()) {
+        if system.iter().any(|e| e.caps.has::<RestApiCap>()) {
             let (router, openapi, route_auth) = self
-                .compose_oop_router(server.options(), hc_registry, &infra, composition)
+                .compose_oop_router(server.options(), hc_registry, &system, composition)
                 .await?;
             server.publish_bootstrap_routes(router, openapi, route_auth);
-            if advertised_is_infra {
+            if advertised_is_system {
                 server.start_presence();
             }
-            // Every co-hosted infrastructure provider is discoverable at once,
+            // Every co-hosted system provider is discoverable at once,
             // whatever the root gear: an external publisher must reach a
             // registry the application group here may be waiting for.
-            for entry in &infra {
+            for entry in &system {
                 if entry.name != advertised.as_str()
                     && entry
                         .caps
@@ -2350,7 +2373,7 @@ impl HostRuntime {
 
         // Application group: pre-init, migrations, the registry clients, then
         // the GTS barrier.
-        self.run_pre_init_phase_for(&app)?;
+        self.run_pre_init_phase_for(&app).await?;
         #[cfg(feature = "db")]
         self.run_db_phase_for(&app).await?;
         self.wire_registry_clients(&manifests)?;
@@ -2385,7 +2408,7 @@ impl HostRuntime {
         // presence of the advertised gear: the directory never advertises it
         // while its routes reply 503.
         server.attach(router, openapi, route_auth)?;
-        if !advertised_is_infra {
+        if !advertised_is_system {
             server.start_presence();
         }
         self.dep_checker.mark_resolved(PREPARATION_GATE);
@@ -3087,7 +3110,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_post_init_runs_after_all_init_and_system_first() {
+    async fn test_post_init_runs_after_all_init_for_every_gear_system_group_first() {
         #[derive(Clone)]
         struct TrackHooks {
             name: &'static str,
@@ -3100,15 +3123,8 @@ mod tests {
                 self.events.lock().await.push(format!("init:{}", self.name));
                 Ok(())
             }
-        }
 
-        #[async_trait::async_trait]
-        impl SystemCapability for TrackHooks {
-            fn pre_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            async fn post_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+            async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
                 self.events
                     .lock()
                     .await
@@ -3116,6 +3132,8 @@ mod tests {
                 Ok(())
             }
         }
+
+        impl SystemCapability for TrackHooks {}
 
         let events = Arc::new(Mutex::new(Vec::<String>::new()));
         let sys_a = Arc::new(TrackHooks {
@@ -3169,7 +3187,7 @@ mod tests {
             "expected all init events before post_init, got: {events:?}"
         );
 
-        // system-first order within each phase
+        // The system group first, each group in topological order.
         assert_eq!(
             events,
             vec![
@@ -3177,6 +3195,8 @@ mod tests {
                 "init:user_b",
                 "init:user_c",
                 "post_init:sys_a",
+                "post_init:user_b",
+                "post_init:user_c",
             ]
         );
     }
@@ -3207,15 +3227,8 @@ mod tests {
                 self.events.lock().await.push("init".to_owned());
                 Ok(())
             }
-        }
 
-        #[async_trait::async_trait]
-        impl SystemCapability for TrackHooks {
-            fn pre_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
-                Ok(())
-            }
-
-            async fn post_init(&self, _sys: &crate::runtime::SystemContext) -> anyhow::Result<()> {
+            async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
                 self.events.lock().await.push("post_init".to_owned());
                 Ok(())
             }
@@ -3227,8 +3240,7 @@ mod tests {
         });
 
         let mut builder = RegistryBuilder::default();
-        builder.register_core_with_meta("sys", &[], gear.clone() as Arc<dyn Gear>);
-        builder.register_system_with_meta("sys", gear.clone() as Arc<dyn SystemCapability>);
+        builder.register_core_with_meta("app", &[], gear.clone() as Arc<dyn Gear>);
         let registry = builder.build_topo_sorted().unwrap();
 
         let runtime = HostRuntime::new(

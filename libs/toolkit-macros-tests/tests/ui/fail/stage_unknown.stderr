@@ -1,5 +1,0 @@
-error: stage must be `infrastructure` or `application`
- --> tests/ui/fail/stage_unknown.rs:3:28
-  |
-3 | #[gear(name = "x", stage = bootstrap)]
-  |                            ^^^^^^^^^

@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the tenant resolver.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system). Mirrors
+# Projected from #[toolkit::gear]: id, runtime_caps (none). Mirrors
 # authn-resolver exactly, including the `vendor` selector defaulting to
 # `constructorfabric`.
 

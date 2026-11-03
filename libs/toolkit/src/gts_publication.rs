@@ -20,7 +20,7 @@
 //! publisher adapter. The gear writes no task, retry loop or readiness code.
 //!
 //! The runtime builds every manifest from the configuration before any gear
-//! runs, then — once the infrastructure (the registry among it) started and
+//! runs, then — once the system group (the registry among it) started and
 //! the application migrations ran — publishes them all concurrently
 //! ([`publish_all`]) and waits until each one is admitted. No application
 //! `init` runs before that barrier. A gear reads its admitted manifest in

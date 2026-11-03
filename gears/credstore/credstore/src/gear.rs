@@ -11,7 +11,7 @@ use authz_resolver_sdk::PolicyEnforcer;
 use tenant_resolver_sdk::TenantResolverClient;
 use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
-use toolkit::contracts::{DatabaseCapability, SystemCapability};
+use toolkit::contracts::DatabaseCapability;
 use toolkit::lifecycle::ReadySignal;
 use toolkit::{Gear, GearCtx, RestApiCapability};
 use toolkit_db::DBProvider;
@@ -29,16 +29,14 @@ use crate::infra::storage::repo_impl::SecretRepoImpl;
 use crate::infra::tenant_resolver::TenantResolverDir;
 use crate::infra::types_registry::GtsSecretTypeResolver;
 
-// `system` capability is required in this platform: consumers like `oagw` are
-// system modules and resolve `CredStoreClientV1` from the ClientHub during their
-// `init`. System modules initialize before non-system ones
-// (`modules_by_system_priority`), so credstore must also be a system module to
-// register its client before those consumers init.
+// Consumers like `oagw` resolve `CredStoreClientV1` from the ClientHub during
+// their `init`; they name `credstore` in their `deps`, so it registers its
+// client first.
 #[toolkit::consumes(contract = authz_resolver_sdk::AuthZResolverApi, from = "authz-resolver")]
 #[toolkit::gear(
     name = "credstore",
     deps = [tenant_resolver, types_registry],
-    capabilities = [system, db, rest, stateful],
+    capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct CredStoreGear {
@@ -172,10 +170,6 @@ impl Gear for CredStoreGear {
         Ok(())
     }
 }
-
-// Empty system capability: credstore needs no pre_init/post_init work, only the
-// system-priority init ordering (see the module attribute above).
-impl SystemCapability for CredStoreGear {}
 
 impl DatabaseCapability for CredStoreGear {
     fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {

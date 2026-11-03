@@ -36,7 +36,7 @@ use cluster_sdk::grpc::stubs;
 
 #[toolkit::gear(
     name = "cluster",
-    stage = infrastructure,
+    // `system`: started before the application group is prepared.
     capabilities = [stateful, system, grpc, rest]
 )]
 // The four coordination contracts this gear serves, over gRPC only. In-process
@@ -261,8 +261,8 @@ impl Gear for ClusterGear {
     }
 }
 
-/// Cluster needs no system hooks: `init` creates the profile registry and `start`
-/// binds its backends. Its infrastructure stage runs both before application
+/// Cluster wires no runtime internals: `init` creates the profile registry and
+/// `start` binds its backends. Its system group runs both before application
 /// preparation, so coordination is available before any application `init`.
 impl toolkit::contracts::SystemCapability for ClusterGear {}
 

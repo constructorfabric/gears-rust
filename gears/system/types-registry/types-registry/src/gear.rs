@@ -54,10 +54,10 @@ use crate::infra::storage::Repos;
 )]
 #[toolkit::gear(
     name = "types-registry",
+    // `system`: admits the GTS documents every application gear waits for,
+    // so it is initialized, seeded and served before the application group
+    // is prepared.
     capabilities = [system, db, rest, stateful],
-    // Admits the GTS documents every application gear waits for: initialized,
-    // seeded and served before the application group is prepared.
-    stage = infrastructure,
     // Leave five seconds before the host's hard shutdown deadline. An admission
     // cut short keeps its outbox message, so the next boot's lease redelivers it.
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
@@ -396,9 +396,9 @@ impl Gear for TypesRegistryGear {
 impl SystemCapability for TypesRegistryGear {
     /// Legacy ready mode: validate what every gear registered during `init()`
     /// and enter ready mode, once, after the application group's `init`. The
-    /// registry is an infrastructure gear, so its ordinary `post_init` runs
-    /// before any application registration and stays a no-op. Goes away with
-    /// the in-memory ready mode.
+    /// registry is a system gear, so its ordinary `post_init` would run
+    /// before any application registration. Goes away with the in-memory
+    /// ready mode.
     async fn legacy_finalize_after_application_init(
         &self,
         _sys: &toolkit::runtime::SystemContext,

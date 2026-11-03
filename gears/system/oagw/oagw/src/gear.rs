@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use toolkit::api::OpenApiRegistry;
 #[cfg(feature = "cluster")]
 use toolkit::client_hub::ClientHub;
-use toolkit::contracts::{RunnableCapability, SystemCapability};
+use toolkit::contracts::RunnableCapability;
 use toolkit::{
     DatabaseCapability, Gear, GearCtx, Healthcheck, HealthcheckResult, HealthcheckStatus,
     RestApiCapability,
@@ -74,7 +74,7 @@ pub struct AppState {
 #[toolkit::gear(
     name = "oagw",
     deps = [types_registry, credstore, tenant_resolver],
-    capabilities = [system, db, rest, stateful]
+    capabilities = [db, rest, stateful]
 )]
 pub struct OutboundApiGatewayGear {
     state: arc_swap::ArcSwapOption<AppState>,
@@ -464,11 +464,17 @@ impl Gear for OutboundApiGatewayGear {
 
         Ok(())
     }
+
+    async fn post_init(&self, _ctx: &GearCtx) -> anyhow::Result<()> {
+        self.prepare_registry_provisioning().await
+    }
 }
 
-#[async_trait]
-impl SystemCapability for OutboundApiGatewayGear {
-    async fn post_init(&self, _sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
+impl OutboundApiGatewayGear {
+    /// `post_init`: prepare the registry provisioning once every gear of the
+    /// group initialized — reconciled now in memory, by `start`'s background
+    /// task on a database.
+    async fn prepare_registry_provisioning(&self) -> anyhow::Result<()> {
         let registry = self
             .registry_client
             .get()

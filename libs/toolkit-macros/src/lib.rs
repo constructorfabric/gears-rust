@@ -28,7 +28,6 @@ struct GearConfig {
     client: Option<Path>,         // trait path for client DX helpers
     lifecycle: Option<LcGearCfg>, // optional lifecycle config (on type)
     gts: Option<gts_publication::GtsCfg>,
-    infrastructure: bool, // `stage = infrastructure`
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -214,7 +213,6 @@ impl Parse for GearConfig {
         let mut client: Option<Path> = None;
         let mut lifecycle: Option<LcGearCfg> = None;
         let mut gts: Option<gts_publication::GtsCfg> = None;
-        let mut stage: Option<bool> = None;
 
         let mut seen_name = false;
         let mut seen_deps = false;
@@ -433,30 +431,6 @@ impl Parse for GearConfig {
                     seen_lifecycle = true;
                     lifecycle = Some(parse_lifecycle_list(&list)?);
                 }
-                // `stage = infrastructure | application`: when the gear runs during
-                // startup (`toolkit::registry::StartupStage`).
-                Meta::NameValue(nv) if nv.path.is_ident("stage") => {
-                    if stage.is_some() {
-                        return Err(syn::Error::new_spanned(
-                            nv.path,
-                            "duplicate `stage` parameter",
-                        ));
-                    }
-                    let ident = match &nv.value {
-                        Expr::Path(p) => p.path.get_ident().map(ToString::to_string),
-                        _ => None,
-                    };
-                    stage = Some(match ident.as_deref() {
-                        Some("infrastructure") => true,
-                        Some("application") => false,
-                        _ => {
-                            return Err(syn::Error::new_spanned(
-                                nv.value,
-                                "stage must be `infrastructure` or `application`",
-                            ));
-                        }
-                    });
-                }
                 Meta::List(list) if list.path.is_ident("gts") => {
                     if gts.is_some() {
                         return Err(syn::Error::new_spanned(
@@ -490,7 +464,6 @@ impl Parse for GearConfig {
             client,
             lifecycle,
             gts,
-            infrastructure: stage.unwrap_or(false),
         })
     }
 }
@@ -690,7 +663,8 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
             Capability::System => {
-                // System is a flag, no trait required
+                // Selects the system group; the registration below requires
+                // `SystemCapability`.
                 quote! {}
             }
             Capability::GrpcHub => quote! {
@@ -731,14 +705,6 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
         quote! {
             b.register_gts_publication_with_meta(#name_lit,
                 gear.clone() as ::std::sync::Arc<dyn ::toolkit::gts_publication::GtsPublicationCapability>);
-        }
-    } else {
-        proc_macro2::TokenStream::new()
-    };
-
-    let stage_registration = if config.infrastructure {
-        quote! {
-            b.register_startup_stage(#name_lit, ::toolkit::registry::StartupStage::Infrastructure);
         }
     } else {
         proc_macro2::TokenStream::new()
@@ -959,7 +925,6 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
             // capabilities
             #(#capability_registrations)*
             #gts_registration
-            #stage_registration
         }
 
         ::toolkit::inventory::submit! {

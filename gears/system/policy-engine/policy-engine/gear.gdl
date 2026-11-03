@@ -4,8 +4,8 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the policy-engine gear.
 #
-# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (system, db,
-# rest) and lifecycle; deps below is an exact checked mirror (GBX0214).
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (db, rest)
+# and lifecycle; deps below is an exact checked mirror (GBX0214).
 
 TR_SDK = cargo(crate_name = "cf-gears-types-registry-sdk", lib = "types_registry_sdk", path = "../../types-registry/types-registry-sdk", features = ["rest-client"])
 

@@ -7,22 +7,6 @@ use thiserror::Error;
 // Re-exported contracts are referenced but not defined here.
 use crate::contracts;
 
-/// When a gear runs during startup.
-///
-/// Infrastructure gears (the types registry, service discovery, cluster, the REST
-/// and gRPC transport hosts) are migrated, initialized and started before the
-/// application group of the process is prepared, so a process waiting for its
-/// GTS admission keeps serving them. Every other gear is
-/// [`Application`](Self::Application): its `init` runs only after every GTS
-/// manifest of the process is admitted. An infrastructure gear must not depend
-/// on an application gear.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StartupStage {
-    Infrastructure,
-    #[default]
-    Application,
-}
-
 /// Type alias for REST host gear configuration.
 type RestHostEntry = (&'static str, Arc<dyn contracts::ApiGatewayCapability>);
 
@@ -252,8 +236,6 @@ pub struct GearEntry {
     pub(crate) core: Arc<dyn contracts::Gear>,
     /// Capabilities declared by this gear.
     pub(crate) caps: CapabilitySet,
-    /// When this gear runs during startup.
-    pub(crate) stage: StartupStage,
 }
 
 impl GearEntry {
@@ -275,10 +257,11 @@ impl GearEntry {
         &self.caps
     }
 
-    /// Returns when this gear runs during startup.
+    /// Whether this gear has the `system` capability, and so belongs to the
+    /// system group that starts before the application group is prepared.
     #[must_use]
-    pub fn stage(&self) -> StartupStage {
-        self.stage
+    pub fn is_system(&self) -> bool {
+        self.caps.has::<SystemCap>()
     }
 }
 
@@ -287,7 +270,6 @@ impl std::fmt::Debug for GearEntry {
         f.debug_struct("GearEntry")
             .field("name", &self.name)
             .field("deps", &self.deps)
-            .field("stage", &self.stage)
             .field("has_rest", &self.caps.has::<RestApiCap>())
             .field("is_rest_host", &self.caps.has::<ApiGatewayCap>())
             .field("has_db", &self.caps.has_db())
@@ -329,26 +311,6 @@ impl GearRegistry {
         &self.gears
     }
 
-    /// Returns gears ordered by system priority.
-    /// System gears come first, followed by non-system gears.
-    /// Within each group, the original topological order is preserved.
-    #[must_use]
-    pub fn gears_by_system_priority(&self) -> Vec<&GearEntry> {
-        let mut system_mods = Vec::new();
-        let mut non_system_mods = Vec::new();
-
-        for entry in &self.gears {
-            if entry.caps.has::<SystemCap>() {
-                system_mods.push(entry);
-            } else {
-                non_system_mods.push(entry);
-            }
-        }
-
-        system_mods.extend(non_system_mods);
-        system_mods
-    }
-
     /// Discover via inventory, have registrators fill the builder, then build & topo-sort.
     ///
     /// # Errors
@@ -381,7 +343,6 @@ pub struct RegistryBuilder {
     core: HashMap<&'static str, Arc<dyn contracts::Gear>>,
     deps: HashMap<&'static str, &'static [&'static str]>,
     capabilities: HashMap<&'static str, Vec<Capability>>,
-    stages: HashMap<&'static str, StartupStage>,
     rest_host: Option<RestHostEntry>,
     grpc_hub: Option<GrpcHubEntry>,
     errors: Vec<String>,
@@ -408,11 +369,6 @@ impl RegistryBuilder {
         }
         self.core.insert(name, m);
         self.deps.insert(name, deps);
-    }
-
-    /// Declare when gear `name` runs during startup; see [`StartupStage`].
-    pub fn register_startup_stage(&mut self, name: &'static str, stage: StartupStage) {
-        self.stages.insert(name, stage);
     }
 
     pub fn register_rest_with_meta(
@@ -610,24 +566,23 @@ impl RegistryBuilder {
         Ok(())
     }
 
-    /// An infrastructure gear runs before the application group is prepared,
-    /// so it cannot depend on an application gear.
-    fn validate_stages(&self) -> Result<(), RegistryError> {
-        let stage = |name: &str| self.stages.get(name).copied().unwrap_or_default();
-        for name in self.stages.keys() {
-            if !self.core.contains_key(name) {
-                return Err(RegistryError::UnknownGear((*name).to_owned()));
-            }
-        }
+    /// A system gear runs before the application group is prepared, so it
+    /// cannot depend on an application gear.
+    fn validate_system_deps(&self) -> Result<(), RegistryError> {
+        let is_system = |name: &str| {
+            self.capabilities
+                .get(name)
+                .is_some_and(|caps| caps.iter().any(|cap| matches!(cap, Capability::System(_))))
+        };
         let mut names: Vec<_> = self.deps.keys().copied().collect();
         names.sort_unstable();
         for gear in names {
-            if stage(gear) != StartupStage::Infrastructure {
+            if !is_system(gear) {
                 continue;
             }
             for dep in self.deps[gear] {
-                if stage(dep) == StartupStage::Application {
-                    return Err(RegistryError::InfrastructureDependsOnApplication {
+                if self.core.contains_key(dep) && !is_system(dep) {
+                    return Err(RegistryError::SystemDependsOnApplication {
                         gear: gear.to_owned(),
                         depends_on: (*dep).to_owned(),
                     });
@@ -713,7 +668,6 @@ impl RegistryBuilder {
                 deps,
                 core,
                 caps,
-                stage: self.stages.get(name).copied().unwrap_or_default(),
             };
             entries.push(entry);
         }
@@ -730,7 +684,7 @@ impl RegistryBuilder {
 
         // 2) Build dependency graph
         let (names, adj, _idx) = self.build_dependency_graph()?;
-        self.validate_stages()?;
+        self.validate_system_deps()?;
 
         // 3) Cycle detection using DFS with path tracking
         if let Some(cycle_path) = Self::detect_cycle_with_path(&names, &adj) {
@@ -901,10 +855,10 @@ pub enum RegistryError {
     #[error("gear '{gear}' depends on unknown '{depends_on}'")]
     UnknownDependency { gear: String, depends_on: String },
     #[error(
-        "infrastructure gear '{gear}' depends on application gear '{depends_on}'; \
-         infrastructure starts before the application group is prepared"
+        "system gear '{gear}' depends on application gear '{depends_on}'; \
+         the system group starts before the application group is prepared"
     )]
-    InfrastructureDependsOnApplication { gear: String, depends_on: String },
+    SystemDependsOnApplication { gear: String, depends_on: String },
     #[error("cyclic dependency detected: {}", path.join(" -> "))]
     CycleDetected { path: Vec<&'static str> },
     #[error("missing deps for '{0}'")]

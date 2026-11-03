@@ -29,7 +29,7 @@ pub use host_runtime::{
 #[cfg(feature = "bootstrap")]
 pub use oop_serve::OopServeOptions;
 /// Stays unresolved until the application group's migrations, GTS admission,
-/// initialization and startup complete. Infrastructure serves while it waits.
+/// initialization and startup complete. The system group serves while it waits.
 pub const PREPARATION_GATE: &str = "application/preparation";
 
 pub use readiness::{

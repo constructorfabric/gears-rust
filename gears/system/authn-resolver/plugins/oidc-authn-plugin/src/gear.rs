@@ -16,7 +16,6 @@ use authn_resolver_sdk::AuthNResolverPluginSpecV1;
 use opentelemetry::global;
 use toolkit::Gear;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
 use tracing::{info, warn};
@@ -32,7 +31,6 @@ use crate::infra::runtime::build_oidc_authn_plugin;
 /// registry seeds from; this gear publishes only its instance.
 #[toolkit::gear(
     name = "oidc-authn-plugin",
-    capabilities = [system],
     gts(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
@@ -116,10 +114,6 @@ impl Gear for OidcAuthNPluginGear {
         Ok(())
     }
 }
-
-// System priority only: no `pre_init` work.
-#[async_trait]
-impl SystemCapability for OidcAuthNPluginGear {}
 
 /// Convert YAML `u32` priority into GTS `i16` priority with safe clamping.
 fn normalize_priority(priority: u32) -> i16 {

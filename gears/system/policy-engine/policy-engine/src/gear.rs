@@ -15,7 +15,7 @@ use policy_engine_sdk::PolicyManagementClientV1;
 use sea_orm_migration::MigratorTrait;
 use tenant_resolver_sdk::TenantResolverClient;
 use toolkit::api::OpenApiRegistry;
-use toolkit::contracts::{DatabaseCapability, SystemCapability};
+use toolkit::contracts::DatabaseCapability;
 use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::plugins::bind_plugin_instances;
 use toolkit::{ClientHub, Gear, GearCtx, Healthcheck, HealthcheckResult, RestApiCapability};
@@ -58,7 +58,7 @@ struct Wired {
 #[toolkit::gear(
     name = "policy-engine",
     deps = [tenant_resolver, authz_resolver],
-    capabilities = [system, db, rest],
+    capabilities = [db, rest],
     gts(crates = [policy_engine_sdk], entities = Self::plugin_instance),
 )]
 #[derive(Default)]
@@ -176,8 +176,6 @@ impl Clients {
         })
     }
 }
-
-impl SystemCapability for PolicyEngine {}
 
 /// Fully validates configured built-ins after admission, then compiles them.
 async fn load_builtins(

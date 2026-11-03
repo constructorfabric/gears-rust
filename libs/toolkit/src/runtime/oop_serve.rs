@@ -711,7 +711,7 @@ pub(super) struct OopHttpServer {
     cancel: CancellationToken,
     registration_task: Option<tokio::task::JoinHandle<()>>,
     /// Presence of co-hosted provider gears other than `options.gear_name`
-    /// (the infrastructure's, published before the application group), each
+    /// (the system group's, published before the application group), each
     /// deregistered on [`join`](Self::join) like the root's.
     provider_presence: Vec<(String, tokio::task::JoinHandle<()>)>,
     /// Taken by [`join`](Self::join); aborted by `Drop` otherwise.
@@ -879,7 +879,7 @@ impl OopHttpServer {
         Ok(())
     }
 
-    /// Publish the infrastructure gears' routes before the application group
+    /// Publish the system gears' routes before the application group
     /// started: platform-plane and anonymous calls are served, a
     /// tenant-plane call (and any unknown path) gets `503`. No tenant
     /// authenticator is installed yet, and a tenant route must not be served
@@ -907,7 +907,7 @@ impl OopHttpServer {
         self.late.publish(layered, Arc::from(openapi_json));
         tracing::info!(
             gear = %self.options.gear_name,
-            "OoP infrastructure routes attached (platform plane only)"
+            "OoP system routes attached (platform plane only)"
         );
     }
 

@@ -10,9 +10,9 @@ gdl_version = "1.0"
 # platform, and it is why this gear is part of `platform-host` rather than a
 # pod of its own.
 #
-# `init` requires both APIs from a host-linked database registry (system gear,
-# initialized first). No `deps` or `consumes`; missing registry fails boot.
-# Remote support: types-registry T41/T42.
+# Runtime GTS publication and early registry wiring provide both registry APIs before
+# application `init`; the provider may be local or remote. Full remote AM composition
+# verification remains tracked in types-registry T41/T42.
 
 gear(
     deps = ["authz-resolver", "resource-group", "tenant-resolver"],

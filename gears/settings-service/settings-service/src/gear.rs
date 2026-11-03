@@ -671,8 +671,8 @@ impl Gear for SettingsService {
                 ctx.client_hub(),
                 &config.step_up,
             )?);
-        // The Secret Manager over the Credential Store: `credstore` is a system
-        // gear, so its client is in the hub before this init runs.
+        // The Secret Manager over the Credential Store: `credstore` is in this
+        // gear's `deps`, so its client is in the hub before this init runs.
         let credstore = ctx
             .client_hub()
             .get::<dyn credstore_sdk::CredStoreClientV1>()

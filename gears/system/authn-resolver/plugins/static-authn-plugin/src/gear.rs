@@ -6,7 +6,6 @@ use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverPluginClient, AuthNResolverPluginSpecV1};
 use toolkit::Gear;
 use toolkit::context::GearCtx;
-use toolkit::contracts::SystemCapability;
 use toolkit::gts::PluginV1;
 use toolkit::gts_publication::GtsPublicationInputs;
 use toolkit::plugins::bind_plugin_instances;
@@ -25,7 +24,6 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.static_authn_resolver.plugin.v1";
 /// scoped client to the admitted instance.
 #[toolkit::gear(
     name = "static-authn-plugin",
-    capabilities = [system],
     gts(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
@@ -82,10 +80,6 @@ impl Gear for StaticAuthNPlugin {
         )
     }
 }
-
-// System priority only: no `pre_init` work.
-#[async_trait]
-impl SystemCapability for StaticAuthNPlugin {}
 
 #[cfg(test)]
 #[path = "gear_tests.rs"]

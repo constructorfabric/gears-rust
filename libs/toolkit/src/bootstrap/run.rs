@@ -99,7 +99,7 @@ pub async fn run_server(config: AppConfig) -> Result<()> {
 
     // Run the ToolKit runtime with the root cancellation token.
     // Shutdown is driven by the signal handler spawned above, not by ShutdownOptions::Signals.
-    // OoP gears are spawned once the infrastructure (grpc-hub among it) is up,
+    // OoP gears are spawned once the system group (grpc-hub among it) is up,
     // before the application group waits for its GTS admission.
     let run_options = RunOptions::new(
         Arc::new(config),

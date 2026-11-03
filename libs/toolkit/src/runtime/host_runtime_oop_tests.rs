@@ -787,13 +787,17 @@ async fn an_oop_publishing_gear_is_neither_served_nor_advertised_before_admissio
         .expect("clean shutdown");
 }
 
-/// An infrastructure root serves its platform-plane and anonymous routes and
+/// Puts a gear in the system group; wires no runtime internals.
+struct SystemMarker;
+impl crate::contracts::SystemCapability for SystemMarker {}
+
+/// A system root serves its platform-plane and anonymous routes and
 /// is present in the directory while its co-hosted application group waits
 /// for admission: other processes must still discover it (a registry, say)
 /// to publish what the group waits for. The group's routes are not served
 /// before; afterwards they are, on the same listener.
 #[tokio::test]
-async fn an_infrastructure_root_serves_and_is_present_while_the_application_group_waits() {
+async fn a_system_root_serves_and_is_present_while_the_application_group_waits() {
     let addr = free_addr();
     let directory = Arc::new(RecordingDirectory::default());
     let root = Arc::new(AxisGear);
@@ -801,7 +805,10 @@ async fn an_infrastructure_root_serves_and_is_present_while_the_application_grou
     let mut builder = RegistryBuilder::default();
     builder.register_core_with_meta("axis-gear", &[], root.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta("axis-gear", root as Arc<dyn RestApiCapability>);
-    builder.register_startup_stage("axis-gear", crate::registry::StartupStage::Infrastructure);
+    builder.register_system_with_meta(
+        "axis-gear",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
     builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta(
         "publishing-ping",
@@ -984,7 +991,7 @@ fn oop_options(
     }
 }
 
-/// An infrastructure gear serving REST that stays out of the directory, as a
+/// A system gear serving REST that stays out of the directory, as a
 /// `legacy_only` registry does.
 struct Unadvertised;
 
@@ -1010,27 +1017,33 @@ impl RestApiCapability for Unadvertised {
     }
 }
 
-/// An application root co-hosting an infrastructure provider: the provider is
+/// An application root co-hosting a system provider: the provider is
 /// discoverable at this listener while the application group waits, the
-/// root only once the group started, an unadvertised infrastructure gear
+/// root only once the group started, an unadvertised system gear
 /// never.
 #[tokio::test]
-async fn a_co_hosted_infrastructure_provider_is_discoverable_under_an_application_root() {
+async fn a_co_hosted_system_provider_is_discoverable_under_an_application_root() {
     let addr = free_addr();
     let directory = Arc::new(RecordingDirectory::default());
     let root = Arc::new(PingGear);
-    let infra = Arc::new(AxisGear);
+    let system = Arc::new(AxisGear);
     let hidden = Arc::new(Unadvertised);
     let side = Arc::new(PublishingPing::default());
     let mut builder = RegistryBuilder::default();
     builder.register_core_with_meta("ping-gear", &[], root.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta("ping-gear", root as Arc<dyn RestApiCapability>);
-    builder.register_core_with_meta("axis-gear", &[], infra.clone() as Arc<dyn Gear>);
-    builder.register_rest_with_meta("axis-gear", infra as Arc<dyn RestApiCapability>);
-    builder.register_startup_stage("axis-gear", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("axis-gear", &[], system.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("axis-gear", system as Arc<dyn RestApiCapability>);
+    builder.register_system_with_meta(
+        "axis-gear",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
     builder.register_core_with_meta("hidden", &[], hidden.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta("hidden", hidden as Arc<dyn RestApiCapability>);
-    builder.register_startup_stage("hidden", crate::registry::StartupStage::Infrastructure);
+    builder.register_system_with_meta(
+        "hidden",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
     builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta(
         "publishing-ping",
@@ -1065,7 +1078,7 @@ async fn a_co_hosted_infrastructure_provider_is_discoverable_under_an_applicatio
     {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the infrastructure provider is present"
+            "the system provider is present"
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -1114,7 +1127,7 @@ async fn a_co_hosted_infrastructure_provider_is_discoverable_under_an_applicatio
     );
 }
 
-/// An infrastructure gear with a tenant-plane route.
+/// A system gear with a tenant-plane route.
 struct TenantAxis;
 
 #[async_trait]
@@ -1177,19 +1190,22 @@ impl Gear for BearerBridge {
     }
 }
 
-/// An infrastructure tenant route is `503` before the application group —
+/// A system tenant route is `503` before the application group —
 /// no authenticator exists yet, and it is not served unauthenticated — then
 /// authenticated by the bridge the group's `init` registered, on the same URL.
 #[tokio::test]
-async fn an_infrastructure_tenant_route_is_authenticated_once_the_bridge_exists() {
+async fn a_system_tenant_route_is_authenticated_once_the_bridge_exists() {
     let addr = free_addr();
     let directory = Arc::new(RecordingDirectory::default());
-    let infra = Arc::new(TenantAxis);
+    let system = Arc::new(TenantAxis);
     let side = Arc::new(PublishingPing::default());
     let mut builder = RegistryBuilder::default();
-    builder.register_core_with_meta("tenant-axis", &[], infra.clone() as Arc<dyn Gear>);
-    builder.register_rest_with_meta("tenant-axis", infra as Arc<dyn RestApiCapability>);
-    builder.register_startup_stage("tenant-axis", crate::registry::StartupStage::Infrastructure);
+    builder.register_core_with_meta("tenant-axis", &[], system.clone() as Arc<dyn Gear>);
+    builder.register_rest_with_meta("tenant-axis", system as Arc<dyn RestApiCapability>);
+    builder.register_system_with_meta(
+        "tenant-axis",
+        Arc::new(SystemMarker) as Arc<dyn crate::contracts::SystemCapability>,
+    );
     builder.register_core_with_meta("bridge", &[], Arc::new(BearerBridge) as Arc<dyn Gear>);
     builder.register_core_with_meta("publishing-ping", &[], side.clone() as Arc<dyn Gear>);
     builder.register_rest_with_meta(
@@ -1345,7 +1361,7 @@ fn no_wire(
     Ok(crate::discovery::WireOutcome::Local)
 }
 
-/// The `OoP` path runs the groups like the in-process one: the infrastructure
+/// The `OoP` path runs the groups like the in-process one: the system group
 /// complete, then the application group, with the legacy finalization once
 /// between its `init` and its `post_init`.
 #[tokio::test]

@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the authz-resolver gear.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system, rest). Projected from #[toolkit::contract] in the
+# Projected from #[toolkit::gear]: id, runtime_caps (rest). Projected from #[toolkit::contract] in the
 # SDK: the contract's version, kind, and which transports it can be bound over.
 # So `provide` names the trait as a join key and declares only the generator
 # inputs -- the base path and the local factory.

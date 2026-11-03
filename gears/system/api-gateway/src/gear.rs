@@ -65,13 +65,12 @@ use crate::web;
 /// typed operation specs to emit a single `OpenAPI` document.
 #[toolkit::gear(
 	name = "api-gateway",
-	capabilities = [rest_host, rest, stateful],
-    deps = [grpc_hub],
-    // Binds before the application group is prepared: probes and the
-    // infrastructure's platform-plane routes are served first; the full
+    // `system`: binds before the application group is prepared: probes and
+    // the system gears' platform-plane routes are served first; the full
     // surface replaces them on the same listener (`rest_bootstrap`). The
     // AuthN resolver client is looked up only then, in `rest_finalize`.
-    stage = infrastructure,
+	capabilities = [system, rest_host, rest, stateful],
+    deps = [grpc_hub],
 	lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
 )]
 pub struct ApiGateway {
@@ -131,6 +130,9 @@ pub struct ApiGateway {
     /// matching `healthcheck_registry`/`health_router`; unset until the server binds.
     pub(crate) bound_endpoint: OnceLock<String>,
 }
+
+/// The REST host of the system group; it takes no runtime internals.
+impl toolkit::contracts::SystemCapability for ApiGateway {}
 
 impl Default for ApiGateway {
     fn default() -> Self {
@@ -1446,7 +1448,7 @@ impl toolkit::Gear for ApiGateway {
             );
         }
         // The AuthN resolver client is resolved in `rest_finalize`: the
-        // gateway initializes with the infrastructure, before the application
+        // gateway initializes with the system group, before the application
         // group (the resolver among it) exists.
 
         // Build the inbound platform-plane authenticator (None in Profile 1).

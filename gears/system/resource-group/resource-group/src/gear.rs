@@ -138,7 +138,7 @@ impl Gear for ResourceGroup {
             .set(membership_service.clone())
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
 
-        // Phase 1 (SystemCapability): register SDK clients in ClientHub
+        // Application init: register SDK clients before client wiring and route composition.
         let type_svc = self
             .type_service
             .get()
