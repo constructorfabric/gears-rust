@@ -3,7 +3,8 @@
 //! Every helper is test-only, so `expect` on internal mutexes is fine.
 #![allow(clippy::missing_panics_doc)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::collections::{BTreeSet, HashMap};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -28,7 +29,10 @@ use toolkit_security::{PlatformSecurityContext, SecurityContext, pep_properties}
 use uuid::Uuid;
 
 use super::Service;
-use super::ports::{CredentialBroker, ModelResolver, PluginDirectory};
+use super::ports::{
+    CredentialBroker, ModelResolver, PluginDirectory, ResolvedPlugin, ToolSchemaSource,
+};
+use super::provider_rules::{ProviderRules, ProviderRulesRegistry};
 use crate::config::LimitsConfig;
 
 /// Provider identity used by the sample model and plugin.
@@ -51,8 +55,18 @@ pub fn ctx() -> SecurityContext {
 /// `ModelInfoV1` is `#[non_exhaustive]`.
 #[must_use]
 pub fn sample_model_info(gts_type: &str) -> ModelInfoV1 {
+    sample_model_info_patched(gts_type, |_| {})
+}
+
+/// [`sample_model_info`] with `patch` applied to the wire JSON first (e.g.
+/// `|v| v["capabilities"]["function_calling"] = json!(true)`).
+#[must_use]
+pub fn sample_model_info_patched(
+    gts_type: &str,
+    patch: impl FnOnce(&mut serde_json::Value),
+) -> ModelInfoV1 {
     let media = serde_json::json!({ "enabled": false, "supported_mime_types": [] });
-    let value = serde_json::json!({
+    let mut value = serde_json::json!({
         "gts_type": gts_type,
         "display_name": "Sample",
         "description": null,
@@ -94,6 +108,7 @@ pub fn sample_model_info(gts_type: &str) -> ModelInfoV1 {
         "allow_extra_params": [],
         "provider_settings": { "oagw_alias": "openai-prod" }
     });
+    patch(&mut value);
     serde_json::from_value(value).expect("sample model info deserializes")
 }
 
@@ -155,6 +170,22 @@ pub fn sample_response(id: &str, model: &str) -> ResponseResource {
         ignored_parameters: Vec::new(),
         provider_details: None,
     }
+}
+
+/// Completed response whose single assistant message carries `text` as
+/// `output_text`.
+#[must_use]
+pub fn sample_response_with_text(id: &str, model: &str, text: &str) -> ResponseResource {
+    let mut resource = sample_response(id, model);
+    resource.output = serde_json::from_value(serde_json::json!([{
+        "type": "message",
+        "id": "msg_1",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{ "type": "output_text", "text": text, "annotations": [] }]
+    }]))
+    .expect("output message deserializes");
+    resource
 }
 
 /// Ordered log of dependency calls, shared by all fakes of one harness.
@@ -336,6 +367,8 @@ pub struct FakePlugin {
     outcome: PluginOutcome,
     calls: AtomicUsize,
     contexts: Mutex<Vec<ProviderCallCtx>>,
+    bodies: Mutex<Vec<CreateResponseBody>>,
+    web_search: AtomicBool,
     log: Arc<CallLog>,
     /// Notified when a call has entered the plugin (only when `gated`).
     pub entered: Notify,
@@ -367,6 +400,8 @@ impl FakePlugin {
             outcome: Box::new(outcome),
             calls: AtomicUsize::new(0),
             contexts: Mutex::new(Vec::new()),
+            bodies: Mutex::new(Vec::new()),
+            web_search: AtomicBool::new(false),
             log,
             entered: Notify::new(),
             release: Notify::new(),
@@ -380,6 +415,17 @@ impl FakePlugin {
         self.calls.load(Ordering::SeqCst)
     }
 
+    /// Report (or stop reporting) the `web_search` integration capability.
+    pub fn set_web_search(&self, enabled: bool) {
+        self.web_search.store(enabled, Ordering::SeqCst);
+    }
+
+    /// Request bodies received so far (the effective requests).
+    #[must_use]
+    pub fn bodies(&self) -> Vec<CreateResponseBody> {
+        self.bodies.lock().expect("bodies").clone()
+    }
+
     /// Provider call contexts received so far.
     #[must_use]
     pub fn contexts(&self) -> Vec<ProviderCallCtx> {
@@ -390,17 +436,23 @@ impl FakePlugin {
 #[async_trait]
 impl LlmGatewayProviderPluginClientV1 for FakePlugin {
     fn capabilities(&self) -> ProviderPluginCapabilities {
-        ProviderPluginCapabilities::new(MediaInputMode::UrlForward)
+        let caps = ProviderPluginCapabilities::new(MediaInputMode::UrlForward);
+        if self.web_search.load(Ordering::SeqCst) {
+            caps.with_web_search()
+        } else {
+            caps
+        }
     }
 
     async fn create_response(
         &self,
         _ctx: &SecurityContext,
         call: &ProviderCallCtx,
-        _body: CreateResponseBody,
+        body: CreateResponseBody,
     ) -> Result<ResponseResource, LlmGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.log.push("plugin");
+        self.bodies.lock().expect("bodies").push(body);
         self.contexts.lock().expect("contexts").push(call.clone());
         if self.gated {
             self.entered.notify_one();
@@ -434,6 +486,7 @@ impl LlmGatewayProviderPluginClientV1 for FakePlugin {
 pub struct FakePluginDirectory {
     provider_type: String,
     plugin: Arc<FakePlugin>,
+    tool_namespace: String,
     calls: AtomicUsize,
     requested: Mutex<Vec<String>>,
     log: Arc<CallLog>,
@@ -446,6 +499,26 @@ impl FakePluginDirectory {
         Arc::new(Self {
             provider_type: provider_type.to_owned(),
             plugin,
+            tool_namespace: "openai".to_owned(),
+            calls: AtomicUsize::new(0),
+            requested: Mutex::new(Vec::new()),
+            log,
+        })
+    }
+
+    /// Same directory, resolving plugins with `tool_namespace` (default
+    /// `openai`).
+    #[must_use]
+    pub fn with_tool_namespace(
+        provider_type: &str,
+        plugin: Arc<FakePlugin>,
+        tool_namespace: &str,
+        log: Arc<CallLog>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            provider_type: provider_type.to_owned(),
+            plugin,
+            tool_namespace: tool_namespace.to_owned(),
             calls: AtomicUsize::new(0),
             requested: Mutex::new(Vec::new()),
             log,
@@ -467,10 +540,7 @@ impl FakePluginDirectory {
 
 #[async_trait]
 impl PluginDirectory for FakePluginDirectory {
-    async fn resolve(
-        &self,
-        provider_type: &str,
-    ) -> Result<Arc<dyn LlmGatewayProviderPluginClientV1>, LlmGatewayError> {
+    async fn resolve(&self, provider_type: &str) -> Result<ResolvedPlugin, LlmGatewayError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.log.push("plugins");
         self.requested
@@ -478,7 +548,10 @@ impl PluginDirectory for FakePluginDirectory {
             .expect("requested")
             .push(provider_type.to_owned());
         if provider_type == self.provider_type {
-            Ok(self.plugin.clone())
+            Ok(ResolvedPlugin::new(
+                self.plugin.clone(),
+                self.tool_namespace.clone(),
+            ))
         } else {
             Err(LlmGatewayError::provider_not_supported(provider_type))
         }
@@ -530,6 +603,113 @@ impl CredentialBroker for FakeBroker {
     }
 }
 
+// ── Tool schema source fake ─────────────────────────────────────────────────
+
+/// Tool schema source fake: serves schemas by GTS id, records requests and
+/// the caller subject of each.
+pub struct FakeToolSchemas {
+    schemas: Mutex<HashMap<String, serde_json::Value>>,
+    requested: Mutex<Vec<String>>,
+    subjects: Mutex<Vec<Uuid>>,
+    log: Arc<CallLog>,
+}
+
+impl FakeToolSchemas {
+    /// Source with no schemas: every id is `schema_not_found`.
+    #[must_use]
+    pub fn new(log: Arc<CallLog>) -> Arc<Self> {
+        Arc::new(Self {
+            schemas: Mutex::new(HashMap::new()),
+            requested: Mutex::new(Vec::new()),
+            subjects: Mutex::new(Vec::new()),
+            log,
+        })
+    }
+
+    /// Serve `schema` under `schema_id` (no `gts://` prefix).
+    pub fn insert(&self, schema_id: &str, schema: serde_json::Value) {
+        self.schemas
+            .lock()
+            .expect("schemas")
+            .insert(schema_id.to_owned(), schema);
+    }
+
+    /// Number of `schema` calls.
+    #[must_use]
+    pub fn calls(&self) -> usize {
+        self.requested.lock().expect("requested").len()
+    }
+
+    /// Schema ids asked for so far, in order.
+    #[must_use]
+    pub fn requested(&self) -> Vec<String> {
+        self.requested.lock().expect("requested").clone()
+    }
+
+    /// Subject ids of the contexts the schemas were requested under.
+    #[must_use]
+    pub fn subjects(&self) -> Vec<Uuid> {
+        self.subjects.lock().expect("subjects").clone()
+    }
+}
+
+#[async_trait]
+impl ToolSchemaSource for FakeToolSchemas {
+    async fn schema(
+        &self,
+        ctx: &SecurityContext,
+        schema_id: &str,
+    ) -> Result<serde_json::Value, LlmGatewayError> {
+        self.log.push("tool_schemas");
+        self.requested
+            .lock()
+            .expect("requested")
+            .push(schema_id.to_owned());
+        self.subjects
+            .lock()
+            .expect("subjects")
+            .push(ctx.subject_id());
+        self.schemas
+            .lock()
+            .expect("schemas")
+            .get(schema_id)
+            .cloned()
+            .ok_or_else(|| LlmGatewayError::schema_not_found(schema_id))
+    }
+}
+
+// ── Provider rules fake ─────────────────────────────────────────────────────
+
+/// Provider rules driven by plain sets; the default supports everything.
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::struct_field_names)]
+pub struct FakeRules {
+    /// Generic parameters the rules reject.
+    pub unsupported_params: BTreeSet<&'static str>,
+    /// Cache-control hints the rules reject.
+    pub unsupported_hints: BTreeSet<&'static str>,
+    /// Construct reported for every schema, when set.
+    pub unsupported_construct: Option<&'static str>,
+}
+
+impl ProviderRules for FakeRules {
+    fn supports_parameter(&self, _model: &ModelInfoV1, parameter: &str) -> bool {
+        !self.unsupported_params.contains(parameter)
+    }
+
+    fn supports_cache_control(&self, _model: &ModelInfoV1, hint: &str) -> bool {
+        !self.unsupported_hints.contains(hint)
+    }
+
+    fn unsupported_schema_construct(
+        &self,
+        _model: &ModelInfoV1,
+        _schema: &serde_json::Value,
+    ) -> Option<String> {
+        self.unsupported_construct.map(ToOwned::to_owned)
+    }
+}
+
 // ── Harness ─────────────────────────────────────────────────────────────────
 
 /// All fakes of one pipeline; mutate the public fields, then call
@@ -541,6 +721,9 @@ pub struct Harness {
     pub plugin: Arc<FakePlugin>,
     pub plugins: Arc<FakePluginDirectory>,
     pub broker: Arc<FakeBroker>,
+    pub tool_schemas: Arc<FakeToolSchemas>,
+    /// Rules registered for [`OPENAI_TYPE`]; supports everything by default.
+    pub rules: FakeRules,
     pub limits: LimitsConfig,
 }
 
@@ -557,7 +740,9 @@ impl Harness {
             models: FakeModels::found(sample_model_info(OPENAI_TYPE), log.clone()),
             plugin: plugin.clone(),
             plugins: FakePluginDirectory::new(OPENAI_TYPE, plugin, log.clone()),
-            broker: FakeBroker::with(|| Ok(None), log),
+            broker: FakeBroker::with(|| Ok(None), log.clone()),
+            tool_schemas: FakeToolSchemas::new(log),
+            rules: FakeRules::default(),
             limits: LimitsConfig::default(),
         }
     }
@@ -568,6 +753,16 @@ impl Harness {
         self.plugin = plugin;
     }
 
+    /// Make the directory resolve the plugin with `tool_namespace`.
+    pub fn set_tool_namespace(&mut self, tool_namespace: &str) {
+        self.plugins = FakePluginDirectory::with_tool_namespace(
+            OPENAI_TYPE,
+            self.plugin.clone(),
+            tool_namespace,
+            self.log.clone(),
+        );
+    }
+
     /// Build the service over the current fakes.
     #[must_use]
     pub fn service(&self) -> Arc<Service> {
@@ -576,6 +771,11 @@ impl Harness {
             self.models.clone(),
             self.plugins.clone(),
             self.broker.clone(),
+            self.tool_schemas.clone(),
+            Arc::new(
+                ProviderRulesRegistry::permissive()
+                    .with_rules(OPENAI_TYPE, Arc::new(self.rules.clone())),
+            ),
             &self.limits,
         ))
     }

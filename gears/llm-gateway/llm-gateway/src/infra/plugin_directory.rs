@@ -10,7 +10,7 @@ use tokio::sync::OnceCell;
 use toolkit::client_hub::{ClientHub, ClientScope};
 use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
 
-use crate::domain::ports::PluginDirectory;
+use crate::domain::ports::{PluginDirectory, ResolvedPlugin};
 
 /// A registered plugin instance: `(instance id, instance JSON)`.
 type PluginInstance = (String, serde_json::Value);
@@ -100,19 +100,24 @@ impl GtsPluginDirectory {
 
 #[async_trait]
 impl PluginDirectory for GtsPluginDirectory {
-    async fn resolve(
-        &self,
-        provider_type: &str,
-    ) -> Result<Arc<dyn LlmGatewayProviderPluginClientV1>, LlmGatewayError> {
+    async fn resolve(&self, provider_type: &str) -> Result<ResolvedPlugin, LlmGatewayError> {
         let instances = self.cached_instances().await?;
         let instance_id = select_plugin_instance(provider_type, &instances)?;
         let scope = ClientScope::gts_id(instance_id.as_str());
-        self.hub
+        let client = self
+            .hub
             .try_get_scoped::<dyn LlmGatewayProviderPluginClientV1>(&scope)
             .ok_or_else(|| {
                 tracing::warn!(instance_id, "provider plugin client is not registered");
                 LlmGatewayError::provider_not_supported(provider_type)
-            })
+            })?;
+        let tool_namespace = instances
+            .iter()
+            .find(|(id, _)| *id == instance_id)
+            .and_then(|(_, value)| value.pointer("/properties/tool_namespace"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        Ok(ResolvedPlugin::new(client, tool_namespace))
     }
 }
 

@@ -9,7 +9,7 @@ use toolkit::api::operation_builder::OperationSpec;
 use tower::ServiceExt as _;
 
 use super::register_routes;
-use crate::domain::test_support::{FakePlugin, Harness, PdpMode, ctx};
+use crate::domain::test_support::{FakePlugin, FakeRules, Harness, PdpMode, ctx};
 
 const PATH: &str = "/llm-gateway/v1/responses";
 
@@ -267,4 +267,26 @@ async fn internal_failure_stays_redacted_on_the_wire_but_is_logged() {
     assert!(!text.contains("disk exploded"), "{text}");
     assert!(logs_contain("disk exploded"));
     assert!(logs_contain(&h.plugin.contexts()[0].request_id));
+}
+
+#[tokio::test]
+async fn unsupported_parameter_is_a_400_problem_naming_the_param() {
+    let mut h = Harness::new();
+    h.rules = FakeRules {
+        unsupported_params: ["temperature"].into(),
+        ..FakeRules::default()
+    };
+    let (_registry, router) = router_for(&h);
+    let (status, content_type, bytes) = send(
+        router,
+        post(&serde_json::json!({ "model": "openai::gpt-4o", "input": "hi", "temperature": 0.5 })),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(content_type.contains("problem+json"), "{content_type}");
+    let body = problem(&bytes);
+    assert_eq!(body["error_code"], "unsupported_parameter");
+    assert_eq!(body["context"]["data"]["param"], "temperature");
+    assert_eq!(h.plugin.calls(), 0);
 }

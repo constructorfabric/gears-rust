@@ -1,12 +1,14 @@
 //! Request pipeline (sync path): allocate id, authorize, take an in-flight
-//! slot, resolve model, select plugin, resolve credentials, dispatch.
+//! slot, resolve model, select plugin, resolve tools, run the capability
+//! checks, resolve credentials, dispatch, validate structured output, attach
+//! `ignored_parameters`.
 
 use std::sync::Arc;
 
 use authz_resolver_sdk::PolicyEnforcer;
 use llm_gateway_sdk::{
     CreateResponseBody, InputItem, LlmGatewayError, ProviderCallCtx, ProviderErrorCategory,
-    ResponseInput, ResponseResource,
+    ResponseInput, ResponseResource, TextFormatKind,
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -16,7 +18,11 @@ use tracing::Instrument as _;
 use uuid::Uuid;
 
 use super::authz::{actions, authorize};
-use super::ports::{CredentialBroker, ModelResolver, PluginDirectory};
+use super::capability_checker::{CapabilityChecker, EffectiveRequest};
+use super::output_validator::OutputValidator;
+use super::ports::{CredentialBroker, ModelResolver, PluginDirectory, ToolSchemaSource};
+use super::provider_rules::ProviderRulesRegistry;
+use super::tool_resolver::ToolResolver;
 use crate::config::LimitsConfig;
 
 /// A failed create-response call together with the response `id` that was
@@ -121,6 +127,10 @@ pub struct Service {
     models: Arc<dyn ModelResolver>,
     plugins: Arc<dyn PluginDirectory>,
     credentials: Arc<dyn CredentialBroker>,
+    tool_resolver: ToolResolver,
+    checker: CapabilityChecker,
+    validator: OutputValidator,
+    max_tools: usize,
     inflight_sync: Arc<Semaphore>,
 }
 
@@ -132,6 +142,8 @@ impl Service {
         models: Arc<dyn ModelResolver>,
         plugins: Arc<dyn PluginDirectory>,
         credentials: Arc<dyn CredentialBroker>,
+        tool_schemas: Arc<dyn ToolSchemaSource>,
+        rules: Arc<ProviderRulesRegistry>,
         limits: &LimitsConfig,
     ) -> Self {
         Self {
@@ -139,6 +151,10 @@ impl Service {
             models,
             plugins,
             credentials,
+            tool_resolver: ToolResolver::new(tool_schemas, limits.max_schema_bytes),
+            checker: CapabilityChecker::new(limits, rules),
+            validator: OutputValidator,
+            max_tools: limits.max_tools,
             inflight_sync: Arc::new(Semaphore::new(limits.max_inflight_sync)),
         }
     }
@@ -210,6 +226,36 @@ impl Service {
             .instrument(span("select_plugin"))
             .await?;
 
+        let mut body = body;
+        if let Some(tools) = body.tools.take() {
+            // Cheap guard first: no Type Registry call for an oversized list.
+            if tools.len() > self.max_tools {
+                return Err(LlmGatewayError::validation_param("too many tools", "tools"));
+            }
+            body.tools = Some(
+                self.tool_resolver
+                    .resolve(ctx, tools)
+                    .instrument(span("tool_resolution"))
+                    .await?,
+            );
+        }
+
+        let effective = {
+            let _enter = span("capability_check").entered();
+            self.checker.check(&model_info, &plugin, body)?
+        };
+        let EffectiveRequest {
+            body,
+            ignored_parameters,
+        } = effective;
+        let output_schema = match body.text.as_ref().map(|text| &text.format) {
+            Some(TextFormatKind::JsonSchema {
+                schema: Some(schema),
+                ..
+            }) => Some(schema.clone()),
+            _ => None,
+        };
+
         let api_key = self
             .credentials
             .resolve(ctx, &model_info)
@@ -223,9 +269,21 @@ impl Service {
 
         // One call, never retried: LLM calls are not idempotent.
         let mut resource = plugin
+            .client
             .create_response(ctx, &call, body)
             .instrument(span("dispatch"))
             .await?;
+
+        if let Some(schema) = output_schema {
+            let _enter = span("output_validation").entered();
+            self.validator.validate(&schema, &resource)?;
+        }
+
+        let mut ignored = std::mem::take(&mut resource.ignored_parameters);
+        ignored.extend(ignored_parameters);
+        ignored.sort();
+        ignored.dedup();
+        resource.ignored_parameters = ignored;
         response_id.clone_into(&mut resource.id);
         Ok(resource)
     }
@@ -251,3 +309,8 @@ impl Service {
 #[cfg_attr(coverage_nightly, coverage(off))]
 #[path = "service_tests.rs"]
 mod service_tests;
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+#[path = "service_checks_tests.rs"]
+mod service_checks_tests;

@@ -12,9 +12,11 @@ use toolkit::{Gear, GearCtx, RestApiCapability};
 
 use crate::api::rest::routes;
 use crate::config::LlmGatewayConfig;
+use crate::domain::provider_rules::ProviderRulesRegistry;
 use crate::domain::{KeylessCredentialBroker, LlmGatewayLocalClient, Service};
 use crate::infra::model_registry::ModelRegistryResolver;
 use crate::infra::plugin_directory::GtsPluginDirectory;
+use crate::infra::tool_schemas::TypesRegistryToolSchemas;
 
 /// LLM Gateway gear: wires the domain service, registers
 /// `Arc<dyn LlmGatewayClientV1>` in `ClientHub`, and mounts the REST routes.
@@ -55,6 +57,8 @@ impl Gear for LlmGatewayModule {
             Arc::new(ModelRegistryResolver::new(registry)),
             Arc::new(GtsPluginDirectory::new(hub.clone())),
             Arc::new(KeylessCredentialBroker),
+            Arc::new(TypesRegistryToolSchemas::new(hub.clone())),
+            Arc::new(ProviderRulesRegistry::permissive()),
             &cfg.limits,
         ));
 

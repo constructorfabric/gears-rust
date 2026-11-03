@@ -119,7 +119,7 @@ async fn non_empty_instance_list_is_cached_after_the_first_load() {
 
     for _ in 0..2 {
         let got = directory.resolve(OPENAI).await.expect("plugin resolves");
-        assert!(same_client(&got, &plugin));
+        assert!(same_client(&got.client, &plugin));
     }
     assert_eq!(registry.list_instance_calls(), 1);
 }
@@ -199,6 +199,18 @@ async fn the_client_is_looked_up_under_the_instance_gts_id_scope() {
 
     let winner = register_plugin(&hub, &instances[0].0);
     let got = directory.resolve(OPENAI).await.expect("winner resolves");
-    assert!(same_client(&got, &winner));
-    assert!(!same_client(&got, &other));
+    assert!(same_client(&got.client, &winner));
+    assert!(!same_client(&got.client, &other));
+}
+
+#[tokio::test]
+async fn resolved_plugin_carries_the_tool_namespace_of_its_instance() {
+    let instances = vec![instance("cf.builtin.openai", OPENAI, 100)];
+    let registry = registry_with(&instances);
+    let hub = hub_with(&registry);
+    register_plugin(&hub, &instances[0].0);
+    let directory = GtsPluginDirectory::new(hub);
+
+    let got = directory.resolve(OPENAI).await.expect("plugin resolves");
+    assert_eq!(got.tool_namespace, "ns");
 }

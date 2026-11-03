@@ -319,6 +319,8 @@ async fn default_broker_gives_the_plugin_no_api_key() {
         h.models.clone(),
         h.plugins.clone(),
         Arc::new(KeylessCredentialBroker),
+        h.tool_schemas.clone(),
+        Arc::new(crate::domain::provider_rules::ProviderRulesRegistry::permissive()),
         &h.limits,
     );
     svc.create_response(&ctx(), body("m"))

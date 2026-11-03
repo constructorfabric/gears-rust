@@ -3533,6 +3533,7 @@ dependencies = [
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "gts",
+ "jsonschema 0.60.2",
  "secrecy",
  "serde",
  "serde_json",
