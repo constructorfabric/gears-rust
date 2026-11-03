@@ -1,5 +1,0 @@
-error: `gts(...)` is not supported on a generic gear struct
- --> tests/ui/fail/gts_generic_gear.rs:4:13
-  |
-4 | pub struct X<T>(T);
-  |             ^^^

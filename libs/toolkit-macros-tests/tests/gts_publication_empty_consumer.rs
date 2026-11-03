@@ -6,7 +6,7 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::unnecessary_wraps,
-    reason = "test gears: the `entities` signature is fixed by `gts(...)`"
+    reason = "test gears: the `entities` signature is fixed by `gts_publication(...)`"
 )]
 
 #[path = "common/fake_publisher.rs"]
@@ -24,7 +24,7 @@ use toolkit::{ClientHub, DbOptions, DependencyChecker, Gear, GearCtx, GearRegist
 #[toolkit::consumes(contract = fake_publisher::FakeRegistryApi, from = "fake-registry")]
 #[toolkit::gear(
     name = "registry-user",
-    gts(publisher = fake_publisher, entities = Self::nothing),
+    gts_publication(publisher = fake_publisher, entities = Self::nothing),
 )]
 #[derive(Default)]
 pub struct RegistryUser;

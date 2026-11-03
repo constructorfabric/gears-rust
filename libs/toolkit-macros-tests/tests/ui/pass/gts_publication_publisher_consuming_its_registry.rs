@@ -49,7 +49,7 @@ pub fn gts_declarations() -> Vec<(String, String)> {
 }
 
 #[toolkit::consumes(contract = adapter::RegistryApi, from = "registry")]
-#[toolkit::gear(name = "x", gts(crates = [crate], publisher = adapter))]
+#[toolkit::gear(name = "x", gts_publication(crates = [crate], publisher = adapter))]
 #[derive(Default)]
 pub struct X;
 

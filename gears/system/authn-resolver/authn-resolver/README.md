@@ -33,10 +33,10 @@ Plugin implementation  (validates tokens, returns SecurityContext)
 
 ## Plugin catalogue
 
-The resolver and its plugins use `PlatformTypesRegistryApi`, wired by their `gts(...)`
+The resolver and its plugins use `PlatformTypesRegistryApi`, wired by their `gts_publication(...)`
 publication capability. None depends on the registry gear crate or declares it in `deps`.
 
-- The resolver and plugins are application gears. `gts(...)` declares the resolver's SDK
+- The resolver and plugins are application gears. `gts_publication(...)` declares the resolver's SDK
   schemas and the plugins' configured instances; runtime publication precedes application `init`.
 - Plugins build and bind their scoped `AuthNResolverPluginClient` in `init`, after admission.
   Refusal or publication-budget expiry prevents application initialization.

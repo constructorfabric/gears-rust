@@ -1,4 +1,4 @@
-//! `gts(...)` with an empty manifest and no registry in the process: the
+//! `gts_publication(...)` with an empty manifest and no registry in the process: the
 //! application group starts without any request, and nothing waits for the
 //! registry: a publication with nothing to publish consumes nothing.
 #![allow(
@@ -6,7 +6,7 @@
     clippy::expect_used,
     clippy::unnecessary_wraps,
     clippy::unused_self,
-    reason = "test gears: the `entities` signature is fixed by `gts(...)`"
+    reason = "test gears: the `entities` signature is fixed by `gts_publication(...)`"
 )]
 
 #[path = "common/fake_publisher.rs"]
@@ -24,7 +24,7 @@ use toolkit::{ClientHub, DbOptions, DependencyChecker, Gear, GearCtx, GearRegist
 
 #[toolkit::gear(
     name = "optional-publisher",
-    gts(publisher = fake_publisher, entities = Self::nothing),
+    gts_publication(publisher = fake_publisher, entities = Self::nothing),
 )]
 #[derive(Default)]
 pub struct OptionalPublisher;

@@ -3,7 +3,7 @@
 //! This gear integrates the `OidcAuthNPlugin` with `ToolKit` runtime by:
 //! 1. Reading plugin runtime configuration from `server.yaml` (`init`).
 //! 2. Declaring its plugin instance, built from the configuration, for GTS
-//!    publication (`gts(...)`); the runtime publishes it until admitted, before
+//!    publication (`gts_publication(...)`); the runtime publishes it until admitted, before
 //!    `init`.
 //! 3. Registering the scoped plugin client in `ClientHub` in `init`, for the
 //!    admitted instance.
@@ -31,7 +31,7 @@ use crate::infra::runtime::build_oidc_authn_plugin;
 /// registry seeds from; this gear publishes only its instance.
 #[toolkit::gear(
     name = "oidc-authn-plugin",
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct OidcAuthNPluginGear {

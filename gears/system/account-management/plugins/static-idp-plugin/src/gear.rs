@@ -24,7 +24,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.static_idp.plugin.v1";
 /// scoped client to the admitted instance, before anything can select it.
 #[toolkit::gear(
     name = "static-idp-plugin",
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct StaticIdpPlugin {

@@ -202,7 +202,7 @@ impl CapabilitySet {
                 Capability::System(_) => "system",
                 Capability::GrpcHub(_) => "grpc_hub",
                 Capability::GrpcService(_) => "grpc",
-                Capability::GtsPublication(_) => "gts",
+                Capability::GtsPublication(_) => "gts_publication",
             })
             .collect()
     }

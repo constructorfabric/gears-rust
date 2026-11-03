@@ -24,7 +24,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.static_authn_resolver.plugin.v1";
 /// scoped client to the admitted instance.
 #[toolkit::gear(
     name = "static-authn-plugin",
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct StaticAuthNPlugin {

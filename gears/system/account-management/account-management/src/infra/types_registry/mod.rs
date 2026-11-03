@@ -2,7 +2,7 @@
 //!
 //! [`crate::gear::AccountManagementGear`] builds its services over the registry's two
 //! APIs, taken from the hub in `init` — a linked registry's, or a remote one's resolving
-//! clients, wired before the application group (by `gts(...)` and
+//! clients, wired before the application group (by `gts_publication(...)` and
 //! `#[toolkit::consumes]`); [`crate::domain::tenant_type::InertTenantTypeChecker`] is for
 //! unit tests only.
 

@@ -1,5 +1,0 @@
-error: unknown `gts(...)` argument; expected crates, publisher or entities
- --> tests/ui/fail/gts_unknown_arg.rs:3:69
-  |
-3 | #[gear(name = "x", gts(crates = [crate], publisher = some::adapter, retry = 3))]
-  |                                                                     ^^^^^

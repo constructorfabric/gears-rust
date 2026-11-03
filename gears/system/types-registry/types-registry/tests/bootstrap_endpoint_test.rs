@@ -61,7 +61,7 @@ pub fn gts_declarations() -> Vec<(String, String)> {
 }
 
 /// A co-hosted application gear publishing the derived type.
-#[toolkit::gear(name = "waiting-publisher", gts(crates = [crate]))]
+#[toolkit::gear(name = "waiting-publisher", gts_publication(crates = [crate]))]
 #[derive(Default)]
 pub struct WaitingPublisher;
 

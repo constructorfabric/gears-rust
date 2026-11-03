@@ -45,7 +45,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.keycloak_idp.plugin.v1";
 #[toolkit::gear(
     name = "keycloak-idp-plugin",
     deps = [credstore],
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct KeycloakIdpPluginGear;

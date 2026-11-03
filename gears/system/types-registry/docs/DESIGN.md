@@ -1802,7 +1802,7 @@ Content duplicates across Context Tenants even when only availability and owners
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
 
-Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::publication` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
+Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts_publication(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::publication` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
 
 The system group (registry, discovery, cluster, REST and gRPC hosts — the only gears with the `system` capability) starts serving first. After application DB migrations and client wiring, the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, before any application `init`. Pending admission holds `application/preparation` and `/readyz`; a terminal refusal fails application preparation. Plugins bind their clients in `init` using their declared instances after admission. Publication is not a lifecycle hook: the general `Gear::pre_init`/`post_init` hooks run per gear within its startup group and must not wait for a remote service. Business bootstrap still runs in `serve`; a separate business-availability gate is future work (#5547, #5562).
 

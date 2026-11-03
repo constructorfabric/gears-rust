@@ -1,4 +1,4 @@
-//! A publisher adapter with the interface `gts(publisher = ...)` expects.
+//! A publisher adapter with the interface `gts_publication(publisher = ...)` expects.
 #![allow(dead_code)]
 
 use std::sync::Arc;

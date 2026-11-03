@@ -1,4 +1,4 @@
-//! `gts(...)` end to end through `HostRuntime`, with a co-located registry:
+//! `gts_publication(...)` end to end through `HostRuntime`, with a co-located registry:
 //! generated descriptor, registry wiring, publication admitted before the
 //! publisher's `init`, which reads its admitted manifest, then start.
 #![allow(
@@ -6,7 +6,7 @@
     clippy::expect_used,
     clippy::unnecessary_wraps,
     clippy::unused_self,
-    reason = "test gears: the `entities` signature is fixed by `gts(...)`"
+    reason = "test gears: the `entities` signature is fixed by `gts_publication(...)`"
 )]
 
 #[path = "common/fake_publisher.rs"]
@@ -52,7 +52,7 @@ impl Gear for FakeRegistryGear {
 
 #[toolkit::gear(
     name = "widget-publisher",
-    gts(
+    gts_publication(
         crates = [crate],
         publisher = fake_publisher,
         entities = Self::configured,

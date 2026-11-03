@@ -2,7 +2,7 @@
 //! and tenant relations.
 //!
 //! Lifecycle:
-//! - publication (`gts(...)`, run by the runtime before any application `init`):
+//! - publication (`gts_publication(...)`, run by the runtime before any application `init`):
 //!   AM's and its SDK's declarations, the configured root type and the optional
 //!   TR-plugin instance, admitted with the rest of the process's manifests.
 //! - `init`: validates config and the local root binding, registers AM's RG types,
@@ -20,7 +20,7 @@
 //! TR boundary.
 //!
 //! The host links a database-backed types-registry, or wires both of its APIs from a
-//! remote one (`gts(...)` consumes the platform API, `#[toolkit::consumes]` the
+//! remote one (`gts_publication(...)` consumes the platform API, `#[toolkit::consumes]` the
 //! request API); either way both are in the hub before `init`.
 
 use std::sync::{Arc, OnceLock};
@@ -106,7 +106,7 @@ const TR_PLUGIN_SEGMENT: &str = "cf.builtin.account_management_tenant_resolver.p
     deps = [authz_resolver, resource_group, tenant_resolver],
     capabilities = [db, rest, stateful],
     lifecycle(entry = "serve", stop_timeout = "30s", await_ready),
-    gts(
+    gts_publication(
         crates = [crate, account_management_sdk],
         entities = Self::configured_entities,
     ),
@@ -636,7 +636,7 @@ impl Gear for AccountManagementGear {
 
         // Both registry APIs, in the hub before any application `init`: the
         // registry's own local clients where it runs here, its resolving REST
-        // clients otherwise (`gts(...)` and `#[toolkit::consumes]` wire both
+        // clients otherwise (`gts_publication(...)` and `#[toolkit::consumes]` wire both
         // with the infrastructure). Request reads use `request_registry` with
         // each caller's context (P33). Bootstrap, retention and the reaper use
         // `platform_registry`. Process-wide IdP selection and TR hierarchy reads

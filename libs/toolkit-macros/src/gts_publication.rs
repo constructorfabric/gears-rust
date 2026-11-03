@@ -1,7 +1,7 @@
-//! `gts(...)` section of `#[toolkit::gear]`: the GTS publication capability.
+//! `gts_publication(...)` section of `#[toolkit::gear]`: the GTS publication capability.
 //!
 //! ```ignore
-//! gts(
+//! gts_publication(
 //!     crates = [crate, my_gear_sdk],          // crate-local collectors
 //!     entities = Self::configured_entities,   // optional, config-only
 //!     publisher = path::to::adapter,          // optional; see below
@@ -31,8 +31,8 @@ use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 use syn::{Expr, Ident, LitStr, MetaList, Path};
 
-/// Parsed `gts(...)`.
-pub struct GtsCfg {
+/// Parsed `gts_publication(...)`.
+pub struct GtsPublicationCfg {
     crates: Vec<Path>,
     publisher: Path,
     entities: Option<Path>,
@@ -48,13 +48,13 @@ fn expect_path(expr: Expr, what: &str) -> syn::Result<Path> {
     }
 }
 
-/// Parse the `gts(...)` list of `#[toolkit::gear]`. `publisher` defaults to
+/// Parse the `gts_publication(...)` list of `#[toolkit::gear]`. `publisher` defaults to
 /// `::types_registry_sdk::publication`.
 ///
 /// # Errors
 /// An unknown, removed or duplicate argument, a value that is not a path or a
 /// list of paths, a crate listed twice, or neither `crates` nor `entities`.
-pub fn parse(list: &MetaList) -> syn::Result<GtsCfg> {
+pub fn parse(list: &MetaList) -> syn::Result<GtsPublicationCfg> {
     let mut crates: Option<Vec<Path>> = None;
     let mut publisher: Option<Path> = None;
     let mut entities: Option<Path> = None;
@@ -67,7 +67,7 @@ pub fn parse(list: &MetaList) -> syn::Result<GtsCfg> {
             .unwrap_or_default();
         let duplicate = |seen: bool| -> syn::Result<()> {
             if seen {
-                Err(meta.error(format!("duplicate `{key}` in `gts(...)`")))
+                Err(meta.error(format!("duplicate `{key}` in `gts_publication(...)`")))
             } else {
                 Ok(())
             }
@@ -109,7 +109,7 @@ pub fn parse(list: &MetaList) -> syn::Result<GtsCfg> {
             }
             _ => {
                 return Err(meta
-                    .error("unknown `gts(...)` argument; expected crates, publisher or entities"));
+                    .error("unknown `gts_publication(...)` argument; expected crates, publisher or entities"));
             }
         }
         Ok(())
@@ -121,10 +121,10 @@ pub fn parse(list: &MetaList) -> syn::Result<GtsCfg> {
     if crates.is_empty() && entities.is_none() {
         return Err(syn::Error::new_spanned(
             &list.path,
-            "`gts(...)` publishes nothing: give `crates = [...]`, `entities = ...` or both",
+            "`gts_publication(...)` publishes nothing: give `crates = [...]`, `entities = ...` or both",
         ));
     }
-    Ok(GtsCfg {
+    Ok(GtsPublicationCfg {
         crates,
         publisher,
         entities,
@@ -151,7 +151,7 @@ fn declarations_of(path: &Path) -> (TokenStream, TokenStream) {
 }
 
 /// Top-level items for the gear struct `ident` named `name`.
-pub fn expand(cfg: &GtsCfg, ident: &Ident, name: &LitStr) -> TokenStream {
+pub fn expand(cfg: &GtsPublicationCfg, ident: &Ident, name: &LitStr) -> TokenStream {
     let publisher = &cfg.publisher;
     let sources = cfg.crates.iter().map(|path| {
         let (call, origin) = declarations_of(path);
@@ -171,7 +171,7 @@ pub fn expand(cfg: &GtsCfg, ident: &Ident, name: &LitStr) -> TokenStream {
     quote! {
         #[doc(hidden)]
         impl #ident {
-            /// The GTS publication generated from `gts(...)`.
+            /// The GTS publication generated from `gts_publication(...)`.
             pub const __TOOLKIT_GTS_PUBLICATION: ::toolkit::gts_publication::GtsPublicationDescriptor =
                 ::toolkit::gts_publication::GtsPublicationDescriptor {
                     gear: #name,

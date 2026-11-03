@@ -33,7 +33,7 @@ use crate::domain::{AuthZResolverLocalClient, Service};
 #[toolkit::gear(
     name = "authz-resolver",
     capabilities = [rest],
-    gts(crates = [authz_resolver_sdk]),
+    gts_publication(crates = [authz_resolver_sdk]),
 )]
 #[toolkit::provides(
     contract = authz_resolver_sdk::AuthZResolverApi,
@@ -168,7 +168,7 @@ mod tests {
     }
 }
 
-/// The GTS publication `gts(...)` declares: exactly the SDK's declarations, under
+/// The GTS publication `gts_publication(...)` declares: exactly the SDK's declarations, under
 /// this gear's name and version, independent of configuration.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

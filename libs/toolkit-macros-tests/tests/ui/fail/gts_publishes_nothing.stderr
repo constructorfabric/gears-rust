@@ -1,5 +1,0 @@
-error: `gts(...)` publishes nothing: give `crates = [...]`, `entities = ...` or both
- --> tests/ui/fail/gts_publishes_nothing.rs:3:20
-  |
-3 | #[gear(name = "x", gts(publisher = some::adapter))]
-  |                    ^^^

@@ -9,7 +9,7 @@ gdl_version = "1.0"
 # by `implements`; vendor and priority are read from source, and so is the link to
 # tenant-resolver, which the attribute states as `deps = [tenant_resolver]`.
 #
-# Runtime `gts(...)` publication uses the local or remote platform registry API.
+# Runtime `gts_publication(...)` publication uses the local or remote platform registry API.
 # The instance must be admitted before this application plugin binds its client in `init`.
 
 gear(

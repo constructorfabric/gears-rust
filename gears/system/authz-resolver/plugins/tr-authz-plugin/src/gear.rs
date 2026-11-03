@@ -29,7 +29,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.tr_authz_resolver.plugin.v1";
 #[toolkit::gear(
     name = "tr-authz-plugin",
     deps = [tenant_resolver],
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 pub struct TrAuthZPlugin {
     service: OnceLock<Arc<Service>>,

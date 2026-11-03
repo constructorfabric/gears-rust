@@ -37,7 +37,7 @@ application group: pre_init → DB migration → GTS publication (admission barr
 
 - **`pre_init`** — optional hook of any gear before its group's migrations run.
 - **DB migration** — gear-owned migrations executed by the runtime (gears with `db` capability).
-- **GTS publication** — the GTS types and instances application gears declare with `gts(...)`
+- **GTS publication** — the GTS types and instances application gears declare with `gts_publication(...)`
   are published concurrently and admitted before any application `init`.
 - **`init`** — build the gear's own services and register its own SDK implementation in the
   `ClientHub`. Ordinary consumed clients are wired only after every `init` of the group, so

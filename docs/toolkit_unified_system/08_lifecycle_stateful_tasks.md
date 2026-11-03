@@ -9,7 +9,7 @@ ToolKit provides lifecycle management for gears with background tasks, graceful 
 - **Rule**: Pass child tokens to background tasks for cooperative shutdown.
 - **Rule**: Implement `RunnableCapability` for custom lifecycle (rare).
 - **Rule**: Never wait for a remote service in a lifecycle hook (`pre_init`, `init`, `post_init`, `start`).
-- **Rule**: A gear that publishes GTS documents declares them with `gts(...)`; the runtime handles publication retries and the admission barrier.
+- **Rule**: A gear that publishes GTS documents declares them with `gts_publication(...)`; the runtime handles publication retries and the admission barrier.
 
 ## Runtime startup
 
@@ -48,7 +48,7 @@ finalization.
    in the directory. Only then clear the `application/preparation` readiness gate.
 
 A system gear cannot declare `deps` or `consumes` on an application gear in the same process
-(bootstrap edges), nor declare `gts(...)`; its bootstrap routes use platform-plane auth only
+(bootstrap edges), nor declare `gts_publication(...)`; its bootstrap routes use platform-plane auth only
 (public probes aside). Outside bootstrap it may look up an application client per request
 through `toolkit::LazyClient` (the API Gateway resolves the AuthN resolver this way).
 A non-empty publication cannot target an application provider in the same process either:
@@ -91,13 +91,13 @@ The current runtime still runs migrations and publication reconciliation after a
 
 ## Publishing GTS documents
 
-Declare `gts(...)`; the runtime handles publication, retries and admission. Use `crates` for
+Declare `gts_publication(...)`; the runtime handles publication, retries and admission. Use `crates` for
 static declarations and `entities` for documents built from configuration:
 
 ```rust
 #[toolkit::gear(
     name = "static-authz-plugin",
-    gts(
+    gts_publication(
         crates = [crate, my_sdk],          // crates with `toolkit_gts::declare_gts_inventory!()`
         entities = Self::plugin_instance,  // optional: config-only documents
     ),
@@ -128,7 +128,7 @@ A gear with no GTS Type Schemas or Instances to publish needs no registry for pu
 
 In `init`, `ctx.gts_publication_manifest()` returns a `GtsManifest`: the publisher name/version
 and authored GTS Type Schemas and Instances, all admitted before `init`. This ToolKit data
-structure is available only to gears declaring `gts(...)`. Plugins bind their scoped clients
+structure is available only to gears declaring `gts_publication(...)`. Plugins bind their scoped clients
 from these documents.
 `choose_registered_plugin_instance` selects the best-ranked instance with a bound client;
 a plugin whose `init` has not run is not selectable. Declare `deps` when initialization order matters.
@@ -141,7 +141,7 @@ It does **not** block `start`, other gears, route publication or the application
 
 Callers must handle a gear that is still bootstrapping. To expose this condition through
 `/readyz`, provide a REST healthcheck; `Unhealthy` keeps the response at `503`, with or without
-`gts(...)`.
+`gts_publication(...)`.
 
 ## Declarative lifecycle with `#[toolkit::gear(...)]`
 
@@ -539,4 +539,4 @@ async fn test_background_task_cancellation() {
 - [ ] Use `tokio::select!` for cooperative shutdown.
 - [ ] Implement graceful shutdown with timeout handling.
 - [ ] Test lifecycle with manual cancellation.
-- [ ] Publish GTS documents with `gts(...)`; notify `ReadySignal` only when the gear can serve.
+- [ ] Publish GTS documents with `gts_publication(...)`; notify `ReadySignal` only when the gear can serve.

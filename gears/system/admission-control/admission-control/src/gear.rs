@@ -62,7 +62,7 @@ struct Wired {
 #[toolkit::consumes(contract = types_registry_sdk::PlatformTypesRegistryApi, from = "types-registry")]
 #[toolkit::gear(
     name = "admission-control",
-    gts(crates = [admission_control_sdk]),
+    gts_publication(crates = [admission_control_sdk]),
     capabilities = [stateful],
     lifecycle(entry = "serve", stop_timeout = "10s", await_ready)
 )]

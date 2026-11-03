@@ -8,7 +8,7 @@ gdl_version = "1.0"
 # (`IdpPluginClient`), declared by `implements`. This plugin's vendor and priority
 # are read from source.
 
-# Runtime `gts(...)` publication uses the local or remote platform registry API.
+# Runtime `gts_publication(...)` publication uses the local or remote platform registry API.
 # The instance must be admitted before this application plugin binds its client in `init`.
 
 gear(

@@ -13,7 +13,7 @@ pub use crate::api::openapi_registry::OpenApiRegistry;
 /// group is prepared, so it serves while the application group waits for its
 /// GTS admission. A system gear therefore:
 ///
-/// - does not publish GTS documents with `gts(...)`;
+/// - does not publish GTS documents with `gts_publication(...)`;
 /// - does not depend on (`deps`) or consume a local application gear;
 /// - serves its bootstrap routes with platform-plane auth only (public probes
 ///   aside), since the tenant plane is not wired yet.

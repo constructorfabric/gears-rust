@@ -21,11 +21,11 @@ use crate::domain::{AuthNResolverLocalClient, Service};
 /// The registry is consumed, not linked: `PlatformTypesRegistryApi` is the registry's own
 /// local client where the registry runs in this process, and its resolving REST client
 /// otherwise. This gear publishes the SDK's `AuthNResolverPluginSpecV1` schema
-/// (`gts(...)`), admitted before any application `init`. Plugin discovery is lazy:
+/// (`gts_publication(...)`), admitted before any application `init`. Plugin discovery is lazy:
 /// it happens on the first API call, after every plugin bound its client in `init`.
 #[toolkit::gear(
     name = "authn-resolver",
-    gts(crates = [authn_resolver_sdk]),
+    gts_publication(crates = [authn_resolver_sdk]),
 )]
 pub(crate) struct AuthNResolver {
     service: OnceLock<Arc<Service>>,
@@ -70,7 +70,7 @@ impl Gear for AuthNResolver {
     }
 }
 
-/// The GTS publication `gts(...)` declares: exactly the SDK's declarations, under
+/// The GTS publication `gts_publication(...)` declares: exactly the SDK's declarations, under
 /// this gear's name and version, independent of configuration.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

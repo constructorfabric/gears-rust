@@ -30,7 +30,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.rg_tenant_resolver.plugin.v1";
 #[toolkit::gear(
     name = "rg-tr-plugin",
     deps = [resource_group],
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 pub struct RgTrPlugin {
     service: OnceLock<Arc<Service>>,

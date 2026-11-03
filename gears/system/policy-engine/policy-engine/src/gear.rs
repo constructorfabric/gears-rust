@@ -59,7 +59,7 @@ struct Wired {
     name = "policy-engine",
     deps = [tenant_resolver, authz_resolver],
     capabilities = [db, rest],
-    gts(crates = [policy_engine_sdk], entities = Self::plugin_instance),
+    gts_publication(crates = [policy_engine_sdk], entities = Self::plugin_instance),
 )]
 #[derive(Default)]
 pub struct PolicyEngine {

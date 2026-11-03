@@ -6,7 +6,7 @@ pub fn gts_declarations() -> Vec<(String, String)> {
     Vec::new()
 }
 
-#[gear(name = "x", gts(crates = [crate]))]
+#[gear(name = "x", gts_publication(crates = [crate]))]
 #[derive(Default)]
 pub struct X;
 

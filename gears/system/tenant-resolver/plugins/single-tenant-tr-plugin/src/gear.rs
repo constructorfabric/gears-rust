@@ -27,7 +27,7 @@ const INSTANCE_SEGMENT: &str = "cf.builtin.single_tenant_resolver.plugin.v1";
 /// it is admitted; `init` binds the scoped client to the admitted instance.
 #[toolkit::gear(
     name = "single-tenant-tr-plugin",
-    gts(entities = Self::plugin_instance),
+    gts_publication(entities = Self::plugin_instance),
 )]
 pub struct SingleTenantTrPlugin;
 

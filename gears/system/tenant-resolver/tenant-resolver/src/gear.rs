@@ -24,7 +24,7 @@ use crate::domain::{Service, TenantResolverLocalClient};
 /// first API call, never in `init`.
 #[toolkit::gear(
     name = "tenant-resolver",
-    gts(crates = [tenant_resolver_sdk]),
+    gts_publication(crates = [tenant_resolver_sdk]),
 )]
 pub(crate) struct TenantResolver {
     service: OnceLock<Arc<Service>>,
@@ -61,7 +61,7 @@ impl Gear for TenantResolver {
     }
 }
 
-/// The GTS publication `gts(...)` declares: exactly the SDK's declarations, under
+/// The GTS publication `gts_publication(...)` declares: exactly the SDK's declarations, under
 /// this gear's name and version, independent of configuration.
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]

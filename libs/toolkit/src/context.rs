@@ -248,18 +248,18 @@ impl GearCtx {
     }
 
     /// This gear's GTS manifest, as the registry admitted it before this
-    /// gear's `init`: the documents of its `gts(...)` declaration. A plugin
+    /// gear's `init`: the documents of its `gts_publication(...)` declaration. A plugin
     /// binds its scoped clients to the instances it lists. It is the manifest
     /// that was published, not rebuilt from the configuration.
     ///
     /// # Errors
-    /// The gear declares no `gts(...)`, or `init` runs outside the runtime.
+    /// The gear declares no `gts_publication(...)`, or `init` runs outside the runtime.
     pub fn gts_publication_manifest(
         &self,
     ) -> anyhow::Result<Arc<crate::gts_publication::GtsManifest>> {
         self.gts_publication_manifest.clone().ok_or_else(|| {
             anyhow::anyhow!(
-                "gear '{}' has no admitted GTS manifest: it declares no `gts(...)`, or the \
+                "gear '{}' has no admitted GTS manifest: it declares no `gts_publication(...)`, or the \
                  runtime did not publish it",
                 self.gear_name
             )

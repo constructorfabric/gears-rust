@@ -4,7 +4,7 @@
 //! the execution of all lifecycle phases.
 //!
 //! High-level phase order:
-//! - the GTS manifest of every `gts(...)` gear, built from the configuration
+//! - the GTS manifest of every `gts_publication(...)` gear, built from the configuration
 //!   and checked for ownership conflicts, and the startup group of every
 //!   consumed client checked, before any gear runs or anything is written
 //! - **system group** (`capabilities = [system]`: the types registry,
@@ -832,7 +832,7 @@ impl HostRuntime {
                     gear: entry.name,
                     source: anyhow::anyhow!(
                         "a system gear initializes before the GTS barrier, so it cannot \
-                         publish GTS documents with `gts(...)`"
+                         publish GTS documents with `gts_publication(...)`"
                     ),
                 });
             }

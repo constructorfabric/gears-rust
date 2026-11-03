@@ -73,7 +73,7 @@ The GTS identifier types the models use (`GtsId`, `GtsTypeId`, `GtsInstanceId`,
 registry configured `mode: legacy_only` keeps only the legacy client and v1 routes for RG:
 it registers neither new API locally, routes neither, runs no seeding or admission over a
 bound database and is not advertised in the service directory, so AM and its selected
-publishers reach a remote registry through the wiring that `gts(...)` generates. The runtime
+publishers reach a remote registry through the wiring that `gts_publication(...)` generates. The runtime
 publishes all application GTS Type Schemas and Instances before any application `init`; readiness waits for
 that barrier. `am-host publish-gts --registry <url>` publishes the same
 GTS Type Schemas and Instances as a deployment step. RG's sealed local
@@ -187,7 +187,7 @@ later changes are left alone. Rejections and call-level refusals stop retries;
 cancellation returns `Cancelled`. Budget expiry reports `deadline`, retaining each
 identifier's last known cause. Accepted writes continue after the caller stops waiting.
 
-`#[toolkit::gear(..., gts(...))]` invokes this adapter during application preparation,
+`#[toolkit::gear(..., gts_publication(...))]` invokes this adapter during application preparation,
 before any application `init`. Ordinary startup uses a 120-second budget; a deployment
 job supplies its absolute deadline instead, shared by every publisher.
 Custom `publisher = ...` adapters must provide `publish_with_deadline(registry, name,
@@ -197,7 +197,7 @@ the existing SDK `publication::publish` remains a wrapper using the startup defa
 ```rust,ignore
 #[toolkit::gear(
     name = "my-gear",
-    gts(
+    gts_publication(
         crates = [crate, my_gear_sdk],      // crates with `declare_gts_inventory!()`
         entities = Self::configured,        // optional: config-only documents
     ),
@@ -231,7 +231,7 @@ in `ClientHub`. Missing database or failed seeding leaves neither registered;
 
 - `deps` orders `init()`; remote clients are wired afterwards. AM, the `AuthN`, `AuthZ` and
   tenant resolvers, and the static `AuthN`, `AuthZ`, TR and `IdP` plugins and the OIDC `AuthN`
-  plugin publish with `gts(...)`; the remaining publishers move in T41/T42.
+  plugin publish with `gts_publication(...)`; the remaining publishers move in T41/T42.
 - The synchronous `publish_startup_entities` helper above runs in its caller's task; it
   does not perform the lifecycle migration by itself.
 - `PublisherContext` is required but only forwarded/enforced in T44/T45;

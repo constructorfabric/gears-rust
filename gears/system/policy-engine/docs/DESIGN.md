@@ -404,7 +404,7 @@ the variant's fields as its data. Clients match on the code or rebuild the typed
 SDK module holds the fixed content bounds.
 
 The three resource types (id-only type schemas) and the three permission instances are declared in the SDK's
-[GTS catalog](../policy-engine-sdk/src/gts.rs), collected locally by that SDK. The `gts(...)` declaration combines
+[GTS catalog](../policy-engine-sdk/src/gts.rs), collected locally by that SDK. The `gts_publication(...)` declaration combines
 these declarations with the configured engine instance; the runtime publishes them and waits for registry admission before init.
 The SDK also contributes its static declarations to the process-wide inventory for embedded compositions.
 
