@@ -95,14 +95,15 @@ curl http://127.0.0.1:8087/cf/readyz      # readiness: 200 ready / 503 not ready
 curl http://127.0.0.1:8087/cf/healthz     # liveness: "ok"
 ```
 
-Run the example server directly with SQLite:
+Other quick start examples:
 
 ```bash
+# Option 1: Run with SQLite database (recommended for development)
 cargo run --bin cf-gears-example-server -- --config config/quickstart.yaml run
-```
 
-The default composition needs a database for its embedded Types Registry and the
-AuthN/AuthZ/tenant resolvers. `config/no-db.yaml` cannot run this composition.
+# Option 2: Run without a persistent database (in-memory SQLite for Types Registry)
+cargo run --bin cf-gears-example-server -- --config config/no-db.yaml run
+```
 
 ### Example Configuration (config/quickstart.yaml)
 
