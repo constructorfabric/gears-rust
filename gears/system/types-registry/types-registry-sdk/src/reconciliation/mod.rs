@@ -54,6 +54,8 @@ pub struct ReconcileOptions {
     pub retry_backoff_max: Duration,
     /// Budget of the whole call, every pass and poll included.
     pub deadline: Duration,
+    /// An adapter's caller-owned deadline; never reconstructed from a remaining duration.
+    pub(crate) absolute_deadline: Option<Instant>,
     /// End the call once a pass admits nothing new and every identifier still wanted
     /// waits on a dependency: only another writer could store that dependency. For a
     /// caller whose desired set is complete, so a missing dependency fails at once;
@@ -69,6 +71,7 @@ impl Default for ReconcileOptions {
             retry_backoff: Duration::from_millis(200),
             retry_backoff_max: Duration::from_secs(5),
             deadline: Duration::from_secs(60),
+            absolute_deadline: None,
             stop_when_stalled: false,
         }
     }
@@ -109,6 +112,10 @@ pub enum ReconcileStop {
     /// A pass admitted nothing and only dependencies remain; see
     /// [`ReconcileOptions::stop_when_stalled`].
     Stalled,
+    /// A terminal item refusal prevents further passes; other batches of the pass ran.
+    Rejected,
+    /// A progress snapshot before the next pass; never a terminal stop.
+    Retrying,
 }
 
 impl ReconcileStop {
@@ -122,6 +129,8 @@ impl ReconcileStop {
             "read_failed" => Some(Self::ReadFailed),
             "invalid_input" => Some(Self::InvalidInput),
             "stalled" => Some(Self::Stalled),
+            "rejected" => Some(Self::Rejected),
+            "retrying" => Some(Self::Retrying),
             _ => None,
         }
     }
@@ -136,6 +145,8 @@ impl ReconcileStop {
             Self::ReadFailed => "read_failed",
             Self::InvalidInput => "invalid_input",
             Self::Stalled => "stalled",
+            Self::Rejected => "rejected",
+            Self::Retrying => "retrying",
         }
     }
 }
@@ -199,9 +210,28 @@ where
     A: PlatformTypesRegistryApi + ?Sized,
     I: IntoIterator<Item = &'d (GtsId, JsonDocument)>,
 {
+    reconcile_with_progress(api, ctx, publisher, desired, options, cancel, |_| {}).await
+}
+
+/// The same reconciliation, with a snapshot before each retrying pass.
+pub async fn reconcile_with_progress<'d, A, I>(
+    api: &A,
+    ctx: &PlatformSecurityContext,
+    publisher: &PublisherContext,
+    desired: I,
+    options: &ReconcileOptions,
+    cancel: &CancellationToken,
+    on_pending: impl FnMut(&ReconcileReport) + Send,
+) -> Result<Reconciliation, CanonicalError>
+where
+    A: PlatformTypesRegistryApi + ?Sized,
+    I: IntoIterator<Item = &'d (GtsId, JsonDocument)>,
+{
     // The whole-call budget starts now, before any preparation.
     let started = Instant::now();
-    let deadline = deadline_after(started, options.deadline);
+    let deadline = options
+        .absolute_deadline
+        .map_or_else(|| deadline_after(started, options.deadline), Ok);
     let span = tracing::info_span!(
         "reconcile",
         reconcile_id = %Uuid::new_v4(),
@@ -220,7 +250,7 @@ where
         wanted,
         outcomes,
     };
-    run(api, ctx, publisher, cancel, options, prepared)
+    run(api, ctx, publisher, cancel, options, prepared, on_pending)
         .instrument(span)
         .await
 }
@@ -240,6 +270,7 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
     cancel: &CancellationToken,
     options: &ReconcileOptions,
     prepared: Prepared<'_>,
+    mut on_pending: impl FnMut(&ReconcileReport) + Send,
 ) -> Result<Reconciliation, CanonicalError> {
     // The guard reports the call's end, whichever way it ends, dropped included.
     let desired = prepared.wanted.len() + prepared.outcomes.len();
@@ -280,6 +311,17 @@ async fn run<A: PlatformTypesRegistryApi + ?Sized>(
             && only_dependencies(&wanted, &run.outcomes)
         {
             end = PassEnd::Stop(ReconcileStop::Stalled);
+        }
+        if matches!(end, PassEnd::Next) {
+            let report = ReconcileReport {
+                stop: ReconcileStop::Retrying,
+                outcomes: run.outcomes.values().cloned().collect(),
+            };
+            if !report.is_transient() {
+                end = PassEnd::Stop(ReconcileStop::Rejected);
+            } else if pass < options.passes.get() && Instant::now() < deadline {
+                on_pending(&report);
+            }
         }
         // Each later pause doubles, up to the maximum.
         if pass > 1 {
@@ -331,7 +373,11 @@ fn stopped_between_passes(stopped: Stop, wanted: &Wanted<'_>, run: &mut Run) -> 
         Stop::Cancelled => PassEnd::Cancelled,
         Stop::Deadline(_) => {
             let cause = ReconcilePendingCause::Unavailable(stopped.into_error());
-            mark_unsettled(wanted, &mut run.outcomes, &cause);
+            for (key, (id, _)) in wanted {
+                run.outcomes
+                    .entry(key.clone())
+                    .or_insert_with(|| (id.clone(), ReconcileOutcome::Pending(cause.clone())));
+            }
             PassEnd::Stop(ReconcileStop::Deadline)
         }
     }
@@ -552,8 +598,15 @@ impl<A: PlatformTypesRegistryApi + ?Sized> Call<'_, A> {
                 return PassEnd::Stop(ReconcileStop::Deadline);
             }
             Ok(Err(e)) => {
+                let retry = transport_failure(&e)
+                    && !matches!(&e, CanonicalError::Aborted { ctx, .. }
+                        if ctx.reason == crate::reason::aborted::RECONCILIATION_PROTOCOL_ERROR);
                 mark_unsettled(wanted, &mut run.outcomes, &ReconcilePendingCause::of(e));
-                return PassEnd::Stop(ReconcileStop::ReadFailed);
+                return if retry {
+                    PassEnd::Next
+                } else {
+                    PassEnd::Stop(ReconcileStop::ReadFailed)
+                };
             }
         };
         let candidates = compare(wanted, &mut run.outcomes, &current);

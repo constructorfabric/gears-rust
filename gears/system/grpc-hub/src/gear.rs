@@ -13,6 +13,8 @@ use toolkit::{
     runtime::{GearInstallers, GrpcInstallerData, GrpcInstallerStore},
 };
 
+use crate::dynamic_routes::DynamicRoutes;
+
 use parking_lot::RwLock;
 use serde::Deserialize;
 #[cfg(unix)]
@@ -284,6 +286,9 @@ fn validate_exempt_method(entry: &str) -> anyhow::Result<()> {
 /// This gear is responsible for hosting the gRPC server and managing the gRPC services.
 #[toolkit::gear(
     name = "grpc-hub",
+    // `system`: serves the directory before the application group is
+    // prepared; the application's services are installed on the same
+    // listener later.
     capabilities = [stateful, system, grpc_hub],
     lifecycle(entry = "serve", await_ready)
 )]
@@ -313,6 +318,28 @@ pub struct GrpcHub {
     /// Bound on one registration call; the remote directory client has its
     /// own, longer one.
     pub(crate) attempt_timeout: std::time::Duration,
+    /// Gears whose services are served: the initial batch and every late one
+    /// installed since; deregistered together on shutdown.
+    pub(crate) installed: parking_lot::Mutex<Vec<GearRecord>>,
+}
+
+/// What the directory record of one gear needs: its name and service names.
+#[derive(Clone, Debug)]
+pub(crate) struct GearRecord {
+    gear_name: String,
+    services: Vec<&'static str>,
+}
+
+impl GearRecord {
+    fn of(gears: &[GearInstallers]) -> Vec<Self> {
+        gears
+            .iter()
+            .map(|gear| Self {
+                gear_name: gear.gear_name.clone(),
+                services: gear.installers.iter().map(|i| i.service_name).collect(),
+            })
+            .collect()
+    }
 }
 
 impl Default for GrpcHub {
@@ -329,6 +356,7 @@ impl Default for GrpcHub {
             serves_no_endpoint: std::sync::atomic::AtomicBool::new(false),
             first_pass_timeout: std::time::Duration::from_secs(5),
             attempt_timeout: std::time::Duration::from_secs(5),
+            installed: parking_lot::Mutex::new(Vec::new()),
         }
     }
 }
@@ -511,9 +539,16 @@ impl GrpcHub {
         Ok(false)
     }
 
-    /// Validate that all service names are unique across all gears.
-    fn validate_unique_services(gears: &[GearInstallers]) -> anyhow::Result<()> {
-        let mut seen = HashSet::new();
+    /// Validate that all service names are unique across all gears, those
+    /// already `installed` included.
+    fn validate_unique_services(
+        installed: &[GearRecord],
+        gears: &[GearInstallers],
+    ) -> anyhow::Result<()> {
+        let mut seen: HashSet<&str> = installed
+            .iter()
+            .flat_map(|record| record.services.iter().copied())
+            .collect();
         for gear in gears {
             for installer in &gear.installers {
                 if !seen.insert(installer.service_name) {
@@ -751,19 +786,20 @@ impl GrpcHub {
         }
     }
 
-    /// Deregister gears from Directory on shutdown.
-    async fn deregister_gears(&self, gears: &[GearInstallers]) -> anyhow::Result<()> {
+    /// Deregister every installed gear from Directory on shutdown.
+    async fn deregister_gears(&self) -> anyhow::Result<()> {
+        let gears = self.installed.lock().clone();
         let Some(directory) = self.resolve_directory_client() else {
             return Ok(());
         };
 
         let instance_id = self.instance_id.get().ok_or_else(|| {
             anyhow::anyhow!(
-                "GrpcHub instance_id not set: SystemGear::pre_init must run before Directory deregistration"
+                "GrpcHub instance_id not set: SystemCapability::wire_runtime must run before Directory deregistration"
             )
         })?;
 
-        for gear_data in gears {
+        for gear_data in &gears {
             if let Err(e) = directory
                 .deregister_instance(&gear_data.gear_name, instance_id)
                 .await
@@ -779,7 +815,8 @@ impl GrpcHub {
         Ok(())
     }
 
-    /// Run the tonic server with the provided installers.
+    /// Run the tonic server with the provided initial installers, then
+    /// install every late batch of the store on the same listener.
     ///
     /// # Errors
     /// Returns an error if server startup or execution fails.
@@ -789,44 +826,55 @@ impl GrpcHub {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
-        Self::validate_unique_services(&data.gears)?;
+        Self::validate_unique_services(&[], &data.gears)?;
 
-        let Some(routes) = Self::build_routes_from_gears(&data.gears) else {
+        let Some(routes) = Self::build_routes_from_gears(&data.gears)
+            .or_else(|| data.more_batches.then(tonic::service::Routes::default))
+        else {
             self.serves_no_endpoint
                 .store(true, std::sync::atomic::Ordering::Release);
             ready.notify();
             cancel.cancelled().await;
             return Ok(());
         };
+        *self.installed.lock() = GearRecord::of(&data.gears);
+        let routes = DynamicRoutes::new(routes);
+        let late = data.more_batches.then_some(&routes);
 
         let listen_cfg = self.listen_cfg.read().clone();
         let serve_result = match listen_cfg {
             ListenConfig::Disabled => {
                 // In-process callers use local clients; nothing to bind or
-                // register an endpoint for.
+                // register an endpoint for. Late batches are acknowledged
+                // without a listener to install them on.
                 self.serves_no_endpoint
                     .store(true, std::sync::atomic::Ordering::Release);
                 ready.notify();
-                cancel.cancelled().await;
+                let acknowledge = async {
+                    if let Some(store) = self.installer_store.get() {
+                        while let Some(batch) = store.next_late().await {
+                            batch.ack(Ok(()));
+                        }
+                    }
+                    std::future::pending::<()>().await;
+                };
+                tokio::select! {
+                    () = cancel.cancelled() => {}
+                    () = acknowledge => {}
+                }
                 return Ok(());
             }
-            ListenConfig::Tcp(addr) => {
-                self.serve_tcp(addr, routes, &data.gears, cancel, ready)
-                    .await
-            }
+            ListenConfig::Tcp(addr) => self.serve_tcp(addr, &routes, late, cancel, ready).await,
             #[cfg(unix)]
-            ListenConfig::Uds(path) => {
-                self.serve_uds(path, routes, &data.gears, cancel, ready)
-                    .await
-            }
+            ListenConfig::Uds(path) => self.serve_uds(path, &routes, late, cancel, ready).await,
             #[cfg(windows)]
             ListenConfig::NamedPipe(ref pipe_name) => {
-                self.serve_named_pipe(pipe_name.clone(), routes, &data.gears, cancel, ready)
+                self.serve_named_pipe(pipe_name.clone(), &routes, late, cancel, ready)
                     .await
             }
         };
 
-        self.deregister_gears(&data.gears).await?;
+        self.deregister_gears().await?;
         serve_result
     }
 
@@ -834,8 +882,8 @@ impl GrpcHub {
     async fn serve_tcp(
         &self,
         addr: SocketAddr,
-        routes: tonic::service::Routes,
-        gears: &[GearInstallers],
+        routes: &DynamicRoutes,
+        late: Option<&DynamicRoutes>,
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
@@ -853,17 +901,20 @@ impl GrpcHub {
             );
         }
 
-        let retry = self.register_gears_first(gears, endpoint, &cancel).await;
+        let initial = self.installed.lock().clone();
+        let retry = self
+            .register_gears_first(initial, endpoint.clone(), &cancel)
+            .await;
         ready.notify();
 
         let shutdown = cancel.clone();
         let server = Server::builder()
             .layer(self.effective_auth_layer()?)
-            .add_routes(routes)
-            .serve_with_incoming_shutdown(incoming, async move {
+            .serve_with_incoming_shutdown(routes.clone(), incoming, async move {
                 shutdown.cancelled().await;
             });
-        self.serve_beside_registration(server, retry, &cancel).await
+        self.serve_beside_registration(server, retry, late.map(|r| (r, endpoint)), &cancel)
+            .await
     }
 
     /// Serve gRPC over Unix Domain Socket with Directory registration.
@@ -871,8 +922,8 @@ impl GrpcHub {
     async fn serve_uds(
         &self,
         path: std::path::PathBuf,
-        routes: tonic::service::Routes,
-        gears: &[GearInstallers],
+        routes: &DynamicRoutes,
+        late: Option<&DynamicRoutes>,
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
@@ -895,8 +946,9 @@ impl GrpcHub {
 
         let endpoint = format!("unix://{}", path.display());
         self.set_bound_endpoint(endpoint.clone());
+        let initial = self.installed.lock().clone();
         let retry = self
-            .register_gears_first(gears, Some(endpoint), &cancel)
+            .register_gears_first(initial, Some(endpoint.clone()), &cancel)
             .await;
         ready.notify();
 
@@ -904,11 +956,11 @@ impl GrpcHub {
         let shutdown = cancel.clone();
         let server = Server::builder()
             .layer(self.effective_auth_layer()?)
-            .add_routes(routes)
-            .serve_with_incoming_shutdown(incoming, async move {
+            .serve_with_incoming_shutdown(routes.clone(), incoming, async move {
                 shutdown.cancelled().await;
             });
-        self.serve_beside_registration(server, retry, &cancel).await
+        self.serve_beside_registration(server, retry, late.map(|r| (r, Some(endpoint))), &cancel)
+            .await
     }
 
     /// Serve gRPC over Windows named pipe with Directory registration.
@@ -916,8 +968,8 @@ impl GrpcHub {
     async fn serve_named_pipe(
         &self,
         pipe_name: String,
-        routes: tonic::service::Routes,
-        gears: &[GearInstallers],
+        routes: &DynamicRoutes,
+        late: Option<&DynamicRoutes>,
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
@@ -925,8 +977,9 @@ impl GrpcHub {
 
         let endpoint = format!("pipe://{pipe_name}");
         self.set_bound_endpoint(endpoint.clone());
+        let initial = self.installed.lock().clone();
         let retry = self
-            .register_gears_first(gears, Some(endpoint), &cancel)
+            .register_gears_first(initial, Some(endpoint.clone()), &cancel)
             .await;
         ready.notify();
 
@@ -934,34 +987,83 @@ impl GrpcHub {
         let shutdown = cancel.clone();
         let server = Server::builder()
             .layer(self.effective_auth_layer()?)
-            .add_routes(routes)
-            .serve_with_incoming_shutdown(incoming, async move {
+            .serve_with_incoming_shutdown(routes.clone(), incoming, async move {
                 shutdown.cancelled().await;
             });
-        self.serve_beside_registration(server, retry, &cancel).await
+        self.serve_beside_registration(server, retry, late.map(|r| (r, Some(endpoint))), &cancel)
+            .await
     }
 
-    /// Run `server` with the registration retries beside it. A server that
-    /// ends -- an accept error, or shutdown -- ends the retries with it and
-    /// reports at once; retries that finish leave the server running.
+    /// Run `server` with the registration retries beside it, and the
+    /// installation of late batches when `late` gives the served routes and
+    /// the directory endpoint. A server that ends -- an accept error, or
+    /// shutdown -- ends the rest with it and reports at once; retries and
+    /// installations that finish leave the server running.
     async fn serve_beside_registration<E>(
         &self,
         server: impl std::future::Future<Output = Result<(), E>>,
-        retry: Option<Retry<'_>>,
+        retry: Option<Retry>,
+        late: Option<(&DynamicRoutes, Option<String>)>,
         cancel: &CancellationToken,
     ) -> anyhow::Result<()>
     where
         E: std::error::Error + Send + Sync + 'static,
     {
-        let retries = self.register_gears_until_done(retry, cancel);
-        tokio::pin!(server, retries);
-        // cancel-safe: dropping `retries` when the server ends abandons at most
-        // one registration call in flight, as cancellation does.
+        let background = async {
+            tokio::join!(
+                self.register_gears_until_done(retry, cancel),
+                self.install_late_batches(late, cancel),
+            );
+        };
+        tokio::pin!(server, background);
+        // cancel-safe: dropping `background` when the server ends abandons at
+        // most one registration call in flight, as cancellation does.
         let outcome = tokio::select! {
             outcome = &mut server => outcome,
-            () = &mut retries => server.await,
+            () = &mut background => server.await,
         };
         outcome.context("gRPC hub server ended")
+    }
+
+    /// Install each late batch of the store on the served routes, then
+    /// acknowledge it; once the store is closed, register the late gears in
+    /// the directory: they are advertised only after they are callable. A
+    /// batch whose service names are taken is refused, the served routes
+    /// unchanged.
+    async fn install_late_batches(
+        &self,
+        late: Option<(&DynamicRoutes, Option<String>)>,
+        cancel: &CancellationToken,
+    ) {
+        let Some((routes, endpoint)) = late else {
+            return;
+        };
+        let Some(store) = self.installer_store.get() else {
+            return;
+        };
+        let mut added = Vec::new();
+        while let Some(batch) = store.next_late().await {
+            let installed = self.installed.lock().clone();
+            if let Err(e) = Self::validate_unique_services(&installed, &batch.gears) {
+                tracing::error!(error = %e, "late gRPC services refused");
+                batch.ack(Err(e));
+                continue;
+            }
+            routes.install(&batch.gears);
+            let records = GearRecord::of(&batch.gears);
+            tracing::info!(
+                gears = ?records.iter().map(|r| r.gear_name.as_str()).collect::<Vec<_>>(),
+                "late gRPC services installed on the running listener"
+            );
+            self.installed.lock().extend(records.iter().cloned());
+            added.extend(records);
+            batch.ack(Ok(()));
+        }
+        if added.is_empty() {
+            return;
+        }
+        let retry = self.register_gears_first(added, endpoint, cancel).await;
+        self.register_gears_until_done(retry, cancel).await;
     }
 
     /// First registration pass, before `ready`: the host's REST registration,
@@ -969,14 +1071,14 @@ impl GrpcHub {
     /// holds the gRPC services. Bounded, so a hung directory does not hold
     /// `ready`. Returns what is left to retry: the gears the directory has not
     /// accepted yet.
-    async fn register_gears_first<'a>(
+    async fn register_gears_first(
         &self,
-        gears: &'a [GearInstallers],
+        gears: Vec<GearRecord>,
         endpoint: Option<String>,
         cancel: &CancellationToken,
-    ) -> Option<Retry<'a>> {
+    ) -> Option<Retry> {
         let endpoint = endpoint?;
-        let mut pending: Vec<&GearInstallers> = gears.iter().collect();
+        let mut pending = gears;
         // cancel-safe: a pass cut short leaves in `pending` exactly the gears
         // whose registration was not confirmed.
         let pass = tokio::time::timeout(
@@ -1008,11 +1110,7 @@ impl GrpcHub {
     /// comes up after this process -- Flight Control starting after the
     /// cluster unit on a cold start -- used to close the port for good while
     /// the process stayed ready.
-    async fn register_gears_until_done(
-        &self,
-        retry: Option<Retry<'_>>,
-        cancel: &CancellationToken,
-    ) {
+    async fn register_gears_until_done(&self, retry: Option<Retry>, cancel: &CancellationToken) {
         let Some(Retry {
             endpoint,
             mut pending,
@@ -1051,7 +1149,7 @@ impl GrpcHub {
     /// The record carries only the gRPC half: the directory keeps the REST
     /// endpoint and `OpenAPI` spec the host registered for the same instance
     /// (`GearInstance::with_metadata_of`), so nothing is read back first.
-    async fn register_pending(&self, pending: &mut Vec<&GearInstallers>, endpoint: &str) {
+    async fn register_pending(&self, pending: &mut Vec<GearRecord>, endpoint: &str) {
         let Some(directory) = self.resolve_directory_client() else {
             tracing::info!("DirectoryClient not available; skipping Directory registration");
             pending.clear();
@@ -1059,7 +1157,7 @@ impl GrpcHub {
         };
         let Some(instance_id) = self.instance_id.get() else {
             tracing::error!(
-                "GrpcHub instance_id not set: SystemGear::pre_init must run before Directory \
+                "GrpcHub instance_id not set: SystemCapability::wire_runtime must run before Directory \
                  registration; not registering"
             );
             pending.clear();
@@ -1084,7 +1182,7 @@ impl GrpcHub {
     async fn register_one(
         &self,
         directory: &dyn DirectoryClient,
-        gear_data: &GearInstallers,
+        gear_data: &GearRecord,
         instance_id: &str,
         endpoint: &str,
     ) -> bool {
@@ -1112,16 +1210,16 @@ impl GrpcHub {
 
     /// The gRPC half of one gear's record.
     fn registration_info(
-        gear_data: &GearInstallers,
+        gear_data: &GearRecord,
         instance_id: &str,
         endpoint: &str,
     ) -> cf_system_sdks::directory::RegisterInstanceInfo {
         let services = gear_data
-            .installers
+            .services
             .iter()
-            .map(|i| {
+            .map(|service| {
                 (
-                    i.service_name.to_owned(),
+                    (*service).to_owned(),
                     cf_system_sdks::directory::ServiceEndpoint::new(endpoint),
                 )
             })
@@ -1165,13 +1263,13 @@ impl GrpcHub {
 }
 
 /// The registration still to retry: the gears the directory has not accepted.
-struct Retry<'a> {
+struct Retry {
     endpoint: String,
-    pending: Vec<&'a GearInstallers>,
+    pending: Vec<GearRecord>,
 }
 
-impl Retry<'_> {
-    fn names<'g>(pending: &[&'g GearInstallers]) -> Vec<&'g str> {
+impl Retry {
+    fn names(pending: &[GearRecord]) -> Vec<&str> {
         pending.iter().map(|g| g.gear_name.as_str()).collect()
     }
 }
@@ -1214,16 +1312,16 @@ fn jittered(delay: std::time::Duration) -> std::time::Duration {
 
 #[async_trait]
 impl SystemCapability for GrpcHub {
-    fn pre_init(&self, sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
+    fn wire_runtime(&self, sys: &toolkit::runtime::SystemContext) -> anyhow::Result<()> {
         self.installer_store
             .set(Arc::clone(&sys.grpc_installers))
             .map_err(|_| {
-                anyhow::anyhow!("GrpcInstallerStore already set (pre_init called twice?)")
+                anyhow::anyhow!("GrpcInstallerStore already set (wire_runtime called twice?)")
             })?;
 
         self.instance_id
             .set(sys.instance_id().to_string())
-            .map_err(|_| anyhow::anyhow!("instance_id already set (pre_init called twice?)"))?;
+            .map_err(|_| anyhow::anyhow!("instance_id already set (wire_runtime called twice?)"))?;
         Ok(())
     }
 }
@@ -1567,6 +1665,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a(), installer_a()],
             }],
+            more_batches: false,
         };
         let cancel = CancellationToken::new();
         let (tx, _rx) = tokio::sync::oneshot::channel();
@@ -1591,6 +1690,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a(), installer_b()],
             }],
+            more_batches: false,
         };
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -1640,6 +1740,7 @@ mod tests {
         rejections: parking_lot::Mutex<HashMap<String, Rejection>>,
         sent: parking_lot::Mutex<Vec<toolkit::RegisterInstanceInfo>>,
         records: parking_lot::Mutex<Vec<toolkit::ServiceInstanceInfo>>,
+        deregistered: parking_lot::Mutex<Vec<String>>,
     }
 
     impl ScriptedDirectory {
@@ -1732,7 +1833,8 @@ mod tests {
             );
             Ok(())
         }
-        async fn deregister_instance(&self, _g: &str, _i: &str) -> anyhow::Result<()> {
+        async fn deregister_instance(&self, gear: &str, _i: &str) -> anyhow::Result<()> {
+            self.deregistered.lock().push(gear.to_owned());
             Ok(())
         }
         async fn send_heartbeat(&self, _g: &str, _i: &str) -> anyhow::Result<()> {
@@ -1786,7 +1888,10 @@ mod tests {
             let cancel = cancel.clone();
             tokio::spawn(async move {
                 hub.run_with_installers(
-                    GrpcInstallerData { gears },
+                    GrpcInstallerData {
+                        gears,
+                        more_batches: false,
+                    },
                     cancel,
                     ReadySignal::from_sender(tx),
                 )
@@ -2054,13 +2159,13 @@ mod tests {
         let gear = service_b_gear("test");
         let retry = Retry {
             endpoint: "http://127.0.0.1:1".to_owned(),
-            pending: vec![&gear],
+            pending: GearRecord::of(std::slice::from_ref(&gear)),
         };
         let cancel = CancellationToken::new();
         let server = async { Err::<(), _>(std::io::Error::other("accept failed")) };
         let err = tokio::time::timeout(
             Duration::from_secs(1),
-            hub.serve_beside_registration(server, Some(retry), &cancel),
+            hub.serve_beside_registration(server, Some(retry), None, &cancel),
         )
         .await
         .expect("the server's end is not held by the retries")
@@ -2171,6 +2276,7 @@ mod tests {
                     gear_name: "test".to_owned(),
                     installers: vec![installer_a()],
                 }],
+                more_batches: false,
             })
             .expect("store should accept installers");
 
@@ -2181,8 +2287,8 @@ mod tests {
             Arc::clone(&installer_store),
         );
 
-        hub.pre_init(&sys_ctx)
-            .expect("pre_init should set installer_store and instance_id");
+        hub.wire_runtime(&sys_ctx)
+            .expect("wire_runtime should set installer_store and instance_id");
         // `serve` requires `auth_layer` to be set (normally by `init`).
         hub.auth_layer
             .set(InternalAuthGrpcLayer::disabled())
@@ -2366,6 +2472,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers,
             }],
+            more_batches: false,
         };
         let cancel_clone = cancel.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2443,6 +2550,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers,
             }],
+            more_batches: false,
         };
         let cancel_clone = cancel.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2474,7 +2582,10 @@ mod tests {
     async fn test_run_with_no_installers_exits_gracefully() {
         let hub = GrpcHub::default();
         hub.set_listen_addr_tcp("127.0.0.1:0".parse().unwrap());
-        let data = GrpcInstallerData { gears: vec![] };
+        let data = GrpcInstallerData {
+            gears: vec![],
+            more_batches: false,
+        };
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2739,6 +2850,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a()],
             }],
+            more_batches: false,
         };
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ready = ReadySignal::from_sender(tx);
@@ -2883,6 +2995,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a()],
             }],
+            more_batches: false,
         };
         let task = {
             let hub = hub.clone();
@@ -3031,6 +3144,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a()],
             }],
+            more_batches: false,
         };
         let task = {
             let hub = hub.clone();
@@ -3073,6 +3187,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a()],
             }],
+            more_batches: false,
         };
         let err = tokio::time::timeout(
             Duration::from_secs(2),
@@ -3099,6 +3214,7 @@ mod tests {
                 gear_name: "test".to_owned(),
                 installers: vec![installer_a()],
             }],
+            more_batches: false,
         };
         let task = {
             let hub = hub.clone();
@@ -3137,5 +3253,223 @@ mod tests {
         );
         let err = expand_home("~/hub.sock", None).unwrap_err();
         assert!(err.to_string().contains("needs HOME"), "{err}");
+    }
+
+    /// A hub with `directory`, wired to `store`, serving `gears` first and
+    /// expecting late batches; returns it, its task, the cancel token and
+    /// the ready receiver.
+    async fn spawn_hub_with_late_batches(
+        directory: &Arc<ScriptedDirectory>,
+        store: &Arc<GrpcInstallerStore>,
+        config: Option<serde_json::Value>,
+        gears: Vec<GearInstallers>,
+    ) -> (
+        Arc<GrpcHub>,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+        CancellationToken,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let hub = match config {
+            None => hub_with_directory(directory, GrpcHub::default()).await,
+            Some(config) => {
+                let hub = Arc::new(GrpcHub::default());
+                hub.init(&ctx_with(config)).await.expect("init");
+                hub.instance_id.set(Uuid::new_v4().to_string()).unwrap();
+                hub
+            }
+        };
+        assert!(hub.installer_store.set(Arc::clone(store)).is_ok());
+        let cancel = CancellationToken::new();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let task = {
+            let hub = Arc::clone(&hub);
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                hub.run_with_installers(
+                    GrpcInstallerData {
+                        gears,
+                        more_batches: true,
+                    },
+                    cancel,
+                    ReadySignal::from_sender(tx),
+                )
+                .await
+            })
+        };
+        (hub, task, cancel, rx)
+    }
+
+    /// One raw unary call to `ServiceA` on `uri`.
+    async fn call_service_a(uri: &str) -> Result<(), tonic::Status> {
+        let path = http::uri::PathAndQuery::from_static("/grpc_hub.test.ServiceA/Method");
+        let channel = tonic::transport::Channel::from_shared(uri.to_owned())
+            .unwrap()
+            .connect()
+            .await
+            .expect("connects");
+        let mut client = tonic::client::Grpc::new(channel);
+        client.ready().await.unwrap();
+        client
+            .unary(tonic::Request::new(Vec::new()), path, RawBytesCodec)
+            .await
+            .map(drop)
+    }
+
+    /// A late batch (the application group's services) is installed on the
+    /// listener already serving the directory: the same endpoint, no new
+    /// bind. It is acknowledged, then registered; shutdown deregisters the
+    /// initial and the late gears.
+    #[tokio::test]
+    async fn a_late_batch_is_served_on_the_same_listener_after_its_ack() {
+        use std::sync::atomic::Ordering;
+
+        let directory = ScriptedDirectory::opened();
+        let store = Arc::new(GrpcInstallerStore::new());
+        let (hub, task, cancel, rx) = spawn_hub_with_late_batches(
+            &directory,
+            &store,
+            None,
+            vec![service_b_gear("directory")],
+        )
+        .await;
+        await_ready(rx).await;
+        let uri = hub.get_bound_endpoint().expect("bound");
+        let err = call_service_a(&uri).await.expect_err("not installed yet");
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let installed = store
+            .publish_late(vec![service_a_gear("cluster", &calls)])
+            .unwrap();
+        store.close();
+        tokio::time::timeout(Duration::from_secs(2), installed)
+            .await
+            .expect("acknowledged")
+            .expect("not dropped")
+            .expect("installed");
+
+        let _status = call_service_a(&uri).await;
+        assert!(
+            calls.load(Ordering::SeqCst) > 0,
+            "the late service handled it"
+        );
+        assert_eq!(hub.get_bound_endpoint().as_deref(), Some(uri.as_str()));
+        eventually("the late gear's registration", || {
+            directory
+                .record_of("cluster")
+                .is_some_and(|r| !r.grpc_services.is_empty())
+        })
+        .await;
+        assert!(directory.record_of("directory").is_some());
+
+        cancel.cancel();
+        task.await.unwrap().expect("clean shutdown");
+        let mut deregistered = directory.deregistered.lock().clone();
+        deregistered.sort();
+        assert_eq!(deregistered, ["cluster", "directory"]);
+    }
+
+    /// A late batch taking a name the hub already serves is refused; what is
+    /// served stays as it was and the refused gear is not advertised.
+    #[tokio::test]
+    async fn a_late_batch_reusing_a_served_name_is_refused() {
+        let directory = ScriptedDirectory::opened();
+        let store = Arc::new(GrpcInstallerStore::new());
+        let (_hub, task, cancel, rx) = spawn_hub_with_late_batches(
+            &directory,
+            &store,
+            None,
+            vec![service_b_gear("directory")],
+        )
+        .await;
+        await_ready(rx).await;
+
+        let installed = store
+            .publish_late(vec![service_b_gear("squatter")])
+            .unwrap();
+        store.close();
+        let err = tokio::time::timeout(Duration::from_secs(2), installed)
+            .await
+            .expect("answered")
+            .expect("not dropped")
+            .expect_err("refused");
+        assert!(err.to_string().contains("Duplicate"), "{err}");
+        sleep(Duration::from_millis(50)).await;
+        assert!(directory.record_of("squatter").is_none());
+
+        cancel.cancel();
+        task.await.unwrap().expect("clean shutdown");
+    }
+
+    /// A late service sits behind the same platform-plane enforcement as the
+    /// initial ones, and an empty initial batch with more to come still binds.
+    #[tokio::test]
+    async fn a_late_service_keeps_the_hubs_platform_auth() {
+        let directory = ScriptedDirectory::opened();
+        let store = Arc::new(GrpcInstallerStore::new());
+        let (hub, task, cancel, rx) = spawn_hub_with_late_batches(
+            &directory,
+            &store,
+            Some(serde_json::json!({
+                "listen_addr": "127.0.0.1:0",
+                "internal_auth": { "provider": "shared_secret", "secret": "late-secret" },
+            })),
+            Vec::new(),
+        )
+        .await;
+        await_ready(rx).await;
+        let uri = hub
+            .get_bound_endpoint()
+            .expect("bound with no initial service");
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let installed = store
+            .publish_late(vec![service_a_gear("cluster", &calls)])
+            .unwrap();
+        store.close();
+        tokio::time::timeout(Duration::from_secs(2), installed)
+            .await
+            .expect("acknowledged")
+            .expect("not dropped")
+            .expect("installed");
+
+        let err = call_service_a(&uri).await.expect_err("no internal token");
+        assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        cancel.cancel();
+        task.await.unwrap().expect("clean shutdown");
+    }
+
+    /// A listener disabled with `listen_addr: none` still acknowledges late
+    /// batches: in-process callers use local clients.
+    #[tokio::test]
+    async fn a_disabled_listener_acknowledges_late_batches() {
+        let directory = ScriptedDirectory::opened();
+        let store = Arc::new(GrpcInstallerStore::new());
+        let (hub, task, cancel, rx) = spawn_hub_with_late_batches(
+            &directory,
+            &store,
+            Some(serde_json::json!({ "listen_addr": "none" })),
+            vec![service_b_gear("directory")],
+        )
+        .await;
+        await_ready(rx).await;
+        assert!(toolkit::contracts::GrpcHubCapability::serves_no_endpoint(
+            hub.as_ref()
+        ));
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let installed = store
+            .publish_late(vec![service_a_gear("cluster", &calls)])
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), installed)
+            .await
+            .expect("acknowledged")
+            .expect("not dropped")
+            .expect("acknowledged without a listener");
+
+        cancel.cancel();
+        task.await.unwrap().expect("clean shutdown");
     }
 }

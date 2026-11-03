@@ -14,6 +14,7 @@ mod api_dto;
 mod domain_model;
 mod expand_vars;
 mod grpc_client;
+mod gts_publication;
 mod temporary;
 /// Implementation of the `temporary` attribute macro.
 mod utils;
@@ -26,6 +27,7 @@ struct GearConfig {
     ctor: Option<Expr>,           // arbitrary constructor expression
     client: Option<Path>,         // trait path for client DX helpers
     lifecycle: Option<LcGearCfg>, // optional lifecycle config (on type)
+    gts_publication: Option<gts_publication::GtsPublicationCfg>,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -210,6 +212,7 @@ impl Parse for GearConfig {
         let mut ctor: Option<Expr> = None;
         let mut client: Option<Path> = None;
         let mut lifecycle: Option<LcGearCfg> = None;
+        let mut gts_publication: Option<gts_publication::GtsPublicationCfg> = None;
 
         let mut seen_name = false;
         let mut seen_deps = false;
@@ -428,6 +431,15 @@ impl Parse for GearConfig {
                     seen_lifecycle = true;
                     lifecycle = Some(parse_lifecycle_list(&list)?);
                 }
+                Meta::List(list) if list.path.is_ident("gts_publication") => {
+                    if gts_publication.is_some() {
+                        return Err(syn::Error::new_spanned(
+                            list.path,
+                            "duplicate `gts_publication(...)` parameter",
+                        ));
+                    }
+                    gts_publication = Some(gts_publication::parse(&list)?);
+                }
                 other => {
                     return Err(syn::Error::new_spanned(
                         other,
@@ -451,6 +463,7 @@ impl Parse for GearConfig {
             ctor,
             client,
             lifecycle,
+            gts_publication,
         })
     }
 }
@@ -572,6 +585,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
     let ctor_expr_opt: Option<Expr> = config.ctor.clone();
     let client_trait_opt: Option<Path> = config.client.clone();
     let lifecycle_cfg_opt: Option<LcGearCfg> = config.lifecycle;
+    let gts_publication_cfg = config.gts_publication;
 
     // Prepare string literals for name/deps
     let name_lit = LitStr::new(&name_owned, Span::call_site());
@@ -649,7 +663,8 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
                 }
             }
             Capability::System => {
-                // System is a flag, no trait required
+                // Selects the system group; the registration below requires
+                // `SystemCapability`.
                 quote! {}
             }
             Capability::GrpcHub => quote! {
@@ -673,6 +688,27 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
         };
         cap_asserts.push(q);
     }
+
+    let gts_publication_items = match &gts_publication_cfg {
+        Some(_) if !input.generics.params.is_empty() => {
+            return syn::Error::new_spanned(
+                &input.generics,
+                "`gts_publication(...)` is not supported on a generic gear struct",
+            )
+            .to_compile_error()
+            .into();
+        }
+        Some(cfg) => gts_publication::expand(cfg, &struct_ident, &name_lit),
+        None => proc_macro2::TokenStream::new(),
+    };
+    let gts_publication_registration = if gts_publication_cfg.is_some() {
+        quote! {
+            b.register_gts_publication_with_meta(#name_lit,
+                gear.clone() as ::std::sync::Arc<dyn ::toolkit::gts_publication::GtsPublicationCapability>);
+        }
+    } else {
+        proc_macro2::TokenStream::new()
+    };
 
     // Registrator name (avoid lowercasing to reduce collisions)
     let struct_name_snake = struct_ident.to_string().to_snake_case();
@@ -888,6 +924,7 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 
             // capabilities
             #(#capability_registrations)*
+            #gts_publication_registration
         }
 
         ::toolkit::inventory::submit! {
@@ -898,6 +935,9 @@ pub fn gear(attr: TokenStream, item: TokenStream) -> TokenStream {
 
         // Top-level extras for lifecycle-enabled types (impl Runnable, ready shim, into_gear)
         #extra_top_level
+
+        // GTS publication capability (`gts_publication(...)`)
+        #gts_publication_items
     };
 
     TokenStream::from(expanded)

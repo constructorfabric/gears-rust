@@ -167,6 +167,8 @@ tonic = { workspace = true, optional = true }
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [dev-dependencies]
+# A platform credential in the deployment publication tests.
+secrecy = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 trybuild = { workspace = true }
 tempfile = { workspace = true }
@@ -175,3 +177,5 @@ serial_test = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 tracing-subscriber = { workspace = true }
 tracing-test = { workspace = true, features = ["no-env-filter"] }
+# `gts_type_schema` plugin specs in unit tests.
+schemars = { workspace = true }

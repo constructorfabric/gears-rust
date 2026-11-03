@@ -404,6 +404,7 @@ async fn e2e_startup_readiness_transition_and_graceful_shutdown() {
             RouteAuthPolicy::default(),
         )
         .expect("attach");
+    server.start_presence();
 
     // 4. Gear routes now serve.
     assert!(
@@ -480,6 +481,7 @@ async fn attach_forwards_configured_labels_to_directory_registration() {
             RouteAuthPolicy::default(),
         )
         .expect("attach");
+    server.start_presence();
 
     // Poll until the registration is captured (registration is async).
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -629,6 +631,7 @@ async fn gear_handler_receives_connect_info_through_fallback() {
             RouteAuthPolicy::default(),
         )
         .expect("attach");
+    server.start_presence();
 
     // A `200` proves the gear handler's `ConnectInfo<SocketAddr>` extractor found
     // the connect-info in the request extensions *through* the swap fallback — a
@@ -824,6 +827,7 @@ async fn canonical_error_layer_runs_inside_the_trace_span_when_composed() {
     let app = layer_gear_router(
         Router::new().route("/boom", get(boom)),
         RouteAuthPolicy::default(),
+        options.tenant_plane(),
         DrainGuard::new(readiness),
         &options,
     );
@@ -950,6 +954,7 @@ fn axis_gear(bearer: bool, internal: bool) -> Router {
     layer_gear_router(
         router,
         policy,
+        options.tenant_plane(),
         DrainGuard::new(readiness(Vec::<String>::new())),
         &options,
     )
@@ -1153,6 +1158,7 @@ async fn an_installed_tenant_authenticator_wins_over_auth_disabled() {
         layer_gear_router(
             router,
             policy,
+            options.tenant_plane(),
             DrainGuard::new(readiness(Vec::<String>::new())),
             &options,
         )
@@ -1269,6 +1275,7 @@ async fn without_a_tenant_authenticator_an_unlisted_route_is_refused() {
     let app = layer_gear_router(
         router,
         route_auth_policy(registry.operation_specs.iter()),
+        options.tenant_plane(),
         DrainGuard::new(readiness(Vec::<String>::new())),
         &options,
     );

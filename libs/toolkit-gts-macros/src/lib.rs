@@ -18,6 +18,11 @@
 //!   `gts_macros::gts_instance!` and submits an `InventoryInstance`.
 //! - **`gts_instance_raw! { ... }`** — raw-JSON Instance. Forwards verbatim
 //!   to `gts_macros::gts_instance_raw!` and submits an `InventoryInstance`.
+//!
+//! The `local_*` variants (re-exported as `toolkit_gts::local::*`) expand the
+//! same way and additionally submit the record into the declaring crate's own
+//! collector, `crate::__toolkit_gts_inventory`, which
+//! `toolkit_gts::declare_gts_inventory!()` defines at the crate root.
 
 use proc_macro::TokenStream;
 use proc_macro2::{Delimiter, TokenStream as TokenStream2, TokenTree};
@@ -232,13 +237,63 @@ fn extract_type_id(attr: &TokenStream2) -> syn::Result<GtsIdInput> {
 pub fn gts_type_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
     let attr_ts: TokenStream2 = attr.into();
     let input = parse_macro_input!(item as ItemStruct);
-    match expand_gts_type_schema(&attr_ts, &input) {
+    match expand_gts_type_schema(&attr_ts, &input, Collector::Global) {
         Ok(tokens) => tokens.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Result<TokenStream2> {
+/// [`gts_type_schema`] that also submits into the declaring crate's collector.
+#[proc_macro_attribute]
+pub fn local_gts_type_schema(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let attr_ts: TokenStream2 = attr.into();
+    let input = parse_macro_input!(item as ItemStruct);
+    match expand_gts_type_schema(&attr_ts, &input, Collector::GlobalAndLocal) {
+        Ok(tokens) => tokens.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// Which collectors a declaration is submitted to.
+#[derive(Clone, Copy)]
+enum Collector {
+    /// The process-wide `toolkit_gts` inventory only.
+    Global,
+    /// The process-wide inventory and the declaring crate's own collector.
+    GlobalAndLocal,
+}
+
+/// `inventory::submit!` of `record` (a `toolkit_gts::Inventory*` value) into
+/// the global collector and, for [`Collector::GlobalAndLocal`], wrapped in the
+/// declaring crate's `newtype` (`TypeSchema` / `Instance`) too.
+fn submit(
+    crate_path: &TokenStream2,
+    collector: Collector,
+    newtype: &str,
+    record: &TokenStream2,
+) -> TokenStream2 {
+    let global = quote! {
+        #crate_path::inventory::submit! { #record }
+    };
+    match collector {
+        Collector::Global => global,
+        Collector::GlobalAndLocal => {
+            let newtype = Ident::new(newtype, proc_macro2::Span::call_site());
+            quote! {
+                #global
+                #crate_path::inventory::submit! {
+                    crate::__toolkit_gts_inventory::#newtype(#record)
+                }
+            }
+        }
+    }
+}
+
+fn expand_gts_type_schema(
+    attr: &TokenStream2,
+    input: &ItemStruct,
+    collector: Collector,
+) -> syn::Result<TokenStream2> {
     let crate_path = resolve_crate_path()?;
     let type_id_input = extract_type_id(attr)?;
     let type_id = type_id_input.emitted_expr(&crate_path);
@@ -272,16 +327,18 @@ fn expand_gts_type_schema(attr: &TokenStream2, input: &ItemStruct) -> syn::Resul
         quote! { <#struct_name>::gts_schema_with_refs_as_string() }
     };
 
+    let record = quote! {
+        #crate_path::InventoryTypeSchema {
+            type_id: #type_id,
+            schema_fn: || #schema_fn_body,
+        }
+    };
+    let submit = submit(&crate_path, collector, "TypeSchema", &record);
     Ok(quote! {
         #[#crate_path::__private::upstream_struct_to_gts_schema(#attr)]
         #input
 
-        #crate_path::inventory::submit! {
-            #crate_path::InventoryTypeSchema {
-                type_id: #type_id,
-                schema_fn: || #schema_fn_body,
-            }
-        }
+        #submit
     })
 }
 
@@ -516,13 +573,22 @@ fn extract_id_input(instance: &ExprStruct) -> syn::Result<GtsIdInput> {
 /// ```
 #[proc_macro]
 pub fn gts_instance(input: TokenStream) -> TokenStream {
-    match expand_gts_instance(input.into()) {
+    match expand_gts_instance(input.into(), Collector::Global) {
         Ok(t) => t.into(),
         Err(e) => e.to_compile_error().into(),
     }
 }
 
-fn expand_gts_instance(input: TokenStream2) -> syn::Result<TokenStream2> {
+/// [`gts_instance!`] that also submits into the declaring crate's collector.
+#[proc_macro]
+pub fn local_gts_instance(input: TokenStream) -> TokenStream {
+    match expand_gts_instance(input.into(), Collector::GlobalAndLocal) {
+        Ok(t) => t.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+fn expand_gts_instance(input: TokenStream2, collector: Collector) -> syn::Result<TokenStream2> {
     let parsed: InstanceInput = parse2(input)?;
     let crate_path = resolve_crate_path()?;
     let id_input = extract_id_input(&parsed.instance)?;
@@ -542,16 +608,15 @@ fn expand_gts_instance(input: TokenStream2) -> syn::Result<TokenStream2> {
         #crate_path::__private::upstream_gts_instance!(#instance_struct)
     };
 
-    let submit_block = quote! {
-        #crate_path::inventory::submit! {
-            #crate_path::InventoryInstance {
-                type_id: #type_id,
-                instance_id: #instance_id,
-                payload_fn: || ::serde_json::to_value(&#payload_call)
-                    .expect("GTS instance must serialize cleanly"),
-            }
+    let record = quote! {
+        #crate_path::InventoryInstance {
+            type_id: #type_id,
+            instance_id: #instance_id,
+            payload_fn: || ::serde_json::to_value(&#payload_call)
+                .expect("GTS instance must serialize cleanly"),
         }
     };
+    let submit_block = submit(&crate_path, collector, "Instance", &record);
 
     if attrs.is_empty() {
         Ok(submit_block)
@@ -584,7 +649,16 @@ fn expand_gts_instance(input: TokenStream2) -> syn::Result<TokenStream2> {
 /// ```
 #[proc_macro]
 pub fn gts_instance_raw(input: TokenStream) -> TokenStream {
-    match expand_gts_instance_raw(input.into()) {
+    match expand_gts_instance_raw(input.into(), Collector::Global) {
+        Ok(t) => t.into(),
+        Err(e) => e.to_compile_error().into(),
+    }
+}
+
+/// [`gts_instance_raw!`] that also submits into the declaring crate's collector.
+#[proc_macro]
+pub fn local_gts_instance_raw(input: TokenStream) -> TokenStream {
+    match expand_gts_instance_raw(input.into(), Collector::GlobalAndLocal) {
         Ok(t) => t.into(),
         Err(e) => e.to_compile_error().into(),
     }
@@ -668,7 +742,7 @@ fn skip_until_comma(iter: &mut std::iter::Peekable<proc_macro2::token_stream::In
     }
 }
 
-fn expand_gts_instance_raw(input: TokenStream2) -> syn::Result<TokenStream2> {
+fn expand_gts_instance_raw(input: TokenStream2, collector: Collector) -> syn::Result<TokenStream2> {
     let crate_path = resolve_crate_path()?;
 
     // Upstream takes `{ ... }` — possibly wrapped in `(...)`. Strip an
@@ -720,15 +794,14 @@ fn expand_gts_instance_raw(input: TokenStream2) -> syn::Result<TokenStream2> {
     let instance_id = id_input.emitted_expr(&crate_path);
     let type_id = quote!(#crate_path::gts_id!(#type_id_lit));
 
-    Ok(quote! {
-        #crate_path::inventory::submit! {
-            #crate_path::InventoryInstance {
-                type_id: #type_id,
-                instance_id: #instance_id,
-                payload_fn: || #crate_path::__private::upstream_gts_instance_raw!({
-                    #body_tokens
-                }),
-            }
+    let record = quote! {
+        #crate_path::InventoryInstance {
+            type_id: #type_id,
+            instance_id: #instance_id,
+            payload_fn: || #crate_path::__private::upstream_gts_instance_raw!({
+                #body_tokens
+            }),
         }
-    })
+    };
+    Ok(submit(&crate_path, collector, "Instance", &record))
 }

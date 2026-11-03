@@ -4,7 +4,7 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for OAGW, the Outbound API Gateway.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (system, rest),
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest, stateful),
 # colocated_deps (types-registry, authz-resolver, credstore, tenant-resolver).
 
 

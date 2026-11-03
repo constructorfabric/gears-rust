@@ -4,6 +4,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
+use crate::client_hub::{ClientHub, ClientScope};
 use crate::gts::PluginV1;
 
 /// A resettable, allocation-friendly selector for GTS plugin instance IDs.
@@ -204,6 +205,94 @@ where
         })
 }
 
+/// Whether `gts_id` names an instance of spec `P` or of a type derived from it:
+/// an ID under `P`'s type ID (which ends at a segment boundary, `~`) that is not
+/// itself a type schema (a schema ID ends with `~`).
+fn is_instance_of<P: gts::GtsSchema>(gts_id: &str) -> bool {
+    P::TYPE_ID.ends_with('~')
+        && !gts_id.ends_with('~')
+        && gts_id
+            .strip_prefix(P::TYPE_ID)
+            .is_some_and(|rest| !rest.is_empty())
+}
+
+/// Bind `client` as the scoped `C` client of every instance of spec `P` in
+/// `documents`: a plugin's `init` binds its client to the instances of its
+/// admitted manifest ([`GearCtx::gts_publication_manifest`]).
+///
+/// [`GearCtx::gts_publication_manifest`]: crate::context::GearCtx::gts_publication_manifest
+///
+/// # Errors
+/// `documents` holds no instance of `P`.
+pub fn bind_plugin_instances<'a, P, C>(
+    hub: &ClientHub,
+    documents: impl IntoIterator<Item = &'a (String, serde_json::Value)>,
+    client: &Arc<C>,
+) -> anyhow::Result<()>
+where
+    P: gts::GtsSchema,
+    C: ?Sized + Send + Sync + 'static,
+{
+    let mut bound = 0usize;
+    for (id, _) in documents {
+        if is_instance_of::<P>(id) {
+            hub.register_scoped::<C>(ClientScope::gts_id(id), Arc::clone(client));
+            tracing::info!(gts_id = %id, "plugin instance admitted and bound");
+            bound += 1;
+        }
+    }
+    anyhow::ensure!(bound > 0, "no instance of {} to bind", P::TYPE_ID);
+    Ok(())
+}
+
+/// [`choose_plugin_instance`] restricted to candidates with a scoped `C` client
+/// in `hub` under [`ClientScope::gts_id`]. This checks registration, not health.
+///
+/// Accepts `(gts_id, content)` pairs. Unregistered entries are skipped without
+/// validation, allowing stale catalogue entries with absent or malformed content.
+/// Registered entries retain listing order; the first wins a priority tie.
+///
+/// Every plugin of the process binds its client in its `init`, after its
+/// instance was admitted and before anything is served, so a selection made
+/// once the process is up sees every local candidate; a listed instance that
+/// no client was bound for here is never chosen.
+///
+/// Callers must pair `C` with the listing's `P` and the later scoped lookup;
+/// the types do not enforce this. Each registered entry must have content that
+/// decodes as `PluginV1<P>` with `id == gts_id`.
+///
+/// # Errors
+///
+/// - [`ChoosePluginError::InvalidPluginInstance`] for missing registered content
+///   (checked for all candidates before decoding) or as [`choose_plugin_instance`] reports.
+/// - [`ChoosePluginError::PluginNotFound`] when no registered instance matches the vendor.
+pub fn choose_registered_plugin_instance<'a, P, C>(
+    hub: &ClientHub,
+    vendor: &str,
+    instances: impl IntoIterator<Item = (&'a str, Option<&'a serde_json::Value>)>,
+) -> Result<String, ChoosePluginError>
+where
+    P: for<'de> gts::GtsDeserialize<'de> + gts::GtsSchema,
+    C: ?Sized + Send + Sync + 'static,
+{
+    let registered = instances
+        .into_iter()
+        .filter(|(gts_id, _)| {
+            hub.try_get_scoped::<C>(&ClientScope::gts_id(gts_id))
+                .is_some()
+        })
+        .map(|(gts_id, content)| {
+            content.map(|content| (gts_id, content)).ok_or_else(|| {
+                ChoosePluginError::InvalidPluginInstance {
+                    gts_id: gts_id.to_owned(),
+                    reason: "listed without content".to_owned(),
+                }
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    choose_plugin_instance::<P>(vendor, registered)
+}
+
 #[cfg(test)]
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
@@ -308,5 +397,274 @@ mod tests {
 
         // Resolve should have been called exactly once
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    mod choose_registered {
+        use super::*;
+        use serde_json::{Value, json};
+        use toolkit_gts::gts_type_schema;
+
+        #[derive(Default)]
+        #[gts_type_schema(
+            dir_path = "schemas",
+            base = PluginV1,
+            type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.test.plugin.v1~"),
+            description = "Test plugin specification",
+            properties = "",
+        )]
+        struct TestPluginSpecV1;
+
+        /// Another contract's spec: its instances never compete with the test spec's.
+        #[derive(Default)]
+        #[gts_type_schema(
+            dir_path = "schemas",
+            base = PluginV1,
+            type_id = gts_id!("cf.toolkit.plugins.plugin.v1~cf.core.other_test.plugin.v1~"),
+            description = "Other test plugin specification",
+            properties = "",
+        )]
+        struct OtherPluginSpecV1;
+
+        trait TestClient: Send + Sync {}
+        trait OtherClient: Send + Sync {}
+        struct Client;
+        impl TestClient for Client {}
+        impl OtherClient for Client {}
+
+        /// A valid instance of `name`; its id and content.
+        fn instance(name: &str, vendor: &str, priority: i16) -> (String, Value) {
+            let (id, content) = PluginV1::<TestPluginSpecV1>::build_registration(
+                &format!("vendor.x.{name}.plugin.v1"),
+                vendor,
+                priority,
+            )
+            .expect("serializes");
+            (id.to_string(), content)
+        }
+
+        fn register(hub: &ClientHub, gts_id: &str) {
+            hub.register_scoped::<dyn TestClient>(ClientScope::gts_id(gts_id), Arc::new(Client));
+        }
+
+        fn choose(
+            hub: &ClientHub,
+            listed: &[(String, Option<Value>)],
+        ) -> Result<String, ChoosePluginError> {
+            choose_registered_plugin_instance::<TestPluginSpecV1, dyn TestClient>(
+                hub,
+                "acme",
+                listed
+                    .iter()
+                    .map(|(id, content)| (id.as_str(), content.as_ref())),
+            )
+        }
+
+        #[test]
+        fn unregistered_entries_are_skipped_unexamined() {
+            let hub = ClientHub::new();
+            let (missing, _) = instance("missing", "acme", 0);
+            let (malformed, _) = instance("malformed", "acme", 0);
+            let (preferred, preferred_content) = instance("preferred", "acme", -10);
+            let (running, running_content) = instance("running", "acme", 5);
+            let (elsewhere, elsewhere_content) = instance("elsewhere", "acme", -20);
+            register(&hub, &running);
+            // Registered for another client type: not a candidate for this one.
+            hub.register_scoped::<dyn OtherClient>(
+                ClientScope::gts_id(&elsewhere),
+                Arc::new(Client),
+            );
+
+            let chosen = choose(
+                &hub,
+                &[
+                    (missing, None),
+                    (malformed, Some(json!({ "bogus": true }))),
+                    (preferred, Some(preferred_content)),
+                    (running.clone(), Some(running_content)),
+                    (elsewhere, Some(elsewhere_content)),
+                ],
+            )
+            .expect("chooses");
+            assert_eq!(chosen, running);
+        }
+
+        #[test]
+        fn the_lowest_registered_priority_of_the_vendor_wins_and_the_first_on_a_tie() {
+            let hub = ClientHub::new();
+            let listed: Vec<_> = [
+                instance("low", "acme", 5),
+                instance("other_vendor", "other", -5),
+                instance("tie_first", "acme", 1),
+                instance("tie_second", "acme", 1),
+            ]
+            .into_iter()
+            .map(|(id, content)| {
+                register(&hub, &id);
+                (id, Some(content))
+            })
+            .collect();
+
+            assert_eq!(choose(&hub, &listed).expect("chooses"), listed[2].0);
+        }
+
+        #[test]
+        fn a_registered_entry_without_content_is_invalid_before_any_is_read() {
+            let hub = ClientHub::new();
+            let (malformed, _) = instance("malformed", "acme", 0);
+            let (missing, _) = instance("missing", "acme", 0);
+            register(&hub, &malformed);
+            register(&hub, &missing);
+
+            let error = choose(
+                &hub,
+                &[
+                    (malformed, Some(json!({ "bogus": true }))),
+                    (missing.clone(), None),
+                ],
+            )
+            .expect_err("refused");
+            assert!(
+                matches!(&error, ChoosePluginError::InvalidPluginInstance { gts_id, reason }
+                    if *gts_id == missing && reason == "listed without content"),
+                "{error:?}"
+            );
+        }
+
+        #[test]
+        fn a_malformed_or_misnamed_registered_entry_is_invalid() {
+            let hub = ClientHub::new();
+            let (malformed, _) = instance("malformed", "other", 0);
+            let (good, good_content) = instance("good", "acme", 0);
+            let (misnamed, _) = instance("misnamed", "acme", 0);
+            for id in [&malformed, &good, &misnamed] {
+                register(&hub, id);
+            }
+
+            let error = choose(
+                &hub,
+                &[
+                    (good, Some(good_content.clone())),
+                    (malformed.clone(), Some(json!({ "bogus": true }))),
+                ],
+            )
+            .expect_err("refused");
+            assert!(
+                matches!(&error, ChoosePluginError::InvalidPluginInstance { gts_id, .. } if *gts_id == malformed),
+                "{error:?}"
+            );
+
+            let error =
+                choose(&hub, &[(misnamed.clone(), Some(good_content))]).expect_err("refused");
+            assert!(
+                matches!(&error, ChoosePluginError::InvalidPluginInstance { gts_id, .. } if *gts_id == misnamed),
+                "{error:?}"
+            );
+        }
+
+        /// Two plugins of one contract and vendor, the better one bound last: the
+        /// first selection after every plugin bound — all bind in their `init`,
+        /// before anything is served — chooses it, and a cached choice is that one.
+        #[tokio::test]
+        async fn the_first_selection_after_every_binding_chooses_the_best_bound_plugin() {
+            let hub = ClientHub::new();
+            let (fast, fast_content) = instance("fast", "acme", 5);
+            let (best, best_content) = instance("best", "acme", 1);
+            register(&hub, &fast);
+            register(&hub, &best);
+            let selector = GtsPluginSelector::new();
+            let listing = vec![
+                (fast, Some(fast_content)),
+                (best.clone(), Some(best_content)),
+            ];
+
+            let chosen = selector
+                .get_or_init(|| async { choose(&hub, &listing) })
+                .await
+                .expect("chooses");
+
+            assert_eq!(&*chosen, best);
+        }
+
+        /// A stale instance in the catalogue that no client was bound for here —
+        /// a plugin removed or disabled since — is never chosen, however it ranks.
+        #[test]
+        fn a_stale_unbound_instance_is_never_chosen() {
+            let hub = ClientHub::new();
+            let (stale, stale_content) = instance("stale", "acme", -100);
+            let (bound, bound_content) = instance("bound", "acme", 10);
+            register(&hub, &bound);
+
+            let chosen = choose(
+                &hub,
+                &[
+                    (stale, Some(stale_content)),
+                    (bound.clone(), Some(bound_content)),
+                ],
+            )
+            .expect("chooses");
+
+            assert_eq!(chosen, bound);
+        }
+
+        /// A plugin's `init` binds the client under each admitted instance of the
+        /// spec, and refuses a manifest without one.
+        #[test]
+        fn binding_admitted_instances_binds_only_the_specs_instances() {
+            let hub = ClientHub::new();
+            let spec = <TestPluginSpecV1 as gts::GtsSchema>::TYPE_ID;
+            let (mine, mine_content) = instance("mine", "acme", 1);
+            let derived = format!("{spec}vendor.x.derived.plugin.v1~vendor.x.mine.plugin.v1");
+            let derived_schema = format!("{spec}vendor.x.derived.plugin.v1~");
+            let other =
+                PluginV1::<OtherPluginSpecV1>::build_registration("vendor.x.o.v1", "acme", 1)
+                    .expect("serializes");
+            let manifest = [
+                (mine.clone(), mine_content),
+                (derived.clone(), json!({})),
+                (derived_schema.clone(), json!({})),
+                (spec.to_owned(), json!({})),
+                (other.0.as_ref().to_owned(), other.1),
+            ];
+            let client: Arc<dyn TestClient> = Arc::new(Client);
+            let bound = |id: &str| {
+                hub.try_get_scoped::<dyn TestClient>(&ClientScope::gts_id(id))
+                    .is_some()
+            };
+
+            bind_plugin_instances::<TestPluginSpecV1, dyn TestClient>(&hub, &manifest, &client)
+                .expect("binds");
+
+            assert!(
+                bound(&mine) && bound(&derived),
+                "the spec's instances, derived included"
+            );
+            assert!(
+                !bound(&derived_schema) && !bound(spec),
+                "type schemas are not bound"
+            );
+            assert!(
+                !bound(other.0.as_ref()),
+                "another spec's instance is not bound"
+            );
+            assert!(
+                bind_plugin_instances::<TestPluginSpecV1, dyn TestClient>(
+                    &hub,
+                    &manifest[2..],
+                    &client
+                )
+                .is_err(),
+                "a manifest without an instance of the spec"
+            );
+        }
+
+        #[test]
+        fn nothing_registered_is_not_found() {
+            let (id, content) = instance("listed", "acme", 0);
+            let error = choose(&ClientHub::new(), &[(id, Some(content))]).expect_err("refused");
+            assert!(
+                matches!(error, ChoosePluginError::PluginNotFound { .. }),
+                "{error:?}"
+            );
+        }
     }
 }

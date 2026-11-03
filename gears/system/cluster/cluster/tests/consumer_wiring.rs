@@ -81,11 +81,10 @@ static START_COMPLETED: AtomicBool = AtomicBool::new(false);
 /// Nothing is lost by omitting it, because neither thing `deps` would buy depends on
 /// it:
 ///
-/// - **Ordering.** `run_start_phase` iterates `gears_by_system_priority()`
-///   (`host_runtime.rs:838`), which runs every `system`-capability gear before every
-///   other one (`registry.rs:290-304`). Cluster declares `system`, so its `start`
-///   precedes any application consumer's `start` in Profile 1 without any `deps`
-///   edge at all.
+/// - **Ordering.** Cluster declares `system`, so it belongs to the system group,
+///   whose whole startup (`start` included) completes before the application
+///   group is prepared. Its `start` precedes any application consumer's `start`
+///   in Profile 1 without any `deps` edge at all.
 /// - **Readiness gating.** The `/readyz` dependency on `cluster` comes from
 ///   cluster-sdk's `ConsumerRegistration::dep_gear`, which the wiring phase feeds to
 ///   the `DependencyChecker` — so a consumer gets the gate in *both* profiles, and

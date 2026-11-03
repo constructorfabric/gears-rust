@@ -34,7 +34,11 @@ use crate::domain::registry::ProfileRegistry;
 use crate::domain::wiring::{ClusterHandle, ClusterWiring};
 use cluster_sdk::grpc::stubs;
 
-#[toolkit::gear(name = "cluster", capabilities = [stateful, system, grpc, rest])]
+#[toolkit::gear(
+    name = "cluster",
+    // `system`: started before the application group is prepared.
+    capabilities = [stateful, system, grpc, rest]
+)]
 // The four coordination contracts this gear serves, over gRPC only. In-process
 // consumers reach the
 // same services through the `ClusterClient` seam (`LocalClusterClient`), so no
@@ -257,20 +261,9 @@ impl Gear for ClusterGear {
     }
 }
 
-/// Platform tier, so cluster initialises in the system phase ahead of application
-/// gears (§4.2).
-///
-/// Empty on purpose, and the emptiness is the whole implementation: every
-/// `SystemCapability` method is defaulted, so the capability is the ordering flag
-/// §4.2 describes and nothing more. Cluster wants neither hook — `pre_init` runs
-/// before *any* gear's `init`, and `post_init` before the REST and gRPC phases, so
-/// neither is a place backends could exist. The same shape as `authn-resolver`,
-/// `tenant-resolver`, `authz-resolver` and `credstore`.
-///
-/// It is still a trait that must be implemented, which §4.2's table does not say:
-/// the `#[toolkit::gear]` macro emits no *assertion* for `system` but its
-/// registration casts to `Arc<dyn SystemCapability>`, so omitting this is a
-/// build error from the macro rather than the documented no-op.
+/// Cluster wires no runtime internals: `init` creates the profile registry and
+/// `start` binds its backends. Its system group runs both before application
+/// preparation, so coordination is available before any application `init`.
 impl toolkit::contracts::SystemCapability for ClusterGear {}
 
 #[async_trait]
