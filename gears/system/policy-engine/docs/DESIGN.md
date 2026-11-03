@@ -65,7 +65,7 @@ a failure, never a permit.
 | `cpt-cf-policy-engine-fr-bundle-composition` | `cpt-cf-policy-engine-entity-document`; the store enforces unique document names per version. |
 | `cpt-cf-policy-engine-fr-content-validation` | `cpt-cf-policy-engine-component-validator`, shared by validate and activate, using `cpt-cf-policy-engine-component-type-reference`. |
 | `cpt-cf-policy-engine-fr-builtin-policies` | `cpt-cf-policy-engine-component-builtin-set`, evaluated by `cpt-cf-policy-engine-component-decision` before reachability; first denial wins. |
-| `cpt-cf-policy-engine-fr-builtin-validation` | Gear init runs `cpt-cf-policy-engine-component-validator` over the built-ins as one version, except the known-type check, which `post_init` runs once the types registry is ready; any finding fails startup. |
+| `cpt-cf-policy-engine-fr-builtin-validation` | After the runtime admits GTS declarations, gear init runs `cpt-cf-policy-engine-component-validator` over the built-ins as one version, including platform catalog reads; any finding fails startup. |
 | `cpt-cf-policy-engine-fr-tenant-assignment` | `cpt-cf-policy-engine-entity-assignment`; the store enforces one assignment per bundle and tenant; the decision path reads assignments with their active version ids along the chain and ignores any whose owner tenant is not in the chain at or above its target. |
 | `cpt-cf-policy-engine-fr-inheritance-barriers` | `cpt-cf-policy-engine-component-hierarchy-client` always asks for barriers to be respected; no setting changes it. The decision path applies an assignment only while its owner tenant is in the resource tenant's barrier-respecting chain at or above the assignment's target (see 3.6). |
 | `cpt-cf-policy-engine-fr-non-enforcing-assignment` | The assignment's enforce flag, the only mutable part of an assignment. |
@@ -146,9 +146,10 @@ Management is authorized by permissions and transactional; decisions are authori
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-principle-builtins-at-startup`
 
 Built-in policies are validated and compiled once at startup, with the checks a version gets at activation; a bad
-built-in fails startup, never a request. Every check except whether concrete resource types are known runs at init;
-the types registry answers type lookups only once it is ready, after every init, so that check runs in the gear's
-`post_init` (a system-capability hook that runs after the registry's own, before anything is served).
+built-in fails startup, never a request. The runtime admits the SDK declarations and configured engine instance
+before application init. The managed registry is already available then: init performs every check, including
+concrete type lookups through `PlatformTypesRegistryApi`, before exposing either client. No legacy finalization
+or deferred known-type check is needed.
 
 #### Fail Closed
 
@@ -247,7 +248,8 @@ flowchart LR
     BS --> EV
     REST[REST API] --> MG[Management Service]
     MG --> VA[Validator]
-    VA --> TR[Type Reference]
+    VA -->|management caller| TR[TypesRegistryApi]
+    VA -->|startup platform| PTR[PlatformTypesRegistryApi]
     MG --> RP
     MG --> HC
     INIT[Gear init] --> VA
@@ -258,8 +260,9 @@ flowchart LR
 
 - [ ] `p1` - **ID**: `cpt-cf-policy-engine-component-engine-plugin`
 
-Implements the `admission-control` engine plugin contract and registers the gear's plugin instance, with the vendor
-and priority from configuration. It only forwards: the decision service already answers in the gate's vocabulary.
+Implements the `admission-control` engine plugin contract. The runtime publishes the instance, with vendor and
+priority from configuration, before init; init binds its admitted identifier to the scoped client. It only forwards:
+the decision service already answers in the gate's vocabulary.
 
 #### Decision Service
 
@@ -401,8 +404,15 @@ the variant's fields as its data. Clients match on the code or rebuild the typed
 SDK module holds the fixed content bounds.
 
 The three resource types (id-only type schemas) and the three permission instances are declared in the SDK's
-[GTS catalog](../policy-engine-sdk/src/gts.rs) and reach `types-registry` through the `toolkit-gts` inventory. The
-engine plugin instance carries the configured vendor and priority, so the gear builds it and registers it at init.
+[GTS catalog](../policy-engine-sdk/src/gts.rs), collected locally by that SDK. The `gts_publication(...)` declaration combines
+these declarations with the configured engine instance; the runtime publishes them and waits for registry admission before init.
+The SDK also contributes its static declarations to the process-wide inventory for embedded compositions.
+
+Validation and activation read through `TypesRegistryApi` with the unchanged request `SecurityContext` and an
+authoritative (`fresh`) batch read. Registry authentication and read-permission refusals become management
+`UNAUTHENTICATED` (401) and `REGISTRY_READ_DENIED` (403); there is no platform retry. A missing schema remains
+`RESOURCE_TYPE_UNKNOWN`, while an outage, timeout or unusable batch is `UNAVAILABLE` (503). Startup built-ins
+use the platform contract and no fabricated tenant identity. The decision path performs no catalog reads.
 
 ### 3.4 Internal Dependencies
 
@@ -417,7 +427,7 @@ engine plugin instance carries the configured vendor and priority, so the gear b
 | Dependency | Use |
 |------------|-----|
 | `tenant-resolver` | Ancestor chain (decisions, barriers respected), reachability and subtree (management) |
-| `types-registry` | Concrete type id existence at startup, validate and activate; registration of the engine plugin instance |
+| `types-registry-sdk` | Consumed platform and request APIs: startup type checks, caller-scoped validate/activate reads, and publication of GTS Type Schemas and Instances before application init |
 | `authz-resolver` | Management permission decisions |
 | `toolkit-db` | Postgres or SQLite |
 

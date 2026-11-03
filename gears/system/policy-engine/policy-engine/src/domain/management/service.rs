@@ -477,7 +477,7 @@ impl<S: ContentStore> ManagementService<S> {
         let version = self
             .load_version(&conn, &auth.scope, bundle_id, version_id)
             .await?;
-        self.validate_content(&version).await
+        self.validate_content(ctx, &version).await
     }
 
     /// Activates a draft: validates it and supersedes the previously active
@@ -552,7 +552,7 @@ impl<S: ContentStore> ManagementService<S> {
             VersionState::Superseded => return Err(ManagementError::VersionNotDraft),
             VersionState::Draft => {}
         }
-        self.validate_content(&version).await?;
+        self.validate_content(ctx, &version).await?;
         // Document ids are fresh on every replace: the same ids are the same
         // content.
         let mut validated: Vec<DocumentId> = version.documents.iter().map(|d| d.id).collect();
@@ -566,12 +566,27 @@ impl<S: ContentStore> ManagementService<S> {
     ///
     /// `VALIDATION_FAILED` with every finding; `service_unavailable` when the
     /// registry cannot answer.
-    async fn validate_content(&self, version: &BundleVersion) -> Result<(), ManagementError> {
+    async fn validate_content(
+        &self,
+        ctx: &SecurityContext,
+        version: &BundleVersion,
+    ) -> Result<(), ManagementError> {
         let findings = self
             .validator
-            .validate(&version.documents)
+            .validate(
+                crate::domain::ports::TypeCatalogScope::Caller(ctx),
+                &version.documents,
+            )
             .await
-            .map_err(error::unavailable)?;
+            .map_err(|error| match error {
+                crate::domain::ports::PortError::Unauthenticated => {
+                    ManagementError::Unauthenticated
+                }
+                crate::domain::ports::PortError::PermissionDenied => {
+                    ManagementError::RegistryReadDenied
+                }
+                other => error::unavailable(other),
+            })?;
         if findings.is_empty() {
             Ok(())
         } else {

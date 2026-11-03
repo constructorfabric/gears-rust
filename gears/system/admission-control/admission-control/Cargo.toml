@@ -23,11 +23,8 @@ workspace = true
 admission-control-sdk = { workspace = true }
 
 # Platform SDKs
-types-registry-sdk = { workspace = true }
+types-registry-sdk = { workspace = true, features = ["rest-client"] }
 event-broker-sdk = { workspace = true }
-
-# Gear crates referenced by `#[toolkit::gear(deps = [types_registry])]`
-types-registry = { workspace = true }
 
 # ToolKit dependencies
 toolkit = { workspace = true }

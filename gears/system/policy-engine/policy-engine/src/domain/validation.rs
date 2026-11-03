@@ -23,7 +23,7 @@ use toolkit_policy_evaluation::{
 use crate::domain::model::{
     ContentLimits, Document, LimitKind, LimitViolation, document_name_valid, duplicate_names,
 };
-use crate::domain::ports::{PortError, TypeCatalogPort};
+use crate::domain::ports::{PortError, TypeCatalogPort, TypeCatalogScope};
 
 /// One validation problem.
 #[domain_model]
@@ -97,18 +97,22 @@ impl ContentValidator {
     ///
     /// [`PortError`] when the types registry cannot answer; an outage is never
     /// a content finding.
-    pub async fn validate(&self, documents: &[Document]) -> Result<Vec<Finding>, PortError> {
+    pub async fn validate(
+        &self,
+        scope: TypeCatalogScope<'_>,
+        documents: &[Document],
+    ) -> Result<Vec<Finding>, PortError> {
         let known = self
             .types
-            .known_types(&concrete_type_identifiers(documents))
+            .known_types(scope, &concrete_type_identifiers(documents))
             .await?;
         Ok(self.screen(documents, &known))
     }
 
     /// Every finding for `documents` that needs no types registry: all of
     /// [`Self::validate`] except whether concrete resource types are known.
-    /// For content checked before the registry can answer; validate it in
-    /// full once it can.
+    /// This is a structural screen only; activation and startup use the full
+    /// scoped validation above.
     #[must_use]
     pub fn validate_offline(&self, documents: &[Document]) -> Vec<Finding> {
         let assumed_known = concrete_type_identifiers(documents).into_iter().collect();

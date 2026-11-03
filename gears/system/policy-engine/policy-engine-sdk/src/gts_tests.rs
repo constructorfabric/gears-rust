@@ -6,6 +6,29 @@ use super::permissions::{self, Capability};
 use super::*;
 
 #[test]
+fn local_publication_contains_exactly_the_owned_schemas_and_permissions() {
+    let declarations = crate::gts_declarations();
+    let ids: BTreeSet<_> = declarations.iter().map(|(id, _)| id.as_str()).collect();
+    let expected: BTreeSet<_> = [
+        BUNDLE_RESOURCE,
+        BUNDLE_VERSION_RESOURCE,
+        ASSIGNMENT_RESOURCE,
+    ]
+    .into_iter()
+    .chain(
+        Capability::ALL
+            .iter()
+            .map(|capability| capability.permission_id()),
+    )
+    .collect();
+    assert_eq!(
+        ids, expected,
+        "a gear must not claim imported SDK declarations"
+    );
+    assert_eq!(declarations.len(), ids.len(), "no duplicate ownership");
+}
+
+#[test]
 fn identifiers_are_valid_and_consistent() {
     for type_id in [
         BUNDLE_RESOURCE,

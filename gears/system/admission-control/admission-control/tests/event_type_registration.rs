@@ -1,62 +1,37 @@
-//! The refusal event type is an inventory entry: the real types registry
-//! admits and validates it beside the platform's inventory, and the platform
-//! API lists it with the traits the broker reads.
+//! The generated refusal event schema obeys the broker's base contract.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
-
-use std::sync::Arc;
 
 use admission_control_sdk::gts::{
     ADMISSION_CONTROL_RESOURCE, AUDIT_TOPIC_ID, REFUSAL_EVENT_TYPE, refusal_event_type_schema,
 };
+use event_broker_sdk::gts::EventV1;
+use gts::GtsSchema;
 use serde_json::json;
 use toolkit_security::PlatformSecurityContext;
-use types_registry::config::TypesRegistryConfig;
-use types_registry::domain::TypesRegistryService;
-use types_registry::infra::InMemoryGtsRepository;
 use types_registry_sdk::testing_platform::MockTypesRegistry;
-use types_registry_sdk::{
-    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApiExt, RegisterResult,
-};
+use types_registry_sdk::{GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApiExt};
 
-/// Registers the platform inventory, with `event_type` in place of its refusal
-/// entry, in a fresh registry and switches it to ready, which validates every
-/// entity.
-fn register_and_validate(event_type: serde_json::Value) -> Result<(), String> {
-    // Linked so their inventory entries (the event and topic bases) exist.
-    use event_broker_sdk as _;
-
-    let config = TypesRegistryConfig::default();
-    let service = TypesRegistryService::new(
-        Arc::new(InMemoryGtsRepository::new(config.to_gts_config())),
-        config,
-    );
-    let mut entities = toolkit_gts::all_inventory_type_schemas().unwrap();
-    entities.extend(toolkit_gts::all_inventory_instances().unwrap());
-    entities.retain(|e| e["$id"] != format!("gts://{REFUSAL_EVENT_TYPE}"));
-    entities.push(event_type);
-    for result in service.register(entities) {
-        if let RegisterResult::Err { gts_id, error } = result {
-            return Err(format!("{gts_id:?} rejected: {error:?}"));
-        }
-    }
-    service
-        .switch_to_ready()
-        .map_err(|err| format!("validation failed: {err:?}"))
+fn validate(event_type: &serde_json::Value) -> Result<gts::ResolvedType, gts::StoreError> {
+    let mut store = gts::GtsStore::new();
+    let base: serde_json::Value =
+        serde_json::from_str(&EventV1::gts_schema_with_refs_as_string()).unwrap();
+    store.register_schema(EventV1::TYPE_ID, &base).unwrap();
+    store
+        .register_schema(REFUSAL_EVENT_TYPE, event_type)
+        .unwrap();
+    store.validate_schema_with(REFUSAL_EVENT_TYPE, gts::GtsRefValidation::None)
 }
 
 #[test]
-fn the_refusal_event_type_validates_in_the_real_registry() {
-    register_and_validate(refusal_event_type_schema()).unwrap();
+fn the_refusal_event_type_validates_against_the_real_gts_base() {
+    validate(&refusal_event_type_schema()).unwrap();
 }
 
 #[test]
 fn a_data_schema_that_widens_the_base_is_refused() {
-    // Control: the registry does check `data` against the event base, so the
-    // test above would catch an incompatible generated schema.
     let mut widened = refusal_event_type_schema();
     widened["allOf"][1]["properties"]["data"] = serde_json::json!({ "type": "string" });
-    let error = register_and_validate(widened).unwrap_err();
-    assert!(error.contains("changes type incompatibly"), "{error}");
+    assert!(validate(&widened).is_err());
 }
 
 #[tokio::test]

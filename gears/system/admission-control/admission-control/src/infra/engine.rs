@@ -13,14 +13,21 @@
 //! a configured engine that cannot be resolved fails startup.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use admission_control_sdk::{AdmissionEnginePluginClientV1, AdmissionEnginePluginSpecV1};
 use async_trait::async_trait;
 use tokio::sync::OnceCell;
 use toolkit::client_hub::{ClientHub, ClientScope};
-use toolkit::plugins::{ChoosePluginError, choose_plugin_instance};
+use toolkit::plugins::{ChoosePluginError, choose_registered_plugin_instance};
 use toolkit_canonical_errors::CanonicalError;
-use types_registry_sdk::{InstanceQuery, TypesRegistryClient};
+use toolkit_security::PlatformSecurityContext;
+use types_registry_sdk::{
+    GtsIdPattern, ListEntitiesRequest, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
+};
+
+/// Includes every registry page and waits for concurrent cold resolution.
+const DISCOVERY_BUDGET: Duration = Duration::from_secs(30);
 
 use crate::config::EngineConfig;
 use crate::domain::service::{EngineHandle, EngineSource, EngineUnavailable};
@@ -31,6 +38,9 @@ pub enum EngineResolveError {
     /// The types registry could not list engine plugin instances.
     #[error("types-registry could not list admission engine plugin instances")]
     Registry(#[source] CanonicalError),
+    /// Discovery exceeded the startup/request budget.
+    #[error("admission engine discovery timed out")]
+    Timeout,
     /// The pinned instance identifier is not registered.
     #[error("configured engine instance `{0}` is not registered")]
     PinnedInstanceNotFound(String),
@@ -49,12 +59,27 @@ pub enum EngineResolveError {
 /// [`EngineResolveError`] when the configured engine cannot be resolved.
 pub async fn resolve_engine(
     hub: &ClientHub,
-    registry: &dyn TypesRegistryClient,
+    registry: &dyn PlatformTypesRegistryApi,
+    selection: &EngineConfig,
+) -> Result<EngineHandle, EngineResolveError> {
+    tokio::time::timeout(DISCOVERY_BUDGET, discover_engine(hub, registry, selection))
+        .await
+        .map_err(|_| EngineResolveError::Timeout)?
+}
+
+async fn discover_engine(
+    hub: &ClientHub,
+    registry: &dyn PlatformTypesRegistryApi,
     selection: &EngineConfig,
 ) -> Result<EngineHandle, EngineResolveError> {
     let type_id = <AdmissionEnginePluginSpecV1 as gts::GtsSchema>::TYPE_ID;
     let mut instances = registry
-        .list_instances(InstanceQuery::new().with_pattern(format!("{type_id}*")))
+        .list_instances(
+            &PlatformSecurityContext::outbound_marker(),
+            ListEntitiesRequest::matching(GtsIdPattern::try_new(type_id).map_err(|error| {
+                EngineResolveError::Registry(CanonicalError::internal(error.to_string()).create())
+            })?),
+        )
         .await
         .map_err(EngineResolveError::Registry)?;
     instances.retain(|instance| AsRef::<str>::as_ref(&instance.id).starts_with(type_id));
@@ -66,11 +91,15 @@ pub async fn resolve_engine(
             return Err(EngineResolveError::PinnedInstanceNotFound(pinned.clone()));
         }
     }
-    let chosen = choose_plugin_instance::<AdmissionEnginePluginSpecV1>(
+    let chosen = choose_registered_plugin_instance::<
+        AdmissionEnginePluginSpecV1,
+        dyn AdmissionEnginePluginClientV1,
+    >(
+        hub,
         selection.vendor.trim(),
         instances
             .iter()
-            .map(|instance| (instance.id.as_ref(), &instance.object)),
+            .map(|instance| (instance.id.as_ref(), instance.content.as_ref())),
     )
     .map_err(EngineResolveError::Selection)?;
 
@@ -85,7 +114,7 @@ pub async fn resolve_engine(
 /// documentation.
 pub struct LazyEngine {
     hub: Arc<ClientHub>,
-    registry: Arc<dyn TypesRegistryClient>,
+    registry: Arc<dyn PlatformTypesRegistryApi>,
     selection: EngineConfig,
     engine: OnceCell<EngineHandle>,
 }
@@ -103,7 +132,7 @@ impl LazyEngine {
     #[must_use]
     pub fn new(
         hub: Arc<ClientHub>,
-        registry: Arc<dyn TypesRegistryClient>,
+        registry: Arc<dyn PlatformTypesRegistryApi>,
         selection: EngineConfig,
     ) -> Self {
         Self {
@@ -120,10 +149,15 @@ impl LazyEngine {
     ///
     /// [`EngineResolveError`] when the engine cannot be resolved now.
     pub async fn resolve(&self) -> Result<EngineHandle, EngineResolveError> {
-        self.engine
-            .get_or_try_init(|| resolve_engine(&self.hub, self.registry.as_ref(), &self.selection))
-            .await
-            .cloned()
+        tokio::time::timeout(
+            DISCOVERY_BUDGET,
+            self.engine.get_or_try_init(|| {
+                resolve_engine(&self.hub, self.registry.as_ref(), &self.selection)
+            }),
+        )
+        .await
+        .map_err(|_| EngineResolveError::Timeout)?
+        .cloned()
     }
 }
 
