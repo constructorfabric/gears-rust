@@ -169,6 +169,9 @@ struct Scripted {
     reads: Mutex<Vec<TraverseRequest>>,
     /// Marks every traversal as cut short for this reason.
     cut_reads: Mutex<Option<TruncationReason>>,
+    /// Marks this many of the next traversals as seeing more than one graph
+    /// state.
+    torn_reads: AtomicU32,
     /// Gives every traversed edge this type instead of its own.
     retype_edges: Mutex<Option<String>>,
     hang_reads: AtomicBool,
@@ -188,6 +191,7 @@ impl Scripted {
             sent_at: Mutex::default(),
             reads: Mutex::default(),
             cut_reads: Mutex::default(),
+            torn_reads: AtomicU32::new(0),
             retype_edges: Mutex::default(),
             hang_reads: AtomicBool::new(false),
             registrations: AtomicU32::new(0),
@@ -328,6 +332,13 @@ impl GraphStorageClientV1 for Scripted {
         let mut response = self.inner.traverse(ctx, request).await?;
         if let Some(reason) = *self.cut_reads.lock().unwrap() {
             response.truncated = Some(reason);
+        }
+        if self
+            .torn_reads
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            response.consistent_snapshot = false;
         }
         if let Some(type_id) = self.retype_edges.lock().unwrap().clone() {
             for edge in &mut response.edges {
@@ -1325,6 +1336,48 @@ async fn a_profile_read_cut_short_for_another_reason_is_internal() {
             "{reason:?}: {read:?}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_read_that_saw_more_than_one_graph_state_is_sent_again() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.torn_reads.store(2, Ordering::SeqCst);
+
+    let read = GraphProfileSource::new(
+        Arc::clone(&scripted) as Arc<dyn GraphStorageClientV1>,
+        Arc::new(PayloadCounter),
+    )
+    .read(&profiles.ctx, profiles.tenant, profiles.subject)
+    .await
+    .unwrap();
+
+    assert_eq!(read.facts.len(), 1);
+    assert_eq!(scripted.reads.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
+async fn a_write_whose_reads_never_see_one_graph_state_is_unavailable_and_sends_nothing() {
+    let profiles = Profiles::new();
+    profiles.given(None, vec![add_skill("Rust")]).await;
+    let scripted = Scripted::over(Arc::clone(&profiles.client));
+    scripted.torn_reads.store(u32::MAX, Ordering::SeqCst);
+
+    let written = profiles
+        .scripted_writer(&scripted)
+        .write(
+            &profiles.ctx,
+            &profiles.plan(Some(1), vec![add_skill("Go")]),
+        )
+        .await;
+
+    assert!(
+        matches!(written, Err(DomainError::Unavailable(_))),
+        "{written:?}"
+    );
+    assert_eq!(scripted.reads.lock().unwrap().len(), 3);
+    assert_eq!(scripted.ingest_calls.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]

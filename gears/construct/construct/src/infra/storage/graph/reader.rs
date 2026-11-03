@@ -31,6 +31,10 @@ pub const MAX_PROFILE_NODES: u32 = 1000;
 /// in one read.
 pub const MAX_FACTS: usize = MAX_PROFILE_NODES as usize - 1;
 
+/// How often a profile read is sent when graph storage answers that the read
+/// saw more than one graph state: a write landed while it ran.
+const SNAPSHOT_TRIES: u32 = 3;
+
 /// A profile as graph storage holds it: the root's version and removal list,
 /// none for a subject without a profile, and every live fact node, also those
 /// the root lists for removal whose soft delete has not run yet.
@@ -60,7 +64,8 @@ fn read_refused(err: &CanonicalError) -> DomainError {
 /// [`DomainError::ProfileFull`] when the profile is larger than one read
 /// takes; internal when graph storage cut the read short for another reason
 /// or refuses the read's node budget; unavailable when graph storage does not
-/// answer in time; any other failure as [`super::graph_error`] maps it.
+/// answer in time or no read of [`SNAPSHOT_TRIES`] saw one graph state; any
+/// other failure as [`super::graph_error`] maps it.
 pub(crate) async fn read_stored(
     client: &dyn GraphStorageClientV1,
     versions: &dyn ProfileVersion,
@@ -78,10 +83,30 @@ pub(crate) async fn read_stored(
         node_type_patterns: Vec::new(),
         max_nodes: Some(MAX_PROFILE_NODES),
     };
-    let response = tokio::time::timeout(timeout, client.traverse(ctx, request))
-        .await
-        .map_err(|_| unanswered("profile read", timeout))?
-        .map_err(|err| read_refused(&err))?;
+    // Without a snapshot, the root and the facts may come from different
+    // graph states: a fresh version with stale facts would pass the write's
+    // compare-and-set. Such a read is sent again.
+    let mut tries = 1;
+    let response = loop {
+        let response = tokio::time::timeout(timeout, client.traverse(ctx, request.clone()))
+            .await
+            .map_err(|_| unanswered("profile read", timeout))?
+            .map_err(|err| read_refused(&err))?;
+        if response.consistent_snapshot {
+            break response;
+        }
+        if tries == SNAPSHOT_TRIES {
+            return Err(DomainError::Unavailable(format!(
+                "no profile read of subject {} saw one graph state in {SNAPSHOT_TRIES} tries",
+                subject.subject_id
+            )));
+        }
+        tracing::debug!(
+            tries,
+            "construct: a profile read saw more than one graph state"
+        );
+        tries += 1;
+    };
     // @cpt-end:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-traverse
 
     // @cpt-begin:cpt-cf-construct-algo-profile-writer-read:p1:inst-read-root
