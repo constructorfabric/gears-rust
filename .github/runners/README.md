@@ -42,9 +42,13 @@ workflows. The boundary is GitHub's approval gate for workflow runs from
 outside contributors' fork pull requests: approving such a run admits its
 workflow file, so read the workflow changes, `runs-on` included, before
 approving one. The repository policy must require approval for all outside
-contributors, not only first-time ones. A member's fork needs no approval, but
-a member already holds write access, so that is the same trust as a branch
-pushed here.
+contributors, not only first-time ones. That gate does not cover organisation
+members: a member's fork run needs no approval, whatever the member's access to
+this repository, so a member can route a fork pull request onto these runners
+by editing the workflow. Organisation members are the trust scope the runners
+are provided for; the runners are ephemeral and carry nothing beyond the
+read-only cache key. Outside contributors are the ones the approval gate keeps
+out.
 
 Matrix jobs with OS legs route the Linux leg only:
 `${{ matrix.os == 'ubuntu-latest' && (<the rule>) || matrix.os }}`.
@@ -73,11 +77,13 @@ Rust and a download cache for the Cargo registry and git checkouts. Only a
 `push` to `main` writes, through the `ci-trusted` environment, whose secrets
 `CI_CACHE_RW_KEY_ID` and `CI_CACHE_RW_SECRET` hold the read-write key and whose
 deployment-branch policy admits `main` alone; every other run reads with the
-key the runner carries. On a runner without the cache (GitHub-hosted) the
-action prints a notice and does nothing, and the job's `Swatinem/rust-cache`
-step, guarded by `steps.cache.outputs.mode == 'none'`, keeps the registry
-cached there. The action's post step writes `sccache --show-stats` into the job
-summary.
+key the runner carries. A read needs both that key and a reachable cache
+endpoint: on a runner without the key (GitHub-hosted), or one whose endpoint is
+missing or does not answer, the action prints a notice, reports mode `none` and
+the job builds without the shared cache. The job's `Swatinem/rust-cache` step,
+guarded by `steps.cache.outputs.mode == 'none'`, then keeps the registry cached
+through GitHub's cache. The action's post step writes `sccache --show-stats`
+into the job summary.
 
 Workflows that never run on a `push` to `main` (`api_contracts`, `e2e`, `fmt`,
 `gear-scoped-ci`, `gts-validation`, `shear-nightly`) call the action without
@@ -89,8 +95,12 @@ On the self-hosted runners the toolchain and the tools come from the runner
 image: Rust (the `rust-toolchain.toml` pin and the nightly pinned in `ci.yml`
 and `shear-nightly.yml`), protoc, nextest, cargo-llvm-cov, cargo-hack,
 cargo-deny, cargo-shear, cargo-gears, gts-validator, Go, cmake. The install
-steps for these carry `if: runner.environment == 'github-hosted'`, as does
-`jlumbroso/free-disk-space`. Bumping one of these versions in a workflow also
+steps for protoc, nextest, cargo-llvm-cov, cargo-hack, cargo-deny, cargo-shear
+and the pinned nightly carry `if: runner.environment == 'github-hosted'`, as
+does `jlumbroso/free-disk-space`. The `rustup toolchain install` of the
+`rust-toolchain.toml` pin, `actions/setup-go` and the `cargo install` steps run
+everywhere and are no-ops when the image already has the version. Bumping one
+of these versions in a workflow also
 needs the matching change in the runner image, which the platform owners
 rebuild weekly; until then the self-hosted run uses the image's version
 (`cargo install` steps, as in `gts-validation.yml`, compile the requested one
