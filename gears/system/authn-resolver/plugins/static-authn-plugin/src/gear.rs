@@ -5,36 +5,44 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use authn_resolver_sdk::{AuthNResolverPluginClient, AuthNResolverPluginSpecV1};
 use toolkit::Gear;
-use toolkit::client_hub::ClientScope;
 use toolkit::context::GearCtx;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use tracing::info;
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
 use crate::config::StaticAuthNPluginConfig;
 use crate::domain::Service;
 
-/// Static `AuthN` resolver plugin gear.
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.static_authn_resolver.plugin.v1";
+
+/// Static token-to-identity `AuthN` plugin.
 ///
-/// Provides token-to-identity mapping from configuration.
-///
-/// **Plugin registration pattern:**
-/// - Gateway registers the plugin schema (GTS type definition)
-/// - This plugin registers its instance (implementation metadata)
-/// - This plugin registers its scoped client (implementation in `ClientHub`)
+/// The runtime publishes the instance built from the configuration
+/// (`entities`) and calls `init` only once it is admitted; `init` binds the
+/// scoped client to the admitted instance.
 #[toolkit::gear(
     name = "static-authn-plugin",
-    deps = [types_registry]
+    gts_publication(entities = Self::plugin_instance),
 )]
+#[derive(Default)]
 pub struct StaticAuthNPlugin {
-    service: OnceLock<Arc<Service>>,
+    service: OnceLock<Arc<dyn AuthNResolverPluginClient>>,
 }
 
-impl Default for StaticAuthNPlugin {
-    fn default() -> Self {
-        Self {
-            service: OnceLock::new(),
-        }
+impl StaticAuthNPlugin {
+    /// The publication's config-only documents: the plugin instance.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let cfg: StaticAuthNPluginConfig = inputs.config_expanded_or_default()?;
+        let (id, document) = PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            cfg.vendor,
+            cfg.priority,
+        )?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
     }
 }
 
@@ -59,34 +67,20 @@ impl Gear for StaticAuthNPlugin {
             "Loaded plugin configuration"
         );
 
-        // Build registration payload and instance id for this plugin.
-        let (instance_id, instance_json) =
-            PluginV1::<AuthNResolverPluginSpecV1>::build_registration(
-                "cf.builtin.static_authn_resolver.plugin.v1",
-                cfg.vendor.clone(),
-                cfg.priority,
-            )?;
-
-        // Publish to types-registry.
-        let registry = ctx.client_hub().get::<dyn TypesRegistryClient>()?;
-        let results = registry.register(vec![instance_json]).await?;
-        RegisterResult::ensure_all_ok(&results)?;
-
-        // Create service from config
-        let service = Arc::new(Service::from_config(&cfg));
+        let service: Arc<dyn AuthNResolverPluginClient> = Arc::new(Service::from_config(&cfg));
         self.service
-            .set(service.clone())
+            .set(Arc::clone(&service))
             .map_err(|_| anyhow::anyhow!("{} gear already initialized", Self::MODULE_NAME))?;
-
-        // Register scoped client in ClientHub
-        let api: Arc<dyn AuthNResolverPluginClient> = service;
-        ctx.client_hub()
-            .register_scoped::<dyn AuthNResolverPluginClient>(
-                ClientScope::gts_id(&instance_id),
-                api,
-            );
-
-        info!(instance_id = %instance_id);
-        Ok(())
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it.
+        bind_plugin_instances::<AuthNResolverPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &service,
+        )
     }
 }
+
+#[cfg(test)]
+#[path = "gear_tests.rs"]
+mod gear_tests;

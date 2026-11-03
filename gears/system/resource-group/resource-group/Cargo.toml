@@ -66,9 +66,9 @@ thiserror = { workspace = true }
 # AuthZ
 authz-resolver-sdk = { workspace = true, features = ["rest-client"] }
 
-# GTS type system — types registry for schema resolution
+# GTS type system — types registry for schema resolution, over the client a
+# types-registry linked into the same process registers (not linked from here).
 types-registry-sdk = { workspace = true }
-types-registry = { workspace = true }
 gts = { workspace = true }
 
 # Local dependencies

@@ -167,6 +167,30 @@ fn default_enabled() -> bool {
     true
 }
 
+/// The GTS publication's view of the configuration: whether the plugin is
+/// enabled, and the vendor and priority of its instance. Config-only: it
+/// reads no secret and needs no Keycloak or `CredStore`, so the runtime builds
+/// the manifest before any `init`. Defaults match [`KeycloakIdpPluginConfig`].
+#[derive(Debug, Deserialize)]
+pub struct KeycloakIdpPluginInstanceProbe {
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    #[serde(default = "default_vendor")]
+    pub vendor: String,
+    #[serde(default = "default_priority")]
+    pub priority: i16,
+}
+
+impl Default for KeycloakIdpPluginInstanceProbe {
+    fn default() -> Self {
+        Self {
+            enabled: default_enabled(),
+            vendor: default_vendor(),
+            priority: default_priority(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, ExpandVars)]
 #[serde(deny_unknown_fields)]
 pub struct KeycloakIdpPluginConfig {

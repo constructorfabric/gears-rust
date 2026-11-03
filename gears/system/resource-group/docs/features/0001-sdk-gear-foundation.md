@@ -215,8 +215,8 @@ Each persistence adapter (type, group, closure, membership) **MUST** be defined 
 The system **MUST** provide an RG gear annotated with `#[toolkit::gear]` that registers SDK clients in ClientHub and establishes the phased initialization order for circular dependency resolution with AuthZ.
 
 **Required behavior**:
-- Phase 1 (SystemCapability): register `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub. REST/gRPC endpoints NOT yet accepting traffic.
-- Phase 2 (ready): start accepting REST/gRPC traffic. Write operations can now call `PolicyEnforcer` → `AuthZResolverApi` (available since AuthZ init in Phase 1).
+- Application `init`: register `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy` in ClientHub, without calling AuthZ. RG does not declare `system`.
+- After application initialization and client wiring, attach REST/gRPC routes. Write operations use `PolicyEnforcer` → `AuthZResolverApi`; AuthZ plugin selection is lazy. This ordering does not imply completion of every gear’s business bootstrap.
 - ClientHub registration: single `RgService` implementation registered as both `dyn ResourceGroupClient` and `dyn ResourceGroupReadHierarchy`.
 - Query profile configuration loaded from gear config (`max_depth`, `max_width`).
 

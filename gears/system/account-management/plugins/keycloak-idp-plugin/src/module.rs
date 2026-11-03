@@ -6,12 +6,14 @@ use account_management_sdk::IdpPluginSpecV1;
 use account_management_sdk::idp::IdpPluginClient;
 use async_trait::async_trait;
 use credstore_sdk::SecretRef;
-use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
+use toolkit::gts_publication::GtsPublicationInputs;
+use toolkit::plugins::bind_plugin_instances;
 use toolkit::{Gear, context::GearCtx};
-use types_registry_sdk::{RegisterResult, TypesRegistryClient};
 
-use crate::config::{KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe};
+use crate::config::{
+    KeycloakIdpPluginConfig, KeycloakIdpPluginEnabledProbe, KeycloakIdpPluginInstanceProbe,
+};
 use crate::domain::credstore::{CredStoreReader, CredStoreWriter};
 use crate::domain::kc::factory::KeycloakAdminClientFactory;
 use crate::domain::metadata_codec::MetadataCodec;
@@ -28,22 +30,50 @@ use crate::idp_impl::KeycloakIdpPlugin;
 use crate::infra::kc_http::ReqwestKcTransport;
 use crate::infra::metrics::build_default_adapter;
 
-// `account-management-sdk` is a Rust SDK dep (Cargo.toml); the plugin
-// publishes a `PluginV1<IdpPluginSpecV1>` instance to types-registry
-// at init and registers `Arc<dyn IdpPluginClient>` in ClientHub under
-// `register_scoped(scope = gts_id)`. AM's `Gear::init` resolves it
-// via `choose_plugin_instance` + `get_scoped` against the configured
-// `idp.vendor` (default `"cf"`, deploys override to `"keycloak"` to
-// pick this plugin).
-//
-// NO toolkit runtime `deps` entry for `account-management` because
-// the host process may legitimately not load that module (e.g. this
-// dev/PoC build) and the plugin must still install. `types-registry`
-// IS declared as a dep because the catalogue publish is a hard
-// prerequisite of the AM-side scoped resolution.
-#[toolkit::gear(name = "keycloak-idp-plugin", deps = [types_registry, credstore])]
+/// The GTS segment of this plugin's instance.
+const INSTANCE_SEGMENT: &str = "cf.builtin.keycloak_idp.plugin.v1";
+
+/// Keycloak `IdP` plugin. Set AM's `idp.vendor` to `"keycloak"` to select it.
+/// No runtime dependency on account-management: the host may omit AM.
+///
+/// The runtime publishes the `PluginV1<IdpPluginSpecV1>` instance built from
+/// the configuration (`entities`), to a local or remote registry, before any
+/// application `init`. `init` builds the transport (reading the optional TLS
+/// CA bundle from `CredStore`), pre-warms the bootstrap admin token — failing
+/// fast as before — and binds the scoped `IdpPluginClient` to the admitted
+/// instance.
+#[toolkit::gear(
+    name = "keycloak-idp-plugin",
+    deps = [credstore],
+    gts_publication(entities = Self::plugin_instance),
+)]
 #[derive(Default)]
 pub struct KeycloakIdpPluginGear;
+
+impl KeycloakIdpPluginGear {
+    /// The publication's config-only documents: the plugin instance, unless
+    /// the plugin is disabled.
+    fn plugin_instance(
+        inputs: &GtsPublicationInputs<'_>,
+    ) -> anyhow::Result<Vec<(String, serde_json::Value)>> {
+        let probe: KeycloakIdpPluginInstanceProbe = inputs.config_or_default()?;
+        if !probe.enabled {
+            return Ok(Vec::new());
+        }
+        // `vendor` and `priority` are what AM's `choose_plugin_instance`
+        // matches against `account-management.idp.vendor`. The segment
+        // distinguishes this plugin from `static-idp-plugin`
+        // (`cf.builtin.static_idp.plugin.v1`); both sit in `cf.builtin`, and the
+        // vendor knob, not the namespace, selects between them.
+        let (id, document) = PluginV1::<IdpPluginSpecV1>::build_registration(
+            INSTANCE_SEGMENT,
+            probe.vendor,
+            probe.priority,
+        )
+        .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
+        Ok(vec![(id.as_ref().to_owned(), document)])
+    }
+}
 
 #[async_trait]
 impl Gear for KeycloakIdpPluginGear {
@@ -203,69 +233,6 @@ impl Gear for KeycloakIdpPluginGear {
             Arc::clone(&failure_metrics),
         ));
 
-        // ---- Plugin root + types-registry catalogue publish +
-        //      scoped ClientHub registration. ----
-        //
-        // Build the `PluginV1<IdpPluginSpecV1>` instance carrying
-        // (vendor, priority) so AM's `choose_plugin_instance` filter
-        // can match against `account-management.idp.vendor`. The
-        // instance segment `cf.builtin.keycloak_idp.plugin.v1` is the
-        // suffix that distinguishes this plugin from the in-process
-        // `static-idp-plugin` (which publishes as
-        // `cf.builtin.static_idp.plugin.v1`). Both sit in the
-        // `cf.builtin` namespace; the vendor knob, not the namespace,
-        // is what selects between them.
-        let (instance_id, instance_json) = PluginV1::<IdpPluginSpecV1>::build_registration(
-            "cf.builtin.keycloak_idp.plugin.v1",
-            cfg.vendor.clone(),
-            cfg.priority,
-        )
-        .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: build_registration: {e}"))?;
-
-        // Publish to types-registry. Idempotent restart: treat
-        // `AlreadyExists` as success ONLY when the stored spec
-        // matches our current serialised instance — otherwise fail
-        // immediately so a stale catalogue entry surfaces as an
-        // operator-actionable error rather than a silent drift.
-        // Mirrors the pattern in `static-idp-plugin` and the AM-
-        // owned TR plugin in `account-management::module`.
-        let registry = ctx
-            .client_hub()
-            .get::<dyn TypesRegistryClient>()
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: get TypesRegistryClient: {e}"))?;
-        let results = registry
-            .register(vec![instance_json.clone()])
-            .await
-            .map_err(|e| anyhow::anyhow!("keycloak-idp-plugin: types-registry register: {e}"))?;
-        for result in &results {
-            if let RegisterResult::Err { error, .. } = result {
-                if matches!(
-                    error,
-                    toolkit::api::canonical_prelude::CanonicalError::AlreadyExists { .. }
-                ) {
-                    let existing =
-                        registry
-                            .get_instance(instance_id.as_ref())
-                            .await
-                            .map_err(|e| {
-                                anyhow::anyhow!(
-                                    "keycloak-idp-plugin: verify existing instance: {e}"
-                                )
-                            })?;
-                    if existing.object != instance_json {
-                        return Err(anyhow::anyhow!(
-                            "keycloak-idp-plugin: instance `{instance_id}` already registered \
-                             with a different spec — refusing to silently drift",
-                        ));
-                    }
-                } else {
-                    return Err(anyhow::anyhow!(
-                        "keycloak-idp-plugin: types-registry registration failed: {error}"
-                    ));
-                }
-            }
-        }
-
         let plugin = Arc::new(KeycloakIdpPlugin {
             tenant_facade,
             user_facade,
@@ -277,23 +244,24 @@ impl Gear for KeycloakIdpPluginGear {
         // methods are part of `IdpPluginClient`, so the single scoped
         // registration below carries them along with tenant and user
         // lifecycle. AM resolves one client for all three halves.
-
+        //
+        // The instance was admitted before `init`: bind the scoped client to
+        // it, as the admitted manifest lists it. AM resolves it via
+        // `ClientHub::get_scoped::<dyn IdpPluginClient>` after selecting this
+        // instance through `choose_plugin_instance`.
         let plugin_dyn: Arc<dyn IdpPluginClient> = plugin;
-        // Scoped registration keyed on the catalogue instance id
-        // (`ClientScope::gts_id`). AM resolves via
-        // `ClientHub::get_scoped::<dyn IdpPluginClient>` after
-        // selecting this instance through `choose_plugin_instance`
-        // — see `account_management::module::resolve_idp_plugin`.
-        ctx.client_hub()
-            .register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&instance_id), plugin_dyn);
+        bind_plugin_instances::<IdpPluginSpecV1, _>(
+            &ctx.client_hub(),
+            ctx.gts_publication_manifest()?.documents(),
+            &plugin_dyn,
+        )?;
 
         tracing::info!(
             module = "keycloak-idp-plugin",
             keycloak_base_url = %cfg.keycloak.base_url,
             vendor = %cfg.vendor,
             priority = cfg.priority,
-            instance_id = %instance_id,
-            "published PluginV1<IdpPluginSpecV1>, registered scoped IdpPluginClient (tenant, user, and machine-identity halves)"
+            "registered scoped IdpPluginClient (tenant, user, and machine-identity halves)"
         );
 
         Ok(())

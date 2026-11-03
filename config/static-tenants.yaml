@@ -35,6 +35,10 @@ gears:
       auth_disabled: true  # Uses DEFAULT_TENANT_ID from toolkit-security
 
   types-registry:
+    # The tenant-resolver plugins publish through the database-backed registry API.
+    database:
+      server: "sqlite_test"
+      file: "types_registry.db"
     config: {}
 
   static-tr-plugin:

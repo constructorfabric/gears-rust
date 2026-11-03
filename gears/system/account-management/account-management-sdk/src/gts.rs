@@ -115,8 +115,9 @@ pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.
 // AM base envelope schema registration
 // ---------------------------------------------------------------------------
 //
-// Registered AM-owned base envelopes (boot-time, via the link-time
-// `toolkit_gts` inventory the `#[gts_type_schema]` macro populates):
+// Registered AM-owned base envelopes (published by AM from this crate's
+// collector, which `toolkit_gts::local::gts_type_schema` populates alongside
+// the process-wide inventory):
 //
 //   * `gts.cf.core.am.tenant_metadata.v1~` and
 //     `gts.cf.core.am.tenant_type.v1~` -- the abstract trait-carrier
@@ -148,7 +149,8 @@ pub const USER_RG_TYPE_CODE: &str = gts_id!("cf.core.rg.type.v1~cf.core.am.user.
 
 use schemars::JsonSchema;
 use toolkit::gts::PluginV1;
-use toolkit_gts::{GtsTraitsSchema, gts_id, gts_type_schema};
+use toolkit_gts::local::gts_type_schema;
+use toolkit_gts::{GtsTraitsSchema, gts_id};
 
 /// GTS Type Schema mirror for the AM `IdpUser` resource type
 /// (`gts.cf.core.am.user.v1~`).

@@ -2,7 +2,8 @@
 //!
 //! Declares every AM-grantable permission as an [`AuthzPermissionV1`] GTS
 //! instance via [`gts_instance!`]. Each invocation submits an
-//! [`InventoryInstance`]; `types-registry::init()` aggregates them at boot.
+//! [`InventoryInstance`] to this crate's collector, which AM publishes itself, and to
+//! the process-wide inventory an embedded `types-registry::init()` still aggregates.
 //! `resource_type` values come from the `account_management_sdk` resource-type
 //! consts; `action` values come from each service's `pep::actions` — the same
 //! constants the `PolicyEnforcer` gate passes — so the catalog cannot drift
@@ -12,13 +13,14 @@
 //!
 //! [`AuthzPermissionV1`]: toolkit_gts::AuthzPermissionV1
 //! [`InventoryInstance`]: toolkit_gts::InventoryInstance
-//! [`gts_instance!`]: toolkit_gts::gts_instance
+//! [`gts_instance!`]: toolkit_gts::local::gts_instance
 
 use account_management_sdk::{
     CONVERSION_REQUEST_RESOURCE_TYPE, SERVICE_ACCOUNT_RESOURCE_TYPE, TENANT_METADATA_RESOURCE_TYPE,
     TENANT_RESOURCE_TYPE, USER_RESOURCE_TYPE,
 };
-use toolkit_gts::{AuthzPermissionV1, gts_instance};
+use toolkit_gts::AuthzPermissionV1;
+use toolkit_gts::local::gts_instance;
 
 use crate::domain::conversion::service::pep::actions as conversion_actions;
 use crate::domain::metadata::service::pep::actions as metadata_actions;

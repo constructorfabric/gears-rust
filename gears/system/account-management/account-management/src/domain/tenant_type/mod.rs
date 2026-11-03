@@ -4,7 +4,7 @@
 //! [`crate::domain::tenant::service::TenantService::create_tenant`] at
 //! saga step 3 (`inst-algo-saga-type-check`). Production wiring resolves
 //! the trait via [`crate::infra::types_registry::GtsTenantTypeChecker`]
-//! against `types_registry_sdk::TypesRegistryClient` (the `ClientHub`
+//! against `types_registry_sdk::TypesRegistryApi`, for each request's caller (the `ClientHub`
 //! binding is wired in the AM gear entry-point
 //! [`crate::gear::AccountManagementGear`]); dev / test wiring uses
 //! [`InertTenantTypeChecker`].

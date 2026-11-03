@@ -36,25 +36,33 @@ use gts::GtsTypeId;
 use toolkit::ClientHub;
 use toolkit::client_hub::ClientScope;
 use toolkit::gts::PluginV1;
+use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::{MockTypesRegistryClient, make_test_instance};
+use types_registry_sdk::testing_platform::{Call, Fault, MockTypesRegistry};
 use uuid::Uuid;
 
 use super::{LazyIdpProvider, NoopIdpProvider};
 
-/// Build a `(instance_id, GtsInstance)` pair for a synthetic `IdP`
+/// Build an `(instance_id, content)` pair for a synthetic `IdP`
 /// plugin advertisement.
 fn build_instance(
     instance_segment: &str,
     vendor: &str,
     priority: i16,
-) -> (String, types_registry_sdk::GtsInstance) {
+) -> (String, serde_json::Value) {
     let (id, payload) =
         PluginV1::<IdpPluginSpecV1>::build_registration(instance_segment, vendor, priority)
             .expect("build_registration must succeed for the marker spec");
-    let gts_id = id.as_ref().to_owned();
-    let instance = make_test_instance(&gts_id, payload);
-    (gts_id, instance)
+    (id.as_ref().to_owned(), payload)
+}
+
+/// A platform registry holding the given advertisements.
+fn registry_with(instances: Vec<(String, serde_json::Value)>) -> Arc<MockTypesRegistry> {
+    let registry = Arc::new(MockTypesRegistry::new());
+    for (id, content) in instances {
+        registry.seed(&id, content);
+    }
+    registry
 }
 
 /// Synthetic `IdpProvisionTenantRequest` -- content is irrelevant,
@@ -208,7 +216,7 @@ impl IdpPluginClient for RecordingIdpPlugin {
 #[tokio::test]
 async fn forwards_every_idp_trait_method_to_the_resolved_plugin() {
     let (gts_id, instance) = build_instance("cf.builtin.lazy_all.plugin.v1", "cf", 100);
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let registry = registry_with(vec![(gts_id.clone(), instance)]);
     let hub = Arc::new(ClientHub::new());
     let recorder = Arc::new(RecordingIdpPlugin::default());
     let plugin: Arc<dyn IdpPluginClient> = recorder.clone();
@@ -318,7 +326,7 @@ async fn forwards_every_idp_trait_method_to_the_resolved_plugin() {
 #[tokio::test]
 async fn resolves_and_forwards_when_vendor_matches() {
     let (gts_id, instance) = build_instance("cf.builtin.lazy_idp_test.plugin.v1", "cf", 100);
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let registry = registry_with(vec![(gts_id.clone(), instance)]);
     let hub = Arc::new(ClientHub::new());
     let plugin: Arc<dyn IdpPluginClient> = Arc::new(NoopIdpProvider);
     hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&gts_id), plugin);
@@ -337,10 +345,10 @@ async fn resolves_and_forwards_when_vendor_matches() {
 
     // Cache pin: registry should have been queried exactly once (the
     // `GtsPluginSelector` caches the gts_id on Ok).
-    let queries_before = registry.list_instance_calls();
+    let queries_before = registry.calls(Call::List);
     drop(lazy.provision_tenant(&ctx(), &request()).await);
     assert_eq!(
-        registry.list_instance_calls(),
+        registry.calls(Call::List),
         queries_before,
         "second call MUST hit the cached gts_id; no additional list_instances"
     );
@@ -355,8 +363,8 @@ async fn surfaces_clean_failure_when_required_and_vendor_misses() {
     // deployment-shaped string -- the test uses `alt-vendor` so the
     // upstream test never references any specific downstream IdP
     // plugin's vendor identifier.
-    let (_, instance) = build_instance("cf.builtin.lazy_idp_test.plugin.v1", "cf", 100);
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let (id, instance) = build_instance("cf.builtin.lazy_idp_test.plugin.v1", "cf", 100);
+    let registry = registry_with(vec![(id, instance)]);
     let hub = Arc::new(ClientHub::new());
 
     let lazy = LazyIdpProvider::new(hub, registry, "alt-vendor".into(), true);
@@ -382,8 +390,8 @@ async fn falls_back_to_noop_when_not_required_and_vendor_misses() {
     // Same setup, but `required = false` — wrapper delegates to
     // NoopIdpProvider which surfaces UnsupportedOperation
     // (HTTP 501, permanent, distinct from the 503 retryable shape).
-    let (_, instance) = build_instance("cf.builtin.lazy_idp_test.plugin.v1", "cf", 100);
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let (id, instance) = build_instance("cf.builtin.lazy_idp_test.plugin.v1", "cf", 100);
+    let registry = registry_with(vec![(id, instance)]);
     let hub = Arc::new(ClientHub::new());
 
     let lazy = LazyIdpProvider::new(hub, registry, "alt-vendor".into(), false);
@@ -401,18 +409,21 @@ async fn falls_back_to_noop_when_not_required_and_vendor_misses() {
 
 #[tokio::test]
 async fn priority_tiebreak_within_same_vendor_lower_wins() {
-    // Two cf-vendor instances. ONLY the winner (priority=50) has its
-    // scope registered in the hub. Wrapper selects winner via
-    // priority tiebreak → forwards successfully. If it had picked
-    // the loser (priority=100) the scoped get would miss and the
-    // wrapper would surface CleanFailure.
+    // Two running cf-vendor instances. The winner (priority=50) forwards
+    // to `NoopIdpProvider` (UnsupportedOperation); the loser records
+    // every call it receives and must receive none.
     let (winner_id, winner_inst) = build_instance("cf.builtin.lazy_first.plugin.v1", "cf", 50);
-    let (_loser_id, loser_inst) = build_instance("cf.builtin.lazy_second.plugin.v1", "cf", 100);
-    let registry =
-        Arc::new(MockTypesRegistryClient::new().with_instances([winner_inst, loser_inst]));
+    let (loser_id, loser_inst) = build_instance("cf.builtin.lazy_second.plugin.v1", "cf", 100);
+    let registry = registry_with(vec![
+        (winner_id.clone(), winner_inst),
+        (loser_id.clone(), loser_inst),
+    ]);
     let hub = Arc::new(ClientHub::new());
     let plugin: Arc<dyn IdpPluginClient> = Arc::new(NoopIdpProvider);
     hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&winner_id), plugin);
+    let loser = Arc::new(RecordingIdpPlugin::default());
+    let loser_plugin: Arc<dyn IdpPluginClient> = loser.clone();
+    hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&loser_id), loser_plugin);
 
     let lazy = LazyIdpProvider::new(hub, registry, "cf".into(), true);
     let err = lazy
@@ -423,6 +434,10 @@ async fn priority_tiebreak_within_same_vendor_lower_wins() {
         err.as_metric_label(),
         "unsupported_operation",
         "winner forwarded → trait default UnsupportedOperation; got {err:?}"
+    );
+    assert!(
+        loser.calls().is_empty(),
+        "the lower-priority plugin is not called"
     );
 }
 
@@ -437,7 +452,7 @@ async fn does_not_cache_resolution_failure_so_late_registration_recovers() {
     //
     // Pin: register scope AFTER first call, second call succeeds.
     let (gts_id, instance) = build_instance("cf.builtin.lazy_late.plugin.v1", "cf", 100);
-    let registry = Arc::new(MockTypesRegistryClient::new().with_instances([instance]));
+    let registry = registry_with(vec![(gts_id.clone(), instance)]);
     let hub = Arc::new(ClientHub::new());
     let lazy = LazyIdpProvider::new(Arc::clone(&hub), registry, "cf".into(), true);
 
@@ -462,4 +477,59 @@ async fn does_not_cache_resolution_failure_so_late_registration_recovers() {
         "unsupported_operation",
         "wrapper MUST retry resolution after partial failure recovered"
     );
+}
+
+#[tokio::test]
+async fn skips_a_stored_instance_whose_plugin_is_not_running() {
+    // An earlier boot published a winning instance; its plugin is disabled
+    // now, so only the running one is a candidate.
+    let (stale_id, stale) = build_instance("cf.builtin.lazy_stale.plugin.v1", "cf", 0);
+    let (running_id, running) = build_instance("cf.builtin.lazy_running.plugin.v1", "cf", 100);
+    let registry = registry_with(vec![(stale_id, stale), (running_id.clone(), running)]);
+    let hub = Arc::new(ClientHub::new());
+    let plugin: Arc<dyn IdpPluginClient> = Arc::new(NoopIdpProvider);
+    hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(&running_id), plugin);
+
+    let lazy = LazyIdpProvider::new(hub, registry, "cf".into(), true);
+    let err = lazy
+        .provision_tenant(&ctx(), &request())
+        .await
+        .expect_err("forwarded to the running plugin");
+    assert_eq!(
+        err.as_metric_label(),
+        "unsupported_operation",
+        "got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_failed_discovery_page_is_unresolvable_not_a_partial_selection() {
+    let mut instances = Vec::new();
+    for n in 0..60 {
+        instances.push(build_instance(
+            &format!("cf.builtin.lazy_a{n:02}.plugin.v1"),
+            "cf",
+            100,
+        ));
+    }
+    let (winner_id, winner) = build_instance("cf.builtin.lazy_zz.plugin.v1", "cf", 1);
+    instances.push((winner_id, winner));
+    let hub = Arc::new(ClientHub::new());
+    for (id, _) in &instances {
+        let plugin: Arc<dyn IdpPluginClient> = Arc::new(NoopIdpProvider);
+        hub.register_scoped::<dyn IdpPluginClient>(ClientScope::gts_id(id), plugin);
+    }
+    let registry = registry_with(instances);
+    registry.inject(
+        Fault::on(Call::List)
+            .nth(2)
+            .fail(CanonicalError::service_unavailable().create()),
+    );
+
+    let lazy = LazyIdpProvider::new(hub, registry, "cf".into(), true);
+    let err = lazy
+        .provision_tenant(&ctx(), &request())
+        .await
+        .expect_err("a failed page leaves the plugin unresolved");
+    assert_eq!(err.as_metric_label(), "clean_failure", "got {err:?}");
 }

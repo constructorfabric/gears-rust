@@ -4,10 +4,9 @@
 //! repository and `FakeIdpProvisioner` for the `IdP` plugin trait -- and
 //! exercise the saga's classify / IdP-wait / finalize / compensate
 //! branches without touching the DB or the network. Tests that need a
-//! `TypesRegistryClient` use the inline [`StubTypesRegistry`] below
-//! (returns one canned `GtsTypeSchema` from `get_type_schema` and
-//! `unreachable!()` for every other method on the 13-method trait;
-//! bootstrap only consults `get_type_schema` during preflight).
+//! registry use [`StubTypesRegistry`] below: a `MockTypesRegistry`
+//! holding the platform root tenant type and the tenant projection
+//! schema, the two Type Schemas bootstrap reads.
 //!
 //! `tokio::time::pause()` is used wherever the saga's wait/backoff
 //! envelope would otherwise stall the test on real wall-clock sleeps.
@@ -27,20 +26,12 @@ use crate::domain::tenant::model::{TenantModel, TenantStatus};
 use crate::domain::tenant::test_support::{
     FakeDeprovisionOutcome, FakeIdpProvisioner, FakeOutcome, FakeTenantRepo,
 };
-use async_trait::async_trait;
-use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
-use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
-use types_registry_sdk::{
-    GtsInstance, GtsTypeId, GtsTypeSchema, InstanceQuery, RegisterResult, TypeSchemaQuery,
-    TypesRegistryClient,
-};
 use uuid::Uuid;
 
 const ROOT_ID_RAW: u128 = 0x100;
-const TENANT_TYPE_SCHEMA: &str = gts_id!("cf.core.am.tenant_type.v1~");
 const TENANT_SCHEMA: &str = gts_id!("cf.core.am.tenant.v1~");
 const TENANT_TYPE_UUID_RAW: u128 = 0xAA;
 const ROOT_TENANT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
@@ -113,145 +104,13 @@ fn make_bootstrap(
     (idp, svc)
 }
 
-/// Minimal `TypesRegistryClient` whose `get_type_schema` returns a
-/// canned AM-prefixed schema with empty `allowed_parent_types`. Every
-/// other method on the 13-method trait is `unreachable!()` because
-/// bootstrap only consults `get_type_schema` during preflight (the
-/// `NoRoot` saga path).
+/// The registry bootstrap preflight reads: see
+/// [`bootstrap_registry`](crate::infra::types_registry::test_helpers::bootstrap_registry).
 struct StubTypesRegistry;
 
 impl StubTypesRegistry {
-    fn arc() -> Arc<dyn TypesRegistryClient> {
-        Arc::new(Self)
-    }
-
-    fn canned_schema() -> GtsTypeSchema {
-        // Return a ROOT-level AM `tenant_type` schema (no parent chain
-        // segment) so `GtsTypeSchema::try_new` does not require a
-        // pre-resolved parent. Bootstrap preflight only inspects the
-        // chain prefix on `type_id` (must start with
-        // the AM tenant-type root schema) and the optional
-        // `x-gts-traits.allowed_parent_types` array (left unset so
-        // the eligibility check passes).
-        GtsTypeSchema::try_new(
-            GtsTypeId::new(TENANT_TYPE_SCHEMA),
-            serde_json::json!({}),
-            None,
-            None,
-        )
-        .expect("canned root schema must construct")
-    }
-
-    /// Canned AM tenant projection schema. Pins the
-    /// `name` field bounds (`minLength: 1, maxLength: 255`) so
-    /// [`crate::domain::gts_validation::validate_tenant_name_via_gts`]
-    /// — called from `insert_root_provisioning` — has a registered
-    /// schema to validate `cfg.root_name` against. Without this the
-    /// helper would short-circuit on `CanonicalError::NotFound` and the
-    /// bounds would not gate the saga in tests.
-    fn canned_tenant_schema() -> GtsTypeSchema {
-        GtsTypeSchema::try_new(
-            GtsTypeId::new(TENANT_SCHEMA),
-            serde_json::json!({
-                "type": "object",
-                "required": ["id", "name"],
-                "properties": {
-                    "id": { "type": "string", "format": "uuid" },
-                    "name": { "type": "string", "minLength": 1, "maxLength": 255 },
-                    "parent_id": { "type": ["string", "null"], "format": "uuid" },
-                },
-            }),
-            None,
-            None,
-        )
-        .expect("canned tenant schema must construct")
-    }
-}
-
-#[async_trait]
-impl TypesRegistryClient for StubTypesRegistry {
-    async fn register(
-        &self,
-        _entities: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn register_type_schemas(
-        &self,
-        _type_schemas: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_type_schema(&self, type_id: &str) -> Result<GtsTypeSchema, CanonicalError> {
-        // Dispatch by the two ids bootstrap consults:
-        //   * `ROOT_TENANT_TYPE` — preflight tenant-type eligibility
-        //     (`preflight_root_tenant_type`).
-        //   * `TENANT_SCHEMA` — `root_name` structural
-        //     validation in `insert_root_provisioning` mirroring the
-        //     `create_tenant` site. Any other id is a wiring regression
-        //     and trips a loud panic, same posture as the previous
-        //     single-id assertion.
-        match type_id {
-            ROOT_TENANT_TYPE => Ok(Self::canned_schema()),
-            TENANT_SCHEMA => Ok(Self::canned_tenant_schema()),
-            other => panic!(
-                "bootstrap queried unexpected type_id `{other}` (expected `{ROOT_TENANT_TYPE}` or `{TENANT_SCHEMA}`)"
-            ),
-        }
-    }
-    async fn get_type_schema_by_uuid(
-        &self,
-        _type_uuid: Uuid,
-    ) -> Result<GtsTypeSchema, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_type_schemas(
-        &self,
-        _type_ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_type_schemas_by_uuid(
-        &self,
-        _type_uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsTypeSchema, CanonicalError>> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn list_type_schemas(
-        &self,
-        _query: TypeSchemaQuery,
-    ) -> Result<Vec<GtsTypeSchema>, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn register_instances(
-        &self,
-        _instances: Vec<serde_json::Value>,
-    ) -> Result<Vec<RegisterResult>, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_instance(&self, _id: &str) -> Result<GtsInstance, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_instance_by_uuid(&self, _uuid: Uuid) -> Result<GtsInstance, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_instances(
-        &self,
-        _ids: Vec<String>,
-    ) -> HashMap<String, Result<GtsInstance, CanonicalError>> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn get_instances_by_uuid(
-        &self,
-        _uuids: Vec<Uuid>,
-    ) -> HashMap<Uuid, Result<GtsInstance, CanonicalError>> {
-        unreachable!("not exercised by bootstrap")
-    }
-    async fn list_instances(
-        &self,
-        _query: InstanceQuery,
-    ) -> Result<Vec<GtsInstance>, CanonicalError> {
-        unreachable!("not exercised by bootstrap")
+    fn arc() -> Arc<dyn PlatformTypesRegistryApi> {
+        crate::infra::types_registry::test_helpers::bootstrap_registry()
     }
 }
 
@@ -1273,4 +1132,80 @@ async fn step3_failure_under_idp_required_keeps_provisioning_row_on_unsupported_
         "row must still be in Provisioning, got status={:?}",
         surviving.status,
     );
+}
+
+// ---------------------------------------------------------------------
+// preflight over the platform registry
+// ---------------------------------------------------------------------
+
+const PLATFORM_ROOT_TYPE: &str = gts_id!("cf.core.am.tenant_type.v1~cf.core.am.platform.v1~");
+
+async fn run_preflight_against(
+    registry: Arc<dyn PlatformTypesRegistryApi>,
+) -> (Arc<FakeIdpProvisioner>, Result<TenantModel, DomainError>) {
+    let (idp, svc) = make_bootstrap(Arc::new(FakeTenantRepo::new()), FakeOutcome::Ok);
+    let result = svc.with_types_registry(registry).run().await;
+    (idp, result)
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_refuses_an_unregistered_root_type() {
+    let registry = Arc::new(types_registry_sdk::testing_platform::MockTypesRegistry::new());
+
+    let (idp, result) = run_preflight_against(registry).await;
+
+    let err = result.expect_err("no root type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(idp.provision_call_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_refuses_a_deleted_root_type() {
+    let registry = crate::infra::types_registry::test_helpers::bootstrap_registry();
+    let content = registry.content(PLATFORM_ROOT_TYPE).expect("seeded");
+    registry.seed_entity(
+        types_registry_sdk::testing_platform::Seed::new(PLATFORM_ROOT_TYPE, content).deleted(),
+    );
+
+    let (idp, result) = run_preflight_against(registry).await;
+
+    let err = result.expect_err("a tombstoned root type");
+    assert!(
+        matches!(err, DomainError::InvalidTenantType { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(idp.provision_call_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_refuses_a_root_type_that_admits_parents() {
+    let registry = crate::infra::types_registry::test_helpers::bootstrap_registry();
+    let mut content = registry.content(PLATFORM_ROOT_TYPE).expect("seeded");
+    content["x-gts-traits"]["allowed_parent_types"] = serde_json::json!([PLATFORM_ROOT_TYPE]);
+    registry.seed(PLATFORM_ROOT_TYPE, content);
+
+    let (idp, result) = run_preflight_against(registry).await;
+
+    let err = result.expect_err("a root type cannot have parents");
+    assert!(
+        matches!(err, DomainError::TypeNotAllowed { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(idp.provision_call_count(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn preflight_treats_a_snapshot_without_effective_traits_as_internal() {
+    let registry = crate::infra::types_registry::test_helpers::Tampered::without_documents(
+        crate::infra::types_registry::test_helpers::bootstrap_registry(),
+    );
+
+    let (idp, result) = run_preflight_against(Arc::new(registry)).await;
+
+    let err = result.expect_err("an incomplete projection is not an empty list");
+    assert!(matches!(err, DomainError::Internal { .. }), "got {err:?}");
+    assert_eq!(idp.provision_call_count(), 0);
 }

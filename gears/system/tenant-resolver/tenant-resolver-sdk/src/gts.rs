@@ -5,7 +5,7 @@
 //! discovered by the gateway.
 
 use toolkit::gts::PluginV1;
-use toolkit_gts::gts_type_schema;
+use toolkit_gts::local::gts_type_schema;
 
 /// GTS type definition for tenant resolver plugin instances.
 ///

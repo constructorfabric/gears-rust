@@ -1,9 +1,16 @@
 # CF/Gears Example Server Configuration
 # Updated to use the new configuration structure
+#
+# No external or persistent database. The embedded types registry uses SQLite
+# in memory to admit the GTS documents its co-hosted resolvers publish.
+# Registry data is discarded when the server stops.
 
 # Core server configuration (global section)
 server:
   home_dir: "~/.cf-gears"
+
+# Enable per-gear database configuration without external database servers.
+database: {}
 
 # Logging configuration (global section)
 logging:
@@ -17,6 +24,13 @@ logging:
 
 # Per-gear configurations using new structure
 gears:
+  types-registry:
+    database:
+      dsn: "sqlite::memory:"
+      pool:
+        min_conns: 1
+        max_conns: 1
+
   api-gateway:
     # No database configuration needed for api-gateway
     config:

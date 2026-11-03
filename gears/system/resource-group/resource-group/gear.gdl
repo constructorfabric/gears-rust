@@ -4,16 +4,20 @@ gdl_version = "1.0"
 #
 # Gearbox product metadata for the resource-group gear.
 #
-# Projected from #[toolkit::gear]: id, runtime_caps (db, rest), colocated_deps
-# (authz-resolver, types-registry). This gear reads no configuration -- there is
+# Projected from #[toolkit::gear]: id, runtime_caps (db, rest). This gear reads no configuration -- there is
 # no `ctx.config*()` call in its `impl Gear` -- so it declares no
 # `config_schema`, which is the right answer rather than a gap.
 
 
 AUTHZ_SDK = cargo(crate_name = "cf-gears-authz-resolver-sdk", lib = "authz_resolver_sdk", path = "../../authz-resolver/authz-resolver-sdk", features = ["rest-client"])
 
+# Local-only registry requirement: `init` reads GTS metadata schemas through the
+# legacy `TypesRegistryClient` of a types-registry linked into the same process (a
+# system gear, so it initializes first). Not a `deps` edge and not a `consumes`: the
+# host links the registry; a host without one fails boot. The move to the new
+# registry API is types-registry T38.
 gear(
-    deps = ["types-registry"],
+    deps = [],
     # The authorization resolver is consumed, not linked: local when co-located,
     # REST with the platform token otherwise.
     consumes = [consume(contract = "AuthZResolverApi", rust = "authz_resolver_sdk::AuthZResolverApi", sdk = AUTHZ_SDK)],

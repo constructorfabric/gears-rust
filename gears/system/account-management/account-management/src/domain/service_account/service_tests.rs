@@ -37,8 +37,7 @@ use time::OffsetDateTime;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_gts::gts_id;
 use toolkit_security::SecurityContext;
-use types_registry_sdk::testing::MockTypesRegistryClient;
-use types_registry_sdk::{GtsTypeId, GtsTypeSchema};
+use types_registry_sdk::testing_platform::MockTypesRegistry;
 use uuid::Uuid;
 
 use crate::domain::error::{DomainError, UnsupportedResource};
@@ -67,14 +66,10 @@ fn test_tenant_type_uuid() -> Uuid {
         .to_uuid()
 }
 
-fn test_tenant_type_schema() -> GtsTypeSchema {
-    fn build(type_id: &str) -> GtsTypeSchema {
-        let parent = GtsTypeSchema::derive_parent_type_id(type_id)
-            .map(|p| std::sync::Arc::new(build(p.as_ref())));
-        GtsTypeSchema::try_new(GtsTypeId::new(type_id), json!({}), None, parent)
-            .expect("synthetic tenant_type schema is valid")
-    }
-    build(TEST_TENANT_TYPE_ID)
+fn registry_with_test_tenant_type() -> MockTypesRegistry {
+    let registry = MockTypesRegistry::new();
+    registry.seed(TEST_TENANT_TYPE_ID, json!({ "type": "object" }));
+    registry
 }
 
 fn fixed_now() -> OffsetDateTime {
@@ -108,8 +103,7 @@ fn make_service(
     tenants: Arc<FakeTenantRepo>,
     idp: Arc<FakeServiceAccountProvider>,
 ) -> ServiceAccountService {
-    let types_registry =
-        Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+    let types_registry = Arc::new(registry_with_test_tenant_type());
     ServiceAccountService::new(tenants, idp, types_registry, mock_enforcer())
 }
 
@@ -119,8 +113,7 @@ fn make_denied_service(
     tenants: Arc<FakeTenantRepo>,
     idp: Arc<FakeServiceAccountProvider>,
 ) -> ServiceAccountService {
-    let types_registry =
-        Arc::new(MockTypesRegistryClient::new().with_type_schemas([test_tenant_type_schema()]));
+    let types_registry = Arc::new(registry_with_test_tenant_type());
     ServiceAccountService::new(tenants, idp, types_registry, deny_all_enforcer())
 }
 
@@ -312,7 +305,7 @@ async fn tenant_type_resolution_failure_uses_fixed_public_detail() {
     let idp = Arc::new(FakeServiceAccountProvider::new());
     // An empty registry returns a canonical NotFound carrying the requested
     // UUID. The shared guard must retain that text only in its operator log.
-    let types_registry = Arc::new(MockTypesRegistryClient::new());
+    let types_registry = Arc::new(MockTypesRegistry::new());
     let idp_client: Arc<dyn account_management_sdk::IdpPluginClient> = idp.clone();
     let svc = ServiceAccountService::new(tenants, idp_client, types_registry, mock_enforcer());
 
@@ -746,4 +739,49 @@ async fn revoke_denied_by_pdp_never_reaches_the_provider() {
 
     assert!(matches!(err, DomainError::CrossTenantDenied { .. }));
     assert_eq!(idp.revoke_call_count(), 0);
+}
+
+// ---- who registry reads are made for (P33) ------------------------
+
+/// Two callers through one shared service: the tenant guard's
+/// `tenant_type` read is made for exactly the caller of each flow, and
+/// none reaches the platform API.
+#[tokio::test]
+async fn the_tenant_guard_reads_for_each_requests_caller() {
+    use crate::infra::types_registry::test_helpers::{CallerSpy, assert_only_caller, caller_in};
+
+    let tenants = Arc::new(FakeTenantRepo::new());
+    let tenant_id = Uuid::from_u128(0x3);
+    seed_tenant(&tenants, tenant_id, TenantStatus::Active, "acme");
+    let spy = CallerSpy::for_requests(Arc::new(registry_with_test_tenant_type()));
+    let svc = ServiceAccountService::new(
+        tenants,
+        Arc::new(FakeServiceAccountProvider::new()),
+        spy.clone(),
+        mock_enforcer(),
+    );
+
+    for n in [1, 2] {
+        let ctx = caller_in(n, ctx_subject_root());
+        let creds = svc
+            .create(
+                &ctx,
+                tenant_id,
+                "ci".to_owned(),
+                vec!["platform.read".to_owned()],
+            )
+            .await
+            .expect("create");
+        svc.list(&ctx, tenant_id).await.expect("list");
+        svc.rotate_secret(&ctx, tenant_id, &creds.client_id)
+            .await
+            .expect("rotate");
+        svc.revoke(&ctx, tenant_id, &creds.client_id)
+            .await
+            .expect("revoke");
+        assert_eq!(spy.callers().len(), 4, "one tenant guard per flow");
+        assert_only_caller(&spy.callers(), &ctx);
+        spy.clear();
+    }
+    assert_eq!(spy.platform_reads(), 0);
 }

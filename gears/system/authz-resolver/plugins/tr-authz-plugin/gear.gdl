@@ -7,11 +7,13 @@ gdl_version = "1.0"
 # Fills authz-resolver's extension point (`AuthZResolverPluginClient`) by
 # walking the tenant hierarchy through tenant-resolver. The point is declared
 # by `implements`; vendor and priority are read from source, and so is the link to
-# tenant-resolver, which the attribute states as
-# `deps = [types_registry, tenant_resolver]`.
+# tenant-resolver, which the attribute states as `deps = [tenant_resolver]`.
+#
+# Runtime `gts_publication(...)` publication uses the local or remote platform registry API.
+# The instance must be admitted before this application plugin binds its client in `init`.
 
 gear(
-    deps = ["tenant-resolver", "types-registry"],
+    deps = ["tenant-resolver"],
     source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/authz-resolver/plugins/tr-authz-plugin"),
     maturity = "preview",
     name = "Tenant-Resolver AuthZ Plugin",

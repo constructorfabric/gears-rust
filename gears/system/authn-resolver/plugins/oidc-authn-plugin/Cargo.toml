@@ -20,12 +20,11 @@ authn-resolver-sdk = {
     version = "0.3",
     path = "../../authn-resolver-sdk"
 }
+# Publishes through the consumed platform API (local or resolving REST client).
 types-registry-sdk = {
     package = "cf-gears-types-registry-sdk", version = "0.4",
-    path = "../../../types-registry/types-registry-sdk"
+    path = "../../../types-registry/types-registry-sdk", features = ["rest-client"]
 }
-types-registry = { workspace = true }
-authn-resolver = { workspace = true }
 
 # ToolKit dependencies
 toolkit.workspace = true
@@ -84,7 +83,10 @@ base64.workspace = true
 secrecy.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tokio-util.workspace = true
+# The in-memory platform registry the publication tests run against.
+types-registry-sdk = { package = "cf-gears-types-registry-sdk", path = "../../../types-registry/types-registry-sdk", features = ["test-util"] }
 secrecy.workspace = true
 criterion.workspace = true
 httpmock.workspace = true
