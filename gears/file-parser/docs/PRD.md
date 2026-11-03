@@ -73,7 +73,7 @@ The previous implementation had four separate format-specific plugins (`HtmlPars
 | IR (Intermediate Representation) | `ParsedDocument` — the internal data model produced by any parser plugin and consumed by the Markdown renderer |
 | Parser plugin | A Rust struct implementing `FileParserBackend`; declares the extensions it handles and contains all format-specific logic |
 | Parser gateway | `FileParserService` — routes each request to the correct plugin; contains no format-specific logic |
-| kreuzberg | Third-party Rust crate (`=4.9.4`, Elastic-2.0) used by `KreuzbergParser` to handle PDF, HTML, XLSX, and PPTX |
+| kreuzberg | Third-party Rust crate (`=4.10.4`, MIT) used by `KreuzbergParser` to handle PDF, HTML, XLSX, and PPTX |
 | `parse-local` | Endpoint family that parses files already present on the server filesystem |
 | `allowed_local_base_dir` | Mandatory config field constraining which filesystem paths `parse-local` may access |
 | Stub parser | `StubParser` — fallback plugin that returns a placeholder document for unsupported legacy formats |
@@ -153,7 +153,7 @@ Currently registered plugins (in priority order):
 | `ImageParser` | `png`, `jpg`, `jpeg`, `webp`, `gif` |
 | `StubParser` (fallback) | `doc`, `rtf`, `odt`, `xls`, `xlsx`, `ppt`, `pptx` |
 
-**Known limitations of `KreuzbergParser` at kreuzberg 4.9.4**:
+**Known limitations of `KreuzbergParser` (kreuzberg 4.9.4 through 4.10.4)**:
 - PPTX multi-slide presentations: slides are emitted as headings rather than distinct nodes; `PageBreak` blocks between slides are not produced.
 - PPTX tables: structured `Table` blocks are not produced; table cell content is extracted as paragraphs.
 
@@ -275,7 +275,7 @@ Consumer gear requests parsing of a file already present on the server filesyste
 
 | Dependency | Type | Notes |
 |---|---|---|
-| `kreuzberg =4.9.4` | External library (Elastic-2.0, exception in `deny.toml`) | Pinned with `=` to prevent silent upgrades; license exception documented in `deny.toml`. Used by `KreuzbergParser`. |
+| `kreuzberg =4.10.4` | External library (MIT, no `deny.toml` exception) | Pinned with `=` to prevent silent upgrades, since upstream has changed license before; any bump must re-check the license. Used by `KreuzbergParser`. |
 | `pdfium` | Bundled native library | Included via `bundled-pdfium` feature; no separate install required |
 | `docx-rust` | External library (MIT) | Used by `DocxParser` for DOCX extraction |
 | Host filesystem | Runtime | Required for `parse-local` endpoints |
@@ -287,15 +287,15 @@ Consumer gear requests parsing of a file already present on the server filesyste
 - The `bundled-pdfium` feature provides a sufficiently up-to-date PDFium for production PDF parsing.
 - The configured `max_file_size_mb` (default 100 MB) is sufficient for current use cases; revision requires an NFR update.
 - Consumer gears calling `parse-local` are trusted to supply valid paths within `allowed_local_base_dir`.
-- `kreuzberg =4.9.4` will remain available on crates.io for the foreseeable future; any upgrade is a deliberate, reviewed action.
+- `kreuzberg =4.10.4` will remain available on crates.io for the foreseeable future; any upgrade is a deliberate, reviewed action.
 
 ## 12. Risks
 
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
-| kreuzberg Elastic-2.0 license restricts future use | Low | High | Version pinned with `=`; upgrade requires explicit license review; other plugins do not use EL-2.0 |
-| PPTX multi-slide / table limitations persist in future kreuzberg releases | Medium | Low | Tests marked `#[ignore]` with strict assertions; re-evaluate on upgrade |
-| PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; update via kreuzberg upgrade when license permits |
+| kreuzberg upstream relicenses again (it went MIT → EL-2.0 → MIT) | Low | High | Exact `=` pin; upgrade requires explicit license review; `cargo-deny` license allow-list with no exception for kreuzberg |
+| PPTX multi-slide / table limitations persist in future kreuzberg releases | Medium | Low | Tests marked `#[ignore]` with strict assertions (fixtures are required, not skipped); re-evaluate on upgrade — still present at 4.10.4 |
+| PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; the PDFium build is pinned by `PDFIUM_VERSION` in `.cargo/config.toml` — bump it there (re-check e2e goldens) |
 | Large document OOM under concurrency | Low | Medium | Configurable size limit enforced before any plugin is invoked; monitor memory usage in production |
 | Plugin registration order conflict (two plugins claim same extension) | Low | Low | First-match semantics are deterministic; document registration order in `gear.rs` |
 | `docx-rust` does not support all DOCX features | Medium | Low | Known limitation; `DocxParser` extracts text and basic structure; rich formatting may be lost |
@@ -311,3 +311,4 @@ Consumer gear requests parsing of a file already present on the server filesyste
 | 2026-02-17 | 0.3.0 | Security | Added FR `fdd-file-parser-fr-local-path-security-v1` — path-traversal protections for `parse-local`. Rationale: prevent arbitrary file read via path traversal (issue #525). |
 | 2026-04-29 | 0.4.0 | Engineering | Restructured to match cypilot SDLC PRD template. Consolidated four format-specific plugins into `KreuzbergParser` backed by `kreuzberg =4.9.4` (Elastic-2.0). Added `DocxParser` (DOCX), `ImageParser` (PNG/JPG/WebP/GIF), `PlainTextParser` (TXT/MD/LOG). Added inline annotation extraction. Documented kreuzberg 4.9.4 PPTX limitations. |
 | 2026-04-30 | 0.5.0 | Engineering | Rewrote to accurately describe the full gateway+plugin architecture. Corrected Out of Scope (DOCX and images are in scope). Corrected file size limit (100 MB default). Updated Format Support FR to list all registered plugins in priority order. Added Plugin Extensibility FR. Corrected Acceptance Criteria, Dependencies, Assumptions, and Risks to be plugin-generic rather than kreuzberg-specific. Removed incorrect NFR exclusion for DOCX/image SLA. |
+| 2026-11-03 | 0.6.0 | Engineering | Bumped `kreuzberg` `=4.9.8` → `=4.10.4` (MIT again; `deny.toml` Elastic-2.0 exception removed). Re-verified the PPTX multi-slide / table known limitations: still present at 4.10.4. Parser tests now require their fixtures instead of silently skipping (issue #5649). |

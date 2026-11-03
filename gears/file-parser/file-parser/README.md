@@ -43,26 +43,14 @@ This gear is licensed under **Apache-2.0**.
 
 ### Third-party dependency: kreuzberg
 
-This gear depends on [`kreuzberg`](https://github.com/kreuzberg-dev/kreuzberg), pinned at **`=4.9.4`** ([Elastic License 2.0](https://www.elastic.co/licensing/elastic-license)).
+This gear depends on [`kreuzberg`](https://github.com/kreuzberg-dev/kreuzberg), pinned at **`=4.10.4`** (MIT).
 
 | Version range | License |
 |---------------|---------|
 | `≤ 4.7.4` | MIT |
-| `≥ 4.8.0` (including `=4.9.4` used here) | [Elastic License 2.0 (EL-2.0)](https://www.elastic.co/licensing/elastic-license) |
+| `4.8.0` – `4.9.x` | [Elastic License 2.0 (EL-2.0)](https://www.elastic.co/licensing/elastic-license) |
+| `4.10.x` (including `=4.10.4` used here) | MIT |
 
-> ℹ️ **EL-2.0 is permitted for this use case.** The `deny.toml` license policy includes
-> an explicit exception for `kreuzberg =4.9.4` with documented rationale:
-> Gears' document parsing is incidental to the platform — it is not sold as a
-> standalone document-parsing product competing with kreuzberg.
->
-> **EL-2.0 key restrictions to be aware of:**
->
-> - You may **not** provide the software (or a product whose primary functionality is
->   substantially the same as kreuzberg) to third parties as a hosted or managed service.
-> - You may **not** build a product sold *primarily* as a document-parsing service that
->   competes with kreuzberg.
->
-> The dependency is pinned with `=4.9.4` in `Cargo.toml` to prevent silent upgrades.
-> Any version bump **must** be reviewed for license changes and approved by the
-> maintainers before merging.
-
+The exact `=` pin stays because upstream has changed license before, so any version bump
+must re-check the license. `deny.toml` has no exception for kreuzberg, so a license that is
+not on the allow-list would fail `cargo deny check`.
