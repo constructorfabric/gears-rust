@@ -178,6 +178,7 @@ members = [
     "gears/chat-engine/chat-engine",
     "gears/model-registry/model-registry-sdk",
     "gears/llm-gateway/llm-gateway-sdk",
+    "gears/llm-gateway/llm-gateway",
     "gears/bss/ledger/ledger",
     "gears/bss/ledger/ledger-sdk",
     "gears/bss/pricing/pricing",
@@ -416,6 +417,7 @@ credstore = { package = "cf-gears-credstore", version = "0.6.2", path = "gears/c
 oagw = { package = "cf-gears-oagw", version = "0.6.2", path = "gears/system/oagw/oagw" }
 account-management = { package = "cf-gears-account-management", version = "0.11.2", path = "gears/system/account-management/account-management" }
 usage-collector = { package = "cf-gears-usage-collector", version = "0.5.2", path = "gears/system/usage-collector/usage-collector" }
+llm-gateway = { package = "cf-gears-llm-gateway", version = "0.1.0", path = "gears/llm-gateway/llm-gateway" }
 quota-enforcement = { package = "cf-gears-quota-enforcement", version = "0.3.0", path = "gears/system/quota-enforcement/quota-enforcement" }
 quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", version = "0.3.0", path = "gears/system/quota-enforcement/plugins/quota-enforcement-storage-plugin" }
 cluster = { package = "cf-gears-cluster", version = "0.3.2", path = "gears/system/cluster/cluster" }
@@ -437,6 +439,8 @@ authz-resolver-sdk = { package = "cf-gears-authz-resolver-sdk", version = "0.6.2
 resource-group-sdk = { package = "cf-gears-resource-group-sdk", version = "0.3.7", path = "gears/system/resource-group/resource-group-sdk" }
 oagw-sdk = { package = "cf-gears-oagw-sdk", version = "0.5.16", path = "gears/system/oagw/oagw-sdk" }
 usage-collector-sdk = { package = "cf-gears-usage-collector-sdk", version = "0.3.17", path = "gears/system/usage-collector/usage-collector-sdk" }
+llm-gateway-sdk = { package = "cf-gears-llm-gateway-sdk", version = "0.2.0", path = "gears/llm-gateway/llm-gateway-sdk" }
+model-registry-sdk = { package = "cf-gears-model-registry-sdk", version = "0.1.13", path = "gears/model-registry/model-registry-sdk" }
 quota-enforcement-engine-most-restrictive = { package = "cf-gears-quota-enforcement-engine-most-restrictive", version = "0.1.2", path = "gears/system/quota-enforcement/plugins/quota-enforcement-engine-most-restrictive" }
 quota-enforcement-sdk = { package = "cf-gears-quota-enforcement-sdk", version = "0.4.0", path = "gears/system/quota-enforcement/quota-enforcement-sdk" }
 event-broker-sdk = { package = "cf-gears-event-broker-sdk", version = "0.4.0", path = "gears/system/event-broker/event-broker-sdk" }
