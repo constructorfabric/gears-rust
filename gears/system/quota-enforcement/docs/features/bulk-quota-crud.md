@@ -114,8 +114,8 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
 **Error Scenarios**:
 - More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
   key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
-- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
-  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` at the same point, before any authorization
+  call; a committed envelope larger than a maximum lowered since is refused, not replayed
 - A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
   second occurrence's index
 - The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
@@ -152,8 +152,8 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
   `CAP_BELOW_CONSUMED` attributed to the item
 - More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
   key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
-- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
-  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` at the same point, before any authorization
+  call; a committed envelope larger than a maximum lowered since is refused, not replayed
 - A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
   second occurrence's index
 - The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
@@ -192,8 +192,8 @@ No dedicated sequence exists: per DECOMPOSITION §2.10 the bulk endpoints follow
   Quotas stay active and no second cascade runs
 - More than 500 items: `BULK_TOO_LARGE` before any authorization call; no items (`BATCH_EMPTY`) or a blank envelope
   key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point
-- More items than the configured maximum (default 50): `BULK_TOO_LARGE` after the authorization and the replay
-  lookup and before any item is validated, so a committed envelope still replays after the maximum is lowered
+- More items than the configured maximum (default 50): `BULK_TOO_LARGE` at the same point, before any authorization
+  call; a committed envelope larger than a maximum lowered since is refused, not replayed
 - A blank item key: `IDEMPOTENCY_KEY_REQUIRED` at its index; an item key used twice: `BATCH_ITEM_KEY_DUPLICATE` at the
   second occurrence's index
 - The envelope key already used for a different item list: `IDEMPOTENCY_PAYLOAD_MISMATCH`, whatever the items target
@@ -226,11 +226,11 @@ and `AccessScope` attached by foundation admission
 **Steps**:
 1. [x] - `p2` - **IF** the item count exceeds the fixed ceiling of 500 items, which no configuration can raise - `inst-qbe-ceiling-if`
    1. [x] - `p2` - **RETURN** `BULK_TOO_LARGE` before any authorization call, so the PDP work one envelope can cause stays bounded; an envelope with no items (`BATCH_EMPTY`) or a blank envelope key (`IDEMPOTENCY_KEY_REQUIRED`) is refused at the same point, and these are the only input-validation refusals that precede the configured size check - `inst-qbe-ceiling`
-2. [x] - `p2` - Enforce the same PDP authorization, tenant-isolation, and trust-boundary rules as the single-item counterparts (`cpt-cf-quota-enforcement-fr-authorization`, `cpt-cf-quota-enforcement-fr-tenant-isolation`, PRD §3.4): a bulk create is one tenant-level create check for the envelope tenant, and every bulk update or deactivate item gets the resource-level check of its single-item operation; each item's `AccessScope` is forwarded into its storage calls, and a PDP denial here can precede the configured size check - `inst-qbe-authz`
-3. [x] - `p2` - DB: `lookup_idempotency` on the envelope key under the management-envelope scope `(tenant, fingerprint of the empty subject set, bulk operation type, key)` with the replay machinery of the consumption-operations feature (`cpt-cf-quota-enforcement-algo-idempotency-replay`); on an exact replay **RETURN** the stored outcome without re-applying once every update or deactivate target is still visible under its item's current scope and every Quota a create recorded is visible under the current create scope; a target no longer visible is `NotFound` for its item, never the stored outcome; a divergent payload under the same envelope scope returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched - `inst-qbe-idem`
-4. [x] - `p2` - **IF** the item count exceeds the operator-configurable maximum batch size (default 50 items per batch, at most the 500-item ceiling) - `inst-qbe-size-if`
-   1. [x] - `p2` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`, 400) as an actionable error before any item is validated; the check follows the replay, so a committed envelope stays replayable after an operator lowers the maximum (section 7 note) - `inst-qbe-size`
-5. [x] - `p2` - Accept per-item idempotency keys when supplied: they identify items individually in the committed outcome, while a failure names its item by `items[index]`, and they carry no replay of their own (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`); a blank or repeated item key, or a Quota named twice in an update or deactivate envelope, is refused at the index of the second occurrence - `inst-qbe-item-keys`
+2. [x] - `p2` - **IF** the item count exceeds the operator-configurable maximum batch size (default 50 items per batch, at most the 500-item ceiling) - `inst-qbe-size-if`
+   1. [x] - `p2` - **RETURN** `BULK_TOO_LARGE` (`DomainError::BulkTooLarge`, canonical `InvalidArgument`, 400) as an actionable error before any authorization call, as batch debit does, so the PDP work one envelope can cause stays within the configured size; a committed envelope larger than a maximum lowered since is refused, not replayed (section 7 note) - `inst-qbe-size`
+3. [x] - `p2` - Enforce the same PDP authorization, tenant-isolation, and trust-boundary rules as the single-item counterparts (`cpt-cf-quota-enforcement-fr-authorization`, `cpt-cf-quota-enforcement-fr-tenant-isolation`, PRD §3.4): a bulk create is one tenant-level create check for the envelope tenant, and every bulk update or deactivate item gets the resource-level check of its single-item operation; each item's `AccessScope` is forwarded into its storage calls - `inst-qbe-authz`
+4. [x] - `p2` - DB: `lookup_idempotency` on the envelope key under the management-envelope scope `(tenant, fingerprint of the empty subject set, bulk operation type, key)` with the replay machinery of the consumption-operations feature (`cpt-cf-quota-enforcement-algo-idempotency-replay`); on an exact replay **RETURN** the stored outcome without re-applying once every update or deactivate target is still visible under its item's current scope and every Quota a create recorded is visible under the current create scope; a target no longer visible is `NotFound` for its item, never the stored outcome; a divergent payload under the same envelope scope returns `IDEMPOTENCY_PAYLOAD_MISMATCH` (409) leaving the original record untouched - `inst-qbe-idem`
+5. [x] - `p2` - Accept per-item idempotency keys when supplied: they identify items individually in the committed outcome, while a failure names its item by `items[index]`, and they carry no replay of their own (`cpt-cf-quota-enforcement-fr-bulk-quota-crud`); a blank item key is refused at its own index, and a repeated item key or a Quota named twice in an update or deactivate envelope at the index of the second occurrence - `inst-qbe-item-keys`
 6. [x] - `p2` - **FOR EACH** item in submission order: every draft must name the envelope tenant, then the per-item validation of the single-item counterpart, as referenced by the calling flow, runs outside the storage transaction (the quota-lifecycle minimum-lock-window rule) - `inst-qbe-validate`
 7. [x] - `p2` - **IF** any item fails validation - `inst-qbe-invalid-if`
    1. [x] - `p2` - **RETURN** the first failing item's canonical error in submission order, identified by index and reason as `items[index]` inside the RFC 9457 `Problem` envelope per the DESIGN error model; nothing is persisted, so the caller can retry with corrections under a new envelope key - `inst-qbe-invalid`
@@ -302,7 +302,9 @@ partial failure rolls back the entire batch, and partial success is not a permit
 produce the same persisted side effects as its single-item counterpart (the quota-lifecycle validation chain outside
 the transaction, the operation-log entry per I1, the `quota-changed` event per I11, and the commit-time cap guard per
 I6), consumed unchanged and never re-specified. Row locks on the affected Quota set **MUST** follow the ascending
-lexicographic `quota_id` ordering (`cpt-cf-quota-enforcement-adr-acquisition-ordering`). An exact replay of a
+lexicographic `quota_id` ordering (`cpt-cf-quota-enforcement-adr-acquisition-ordering`), and the lease, capacity and
+counter rows the items write past them **MUST** be locked before the first item, one rank at a time in ascending
+order, so an envelope never meets a single-Quota operation in the opposite order. An exact replay of a
 committed envelope key **MUST** return the original outcome without re-applying, with the envelope idempotency record
 persisted in the same transaction as the batch; a divergent payload under the same envelope scope **MUST** return
 `IDEMPOTENCY_PAYLOAD_MISMATCH`, and the replay machinery is the one established by the consumption-operations feature,
@@ -359,9 +361,9 @@ no lease semantics are re-specified here.
 - [ ] A batch of 51 items under the default limit fails with `BULK_TOO_LARGE` before any item is validated; after the
   operator changes the configured maximum, the new bound is enforced
 - [ ] An exact replay of a committed envelope key returns the original outcome without re-applying: no second create,
-  patch, or cascade occurs and no counter moves; the replay returns the stored outcome even after the operator lowers
-  the maximum batch size below the original batch's item count; a divergent payload under the same envelope key fails
-  with `IDEMPOTENCY_PAYLOAD_MISMATCH` leaving the original record untouched
+  patch, or cascade occurs and no counter moves; once the operator lowers the maximum batch size below the original
+  batch's item count, a replay fails with `BULK_TOO_LARGE` before any authorization call; a divergent payload under
+  the same envelope key fails with `IDEMPOTENCY_PAYLOAD_MISMATCH` leaving the original record untouched
 - [ ] A bulk-update applies every patch or none: an item that trips the commit-time `CAP_BELOW_CONSUMED` guard under
   concurrent counter mutation rolls back the entire batch, and the error names the item index and reason
 - [ ] A bulk-update item touching metric, type, period, or subject fails the envelope via the single-item
@@ -378,8 +380,8 @@ no lease semantics are re-specified here.
 - [ ] An item whose explicit target identity falls outside the caller's tenant or `AccessScope` fails the envelope
   under the same authorization and tenant-isolation rules as the single-item endpoints, with no partial application
   (adversarial integration test)
-- [ ] Interleaved bulk envelopes over overlapping Quota sets observe no deadlock (ADR-0002 ordering) and no partial
-  application (concurrency integration test)
+- [ ] Interleaved bulk envelopes over overlapping Quota sets, and envelopes racing single-Quota deactivations over
+  shared leases, observe no deadlock (ADR-0002 ordering) and no partial application (concurrency integration test)
 - [ ] No request parameter or mode selects partial success on any of the three endpoints; the responses never carry a
   Decision shape, and every failure is an RFC 9457 `Problem`
 - [ ] The feature adds no metric instrument and no label dimension; the scrape is unchanged against the closed PRD
@@ -407,10 +409,12 @@ no lease semantics are re-specified here.
 - **One tenant per envelope**: the request names its tenant; every draft must carry it, and an update or deactivate
   target outside that tenant or outside its item's scope is `NotFound`, never reported as foreign. A workflow spanning
   tenants sends one envelope per tenant.
-- **Order of checks**: the fixed 500-item ceiling and the envelope's own shape come first, before any authorization
-  call; then the PDP, then the replay, then the configured limit, then the item checks in submission order. The
-  replay precedes the configured limit, matching the batch-debit precedent, so a committed envelope stays replayable
-  after an operator lowers the limit; the ceiling bounds the authorization work an oversized envelope can cause.
+- **Order of checks**: the fixed 500-item ceiling, the envelope's own shape and the configured limit come first,
+  before any authorization call, as in batch debit; then the PDP, then the replay, then the item checks in submission
+  order. An update or deactivate item costs a PDP call, so the configured limit bounds the authorization work an
+  envelope can cause. The trade-off: after an operator lowers the limit, a retry of a larger envelope committed within
+  the idempotency retention gets `BULK_TOO_LARGE` instead of its stored outcome, and a caller that then splits it
+  under new keys applies it again. Lower the limit only when no larger envelope is still being retried.
   Validation stops at the first failing item. A Quota named twice or an item key used twice is refused at the second
   occurrence; identical create drafts are distinct Quotas and allowed. The PRD text "replay returns the original
   outcome without re-applying" covers committed envelopes: a rolled-back envelope persists no idempotency record and

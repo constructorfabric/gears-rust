@@ -221,6 +221,10 @@ struct LogEntry {
 #[derive(Clone, Default)]
 struct StorageState {
     installed_major: Option<u32>,
+    /// The largest page `read_quotas` serves, when it serves less than asked.
+    page_cap: Option<u32>,
+    /// `read_quotas` answers a first page with no items and a cursor.
+    empty_first_quota_page: bool,
     bootstrapped: Option<BootstrapBundle>,
     bootstrap_calls: usize,
     defaults: Option<ConfigDefaults>,
@@ -562,6 +566,18 @@ impl InMemoryStorage {
         let this = Self::new();
         this.state.lock().installed_major = Some(major);
         this
+    }
+
+    /// Serve at most `max` Quotas per `read_quotas` page, as a plugin with a
+    /// smaller page than the caller asked for may.
+    pub fn cap_pages(&self, max: u32) {
+        self.state.lock().page_cap = Some(max);
+    }
+
+    /// Answer the first `read_quotas` page with no items and a cursor to the
+    /// rest, as a plugin that filters after paging may.
+    pub fn empty_first_quota_page(&self) {
+        self.state.lock().empty_first_quota_page = true;
     }
 
     /// Every later call fails with `err` until [`Self::clear_failure`].
@@ -1965,6 +1981,19 @@ impl QuotaEnforcementStoragePluginV1 for InMemoryStorage {
             .filter(|q| filter.ids.is_empty() || filter.ids.contains(&q.id))
             .cloned()
             .collect();
+        if st.empty_first_quota_page && page.cursor.is_none() {
+            return Ok(PageResult {
+                items: Vec::new(),
+                next_cursor: Some("0".to_owned()),
+            });
+        }
+        let page = match st.page_cap {
+            Some(cap) => PageRequest {
+                limit: page.limit.min(cap),
+                ..page
+            },
+            None => page,
+        };
         Self::paginate(&items, &page)
     }
 

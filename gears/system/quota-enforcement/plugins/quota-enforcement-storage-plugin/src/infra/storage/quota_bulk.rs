@@ -8,11 +8,15 @@
 //! `quota_id` and whatever its status (rank 1), each under its own item's
 //! scope. The envelope's idempotency stripe follows (rank 2), `NOWAIT`, and a
 //! refused stripe retries the whole transaction within the contention budget.
-//! The budget bounds that stripe contention only: the Quota rows, and the
-//! counter and lease rows each item's single-item body locks afterwards, wait
-//! exactly as single-item Quota CRUD does. Create has no Quota row to lock: its
-//! stripe comes first, then the capacity rows of its distinct metrics,
-//! ascending, which each insert then finds in place.
+//! The rest is locked before the first item, a rank at a time, ascending:
+//! an update's target counters; a deactivation's live leases on any target,
+//! their capacity rows, and the counter of every hold of those leases, on
+//! whichever Quota. Items run in submission order and find their rows held,
+//! so the envelope never goes back a rank. The budget bounds the stripe
+//! contention only: every other row waits as single-item Quota CRUD does.
+//! Create has no Quota row to lock: its stripe comes first, then the
+//! capacity rows of its distinct metrics, ascending, which each insert then
+//! finds in place.
 //!
 //! # Order of items
 //!
@@ -199,10 +203,7 @@ async fn prelock(
     tx: &impl DBRunner,
     targets: &[(QuotaId, &AccessScope)],
 ) -> Result<HashMap<QuotaId, quota::Model>, TxError> {
-    let mut ordered: BTreeMap<uuid::Uuid, &AccessScope> = BTreeMap::new();
-    for (id, scope) in targets {
-        ordered.entry(id.as_uuid()).or_insert(*scope);
-    }
+    let ordered = ascending(targets);
     let mut rows = HashMap::with_capacity(ordered.len());
     for (id, scope) in ordered {
         if let Some(row) = quota_repo::find_by_id(tx, scope, id, Some(RowWait::Wait)).await? {
@@ -210,6 +211,15 @@ async fn prelock(
         }
     }
     Ok(rows)
+}
+
+/// Each target once, ascending by id, under the scope of its first item.
+fn ascending<'a>(targets: &[(QuotaId, &'a AccessScope)]) -> BTreeMap<uuid::Uuid, &'a AccessScope> {
+    let mut ordered = BTreeMap::new();
+    for (id, scope) in targets {
+        ordered.entry(id.as_uuid()).or_insert(*scope);
+    }
+    ordered
 }
 
 /// The locked row of `id` when it belongs to `tenant`; a row of another
@@ -478,6 +488,11 @@ impl SqlQuotaStore {
                             )?;
                             return Ok(TransitionOutcome::NoOp(stored));
                         }
+                        for (id, scope) in ascending(&targets) {
+                            if let Some(row) = rows.get(&QuotaId::from(id)) {
+                                Self::lock_counter_of(tx, scope, row).await?;
+                            }
+                        }
                         let mut items = Vec::with_capacity(envelope.items.len());
                         let mut metrics = Vec::with_capacity(envelope.items.len());
                         for (index, (item, update)) in
@@ -526,7 +541,6 @@ impl SqlQuotaStore {
     ) -> Result<TransitionOutcome<BulkDeactivated>, StoreError> {
         const OPERATION: &str = "bulk deactivate quotas";
         let tenant = envelope.tenant_id;
-        let now = self.now();
         let metrics = self
             .target_metrics(
                 OPERATION,
@@ -542,8 +556,10 @@ impl SqlQuotaStore {
             .await?;
         let owned: Arc<(BulkDeactivateEnvelope, Actor)> =
             Arc::new((envelope.clone(), actor.clone()));
+        let clock = Arc::clone(&self.clock);
         self.run_envelope(OPERATION, budget, || {
             let owned = Arc::clone(&owned);
+            let clock = Arc::clone(&clock);
             let wakes = AttemptWakes::begin(&self.enqueuer);
             let enqueuer = wakes.enqueuer();
             settling(
@@ -558,6 +574,8 @@ impl SqlQuotaStore {
                             .collect();
                         let rows = prelock(tx, &targets).await?;
                         lock_scopes::<TxError>(tx, &[&envelope.idempotency.scope]).await?;
+                        // Read under the locks: a lease can expire while they are waited on.
+                        let now = clock();
                         if let Some(stored) =
                             stored_outcome::<BulkDeactivated>(tx, &envelope.idempotency, now)
                                 .await?
@@ -571,6 +589,11 @@ impl SqlQuotaStore {
                         }
                         // @cpt-begin:cpt-cf-quota-enforcement-state-bulk-envelope:p2:inst-qbs-enter
                         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-apply
+                        let cascades: Vec<(uuid::Uuid, &AccessScope)> =
+                            ascending(&targets).into_iter().collect();
+                        Self::lock_cascades(tx, &cascades, now).await?;
+                        // Again, past the cascades' own lock waits.
+                        let now = clock();
                         let mut items = Vec::with_capacity(envelope.items.len());
                         let mut metrics = Vec::with_capacity(envelope.items.len());
                         for (index, item) in envelope.items.iter().enumerate() {

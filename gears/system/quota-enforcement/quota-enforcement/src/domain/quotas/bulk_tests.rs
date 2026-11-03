@@ -264,7 +264,7 @@ async fn an_envelope_over_the_ceiling_is_refused_before_any_pdp_call() {
 }
 
 #[tokio::test]
-async fn a_bulk_create_commits_every_draft_and_replays_after_the_limit_is_lowered() {
+async fn a_bulk_create_commits_every_draft_and_a_lowered_limit_refuses_its_replay() {
     let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
     let h = Harness::new(pdp.clone()).await;
     let request = creates("pack", vec![draft("u1"), draft("u2")]);
@@ -285,14 +285,88 @@ async fn a_bulk_create_commits_every_draft_and_replays_after_the_limit_is_lowere
         .quotas()
         .bulk_create(&ctx(), request)
         .await
-        .expect("a committed envelope replays past a lowered limit");
-    assert_eq!(replay, created);
+        .expect_err("the limit comes before the replay");
+    assert_eq!(replay, DomainError::BulkTooLarge { items: 2, max: 1 });
     let fresh = lowered
         .quotas()
         .bulk_create(&ctx(), creates("pack-2", vec![draft("u3"), draft("u4")]))
         .await
         .expect_err("a new envelope meets the lowered limit");
     assert_eq!(fresh, DomainError::BulkTooLarge { items: 2, max: 1 });
+}
+
+#[tokio::test]
+async fn the_configured_limit_is_checked_before_any_pdp_call() {
+    let pdp = Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]));
+    let h = Harness::new(pdp.clone()).await;
+    let ids = [h.create_one("u1").await, h.create_one("u2").await];
+    let lowered = Harness::over(pdp.clone(), Arc::clone(&h.storage), limits(1)).await;
+    let before = pdp.calls();
+    let quotas = lowered.quotas();
+    let errors = [
+        quotas
+            .bulk_create(&ctx(), creates("pack", vec![draft("u3"), draft("u4")]))
+            .await
+            .expect_err("too large"),
+        quotas
+            .bulk_update(
+                &ctx(),
+                updates(
+                    "raise",
+                    ids.iter().map(|id| (*id, cap_patch(200))).collect(),
+                ),
+            )
+            .await
+            .expect_err("too large"),
+        quotas
+            .bulk_deactivate(&ctx(), deactivations("off", &ids))
+            .await
+            .expect_err("too large"),
+    ];
+    for err in errors {
+        assert_eq!(err, DomainError::BulkTooLarge { items: 2, max: 1 });
+    }
+    assert_eq!(
+        pdp.calls(),
+        before,
+        "no authorization work for an envelope over the limit"
+    );
+}
+
+#[tokio::test]
+async fn a_create_replay_reads_every_page_of_its_quotas() {
+    let h = Harness::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
+    let request = creates("pack", vec![draft("u1"), draft("u2")]);
+    let created = h
+        .quotas()
+        .bulk_create(&ctx(), request.clone())
+        .await
+        .expect("bulk create");
+    h.storage.cap_pages(1);
+    let replay = h
+        .quotas()
+        .bulk_create(&ctx(), request)
+        .await
+        .expect("the replay reads past the first page");
+    assert_eq!(replay, created);
+}
+
+#[tokio::test]
+async fn a_create_replay_follows_a_cursor_past_an_empty_page() {
+    let h = Harness::new(Arc::new(PermitTenantsPdp::new(vec![tenant().as_uuid()]))).await;
+    let request = creates("pack", vec![draft("u1"), draft("u2")]);
+    let created = h
+        .quotas()
+        .bulk_create(&ctx(), request.clone())
+        .await
+        .expect("bulk create");
+    h.storage.empty_first_quota_page();
+    let replay = h
+        .quotas()
+        .bulk_create(&ctx(), request)
+        .await
+        .expect("the replay reads past the empty page");
+    assert_eq!(replay, created);
 }
 
 #[tokio::test]

@@ -3,16 +3,17 @@
 //!
 //! Every envelope runs in one order:
 //!
-//! 1. more than [`BULK_MAX_ITEMS_CEILING`] items is `BULK_TOO_LARGE`, before
-//!    any PDP call, so the authorization work one envelope causes is bounded;
+//! 1. more than [`BULK_MAX_ITEMS_CEILING`] items is `BULK_TOO_LARGE`;
 //! 2. the envelope itself: items present, an envelope key;
-//! 3. the PDP, as the single-item operations ask it — one tenant-level check
+//! 3. the configured limit. These three come before any PDP call, so the
+//!    authorization work one envelope causes is bounded, as in batch debit;
+//!    a committed envelope larger than a limit lowered since is refused, not
+//!    replayed;
+//! 4. the PDP, as the single-item operations ask it — one tenant-level check
 //!    for a create, one resource-level check per item for an update or a
 //!    deactivation;
-//! 4. the replay: a stored outcome is returned only once every target is
+//! 5. the replay: a stored outcome is returned only once every target is
 //!    still visible under its item's current scope;
-//! 5. the configured limit, after the replay, so a committed envelope stays
-//!    replayable after an operator lowers it;
 //! 6. the item checks, in submission order, stopping at the first failure:
 //!    duplicates, the item keys, the envelope tenant, then the single-item
 //!    validation chain;
@@ -160,19 +161,34 @@ struct CreateDigest<'a> {
 
 impl<'a> From<&'a CreateQuotaRequest> for CreateDigest<'a> {
     fn from(request: &'a CreateQuotaRequest) -> Self {
+        // No `..`: a new request field does not compile until the digest takes it.
+        let CreateQuotaRequest {
+            tenant_id,
+            subject,
+            metric,
+            quota_type,
+            period,
+            enforcement_mode,
+            cap,
+            notification_thresholds,
+            validity_window,
+            fail_open_hint,
+            metadata,
+            source,
+        } = request;
         Self {
-            tenant_id: request.tenant_id,
-            subject: &request.subject,
-            metric: &request.metric,
-            quota_type: request.quota_type,
-            period: (&request.period).into(),
-            enforcement_mode: request.enforcement_mode,
-            cap: request.cap,
-            notification_thresholds: &request.notification_thresholds,
-            validity_window: request.validity_window.as_ref(),
-            fail_open_hint: request.fail_open_hint,
-            metadata: request.metadata.as_ref(),
-            source: request.source,
+            tenant_id: *tenant_id,
+            subject,
+            metric,
+            quota_type: *quota_type,
+            period: period.into(),
+            enforcement_mode: *enforcement_mode,
+            cap: *cap,
+            notification_thresholds,
+            validity_window: validity_window.as_ref(),
+            fail_open_hint: *fail_open_hint,
+            metadata: metadata.as_ref(),
+            source: *source,
         }
     }
 }
@@ -193,17 +209,30 @@ struct UpdateDigest<'a> {
 
 impl<'a> From<&'a UpdateQuotaRequest> for UpdateDigest<'a> {
     fn from(request: &'a UpdateQuotaRequest) -> Self {
+        // No `..`: a new request field does not compile until the digest takes it.
+        let UpdateQuotaRequest {
+            metric,
+            quota_type,
+            period,
+            subject,
+            cap,
+            notification_thresholds,
+            validity_window,
+            metadata,
+            enforcement_mode,
+            fail_open_hint,
+        } = request;
         Self {
-            metric: (&request.metric).into(),
-            quota_type: (&request.quota_type).into(),
-            period: (&request.period).into(),
-            subject: (&request.subject).into(),
-            cap: (&request.cap).into(),
-            notification_thresholds: request.notification_thresholds.as_deref(),
-            validity_window: (&request.validity_window).into(),
-            metadata: request.metadata.as_ref(),
-            enforcement_mode: request.enforcement_mode,
-            fail_open_hint: request.fail_open_hint,
+            metric: metric.into(),
+            quota_type: quota_type.into(),
+            period: period.into(),
+            subject: subject.into(),
+            cap: cap.into(),
+            notification_thresholds: notification_thresholds.as_deref(),
+            validity_window: validity_window.into(),
+            metadata: metadata.as_ref(),
+            enforcement_mode: *enforcement_mode,
+            fail_open_hint: *fail_open_hint,
         }
     }
 }
@@ -343,7 +372,7 @@ impl QuotaManagement<'_> {
         Ok(())
     }
 
-    /// Step 5: the operator's limit.
+    /// Step 3: the operator's limit.
     fn check_configured_limit(&self, items: usize) -> Result<(), DomainError> {
         if items > self.limits.bulk_max_items {
             self.metrics.record_denial(DenialReason::InvalidArgument);
@@ -432,6 +461,11 @@ impl QuotaManagement<'_> {
         self.check_envelope(request.items.len(), &request.idempotency_key)?;
         // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-ceiling
         // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-ceiling-if
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size-if
+        // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size
+        self.check_configured_limit(request.items.len())?;
+        // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size
+        // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size-if
         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-authz
         let admitted = self
             .admission
@@ -471,11 +505,6 @@ impl QuotaManagement<'_> {
         }
         // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-idem
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-create:p2:inst-qbc-envelope
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size-if
-        // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size
-        self.check_configured_limit(request.items.len())?;
-        // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size
-        // @cpt-end:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-size-if
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-create:p2:inst-qbc-validate
         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-validate
         // @cpt-begin:cpt-cf-quota-enforcement-algo-bulk-envelope:p2:inst-qbe-invalid-if
@@ -545,19 +574,29 @@ impl QuotaManagement<'_> {
         stored: &BulkCreated,
     ) -> Result<(), DomainError> {
         let ids: Vec<QuotaId> = stored.items.iter().map(|item| item.quota_id).collect();
-        let page = self
-            .storage
-            .read_quotas(
-                ctx,
-                scope,
-                QuotaFilter {
-                    ids: ids.clone(),
-                    ..QuotaFilter::default()
-                },
-                PageRequest::first(u32::try_from(ids.len()).unwrap_or(u32::MAX)),
-            )
-            .await?;
-        let visible: HashSet<QuotaId> = page.items.iter().map(|quota| quota.id).collect();
+        let limit = u32::try_from(ids.len()).unwrap_or(u32::MAX);
+        let mut visible = HashSet::with_capacity(ids.len());
+        let mut cursor = None;
+        // Storage may serve smaller pages than asked for, empty ones included.
+        loop {
+            let page = self
+                .storage
+                .read_quotas(
+                    ctx,
+                    scope,
+                    QuotaFilter {
+                        ids: ids.clone(),
+                        ..QuotaFilter::default()
+                    },
+                    PageRequest { limit, cursor },
+                )
+                .await?;
+            visible.extend(page.items.iter().map(|quota| quota.id));
+            match page.next_cursor {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
         match stored
             .items
             .iter()
@@ -586,6 +625,7 @@ impl QuotaManagement<'_> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-request
         let tenant = request.tenant_id;
         self.check_envelope(request.items.len(), &request.idempotency_key)?;
+        self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
         let targets = self.admit_items(ctx, actions::UPDATE, &ids).await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-request
@@ -613,7 +653,6 @@ impl QuotaManagement<'_> {
             return Ok(stored);
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-envelope
-        self.check_configured_limit(request.items.len())?;
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-update:p2:inst-qbu-validate
         let mut entries = Vec::with_capacity(request.items.len());
         let mut seen = SeenItems::default();
@@ -686,6 +725,7 @@ impl QuotaManagement<'_> {
         // @cpt-begin:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-request
         let tenant = request.tenant_id;
         self.check_envelope(request.items.len(), &request.idempotency_key)?;
+        self.check_configured_limit(request.items.len())?;
         let ids: Vec<QuotaId> = request.items.iter().map(|item| item.quota_id).collect();
         let targets = self.admit_items(ctx, actions::DEACTIVATE, &ids).await?;
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-request
@@ -713,7 +753,6 @@ impl QuotaManagement<'_> {
             return Ok(stored);
         }
         // @cpt-end:cpt-cf-quota-enforcement-flow-bulk-deactivate:p2:inst-qbd-envelope
-        self.check_configured_limit(request.items.len())?;
         let mut entries = Vec::with_capacity(request.items.len());
         let mut seen = SeenItems::default();
         for (index, (item, (_, scope))) in request.items.into_iter().zip(targets).enumerate() {

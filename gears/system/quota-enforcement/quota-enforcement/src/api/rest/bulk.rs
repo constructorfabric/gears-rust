@@ -294,11 +294,11 @@ async fn bulk_deactivate_quotas(
 
 /// The ordering and limits every bulk endpoint shares, for the descriptions.
 const ENVELOPE_RULES: &str = "All items belong to `tenant_id`; the envelope commits in one \
-    transaction or not at all. More than 500 items answers 400 BULK_TOO_LARGE before any \
-    authorization; each item is authorized as its single-item operation is; replaying the \
-    envelope key returns the stored outcome while every target is still visible to the \
-    caller; more items than the configured limit (default 50) answers 400 BULK_TOO_LARGE; \
-    the first failing item's error names it as `items[index]`.";
+    transaction or not at all. More than 500 items, or more than the configured limit \
+    (default 50), answers 400 BULK_TOO_LARGE before any authorization; each item is \
+    authorized as its single-item operation is; replaying the envelope key returns the \
+    stored outcome while every target is still visible to the caller; the first failing \
+    item's error names it as `items[index]`.";
 
 /// Mount the three bulk Quota endpoints.
 // @cpt-dod:cpt-cf-quota-enforcement-dod-bulk-endpoints:p2
