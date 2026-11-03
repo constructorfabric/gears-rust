@@ -1,1 +1,7 @@
-{{- include "toolkit-common.deployment" . }}
+{{- $ctx := deepCopy . -}}
+{{- $_ := set $ctx.Values.config.data "database" (include "flight-control.postgres-config" . | fromYaml) -}}
+{{- $secret := include "flight-control.postgres-secret" . | fromYaml -}}
+{{- $_ := set $ctx.Values "secrets" (prepend (.Values.secrets | default list) $secret) -}}
+{{- $password := dict "name" "DB_PASSWORD" "valueFrom" (dict "secretKeyRef" (dict "name" $secret.name "key" "pg-password")) -}}
+{{- $_ := set $ctx.Values "extraEnv" (prepend (.Values.extraEnv | default list) $password) -}}
+{{- include "toolkit-common.deployment" $ctx }}

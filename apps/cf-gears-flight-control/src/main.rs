@@ -13,6 +13,9 @@
 
 mod registered_gears;
 
+// Select the database backend in this executable composition.
+use toolkit_db as _;
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use mimalloc::MiMalloc;

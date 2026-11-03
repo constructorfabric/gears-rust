@@ -46,6 +46,8 @@ mimalloc = { workspace = true }
 
 # ToolKit bootstrap (host mode)
 toolkit = { workspace = true, features = ["bootstrap"] }
+# PostgreSQL for the embedded registry in the Helm deployment.
+toolkit-db = { workspace = true, features = ["pg"] }
 
 # Control-plane system gears: directory (service-discovery), transport (grpc-hub),
 # edge / REST host (api-gateway), GTS catalogue (types-registry), and edge JWT
