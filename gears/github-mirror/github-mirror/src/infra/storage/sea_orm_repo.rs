@@ -23,7 +23,7 @@ use github_mirror_sdk::{
 };
 use sea_orm::prelude::DateTimeUtc;
 use sea_orm::sea_query::{Alias, Expr, Func, LikeExpr};
-use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, Order, QuerySelect};
+use sea_orm::{ActiveValue, ColumnTrait, EntityTrait, ExprTrait, Order, QuerySelect};
 use toolkit_db::odata::sea_orm_filter::{LimitCfg, paginate_odata};
 use toolkit_db::secure::{
     DBRunner, ScopeError, SecureDeleteExt, SecureEntityExt, SecureInsertExt, SecureInsertManyExt,
