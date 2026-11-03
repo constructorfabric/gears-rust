@@ -354,7 +354,7 @@ pub struct ConversionRequestV1 {
 // contract (the drift guard asserts byte-equality), so they are prose,
 // not rustdoc — suppress the markdown-backtick lint.
 // A single `allowed_parent_types` entry: the GTS type identifier of a
-// tenant type permitted as parent. The `x-gts-ref` extension makes the
+// tenant type permitted as parent. The `x-gts-type-ref` extension makes the
 // gts store validate each value is a `tenant_type.v1~`-derived type id
 // when a derived tenant-type schema is registered. The prefix also
 // permits same-type nesting (a type listing its own id); `/$id`
@@ -365,14 +365,14 @@ pub struct ConversionRequestV1 {
 #[allow(dead_code)]
 #[derive(serde::Serialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(transparent, extend("x-gts-ref" = gts_id!("cf.core.am.tenant_type.v1~")))]
+#[schemars(transparent, extend("x-gts-type-ref" = gts_id!("cf.core.am.tenant_type.v1~")))]
 pub struct TenantTypeRef(pub String);
 
 #[allow(clippy::doc_markdown)]
 #[derive(JsonSchema, serde::Serialize, GtsTraitsSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TenantTypeTraits {
-    /// GTS instance identifiers of tenant types allowed as parent. Empty array means the type is root-only or leaf-only. The root tenant type has allowed_parent_types: [] by convention.
+    /// GTS type identifiers of tenant types allowed as parent. Empty array means no parent tenant type is allowed, so a tenant of this type cannot be created under any parent; it does not restrict which types may list this type as their parent. The root tenant type has allowed_parent_types: [] by convention.
     #[serde(default)]
     pub allowed_parent_types: Vec<TenantTypeRef>,
     /// Whether tenants of this type typically require dedicated IdP-side resources. Account Management still calls IdpPluginClient::provision_tenant and deprovision_tenant; provider implementations may use this trait to decide whether to create resources or complete as a no-op.
@@ -675,7 +675,8 @@ mod sync_tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use gts::GtsSchema;
+    use gts::schema_traits::X_GTS_TRAITS_SCHEMA;
+    use gts::{GtsSchema, X_GTS_TYPE_REF};
     use serde_json::Value;
 
     use super::{TenantMetadataEnvelopeV1, TenantTypeEnvelopeV1};
@@ -764,16 +765,17 @@ mod sync_tests {
             &serde_json::json!({ "allowed_parent_types": [], "idp_provisioning": false }),
         );
         assert_data_shape(&generated, &disk, TenantTypeEnvelopeV1::<()>::TYPE_ID);
-        // `type_id` and the `allowed_parent_types` `x-gts-ref` are separate
+        // `type_id` and the `allowed_parent_types` `x-gts-type-ref` are separate
         // attribute literals (Rust attributes can't reference a const), so
         // guard that they agree: the ref must equal this envelope's TYPE_ID
         // so derived chains validate against the correct base prefix.
-        let xref = generated
-            .pointer("/x-gts-traits-schema/properties/allowed_parent_types/items/x-gts-ref");
+        let xref = generated.pointer(&format!(
+            "/{X_GTS_TRAITS_SCHEMA}/properties/allowed_parent_types/items/{X_GTS_TYPE_REF}"
+        ));
         assert_eq!(
             xref.and_then(Value::as_str),
             Some(TenantTypeEnvelopeV1::<()>::TYPE_ID),
-            "allowed_parent_types x-gts-ref literal must match the envelope's type_id literal",
+            "allowed_parent_types x-gts-type-ref literal must match the envelope's type_id literal",
         );
     }
 

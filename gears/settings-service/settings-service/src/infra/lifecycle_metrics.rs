@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-typed-value-validation-needs-review-gauge:p2
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-retention:p1
 //! What the managed lifecycle's passes report, on the process's meter.

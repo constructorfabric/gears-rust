@@ -1,8 +1,9 @@
 //! Who a registry call is made for (D17).
 //!
 //! Local clients identify callers by contract; REST uses the authenticated credential.
-//! P0 applies no tenant scope or principal recording (C2/C6). Passing context now
-//! lets P1 add policy without changing signatures.
+//! Domain calls accept either plane; REST routes and SDK contracts restrict which
+//! operations each plane exposes. P0 applies no tenant scope or principal recording
+//! (C2/C6). Passing context now lets P1 add policy without changing signatures.
 
 use toolkit_macros::domain_model;
 use toolkit_security::{PlatformSecurityContext, SecurityContext};

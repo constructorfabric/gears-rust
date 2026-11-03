@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The reconcile itself, one declaration at a time.
 
 use std::sync::Arc;
@@ -15,11 +14,11 @@ use toolkit_security::AccessScope;
 use uuid::Uuid;
 
 use super::{SettingTypeRegistrar, reason};
-use crate::audit::{AuditOperation, AuditRecord, AuditSink, AuditValue};
+use crate::audit::{ActorTenant, AuditOperation, AuditRecord, AuditSink, AuditValue};
 use crate::domain::category::{CategoryDraft, CategoryKey, CategoryRepository};
 use crate::domain::declaration::admin::{is_empty_placeholder, normalise_display_name};
 use crate::domain::declaration::{
-    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository,
+    Declaration, DeclarationDraft, DeclarationMetadata, DeclarationRepository, DeclarationStatus,
 };
 use crate::domain::error::DomainError;
 use crate::domain::validation::TypeValidator;
@@ -181,7 +180,7 @@ fn snapshot(declaration: &Declaration) -> Value {
         "default_value": declaration.default_value,
         "scope_class": declaration.scope_class,
         "mode": declaration.mode,
-        "status": declaration.status,
+        "status": declaration.status.as_str(),
         "description": declaration.description,
         "display_name": declaration.display_name,
         "domain_affinity": declaration.domain_affinity,
@@ -333,7 +332,7 @@ where
             (None, Some(highest)) => {
                 let predecessor = on_path
                     .iter()
-                    .find(|d| major_of(d) == Some(highest) && d.status == "active")
+                    .find(|d| major_of(d) == Some(highest) && d.status.is_active())
                     .cloned();
                 match predecessor {
                     Some(predecessor) => {
@@ -413,7 +412,7 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-2
         // @cpt-begin:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-3
-        if existing.status == "retired" {
+        if existing.status.is_retired() {
             return Ok(false);
         }
         // @cpt-end:cpt-cf-settings-service-flow-module-contributions-retire:p1:inst-mc-ret-3
@@ -422,7 +421,7 @@ where
         // resolution, and the type stays registered so a re-registration is a
         // lookup rather than a re-mint.
         self.declarations
-            .set_status(conn, &scope, existing.id, "retired", None)
+            .set_status(conn, &scope, existing.id, DeclarationStatus::Retired, None)
             .await?;
         let retired = self.reload(conn, &scope, key).await?;
         self.record(
@@ -643,7 +642,7 @@ where
         let changed = metadata_differs(&existing, &metadata);
         let classification_changed = existing.data_classification != metadata.data_classification;
 
-        if existing.status == "retired" {
+        if existing.status.is_retired() {
             // @cpt-begin:cpt-cf-settings-service-algo-module-contributions-reconcile:p1:inst-mc-rec-6
             // Revive in place: the row keeps its id and its values stay where
             // they are.
@@ -652,7 +651,7 @@ where
                 .update_metadata(conn, scope, existing.id, metadata, None, redefines)
                 .await?;
             self.declarations
-                .set_status(conn, scope, existing.id, "active", None)
+                .set_status(conn, scope, existing.id, DeclarationStatus::Active, None)
                 .await?;
             if classification_changed {
                 self.values
@@ -748,7 +747,13 @@ where
             })
         })?;
         self.declarations
-            .set_status(conn, scope, predecessor.id, "retired", None)
+            .set_status(
+                conn,
+                scope,
+                predecessor.id,
+                DeclarationStatus::Retired,
+                None,
+            )
             .await?;
         let retired = self.reload(conn, scope, &predecessor_key).await?;
         // @cpt-end:cpt-cf-settings-service-algo-module-contributions-upgrade:p1:inst-mc-up-1
@@ -800,6 +805,7 @@ where
                         needs_review: detail.is_some(),
                         needs_review_detail: detail,
                         set_by: row.set_by.clone(),
+                        set_by_tenant: row.set_by_tenant,
                     },
                 )
                 .await?;
@@ -931,8 +937,18 @@ where
         pre: Option<Value>,
         post: Option<Value>,
     ) -> Result<(), DomainError> {
-        let mut rec =
-            AuditRecord::new(key.as_str(), None, owner_module, operation, request_id).by_module();
+        // A machine act has no security context to take a tenant from: the
+        // record names no actor tenant, so no tenant reader is shown its actor
+        // and a platform administrator is.
+        let mut rec = AuditRecord::new(
+            key.as_str(),
+            None,
+            owner_module,
+            ActorTenant::machine(),
+            operation,
+            request_id,
+        )
+        .by_module();
         if let Some(pre) = pre {
             rec = rec.with_pre_image(AuditValue::definition(pre));
         }

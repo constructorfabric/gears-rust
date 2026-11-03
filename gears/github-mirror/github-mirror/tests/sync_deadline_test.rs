@@ -8,7 +8,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use github_mirror::domain::error::DomainError;
 use github_mirror::domain::ports::github::{
-    ActionsListing, CommitDetail, CommitListing, FetchOptions, GithubPort, IssueDetail,
+    ActionsListing, CommitDetail, CommitListing, FetchOptions, ForceMode, GithubPort, IssueDetail,
     IssueDetailWants, IssueListing, ListCursor, MetadataListing, PullDetail, PullListing, RepoRef,
 };
 use github_mirror::domain::repo::{RepoRecord, SessionStatus, WorkflowJobRecord};
@@ -118,11 +118,38 @@ impl GithubPort for NeverAnswers {
     async fn clear_cache(
         &self,
         _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
         _owner: &str,
         _name: Option<&str>,
         _repo_ids: &[i64],
     ) -> Result<u64, DomainError> {
         unreachable!("this test never clears the cache")
+    }
+
+    async fn expire_cache(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _fetched_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn cache_size(
+        &self,
+        _scope: &AccessScope,
+        _tenant_id: uuid::Uuid,
+        _owner: &str,
+        _name: &str,
+        _repo_ids: &[i64],
+    ) -> Result<u64, DomainError> {
+        Ok(0)
+    }
+
+    async fn rate_limit(
+        &self,
+    ) -> Result<Vec<github_mirror::domain::ports::github::RateLimitQuota>, DomainError> {
+        Ok(Vec::new())
     }
 }
 
@@ -146,7 +173,7 @@ async fn a_run_that_will_not_end_is_stopped_at_its_deadline() {
     let mut pump = common::SyncPump::take(&service).await;
 
     let queued = service
-        .enqueue_sync(&ctx, OWNER, NAME, None, false, None)
+        .enqueue_sync(&ctx, OWNER, NAME, None, ForceMode::None, None)
         .await
         .expect("the sync must queue");
 

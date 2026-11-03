@@ -15,6 +15,7 @@ use github_mirror_sdk::{
 use github_mirror_sdk::{CountDrift, MirrorStatus, SyncSummary};
 
 use crate::domain::repo::{RepoRunStatus, RepoSyncStatusRecord, SessionStatus, SyncSessionRecord};
+use crate::domain::sync::TelemetrySnapshot;
 
 /// Deliberately without `api_base_url`: `/health` is registered
 /// `.anonymous()`, and the configured upstream host is infrastructure detail
@@ -524,6 +525,9 @@ pub struct ReviewCommentDto {
     /// The review this inline comment belongs to, as GitHub reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pull_request_review_id: Option<i64>,
+    /// Code lines above and below the commented line, when the sync kept them.
+    pub snippet_before: Option<String>,
+    pub snippet_after: Option<String>,
 }
 
 impl From<ReviewComment> for ReviewCommentDto {
@@ -549,6 +553,8 @@ impl From<ReviewComment> for ReviewCommentDto {
             start_side: c.start_side,
             subject_type: c.subject_type,
             pull_request_review_id: c.pull_request_review_id,
+            snippet_before: c.snippet_before,
+            snippet_after: c.snippet_after,
         }
     }
 }
@@ -1534,6 +1540,7 @@ pub struct SyncSessionDto {
     /// True when the run completed but its stored summary could not be read,
     /// so `summary` is empty for a reason other than "not finished yet".
     pub summary_unreadable: bool,
+    pub telemetry: Option<SessionTelemetryDto>,
     #[schema(format = DateTime)]
     pub created_at: String,
     #[schema(format = DateTime)]
@@ -1582,6 +1589,11 @@ impl From<SyncSessionRecord> for SyncSessionDto {
             s.started_at.as_deref(),
             s.ended_at.as_deref().or(s.updated_at.as_deref()),
         );
+        let telemetry = s
+            .telemetry_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<TelemetrySnapshot>(raw).ok())
+            .map(SessionTelemetryDto::from);
 
         Self {
             id: s.id.to_string(),
@@ -1591,11 +1603,71 @@ impl From<SyncSessionRecord> for SyncSessionDto {
             error: s.error,
             summary,
             summary_unreadable,
+            telemetry,
             created_at: s.created_at,
             started_at: s.started_at,
             ended_at: s.ended_at,
             updated_at: s.updated_at,
             duration_ms,
+        }
+    }
+}
+
+#[derive(Debug)]
+#[toolkit_macros::api_dto(response)]
+pub struct SessionTelemetryDto {
+    pub rest_calls: u64,
+    pub graphql_calls: u64,
+    pub fresh: u64,
+    pub not_modified: u64,
+    pub rate_limited: u64,
+    pub failed: u64,
+    pub bytes_downloaded: u64,
+    pub bytes_saved: u64,
+    pub rate_limit_waits: u64,
+    pub rate_limit_wait_ms: u64,
+    pub graphql_points: u64,
+    pub cache_hit_ratio: f64,
+    pub tasks_pending: u64,
+    pub tasks_running: u64,
+    pub tasks_done: u64,
+    pub tasks_failed: u64,
+    pub entities_indexed: u64,
+    pub entities_refined: u64,
+    pub entities_skipped: u64,
+}
+
+fn share(part: u64, whole: u64) -> f64 {
+    let as_f64 = |n: u64| f64::from(u32::try_from(n).unwrap_or(u32::MAX));
+    if whole == 0 {
+        0.0
+    } else {
+        as_f64(part) / as_f64(whole)
+    }
+}
+
+impl From<TelemetrySnapshot> for SessionTelemetryDto {
+    fn from(t: TelemetrySnapshot) -> Self {
+        Self {
+            rest_calls: t.rest_calls,
+            graphql_calls: t.graphql_calls,
+            fresh: t.fresh,
+            not_modified: t.not_modified,
+            rate_limited: t.rate_limited,
+            failed: t.failed,
+            bytes_downloaded: t.bytes_downloaded,
+            bytes_saved: t.bytes_saved,
+            rate_limit_waits: t.rate_limit_waits,
+            rate_limit_wait_ms: t.rate_limit_wait_ms,
+            graphql_points: t.graphql_points,
+            cache_hit_ratio: share(t.not_modified, t.rest_calls),
+            tasks_pending: t.tasks_pending,
+            tasks_running: t.tasks_running,
+            tasks_done: t.tasks_done,
+            tasks_failed: t.tasks_failed,
+            entities_indexed: t.entities_indexed,
+            entities_refined: t.entities_refined,
+            entities_skipped: t.entities_skipped,
         }
     }
 }

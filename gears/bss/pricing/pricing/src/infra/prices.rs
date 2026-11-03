@@ -331,12 +331,15 @@ fn date(d: Date) -> String {
     d.to_string()
 }
 /// Proposed business content only: never state, lock, version or recomputed columns. The model
-/// is the entry's, not the price's content (D-427).
+/// is the entry's, not the price's content (D-427). The money carries its currency spec (D-539),
+/// as a price read does (D-531): a review renders it from the unit alone.
 fn after(r: &Price, note: Option<&str>) -> Value {
     json!({
         "price_book_entry_id": r.price_book_entry_id,
         "version_no": r.version_no,
         "dim_value": r.dim_value,
+        "currency": r.currency.code(),
+        "currency_scale": r.currency.scale(),
         "price": r.price,
         "min_fee": r.min_fee.map(bss_money::canonical_decimal),
         "eligibility": r.eligibility.as_str(),
@@ -353,6 +356,8 @@ fn after(r: &Price, note: Option<&str>) -> Value {
 fn change_after(m: &entity::price::Model, change: &Change) -> Value {
     json!({
         "price_book_entry_id": m.price_book_entry_id,
+        "currency": m.currency,
+        "currency_scale": m.currency_scale,
         "change_kind": change.kind().as_str(),
         "target_price_id": change.target(),
         "dim_value": m.dim_value,
@@ -364,6 +369,8 @@ fn before(r: &Price) -> Value {
     json!({
         "price_id": r.id,
         "version_no": r.version_no,
+        "currency": r.currency.code(),
+        "currency_scale": r.currency.scale(),
         "price": r.price,
         "min_fee": r.min_fee.map(bss_money::canonical_decimal),
         "eligibility": r.eligibility.as_str(),

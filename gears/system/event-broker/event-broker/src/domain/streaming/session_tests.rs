@@ -17,7 +17,7 @@ use uuid::Uuid;
 
 use crate::domain::model::{Assignment, BarrierMode, Event, Sequence, TenantTraversalDepth};
 use crate::domain::streaming::assignment::{AssignmentDelta, Generation};
-use crate::domain::streaming::filter::{EventFilter, InterestFilter};
+use crate::domain::streaming::filter::{AuthorizedInterestFilter, EventFilter, InterestFilter};
 use crate::domain::streaming::frames::{CloseReason, ControlCode, Frame};
 use crate::domain::streaming::lease::{InProcessStreamLeases, StreamLeases};
 use crate::domain::streaming::progress::ProgressConfig;
@@ -168,6 +168,16 @@ fn membership(
 }
 
 fn open(partitions: Vec<(i32, Arc<StubPartition>)>, tenant: Uuid) -> Harness {
+    open_with_policy(partitions, tenant, None)
+}
+
+/// Optionally installs the production authorization filter around the same
+/// parent selector used by the pure streaming tests.
+fn open_with_policy(
+    partitions: Vec<(i32, Arc<StubPartition>)>,
+    tenant: Uuid,
+    policy: Option<authz_resolver_sdk::PolicyEnforcer>,
+) -> Harness {
     let leases = Arc::new(InProcessStreamLeases::new());
     let lease = leases.acquire(Uuid::new_v4()).expect("lease is free");
 
@@ -176,15 +186,26 @@ fn open(partitions: Vec<(i32, Arc<StubPartition>)>, tenant: Uuid) -> Harness {
         .map(|(partition, held)| PartitionSlot::new(key(partition), held))
         .collect();
 
-    let filter: Arc<dyn EventFilter> =
-        Arc::new(InterestFilter::compile(&[crate::domain::model::Interest {
-            topic: gts(TOPIC),
-            tenant_id: tenant,
-            depth: TenantTraversalDepth::CurrentTenant,
-            barrier_mode: BarrierMode::Respect,
-            types: vec![gts::GtsIdPattern::try_new(CREATED).unwrap()],
-            filter: None,
-        }]));
+    let interests = [crate::domain::model::Interest {
+        topic: gts(TOPIC),
+        tenant_id: tenant,
+        depth: TenantTraversalDepth::CurrentTenant,
+        barrier_mode: BarrierMode::Respect,
+        types: vec![gts::GtsIdPattern::try_new(CREATED).unwrap()],
+        filter: None,
+    }];
+    let filter: Arc<dyn EventFilter> = match policy {
+        Some(policy) => Arc::new(AuthorizedInterestFilter::new(
+            &interests,
+            policy,
+            toolkit_security::SecurityContext::builder()
+                .subject_tenant_id(tenant)
+                .subject_id(Uuid::new_v4())
+                .build()
+                .expect("valid stream caller"),
+        )),
+        None => Arc::new(InterestFilter::compile(&interests)),
+    };
 
     let now: NowFn = Arc::new(Utc::now);
     let (generations, membership) = membership(8);
@@ -898,4 +919,92 @@ async fn a_quiet_session_parks_between_frames_rather_than_spinning() {
         "a quiet session probed readiness {probes} times between two frames; \
          it is spinning rather than parking"
     );
+}
+
+/// A parent selector can match a derived event that the caller cannot consume.
+#[tokio::test]
+async fn parent_subscription_does_not_deliver_a_denied_derived_type() {
+    use crate::test_support::authz_doubles::DenyingAuthZ;
+    use authz_resolver_sdk::{EvaluationRequest, PolicyEnforcer};
+
+    let tenant = Uuid::new_v4();
+    let mut child = event(tenant, 2);
+    child.r#type = crate::test_support::event_type_id(
+        "gts.cf.core.events.event.v1~x.eb.orders.created.v1~acme.audit.log.entry.v1~",
+    );
+    let held = StubPartition::holding(vec![event(tenant, 1), child, event(tenant, 3)]);
+    let policy = PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+        deny_if: |request: &EvaluationRequest| {
+            assert_eq!(request.action.name, "consume");
+            request.resource.resource_type != CREATED
+        },
+    }));
+    let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));
+    let frames = drain(&mut harness.session, 4).await;
+    let sequences: Vec<_> = frames
+        .iter()
+        .filter_map(|frame| match frame {
+            Frame::Event(event) => event.sequence,
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        sequences,
+        vec![Sequence::assigned(1), Sequence::assigned(3)]
+    );
+    assert_eq!(
+        harness.session.positions()[0].last_examined,
+        Sequence::assigned(3)
+    );
+}
+
+/// A PDP outage after one allow must not publish a partial batch or report a
+/// cursor beyond events whose authorization could not be established.
+#[tokio::test]
+async fn authorization_outage_closes_without_advancing_the_batch_frontier() {
+    use authz_resolver_sdk::{
+        AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+        PolicyEnforcer,
+    };
+    use toolkit_canonical_errors::CanonicalError;
+    use toolkit_security::PlatformSecurityContext;
+
+    struct FailsAfterOneAllow(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl AuthZResolverApi for FailsAfterOneAllow {
+        async fn evaluate(
+            &self,
+            _ctx: PlatformSecurityContext,
+            _request: EvaluationRequest,
+        ) -> Result<EvaluationResponse, CanonicalError> {
+            if self.0.swap(true, Ordering::Relaxed) {
+                Err(CanonicalError::service_unavailable().create())
+            } else {
+                Ok(EvaluationResponse {
+                    decision: true,
+                    context: EvaluationResponseContext::default(),
+                })
+            }
+        }
+    }
+
+    let tenant = Uuid::new_v4();
+    let policy = PolicyEnforcer::new(Arc::new(FailsAfterOneAllow(
+        std::sync::atomic::AtomicBool::new(false),
+    )));
+    let held = StubPartition::holding(vec![event(tenant, 1), event(tenant, 2)]);
+    let mut harness = open_with_policy(vec![(0, held)], tenant, Some(policy));
+    let frames = drain(&mut harness.session, 4).await;
+    assert_eq!(kinds(&frames), vec!["topology", "terminal"]);
+    assert!(matches!(
+        frames.last(),
+        Some(Frame::Control {
+            reason: Some(CloseReason::Teardown),
+            ..
+        })
+    ));
+    let position = &harness.session.positions()[0];
+    assert_eq!(position.offset, Sequence::assigned(0));
+    assert_eq!(position.last_examined, Sequence::assigned(0));
 }

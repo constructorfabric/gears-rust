@@ -98,7 +98,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -114,7 +114,7 @@ jobs:
 
       - name: release-plz release
         id: release-plz
-        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.3.155
+        uses: release-plz/action@f67a7e724bdad4a0f6875f186060a0ca2770d76c # v0.3.155
         with:
           command: release
         env:
@@ -169,7 +169,7 @@ jobs:
           cache: false
 
       - name: Install protoc
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: protoc@3.34.1
 
@@ -179,11 +179,13 @@ jobs:
           rustup show
 
       - name: release-plz release-pr
-        uses: release-plz/action@f393a7b38aca9d9b4c58447b291dbac963901df6 # v0.3.155
+        uses: release-plz/action@f67a7e724bdad4a0f6875f186060a0ca2770d76c # v0.3.155
         with:
           command: release-pr
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Share one build directory across release-plz tasks to save disk space.
+          CARGO_TARGET_DIR: ${{ runner.temp }}/release-plz-target
 
   # Publish the Docker image + Helm chart for each released, publishable gear, in this
   # same run. Driven by release-plz's `releases` output, NOT by tag pushes: release-plz

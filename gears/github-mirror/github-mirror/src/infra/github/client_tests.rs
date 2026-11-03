@@ -1,5 +1,10 @@
-use super::{MAX_BODY_BYTES, graphql_url, read_capped};
+use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
+
+use super::{GithubClient, MAX_BODY_BYTES, RateLimitHeaders, graphql_url, read_capped};
 use crate::domain::error::DomainError;
+use crate::domain::sync::SessionTelemetry;
 
 #[test]
 fn github_com_serves_graphql_beside_its_rest_root() {
@@ -51,5 +56,41 @@ async fn a_body_one_byte_past_the_cap_is_refused() {
     assert!(
         matches!(&error, DomainError::Internal(message) if message.contains("larger than")),
         "{error:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_backoff_set_while_a_request_waits_for_its_permit_holds_that_request_back() {
+    let client = GithubClient::new("https://api.github.com".to_owned(), None)
+        .unwrap()
+        .with_max_concurrent_requests(std::num::NonZeroUsize::MIN);
+    let telemetry = SessionTelemetry::default();
+    let cancel = CancellationToken::new();
+    let held = client.permits.acquire().await.unwrap();
+
+    let admitted = client.admit(&telemetry, &cancel);
+    tokio::pin!(admitted);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut admitted)
+            .await
+            .is_err(),
+        "the request must be waiting for the permit, past the controller"
+    );
+
+    let limited = RateLimitHeaders {
+        retry_after_secs: Some(1),
+        ..RateLimitHeaders::default()
+    };
+    client.controller.observe(&limited, 429, 1).await;
+    let released = Instant::now();
+    drop(held);
+
+    let admission = admitted.await;
+
+    assert!(admission.is_ok());
+    assert!(
+        released.elapsed() >= Duration::from_millis(900),
+        "the request went out {:?} after the permit came free, inside the backoff",
+        released.elapsed()
     );
 }

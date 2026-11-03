@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use url::Url;
 
-use super::error::TokenError;
+use super::error::{HttpOperation, TokenError};
 
 /// Minimal subset of the `OpenID` Connect discovery document.
 ///
@@ -18,7 +18,7 @@ struct OidcDiscoveryDoc {
 ///
 /// # Errors
 ///
-/// Returns [`TokenError::Http`] if the discovery request fails or returns a
+/// Returns [`TokenError::Http`] or [`TokenError::HttpStatus`] if the discovery request fails or returns a
 /// non-success status.
 /// Returns [`TokenError::InvalidResponse`] if the response body cannot be
 /// parsed, the `token_endpoint` field is missing, or it is not a valid URL.
@@ -26,16 +26,22 @@ pub async fn discover_token_endpoint(
     client: &toolkit_http::HttpClient,
     issuer_url: &Url,
 ) -> Result<Url, TokenError> {
-    let base = issuer_url.as_str().trim_end_matches('/');
-    let discovery_url = format!("{base}/.well-known/openid-configuration");
+    let mut discovery_url = issuer_url.clone();
+    let path = format!(
+        "{}/.well-known/openid-configuration",
+        issuer_url.path().trim_end_matches('/')
+    );
+    discovery_url.set_path(&path);
+    discovery_url.set_query(None);
+    discovery_url.set_fragment(None);
 
     let doc: OidcDiscoveryDoc = client
-        .get(&discovery_url)
+        .get(discovery_url.as_str())
         .send()
         .await
-        .map_err(|e| TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery")))?
+        .map_err(|e| TokenError::from_http(&e, HttpOperation::Discovery, &discovery_url))?
         .error_for_status()
-        .map_err(|e| TokenError::Http(crate::http_error::format_http_error(&e, "OIDC discovery")))?
+        .map_err(|e| TokenError::from_http(&e, HttpOperation::Discovery, &discovery_url))?
         .json()
         .await
         .map_err(|e| {
@@ -179,6 +185,7 @@ mod tests {
         mock.assert();
     }
 
+    /// Discovery preserves the HTTP rejection as a typed acquisition error.
     #[tokio::test]
     async fn discover_http_error() {
         let server = MockServer::start();
@@ -198,9 +205,8 @@ mod tests {
         assert!(
             matches!(
                 err,
-                TokenError::Http(ref msg)
-                    if msg.contains("OIDC discovery")
-                        && msg.contains("500")
+                TokenError::HttpStatus { operation: HttpOperation::Discovery, .. }
+                    if err.status() == Some(http::StatusCode::INTERNAL_SERVER_ERROR)
             ),
             "expected Http error with 500 status, got: {err}"
         );

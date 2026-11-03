@@ -1,42 +1,63 @@
-//! # `SQLite` event-broker plugin
+//! # `SQLite` event-broker backend
 //!
-//! The durable storage backend for the `event-broker` gear: the append-only
-//! `(topic, partition)` event log, the per-partition bookkeeping that assigns
-//! sequences and dedups outbox retries, and the retention pass that keeps every
-//! partition bounded.
+//! A storage backend for the event-broker gear over one `SQLite` database file
+//! the plugin owns (`docs/DESIGN.md`). It implements
+//! `event_broker_sdk::backend::Backend` and ships a
+//! `event_broker_sdk::backend::Provider` for the backend type
+//! [`BACKEND_TYPE`]:
 //!
-//! Implements `event_broker_sdk::EventBrokerBackend` and depends on the SDK
-//! only, never on the gear. Not a `RunnableCapability` and not a `Gear`:
-//! following the cluster plugins, it exposes a provider the host gear injects
-//! at wiring.
+//! - one table holds every event, keyed by topic, partition and sequence; no
+//!   partitioning of the table - the plugin is for small volumes;
+//! - an append and its fence row commit in one write transaction
+//!   (`Dedup::Fenced`), synced to disk before it returns;
+//! - heads travel through a hub shared by every instance over the file in
+//!   this process (`Watch::Native`);
+//! - a sweep removes expired events, oldest first, ageing them by when they
+//!   were stored.
 //!
-//! The backend owns no task and no timer. Its retention pass is a trait method
-//! the gear drives on its own tick, so a test forces a pass deterministically
-//! instead of sleeping and hoping a background thread ran.
+//! One process owns the file; sharing it between processes is unsupported.
 //!
-//! The database it writes to is its own. The one the platform hands the host
-//! gear keeps ingest and delivery metadata; a topic's events are not metadata,
-//! so this backend opens the storage its options name - a file, or `:memory:`
-//! for a log that lives no longer than the process - and applies its own tables
-//! to it.
+//! ## Why `sqlx` directly, not `libs/toolkit-db`
+//!
+//! `BEGIN IMMEDIATE` write transactions, connect-time pragmas and dynamic
+//! per-topic state have no `SeaORM` equivalent. This is the same deliberate
+//! exception to the platform's DB-access rule the `PostgreSQL` plugin makes -
+//! hence the crate-level `allow` below. `unknown_lints` is needed alongside:
+//! `de0706_no_direct_sqlx` only exists under the `cargo gears lint --dylint`
+//! driver.
 
 #![forbid(unsafe_code)]
-#![deny(rust_2018_idioms)]
+#![allow(unknown_lints)]
+#![allow(de0706_no_direct_sqlx)]
 
+mod append;
 mod backend;
-mod connection;
-pub mod entity;
+mod body;
+mod clock;
 mod error;
-mod migrations;
-mod options;
+mod hub;
 mod provider;
-mod sizing;
+mod provision;
+mod read;
+mod settings;
+mod shared;
+mod startup;
+mod sweep;
 
 #[cfg(test)]
-mod footprint_tests;
+mod append_tests;
 #[cfg(test)]
-mod test_support;
+mod body_tests;
+#[cfg(test)]
+mod clock_tests;
+#[cfg(test)]
+mod error_tests;
+#[cfg(test)]
+mod hub_tests;
+#[cfg(test)]
+mod settings_tests;
+#[cfg(test)]
+mod sweep_tests;
 
-pub use backend::SqliteEventBackend;
-pub use options::{EventLogPath, SqliteBackendOptions};
+pub use backend::SqliteBackend;
 pub use provider::{BACKEND_TYPE, SqliteBackendProvider};

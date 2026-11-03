@@ -1,21 +1,19 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 //! The same conformance suite against the built-in `PostgreSQL` store, plus the
-//! cases that only exist against a real server: the SQL/PGQ hop, its parity
-//! with the fallback hop, and the cross-tenant trap.
+//! cases that only exist against a real server: the plans the read paths can
+//! use, the cross-tenant trap, and the migrations.
 //!
-//! The lane needs `PostgreSQL` 19 (`GRAPH_TABLE`) **with pgvector**, and those
-//! two do not currently come in one platform-pinned image: the toolkit's
-//! `postgres_graph()` pin is a stock `19beta3-alpine`, which has no pgvector,
-//! while the gear's documented baseline requires it. Set
-//! `GEARS_TEST_PG_GRAPH_IMAGE` to an image that carries both (see
-//! the README) to run this lane; otherwise it skips — unless
+//! The lane needs `PostgreSQL` 16 or later **with pgvector**, which the
+//! platform's `postgres_graph()` pin does not carry. Set
+//! `GEARS_TEST_PG_GRAPH_IMAGE` to such an image — CI uses
+//! `pgvector/pgvector:0.8.7-pg18` — to run this lane; otherwise it skips, unless
 //! `GEARS_TEST_PG_GRAPH_REQUIRED` is set, which turns a missing server into a
 //! failure so CI cannot go green by silently running nothing.
 //!
-//! **Every case gets its own server**, because two of them are operator
-//! surgery on server-wide state (dropping the property graph, re-resolving the
-//! embedding space at boot) and a shared instance would make them poison the
+//! **Every case gets its own server**, because some of them are operator
+//! surgery on server-wide state (re-resolving the embedding space at boot,
+//! creating the retired property graph for `m0010` to drop) and a shared instance would make them poison the
 //! rest. The cost is one container per case, which on an ordinary machine is
 //! more than Docker and `PostgreSQL` will take at once: at eight in parallel
 //! the connection pools time out (`PoolTimedOut`) and a *different* case fails
@@ -29,12 +27,12 @@ mod support;
 
 use std::sync::Arc;
 
-use graph_storage::config::{GraphStorageConfig, HopStrategy};
+use graph_storage::config::GraphStorageConfig;
 use graph_storage::infra::engine::PgGraphEngine;
 use graph_storage::infra::storage::migrations::Migrator;
 use graph_storage::infra::store::PgGraphStore;
 use graph_storage_sdk::models::{Direction, HopBudget, TruncationReason};
-use graph_storage_sdk::plugin_api::{ExpandRequest, GraphEngineV1, GraphStoreV1, HopBackend};
+use graph_storage_sdk::plugin_api::{ExpandRequest, GraphEngineV1, GraphStoreV1};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::runners::AsyncRunner as _;
 use testcontainers::{ContainerAsync, ImageExt as _};
@@ -132,30 +130,18 @@ async fn connect_with_retry(dsn: &str) -> Db {
     panic!("the server never accepted a connection: {last:?}");
 }
 
-/// A live `PostgreSQL` 19 with the gear's schema and property graph applied.
+/// A live `PostgreSQL` with pgvector and the gear's schema applied.
 struct Stand {
     store: Arc<PgGraphStore>,
     engine: PgGraphEngine,
     db: Arc<Db>,
-    /// Kept so a test can reach the server outside the secure ORM — dropping
-    /// the property graph is operator surgery, not something a gear can do.
+    /// Kept so a test can reach the server outside the secure ORM — reading
+    /// plans and the catalog is operator surgery, not something a gear can do.
     dsn: String,
     _container: ContainerAsync<Postgres>,
     /// Held for the case's lifetime: the stand is the scarce resource, not
     /// its startup, so the permit is released when the stand is dropped.
     _permit: tokio::sync::SemaphorePermit<'static>,
-}
-
-/// Remove the property graph, leaving the tables. This is what a gear sees on
-/// a server whose major cannot create one.
-async fn drop_property_graph(stand: &Stand) {
-    use sea_orm::ConnectionTrait as _;
-    let raw = sea_orm::Database::connect(&stand.dsn)
-        .await
-        .expect("a plain connection for operator surgery");
-    raw.execute_unprepared("DROP PROPERTY GRAPH kb")
-        .await
-        .expect("the property graph is dropped");
 }
 
 /// An image carrying `PostgreSQL` 19 **and** pgvector, when the operator names
@@ -167,7 +153,7 @@ fn graph_image() -> Option<(String, String)> {
     Some((name.to_owned(), tag.to_owned()))
 }
 
-async fn stand(hop: HopStrategy) -> Option<Stand> {
+async fn stand() -> Option<Stand> {
     // Decide the skip before starting anything. The platform pin is a stock
     // image with no pgvector, so with no image configured this lane can only
     // end in a skip — and paying for a container per case first is how a
@@ -178,7 +164,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
     if graph_image().is_none() && !test_containers::graph_lane_required() {
         eprintln!(
             "GEARS_TEST_PG_GRAPH_IMAGE is unset and the platform pin ({}) has no pgvector - \
-             skipping the SQL/PGQ lane",
+             skipping the PostgreSQL lane",
             test_containers::postgres_graph_tag()
         );
         return None;
@@ -205,10 +191,10 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         Err(error) => {
             assert!(
                 !test_containers::graph_lane_required(),
-                "GEARS_TEST_PG_GRAPH_REQUIRED is set but PostgreSQL 19 ({}) could not start: {error}",
+                "GEARS_TEST_PG_GRAPH_REQUIRED is set but the graph image ({}) could not start: {error}",
                 test_containers::postgres_graph_tag()
             );
-            eprintln!("PostgreSQL 19 unavailable - skipping the SQL/PGQ lane: {error}");
+            eprintln!("the graph image is unavailable - skipping the PostgreSQL lane: {error}");
             return None;
         }
     };
@@ -231,7 +217,7 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         if no_pgvector {
             eprintln!(
                 "the graph image has no pgvector - skipping; set GEARS_TEST_PG_GRAPH_IMAGE \
-                 to an image with PostgreSQL 19 and pgvector"
+                 to an image with PostgreSQL 16+ and pgvector"
             );
             return None;
         }
@@ -239,7 +225,6 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
     }
 
     let config = GraphStorageConfig {
-        traversal_hop: hop,
         // A deployment mirroring a domain hierarchy raises the chain ceiling;
         // the suite's deep-chain case needs the raised posture, and nothing
         // else in the suite is sensitive to it.
@@ -247,13 +232,9 @@ async fn stand(hop: HopStrategy) -> Option<Stand> {
         ..GraphStorageConfig::default()
     };
     let db = Arc::new(db);
-    // The stand probes exactly as the gear's composition root does, so a
-    // change to the probe is exercised by every case here.
-    let pgq_available = graph_storage::infra::engine::probe_pgq(&db).await;
     let store = Arc::new(PgGraphStore::new(
         Arc::clone(&db),
         config.validated().expect("the test configuration is valid"),
-        pgq_available,
     ));
     let engine = PgGraphEngine::new(Arc::clone(&store));
     Some(Stand {
@@ -296,14 +277,11 @@ async fn store_with(stand: &Stand, options: &str) -> Arc<PgGraphStore> {
     )
     .await
     .unwrap_or_else(|error| panic!("a second pool with `{options}` connects: {error}"));
-    let db = Arc::new(db);
-    let pgq = graph_storage::infra::engine::probe_pgq(&db).await;
     Arc::new(PgGraphStore::new(
-        db,
+        Arc::new(db),
         GraphStorageConfig::default()
             .validated()
             .expect("the default configuration is valid"),
-        pgq,
     ))
 }
 
@@ -323,7 +301,7 @@ async fn store_with(stand: &Stand, options: &str) -> Arc<PgGraphStore> {
 /// would measure the machine rather than the behaviour.
 #[tokio::test]
 async fn a_filtered_vector_search_under_returns_without_iterative_scan() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let crowd = tenant_on(&stand).await;
@@ -391,7 +369,7 @@ macro_rules! pg_case {
     ($name:ident, $case:path) => {
         #[tokio::test]
         async fn $name() {
-            let Some(stand) = stand(HopStrategy::Pgq).await else {
+            let Some(stand) = stand().await else {
                 return;
             };
             let tenant = tenant_on(&stand).await;
@@ -542,10 +520,10 @@ pg_case!(
 );
 
 /// Readiness against a real server: the database row is healthy because the
-/// migrations ran, and the SQL/PGQ row reports what this server could provide.
+/// migrations ran.
 #[tokio::test]
 async fn readiness_reports_every_capability_and_only_some_block_service() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::readiness_reports_every_capability_and_only_some_block_service(
@@ -561,7 +539,7 @@ async fn readiness_reports_every_capability_and_only_some_block_service() {
 /// the obligation is about never happens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_replacements_of_one_scope_serialize() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_replacements_of_one_scope_serialize(
@@ -574,7 +552,7 @@ async fn two_replacements_of_one_scope_serialize() {
 /// Spawned tasks again, so the runtime needs threads to put them on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_update_of_a_node_advances_its_version() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::every_update_of_a_node_advances_its_version(
@@ -586,7 +564,7 @@ async fn every_update_of_a_node_advances_its_version() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_writers_with_one_expected_version_do_not_both_win() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_writers_with_one_expected_version_do_not_both_win(
@@ -599,7 +577,7 @@ async fn two_writers_with_one_expected_version_do_not_both_win() {
 /// Spawned tasks again, so a multi-thread runtime rather than `pg_case!`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_type_updates_do_not_share_one_revision() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_type_updates_do_not_share_one_revision(
@@ -612,7 +590,7 @@ async fn two_type_updates_do_not_share_one_revision() {
 /// Spawned tasks again, so a multi-thread runtime rather than `pg_case!`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::a_delete_racing_an_upsert_leaves_no_rewritten_tombstone(
@@ -626,7 +604,7 @@ async fn a_delete_racing_an_upsert_leaves_no_rewritten_tombstone() {
 /// removal are separate statements, and the ingest can commit between them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope(
@@ -640,7 +618,7 @@ async fn a_replacement_does_not_delete_what_an_ingest_moved_out_of_its_scope() {
 /// key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_batches_naming_one_new_endpoint_both_land() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_batches_naming_one_new_endpoint_both_land(
@@ -656,7 +634,7 @@ async fn two_batches_naming_one_new_endpoint_both_land() {
 /// both read the edge live before either commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::a_node_delete_racing_its_edge_delete_counts_every_edge_once(
@@ -668,7 +646,7 @@ async fn a_node_delete_racing_its_edge_delete_counts_every_edge_once() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_deletes_of_one_node_tombstone_it_once() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_deletes_of_one_node_tombstone_it_once(
@@ -682,7 +660,7 @@ async fn two_deletes_of_one_node_tombstone_it_once() {
 /// open in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_deleted_edge_is_revived_by_the_next_upsert() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::a_deleted_edge_is_revived_by_the_next_upsert(
@@ -697,7 +675,7 @@ async fn a_deleted_edge_is_revived_by_the_next_upsert() {
 /// with threads to put them on.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_committed_mutation_gets_its_own_revision() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::every_committed_mutation_gets_its_own_revision(
@@ -728,7 +706,7 @@ pg_case!(
 /// on the run where it does not happen.
 #[tokio::test]
 async fn a_catalogue_scan_with_no_progress_refuses_rather_than_answering_empty() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -882,7 +860,7 @@ pg_case!(
 #[tokio::test]
 async fn a_payload_ordered_projection_pages_by_keyset() {
     use toolkit_odata::SortDir;
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -936,7 +914,7 @@ async fn a_payload_ordered_projection_pages_by_keyset() {
 #[tokio::test]
 async fn a_cursor_is_held_to_its_filter_and_type_set_at_the_store() {
     use toolkit_odata::SortDir;
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1038,7 +1016,7 @@ async fn a_cursor_is_held_to_its_filter_and_type_set_at_the_store() {
 /// can be told to hold it at two rows.
 #[tokio::test]
 async fn a_pass_over_the_ceiling_is_refused_and_a_dry_run_reports_it() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let bounded = Arc::new(PgGraphStore::new(
@@ -1050,7 +1028,6 @@ async fn a_pass_over_the_ceiling_is_refused_and_a_dry_run_reports_it() {
         }
         .validated()
         .expect("the test configuration is valid"),
-        true,
     ));
     let tenant = tenant_on(&stand).await;
     conformance::a_pass_over_the_ceiling_is_refused_and_a_dry_run_reports_it(
@@ -1062,7 +1039,7 @@ async fn a_pass_over_the_ceiling_is_refused_and_a_dry_run_reports_it() {
 
 #[tokio::test]
 async fn colliding_node_keys_stay_inside_their_tenants() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let one = tenant_on(&stand).await;
@@ -1070,16 +1047,14 @@ async fn colliding_node_keys_stay_inside_their_tenants() {
     conformance::tenant_isolation(stand.store.as_ref(), one, two).await;
 }
 
-// --- what only a real PostgreSQL 19 can show --------------------------------
+// --- what only a real PostgreSQL can show -----------------------------------
 
 /// The plans of the two hot read paths can reach an index (m0009).
 ///
 /// `enable_seqscan = off` makes the question "is there an index this
-/// statement *can* use" rather than "is one cheaper here": with only the
-/// partial edge indexes the `GRAPH_TABLE` hop has none that constrains the
-/// frontier (`deleted_at` is outside the edge element's `PROPERTIES`, so the
-/// pattern cannot state the partial predicate), and a listing of one type has
-/// none that yields that type in key order -- the shape a payload filter
+/// statement *can* use" rather than "is one cheaper here": the hop's read of
+/// a frontier's incident edges has to be driven by an endpoint index, and a
+/// listing of one type has none that yields that type in key order -- the shape a payload filter
 /// needs at a middling selectivity, where the planner otherwise walks the
 /// whole tenant in key order (measured on the Studio stand; the choice itself
 /// needs volume to reproduce, the missing index does not). The assertion is
@@ -1088,7 +1063,7 @@ async fn colliding_node_keys_stay_inside_their_tenants() {
 #[tokio::test]
 async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
     use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1144,17 +1119,15 @@ async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
     let type_id: i32 = row.try_get_by_index(1).expect("a type id");
 
     let hop = plan(format!(
-        "SELECT cf_graph.neighbour FROM node, GRAPH_TABLE(kb MATCH \
-         (a IS node WHERE a.tenant_id = node.tenant_id AND a.id = node.id AND a.tenant_id IN ({t})) \
-         -[e IS edge WHERE e.tenant_id IN ({t})]-> \
-         (b IS node WHERE b.tenant_id IN ({t})) COLUMNS (b.id AS neighbour)) AS cf_graph \
-         WHERE node.tenant_id IN ({t}) AND node.id IN ({seed}) AND node.deleted_at IS NULL LIMIT 101"
+        "SELECT edge_key, gts_edge_type_id, src_node_id, dst_node_id FROM edge \
+         WHERE tenant_id IN ({t}) AND (src_node_id IN ({seed}) OR dst_node_id IN ({seed})) \
+         AND deleted_at IS NULL LIMIT 100001"
     ))
     .await;
     assert!(
         hop.iter()
             .any(|line| line.contains("Index Cond") && line.contains("src_node_id")),
-        "the pattern hop finds the frontier's edges through an index on their source:\n{}",
+        "the hop finds the frontier's edges through an index on their source:\n{}",
         hop.join("\n")
     );
 
@@ -1177,6 +1150,66 @@ async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
     );
 }
 
+/// `m0010` drops a property graph `m0002` left behind, and does nothing on a
+/// server without SQL/PGQ, which is every server CI runs. Against a 19 beta
+/// 1–3 image the case re-creates the graph and shows the drop.
+#[tokio::test]
+async fn m0010_drops_the_retired_property_graph_where_one_exists() {
+    use sea_orm::ConnectionTrait as _;
+    use sea_orm_migration::{MigrationTrait as _, SchemaManager};
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let raw = sea_orm::Database::connect(&stand.dsn)
+        .await
+        .expect("a plain connection for operator surgery");
+    let present = |raw: &sea_orm::DatabaseConnection| {
+        let raw = raw.clone();
+        async move {
+            raw.query_one_raw(sea_orm::Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT 1 AS present FROM pg_class WHERE relname = 'kb' AND relkind = 'g'",
+            ))
+            .await
+            .expect("the catalog reads")
+            .is_some()
+        }
+    };
+    let drop_graph =
+        graph_storage::infra::storage::migrations::m0010_drop_property_graph::Migration;
+
+    assert!(
+        !present(&raw).await,
+        "the migrations leave no property graph on a fresh database"
+    );
+    let created = raw
+        .execute_unprepared(
+            "CREATE PROPERTY GRAPH kb \
+             VERTEX TABLES (node KEY (tenant_id, id)) \
+             EDGE TABLES (edge KEY (tenant_id, id) \
+               SOURCE KEY (tenant_id, src_node_id) REFERENCES node (tenant_id, id) \
+               DESTINATION KEY (tenant_id, dst_node_id) REFERENCES node (tenant_id, id))",
+        )
+        .await;
+    if let Err(error) = created {
+        eprintln!(
+            "this server has no SQL/PGQ ({error}); m0010 has nothing to drop, and runs as a no-op"
+        );
+        drop_graph
+            .up(&SchemaManager::new(&raw))
+            .await
+            .expect("m0010 is a no-op on a server without SQL/PGQ");
+        assert!(!present(&raw).await);
+        return;
+    }
+    assert!(present(&raw).await, "the retired graph was re-created");
+    drop_graph
+        .up(&SchemaManager::new(&raw))
+        .await
+        .expect("m0010 drops the graph");
+    assert!(!present(&raw).await, "m0010 dropped the retired graph");
+}
+
 /// A type an earlier build stored, and this build's analysis refuses,
 /// converges when it is offered again byte-identical.
 ///
@@ -1191,7 +1224,7 @@ async fn the_hop_and_the_filtered_listing_have_an_index_to_use() {
 #[tokio::test]
 async fn a_stored_type_this_build_would_refuse_converges_when_offered_unchanged() {
     use sea_orm::ConnectionTrait as _;
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1307,7 +1340,7 @@ async fn a_stored_type_this_build_would_refuse_converges_when_offered_unchanged(
 /// child's node must come out of both exactly as it went in.
 #[tokio::test]
 async fn a_parent_tenants_writes_never_reach_its_child() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let child = tenant_on(&stand).await;
@@ -1404,7 +1437,7 @@ async fn a_replacements_membership_is_served_by_the_payload_index() {
     use graph_storage::infra::storage::entity::node;
     use sea_orm::sea_query::{Expr, ExprTrait as _, PostgresQueryBuilder, Query};
     use sea_orm::{ConnectionTrait as _, TransactionTrait as _};
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1480,7 +1513,7 @@ async fn a_replacements_membership_is_served_by_the_payload_index() {
 /// it used to classify as `Internal` and answer `500 unknown`.
 #[tokio::test]
 async fn a_nul_that_reaches_the_server_is_invalid_input_not_an_internal_error() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1508,189 +1541,6 @@ async fn a_nul_that_reaches_the_server_is_invalid_input_not_an_internal_error() 
     );
 }
 
-/// The property-graph DDL the migration executed is the DDL the declaration
-/// generates: if `MATCH` and `CREATE PROPERTY GRAPH` could disagree, this hop
-/// would not parse.
-#[tokio::test]
-async fn the_pattern_hop_walks_the_graph() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
-        return;
-    };
-    let tenant = tenant_on(&stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("ontology registers");
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![
-                conformance::node("a", "a"),
-                conformance::node("b", "b"),
-                conformance::node("c", "c"),
-            ],
-            vec![conformance::edge("a", "b"), conformance::edge("b", "c")],
-        ),
-    )
-    .await
-    .expect("the batch commits");
-
-    let ids = stand
-        .store
-        .resolve_node_ids(&ctx, &["a".to_owned()])
-        .await
-        .expect("resolution succeeds");
-    let seed = ids.first().expect("`a` resolves").1;
-
-    let response = stand
-        .engine
-        .expand(
-            &ctx,
-            ExpandRequest {
-                frontier: vec![seed],
-                direction: Direction::Outgoing,
-                edge_types: None,
-                labels: None,
-                budget: HopBudget {
-                    max_frontier: 100,
-                    max_edges_scanned: 1_000,
-                },
-                with_degrees: false,
-            },
-        )
-        .await
-        .expect("the pattern hop runs");
-
-    // Asserted first, and deliberately: the pattern backend declines by
-    // falling back, so a hop that never executed returns the *right answer*
-    // from the two-query backend. Without this line this test passes while
-    // testing nothing it claims to test -- which is how a pattern that lost
-    // its anchor and failed on every request went unnoticed.
-    assert_eq!(
-        response.served_by,
-        HopBackend::Pattern,
-        "the single-statement pattern must be what answered, not the fallback"
-    );
-    let reached: Vec<String> = response.edges.iter().map(|e| e.dst.clone()).collect();
-    assert_eq!(reached, vec!["b".to_owned()], "one hop reaches exactly `b`");
-    assert!(response.truncated.is_none());
-}
-
-/// Seed one stand and expand one hop, returning the reached ids, the producer
-/// keys of the traversed edges, and which backend actually answered.
-///
-/// The last of the three is not decoration. The pattern backend declines by
-/// falling back, so a comparison of "the two backends" run against a stand
-/// whose pattern silently failed compares the fallback with itself and agrees
-/// perfectly.
-async fn seed_and_expand(
-    stand: &Stand,
-    direction: Direction,
-) -> (Vec<i64>, Vec<String>, HopBackend) {
-    let tenant = tenant_on(stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("ontology registers");
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![
-                conformance::node("hub", "hub"),
-                conformance::node("spoke-1", "one"),
-                conformance::node("spoke-2", "two"),
-            ],
-            vec![
-                conformance::edge("hub", "spoke-1"),
-                conformance::edge("spoke-2", "hub"),
-            ],
-        ),
-    )
-    .await
-    .expect("the batch commits");
-
-    let seed = stand
-        .store
-        .resolve_node_ids(&ctx, &["hub".to_owned()])
-        .await
-        .expect("resolution succeeds")
-        .first()
-        .expect("`hub` resolves")
-        .1;
-
-    let response = stand
-        .engine
-        .expand(
-            &ctx,
-            ExpandRequest {
-                frontier: vec![seed],
-                direction,
-                edge_types: None,
-                labels: None,
-                budget: HopBudget {
-                    max_frontier: 100,
-                    max_edges_scanned: 1_000,
-                },
-                with_degrees: false,
-            },
-        )
-        .await
-        .expect("the hop runs");
-
-    // Ids are per-stand surrogates, so compare the producer keys — the
-    // only representation both stands share.
-    let mut keys: Vec<String> = response
-        .edges
-        .iter()
-        .flat_map(|e| [e.src.clone(), e.dst.clone()])
-        .collect();
-    keys.sort();
-    (response.reached, keys, response.served_by)
-}
-
-/// The two backends must answer identically. Compared **at the seam**, not
-/// through the API: an end-to-end comparison hid a backend returning its own
-/// frontier for days on the prototype.
-#[tokio::test]
-async fn both_hop_backends_return_the_same_answer() {
-    let Some(pgq) = stand(HopStrategy::Pgq).await else {
-        return;
-    };
-    let Some(two_query) = stand(HopStrategy::TwoQuery).await else {
-        return;
-    };
-
-    for direction in [Direction::Outgoing, Direction::Incoming, Direction::Either] {
-        let (pattern_reached, pattern_keys, pattern_backend) =
-            seed_and_expand(&pgq, direction).await;
-        let (fallback_reached, fallback_keys, fallback_backend) =
-            seed_and_expand(&two_query, direction).await;
-        assert_eq!(
-            (pattern_backend, fallback_backend),
-            (HopBackend::Pattern, HopBackend::TwoQuery),
-            "the {direction:?} comparison must be between two different backends"
-        );
-        assert_eq!(
-            pattern_reached.len(),
-            fallback_reached.len(),
-            "the backends disagree on how many nodes {direction:?} reaches"
-        );
-        assert_eq!(
-            pattern_keys, fallback_keys,
-            "the backends disagree on the {direction:?} edges"
-        );
-    }
-}
-
 /// The cross-tenant trap. Two tenants own a node under the same key, and each
 /// has its own edge; a hop that leaked would return the other tenant's key.
 ///
@@ -1698,7 +1548,7 @@ async fn both_hop_backends_return_the_same_answer() {
 /// missing and the guard test passed vacuously for days.
 #[tokio::test]
 async fn a_hop_never_leaves_its_tenant() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let ours = tenant_on(&stand).await;
@@ -1784,7 +1634,7 @@ async fn a_hop_never_leaves_its_tenant() {
 /// A budget that stops a walk says so; truncation is never silent.
 #[tokio::test]
 async fn a_stopped_hop_reports_why() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1832,7 +1682,7 @@ async fn a_stopped_hop_reports_why() {
 /// caller is asking is not a limit anyone can size a deployment against.
 #[tokio::test]
 async fn asking_for_degrees_does_not_double_the_hop_edge_budget() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -1925,82 +1775,73 @@ async fn asking_for_degrees_does_not_double_the_hop_edge_budget() {
 /// caller could not tell from a complete one -- the failure mode the type's own
 /// "never silent" comment forbids, and the same shape as the traversal
 /// backend that fell back in silence.
-///
-/// Run on both backends, because they build their answer differently and each
-/// has to reach the same conclusion about its own scan.
 #[tokio::test]
-async fn a_hop_that_hits_its_edge_budget_reports_it_on_both_backends() {
-    for hop in [HopStrategy::Pgq, HopStrategy::TwoQuery] {
-        let Some(stand) = stand(hop).await else {
-            return;
-        };
-        let tenant = tenant_on(&stand).await;
-        let scope = AccessScope::for_tenant(tenant);
-        let ctx = conformance::ctx(tenant, &scope, None);
+async fn a_hop_that_hits_its_edge_budget_reports_it() {
+    let Some(stand) = stand().await else {
+        return;
+    };
+    let tenant = tenant_on(&stand).await;
+    let scope = AccessScope::for_tenant(tenant);
+    let ctx = conformance::ctx(tenant, &scope, None);
 
-        stand
-            .store
-            .register_types(&ctx, conformance::ontology_batch())
-            .await
-            .expect("ontology registers");
+    stand
+        .store
+        .register_types(&ctx, conformance::ontology_batch())
+        .await
+        .expect("ontology registers");
 
-        // A hub with six edges, so a budget of three is inside it.
-        let mut nodes = vec![conformance::node("hub", "hub")];
-        let mut edges = Vec::new();
-        for index in 0..6 {
-            let key = format!("spoke-{index}");
-            nodes.push(conformance::node(&key, &key));
-            edges.push(conformance::edge("hub", &key));
-        }
-        conformance::ingest_batch(stand.store.as_ref(), &ctx, conformance::batch(nodes, edges))
-            .await
-            .expect("the hub commits");
-
-        let ids = stand
-            .store
-            .resolve_node_ids(&ctx, &["hub".to_owned()])
-            .await
-            .expect("the hub resolves");
-        let frontier: Vec<_> = ids.into_iter().map(|(_, id)| id).collect();
-
-        let request = |max_edges_scanned| ExpandRequest {
-            frontier: frontier.clone(),
-            direction: Direction::Either,
-            edge_types: None,
-            labels: None,
-            budget: HopBudget {
-                max_frontier: 1_000,
-                max_edges_scanned,
-            },
-            with_degrees: false,
-        };
-
-        let cut = stand
-            .engine
-            .expand(&ctx, request(3))
-            .await
-            .expect("the hop runs");
-        assert_eq!(
-            cut.truncated,
-            Some(TruncationReason::EdgeScanCap),
-            "{hop:?}: a scan stopped by the edge budget must say so"
-        );
-        assert_eq!(
-            cut.edges.len(),
-            3,
-            "{hop:?}: the budget still bounds the work"
-        );
-
-        // The same hop inside its budget is not truncated, otherwise the
-        // assertion above would pass on a hop that reports the cap always.
-        let whole = stand
-            .engine
-            .expand(&ctx, request(100))
-            .await
-            .expect("the hop runs");
-        assert_eq!(whole.truncated, None, "{hop:?}: an unbounded hop is whole");
-        assert_eq!(whole.edges.len(), 6, "{hop:?}: every edge of the hub");
+    // A hub with six edges, so a budget of three is inside it.
+    let mut nodes = vec![conformance::node("hub", "hub")];
+    let mut edges = Vec::new();
+    for index in 0..6 {
+        let key = format!("spoke-{index}");
+        nodes.push(conformance::node(&key, &key));
+        edges.push(conformance::edge("hub", &key));
     }
+    conformance::ingest_batch(stand.store.as_ref(), &ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the hub commits");
+
+    let ids = stand
+        .store
+        .resolve_node_ids(&ctx, &["hub".to_owned()])
+        .await
+        .expect("the hub resolves");
+    let frontier: Vec<_> = ids.into_iter().map(|(_, id)| id).collect();
+
+    let request = |max_edges_scanned| ExpandRequest {
+        frontier: frontier.clone(),
+        direction: Direction::Either,
+        edge_types: None,
+        labels: None,
+        budget: HopBudget {
+            max_frontier: 1_000,
+            max_edges_scanned,
+        },
+        with_degrees: false,
+    };
+
+    let cut = stand
+        .engine
+        .expand(&ctx, request(3))
+        .await
+        .expect("the hop runs");
+    assert_eq!(
+        cut.truncated,
+        Some(TruncationReason::EdgeScanCap),
+        "a scan stopped by the edge budget must say so"
+    );
+    assert_eq!(cut.edges.len(), 3, "the budget still bounds the work");
+
+    // The same hop inside its budget is not truncated, otherwise the
+    // assertion above would pass on a hop that reports the cap always.
+    let whole = stand
+        .engine
+        .expand(&ctx, request(100))
+        .await
+        .expect("the hop runs");
+    assert_eq!(whole.truncated, None, "an unbounded hop is whole");
+    assert_eq!(whole.edges.len(), 6, "every edge of the hub");
 }
 
 /// The degree a neighborhood ranks by is the neighbour's own connectivity in
@@ -2014,7 +1855,7 @@ async fn a_hop_that_hits_its_edge_budget_reports_it_on_both_backends() {
 /// for.
 #[tokio::test]
 async fn a_hop_reports_the_reached_nodes_degree_only_when_asked() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -2112,233 +1953,6 @@ async fn a_hop_reports_the_reached_nodes_degree_only_when_asked() {
     );
 }
 
-/// The configuration ADR-0001 calls the baseline: a server with no SQL/PGQ.
-///
-/// `PostgreSQL` 16 has no `GRAPH_TABLE`, so the conditional migration emits no
-/// property graph and the gear must serve every hop on the fallback backend
-/// "with no functional difference to the caller". Dropping the property graph
-/// on a PG19 stand reproduces exactly that condition — the capability is
-/// absent — without needing a second image, and it is the condition the gear
-/// got wrong: it attempted a pattern per request and answered `500` on a
-/// configuration the specification supports.
-#[tokio::test]
-async fn a_property_graph_lost_after_boot_is_reported_and_not_substituted_on_demand() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
-        return;
-    };
-    let tenant = tenant_on(&stand).await;
-    let scope = AccessScope::for_tenant(tenant);
-    let ctx = conformance::ctx(tenant, &scope, None);
-
-    stand
-        .store
-        .register_types(&ctx, conformance::ontology_batch())
-        .await
-        .expect("ontology registers");
-    conformance::ingest_batch(
-        stand.store.as_ref(),
-        &ctx,
-        conformance::batch(
-            vec![conformance::node("p-a", "a"), conformance::node("p-b", "b")],
-            vec![conformance::edge("p-a", "p-b")],
-        ),
-    )
-    .await
-    .expect("the batch commits");
-
-    let seed = stand
-        .store
-        .resolve_node_ids(&ctx, &["p-a".to_owned()])
-        .await
-        .expect("resolution succeeds")
-        .first()
-        .map_or_else(|| panic!("`p-a` resolves"), |(_, id)| *id);
-
-    // Precondition: with the property graph present, the probe says so and the
-    // pattern hop is what answers. Without this the test could pass on a stand
-    // that never had SQL/PGQ at all, proving nothing.
-    assert!(
-        graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
-        "the stand must start with a working property graph for this test to mean anything"
-    );
-
-    let hop = || ExpandRequest {
-        frontier: vec![seed],
-        direction: Direction::Outgoing,
-        edge_types: None,
-        labels: None,
-        budget: HopBudget {
-            max_frontier: 100,
-            max_edges_scanned: 1_000,
-        },
-        with_degrees: false,
-    };
-    // And the running engine serves it on the pattern, which is what this
-    // test then takes away.
-    let served = stand
-        .engine
-        .expand(&ctx, hop())
-        .await
-        .expect("with the property graph present the pattern answers");
-    assert_eq!(
-        served.served_by,
-        graph_storage_sdk::plugin_api::HopBackend::Pattern,
-        "precondition: the pattern hop answers before the graph is dropped"
-    );
-    assert_eq!(
-        sqlpgq_row(stand.store.as_ref()).await.state,
-        graph_storage_sdk::models::ReadinessState::Healthy
-    );
-
-    drop_property_graph(&stand).await;
-
-    assert!(
-        !graph_storage::infra::engine::probe_pgq(stand.store.db()).await,
-        "the probe must report the capability as absent once the graph is gone"
-    );
-
-    // The engine was built while the capability was present, so this is the
-    // per-request path. The stand demanded `pgq`, so the request is refused
-    // rather than served by a backend the operator did not name -- the same
-    // answer a restart would give -- and the store, having found out,
-    // reports the loss. It used to fall back here while readiness stayed
-    // healthy on the boot-time probe.
-    let refused = stand
-        .engine
-        .expand(&ctx, hop())
-        .await
-        .err()
-        .expect("`pgq` is a demand: a pattern that stopped executing is not quietly replaced");
-    assert!(
-        matches!(refused, graph_storage_sdk::plugin_api::GraphEngineError::Unavailable { ref reason } if reason.contains("traversal_hop")),
-        "the refusal names the setting, got {refused:?}"
-    );
-    // The server's own words stay in the log: the reason carries a fixed
-    // sentence and a pointer, not the statement's diagnostic.
-    if let graph_storage_sdk::plugin_api::GraphEngineError::Unavailable { reason } = &refused {
-        assert!(
-            reason.contains("the reason is in the gear's log")
-                && !reason.contains("does not exist"),
-            "the refusal does not carry the server's diagnostic: {reason}"
-        );
-    }
-    let row = sqlpgq_row(stand.store.as_ref()).await;
-    assert_eq!(
-        row.state,
-        graph_storage_sdk::models::ReadinessState::Unhealthy,
-        "readiness reports the loss from the request that found it: {row:?}"
-    );
-
-    // A running engine that merely *preferred* the pattern is served by the
-    // two-query hop, and its readiness says so from then on. Built as init
-    // built it while the graph was there: the probe said yes.
-    let preferring = Arc::new(PgGraphStore::new(
-        Arc::clone(&stand.db),
-        GraphStorageConfig {
-            traversal_hop: HopStrategy::Auto,
-            ..GraphStorageConfig::default()
-        }
-        .validated()
-        .expect("the test configuration is valid"),
-        true,
-    ));
-    assert_eq!(
-        sqlpgq_row(preferring.as_ref()).await.state,
-        graph_storage_sdk::models::ReadinessState::Healthy,
-        "until a request meets the loss, the store believes the probe"
-    );
-    let response = PgGraphEngine::new(Arc::clone(&preferring))
-        .expand(&ctx, hop())
-        .await
-        .expect("`auto` is a preference, and the fallback backend answers");
-    assert_eq!(
-        response.served_by,
-        graph_storage_sdk::plugin_api::HopBackend::TwoQuery
-    );
-    let reached: Vec<String> = response.edges.iter().map(|e| e.dst.clone()).collect();
-    assert_eq!(
-        reached,
-        vec!["p-b".to_owned()],
-        "the fallback backend answers the same question the pattern would have"
-    );
-    assert_eq!(
-        sqlpgq_row(preferring.as_ref()).await.state,
-        graph_storage_sdk::models::ReadinessState::Degraded,
-        "the loss is reported once a request has met it"
-    );
-
-    // And an engine constructed *after* the capability vanished resolves the
-    // backend from the configuration: `auto` is a preference and is served
-    // on the fallback, `pgq` is a demand and is refused rather than quietly
-    // substituted. The probe is what init uses, so these are the two engines
-    // a restart on this server would build.
-    let probed = graph_storage::infra::engine::probe_pgq(stand.store.db()).await;
-    let store_for = |hop: HopStrategy| {
-        Arc::new(PgGraphStore::new(
-            Arc::clone(&stand.db),
-            GraphStorageConfig {
-                traversal_hop: hop,
-                ..GraphStorageConfig::default()
-            }
-            .validated()
-            .expect("the test configuration is valid"),
-            probed,
-        ))
-    };
-    let preferred = store_for(HopStrategy::Auto);
-    let again = PgGraphEngine::new(Arc::clone(&preferred))
-        .expand(&ctx, hop())
-        .await
-        .expect("`auto` is a preference, and the fallback backend answers");
-    assert_eq!(again.edges.len(), 1);
-    let row = sqlpgq_row(preferred.as_ref()).await;
-    assert_eq!(
-        row.state,
-        graph_storage_sdk::models::ReadinessState::Degraded,
-        "{row:?}"
-    );
-
-    let demanded = store_for(HopStrategy::Pgq);
-    let refused = PgGraphEngine::new(Arc::clone(&demanded))
-        .expand(&ctx, hop())
-        .await
-        .err()
-        .expect("`pgq` is a demand, and another backend is not substituted for it");
-    assert!(
-        matches!(refused, graph_storage_sdk::plugin_api::GraphEngineError::Unavailable { ref reason } if reason.contains("traversal_hop")),
-        "the refusal names the setting to change, got {refused:?}"
-    );
-    let row = sqlpgq_row(demanded.as_ref()).await;
-    assert_eq!(
-        row.state,
-        graph_storage_sdk::models::ReadinessState::Unhealthy,
-        "{row:?}"
-    );
-    assert!(
-        !graph_storage_sdk::models::Readiness::of(vec![row]).ready,
-        "an explicitly configured backend the server cannot provide leaves the gear not ready"
-    );
-
-    // Naming the fallback states the choice, and reports healthy.
-    let chosen = store_for(HopStrategy::TwoQuery);
-    let row = sqlpgq_row(chosen.as_ref()).await;
-    assert_eq!(
-        row.state,
-        graph_storage_sdk::models::ReadinessState::Healthy,
-        "{row:?}"
-    );
-}
-
-/// The SQL/PGQ row of a store's own readiness report.
-async fn sqlpgq_row(store: &PgGraphStore) -> graph_storage_sdk::models::ComponentReadiness {
-    store
-        .probe_readiness()
-        .await
-        .into_iter()
-        .find(|row| row.component == graph_storage_sdk::models::SQLPGQ)
-        .expect("the store reports its SQL/PGQ row")
-}
-
 /// What `StoreCapabilities::snapshots = false` actually means here.
 ///
 /// DESIGN § 3.3 obligation 5 asks that every arm of one compound read observe
@@ -2351,7 +1965,7 @@ async fn sqlpgq_row(store: &PgGraphStore) -> graph_storage_sdk::models::Componen
 /// quietly makes it worse, shows up here.
 #[tokio::test]
 async fn the_built_in_store_declines_the_snapshot_obligation() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let tenant = tenant_on(&stand).await;
@@ -2432,7 +2046,7 @@ pg_case!(
 
 #[tokio::test]
 async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let one = tenant_on(&stand).await;
@@ -2445,7 +2059,7 @@ async fn an_edge_whose_endpoint_is_hidden_is_not_readable() {
 /// exposes, against a real server.
 #[tokio::test]
 async fn no_read_surface_answers_with_another_tenants_rows() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let one = tenant_on(&stand).await;
@@ -2476,7 +2090,7 @@ fn space(model: &str) -> graph_storage_sdk::models::EmbeddingSpaceId {
 /// one the stored vectors came from -- was made by code nothing exercised.
 #[tokio::test]
 async fn a_second_boot_with_another_provider_reports_a_mismatch_rather_than_opening_an_epoch() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let first = resolve(&stand.db, &space("model-a"))
@@ -2534,7 +2148,7 @@ async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
     use graph_storage::infra::storage::entity::graph_meta;
     use sea_orm::{ActiveValue, EntityTrait as _, sea_query::OnConflict};
 
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     let raw = sea_orm::Database::connect(&stand.dsn)
@@ -2571,7 +2185,7 @@ async fn an_elided_insert_that_asks_for_its_row_reports_record_not_found() {
 /// transactions, and both read the edge unowned before either commits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_scopes_racing_to_claim_an_unowned_edge_leave_it_with_one(
@@ -2603,7 +2217,7 @@ pg_case!(
 /// commits, and the unique key decides.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn two_creators_with_expected_version_zero_do_not_both_win() {
-    let Some(stand) = stand(HopStrategy::Pgq).await else {
+    let Some(stand) = stand().await else {
         return;
     };
     conformance::two_creators_with_expected_version_zero_do_not_both_win(

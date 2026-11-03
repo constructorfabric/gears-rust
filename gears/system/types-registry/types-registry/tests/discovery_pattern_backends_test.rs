@@ -44,7 +44,7 @@ fn corpus() -> Vec<String> {
     let mut ids = BTreeSet::new();
     for vendor in ["x", "x_y", "x0"] {
         for ty in ["t", "t2"] {
-            for version in ["v0", "v1", "v1.0", "v1.2", "v10"] {
+            for version in ["v0", "v0.0", "v0.2", "v1", "v1.0", "v1.2", "v10"] {
                 ids.insert(format!("{p}{vendor}.p.n.{ty}.{version}~"));
             }
         }

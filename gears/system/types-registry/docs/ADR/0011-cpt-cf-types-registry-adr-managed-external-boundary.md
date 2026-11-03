@@ -111,7 +111,7 @@ There is therefore no **registered or platform-observable** external dependent f
 
 **Managed to external** fails on each of the platform's four guarantees independently, and this half of the decision is unchanged:
 
-The four guarantees below concern resolution-bearing dependencies. `x-gts-ref` creates none, but the disjointness rule still covers its authority identifier: Managed admission checks current Source Claims, and claim activation reclassifies current Managed Type Schema content. Neither path stores a dependency.
+The four guarantees below concern resolution-bearing dependencies. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates none, but the disjointness rule still covers its authority identifier: Managed admission checks current Source Claims, and claim activation reclassifies current Managed Type Schema content. Neither path stores a dependency.
 
 * **Compatibility.** ADR-0004 makes a managed `$ref` float to the current revision, and ADR-0005 requires the affected dependency closure to be revalidated before a referenced revision becomes current. A source publishes a new revision without telling the platform, so the revalidation that makes floating references safe never runs. ADR-0003 already concluded that a managed schema referencing an external one inherits the weakest guarantee in its closure; with no per-revision monotonicity assertion, that is no guarantee.
 * **Deletion safety.** A source may delete its entity unilaterally. The managed entity that references it breaks with no registry event and no opportunity to block.
@@ -133,7 +133,7 @@ The prohibition on an Externally Managed Entity depending on a Managed Entity ha
 
 **Derivation across the boundary is structurally impossible.** A derived identifier `A~B~` has first segment `A`, and Source Claims are rooted single-segment patterns, so the owning source of `A~B~` and of `A~` is necessarily the same claim. An external derived type therefore cannot have a managed base. This is identifier arithmetic, not a rule anything has to check.
 
-**A reference from inside an external schema document is representable and undetectable.** The claim grammar constrains identifiers, not content. An External Registry Source is outside the platform's control and its implementation may well permit a `$ref` or `x-gts-ref` to a managed identifier, and ADR-0002 forbids Types Registry from interpreting source-owned content, so the platform neither sees nor checks it. The `MUST NOT` for this case is therefore a statement about what the platform recognizes, not about what a source can publish.
+**A reference from inside an external schema document is representable and undetectable.** The claim grammar constrains identifiers, not content. An External Registry Source is outside the platform's control and its implementation may well permit a `$ref` or entity reference to a managed identifier, and ADR-0002 forbids Types Registry from interpreting source-owned content, so the platform neither sees nor checks it. The `MUST NOT` for this case is therefore a statement about what the platform recognizes, not about what a source can publish.
 
 **Types Registry consequently offers no guarantee for such a reference.** Admission-time validation applies to Managed Entities only; for a live external result the platform validates the response envelope and its own invariants — identifier integrity, derived reference equality, claim conformance, entity kind, presence of the opaque `external_revision` — and nothing about content. Specifically, for a cross-boundary content reference:
 
@@ -174,7 +174,7 @@ The cost that remains is real and must be documented for vendors: **an external 
 
 Deletion of a Managed Entity is decided from managed storage alone. It calls no plugin, reads no plugin-supplied data, and depends on neither plugin uptime nor plugin diligence.
 
-Types Registry examines only dependencies it owns and can enumerate: derived types, schemas holding a `$ref` to the target, and registered Instances conforming to it. `x-gts-ref` creates no dependency and therefore does not block deletion.
+Types Registry examines only dependencies it owns and can enumerate: derived types, schemas holding a `$ref` to the target, and registered Instances conforming to it. An entity reference creates no dependency and therefore does not block deletion.
 
 **Live reverse-impact query is not retained at all,** and closing the boundary is what emptied it. It could report nothing **platform-authoritative** about a Managed Entity: no externally managed entity may depend on one, so any dependent a source named would be one the rule forbids and the platform does not recognize — and, because a reference from inside an external document is undetectable here, the platform could neither confirm nor refute it. What remained was external dependents of an *externally managed* entity: a question entirely inside the source's own universe, which the source's own tooling answers better.
 
@@ -251,8 +251,8 @@ The composition story therefore sits on the managed side of the boundary rather 
 
 This decision is confirmed when:
 
-* admission rejects a managed Type Schema containing a `$ref` or `x-gts-ref` to an externally managed target, and rejects a managed identifier deriving from an externally managed base, with diagnostics naming the offending reference;
-* Source Claim activation rejects a pattern covering an `x-gts-ref` authority identifier in current Managed Type Schema content;
+* admission rejects a managed Type Schema containing a `$ref` or entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) to an externally managed target, and rejects a managed identifier deriving from an externally managed base, with diagnostics naming the offending reference;
+* Source Claim activation rejects a pattern covering an entity-reference authority identifier in current Managed Type Schema content;
 * no admitted managed revision contains an external revision token or any other source-derived value in its provenance record;
 * Types Registry storage contains no external entity identifier in any column, including on dependency edges;
 * an externally managed entity cannot be admitted as derived from a managed base, and the impossibility follows from claim selection on the first segment rather than from a check that could be bypassed;

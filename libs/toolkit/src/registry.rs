@@ -758,7 +758,7 @@ pub enum RegistryError {
         #[source]
         source: anyhow::Error,
     },
-    #[error("consumer proxy-wiring failed for gear '{gear}'")]
+    #[error("consumer proxy-wiring failed for gear '{gear}': {source}")]
     ProxyWiring {
         gear: &'static str,
         #[source]

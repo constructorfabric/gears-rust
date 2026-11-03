@@ -14,10 +14,10 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use aws_lc_rs::digest::{Context, SHA256};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use toolkit_macros::domain_model;
+use toolkit_security::crypto::hash::Sha256;
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -49,14 +49,13 @@ use crate::domain::type_provisioning::{ProvisionedRoute, ProvisionedUpstream};
 /// `("a", "bc")` differ), map entries are sorted by key, `f64` is encoded by
 /// its bits, enums by their variant names, and instances are sorted by
 /// `(tenant_id, id)`, so neither listing order nor `HashMap` order matters.
-/// SHA-256 comes from `aws-lc-rs` (`sha2` is banned outside an allow-list,
-/// DE0708).
+/// SHA-256 comes from the toolkit-security facade and its selected backend.
 pub(crate) fn content_hash(
     upstreams: &[ProvisionedUpstream],
     routes: &[ProvisionedRoute],
     root_tenant_id: Uuid,
 ) -> String {
-    let mut e = Encoder(Context::new(&SHA256));
+    let mut e = Encoder(Sha256::new());
     e.str("oagw-registry-content-v1");
     e.str(env!("CARGO_PKG_VERSION"));
 
@@ -80,16 +79,16 @@ pub(crate) fn content_hash(
         e.route(request);
     }
 
-    let digest = e.0.finish();
+    let digest = e.0.finalize();
     digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The canonical encoder behind [`content_hash`].
-struct Encoder(Context);
+struct Encoder(Sha256);
 
 impl Encoder {
     fn bytes(&mut self, bytes: &[u8]) {
-        self.0.update(&(bytes.len() as u64).to_be_bytes());
+        self.0.update((bytes.len() as u64).to_be_bytes());
         self.0.update(bytes);
     }
 

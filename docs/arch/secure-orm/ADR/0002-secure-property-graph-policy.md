@@ -8,6 +8,8 @@ decision-makers: Constructor Fabric steering committee
 
 **ID**: `cpt-cf-adr-secure-property-graph-policy`
 
+> **Deferred until PostgreSQL 20, 2026-10-14** (gears-rust #5343). PostgreSQL 19 GA ships without SQL/PGQ (reverted in 19 beta 4), so the re-validation "at GA" moves to the PostgreSQL 20 betas; until then the integration suite runs only while a 19 beta image is pullable.
+
 ## Context and Problem Statement
 
 [ADR-0001](./0001-secure-cte-policy.md) settled the Secure ORM's load-bearing invariant —

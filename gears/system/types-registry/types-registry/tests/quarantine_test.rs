@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use gts::{X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use sea_orm::EntityTrait;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -44,7 +45,7 @@ const DERIVED_FROM_UNSTABLE: &str = gts_id!("cf.core.quar.draft.v0~cf.core.quar.
 const DERIVED_FROM_STABLE: &str = gts_id!("cf.core.quar.published.v1~cf.core.quar.leaf.v1~");
 /// An unstable leaf derived from the stable entity: weaker on stronger.
 const UNSTABLE_LEAF: &str = gts_id!("cf.core.quar.published.v1~cf.core.quar.sketch.v0~");
-/// A standalone stable schema, used as the `$ref`-ing and `x-gts-ref`-ing subject.
+/// A standalone stable schema, used as the `$ref`-ing and entity-reference subject.
 const REFERRER: &str = gts_id!("cf.core.quar.referrer.v1~");
 const CONSTRAINER: &str = gts_id!("cf.core.quar.constrainer.v1~");
 /// A registered Instance whose conforming type is the unstable entity.
@@ -86,8 +87,8 @@ fn schema(gts_id: &str) -> Value {
     })
 }
 
-/// The same schema with `properties` replaced, so a `$ref` or an `x-gts-ref` is
-/// the only difference from the admissible baseline shape.
+/// The same schema with `properties` replaced, so a `$ref` or an entity reference
+/// is the only difference from the admissible baseline shape.
 fn schema_with(gts_id: &str, properties: Value) -> Value {
     let mut doc = schema(gts_id);
     doc["properties"] = properties;
@@ -101,10 +102,10 @@ fn referencing(gts_id: &str, target: &str) -> Value {
     )
 }
 
-fn constraining(gts_id: &str, pattern: &str) -> Value {
+fn constraining(gts_id: &str, keyword: &str, pattern: &str) -> Value {
     schema_with(
         gts_id,
-        json!({ "target": { "type": "string", "x-gts-ref": pattern } }),
+        json!({ "target": { "type": "string", keyword: pattern } }),
     )
 }
 
@@ -281,23 +282,26 @@ async fn a_registered_instance_of_a_major_zero_schema_is_refused() {
 // What the rule deliberately does not reach
 // ---------------------------------------------------------------------------
 
-/// `x-gts-ref` creates no dependency, for exact IDs or patterns. Leave the target
-/// unregistered to verify that the store is not consulted.
+/// An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no
+/// dependency, for exact IDs or patterns. Leave the target unregistered to
+/// verify that the store is not consulted.
 #[tokio::test]
-async fn a_stable_schema_whose_x_gts_ref_names_a_major_zero_entity_is_admitted() {
-    let db = test_db().await;
+async fn a_stable_schema_whose_entity_ref_names_a_major_zero_entity_is_admitted() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        let db = test_db().await;
 
-    for (key, id, pattern) in [
-        ("exact", REFERRER, UNSTABLE.to_owned()),
-        ("pattern", CONSTRAINER, format!("{UNSTABLE}*")),
-    ] {
-        succeeded(&admit(&db, key, id, constraining(id, &pattern)).await);
+        for (key, id, pattern) in [
+            ("exact", REFERRER, UNSTABLE.to_owned()),
+            ("pattern", CONSTRAINER, format!("{UNSTABLE}*")),
+        ] {
+            succeeded(&admit(&db, key, id, constraining(id, keyword, &pattern)).await);
+        }
+        assert_eq!(
+            registered(&db).await,
+            vec![CONSTRAINER.to_owned(), REFERRER.to_owned()],
+            "both stable schemas are admitted despite naming a major-0 entity via {keyword}",
+        );
     }
-    assert_eq!(
-        registered(&db).await,
-        vec![CONSTRAINER.to_owned(), REFERRER.to_owned()],
-        "both stable schemas are admitted despite naming a major-0 entity",
-    );
 }
 
 /// Unstable types may derive from stable bases.

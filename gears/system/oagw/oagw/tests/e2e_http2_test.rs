@@ -1,4 +1,4 @@
-//! E2E tests verifying HTTP/2 upstream support through the Pingora proxy.
+//! E2E tests verifying HTTP/2 upstream support through the upstream proxy engine.
 //!
 //! Spins up a local TLS server that only speaks HTTP/2 (via ALPN `h2`),
 //! configures OAGW to proxy to it with cert verification disabled, and
@@ -168,7 +168,7 @@ async fn start_h2_mock() -> (SocketAddr, Arc<H2MockState>, tokio::task::JoinHand
 
 /// E2E: OAGW proxies a POST request to an HTTPS/H2-only upstream and gets
 /// a successful response. Proves that ALPN negotiation + H2 framing works
-/// end-to-end through the Pingora bridge.
+/// end-to-end through the upstream engine.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_http2_upstream_round_trip() {
     let (mock_addr, mock_state, _handle) = start_h2_mock().await;
@@ -382,7 +382,7 @@ async fn e2e_http2_upstream_large_body() {
 
 /// E2E: SSE streaming response over HTTP/2. Verifies that chunked/streaming
 /// responses from an H2-only upstream are correctly relayed through the
-/// Pingora bridge back to the client.
+/// upstream engine back to the client.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn e2e_http2_upstream_sse_streaming() {
     let (mock_addr, mock_state, _handle) = start_h2_mock().await;

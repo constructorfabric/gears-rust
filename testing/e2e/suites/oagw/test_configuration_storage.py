@@ -1,5 +1,6 @@
 """E2E tests for configuration storage (ADR-0018): OAGW on a database, with
-upstreams and routes provisioned from the types registry.
+upstreams and routes provisioned from the types registry, and the proxy
+configuration cache a database turns on (ADR-0020).
 
 They need this suite's ``sqlite`` profile (``make e2e-oagw-sqlite``). It binds
 OAGW to SQLite and adds the upstream and routes below to the types-registry
@@ -11,11 +12,13 @@ suite's ``registry_provisioned`` fixture waits for the rows.
 
 The tests run when ``OAGW_E2E_PROFILE=sqlite`` is set or the server has the
 registry upstream, and are skipped only when neither holds. 19.1 reads the
-stored rows from the SQLite file at ``OAGW_E2E_DB``.
+stored rows from the SQLite file at ``OAGW_E2E_DB``; the cache test writes a
+row there behind OAGW's back.
 """
 import os
 import sqlite3
 import uuid
+from contextlib import closing
 
 import httpx
 import pytest
@@ -29,7 +32,11 @@ from .helpers import (
     UPSTREAM_SCHEMA,
     assert_problem,
     create_route,
+    create_upstream,
     list_all,
+    unique_alias,
+    update_route,
+    update_upstream,
 )
 
 # Mirrors the types-registry entities of the sqlite profile in e2e.yaml.
@@ -59,12 +66,36 @@ async def sqlite_profile(oagw_base_url, oagw_headers):
         assert resp.status_code == 200, resp.text[:300]
 
 
+def _db_path() -> str:
+    """OAGW's SQLite file; it exists, so OAGW runs on the database."""
+    db_path = os.path.expanduser(os.getenv("OAGW_E2E_DB", "~/.cf-gears/oagw/oagw.db"))
+    assert os.path.isfile(db_path), (
+        f"no OAGW database at {db_path}; set OAGW_E2E_DB to <home_dir>/oagw/oagw.db"
+    )
+    return db_path
+
+
+def _row_id(gts_id: str) -> bytes:
+    """A row's stored ID; SQLite stores UUIDs as 16-byte blobs."""
+    return uuid.UUID(gts_id.rsplit("~", 1)[-1]).bytes
+
+
 def _stored_owner(db: sqlite3.Connection, table: str, gts_id: str) -> str:
-    """``managed_by`` of a stored row; SQLite stores UUIDs as 16-byte blobs."""
-    row_id = uuid.UUID(gts_id.rsplit("~", 1)[-1]).bytes
-    row = db.execute(f"SELECT managed_by FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    """``managed_by`` of a stored row."""
+    row = db.execute(f"SELECT managed_by FROM {table} WHERE id = ?", (_row_id(gts_id),)).fetchone()
     assert row is not None, f"{gts_id} is not in {table}"
     return row[0]
+
+
+def _disable_behind_oagw(upstream_id: str) -> None:
+    """Disable an upstream in OAGW's SQLite file directly. No OAGW write
+    path runs, so nothing evicts it from the proxy configuration cache."""
+    with closing(sqlite3.connect(_db_path(), timeout=10.0)) as db:
+        cur = db.execute(
+            "UPDATE oagw_upstream SET enabled = 0 WHERE id = ?", (_row_id(upstream_id),),
+        )
+        db.commit()
+        assert cur.rowcount == 1, f"{upstream_id} is not in oagw_upstream"
 
 
 async def _get(client, base, headers, collection, rid):
@@ -140,11 +171,7 @@ async def test_registry_instances_provisioned_at_startup(
 
     # The rows are in OAGW's SQLite file, so OAGW runs on the database and
     # not in memory.
-    db_path = os.path.expanduser(os.getenv("OAGW_E2E_DB", "~/.cf-gears/oagw/oagw.db"))
-    assert os.path.isfile(db_path), (
-        f"no OAGW database at {db_path}; set OAGW_E2E_DB to <home_dir>/oagw/oagw.db"
-    )
-    with sqlite3.connect(f"file:{db_path}?mode=ro", uri=True) as db:
+    with closing(sqlite3.connect(f"file:{_db_path()}?mode=ro", uri=True)) as db:
         assert _stored_owner(db, "oagw_upstream", REGISTRY_UPSTREAM_ID) == "registry"
         for route_id in (REGISTRY_ROUTE_ID, BARE_UUID_ROUTE_ID):
             assert _stored_owner(db, "oagw_route", route_id) == "registry"
@@ -234,3 +261,62 @@ async def test_registry_managed_resources_read_only(
         )
         ids = [r["id"] for r in routes]
         assert REGISTRY_ROUTE_ID in ids and api_route["id"] not in ids
+
+
+@pytest.mark.asyncio
+async def test_proxy_sees_each_write(
+    oagw_base_url, oagw_headers, mock_upstream_url, mock_upstream, cleanup,
+):
+    """On a database proxy calls are served from the configuration cache, and
+    each Management API write is visible to the next proxy call: disabling and
+    re-enabling the upstream (alias map), then narrowing its route's methods
+    (route map). An upstream disabled behind OAGW's back is still proxied,
+    which proves the cache serves (uncached, it would answer 503).
+
+    ADR-0020: CACHE-FRESH-001.
+    """
+    _ = mock_upstream
+    alias = unique_alias("cache-fresh")
+    url = f"{oagw_base_url}/oagw/v1/proxy/{alias}/v1/models"
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        upstream = cleanup.upstream(oagw_headers, await create_upstream(
+            client, oagw_base_url, oagw_headers, mock_upstream_url, alias=alias,
+        ))
+        route = await create_route(
+            client, oagw_base_url, oagw_headers, upstream["id"], ["GET"], "/v1/models",
+        )
+        # The first call loads both maps, the second is served from them.
+        for _ in range(2):
+            resp = await client.get(url, headers=oagw_headers)
+            assert resp.status_code == 200, resp.text[:300]
+
+        # Not seen until the entry expires (TTL 60 s).
+        _disable_behind_oagw(upstream["id"])
+        resp = await client.get(url, headers=oagw_headers)
+        assert resp.status_code == 200, f"not served from the cache: {resp.text[:300]}"
+
+        await update_upstream(
+            client, oagw_base_url, oagw_headers, upstream["id"], mock_upstream_url,
+            alias=alias, enabled=False,
+        )
+        resp = await client.get(url, headers=oagw_headers)
+        assert_problem(resp, 503, category="service_unavailable")
+        assert resp.headers.get("retry-after") == "30"
+
+        await update_upstream(
+            client, oagw_base_url, oagw_headers, upstream["id"], mock_upstream_url,
+            alias=alias, enabled=True,
+        )
+        resp = await client.get(url, headers=oagw_headers)
+        assert resp.status_code == 200, resp.text[:300]
+
+        await update_route(
+            client, oagw_base_url, oagw_headers, route["id"], ["POST"], "/v1/models",
+        )
+        resp = await client.get(url, headers=oagw_headers)
+        assert_problem(
+            resp, 404,
+            category="not_found",
+            resource_type=ROUTE_SCHEMA,
+            detail_contains="route not found",
+        )

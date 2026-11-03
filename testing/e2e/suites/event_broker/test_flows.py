@@ -22,6 +22,7 @@ import pytest
 from .conftest import EVENT_TYPE_STREAM, SUBJECT_TYPE, TOPIC_STREAM, SseFrameReader
 
 
+@pytest.mark.backend_sensitive
 @pytest.mark.timeout(30, func_only=True)
 async def test_publish_subscribe_consume_full_flow(api, test_env):
     """scenario: flows/1.01-flow-publish-subscribe-consume.md"""

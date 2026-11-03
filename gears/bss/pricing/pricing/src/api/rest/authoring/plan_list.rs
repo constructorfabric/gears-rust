@@ -10,7 +10,7 @@ use super::{
     plans,
     support::{
         authz_failure, if_none_match, invalid_because, require_authenticated, revalidate_header,
-        transaction, weak_etag_header,
+        transaction_read, weak_etag_header,
     },
 };
 use crate::{
@@ -368,7 +368,7 @@ async fn list_plans(
     let (filter, odata) = prepared(&uri, LIST_PLAIN, odata, today)?;
     let tenant = ctx.subject_tenant_id();
     let backend = state.db.db().backend();
-    let mut body = transaction(&state.db.db(), move |tx| {
+    let mut body = transaction_read(&state.db.db(), move |tx| {
         let (scope, filter, odata) = (scope.clone(), filter.clone(), odata.clone());
         Box::pin(async move { plans::list(tx, &scope, tenant, backend, &filter, &odata).await })
     })
@@ -408,7 +408,7 @@ async fn count_plans(
     }
     let tenant = ctx.subject_tenant_id();
     let backend = state.db.db().backend();
-    transaction(&state.db.db(), move |tx| {
+    transaction_read(&state.db.db(), move |tx| {
         let (scope, filter, odata, headers) = (
             scope.clone(),
             filter.clone(),

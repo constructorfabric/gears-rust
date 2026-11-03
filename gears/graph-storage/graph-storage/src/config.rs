@@ -29,32 +29,25 @@ pub enum EmbeddingProviderKind {
 }
 
 /// Which backend serves one-hop expansion.
+///
+/// Only the two-query hop exists. The key stays so existing configurations
+/// keep loading; `pgq` is refused at startup (gears-rust #5267).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopStrategy {
-    /// The SQL/PGQ hop where the server provides it, the two-query hop where
-    /// it does not. The default, because it is a preference and not a
-    /// demand: the gear's baseline is `PostgreSQL` 16 and SQL/PGQ a backend
-    /// capability (ADR-0001), so a server without it is served, not refused.
-    /// Readiness reports that fallback as `Degraded`; naming `two_query`
-    /// states the choice outright and reports healthy.
+    /// The two-query hop. The default.
     #[default]
     Auto,
-    /// One-statement SQL/PGQ `GRAPH_TABLE` hop (requires `PostgreSQL` 19+),
-    /// as a demand. On a server that cannot provide it the gear is not ready
-    /// and traversal is refused, rather than quietly served by another
-    /// backend: an operator who asked for this one by name would otherwise
-    /// never learn they are not getting it (ADR-0001, point 2).
+    /// Retired; refused by [`GraphStorageConfig::validate`].
     Pgq,
-    /// Two scoped queries; the universal fallback every deployment can serve.
+    /// The two-query hop, named outright.
     TwoQuery,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct GraphStorageConfig {
-    /// Traversal backend. SQL/PGQ falls back to `two_query` per request when
-    /// the scope defeats it, always with a logged reason.
+    /// Traversal backend: `auto` or `two_query`, both the two-query hop.
     pub traversal_hop: HopStrategy,
 
     /// Vector width of the deployment's single embedding space. Fixed at
@@ -335,6 +328,14 @@ impl GraphStorageConfig {
     /// Enforce the hard ranges of the Capacity and Admission Contract.
     pub fn validate(&self) -> anyhow::Result<()> {
         let mut errors: Vec<String> = Vec::new();
+        if self.traversal_hop == HopStrategy::Pgq {
+            errors.push(
+                "traversal_hop `pgq` is retired: PostgreSQL 19 GA ships without SQL/PGQ \
+                 (gears-rust #5267); use `two_query` (or `auto`), which every supported \
+                 server runs"
+                    .to_owned(),
+            );
+        }
         self.check_embedding_ranges(&mut errors);
         self.check_write_ranges(&mut errors);
         self.check_graph_ranges(&mut errors);
@@ -617,13 +618,11 @@ mod tests {
     /// The traversal backend defaults to a preference, and the three
     /// spellings an operator writes are the three that parse.
     ///
-    /// `auto` is the default because the gear's baseline is `PostgreSQL` 16
-    /// and SQL/PGQ a capability of 19: a default of `pgq` made every
-    /// deployment on the baseline a demand the server could not meet, which
-    /// is why readiness could never report that demand as the failure the
-    /// matrix says it is.
+    /// `pgq` still parses, so the refusal can name it, and is refused at
+    /// startup: it was a demand for a backend that no released PostgreSQL
+    /// serves, and silently serving the two-query hop instead would hide that.
     #[test]
-    fn the_traversal_backend_defaults_to_a_preference() {
+    fn the_retired_sqlpgq_backend_is_refused_by_name() {
         assert_eq!(
             GraphStorageConfig::default().traversal_hop,
             HopStrategy::Auto
@@ -640,6 +639,25 @@ mod tests {
         assert!(
             serde_json::from_value::<HopStrategy>(serde_json::json!("pattern")).is_err(),
             "an unknown backend is refused, not defaulted"
+        );
+        for accepted in [HopStrategy::Auto, HopStrategy::TwoQuery] {
+            let config = GraphStorageConfig {
+                traversal_hop: accepted,
+                ..GraphStorageConfig::default()
+            };
+            assert!(config.validate().is_ok(), "{accepted:?} is accepted");
+        }
+        let refused = GraphStorageConfig {
+            traversal_hop: HopStrategy::Pgq,
+            ..GraphStorageConfig::default()
+        }
+        .validate()
+        .expect_err("`pgq` is refused at startup");
+        assert!(
+            refused
+                .to_string()
+                .contains("traversal_hop `pgq` is retired"),
+            "{refused}"
         );
     }
 

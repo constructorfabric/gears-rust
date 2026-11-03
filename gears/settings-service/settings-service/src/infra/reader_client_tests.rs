@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The SDK contract as a consumer sees it, over the resolution harness.
 
 use std::sync::Arc;

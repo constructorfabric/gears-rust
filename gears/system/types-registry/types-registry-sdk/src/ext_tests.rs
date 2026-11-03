@@ -458,6 +458,39 @@ async fn list_helpers_select_their_documents_by_default_and_follow_every_page() 
 }
 
 #[tokio::test]
+async fn a_pattern_query_without_a_kind_lists_only_the_helpers_kind_with_documents() {
+    let fake = MockTypesRegistry::new();
+    fake.seed(TYPE, schema(TYPE));
+    fake.seed(INSTANCE, json!({ "n": 1 }));
+    fake.seed(
+        "gts.cf.test.pkg.thing.v1~cf.test.pkg.two.v1",
+        json!({ "n": 2 }),
+    );
+    // The pattern matches the Type Schema too; the helper narrows the kind itself.
+    let query = ListEntitiesRequest::matching(
+        gts::GtsIdPattern::try_new(&format!("{TYPE}*")).expect("pattern"),
+    )
+    .with_limit(1);
+
+    let instances = fake
+        .list_instances(&ctx(), query.clone())
+        .await
+        .expect("lists");
+    assert_eq!(instances.len(), 2, "every page, Instances only");
+    assert!(instances.iter().all(|s| s.content.is_some()));
+
+    let light = fake
+        .list_instances(&ctx(), query.with_projection(FieldSelection::light()))
+        .await
+        .expect("lists");
+    assert_eq!(light.len(), 2);
+    assert!(
+        light.iter().all(|s| s.content.is_none()),
+        "an explicit light selection is kept"
+    );
+}
+
+#[tokio::test]
 async fn a_list_helper_reads_documents_only_for_the_default_projection() {
     let fake = MockTypesRegistry::new();
     fake.seed(TYPE, schema(TYPE));
@@ -923,34 +956,22 @@ mod tenant {
 }
 
 #[tokio::test]
-async fn spellings_of_one_entity_are_read_once_and_each_answered() {
+async fn a_padded_spelling_is_refused_before_any_read() {
     let fake = MockTypesRegistry::new();
     fake.seed(TYPE, json!({}));
-    // Unchecked: parsing trims it to `TYPE`, so both name one entity key.
+    // Unchecked: identifiers are validated as spelled, so padding is not trimmed away.
     let padded = GtsTypeId::new(&format!(" {TYPE}"));
-    assert_ne!(padded, type_id(TYPE));
 
-    let answers = fake
-        .batch_get_type_schemas(
-            &ctx(),
-            &[type_id(TYPE), padded.clone(), type_id(TYPE)],
-            ReadOptions::default(),
-        )
+    let error = fake
+        .batch_get_type_schemas(&ctx(), &[type_id(TYPE), padded], ReadOptions::default())
         .await
-        .expect("the read succeeds");
+        .expect_err("the padded spelling is not a GTS id");
 
-    assert_eq!(
-        answers.len(),
-        2,
-        "each distinct spelling is a key of the answer"
+    assert!(
+        matches!(error, CanonicalError::InvalidArgument { .. }),
+        "{error:?}"
     );
-    assert!(answers[&type_id(TYPE)].is_some());
-    assert_eq!(answers[&padded], answers[&type_id(TYPE)]);
-    assert_eq!(
-        fake.reads(),
-        [crate::models::EntityKey::GtsId(id(TYPE))],
-        "the entity is read once"
-    );
+    assert!(fake.reads().is_empty(), "no identifier is read");
 }
 
 #[tokio::test]

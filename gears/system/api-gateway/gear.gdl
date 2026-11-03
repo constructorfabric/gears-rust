@@ -1,0 +1,52 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the api-gateway gear.
+#
+# Under ADR cpt-gearbox-adr-macro-projected-catalogue the Rust attributes keep
+# identity, capabilities and lifecycle. Projected from #[toolkit::gear] in
+# src/gear.rs; deps below is an exact checked mirror:
+#
+#   id             <- name = "api-gateway"
+#   runtime_caps   <- capabilities = [rest_host, rest, stateful]
+#   colocated_deps <- deps = [grpc_hub, authn_resolver]   (link-time; uncuttable)
+#   lifecycle      <- lifecycle(entry = "serve", stop_timeout = "30s", await_ready)
+#
+# Other projected fields are refused by GBX0210; deps drift is GBX0214.
+
+gear(
+    deps = ["authn-resolver", "grpc-hub"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/api-gateway"),
+    maturity = "preview",
+    implementation = "in-progress",
+    name = "API Gateway",
+    description = "Single public API entrypoint with routing, auth, rate limiting, and OpenAPI publication.",
+    category = "api-ingress",
+    visibility = "internal",
+
+    # `lib` is mandatory, never derived. `attr` is omitted: this crate declares
+    # exactly one gear, so scanning src/ is unambiguous.
+    package = cargo(
+        crate_name = "cf-gears-api-gateway",
+        lib = "api_gateway",
+        path = ".",
+    ),
+
+    # `bind_addr` is this gear's real config key (src/config.rs), and a runtime
+    # configuration fact rather than a Rust one -- so it is declared here.
+    serves = [endpoint(name = "rest", config_key = "bind_addr", default_port = 8087)],
+
+    # Includes structured discovery and platform-auth settings so prepared
+    # products can declare them without losing them during generation.
+    config_schema = config(exposes = ["bind_addr", "enable_docs", "cors_enabled", "prefix_path", "auth_disabled", "advertise_uri", "gateway_proxy", "internal_auth", "route_policies"]),
+
+    # Every one of these is a product decision. `k8s-auth` is the exception that
+    # needs a kind: it authenticates against a Kubernetes service account.
+    cargo_features = [
+        feature("grpc"),
+        feature("otel"),
+        feature("embed_elements"),
+        feature("k8s-auth", kinds = ["kubernetes"]),
+    ],
+)

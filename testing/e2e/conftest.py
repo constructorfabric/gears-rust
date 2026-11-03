@@ -30,6 +30,23 @@ def auth_headers():
 
 
 @pytest.fixture
+def platform_headers():
+    """
+    Build platform-plane headers: the internal token alone, never a bearer.
+
+    A request carrying both an ``Authorization`` header and the internal token is
+    refused ``401 MIXED_CREDENTIALS`` on every route, so these must not be merged
+    into ``auth_headers``. The token is the gateway's ``internal_auth``
+    shared secret, ``E2E_INTERNAL_TOKEN`` or the one ``config/e2e-local.yaml`` sets.
+
+    Returns:
+        dict: Headers dict with the X-ToolKit-Internal-Token header.
+    """
+    token = os.getenv("E2E_INTERNAL_TOKEN", "e2e-internal-token")
+    return {"X-ToolKit-Internal-Token": token}
+
+
+@pytest.fixture
 def local_files_root():
     """
     Provide the root directory for local file parsing tests.

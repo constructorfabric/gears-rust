@@ -19,6 +19,33 @@ fn identifiers_are_valid_and_consistent() {
 }
 
 #[test]
+fn resource_type_schemas_are_in_inventory_under_their_constants() {
+    let schemas = toolkit_gts::all_inventory_type_schemas().unwrap();
+    for type_id in [
+        BUNDLE_RESOURCE,
+        BUNDLE_VERSION_RESOURCE,
+        ASSIGNMENT_RESOURCE,
+    ] {
+        let schema = schemas
+            .iter()
+            .find(|s| s["$id"] == format!("gts://{type_id}"))
+            .unwrap_or_else(|| panic!("{type_id} not declared"));
+        assert!(
+            schema["description"]
+                .as_str()
+                .is_some_and(|d| d.starts_with("Policy engine ")),
+            "{type_id}: {schema}"
+        );
+        let properties: Vec<_> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("{type_id}: {schema}"))
+            .keys()
+            .collect();
+        assert_eq!(properties, ["id"], "{type_id} is id-only");
+    }
+}
+
+#[test]
 fn permission_catalog_is_in_inventory_and_matches_capabilities() {
     let instances = toolkit_gts::all_inventory_instances().unwrap();
     let mut seen = BTreeSet::new();

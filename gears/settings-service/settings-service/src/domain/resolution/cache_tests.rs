@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! The cache's contract: hit, miss, expiry, and the eviction shapes.
 
 use std::sync::Arc;

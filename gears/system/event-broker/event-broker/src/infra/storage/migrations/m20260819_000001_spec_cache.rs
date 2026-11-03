@@ -1,9 +1,14 @@
 //! `event_broker_spec_cache` table - `SpecificationManager`'s local
-//! topic/event-type cache (eb-single-process-implementation D1). `SQLite`
-//! only (decision log entry 7); no other backend branch needed.
+//! topic/event-type cache (eb-single-process-implementation D1). Built with
+//! the schema builder, so one definition serves `SQLite`, `PostgreSQL` and
+//! `MySQL`/`MariaDB` ([`super::columns`]).
 
 use sea_orm_migration::prelude::*;
-use sea_orm_migration::sea_orm::ConnectionTrait;
+
+use super::columns::{create_index, document, gts_id};
+
+/// `SpecKind::as_str`: `topic` or `event_type`.
+const KIND_LEN: u32 = 16;
 
 #[derive(DeriveMigrationName)]
 pub struct Migration;
@@ -11,29 +16,52 @@ pub struct Migration;
 #[async_trait::async_trait]
 impl MigrationTrait for Migration {
     async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        let conn = manager.get_connection();
-        conn.execute_unprepared(
-            r"
-CREATE TABLE IF NOT EXISTS event_broker_spec_cache (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    gts_id  TEXT NOT NULL,
-    kind    TEXT NOT NULL,
-    payload TEXT NOT NULL
-);
-
-CREATE UNIQUE INDEX IF NOT EXISTS event_broker_spec_cache_gts_id_idx
-    ON event_broker_spec_cache (gts_id);
-",
+        use EventBrokerSpecCache as T;
+        manager
+            .create_table(
+                Table::create()
+                    .table(T::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(T::Id)
+                            .big_integer()
+                            .not_null()
+                            .auto_increment()
+                            .primary_key(),
+                    )
+                    .col(gts_id(manager, T::GtsId))
+                    .col(ColumnDef::new(T::Kind).string_len(KIND_LEN).not_null())
+                    .col(document(manager, T::Payload))
+                    .to_owned(),
+            )
+            .await?;
+        create_index(
+            manager,
+            "event_broker_spec_cache_gts_id_idx",
+            T::Table,
+            &[T::GtsId],
+            true,
         )
-        .await?;
-        Ok(())
+        .await
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager
-            .get_connection()
-            .execute_unprepared("DROP TABLE IF EXISTS event_broker_spec_cache;")
-            .await?;
-        Ok(())
+            .drop_table(
+                Table::drop()
+                    .table(EventBrokerSpecCache::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
+            .await
     }
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+enum EventBrokerSpecCache {
+    Table,
+    Id,
+    GtsId,
+    Kind,
+    Payload,
 }

@@ -71,12 +71,19 @@ impl Gear for FileStorageGear {
         );
 
         // `cfg.validate()` already rejected an absent/empty secret.
+        // Grace for a slow upload outlasting the token TTL; `validate()` caps it, `unwrap_or` is a fallback.
+        let finalize_token_grace = time::Duration::seconds(
+            i64::try_from(cfg.finalize_token_grace_secs).unwrap_or(i64::MAX),
+        );
         let secret = cfg
             .finalize_internal_secret
             .as_ref()
             .map(|s| s.expose().to_owned())
             .ok_or_else(|| anyhow::anyhow!("finalize_internal_secret is required"))?;
-        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(secret));
+        let finalize_auth = Arc::new(crate::api::rest::handlers::FinalizeAuth::new(
+            secret,
+            finalize_token_grace,
+        ));
         self.finalize_auth
             .set(Arc::clone(&finalize_auth))
             .map_err(|_| {
@@ -88,19 +95,22 @@ impl Gear for FileStorageGear {
         let backends =
             build_backend_registry(&cfg).map_err(|e| anyhow::anyhow!("backend registry: {e}"))?;
 
-        // A configured seed keeps the keypair stable across restarts; otherwise the key
+        // A configured PKCS#8 key stays stable across restarts; otherwise the key
         // is ephemeral (local dev).
         let max_ttl = i64::try_from(cfg.max_url_ttl_secs).unwrap_or(i64::MAX);
-        let issuer = Arc::new(if let Some(seed_b64) = &cfg.signing_key_seed {
-            let seed = URL_SAFE_NO_PAD
-                .decode(seed_b64.expose().trim())
-                .map_err(|e| anyhow::anyhow!("invalid file-storage signing_key_seed: {e}"))?;
-            Issuer::from_seed(&seed, max_ttl).map_err(|e| anyhow::anyhow!("signing key: {e}"))?
+        let issuer = Arc::new(if let Some(key_b64) = &cfg.signing_key_pkcs8 {
+            let key_der = zeroize::Zeroizing::new(
+                URL_SAFE_NO_PAD
+                    .decode(key_b64.expose().trim())
+                    .map_err(|e| anyhow::anyhow!("invalid file-storage signing_key_pkcs8: {e}"))?,
+            );
+            Issuer::from_pkcs8(&key_der, max_ttl)
+                .map_err(|e| anyhow::anyhow!("signing key: {e}"))?
         } else {
             info!(
-                "file-storage: no signing_key_seed configured - generating an EPHEMERAL \
+                "file-storage: no signing_key_pkcs8 configured - generating an EPHEMERAL \
                  URL-signing key. Signed URLs will not survive a restart and the sidecar must \
-                 be reconfigured with the matching public key. Set signing_key_seed for \
+                 be reconfigured with the matching public key. Set signing_key_pkcs8 for \
                  production."
             );
             Issuer::generate(max_ttl).map_err(|e| anyhow::anyhow!("signing key: {e}"))?
@@ -142,6 +152,8 @@ impl Gear for FileStorageGear {
         // Needed by both services before `svc_cfg` is moved.
         let sidecar_base_url = svc_cfg.sidecar_base_url.clone();
         let url_ttl_secs = svc_cfg.default_url_ttl_secs;
+        // Multipart sessions use their own, longer TTL.
+        let session_ttl_secs = i64::try_from(cfg.multipart_session_ttl_secs).unwrap_or(i64::MAX);
 
         // TODO: wire the quota-enforcement client once the Quota Enforcement gear
         // exposes an SDK crate; until then no quota checks are performed.
@@ -177,6 +189,10 @@ impl Gear for FileStorageGear {
                 sidecar_base_url,
                 url_ttl_secs,
             )
+            .with_session_ttl_secs(session_ttl_secs)
+            .with_complete_lease_secs(
+                i64::try_from(cfg.multipart_complete_lease_secs).unwrap_or(120),
+            )
             .with_metrics(Arc::clone(&metrics))
             .with_usage_reporter(None), // see TODO above
         );
@@ -187,7 +203,12 @@ impl Gear for FileStorageGear {
             )
         })?;
 
-        let policy_svc = Arc::new(PolicyService::new(policy_store, authorizer));
+        let policy_svc = Arc::new(PolicyService::new(
+            policy_store,
+            authorizer,
+            cfg.default_page_size,
+            cfg.max_page_size,
+        ));
         self.policy_service.set(policy_svc).map_err(|_| {
             anyhow::anyhow!("{} policy service already initialized", Self::MODULE_NAME)
         })?;

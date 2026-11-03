@@ -1309,9 +1309,15 @@ pub struct TestMetrics {
     /// `result` label of every `record_background_indexing` call, in order.
     pub background_indexing: Mutex<Vec<String>>,
     pub finalization_latency_ms: AtomicU64,
+    /// `(queue, reason)` of every `record_outbox_dead` call, in order.
+    pub outbox_dead: Mutex<Vec<(String, String)>>,
     pub quota_commit: AtomicU64,
     pub quota_overshoot: AtomicU64,
+    /// Every `record_quota_overshoot_uncharged_tokens` value, in order.
+    pub quota_overshoot_uncharged_tokens: Mutex<Vec<f64>>,
     pub quota_actual_tokens: AtomicU64,
+    /// `model` label of every `record_quota_usage_missing` call, in order.
+    pub quota_usage_missing: Mutex<Vec<String>>,
     pub streams_aborted: AtomicU64,
     pub attachment_upload: AtomicU64,
     pub attachment_upload_bytes: AtomicU64,
@@ -1329,9 +1335,12 @@ impl TestMetrics {
             audit_emit_results: Mutex::new(Vec::new()),
             background_indexing: Mutex::new(Vec::new()),
             finalization_latency_ms: AtomicU64::new(0),
+            outbox_dead: Mutex::new(Vec::new()),
             quota_commit: AtomicU64::new(0),
             quota_overshoot: AtomicU64::new(0),
+            quota_overshoot_uncharged_tokens: Mutex::new(Vec::new()),
             quota_actual_tokens: AtomicU64::new(0),
+            quota_usage_missing: Mutex::new(Vec::new()),
             streams_aborted: AtomicU64::new(0),
             attachment_upload: AtomicU64::new(0),
             attachment_upload_bytes: AtomicU64::new(0),
@@ -1368,6 +1377,12 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_finalization_latency_ms(&self, _: f64) {
         self.finalization_latency_ms.fetch_add(1, Ordering::Relaxed);
     }
+    fn record_outbox_dead(&self, queue: &str, reason: &str) {
+        self.outbox_dead
+            .lock()
+            .unwrap()
+            .push((queue.to_owned(), reason.to_owned()));
+    }
     fn record_quota_preflight(&self, _: &str, _: &str, _: &str) {}
     fn record_quota_reserve(&self, _: &str) {}
     fn record_quota_commit(&self, _: &str) {
@@ -1376,9 +1391,21 @@ impl crate::domain::ports::MiniChatMetricsPort for TestMetrics {
     fn record_quota_overshoot(&self, _: &str) {
         self.quota_overshoot.fetch_add(1, Ordering::Relaxed);
     }
+    fn record_quota_overshoot_uncharged_tokens(&self, tokens: f64) {
+        self.quota_overshoot_uncharged_tokens
+            .lock()
+            .unwrap()
+            .push(tokens);
+    }
     fn record_quota_estimated_tokens(&self, _: f64) {}
     fn record_quota_actual_tokens(&self, _: f64) {
         self.quota_actual_tokens.fetch_add(1, Ordering::Relaxed);
+    }
+    fn record_quota_usage_missing(&self, model: &str) {
+        self.quota_usage_missing
+            .lock()
+            .unwrap()
+            .push(model.to_owned());
     }
     fn record_stream_incomplete(&self, _: &str, _: &str, _: &str) {}
     fn record_cancel_requested(&self, _: &str) {}

@@ -1,7 +1,9 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! `ValueRepository` over `setting_values`.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
+use sea_orm::ExprTrait as _;
 use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryTrait};
 use settings_service_sdk::odata::DeclarationFilterField;
@@ -15,7 +17,9 @@ use uuid::Uuid;
 use crate::domain::error::DomainError;
 use crate::domain::odata::ReviewOrderField;
 use crate::domain::precondition;
-use crate::domain::value::{ReviewRequest, StoredValue, ValueDraft, ValueRepository};
+use crate::domain::value::{
+    DistinctValue, ListedValue, ReviewRequest, StoredValue, ValueDraft, ValueRepository,
+};
 use crate::infra::storage::clock::{now, stamp_after};
 use crate::infra::storage::declaration_odata_mapper::DeclarationODataMapper;
 use crate::infra::storage::declaration_repo;
@@ -30,9 +34,28 @@ const REVIEW_LIMIT_CFG: LimitCfg = LimitCfg {
     max: 200,
 };
 
+/// How many references one `IN` list carries.
+const REFERENCE_CHUNK: usize = 500;
+
 /// The repository. Stateless: every operation takes its connection.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ValueRepo;
+
+/// One group of the distinct-values read.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct DistinctRow {
+    value: Option<serde_json::Value>,
+    data_classification: String,
+    n: i64,
+}
+
+/// One row of the listing projection.
+#[derive(Debug, sea_orm::FromQueryResult)]
+struct ListedRow {
+    tenant_id: Uuid,
+    value: Option<serde_json::Value>,
+    data_classification: String,
+}
 
 /// Converts a stored setting value row to the domain type.
 pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
@@ -48,6 +71,7 @@ pub(crate) fn to_domain(model: setting_value::Model) -> StoredValue {
         last_change_at: model.last_change_at,
         updated_at: model.updated_at,
         set_by: model.set_by,
+        set_by_tenant: model.set_by_tenant,
     }
 }
 
@@ -147,6 +171,127 @@ impl ValueRepository for ValueRepo {
         Ok(rows.into_iter().map(to_domain).collect())
     }
 
+    async fn count_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(0);
+        }
+        // `SELECT COUNT(*)` over the predicate of `find_in_tenants`.
+        ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .count(conn)
+            .await
+            .map_err(db_error)
+    }
+
+    async fn distinct_values_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<DistinctValue>, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `SELECT value, data_classification, COUNT(id) ... GROUP BY value,
+        // data_classification` over the predicate of `find_in_tenants`: the
+        // distinct pairs and their multiplicity, nothing else of a row. The
+        // secret rows (`value IS NULL`) group together per classification.
+        let groups = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(setting_value::Column::Value)
+                    .column(setting_value::Column::DataClassification)
+                    .column_as(Expr::col(setting_value::Column::Id).count(), "n")
+                    .group_by(setting_value::Column::Value)
+                    .group_by(setting_value::Column::DataClassification)
+                    .into_model::<DistinctRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(groups
+            .into_iter()
+            .map(|group| DistinctValue {
+                value: group.value,
+                data_classification: group.data_classification,
+                count: u64::try_from(group.n).unwrap_or_default(),
+            })
+            .collect())
+    }
+
+    async fn list_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<ListedValue>, DomainError> {
+        if tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        // The predicate of `find_in_tenants`, three columns of it.
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .project_all(conn, |q| {
+                q.select_only()
+                    .column(setting_value::Column::TenantId)
+                    .column(setting_value::Column::Value)
+                    .column(setting_value::Column::DataClassification)
+                    .into_model::<ListedRow>()
+            })
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ListedValue {
+                tenant_id: row.tenant_id,
+                value: row.value,
+                data_classification: row.data_classification,
+            })
+            .collect())
+    }
+
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError> {
+        if declaration_ids.is_empty() || tenant_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.is_in(declaration_ids.iter().copied()))
+            .filter(setting_value::Column::TenantId.is_in(tenant_ids.iter().copied()))
+            .filter(subjectless())
+            .secure()
+            .scope_with(scope)
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows.into_iter().map(to_domain).collect())
+    }
+
     async fn find_all<C: DBRunner>(
         &self,
         conn: &C,
@@ -180,6 +325,49 @@ impl ValueRepository for ValueRepo {
             .await
             .map_err(db_error)?;
         Ok(rows.into_iter().map(to_domain).collect())
+    }
+
+    async fn secret_refs<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DomainError> {
+        // Unscoped and not narrowed to the subject-less track, for the reason
+        // `count_referencing_declarations` gives: the cascade removes every row
+        // whatever the caller's scope, so the collect must see them all.
+        let rows = ValueEntity::find()
+            .filter(setting_value::Column::DeclarationId.eq(declaration_id))
+            .filter(setting_value::Column::SecretRef.is_not_null())
+            .secure()
+            .scope_with(&AccessScope::allow_all())
+            .all(conn)
+            .await
+            .map_err(db_error)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| row.secret_ref.map(|secret_ref| (row.tenant_id, secret_ref)))
+            .collect())
+    }
+
+    async fn references_held_by_others<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<HashSet<String>, DomainError> {
+        let mut held = HashSet::new();
+        for chunk in refs.chunks(REFERENCE_CHUNK) {
+            let rows = ValueEntity::find()
+                .filter(setting_value::Column::DeclarationId.ne(declaration_id))
+                .filter(setting_value::Column::SecretRef.is_in(chunk.iter().cloned()))
+                .secure()
+                .scope_with(&AccessScope::allow_all())
+                .all(conn)
+                .await
+                .map_err(db_error)?;
+            held.extend(rows.into_iter().filter_map(|row| row.secret_ref));
+        }
+        Ok(held)
     }
 
     async fn flag<C: DBRunner>(
@@ -375,6 +563,7 @@ impl ValueRepository for ValueRepo {
             created_at: Set(at),
             updated_at: Set(at),
             set_by: Set(draft.set_by),
+            set_by_tenant: Set(draft.set_by_tenant),
         };
         let model = toolkit_db::secure::secure_insert::<ValueEntity>(active, scope, conn)
             .await
@@ -391,6 +580,7 @@ impl ValueRepository for ValueRepo {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError> {
         // Strictly after the version being replaced: the tag moves with the
@@ -407,6 +597,10 @@ impl ValueRepository for ValueRepo {
             .col_expr(setting_value::Column::LastChangeAt, Expr::value(at))
             .col_expr(setting_value::Column::UpdatedAt, Expr::value(at))
             .col_expr(setting_value::Column::SetBy, Expr::value(set_by.to_owned()))
+            .col_expr(
+                setting_value::Column::SetByTenant,
+                Expr::value(set_by_tenant),
+            )
             .filter(setting_value::Column::Id.eq(id))
             // The row at the version the tag was compared against, and no
             // other: two writers holding one tag both pass the comparison, and

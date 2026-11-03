@@ -1,4 +1,3 @@
-// Created: 2026-08-11 by Virtuozzo International GmbH
 //! Settings Service SDK
 //!
 //! Public contract for the `settings-service` gear.

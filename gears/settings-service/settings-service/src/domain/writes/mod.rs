@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The write path: validate, set, revert, remove, clone, batch and the impact
 //! report — every value operation taking effect when the caller performs it.
 

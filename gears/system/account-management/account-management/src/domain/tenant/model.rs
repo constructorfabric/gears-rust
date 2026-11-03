@@ -18,6 +18,8 @@
 //! * [`TenantModel`] — full storage row (with `tenant_type_uuid`,
 //!   `depth`, lifecycle timestamps).
 //! * [`NewTenant`] — repo-level insert input.
+//! * [`TenantName`] — a caller-supplied tenant name that has passed
+//!   [`verify_tenant_name`] (trimmed, not empty or all-whitespace).
 //! * [`ChildCountFilter`] — repo-level filter for `count_children`.
 //! * `validate_*` free functions — domain validation reused by the
 //!   service before mutating the DB through the SDK input shapes.
@@ -26,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use toolkit_macros::domain_model;
 use uuid::Uuid;
+
+use crate::domain::error::DomainError;
 
 /// Full lifecycle status of a tenant.
 ///
@@ -157,6 +161,55 @@ pub struct NewTenant {
     pub self_managed: bool,
     pub tenant_type_uuid: Uuid,
     pub depth: u32,
+}
+
+/// A caller-supplied tenant name that is trimmed and not empty or
+/// all-whitespace.
+///
+/// Only [`verify_tenant_name`] constructs it, so a `TenantName` in hand
+/// means the AM whitespace rule has already run.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantName(String);
+
+impl TenantName {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+/// Trim the caller-supplied tenant `name` and reject an empty or
+/// all-whitespace value.
+///
+/// Whitespace-equivalence is AM policy (as it is for `username` on the
+/// user surface and `name` on the service-account surface) and is
+/// wider than the structural contract: neither the published
+/// `gts.cf.core.am.tenant.v1~` schema's `minLength: 1` nor the DB
+/// `CHECK (length(name) BETWEEN 1 AND 255)` rejects `"   "`. Callers
+/// run this BEFORE the GTS check so the schema bounds apply to the
+/// value that is actually persisted.
+///
+/// # Errors
+///
+/// [`DomainError::Validation`] when `name` is empty or all-whitespace;
+/// `label` prefixes the detail with the calling operation.
+pub fn verify_tenant_name(label: &'static str, name: String) -> Result<TenantName, DomainError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(DomainError::Validation {
+            detail: format!("{label}: name MUST not be empty or all-whitespace"),
+        });
+    }
+    if trimmed.len() == name.len() {
+        return Ok(TenantName(name));
+    }
+    Ok(TenantName(trimmed.to_owned()))
 }
 
 /// Lift a SDK [`account_management_sdk::TenantStatus`] (3-variant,

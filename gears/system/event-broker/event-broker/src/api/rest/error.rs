@@ -216,7 +216,6 @@ impl From<DomainError> for CanonicalError {
 
             DomainError::SequenceViolation {
                 topic,
-                partition,
                 last_sequence,
             } => {
                 // `failed_precondition()` takes no detail argument and its
@@ -231,9 +230,7 @@ impl From<DomainError> for CanonicalError {
                 TopicResourceError::failed_precondition()
                     .with_precondition_violation(
                         "(producer)",
-                        format!(
-                            "topic={topic} partition={partition} expected_previous={last_sequence}"
-                        ),
+                        format!("topic={topic} expected_previous={last_sequence}"),
                         reasons::SEQUENCE_MISMATCH,
                     )
                     .with_resource(topic)

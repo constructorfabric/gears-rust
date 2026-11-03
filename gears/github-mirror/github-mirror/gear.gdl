@@ -1,0 +1,34 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for GitHub Mirror.
+#
+# Projected from #[toolkit::gear]: id, runtime_caps (rest, db, stateful),
+# colocated_deps (authz-resolver, credstore).
+
+gear(
+    deps = ["authz-resolver", "credstore"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/github-mirror/github-mirror"),
+    maturity = "preview",
+    implementation = "in-progress",
+    name = "GitHub Mirror",
+    description = "Continuously synchronised local replica of GitHub repository metadata, behind a GitHub-compatible API.",
+    category = "core-platform-integration",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-github-mirror",
+        lib = "github_mirror",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-github-mirror-sdk",
+        lib = "github_mirror_sdk",
+        path = "../github-mirror-sdk",
+    ),
+
+    # `github_token_secret` names a CredStore secret and is never offered as a control.
+    config_schema = config(exposes = ["api_base_url"]),
+)

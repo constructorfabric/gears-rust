@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Handlers of the tenant access restriction surface.
 
 use std::sync::Arc;
@@ -13,9 +12,10 @@ use uuid::Uuid;
 
 use crate::api::authz::{self, resource};
 use crate::api::rest::access_dto::{
-    AccessReadDto, RestrictionDto, SetRestrictionRequest, render_readout, render_restriction,
+    AccessReadDto, RestrictionDto, SetRestrictionRequest, render_listing, render_readout,
 };
 use crate::api::rest::if_match;
+use crate::api::rest::setting_dto::Reader;
 use crate::api::rest::setting_handlers::{TenantParam, may_read_pii};
 use crate::domain::access::{AccessActor, AccessReadout, TenantAccess};
 use crate::domain::category::domain_visibility;
@@ -84,7 +84,10 @@ async fn with_etag(
     ctx: &SecurityContext,
 ) -> ([(header::HeaderName, String); 1], Json<AccessReadDto>) {
     let pii = readout.stored.is_some() && may_read_pii(enforcer, ctx).await;
-    let dto = render_readout(readout, pii);
+    // The reader is the caller's own tenant: the root for a platform
+    // administrator.
+    let reader = Reader::new(ctx.subject_tenant_id(), readout.root);
+    let dto = render_readout(readout, pii, reader);
     ([(header::ETAG, super::etag_header(&dto.etag))], Json(dto))
 }
 
@@ -236,16 +239,13 @@ pub async fn list_access(
     let scope = authz::access_scope(&enforcer, &ctx, &resource::VALUE, READ, None).await?;
     // @cpt-end:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-2
     let conn = db.conn().map_err(|e| conn_error(&e))?;
-    let rows = service
+    let listing = service
         .list(&conn, &actor(&ctx, &headers, &scope), &key)
         .await?;
     // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-list:p1:inst-ta-list-5
     // Every row names who recorded it; asked once for the page.
-    let pii = !rows.is_empty() && may_read_pii(&enforcer, &ctx).await;
-    let items: Vec<RestrictionDto> = rows
-        .iter()
-        .map(|row| render_restriction(row, pii))
-        .collect();
+    let pii = !listing.rows.is_empty() && may_read_pii(&enforcer, &ctx).await;
+    let items: Vec<RestrictionDto> = render_listing(&listing, pii);
     // The whole list in one page, by design: at most one row per descendant
     // tenant, the subtree walked under the shared budget and refused past it,
     // so there is nothing to continue from. The page envelope is the

@@ -55,7 +55,7 @@ Registration and deletion use one asynchronous read/reconcile/conditional-write 
 | `cpt-cf-types-registry-fr-minor-version-profile` | Per-major choice between mutable major-only identity and a gap-free immutable minor sequence opening at `M.0`; `skip_compatibility_check` waives one cross-minor check and is recorded. See *Compatibility & Evolution Policy* and *Dependency-aware partial admission* in §3.2. |
 | `cpt-cf-types-registry-fr-validate-type-derivation` | Identifier-derived chain validation against every managed base under one resolution-closure dialect. See *Compatibility & Evolution Policy* in §3.2. |
 | `cpt-cf-types-registry-fr-gts-validation` | All GTS semantics come from `gts-rust`; the managed profile adds Draft-07 and identifier restrictions, while federation does not reinterpret source content. See §2.2, *Admission Pipeline*, and *Compatibility & Evolution Policy* in §3.2. |
-| `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, and Instance-to-schema relationships; used for deletion safety and impact analysis. `x-gts-ref` creates no edge. See *Dependency Graph & Deletion Safety* in §3.2. |
+| `cpt-cf-types-registry-fr-ref-tracking` | Flat managed dependency edges for derivation, `$ref`, and Instance-to-schema relationships; used for deletion safety and impact analysis. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) creates no edge. See *Dependency Graph & Deletion Safety* in §3.2. |
 | `cpt-cf-types-registry-fr-type-query-assistance` | Exact managed matching in SQL over stored parsed segments, GTS matcher confirmation of external results, source-major federation, and a bounded complete Registry Reference set. See *Query Assistance & Discovery* in §3.2. |
 | `cpt-cf-types-registry-fr-tenant-ownership` | Global or tenant ownership stored on each Managed Entity; tenant visibility follows the directed descendant relation, computed from the subject tenant; boolean `read`/`list` grants gate the operation without altering that relation. See *Visibility Resolver* and *Read authorization* in §3.2. |
 | `cpt-cf-types-registry-fr-registration-authority` | Global writes use `PlatformSecurityContext`; tenant writes use PDP grants over the candidate identifier, evaluated before identifier availability. See *Tenant-plane authorization* and *Platform-plane authorization* in §3.2. |
@@ -230,7 +230,7 @@ Managed Type Schemas MUST declare JSON Schema Draft-07 in P1. The dialect is fix
 
 This is a correctness constraint rather than a format preference: `resolve_schema_refs` strips non-root `$schema`, and JSON Schema ignores unrecognised keywords, so a mixed-dialect closure can silently lose constraints instead of failing.
 
-Any future widening preserves dialect uniformity across the managed resolution closure: the `$id` chain and `$ref` targets, including references inside `x-gts-traits-schema`, but excluding `x-gts-ref` targets because they are not inlined. Externally Managed Entities are outside this profile, cannot enter a managed closure, and their returned content is never parsed by the registry.
+Any future widening preserves dialect uniformity across the managed resolution closure: the `$id` chain and `$ref` targets, including references inside `x-gts-traits-schema`, but excluding entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) targets because they are not inlined. Externally Managed Entities are outside this profile, cannot enter a managed closure, and their returned content is never parsed by the registry.
 
 **ADRs**: `cpt-cf-types-registry-adr-managed-type-schema-dialect-profile`, `cpt-cf-types-registry-adr-type-schema-evolution-compatibility`, `cpt-cf-types-registry-adr-managed-external-boundary`
 
@@ -299,7 +299,7 @@ A managed GTS Identifier names a logical entity that is mutable when major-only 
 | Registry Entity | One admitted managed GTS Identifier, of kind Type Schema or registered Instance. Carries identity, ownership, the publisher, lifecycle, and the `resource_version` that write preconditions test. Survives deletion as the tombstone that keeps a previously issued reference resolvable | `entity`, plus the kind-specific current-state row `type_schema` or `instance` |
 | Revision | One immutable admitted definition or value, with the specification and implementation versions in force at its admission | `type_schema_revision`, `instance_revision` |
 | Version Family | The set of Version Successors of one another, named by the family key of ADR-0004. Holds an ownership scope and nothing else | `version_family` |
-| Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An `x-gts-ref` target is not one. Nothing transitive is stored | `dependency` |
+| Dependency | A direct edge between two Registry Entities: `$ref`, immediate derivation base, or Instance conformance. An entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) target is not one. Nothing transitive is stored | `dependency` |
 | Operation | One accepted mutation: its scoped request identity, its client-visible progress, and one durable outcome per candidate identifier | `operation`, `operation_item` |
 | Registry Source | Where an identifier is authoritative — managed storage, or an External Registry Source behind a claim. Managed storage is implicit; a claim is a projection of a plugin's registered Instance and outlives it as a reservation | `source_claim`, plus the `routing` state row of `coordination_state` |
 
@@ -450,8 +450,8 @@ dependency edges and checks ADR-0015 quarantine before loading target
 documents. A stable candidate whose immediate derivation base or `$ref`
 targets include a major-0 identifier fails as an operation item with
 `stable_derives_from_major_zero` or `stable_refs_major_zero`. Independent
-batch candidates remain eligible to commit. `x-gts-ref` is an instance-value
-constraint and is outside quarantine in every form. Reusing the extracted
+batch candidates remain eligible to commit. An entity reference (`x-gts-type-ref` / `x-gts-instance-ref`) is an
+instance-value constraint and is outside quarantine in every form. Reusing the extracted
 edges keeps this check consistent with dependency ordering and
 malformed-reference failures (P0 SPEC §8.1).
 
@@ -549,7 +549,7 @@ For determinism, the graph adds an implicit edge `vM.(n-1)~` → `vM.n~`. It mak
 
 Outside the transaction, the worker runs parsing, resolution, compatibility, derivation, reference, and dependent-revalidation checks through `gts-rust`, recording the complete reverse-impact identifier set for each updated schema and a revision vector for every correctness-relevant dependency or dependant. That vector contains each entity's `resource_version` and, where effective Type Schema content was consumed, its `resolution_fingerprint`.
 
-For the managed–external boundary, the worker classifies entity-naming `x-gts-ref` values and rejects targets covered by active or retired Source Claims. It loads no target and creates no dependency edge; the commit rechecks the relevant claims.
+For the managed–external boundary, the worker classifies entity-naming `x-gts-type-ref` and `x-gts-instance-ref` values and rejects targets covered by active or retired Source Claims. It loads no target and creates no dependency edge; the commit rechecks the relevant claims.
 
 A registered Instance is rejected when its conforming Type Schema is in the major-0 unstable profile, even though the minor or major marker is in a preceding identifier segment rather than the Instance's own last segment. This is distinct from the stable-reference quarantine: an unstable schema cannot carry a registered Instance because later unchecked evolution would make its current validation record untruthful (ADR-0006, ADR-0015).
 
@@ -558,7 +558,7 @@ The registration commit transaction then:
 1. advances the `entity_write_order` row of `types_registry__coordination_state` as its first statement, thereby claiming it for the transaction before any read;
 2. enforces the caller precondition and acquires any family and entity locks in canonical order;
 3. rebuilds the affected committed-plus-candidate graph, rechecks acyclicity, and compares the reverse-impact set and revision vector, retrying boundedly on drift;
-4. rechecks active and retired Source Claims for a new managed identifier and any entity-naming `x-gts-ref` target;
+4. rechecks active and retired Source Claims for a new managed identifier and any entity-naming `x-gts-type-ref` or `x-gts-instance-ref` target;
 5. repeats the predecessor test for each minor-bearing candidate;
 6. inserts the immutable revision, replaces the current-state projection, and replaces the entity's dependency edges;
 7. refreshes the affected current effective schemas;
@@ -868,7 +868,7 @@ It computes and returns; it does not act. It never mutates an entity, filters ge
 
 Maintains every direct managed-to-managed dependency: `$ref`, Instance conformance, and immediate derivation base.
 
-**`x-gts-ref` is classified, not stored.** It constrains an Instance value without resolving an entity, so it creates no dependency and does not affect compatibility, quarantine, refresh, availability, or deletion. Managed admission classifies the candidate; Source Claim activation reclassifies current schemas. Both use an exact identifier or a pattern's longest valid identifier prefix only to enforce the managed–external boundary; `gts.*` and relative JSON pointers name no entity.
+**Entity references (`x-gts-type-ref` / `x-gts-instance-ref`) are classified, not stored.** Each constrains an Instance value without resolving an entity, so it creates no dependency and does not affect compatibility, quarantine, refresh, availability, or deletion. Managed admission classifies the candidate; Source Claim activation reclassifies current schemas. Both use an exact identifier or a pattern's longest valid identifier prefix only to enforce the managed–external boundary; `gts.*` and the `/$id` pointer name no entity.
 
 Both endpoints are always Managed Entities. Direct rows decide deletion safety. A recursive CTE finds the reverse impact set for a revision; a second edge read supplies the worker's topological ordering, which needs no condensation step because the relation is acyclic (ADR-0012). Dry Run exposes the resulting mutation verdict, so no separate graph API is provided.
 
@@ -922,7 +922,7 @@ Expansion returns concrete references, never a normalized predicate or an execut
 
 ##### Responsibility scope
 
-A closed, in-process validator set for platform-defined control-plane types. It enforces Source Claim pattern grammar and non-overlap, including against `x-gts-ref` authority identifiers reclassified from current Managed Type Schemas. It also rejects tenant-scoped control-plane types and instances and claims overlapping retired reservations.
+A closed, in-process validator set for platform-defined control-plane types. It enforces Source Claim pattern grammar and non-overlap, including against entity-reference (`x-gts-type-ref` / `x-gts-instance-ref`) authority identifiers reclassified from current Managed Type Schemas. It also rejects tenant-scoped control-plane types and instances and claims overlapping retired reservations.
 
 ##### Responsibility boundaries
 
@@ -941,7 +941,7 @@ A Registry Source Plugin registers as a well-known GTS Instance of a Types Regis
 
 The base schema provides the plugin `id`, `vendor`, lower-wins `priority`, and generic `properties`. The derived schema adds one thing: a set of Source Claims, each a GTS Identifier pattern. Nothing else is declared — the federation contract is total, so implementing the trait is the whole obligation and there is no profile to state or check, and entity kind is not declared either because the trailing `~` of each identifier already carries it (ADR-0007). `source_claim.priority` and `source_claim.plugin_entity_gts_id` project the base `priority` and `id`.
 
-Registration is ordinary platform-plane Instance admission under ADR-0012, including operation, idempotency, and audit; there is no separate plugin API. Outside the transaction, the Control-Plane Validator rejects malformed claims and overlap with active claims, retired reservations, managed identifier ranges, or `x-gts-ref` authority identifiers reclassified from current Managed Type Schemas.
+Registration is ordinary platform-plane Instance admission under ADR-0012, including operation, idempotency, and audit; there is no separate plugin API. Outside the transaction, the Control-Plane Validator rejects malformed claims and overlap with active claims, retired reservations, managed identifier ranges, or entity-reference authority identifiers reclassified from current Managed Type Schemas.
 
 The commit transaction atomically:
 

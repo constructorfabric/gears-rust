@@ -5,10 +5,10 @@
 //! Every field is length-prefixed and NULL-safe so two different field
 //! boundaries can never collide: a NULL field is a bare [`ABSENT`] byte; a
 //! present field is [`PRESENT`] ‖ u32-BE length ‖ bytes. A `None` and an empty
-//! string therefore hash differently. SHA-256 via the FIPS-validated
-//! `aws-lc-rs` provider — `sha2` is blocked by dylint DE0708.
+//! string therefore hash differently. SHA-256 routes through the toolkit-security
+//! facade and its selected platform/FIPS backend.
 
-use aws_lc_rs::digest::{SHA256, digest as sha256};
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 /// NULL-safe presence marker for an absent (NULL) field: a bare byte.
@@ -64,7 +64,7 @@ pub(crate) fn put_i32(buf: &mut Vec<u8>, n: i32) {
 
 /// SHA-256 digest of the framed buffer, as a fixed 32-byte array.
 pub(crate) fn digest32(buf: &[u8]) -> [u8; 32] {
-    let d = sha256(&SHA256, buf);
+    let d = Sha256::digest(buf);
     let mut out = [0u8; 32];
     out.copy_from_slice(d.as_ref());
     out

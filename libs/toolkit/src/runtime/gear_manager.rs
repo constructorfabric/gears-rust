@@ -122,15 +122,30 @@ impl GearInstance {
     /// `self`'s `inner` runtime-state lock. This makes re-registration atomic:
     /// concurrent `update_heartbeat` calls continue to write to the same state
     /// object instead of racing with a copied/swapped `InstanceRuntimeState`.
+    ///
+    /// One process registers an instance from two places: the gRPC hub with
+    /// its services, the host with its REST endpoint and `OpenAPI` spec. Each
+    /// writes only its own half, and they race, so an absent half keeps the
+    /// stored one instead of clearing it, as labels do.
     fn with_metadata_of(&self, other: &GearInstance) -> GearInstance {
         GearInstance {
             gear: other.gear.clone(),
             instance_id: other.instance_id,
             control: other.control.clone(),
-            grpc_services: other.grpc_services.clone(),
+            grpc_services: if other.grpc_services.is_empty() {
+                self.grpc_services.clone()
+            } else {
+                other.grpc_services.clone()
+            },
             version: other.version.clone(),
-            rest_endpoint: other.rest_endpoint.clone(),
-            openapi_spec: other.openapi_spec.clone(),
+            rest_endpoint: other
+                .rest_endpoint
+                .clone()
+                .or_else(|| self.rest_endpoint.clone()),
+            openapi_spec: other
+                .openapi_spec
+                .clone()
+                .or_else(|| self.openapi_spec.clone()),
             // Empty incoming labels mean "keep the stored set", not "clear"; a
             // non-empty set replaces it. See `RegisterInstanceInfo::with_labels`
             // for why (self-heal / REST-augmentation re-registers omit labels).
@@ -807,6 +822,73 @@ mod tests {
             "label-less re-registration must preserve stored labels"
         );
         assert_eq!(registered[0].version, Some("2.0.0".to_owned()));
+    }
+
+    /// The hub's gRPC record and the host's REST record of one instance, in
+    /// either order: each keeps the other's half.
+    #[test]
+    fn grpc_and_rest_halves_of_an_instance_survive_each_other() {
+        let grpc = |id| {
+            GearInstance::new("both", id)
+                .with_grpc_service("pkg.Svc", Endpoint::from_uri("http://127.0.0.1:50051"))
+        };
+        let rest = |id| {
+            GearInstance::new("both", id)
+                .with_rest_endpoint(Endpoint::from_uri("http://127.0.0.1:8080"))
+                .with_openapi_spec("{}")
+        };
+        for grpc_first in [true, false] {
+            let dir = GearManager::new();
+            let id = Uuid::new_v4();
+            let (first, second) = if grpc_first {
+                (grpc(id), rest(id))
+            } else {
+                (rest(id), grpc(id))
+            };
+            seed(&dir, Arc::new(first));
+            seed(&dir, Arc::new(second));
+
+            let registered = dir.instances_of("both");
+            assert_eq!(registered.len(), 1);
+            assert!(
+                registered[0].grpc_services.contains_key("pkg.Svc"),
+                "gRPC kept (grpc_first={grpc_first})"
+            );
+            assert_eq!(
+                registered[0].rest_endpoint.as_ref().map(|e| e.uri.as_str()),
+                Some("http://127.0.0.1:8080"),
+                "REST kept (grpc_first={grpc_first})"
+            );
+            assert_eq!(registered[0].openapi_spec.as_deref(), Some("{}"));
+        }
+    }
+
+    /// A present half still replaces the stored one.
+    #[test]
+    fn a_present_half_replaces_the_stored_one() {
+        let dir = GearManager::new();
+        let id = Uuid::new_v4();
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("moved", id)
+                    .with_rest_endpoint(Endpoint::from_uri("http://127.0.0.1:8080")),
+            ),
+        );
+        seed(
+            &dir,
+            Arc::new(
+                GearInstance::new("moved", id)
+                    .with_rest_endpoint(Endpoint::from_uri("http://127.0.0.1:9090")),
+            ),
+        );
+        assert_eq!(
+            dir.instances_of("moved")[0]
+                .rest_endpoint
+                .as_ref()
+                .map(|e| e.uri.as_str()),
+            Some("http://127.0.0.1:9090")
+        );
     }
 
     #[test]

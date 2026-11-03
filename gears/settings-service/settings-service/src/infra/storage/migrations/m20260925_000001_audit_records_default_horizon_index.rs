@@ -1,4 +1,3 @@
-// Created: 2026-09-25 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-audit-store-table:p1
 //! `audit_records` gains the index the retention pass prunes by.
 //!

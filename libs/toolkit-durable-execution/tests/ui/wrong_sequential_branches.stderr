@@ -1,0 +1,9 @@
+error[E0599]: no method named `branches` found for struct `StepRef<T>` in the current scope
+ --> tests/ui/wrong_sequential_branches.rs:6:23
+  |
+4 | /     WorkflowBuilder::<u32>::new("wrong.branches.v1")
+5 | |         .then(Step::new("pair", Duration::from_secs(1), |_, n: u32| async move { Ok((n,n)) }))
+6 | |         .checkpoint().branches();
+  | |                      -^^^^^^^^ method not found in `StepRef<(u32, u32)>`
+  | |______________________|
+  |

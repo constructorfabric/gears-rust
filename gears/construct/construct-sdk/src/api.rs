@@ -7,7 +7,7 @@ use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::SecurityContext;
 use uuid::Uuid;
 
-use crate::models::{FoundationNote, NewFoundationNote};
+use crate::models::RecordOutcome;
 
 /// Public API trait of the Construct gear (Version 1), registered in
 /// `ClientHub` by the gear:
@@ -16,19 +16,21 @@ use crate::models::{FoundationNote, NewFoundationNote};
 /// ```
 #[async_trait]
 pub trait ConstructClientV1: Send + Sync {
-    /// Create a note in the caller's tenant.
-    async fn create_note(
+    /// Hand Construct one connector record for `tenant_id`, the same operation
+    /// as `POST /construct/v1/records`. The caller is the connector; the
+    /// platform must authorize it for the tenant.
+    ///
+    /// # Errors
+    ///
+    /// A refused record is an invalid-argument error that names the record's
+    /// type, the place in the record and the broken rule. A caller the
+    /// platform does not authorize for the tenant gets a permission error.
+    async fn submit_record(
         &self,
         ctx: &SecurityContext,
-        note: NewFoundationNote,
-    ) -> Result<FoundationNote, CanonicalError>;
-
-    /// Read one note of the caller's tenant.
-    async fn get_note(
-        &self,
-        ctx: &SecurityContext,
-        id: Uuid,
-    ) -> Result<FoundationNote, CanonicalError>;
+        tenant_id: Uuid,
+        record: serde_json::Value,
+    ) -> Result<RecordOutcome, CanonicalError>;
 }
 
 #[cfg(test)]

@@ -1,4 +1,3 @@
-// Created: 2026-09-29 by Virtuozzo International GmbH
 //! The bounded walk's parent links, and the chains read off them.
 
 use std::collections::HashMap;

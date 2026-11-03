@@ -1,4 +1,3 @@
-// Created: 2026-10-08 by Virtuozzo International GmbH
 //! The listing envelope: the shared shape plus a total, and nothing else.
 
 use serde_json::json;

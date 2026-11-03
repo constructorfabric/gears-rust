@@ -1,0 +1,40 @@
+{
+  "$id": "gts://gts.cf.core.tasks.entry.v1~cf.core.tasks.entry_measurement.v1~",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "description": "Pre-built task entry kind: a measurement or metric sample captured during execution.",
+  "type": "object",
+  "allOf": [
+    {
+      "$ref": "gts://gts.cf.core.tasks.entry.v1~"
+    },
+    {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "name": {
+              "description": "Name of the measured quantity.",
+              "type": "string",
+              "maxLength": 256
+            },
+            "value": {
+              "description": "Measured numeric value.",
+              "type": "number"
+            },
+            "unit": {
+              "description": "Optional unit of the measured value (e.g. ms, bytes, count).",
+              "type": "string",
+              "maxLength": 64
+            }
+          },
+          "required": [
+            "name",
+            "value"
+          ]
+        }
+      }
+    }
+  ]
+}

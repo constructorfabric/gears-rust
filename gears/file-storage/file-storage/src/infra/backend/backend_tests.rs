@@ -87,6 +87,93 @@ async fn local_fs_satisfies_backend_contract() {
 }
 
 #[tokio::test]
+async fn local_fs_is_ready_self_tests_hard_links_and_leaves_no_probe_files() {
+    let root = unique_root();
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    let b = LocalFsBackend::new("fs", &root);
+    b.is_ready().await.expect("hard links work on a regular fs");
+    // Cached: a second call succeeds without touching the fs again.
+    b.is_ready().await.expect("cached self-test result");
+    let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+    assert!(
+        entries.next_entry().await.unwrap().is_none(),
+        "probe files must be removed"
+    );
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+#[cfg(unix)]
+async fn set_mode(path: &std::path::Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        .await
+        .unwrap();
+}
+
+/// A failed self-test is not remembered: once the root is writable again, `is_ready` passes; a
+/// success is cached even if the root turns read-only afterwards. No probe files are left.
+#[cfg(unix)]
+#[tokio::test]
+async fn local_fs_is_ready_caches_only_success() {
+    let root = unique_root();
+    tokio::fs::create_dir_all(&root).await.unwrap();
+    set_mode(&root, 0o555).await;
+    // Root (or a permissive fs) ignores the mode: nothing to test.
+    if tokio::fs::write(root.join(".writable-check"), b"x")
+        .await
+        .is_ok()
+    {
+        set_mode(&root, 0o755).await;
+        drop(tokio::fs::remove_dir_all(&root).await);
+        return;
+    }
+
+    let b = LocalFsBackend::new("fs", &root);
+    let err = b.is_ready().await.expect_err("read-only root must fail");
+    assert!(
+        err.to_string().contains("cannot write a probe file"),
+        "unexpected error: {err}"
+    );
+    b.is_ready().await.expect_err("the failure is retried");
+
+    set_mode(&root, 0o755).await;
+    b.is_ready()
+        .await
+        .expect("passes once the root is writable");
+
+    set_mode(&root, 0o555).await;
+    b.is_ready().await.expect("success is cached");
+    set_mode(&root, 0o755).await;
+
+    let mut entries = tokio::fs::read_dir(&root).await.unwrap();
+    assert!(
+        entries.next_entry().await.unwrap().is_none(),
+        "no probe files may remain"
+    );
+    drop(tokio::fs::remove_dir_all(&root).await);
+}
+
+#[test]
+fn local_fs_io_errors_classify_transient_vs_permanent() {
+    use std::io::{Error, ErrorKind};
+    let b = LocalFsBackend::new("fs", "/nonexistent");
+    for kind in [
+        ErrorKind::TimedOut,
+        ErrorKind::Interrupted,
+        ErrorKind::WouldBlock,
+    ] {
+        assert!(matches!(
+            b.io_err(&Error::from(kind)),
+            DomainError::BackendUnavailable { .. }
+        ));
+    }
+    assert!(matches!(
+        b.io_err(&Error::from(ErrorKind::PermissionDenied)),
+        DomainError::Backend { .. }
+    ));
+}
+
+#[tokio::test]
 async fn local_fs_rejects_path_traversal() {
     let root = unique_root();
     let b = LocalFsBackend::new("fs", &root);

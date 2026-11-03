@@ -215,7 +215,7 @@ The domain model and API contracts are intentionally decoupled from any specific
 
 - [ ] `p1` - **ID**: `cpt-cf-serverless-runtime-principle-gts-identity`
 
-All domain entities use Global Type System (GTS) identifiers following the [GTS specification](https://github.com/globaltypesystem/gts-spec). GTS provides hierarchical type inheritance, schema-first validation, and stable cross-gear references. Entity identity is the GTS instance address, not an internal database key, ensuring that types are portable and self-describing.
+All domain entities use Global Type System (GTS) identifiers following the [GTS specification](https://github.com/globaltypesystem/gts-spec). GTS provides hierarchical type inheritance, schema-first validation, and stable cross-gear references. Entity identity is the GTS identifier, not an internal database key, ensuring that types are portable and self-describing: callables (functions and workflows) are identified by their registered GTS type ID ending in `~`, while lifecycle statuses and other well-known values are GTS instance IDs.
 
 #### Unified Callable Model
 

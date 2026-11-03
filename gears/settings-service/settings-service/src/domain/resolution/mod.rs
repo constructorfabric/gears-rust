@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Effective value resolution: the hot read path.
 //!
 //! A read dispatches on the declaration's scope class, walks the caller's own
@@ -235,6 +234,9 @@ pub struct TrailEntry {
     pub needs_review: bool,
     /// Who set the row here, when one exists.
     pub set_by: Option<String>,
+    /// The tenant that setter acted from, when it was recorded: what the
+    /// upward disclosure boundary decides by.
+    pub set_by_tenant: Option<Uuid>,
     /// When the row here last changed, when one exists.
     pub last_change_at: Option<OffsetDateTime>,
 }

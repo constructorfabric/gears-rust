@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! `tenant_permissions`: one sparse restriction per `(declaration, tenant)`.
 
 use sea_orm::entity::prelude::*;
@@ -22,6 +21,10 @@ pub struct Model {
     pub access: String,
     /// Subject who set the restriction.
     pub set_by: String,
+    /// The tenant the setter acted from, written with `set_by`; `NULL` on a
+    /// row written before it was recorded.
+    #[sea_orm(nullable)]
+    pub set_by_tenant: Option<Uuid>,
     /// When the row was created.
     pub created_at: OffsetDateTime,
     /// When the row was last changed.

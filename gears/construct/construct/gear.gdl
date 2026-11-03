@@ -1,0 +1,36 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the construct gear.
+#
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (rest, db)
+# and lifecycle; deps below is an exact checked mirror (GBX0214).
+
+gear(
+    deps = ["authz-resolver", "types-registry"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/construct/construct"),
+    maturity = "experimental",
+    implementation = "in-progress",
+    name = "Construct",
+    description = "Living per-subject profile built from connector records and served to applications.",
+    category = "gen-ai",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-construct",
+        lib = "construct",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-construct-sdk",
+        lib = "construct_sdk",
+        path = "../construct-sdk",
+    ),
+
+    config_schema = config(exposes = ["personalization_default", "connectors_off"]),
+
+    # The crate has no [features] section.
+    cargo_features = [],
+)

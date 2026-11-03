@@ -180,26 +180,23 @@ fn db_error(e: &RepoError) -> Option<&sea_orm::DbErr> {
         _ => None,
     }
 }
+/// Start both writers together. The barrier sits before the transaction: on `SQLite` a
+/// transaction that may write begins with `BEGIN IMMEDIATE` and holds the write lock, so the
+/// second writer waits in its `BEGIN` until the first commits, then sees the conflict. Inside
+/// the transaction the first writer would hold the lock at the barrier, waiting for a second
+/// writer that cannot begin.
 async fn writer(db: Db, work: Work, barrier: Arc<tokio::sync::Barrier>) -> Result<(), RepoError> {
-    let mut attempt = 0;
+    barrier.wait().await;
     db.transaction_with_retry(TxConfig::serializable(), db_error, move |tx| {
-        attempt += 1;
-        let first = attempt == 1;
-        let barrier = Arc::clone(&barrier);
         let work = Arc::clone(&work);
-        Box::pin(async move {
-            if first {
-                barrier.wait().await;
-            }
-            work(tx).await
-        })
+        Box::pin(async move { work(tx).await })
     })
     .await
 }
 /// Run `work` on two connections to one file at once; exactly one wins and the other sees `code`.
 async fn exactly_one_wins(db: &DBProvider<DbError>, dsn: &str, code: &str, work: Work) {
     let other = toolkit_db::connect_db(
-        dsn,
+        &storage_support::toolkit_dsn(dsn),
         ConnectOpts {
             max_conns: Some(1),
             min_conns: Some(1),

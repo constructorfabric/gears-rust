@@ -83,6 +83,12 @@ pub trait MiniChatMetricsPort: Send + Sync {
     /// `{prefix}_finalization_latency_ms` — histogram
     fn record_finalization_latency_ms(&self, ms: f64);
 
+    /// `{prefix}_outbox_dead_total` — counter
+    /// Messages a handler dead-lettered. `queue`: `usage`; `reason`:
+    /// `invalid_payload`, `permanent`, `max_attempts`
+    /// (see [`metric_labels`](super::metric_labels)).
+    fn record_outbox_dead(&self, queue: &str, reason: &str);
+
     // ── P1: Quota Enforcement (6 metrics) ──────────────────────────────
 
     /// `{prefix}_quota_preflight_total` — counter
@@ -97,11 +103,21 @@ pub trait MiniChatMetricsPort: Send + Sync {
     /// `{prefix}_quota_overshoot_total` — counter
     fn record_quota_overshoot(&self, period: &str);
 
+    /// `{prefix}_quota_overshoot_uncharged_tokens` — histogram
+    /// `actual - reserve` tokens of an actual settlement whose overshoot
+    /// exceeded the tolerance and was capped at the reserve.
+    fn record_quota_overshoot_uncharged_tokens(&self, tokens: f64);
+
     /// `{prefix}_quota_estimated_tokens` — histogram
     fn record_quota_estimated_tokens(&self, tokens: f64);
 
     /// `{prefix}_quota_actual_tokens` — histogram
     fn record_quota_actual_tokens(&self, tokens: f64);
+
+    /// `{prefix}_quota_usage_missing_total` — counter
+    /// Completed turns settled with the estimated formula because the
+    /// provider reported zero or no usage.
+    fn record_quota_usage_missing(&self, model: &str);
 
     // ── P1: Streaming Incomplete (1 metric) ────────────────────────────
 
@@ -255,12 +271,15 @@ impl MiniChatMetricsPort for NoopMetrics {
     fn record_turn_mutation_latency_ms(&self, _: &str, _: f64) {}
     fn record_audit_emit(&self, _: &str) {}
     fn record_finalization_latency_ms(&self, _: f64) {}
+    fn record_outbox_dead(&self, _: &str, _: &str) {}
     fn record_quota_preflight(&self, _: &str, _: &str, _: &str) {}
     fn record_quota_reserve(&self, _: &str) {}
     fn record_quota_commit(&self, _: &str) {}
     fn record_quota_overshoot(&self, _: &str) {}
+    fn record_quota_overshoot_uncharged_tokens(&self, _: f64) {}
     fn record_quota_estimated_tokens(&self, _: f64) {}
     fn record_quota_actual_tokens(&self, _: f64) {}
+    fn record_quota_usage_missing(&self, _: &str) {}
     fn record_stream_incomplete(&self, _: &str, _: &str, _: &str) {}
     fn record_cancel_requested(&self, _: &str) {}
     fn record_cancel_effective(&self, _: &str) {}

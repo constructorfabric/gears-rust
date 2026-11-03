@@ -4,9 +4,9 @@
 //! any external plugin derive byte-identical keys and hashes — identity is
 //! contract, not implementation detail.
 
-use aws_lc_rs::digest::{Context, SHA256, digest as sha256};
 use graph_storage_sdk::models::{EdgeSpec, IngestRequest};
 use serde_json::Value;
+use toolkit_security::crypto::hash::Sha256;
 use uuid::Uuid;
 
 /// Deterministic edge key: a hash of (edge type, source key, destination key,
@@ -14,20 +14,18 @@ use uuid::Uuid;
 /// of distinct inputs can collide.
 #[must_use]
 pub fn derive_edge_key(type_uuid: Uuid, edge: &EdgeSpec) -> String {
-    // `aws-lc-rs` is the workspace's FIPS-capable backend; a pure-Rust hasher
-    // is refused by the DE0708 lint, and under `--features fips` it would not
-    // run through the validated module at all.
-    let mut hasher = Context::new(&SHA256);
+    // The toolkit-security facade selects the platform/FIPS implementation.
+    let mut hasher = Sha256::new();
     for part in [
         type_uuid.as_bytes().as_slice(),
         edge.src_node_key.as_bytes(),
         edge.dst_node_key.as_bytes(),
         edge.discriminator.as_deref().unwrap_or("").as_bytes(),
     ] {
-        hasher.update(&(part.len() as u64).to_be_bytes());
+        hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
-    hex::encode(hasher.finish())
+    hex::encode(hasher.finalize())
 }
 
 /// Reference-node key, derived from the full source-qualified canonical
@@ -122,7 +120,7 @@ pub fn ingest_request_hash(request: &IngestRequest) -> String {
         // a replay of one must not be answered with the other's receipt.
         "embed": request.options.embed,
     });
-    hex::encode(sha256(&SHA256, canonical.to_string().as_bytes()))
+    hex::encode(Sha256::digest(canonical.to_string().as_bytes()))
 }
 
 #[cfg(test)]

@@ -3,6 +3,17 @@ use super::*;
 use crate::domain::{price_book_entry::Model, test_support::dec};
 use bss_money::exact::{ExactAmount, ExactError};
 use bss_pricing_sdk::numeric::NumericError;
+/// A decimal of the body itself.
+const fn at(field: PriceField) -> Place {
+    Place { field, tier: None }
+}
+/// A decimal of tier `i`.
+const fn in_tier(i: usize, field: PriceField) -> Place {
+    Place {
+        field,
+        tier: Some(i),
+    }
+}
 /// The exact value of decimal text.
 fn exact(text: &str) -> ExactAmount {
     ExactAmount::from_decimal(dec(text))
@@ -676,14 +687,20 @@ fn smallest(places: usize) -> String {
 #[test]
 fn decode_regression_for_numbers_text_limits_and_exact_rates() {
     let number = decode(Model::PerUnit, serde_json::json!({"rate": 0.047})).unwrap_err();
-    assert_eq!(number, DecodeError::JsonNumber);
+    assert_eq!(
+        number,
+        DecodeError::JsonNumber {
+            at: Some(at(PriceField::Rate))
+        }
+    );
+    assert_eq!(number.path(), "price.rate");
     assert_eq!(number.code(), "AMOUNT_INVALID");
     assert_eq!(number.message(), DECIMALS_ARE_STRINGS);
     let exponent = decode(Model::PerUnit, per_unit("1e-3")).unwrap_err();
     assert_eq!(
         exponent,
         DecodeError::Numeric {
-            field: PriceField::Rate,
+            at: at(PriceField::Rate),
             error: NumericError::InvalidText
         }
     );
@@ -693,7 +710,7 @@ fn decode_regression_for_numbers_text_limits_and_exact_rates() {
     assert_eq!(
         scale_29,
         DecodeError::Numeric {
-            field: PriceField::Rate,
+            at: at(PriceField::Rate),
             error: NumericError::OutOfRange
         }
     );
@@ -718,7 +735,7 @@ fn decode_refuses_text_that_is_not_a_plain_decimal() {
         assert_eq!(
             refused,
             DecodeError::Numeric {
-                field: PriceField::Rate,
+                at: at(PriceField::Rate),
                 error: NumericError::InvalidText
             },
             "plain decimal text only"
@@ -732,46 +749,50 @@ fn decode_refuses_text_that_is_not_a_plain_decimal() {
         )
         .unwrap_err(),
         DecodeError::Numeric {
-            field: PriceField::UpTo,
+            at: in_tier(0, PriceField::UpTo),
             error: NumericError::InvalidText
         }
     );
 }
 #[test]
 fn decode_refuses_a_value_over_its_limit_and_names_the_limit() {
-    for (model, price, field) in [
-        (Model::PerUnit, per_unit(&smallest(13)), PriceField::Rate),
+    for (model, price, at) in [
+        (
+            Model::PerUnit,
+            per_unit(&smallest(13)),
+            at(PriceField::Rate),
+        ),
         (
             Model::Flat,
             serde_json::json!({"amount": "12345678901234567890123456789"}),
-            PriceField::Amount,
+            at(PriceField::Amount),
         ),
         (
             Model::Package,
             serde_json::json!({"package_size": "10", "package_price": smallest(13)}),
-            PriceField::PackagePrice,
+            at(PriceField::PackagePrice),
         ),
         (
             Model::Package,
             serde_json::json!({"package_size": smallest(29), "package_price": "1"}),
-            PriceField::PackageSize,
+            at(PriceField::PackageSize),
         ),
         (
             Model::Volume,
             serde_json::json!({"tiers":[{"up_to": smallest(29),"rate":"1"},{"up_to":null,"rate":"1"}]}),
-            PriceField::UpTo,
+            in_tier(0, PriceField::UpTo),
         ),
         (
             Model::Volume,
             serde_json::json!({"tiers":[{"up_to":null,"rate": smallest(13)}]}),
-            PriceField::Rate,
+            in_tier(0, PriceField::Rate),
         ),
     ] {
         let refused = decode(model, price).unwrap_err();
         assert_eq!(
             refused,
             DecodeError::Numeric {
-                field,
+                at,
                 error: NumericError::OutOfRange
             },
             "over the field's limit"
@@ -813,53 +834,49 @@ fn decode_refuses_a_value_over_its_limit_and_names_the_limit() {
 fn decode_names_the_field_of_a_negative_or_zero_value() {
     // The plan's error table: a negative or non-positive value is `AMOUNT_INVALID`, and the
     // message names the field, for a package field as for any other.
-    for (model, price, field, error) in [
+    for (model, price, at, error) in [
         (
             Model::PerUnit,
             per_unit("-1"),
-            PriceField::Rate,
+            at(PriceField::Rate),
             NumericError::Negative,
         ),
         (
             Model::Flat,
             serde_json::json!({"amount": "-0.5"}),
-            PriceField::Amount,
+            at(PriceField::Amount),
             NumericError::Negative,
         ),
         (
             Model::Graduated,
             serde_json::json!({"tiers":[{"up_to":"-5","rate":"1"},{"up_to":null,"rate":"1"}]}),
-            PriceField::UpTo,
+            in_tier(0, PriceField::UpTo),
             NumericError::Negative,
         ),
         (
             Model::Package,
             serde_json::json!({"package_size": "0", "package_price": "5"}),
-            PriceField::PackageSize,
+            at(PriceField::PackageSize),
             NumericError::NotPositive,
         ),
         (
             Model::Package,
             serde_json::json!({"package_size": "-10", "package_price": "5"}),
-            PriceField::PackageSize,
+            at(PriceField::PackageSize),
             NumericError::Negative,
         ),
         (
             Model::Package,
             serde_json::json!({"package_size": "10", "package_price": "-5"}),
-            PriceField::PackagePrice,
+            at(PriceField::PackagePrice),
             NumericError::Negative,
         ),
     ] {
         let refused = decode(model, price).unwrap_err();
-        assert_eq!(
-            refused,
-            DecodeError::Numeric { field, error },
-            "the sign rule"
-        );
+        assert_eq!(refused, DecodeError::Numeric { at, error }, "the sign rule");
         assert_eq!(refused.code(), "AMOUNT_INVALID");
         assert!(
-            refused.message().starts_with(field.name()),
+            refused.message().starts_with(at.field.name()),
             "the message names the field"
         );
     }
@@ -933,7 +950,7 @@ fn a_stored_decimal_must_be_its_canonical_text() {
     assert_eq!(
         decode_stored(Model::PerUnit, per_unit("0.10")).unwrap_err(),
         DecodeError::NotCanonical {
-            field: PriceField::Rate
+            at: at(PriceField::Rate)
         }
     );
     assert_eq!(
@@ -943,17 +960,19 @@ fn a_stored_decimal_must_be_its_canonical_text() {
         )
         .unwrap_err(),
         DecodeError::NotCanonical {
-            field: PriceField::UpTo
+            at: in_tier(0, PriceField::UpTo)
         }
     );
     assert_eq!(
         decode_stored(Model::PerUnit, serde_json::json!({"rate": 0.1})).unwrap_err(),
-        DecodeError::JsonNumber
+        DecodeError::JsonNumber {
+            at: Some(at(PriceField::Rate))
+        }
     );
     assert_eq!(
         decode_stored(Model::PerUnit, per_unit("-1")).unwrap_err(),
         DecodeError::Numeric {
-            field: PriceField::Rate,
+            at: at(PriceField::Rate),
             error: NumericError::Negative
         }
     );
@@ -1237,4 +1256,69 @@ proptest::proptest! {
             }
         }
     }
+}
+
+/// D-538: a refusal names the decimal's path under `price`: the body's own field, a tier's field
+/// with the tier's index, and `price` itself when no one decimal is named.
+#[test]
+fn a_refusal_names_the_decimals_path() {
+    let graduated = |up_to: serde_json::Value, rate: serde_json::Value| serde_json::json!({"tiers":[{"up_to":"10","rate":"1"},{"up_to":up_to,"rate":rate}]});
+    for (model, price, path) in [
+        (
+            Model::PerUnit,
+            serde_json::json!({"rate": 0.1}),
+            "price.rate",
+        ),
+        (
+            Model::Flat,
+            serde_json::json!({"amount": "-1"}),
+            "price.amount",
+        ),
+        (
+            Model::Package,
+            serde_json::json!({"package_size": "1", "package_price": 5}),
+            "price.package_price",
+        ),
+        (
+            Model::Package,
+            serde_json::json!({"package_size": "0", "package_price": "5"}),
+            "price.package_size",
+        ),
+        (
+            Model::Graduated,
+            graduated(serde_json::json!("1e2"), serde_json::json!("1")),
+            "price.tiers[1].up_to",
+        ),
+        (
+            Model::Graduated,
+            graduated(serde_json::json!(null), serde_json::json!(2)),
+            "price.tiers[1].rate",
+        ),
+        (
+            Model::Graduated,
+            graduated(serde_json::json!(null), serde_json::json!("-2")),
+            "price.tiers[1].rate",
+        ),
+        // A number under a key that is no decimal of a price names the price.
+        (
+            Model::PerUnit,
+            serde_json::json!({"rate": "1", "extra": 1}),
+            "price",
+        ),
+        // So does a body that is not the model's shape.
+        (Model::Flat, per_unit("1"), "price"),
+    ] {
+        let refused = decode(model, price.clone()).unwrap_err();
+        assert_eq!(refused.path(), path, "{price}");
+    }
+    assert_eq!(
+        decode_stored(
+            Model::Volume,
+            serde_json::json!({"tiers":[{"up_to":"100","rate":"1"},{"up_to":null,"rate":"1.0"}]})
+        )
+        .unwrap_err()
+        .path(),
+        "price.tiers[1].rate",
+        "a stored decimal that is not canonical"
+    );
 }

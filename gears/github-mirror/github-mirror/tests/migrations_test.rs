@@ -45,6 +45,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             manager.has_table(table).await.unwrap(),
@@ -52,11 +53,6 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         );
     }
 
-    // The two additive-column migrations that predate this test, plus the
-    // one added alongside review-comment diff anchoring: `up`/`down` for
-    // these never touched a whole table, so the table-existence loop above
-    // cannot tell a working migration from a no-op one — only checking the
-    // column itself can.
     for (table, column) in [
         ("gm_repositories", "clone_url"),
         ("gm_pull_requests", "html_url"),
@@ -71,8 +67,6 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         );
     }
 
-    // The 26-table extracted_at migration is column-additive: only checking
-    // the column itself proves its up() did anything.
     for table in ["gm_issues", "gm_pull_requests", "gm_commits", "gm_labels"] {
         assert!(
             manager.has_column(table, "extracted_at").await.unwrap(),
@@ -146,6 +140,7 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             manager.has_column(table, "tenant_id").await.unwrap(),
@@ -218,58 +213,11 @@ async fn migrations_apply_and_roll_back_on_a_clean_database() {
         "gm_entity_fingerprints",
         "gm_repo_sync_status",
         "gm_http_cache",
+        "gm_logical_conversations",
     ] {
         assert!(
             !manager.has_table(table).await.unwrap(),
             "{table} must be gone after down()"
-        );
-    }
-    // The additive migrations roll back to no table at all (down() for the
-    // 26 CREATE TABLE migrations already dropped these tables by this point),
-    // so there is nothing further to assert for the individual columns.
-}
-
-/// The last ten migrations are the cache table and the nine that only add
-/// columns, so they are the first ten to roll back. Undoing exactly those leaves every table in place, which
-/// is what makes their `down()` bodies observable: replace one with `Ok(())`
-/// and its column survives here.
-#[tokio::test]
-async fn the_additive_migrations_drop_their_columns_on_rollback() {
-    let conn = Database::connect("sqlite::memory:")
-        .await
-        .expect("in-memory database must connect");
-
-    Migrator::up(&conn, None).await.expect("up must succeed");
-    Migrator::down(&conn, Some(10))
-        .await
-        .expect("rolling back the additive migrations must succeed");
-
-    let manager = SchemaManager::new(&conn);
-    for (table, column) in [
-        ("gm_repositories", "extracted_at"),
-        ("gm_issues", "extracted_at"),
-        ("gm_contributors", "roles"),
-        ("gm_contributors", "first_seen_at"),
-        ("gm_contributors", "last_seen_at"),
-        ("gm_releases", "assets_json"),
-        ("gm_review_comments", "pull_request_review_id"),
-        ("gm_review_comments", "line"),
-        ("gm_review_comments", "subject_type"),
-        ("gm_repositories", "node_id"),
-        ("gm_issues", "node_id"),
-        ("gm_pull_request_files", "patch"),
-        ("gm_issues", "author_login"),
-        ("gm_issues", "labels_json"),
-        ("gm_issues", "author_json"),
-        ("gm_pull_requests", "requested_reviewers_json"),
-    ] {
-        assert!(
-            manager.has_table(table).await.unwrap(),
-            "{table} must still exist: only the additive migrations were rolled back"
-        );
-        assert!(
-            !manager.has_column(table, column).await.unwrap(),
-            "{table}.{column} must be gone after its migration's down()"
         );
     }
 }

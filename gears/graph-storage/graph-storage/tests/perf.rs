@@ -4,7 +4,7 @@
 //!
 //! Opt-in: seeding the graph the criteria name takes minutes, so this lane
 //! runs only when `GEARS_GRAPH_PERF` is set, alongside the same
-//! `PostgreSQL` 19 + pgvector image the conformance lane needs. Without it
+//! `PostgreSQL` + pgvector image the conformance lane needs. Without it
 //! the cases skip -- loudly enough to be noticed in the output, quietly
 //! enough not to make `cargo test` a coffee break.
 //!
@@ -17,7 +17,7 @@
 //! else's number as this gear's.
 //!
 //! ```text
-//! GEARS_GRAPH_PERF=1 GEARS_TEST_PG_GRAPH_IMAGE=pg19-pgvector-test:latest \
+//! GEARS_GRAPH_PERF=1 GEARS_TEST_PG_GRAPH_IMAGE=pgvector/pgvector:0.8.7-pg18 \
 //!   cargo test --release -p cf-gears-graph-storage --test perf -- --nocapture
 //! ```
 //!
@@ -35,7 +35,7 @@ mod conformance;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use graph_storage::config::{GraphStorageConfig, HopStrategy};
+use graph_storage::config::GraphStorageConfig;
 use graph_storage::infra::engine::PgGraphEngine;
 use graph_storage::infra::storage::migrations::Migrator;
 use graph_storage::infra::store::PgGraphStore;
@@ -44,7 +44,7 @@ use graph_storage_sdk::models::{
     RemainingBudget, SearchMode, SearchRequest,
 };
 use graph_storage_sdk::plugin_api::{
-    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreV1, HopBackend, StoreCtx, VectorArm,
+    EmbeddingPlan, ExpandRequest, GraphEngineV1, GraphStoreV1, StoreCtx, VectorArm,
 };
 use sea_orm_migration::MigratorTrait;
 use testcontainers::runners::AsyncRunner as _;
@@ -58,30 +58,8 @@ use uuid::Uuid;
 
 struct Stand {
     store: Arc<PgGraphStore>,
-    /// The SQL/PGQ hop, which `stand()` configures outright.
     engine: PgGraphEngine,
-    db: Arc<toolkit_db::secure::Db>,
-    pgq: bool,
     _container: ContainerAsync<Postgres>,
-}
-
-impl Stand {
-    /// A second engine over the same database and the same seeded graph,
-    /// configured for `hop`. ADR-0001 promises the traversal budget for both
-    /// backends, so both are timed on one seeding rather than the two-query
-    /// hop being assumed from the pattern's number.
-    fn engine_for(&self, hop: HopStrategy) -> PgGraphEngine {
-        PgGraphEngine::new(Arc::new(PgGraphStore::new(
-            Arc::clone(&self.db),
-            GraphStorageConfig {
-                traversal_hop: hop,
-                ..GraphStorageConfig::default()
-            }
-            .validated()
-            .expect("the perf configuration is valid"),
-            self.pgq,
-        )))
-    }
 }
 
 /// The graph the criteria name, scaled.
@@ -171,24 +149,16 @@ async fn stand() -> Option<Stand> {
     run_migrations_for_testing(&db, Migrator::migrations())
         .await
         .expect("migrations apply");
-    let db = Arc::new(db);
-    let pgq = graph_storage::infra::engine::probe_pgq(&db).await;
     let store = Arc::new(PgGraphStore::new(
-        Arc::clone(&db),
-        GraphStorageConfig {
-            traversal_hop: HopStrategy::Pgq,
-            ..GraphStorageConfig::default()
-        }
-        .validated()
-        .expect("the perf configuration is valid"),
-        pgq,
+        Arc::new(db),
+        GraphStorageConfig::default()
+            .validated()
+            .expect("the perf configuration is valid"),
     ));
     let engine = PgGraphEngine::new(Arc::clone(&store));
     Some(Stand {
         store,
         engine,
-        db,
-        pgq,
         _container: container,
     })
 }
@@ -343,6 +313,23 @@ fn seeded_edge(index: usize, nodes: usize) -> EdgeSpec {
     }
 }
 
+/// A context with a budget of its own.
+///
+/// The conformance context's budget starts when the context is made (30 s),
+/// and every store call checks it, so one context cannot outlive a seeding of
+/// minutes: the lane used to fail with `edges commit: Deadline` (gears-rust
+/// #5330). Every ingest batch and every timed round gets its own.
+fn fresh<'a>(ctx: &StoreCtx<'a>) -> StoreCtx<'a> {
+    StoreCtx {
+        tenant: ctx.tenant,
+        scope: ctx.scope,
+        subject: ctx.subject.clone(),
+        snapshot: None,
+        budget: RemainingBudget::starting_now(Duration::from_mins(10)),
+        cancel: ctx.cancel.clone(),
+    }
+}
+
 /// Seed the graph and report what the write path cost while doing it.
 ///
 /// Two numbers come out of this: throughput with embedding **off**, which is
@@ -375,6 +362,7 @@ async fn seed(stand: &Stand, ctx: &StoreCtx<'_>, shape: &Shape, embed: bool) -> 
             replace_scope: None,
             idempotency_key: None,
         };
+        let ctx = &fresh(ctx);
         let plan = plan_for(store, ctx, &request, &coordinator).await;
         written += request.nodes.len();
         store
@@ -400,6 +388,7 @@ async fn seed(stand: &Stand, ctx: &StoreCtx<'_>, shape: &Shape, embed: bool) -> 
             idempotency_key: None,
         };
         written += request.edges.len();
+        let ctx = &fresh(ctx);
         store
             .ingest(
                 ctx,
@@ -477,6 +466,8 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         shape.caveat()
     );
 
+    let ctx = fresh(&ctx);
+
     // --- scenario 1: hybrid narrowing ------------------------------------
     //
     // The query text is embedded once, outside the loop: `nfr-search-latency`
@@ -542,13 +533,7 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
     .await;
     println!("criteria table (filter + page 50) {table}");
 
-    // --- scenarios 3 and 4, on both hop backends ---------------------------
-    //
-    // ADR-0001 § Confirmation promises `nfr-traversal-latency` for both
-    // backends, and they are not one another's proxy: the two-query hop is
-    // what a server without SQL/PGQ serves, and on the development stand it
-    // was the slower of the two at depth 3. Same seeded graph, same seeds,
-    // same budgets; one engine per backend.
+    // --- scenarios 3 and 4: the two-query hop ---------------------------
     let seeds: Vec<String> = (0..8).map(|i| format!("perf-{}", i * 977)).collect();
     let seed_ids: Vec<graph_storage_sdk::models::NodeId> = store
         .resolve_node_ids(&ctx, &seeds)
@@ -569,18 +554,10 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
         .first()
         .expect("the root exists")
         .1;
-    let two_query = stand.engine_for(HopStrategy::TwoQuery);
-    let mut hops: Vec<(&str, Measured, Measured)> = Vec::new();
-    for (backend, engine, served_by) in [
-        ("sql/pgq", &stand.engine, HopBackend::Pattern),
-        ("two-query", &two_query, HopBackend::TwoQuery),
-    ] {
-        let (traversal, neighborhood) =
-            time_hops(engine, served_by, store, &ctx, &seed_ids, &type_set, root).await;
-        println!("[{backend}] depth-3 typed traversal           {traversal}");
-        println!("[{backend}] depth-3 neighborhood (budget 1k)  {neighborhood}");
-        hops.push((backend, traversal, neighborhood));
-    }
+    let (traversal, neighborhood) =
+        time_hops(&stand.engine, store, &ctx, &seed_ids, &type_set, root).await;
+    println!("depth-3 typed traversal            {traversal}");
+    println!("depth-3 neighborhood (budget 1k)   {neighborhood}");
     println!();
 
     // The thresholds, asserted only at full scale: a latency measured on a
@@ -591,16 +568,14 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
             hybrid.p95 <= Duration::from_millis(500),
             "nfr-search-latency: hybrid p95 {hybrid}"
         );
-        for (backend, traversal, neighborhood) in &hops {
-            assert!(
-                neighborhood.p95 <= Duration::from_secs(1),
-                "nfr-traversal-latency [{backend}]: neighborhood p95 {neighborhood}"
-            );
-            assert!(
-                traversal.p95 <= Duration::from_secs(1),
-                "typed traversal [{backend}]: p95 {traversal}"
-            );
-        }
+        assert!(
+            neighborhood.p95 <= Duration::from_secs(1),
+            "nfr-traversal-latency: neighborhood p95 {neighborhood}"
+        );
+        assert!(
+            traversal.p95 <= Duration::from_secs(1),
+            "typed traversal: p95 {traversal}"
+        );
     }
 }
 
@@ -608,13 +583,8 @@ async fn the_retrieval_scenarios_answer_within_their_budgets() {
 /// the depth-3 UI neighborhood with the hydration the UI needs, which is
 /// what `nfr-traversal-latency` actually budgets -- a neighborhood nobody can
 /// render is not the scenario.
-///
-/// `served_by` is asserted on every hop: the pattern backend declines by
-/// falling back, so without it a number printed under "sql/pgq" could be the
-/// two-query hop's, and the two backends would be measured as one.
 async fn time_hops(
     engine: &PgGraphEngine,
-    served_by: HopBackend,
     store: &PgGraphStore,
     reader: &StoreCtx<'_>,
     seed_ids: &[graph_storage_sdk::models::NodeId],
@@ -644,10 +614,6 @@ async fn time_hops(
                     )
                     .await
                     .expect("the hop runs");
-                assert_eq!(
-                    response.served_by, served_by,
-                    "the backend under test answered"
-                );
                 reached = response.reached;
                 reached.sort_unstable();
                 reached.dedup();
@@ -681,10 +647,6 @@ async fn time_hops(
                 )
                 .await
                 .expect("the hop runs");
-            assert_eq!(
-                response.served_by, served_by,
-                "the backend under test answered"
-            );
             frontier = response.reached;
             frontier.sort_unstable();
             frontier.dedup();

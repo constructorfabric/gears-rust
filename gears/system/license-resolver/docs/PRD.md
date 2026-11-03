@@ -531,4 +531,4 @@ Links to related specification artifacts.
 
 - **Design**: [DESIGN.md](./DESIGN.md)
 - **ADRs**: [ADR/](./ADR/)
-- **Features**: [features/](./features/)
+- **Features**: `features/`

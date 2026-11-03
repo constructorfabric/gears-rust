@@ -1,4 +1,3 @@
-// Created: 2026-10-14 by Virtuozzo International GmbH
 //! The review cursor's binding: stable for one listing, different for another.
 
 use toolkit_odata::ast::{CompareOperator, Expr, Value};

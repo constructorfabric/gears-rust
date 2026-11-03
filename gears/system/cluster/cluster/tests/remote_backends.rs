@@ -1663,3 +1663,132 @@ async fn a_wedged_remote_consumer_is_told_it_lagged() {
     drop(watch);
     let _stopped = shutdown.send(());
 }
+
+/// One side of a parity test: its name, the stale holder's handle and the
+/// successor's.
+type Sides<B> = (&'static str, Arc<B>, Arc<B>);
+
+/// A second remote client, on its own connection: a different holder, since
+/// the server mints a lease's owner from the calling client.
+fn remote_client(addr: SocketAddr) -> RemoteClusterClient {
+    RemoteClusterClient::connect_lazy(&format!("http://{addr}"), None).expect("a valid endpoint")
+}
+
+/// Stale-fence parity: a holder that lost its lock without knowing it
+/// -- its lease lapsed, another holder took the name -- holds a stale token.
+/// The taker's fence is higher, and the stale token can neither renew the lock
+/// nor release it: over the wire (two clients) exactly as against the server's
+/// own backend (two owners). A *voluntary* release deletes the
+/// record instead (the releaser knows it let go), so the case is the steal.
+#[tokio::test]
+async fn a_stolen_lock_fences_its_stale_holder_local_and_remote() {
+    let fixture = Fixture::start().await;
+    let local = Arc::clone(
+        &fixture
+            .gear
+            .registry
+            .resolve(PROFILE)
+            .expect("published")
+            .lock,
+    );
+    let successor_client = remote_client(fixture.gear.addr);
+    let sides: [Sides<dyn cluster_sdk::DistributedLockBackend>; 2] = [
+        (
+            "remote",
+            fixture.lock(),
+            successor_client.lock_backend(PROFILE).expect("a handle"),
+        ),
+        ("local", Arc::clone(&local), local),
+    ];
+    let short = Duration::from_millis(300);
+    let ttl = Duration::from_secs(30);
+    for (side, holder, successor) in sides {
+        let name = format!("fenced-{side}");
+        let first = holder.acquire(&name, "a", short).await.expect("free");
+        tokio::time::sleep(short * 3).await;
+        let second = successor
+            .acquire(&name, "b", ttl)
+            .await
+            .expect("a lapsed lease is taken");
+        assert_ne!(second.owner, first.owner, "{side}: another holder");
+        assert!(
+            second.fence > first.fence,
+            "{side}: the steal raises the fence"
+        );
+
+        let stale = holder
+            .renew(&first, ttl)
+            .await
+            .expect_err("a stale token cannot renew");
+        assert!(
+            matches!(stale, ClusterError::LockExpired { .. }),
+            "{side}: {stale}"
+        );
+        holder
+            .release(&first)
+            .await
+            .expect("a stale release is Ok -- and touches nothing");
+        successor
+            .renew(&second, ttl)
+            .await
+            .unwrap_or_else(|e| panic!("{side}: the successor's lease is untouched: {e}"));
+        successor.release(&second).await.expect("released");
+    }
+    fixture.stop().await;
+}
+
+/// The same for an election: a leader whose claim lapsed while another
+/// candidate took it holds a stale token that neither renews nor resigns the
+/// new claim.
+#[tokio::test]
+async fn a_taken_election_fences_its_stale_leader_local_and_remote() {
+    let fixture = Fixture::start().await;
+    let local = Arc::clone(
+        &fixture
+            .gear
+            .registry
+            .resolve(PROFILE)
+            .expect("published")
+            .leader_election,
+    );
+    let sides: [Sides<dyn cluster_sdk::LeaderElectionBackend>; 2] = [
+        ("remote", fixture.leader(), fixture.direct_leader()),
+        ("local", Arc::clone(&local), local),
+    ];
+    let short = cluster_sdk::ElectionConfig::new(Duration::from_millis(300), 2).expect("valid");
+    let config = cluster_sdk::ElectionConfig::default();
+    for (side, holder, successor) in sides {
+        let name = format!("fenced-{side}");
+        let first = holder
+            .join(&name, "a", short)
+            .await
+            .expect("join")
+            .expect("the sole candidate wins");
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        let second = successor
+            .join(&name, "b", config)
+            .await
+            .expect("join")
+            .expect("a lapsed claim is taken");
+        assert_ne!(second.owner, first.owner, "{side}: another candidate");
+        assert!(
+            second.fence > first.fence,
+            "{side}: taking the claim raises the fence"
+        );
+
+        holder
+            .renew(&first, config.ttl())
+            .await
+            .expect_err("a stale token cannot renew");
+        holder
+            .resign(&first)
+            .await
+            .expect("a stale resign is Ok -- and touches nothing");
+        successor
+            .renew(&second, config.ttl())
+            .await
+            .unwrap_or_else(|e| panic!("{side}: the successor still leads: {e}"));
+        successor.resign(&second).await.expect("resign");
+    }
+    fixture.stop().await;
+}

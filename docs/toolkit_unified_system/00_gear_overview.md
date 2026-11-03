@@ -42,7 +42,7 @@ SDK pattern.
 The diagram below shows a typical Gear "X" with every option in play: an SDK for
 external Gears, gRPC and REST APIs, a built-in plugin, an external plugin, and a
 database. It also shows the shared **ModKit libraries** (errors, security, GTS
-types, HTTP client, cluster primitives, outbox) and the **SDKs for other system
+types, HTTP client, cluster primitives, outbox, durable execution) and the **SDKs for other system
 Gears** (authz/authn resolver, tenant resolver, types registry, events, outbound
 API gateway, flight control, cred store).
 

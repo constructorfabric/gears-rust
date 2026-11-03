@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! The search service: one page of declarations, its matching overrides, and
 //! the attribution of every hit to the field that matched.
 //!

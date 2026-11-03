@@ -1,7 +1,7 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! Administrative authoring over the resolution harness: what is composed,
 //! what is derived, what is refused, and what needs a fresh authentication.
 
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -13,27 +13,40 @@ use uuid::Uuid;
 
 use super::{CreateDeclaration, DeclarationAdmin, FieldClass, classify_field, etag_of};
 use crate::audit::AuditOperation;
-use crate::domain::declaration::{Declaration, DeclarationDraft, DeclarationRepository};
+use crate::domain::declaration::{
+    Declaration, DeclarationDraft, DeclarationRepository, DeclarationStatus,
+};
 use crate::domain::error::DomainError;
+use crate::domain::ports::SecretManager as _;
+use crate::domain::ports::StepUpOperation;
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
 use crate::domain::writes::WriteActor;
 use crate::infra::storage::category_repo::CategoryRepo;
 use crate::infra::storage::declaration_repo::DeclarationRepo;
+use crate::infra::storage::pending_secret_repo::PendingSecretRepo;
 use crate::infra::storage::value_repo::ValueRepo;
 use crate::infra::type_validator::GtsTypeValidator;
 use crate::test_support::{
-    BOOL, FixedStepUp, RecordingAudit, RecordingRegistrar, ResolutionHarness, SECRET, TEXT,
-    resolution_catalogue,
+    BOOL, FixedStepUp, RecordingAudit, RecordingMetrics, RecordingRegistrar, RecordingSecrets,
+    ResolutionHarness, SECRET, TEXT, resolution_catalogue,
 };
 
-type Admin = DeclarationAdmin<DeclarationRepo, CategoryRepo, ValueRepo, Arc<RecordingAudit>>;
+type Admin = DeclarationAdmin<
+    DeclarationRepo,
+    CategoryRepo,
+    ValueRepo,
+    Arc<RecordingAudit>,
+    PendingSecretRepo,
+>;
 
 struct Harness {
     base: ResolutionHarness,
     admin: Admin,
     audit: Arc<RecordingAudit>,
     registrar: Arc<RecordingRegistrar>,
+    secrets: Arc<RecordingSecrets>,
+    metrics: Arc<RecordingMetrics>,
 }
 
 impl Harness {
@@ -53,6 +66,8 @@ impl Harness {
         let base = ResolutionHarness::new().await;
         let audit = Arc::new(RecordingAudit::default());
         let registrar = Arc::new(RecordingRegistrar::default());
+        let secrets = Arc::new(RecordingSecrets::default());
+        let metrics = Arc::new(RecordingMetrics::default());
         let admin = DeclarationAdmin::new(
             DeclarationRepo,
             CategoryRepo,
@@ -62,12 +77,17 @@ impl Harness {
             step_up,
             Arc::clone(&audit),
             Arc::clone(&base.cache),
+            PendingSecretRepo,
+            Arc::clone(&secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+            Arc::clone(&metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
         );
         Self {
             base,
             admin,
             audit,
             registrar,
+            secrets,
+            metrics,
         }
     }
 
@@ -125,6 +145,44 @@ impl Harness {
         self.admin
             .retire(&conn, &AccessScope::allow_all(), id, if_match, actor)
             .await
+    }
+
+    async fn purge(
+        &self,
+        id: Uuid,
+        if_match: Option<&str>,
+        actor: &WriteActor,
+    ) -> Result<super::PurgedDeclaration, DomainError> {
+        let conn = self.base.db.conn().expect("connection");
+        self.admin
+            .purge(&conn, &AccessScope::allow_all(), id, if_match, actor)
+            .await
+    }
+
+    /// An admin-authored declaration, retired; answers its id and current tag.
+    async fn retired(&self, name: &str) -> (Uuid, String) {
+        let created = self
+            .create(self.request(name), &admin_actor())
+            .await
+            .expect("created");
+        let id = created.declaration.id;
+        let tag = etag_of(&created.declaration);
+        self.retire(id, Some(tag.as_str()), &admin_actor())
+            .await
+            .expect("retired");
+        let tag = etag_of(&self.load(id).await);
+        (id, tag.as_str().to_owned())
+    }
+
+    /// How many declarations the setting has had, whatever their status.
+    async fn versions_of(&self, key: &str) -> usize {
+        let conn = self.base.db.conn().expect("connection");
+        let prefix = key.strip_suffix("1~").expect("a v1 key");
+        DeclarationRepo
+            .find_by_key_prefix(&conn, &AccessScope::allow_all(), prefix)
+            .await
+            .expect("lookup")
+            .len()
     }
 
     async fn load(&self, id: Uuid) -> Declaration {
@@ -185,7 +243,7 @@ async fn a_create_composes_the_key_registers_the_type_and_records_it() {
     );
     assert_eq!(d.leaf_slug, "retry_policy");
     assert_eq!(d.source, "admin_authored");
-    assert_eq!(d.status, "active");
+    assert_eq!(d.status, DeclarationStatus::Active);
     assert!(d.owner_module.is_none());
     // Unsupplied gates take their protective defaults.
     assert!(d.requires_step_up);
@@ -420,7 +478,13 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
         "{refused:?}"
     );
     let refused = DeclarationRepo
-        .set_status(&conn, &all, current.id, "retired", Some(stale))
+        .set_status(
+            &conn,
+            &all,
+            current.id,
+            DeclarationStatus::Retired,
+            Some(stale),
+        )
         .await
         .expect_err("moved");
     assert!(
@@ -428,16 +492,22 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
         "{refused:?}"
     );
     let kept = h.load(current.id).await;
-    assert_eq!(kept.status, "active");
+    assert_eq!(kept.status, DeclarationStatus::Active);
     assert_eq!(kept.description.as_deref(), Some("a demo setting"));
 
     // At the version read, the write lands; without a version — a caller
     // under its own transaction, like a revive — it is unconditional.
     DeclarationRepo
-        .set_status(&conn, &all, current.id, "retired", Some(current.updated_at))
+        .set_status(
+            &conn,
+            &all,
+            current.id,
+            DeclarationStatus::Retired,
+            Some(current.updated_at),
+        )
         .await
         .expect("current version");
-    assert_eq!(h.load(current.id).await.status, "retired");
+    assert_eq!(h.load(current.id).await.status, DeclarationStatus::Retired);
     DeclarationRepo
         .update_metadata(&conn, &all, current.id, metadata(), None, true)
         .await
@@ -623,7 +693,7 @@ async fn a_contributed_declaration_is_not_admin_editable_or_retirable() {
         ),
         other => panic!("{other:?}"),
     }
-    assert_eq!(h.load(id).await.status, "active");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Active);
 }
 
 /// A module's declaration at the key an administrative create composes.
@@ -718,7 +788,7 @@ async fn a_retired_contributed_declaration_is_not_revived_by_an_administrative_c
         assert_contributed_immutable(err, what);
     }
     let row = h.load(id).await;
-    assert_eq!(row.status, "retired");
+    assert_eq!(row.status, DeclarationStatus::Retired);
     assert_eq!(row.default_value, json!(true));
     assert_eq!(row.owner_module.as_deref(), Some("module-x"));
     assert!(h.audit.records().is_empty(), "nothing audited");
@@ -737,7 +807,7 @@ async fn an_active_contributed_declaration_is_not_evolved_by_an_administrative_c
         assert_contributed_immutable(err, what);
     }
     let row = h.load(id).await;
-    assert_eq!(row.status, "active");
+    assert_eq!(row.status, DeclarationStatus::Active);
     assert_eq!(row.default_value, json!(true));
     assert!(
         h.by_key(&row.key.replace(".v1~", ".v2~")).await.is_none(),
@@ -761,7 +831,7 @@ async fn retire_needs_step_up_keeps_every_value_and_answers_with_the_retired_row
         .await
         .expect_err("step-up");
     assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
-    assert_eq!(h.load(id).await.status, "active");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Active);
 
     // With one: retired, values retained.
     let h = Harness::verified().await;
@@ -787,7 +857,7 @@ async fn retire_needs_step_up_keeps_every_value_and_answers_with_the_retired_row
         .retire(id, Some(tag.as_str()), &admin_actor())
         .await
         .expect("retired");
-    assert_eq!(retired.status, "retired");
+    assert_eq!(retired.status, DeclarationStatus::Retired);
     let conn = h.base.db.conn().expect("connection");
     assert!(
         ValueRepo
@@ -825,7 +895,7 @@ async fn re_declaring_a_retired_key_revives_it_with_its_values() {
         .expect("revived");
     assert!(revived.reactivated);
     assert_eq!(revived.declaration.id, id, "the row keeps its identity");
-    assert_eq!(revived.declaration.status, "active");
+    assert_eq!(revived.declaration.status, DeclarationStatus::Active);
     let conn = h.base.db.conn().expect("connection");
     assert!(
         ValueRepo
@@ -891,7 +961,7 @@ async fn a_revive_may_not_flip_the_secret_boundary_or_the_scope_class() {
     }
 
     // Nothing was reactivated, and the retained value is as it was.
-    assert_eq!(h.load(id).await.status, "retired");
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Retired);
     let conn = h.base.db.conn().expect("connection");
     let row = ValueRepo
         .find_one(&conn, &AccessScope::allow_all(), id, tenant)
@@ -935,7 +1005,7 @@ async fn a_revive_may_not_retype_the_setting_because_its_registered_type_cannot_
     // Nothing was reactivated, retyped or re-registered, and the retained
     // value is as it was.
     let row = h.load(id).await;
-    assert_eq!(row.status, "retired");
+    assert_eq!(row.status, DeclarationStatus::Retired);
     assert_eq!(row.value_type_id, BOOL);
     assert_eq!(row.default_value, json!(false));
     assert_eq!(h.registrar.registered.lock().expect("lock").len(), 1);
@@ -1155,7 +1225,7 @@ fn every_field_falls_into_exactly_one_class() {
         category_id: Uuid::new_v4(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
@@ -1350,10 +1420,10 @@ async fn a_behaviour_change_on_an_active_path_evolves_it_to_the_next_major() {
     assert!(v2.key.ends_with(".retry_policy.v2~"), "{}", v2.key);
     assert_ne!(v2.id, v1.id, "a new declaration, not the old row retyped");
     assert_eq!(v2.value_type_id, TEXT);
-    assert_eq!(v2.status, "active");
+    assert_eq!(v2.status, DeclarationStatus::Active);
     assert_eq!(
         h.load(v1.id).await.status,
-        "retired",
+        DeclarationStatus::Retired,
         "exactly one major is active"
     );
     assert_eq!(evolved.retired.as_deref(), Some(v1.key.as_str()));
@@ -1433,8 +1503,12 @@ async fn evolution_follows_the_active_major_and_a_repeat_of_it_mints_nothing() {
         .expect("to v3")
         .declaration;
     assert!(v3.key.ends_with(".retry_policy.v3~"), "{}", v3.key);
-    assert_eq!(h.load(v2.id).await.status, "retired");
-    assert_eq!(h.load(v1.id).await.status, "retired", "v1 stays retired");
+    assert_eq!(h.load(v2.id).await.status, DeclarationStatus::Retired);
+    assert_eq!(
+        h.load(v1.id).await.status,
+        DeclarationStatus::Retired,
+        "v1 stays retired"
+    );
     assert!(h.by_key(&v3.key.replace(".v3~", ".v4~")).await.is_none());
 }
 
@@ -1478,7 +1552,7 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
         .await
         .expect_err("no step-up");
     assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
-    assert_eq!(h.load(v1.id).await.status, "active");
+    assert_eq!(h.load(v1.id).await.status, DeclarationStatus::Active);
 
     // Values stored inline are not re-interpreted as secret references.
     let h = Harness::verified().await;
@@ -1502,7 +1576,11 @@ async fn evolution_needs_step_up_and_may_not_cross_the_secret_boundary() {
         ),
         other => panic!("{other:?}"),
     }
-    assert_eq!(h.load(v1.id).await.status, "active", "nothing moved");
+    assert_eq!(
+        h.load(v1.id).await.status,
+        DeclarationStatus::Active,
+        "nothing moved"
+    );
     assert!(h.by_key(&v1.key.replace(".v1~", ".v2~")).await.is_none());
 }
 
@@ -1549,7 +1627,7 @@ fn classified_declaration() -> Declaration {
         category_id: Uuid::new_v4(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
@@ -1921,4 +1999,1610 @@ async fn the_audit_images_carry_the_display_name_before_and_after_each_edit() {
         Value::Null,
         "clearing records null"
     );
+}
+
+// ── The revival report ───────────────────────────────────────────────────────
+
+/// A validator that resolves every type's traits and judges every value as
+/// the real one does, except that one value cannot be judged: the registry
+/// is gone by the time it is asked about it.
+struct FailsOnOneValue {
+    inner: Arc<dyn crate::domain::validation::TypeValidator>,
+    unjudgeable: Value,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::validation::TypeValidator for FailsOnOneValue {
+    async fn validate_value(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<crate::domain::validation::ValidationResult, DomainError> {
+        if *value == self.unjudgeable {
+            return Err(DomainError::Unavailable {
+                detail: "types registry down".to_owned(),
+            });
+        }
+        self.inner.validate_value(value_type_id, value).await
+    }
+
+    async fn resolve_traits(
+        &self,
+        value_type_id: &str,
+    ) -> Result<crate::domain::validation::TraitSet, DomainError> {
+        self.inner.resolve_traits(value_type_id).await
+    }
+}
+
+#[tokio::test]
+async fn a_validator_that_goes_down_at_the_row_re_validation_fails_the_report_unavailable() {
+    // The traits and the Schema Default are judged first and succeed; it is
+    // the re-validation of a retained row that cannot be answered, and the
+    // whole report fails with it rather than listing the rows it could judge.
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let (root, a) = (h.base.tree.root, h.base.tree.a);
+    h.base.set(id, root, json!(true)).await;
+    h.base.set(id, a, json!("unjudgeable")).await;
+
+    let flaky = DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::new(FailsOnOneValue {
+            inner: Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+            unjudgeable: json!("unjudgeable"),
+        }),
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let request = h.request("retry_policy");
+    let report = |tenants: Vec<Uuid>| {
+        let (flaky, conn, scope, request) = (&flaky, &conn, &scope, &request);
+        async move {
+            let plan = flaky
+                .plan_revival(conn, scope, request, &OpenGate)
+                .await
+                .expect("planned");
+            flaky
+                .revival_report(conn, scope, plan, request, 100, || async move {
+                    Ok(super::Walk {
+                        tenants,
+                        truncated: false,
+                    })
+                })
+                .await
+        }
+    };
+
+    let err = report(vec![root, a])
+        .await
+        .expect_err("the row cannot be judged");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+
+    // The same admin reports a walk that does not reach the unjudgeable row.
+    let whole = report(vec![root]).await.expect("reported");
+    assert_eq!(whole.rows.len(), 1);
+    assert!(!whole.rows[0].needs_review);
+
+    // Advisory: the declaration is still retired and nothing was audited
+    // beyond the create and the retire.
+    assert_eq!(h.load(id).await.status, DeclarationStatus::Retired);
+    assert_eq!(h.audit.operations(), vec!["create", "remove"]);
+}
+
+/// A read gate that lets every caller read every declaration.
+struct OpenGate;
+
+#[async_trait::async_trait]
+impl super::RevivalReadGate for OpenGate {
+    async fn may_read(&self, _declaration: &Declaration) -> Result<bool, DomainError> {
+        Ok(true)
+    }
+}
+
+/// A read gate that refuses every declaration to the caller.
+struct ClosedGate;
+
+#[async_trait::async_trait]
+impl super::RevivalReadGate for ClosedGate {
+    async fn may_read(&self, _declaration: &Declaration) -> Result<bool, DomainError> {
+        Ok(false)
+    }
+}
+
+#[tokio::test]
+async fn a_refusing_read_gate_answers_nothing_to_revive_like_an_absent_declaration() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let tag = etag_of(&created.declaration);
+    h.retire(created.declaration.id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+
+    let refused = h
+        .admin
+        .plan_revival(&conn, &scope, &h.request("retry_policy"), &ClosedGate)
+        .await
+        .expect_err("refused");
+    let absent = h
+        .admin
+        .plan_revival(&conn, &scope, &h.request("never_declared"), &OpenGate)
+        .await
+        .expect_err("absent");
+    assert_eq!(format!("{refused:?}"), format!("{absent:?}"));
+    assert!(matches!(
+        refused,
+        DomainError::NotFound {
+            resource: super::NOTHING_TO_REVIVE
+        }
+    ));
+    assert!(
+        h.admin
+            .plan_revival(&conn, &scope, &h.request("retry_policy"), &OpenGate)
+            .await
+            .is_ok()
+    );
+}
+
+#[test]
+fn a_listed_value_is_masked_by_the_strictest_class_and_an_unknown_one_fails_closed() {
+    use super::{DataClassification as C, strictest_classification as strictest};
+    // A stored string becomes the enum through `from_stored`, which is where
+    // an unknown one ranks as the strictest.
+    let stored = |s: &str| C::from_stored(s);
+    assert_eq!(strictest([C::Public, C::Public]), C::Public);
+    assert_eq!(strictest([C::Public, C::Pii]), C::Pii);
+    assert_eq!(strictest([C::Pii, C::Public, C::Secret]), C::Secret);
+    assert_eq!(strictest([C::Pii, C::Secret]), C::Secret);
+    assert_eq!(
+        strictest([C::Public, stored("restricted")]),
+        C::Secret,
+        "unknown"
+    );
+    assert_eq!(
+        strictest([stored(""), C::Public]),
+        C::Secret,
+        "empty is unknown"
+    );
+    assert_eq!(strictest(std::iter::empty()), C::Public);
+}
+
+/// A validator that records every value it was asked to judge.
+struct CountingValidator {
+    inner: Arc<dyn crate::domain::validation::TypeValidator>,
+    judged: std::sync::Mutex<Vec<Value>>,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::validation::TypeValidator for CountingValidator {
+    async fn validate_value(
+        &self,
+        value_type_id: &str,
+        value: &Value,
+    ) -> Result<crate::domain::validation::ValidationResult, DomainError> {
+        self.judged.lock().expect("lock").push(value.clone());
+        self.inner.validate_value(value_type_id, value).await
+    }
+
+    async fn resolve_traits(
+        &self,
+        value_type_id: &str,
+    ) -> Result<crate::domain::validation::TraitSet, DomainError> {
+        self.inner.resolve_traits(value_type_id).await
+    }
+}
+
+#[tokio::test]
+async fn rows_holding_the_same_value_are_judged_once_and_each_gets_its_own_verdict() {
+    let h = Harness::verified().await;
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+
+    // The same text twice; one object with its keys in two orders; the
+    // integer `1` and the float `1.0`; the one valid boolean twice.
+    let held = [
+        json!("x"),
+        json!("x"),
+        json!({"a": 1, "b": 2}),
+        serde_json::from_str(r#"{"b": 2, "a": 1}"#).expect("json"),
+        json!(1),
+        json!(1.0),
+        json!(true),
+        json!(true),
+    ];
+    let mut tenants = Vec::new();
+    for value in &held {
+        let tenant = Uuid::new_v4();
+        h.base.set(id, tenant, value.clone()).await;
+        tenants.push(tenant);
+    }
+
+    let counting = Arc::new(CountingValidator {
+        inner: Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        judged: std::sync::Mutex::new(Vec::new()),
+    });
+    let admin = DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::clone(&counting) as Arc<dyn crate::domain::validation::TypeValidator>,
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let request = h.request("retry_policy");
+    let plan = admin
+        .plan_revival(&conn, &scope, &request, &OpenGate)
+        .await
+        .expect("planned");
+    let walk_tenants = tenants.clone();
+    let report = admin
+        .revival_report(&conn, &scope, plan, &request, 100, || async move {
+            Ok(super::Walk {
+                tenants: walk_tenants,
+                truncated: false,
+            })
+        })
+        .await
+        .expect("reported");
+
+    // The Schema Default is judged by the create's checks, once; every
+    // other judgement is of a retained value.
+    let judged: Vec<Value> = counting
+        .judged
+        .lock()
+        .expect("lock")
+        .iter()
+        .filter(|v| **v != request.default_value)
+        .cloned()
+        .collect();
+    let distinct = judged.len();
+    assert_eq!(
+        distinct, 5,
+        "`x`, the object, `1`, `1.0` and `true`, each once: {judged:?}"
+    );
+    assert_eq!(report.rows.len(), held.len());
+    for (row, value) in report.rows.iter().zip(&held) {
+        assert_eq!(row.value.as_ref(), Some(value));
+        assert_eq!(
+            row.needs_review,
+            *value != json!(true),
+            "a boolean validates, everything else is flagged: {value}"
+        );
+        assert_eq!(row.needs_review_detail.is_some(), row.needs_review);
+    }
+    assert_eq!(report.total_needs_review, 6);
+}
+
+#[test]
+fn equal_objects_are_one_verdict_key_whatever_their_key_order() {
+    // Built member by member in the opposite order: with `serde_json`'s
+    // `preserve_order` on, as a workspace build has it, the two print
+    // differently and are still equal, nested objects included — and the
+    // verdicts, keyed by the value, hold them as one key.
+    let mut inner = Map::new();
+    inner.insert("q".to_owned(), json!(1));
+    inner.insert("p".to_owned(), json!(2));
+    let mut outer = Map::new();
+    outer.insert("x".to_owned(), json!([Value::Object(inner)]));
+    outer.insert("y".to_owned(), json!(1));
+    let reversed = json!({ "outer": Value::Object(outer) });
+    let ordered = json!({ "outer": { "y": 1, "x": [{ "p": 2, "q": 1 }] } });
+    assert_eq!(ordered, reversed);
+    let mut verdicts: HashMap<Value, Option<String>> = HashMap::new();
+    verdicts.insert(ordered, None);
+    verdicts.insert(reversed.clone(), Some("flagged".to_owned()));
+    assert_eq!(verdicts.len(), 1);
+    assert_eq!(verdicts.get(&reversed), Some(&Some("flagged".to_owned())));
+}
+
+/// The real value repository, recording the tenant batch of every listing
+/// read it is asked for.
+#[derive(Clone, Default)]
+struct BatchRecordingValues {
+    listings: Arc<std::sync::Mutex<Vec<Vec<Uuid>>>>,
+}
+
+#[async_trait::async_trait]
+impl ValueRepository for BatchRecordingValues {
+    async fn resync_classification<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        data_classification: &str,
+    ) -> Result<u64, DomainError> {
+        ValueRepo
+            .resync_classification(conn, scope, declaration_id, data_classification)
+            .await
+    }
+
+    async fn find_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo
+            .find_in_tenants(conn, scope, declaration_id, tenant_ids)
+            .await
+    }
+
+    async fn find_many_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo
+            .find_many_in_tenants(conn, scope, declaration_ids, tenant_ids)
+            .await
+    }
+
+    async fn count_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, DomainError> {
+        ValueRepo
+            .count_in_tenants(conn, scope, declaration_id, tenant_ids)
+            .await
+    }
+
+    async fn distinct_values_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::value::DistinctValue>, DomainError> {
+        ValueRepo
+            .distinct_values_in_tenants(conn, scope, declaration_id, tenant_ids)
+            .await
+    }
+
+    async fn list_in_tenants<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<crate::domain::value::ListedValue>, DomainError> {
+        self.listings
+            .lock()
+            .expect("lock")
+            .push(tenant_ids.to_vec());
+        ValueRepo
+            .list_in_tenants(conn, scope, declaration_id, tenant_ids)
+            .await
+    }
+
+    async fn find_all<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+    ) -> Result<Vec<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo.find_all(conn, scope, declaration_id).await
+    }
+
+    async fn lock_all<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+    ) -> Result<Vec<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo.lock_all(conn, scope, declaration_id).await
+    }
+
+    async fn flag<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        detail: Option<String>,
+    ) -> Result<(), DomainError> {
+        ValueRepo.flag(conn, scope, id, detail).await
+    }
+
+    async fn find_one<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_id: Uuid,
+    ) -> Result<Option<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo
+            .find_one(conn, scope, declaration_id, tenant_id)
+            .await
+    }
+
+    async fn count_flagged<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        source: &str,
+    ) -> Result<u64, DomainError> {
+        ValueRepo.count_flagged(conn, scope, source).await
+    }
+
+    async fn list_review<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        request: &crate::domain::value::ReviewRequest<'_>,
+    ) -> Result<toolkit_odata::Page<crate::domain::value::StoredValue>, DomainError> {
+        ValueRepo.list_review(conn, request).await
+    }
+
+    async fn insert<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        draft: crate::domain::value::ValueDraft,
+    ) -> Result<crate::domain::value::StoredValue, DomainError> {
+        ValueRepo.insert(conn, scope, draft).await
+    }
+
+    async fn update<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        id: Uuid,
+        value: Option<Value>,
+        secret_ref: Option<String>,
+        set_by: &str,
+        set_by_tenant: Option<Uuid>,
+        expected: time::OffsetDateTime,
+    ) -> Result<crate::domain::value::StoredValue, DomainError> {
+        ValueRepo
+            .update(
+                conn,
+                scope,
+                id,
+                value,
+                secret_ref,
+                set_by,
+                set_by_tenant,
+                expected,
+            )
+            .await
+    }
+
+    async fn delete<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_id: Uuid,
+        expected: time::OffsetDateTime,
+    ) -> Result<(), DomainError> {
+        ValueRepo
+            .delete(conn, scope, declaration_id, tenant_id, expected)
+            .await
+    }
+
+    async fn secret_refs<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DomainError> {
+        ValueRepo.secret_refs(conn, declaration_id).await
+    }
+
+    async fn references_held_by_others<C: toolkit_db::secure::DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<std::collections::HashSet<String>, DomainError> {
+        ValueRepo
+            .references_held_by_others(conn, declaration_id, refs)
+            .await
+    }
+}
+
+/// A retired `retry_policy` declaration, its report asked of an admin whose
+/// value repository records the listing batches, over `walk`, with `limit`.
+async fn report_over(
+    h: &Harness,
+    walk: Vec<Uuid>,
+    limit: usize,
+) -> (super::RevivalReport, Vec<Vec<Uuid>>) {
+    let values = BatchRecordingValues::default();
+    let admin = DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        values.clone(),
+        Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        Arc::clone(&h.secrets) as Arc<dyn crate::domain::ports::SecretManager>,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
+    );
+    let conn = h.base.db.conn().expect("connection");
+    let scope = AccessScope::allow_all();
+    let request = h.request("retry_policy");
+    let plan = admin
+        .plan_revival(&conn, &scope, &request, &OpenGate)
+        .await
+        .expect("planned");
+    let report = admin
+        .revival_report(&conn, &scope, plan, &request, limit, || async move {
+            Ok(super::Walk {
+                tenants: walk,
+                truncated: false,
+            })
+        })
+        .await
+        .expect("reported");
+    let batches = values.listings.lock().expect("lock").clone();
+    (report, batches)
+}
+
+async fn retired_retry_policy(h: &Harness) -> Uuid {
+    let created = h
+        .create(h.request("retry_policy"), &admin_actor())
+        .await
+        .expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    id
+}
+
+#[tokio::test]
+async fn a_small_limit_lists_the_first_rows_in_walk_order_and_still_counts_every_row() {
+    let h = Harness::verified().await;
+    let id = retired_retry_policy(&h).await;
+    // The walk's order is not the order the rows were written in; the
+    // valid value is held by many tenants and an invalid one only by the
+    // last tenants of the walk, which are counted but not listed.
+    let walk: Vec<Uuid> = (0..6).map(|_| Uuid::new_v4()).collect();
+    for tenant in walk.iter().rev().take(3) {
+        h.base.set(id, *tenant, json!("not a boolean")).await;
+    }
+    for tenant in walk.iter().take(3).rev() {
+        h.base.set(id, *tenant, json!(true)).await;
+    }
+
+    let (report, batches) = report_over(&h, walk.clone(), 2).await;
+    let listed: Vec<Uuid> = report.rows.iter().map(|r| r.tenant_id).collect();
+    assert_eq!(listed, walk[..2].to_vec(), "the first two, in walk order");
+    assert!(report.rows.iter().all(|r| !r.needs_review));
+    assert_eq!(report.total, 6);
+    assert_eq!(
+        report.total_needs_review, 3,
+        "the invalid rows after the listed ones are counted"
+    );
+    assert_eq!(report.scanned, 6);
+    assert_eq!(batches.len(), 1, "the one batch fills the limit");
+
+    // A limit past the rows lists them all, each with its own verdict.
+    let (all, _) = report_over(&h, walk.clone(), 100).await;
+    assert_eq!(all.rows.len(), 6);
+    assert_eq!(
+        all.rows.iter().filter(|r| r.needs_review).count(),
+        3,
+        "the verdicts are per row"
+    );
+    assert_eq!(all.rows[5].tenant_id, walk[5]);
+}
+
+#[tokio::test]
+async fn the_listing_stops_after_the_first_tenant_batch_that_fills_the_limit() {
+    let h = Harness::verified().await;
+    let id = retired_retry_policy(&h).await;
+    let batch = super::REVIVAL_TENANT_BATCH;
+    let walk: Vec<Uuid> = (0..batch + 100).map(|_| Uuid::new_v4()).collect();
+    // Three rows in the first batch, three in the second.
+    for at in [0, 1, 2, batch + 50, batch + 51, batch + 52] {
+        h.base.set(id, walk[at], json!(true)).await;
+    }
+
+    let (report, batches) = report_over(&h, walk.clone(), 2).await;
+    assert_eq!(report.rows.len(), 2);
+    assert_eq!(report.total, 6);
+    assert_eq!(batches.len(), 1, "the first batch fills the limit");
+    assert_eq!(batches[0], walk[..batch].to_vec());
+
+    // Asked for more than the first batch holds, the listing goes on to the
+    // second, in walk order, and stops there.
+    let (report, batches) = report_over(&h, walk.clone(), 4).await;
+    let listed: Vec<Uuid> = report.rows.iter().map(|r| r.tenant_id).collect();
+    assert_eq!(
+        listed,
+        vec![walk[0], walk[1], walk[2], walk[batch + 50]],
+        "the walk's order across batches"
+    );
+    assert_eq!(batches.len(), 2);
+    assert_eq!(batches[1], walk[batch..].to_vec());
+
+    // A limit of nothing lists nothing and reads no batch, yet counts.
+    let (report, batches) = report_over(&h, walk, 0).await;
+    assert!(report.rows.is_empty());
+    assert_eq!(report.total, 6);
+    assert!(batches.is_empty());
+}
+// ── Purge ────────────────────────────────────────────────────────────────────
+
+fn conflict_detail(err: DomainError) -> String {
+    match err {
+        DomainError::Conflict { detail } => detail,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_purge_refuses_an_active_and_a_contributed_declaration_and_wants_a_current_tag() {
+    let h = Harness::verified().await;
+
+    // Active: refused as not retired, and still there.
+    let created = h
+        .create(h.request("live"), &admin_actor())
+        .await
+        .expect("created");
+    let live = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    let err = h
+        .purge(live, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("active");
+    assert!(
+        conflict_detail(err).starts_with(super::conflict::NOT_RETIRED),
+        "the status refusal"
+    );
+    assert_eq!(h.load(live).await.status, DeclarationStatus::Active);
+
+    // Contributed, active or retired: the kind is judged before the status.
+    let contributed = h
+        .base
+        .declare(
+            "owned",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let tag = etag_of(&h.load(contributed).await);
+    let err = h
+        .purge(contributed, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("contributed");
+    assert!(conflict_detail(err).starts_with(super::conflict::CONTRIBUTED_IMMUTABLE));
+    h.base.retire(contributed).await;
+    let tag = etag_of(&h.load(contributed).await);
+    let err = h
+        .purge(contributed, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect_err("contributed, retired");
+    assert!(conflict_detail(err).starts_with(super::conflict::CONTRIBUTED_IMMUTABLE));
+
+    // Retired: the tag is required, and a stale one is refused.
+    let (id, tag) = h.retired("gone").await;
+    let err = h.purge(id, None, &admin_actor()).await.expect_err("no tag");
+    assert!(
+        matches!(err, DomainError::PreconditionRequired { .. }),
+        "{err:?}"
+    );
+    let err = h
+        .purge(id, Some("\"stale\""), &admin_actor())
+        .await
+        .expect_err("stale tag");
+    assert!(
+        matches!(err, DomainError::PreconditionFailed { .. }),
+        "{err:?}"
+    );
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "nothing was removed"
+    );
+
+    // And a current one purges.
+    h.purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+}
+
+#[tokio::test]
+async fn a_purge_collects_every_reference_held_at_any_scope_and_subject_and_records_a_remove() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("tokens").await;
+    let key = h.load(id).await.key;
+    let t = &h.base.tree;
+    h.base.set(id, t.root, json!(true)).await;
+    h.base.set_secret(id, t.a, "value-a").await;
+    h.base.set_secret(id, t.b, "value-b").await;
+    h.base.set_subject_secret(id, t.c, "value-subject").await;
+    h.base.stage_secret(id, t.s, "staged-s").await;
+    // The same entry named twice is released once.
+    h.base.stage_secret(id, t.a, "value-a").await;
+
+    let purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    assert_eq!(purged.key, key);
+    let mut refs: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| (e.tenant, e.secret_ref.as_str()))
+        .collect();
+    refs.sort();
+    let mut expected = vec![
+        (t.a, "value-a"),
+        (t.b, "value-b"),
+        (t.c, "value-subject"),
+        (t.s, "staged-s"),
+    ];
+    expected.sort();
+    assert_eq!(refs, expected);
+    let conn = h.base.db.conn().expect("connection");
+    assert!(
+        ValueRepo
+            .find_all(&conn, &AccessScope::allow_all(), id)
+            .await
+            .expect("rows")
+            .is_empty()
+    );
+    let records = h.audit.records();
+    let last = records.last().expect("a record");
+    assert_eq!(last.operation, AuditOperation::Remove);
+    assert!(last.pre_image.is_some() && last.post_image.is_none());
+    assert_eq!(last.declaration_key, key);
+}
+
+#[tokio::test]
+async fn every_declaration_action_counts_its_step_up_under_its_own_operation() {
+    let h = Harness::verified().await;
+
+    // update: loosening a gate needs step-up.
+    let created = h
+        .create(h.request("tuned"), &admin_actor())
+        .await
+        .expect("created");
+    let tag = etag_of(&created.declaration);
+    h.update(
+        created.declaration.id,
+        Some(tag.as_str()),
+        json!({"requires_step_up": false}),
+        &admin_actor(),
+    )
+    .await
+    .expect("updated");
+
+    // evolve: a changed default on the active declaration.
+    let mut evolved = h.request("tuned");
+    evolved.default_value = json!(true);
+    let evolved = h.create(evolved, &admin_actor()).await.expect("evolved");
+    assert!(evolved.evolved);
+
+    // retire, reactivate, purge on another one.
+    let (id, _) = h.retired("cycled").await;
+    let revived = h
+        .create(h.request("cycled"), &admin_actor())
+        .await
+        .expect("revived");
+    assert!(revived.reactivated);
+    let tag = etag_of(&revived.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired again");
+    let tag = etag_of(&h.load(id).await);
+    h.purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Update),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Evolve),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Reactivate),
+        vec!["verified"]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Retire),
+        vec!["verified"; 2]
+    );
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["verified"]
+    );
+}
+
+#[tokio::test]
+async fn a_refused_step_up_is_counted_by_its_code_and_a_service_principal_as_its_own_result() {
+    let h = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Stale))).await;
+    // Judged before anything is read: no row at this id, still the challenge.
+    let err = h
+        .purge(Uuid::new_v4(), Some("\"any\""), &admin_actor())
+        .await
+        .expect_err("challenge");
+    assert!(matches!(err, DomainError::StepUpRequired { .. }), "{err:?}");
+    assert_eq!(h.metrics.step_ups_of(StepUpOperation::Purge), vec!["stale"]);
+
+    let err = h
+        .purge(Uuid::new_v4(), Some("\"any\""), &service_actor())
+        .await
+        .expect_err("machine");
+    assert!(matches!(err, DomainError::Unauthorized { .. }), "{err:?}");
+    assert_eq!(
+        h.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["stale", "service_principal"]
+    );
+
+    // An outage of the verifier is counted too, and is no challenge.
+    let down = Harness::with_step_up(Arc::new(FixedStepUp::refusing(StepUpRefusal::Unavailable(
+        "authn down".to_owned(),
+    ))))
+    .await;
+    let err = down
+        .purge(Uuid::new_v4(), Some("\"any\""), &admin_actor())
+        .await
+        .expect_err("unavailable");
+    assert!(matches!(err, DomainError::Unavailable { .. }), "{err:?}");
+    assert_eq!(
+        down.metrics.step_ups_of(StepUpOperation::Purge),
+        vec!["unavailable"]
+    );
+}
+
+// ── The release ──────────────────────────────────────────────────────────────
+
+fn held(n: usize) -> super::PurgedDeclaration {
+    super::PurgedDeclaration {
+        id: Uuid::new_v4(),
+        key: "gts.cf.core.settings.setting_type.v1~acme.settings.network.x.v1~".to_owned(),
+        secrets: (0..n)
+            .map(|i| super::HeldSecret {
+                tenant: Uuid::new_v4(),
+                secret_ref: format!("ref-{i}"),
+            })
+            .collect(),
+        kept_secrets: Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn the_release_counts_ok_for_every_entry_and_failed_when_the_store_refuses() {
+    let h = Harness::verified().await;
+    let purged = held(3);
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext");
+    }
+
+    let summary = h.admin.release_purged(purged.clone(), "req-1").await;
+
+    assert_eq!((summary.released, summary.failed), (3, 0));
+    assert!(h.secrets.held().is_empty());
+    assert_eq!(
+        *h.metrics.purge_releases.lock().expect("lock"),
+        vec!["ok"; 3]
+    );
+
+    h.secrets.go_down();
+    let summary = h.admin.release_purged(purged, "req-2").await;
+    assert_eq!((summary.released, summary.failed), (0, 3));
+    assert_eq!(
+        h.metrics
+            .purge_releases
+            .lock()
+            .expect("lock")
+            .iter()
+            .filter(|r| **r == "failed")
+            .count(),
+        3
+    );
+}
+
+/// A store that answers every release after a pause and remembers how many
+/// were in flight at once; optionally holds each one at a gate.
+struct SlowStore {
+    in_flight: std::sync::atomic::AtomicUsize,
+    peak: std::sync::atomic::AtomicUsize,
+    started: std::sync::atomic::AtomicUsize,
+    released: std::sync::atomic::AtomicUsize,
+    gate: Option<tokio::sync::Semaphore>,
+}
+
+impl SlowStore {
+    fn new(gated: bool) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: 0.into(),
+            peak: 0.into(),
+            started: 0.into(),
+            released: 0.into(),
+            gate: gated.then(|| tokio::sync::Semaphore::new(0)),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::domain::ports::SecretManager for SlowStore {
+    fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
+        unreachable!("a release mints nothing")
+    }
+    async fn store_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+        _plaintext: &Value,
+    ) -> Result<(), DomainError> {
+        unreachable!("a release stores nothing")
+    }
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<SecretString, DomainError> {
+        unreachable!("a release reads nothing")
+    }
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.started.fetch_add(1, SeqCst);
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.peak.fetch_max(now, SeqCst);
+        if let Some(gate) = &self.gate {
+            gate.acquire().await.expect("open gate").forget();
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        self.in_flight.fetch_sub(1, SeqCst);
+        self.released.fetch_add(1, SeqCst);
+        Ok(())
+    }
+}
+
+/// The admin of a harness, over a Secret Manager of the test's choosing.
+fn admin_over(h: &Harness, secrets: Arc<dyn crate::domain::ports::SecretManager>) -> Admin {
+    DeclarationAdmin::new(
+        DeclarationRepo,
+        CategoryRepo,
+        ValueRepo,
+        Arc::new(GtsTypeValidator::new(resolution_catalogue())),
+        Arc::clone(&h.registrar) as Arc<dyn crate::domain::contribution::SettingTypeRegistrar>,
+        Arc::new(FixedStepUp::verified()),
+        Arc::clone(&h.audit),
+        Arc::clone(&h.base.cache),
+        PendingSecretRepo,
+        secrets,
+        Arc::clone(&h.metrics) as Arc<dyn crate::domain::ports::WriteMetrics>,
+    )
+}
+
+#[tokio::test]
+async fn the_release_runs_at_most_four_at_a_time() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let h = Harness::verified().await;
+    let store = SlowStore::new(false);
+    let admin = admin_over(
+        &h,
+        Arc::clone(&store) as Arc<dyn crate::domain::ports::SecretManager>,
+    );
+
+    let summary = admin.release_purged(held(10), "req").await;
+
+    assert_eq!((summary.released, summary.failed), (10, 0));
+    assert_eq!(store.released.load(SeqCst), 10);
+    let peak = store.peak.load(SeqCst);
+    assert!(peak <= 4, "never more than four in flight: {peak}");
+    assert!(peak > 1, "and the releases do overlap: {peak}");
+}
+
+#[tokio::test]
+async fn the_release_finishes_when_the_caller_that_started_it_is_dropped() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let h = Harness::verified().await;
+    let store = SlowStore::new(true);
+    let admin = admin_over(
+        &h,
+        Arc::clone(&store) as Arc<dyn crate::domain::ports::SecretManager>,
+    );
+
+    {
+        let release = admin.release_purged(held(6), "req");
+        tokio::pin!(release);
+        // Run the caller until the first release has begun, then drop it.
+        let begun = async {
+            while store.started.load(SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        };
+        tokio::select! {
+            _ = &mut release => panic!("the gate is shut; nothing can have finished"),
+            () = begun => {}
+        }
+    }
+    store.gate.as_ref().expect("gated").add_permits(6);
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while store.released.load(SeqCst) < 6 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every entry is released although the caller is gone");
+}
+
+// ── What an evolution shares, and what a purge must not take ────────────────
+
+/// The references still named by a value or staged row of `id`.
+async fn refs_held_by(h: &Harness, id: Uuid) -> Vec<String> {
+    let conn = h.base.db.conn().expect("connection");
+    let mut refs: Vec<String> = ValueRepo
+        .secret_refs(&conn, id)
+        .await
+        .expect("refs")
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect();
+    refs.sort();
+    refs
+}
+
+#[tokio::test]
+async fn a_purge_releases_none_of_the_entries_another_declaration_still_holds() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("old").await;
+    let successor = h
+        .base
+        .declare(
+            "new",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let t = &h.base.tree;
+    // What an evolution's copy leaves: the successor's row names the same
+    // reference as the retired predecessor's.
+    h.base.set_secret(id, t.a, "shared-value").await;
+    h.base.set_secret(successor, t.a, "shared-value").await;
+    // A reference another declaration holds only as a staged row.
+    h.base.set_secret(id, t.b, "shared-staged").await;
+    h.base.stage_secret(successor, t.b, "shared-staged").await;
+    // And the ones nobody else holds.
+    h.base.set_secret(id, t.c, "own-value").await;
+    h.base.stage_secret(id, t.s, "own-staged").await;
+    for reference in ["shared-value", "shared-staged", "own-value", "own-staged"] {
+        h.secrets.seed(reference, "plaintext");
+    }
+
+    let purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+
+    let mut released: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| e.secret_ref.as_str())
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released, vec!["own-staged", "own-value"]);
+    assert_eq!(
+        purged.kept_secrets.len(),
+        2,
+        "both shared references are counted"
+    );
+    let summary = h.admin.release_purged(purged, "req").await;
+    assert_eq!((summary.released, summary.failed), (2, 0));
+    assert_eq!(
+        h.secrets.held(),
+        vec!["shared-staged".to_owned(), "shared-value".to_owned()],
+        "the entries the successor still holds are in the store"
+    );
+    assert_eq!(
+        refs_held_by(&h, successor).await,
+        vec!["shared-value".to_owned()],
+        "and its row still names its own"
+    );
+}
+
+#[tokio::test]
+async fn after_an_evolution_of_a_secret_setting_a_purge_of_its_predecessor_keeps_the_successors_entries()
+ {
+    let h = Harness::verified().await;
+    let mut first = h.request("api_token");
+    first.value_type_id = SECRET.to_owned();
+    first.default_value = json!("");
+    let first = h.create(first, &admin_actor()).await.expect("created");
+    let old = first.declaration.id;
+    let t = &h.base.tree;
+    h.base.set_secret(old, t.a, "tenant-a-entry").await;
+    h.base.set_secret(old, t.b, "tenant-b-entry").await;
+    h.secrets.seed("tenant-a-entry", "plaintext-a");
+    h.secrets.seed("tenant-b-entry", "plaintext-b");
+
+    // Evolve: a changed scope class on the active declaration.
+    let mut next = h.request("api_token");
+    next.value_type_id = SECRET.to_owned();
+    next.default_value = json!("");
+    next.scope_class = "local".to_owned();
+    let evolved = h.create(next, &admin_actor()).await.expect("evolved");
+    assert!(evolved.evolved);
+    let successor = evolved.declaration.id;
+    assert_eq!(
+        refs_held_by(&h, successor).await,
+        vec!["tenant-a-entry".to_owned(), "tenant-b-entry".to_owned()],
+        "the evolution copied the references"
+    );
+
+    let tag = etag_of(&h.load(old).await);
+    let purged = h
+        .purge(old, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+    assert_eq!(purged.secrets, Vec::<super::HeldSecret>::new());
+    assert_eq!(purged.kept_secrets.len(), 2);
+    let summary = h.admin.release_purged(purged, "req").await;
+
+    assert_eq!((summary.released, summary.failed), (0, 0));
+    assert_eq!(
+        h.secrets.held(),
+        vec!["tenant-a-entry".to_owned(), "tenant-b-entry".to_owned()],
+        "the live successor keeps its secrets"
+    );
+    assert!(h.secrets.deleted.lock().expect("lock").is_empty());
+    let key = h.load(successor).await.key;
+    for (tenant, reference, plaintext) in [
+        (t.a, "tenant-a-entry", "plaintext-a"),
+        (t.b, "tenant-b-entry", "plaintext-b"),
+    ] {
+        let resolved = h
+            .secrets
+            .resolve_plaintext(&key, tenant, reference)
+            .await
+            .expect("the successor's secret still resolves");
+        assert_eq!(secrecy::ExposeSecret::expose_secret(&resolved), plaintext);
+    }
+}
+
+#[tokio::test]
+async fn a_purge_outside_the_callers_administrative_domain_is_not_found_and_removes_nothing() {
+    let h = Harness::verified().await;
+    let mut request = h.request("domained");
+    request.domain_affinity = Some("infra".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+    let tag = etag_of(&created.declaration);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let tag = etag_of(&h.load(id).await);
+    h.base
+        .set_secret(id, h.base.tree.a, "inside-the-domain")
+        .await;
+    h.secrets.seed("inside-the-domain", "plaintext");
+    let billing = AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::In(toolkit_security::InScopeFilter::new(
+            crate::domain::category::visibility::DOMAIN_PROPERTY,
+            vec!["billing".into()],
+        )),
+    ]));
+    let mut actor = admin_actor();
+    actor.visibility = crate::domain::category::domain_visibility(&billing);
+    let conn = h.base.db.conn().expect("connection");
+
+    let err = h
+        .admin
+        .purge(&conn, &billing, id, Some(tag.as_str()), &actor)
+        .await
+        .expect_err("outside the caller's domain");
+
+    assert!(
+        matches!(
+            err,
+            DomainError::NotFound {
+                resource: "declaration"
+            }
+        ),
+        "{err:?}"
+    );
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "the row stays"
+    );
+    assert_eq!(
+        refs_held_by(&h, id).await,
+        vec!["inside-the-domain".to_owned()]
+    );
+    assert_eq!(h.secrets.held(), vec!["inside-the-domain".to_owned()]);
+    assert!(
+        h.secrets.deleted.lock().expect("lock").is_empty(),
+        "nothing is released"
+    );
+}
+
+/// What a purge keeps for another declaration, checked again after the commit.
+#[tokio::test]
+async fn the_kept_references_of_a_purge_are_released_once_the_other_declaration_is_gone() {
+    let h = Harness::verified().await;
+    let (id, tag) = h.retired("old").await;
+    let other = h
+        .base
+        .declare(
+            "new",
+            crate::domain::resolution::scope_class::CASCADING,
+            json!(true),
+        )
+        .await;
+    let t = &h.base.tree;
+    h.base.set_secret(id, t.a, "shared-value").await;
+    h.base.set_secret(other, t.a, "shared-value").await;
+    h.base.stage_secret(id, t.b, "own-staged").await;
+    h.secrets.seed("shared-value", "plaintext");
+    h.secrets.seed("own-staged", "plaintext");
+    let mut purged = h
+        .purge(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("purged");
+    assert_eq!(purged.id, id);
+    assert_eq!(purged.kept_secrets.len(), 1);
+    let conn = h.base.db.conn().expect("connection");
+
+    // The other declaration still holds it: nothing moves.
+    h.admin.reclaim_kept(&conn, &mut purged).await;
+    assert_eq!(purged.kept_secrets.len(), 1, "still held, still kept");
+    assert_eq!(purged.secrets.len(), 1);
+
+    // Its own purge commits meanwhile: the rows are gone.
+    let current = h.load(other).await;
+    DeclarationRepo
+        .delete(&conn, &AccessScope::allow_all(), other, current.updated_at)
+        .await
+        .expect("the other declaration is deleted");
+    h.admin.reclaim_kept(&conn, &mut purged).await;
+    assert_eq!(purged.kept_secrets, Vec::<super::HeldSecret>::new());
+    let mut released: Vec<_> = purged
+        .secrets
+        .iter()
+        .map(|e| e.secret_ref.as_str())
+        .collect();
+    released.sort_unstable();
+    assert_eq!(released, vec!["own-staged", "shared-value"]);
+    let summary = h.admin.release_purged(purged, "req").await;
+    assert_eq!((summary.released, summary.failed), (2, 0));
+    assert_eq!(h.secrets.held(), Vec::<String>::new());
+}
+
+/// A declaration outside the caller's administrative domain is not found by a
+/// revive or an evolution either, whatever was read about it before the lock:
+/// both read it again by id under the lock, with the caller's visibility.
+#[tokio::test]
+async fn a_revive_and_an_evolution_outside_the_callers_domain_are_not_found_and_change_nothing() {
+    let h = Harness::verified().await;
+    let billing = AccessScope::single(toolkit_security::ScopeConstraint::new(vec![
+        toolkit_security::ScopeFilter::In(toolkit_security::InScopeFilter::new(
+            crate::domain::category::visibility::DOMAIN_PROPERTY,
+            vec!["billing".into()],
+        )),
+    ]));
+    let mut actor = admin_actor();
+    actor.visibility = crate::domain::category::domain_visibility(&billing);
+    let conn = h.base.db.conn().expect("connection");
+    let not_found = |err: DomainError| {
+        assert!(
+            matches!(
+                err,
+                DomainError::NotFound {
+                    resource: "declaration"
+                }
+            ),
+            "{err:?}"
+        );
+    };
+    let derived = || super::DerivedClassification {
+        has_secret_trait: false,
+        data_classification: crate::domain::declaration::DataClassification::Public,
+    };
+    let metadata = || crate::domain::declaration::DeclarationMetadata {
+        mode: "standard".to_owned(),
+        display_name: None,
+        description: None,
+        domain_affinity: Some("infra".to_owned()),
+        licence_feature: None,
+        data_classification: "public".to_owned(),
+        requires_step_up: true,
+        anonymous_exposable: false,
+    };
+
+    // An evolution of an active declaration.
+    let mut request = h.request("domained");
+    request.domain_affinity = Some("infra".to_owned());
+    let created = h.create(request, &admin_actor()).await.expect("created");
+    let id = created.declaration.id;
+    let key = SettingKey::parse(&created.declaration.key).expect("a key");
+    let mut evolving = h.request("domained");
+    evolving.scope_class = "local".to_owned();
+    let err = h
+        .admin
+        .evolve(
+            &conn,
+            &billing,
+            &key,
+            h.load(id).await,
+            &[],
+            &evolving,
+            derived(),
+            metadata(),
+            &actor,
+        )
+        .await
+        .expect_err("outside the caller's domain");
+    not_found(err);
+    let after = h.load(id).await;
+    assert_eq!(after.status, DeclarationStatus::Active);
+    assert_eq!(after.scope_class, "cascading");
+    assert_eq!(h.versions_of(&after.key).await, 1, "no successor");
+
+    // A revive of a retired one.
+    let tag = etag_of(&after);
+    h.retire(id, Some(tag.as_str()), &admin_actor())
+        .await
+        .expect("retired");
+    let err = h
+        .admin
+        .revive(
+            &conn,
+            &billing,
+            &key,
+            h.load(id).await,
+            &h.request("domained"),
+            derived(),
+            metadata(),
+            &actor,
+        )
+        .await
+        .expect_err("outside the caller's domain");
+    not_found(err);
+    assert_eq!(
+        h.load(id).await.status,
+        DeclarationStatus::Retired,
+        "still retired"
+    );
+}
+
+// ── The release's log lines ──────────────────────────────────────────────────
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn the_refused_release_logs_an_error_with_the_key_the_tenant_and_the_error_never_the_secret()
+{
+    let h = Harness::verified().await;
+    let purged = held(2);
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext-of-the-entry");
+    }
+    h.secrets.go_down();
+    let key = purged.key.clone();
+    let tenants: Vec<String> = purged
+        .secrets
+        .iter()
+        .map(|e| e.tenant.to_string())
+        .collect();
+
+    let summary = h.admin.release_purged(purged, "req-error").await;
+    assert_eq!((summary.released, summary.failed), (0, 2));
+
+    logs_assert(|lines: &[&str]| {
+        let errors: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("a credential store entry was not released"))
+            .collect();
+        if errors.len() != 2 {
+            return Err(format!("one error line per refused entry: {lines:?}"));
+        }
+        for tenant in &tenants {
+            let line = errors
+                .iter()
+                .find(|l| l.contains(tenant.as_str()))
+                .ok_or_else(|| format!("a line carries tenant {tenant}"))?;
+            if !line.contains("ERROR") || !line.contains(&key) {
+                return Err(format!("level and key on the line: {line}"));
+            }
+            if !line.contains("the fake store is down") {
+                return Err(format!("the error's log-safe text on the line: {line}"));
+            }
+        }
+        for line in lines {
+            for secret in ["plaintext-of-the-entry", "ref-0", "ref-1"] {
+                if line.contains(secret) {
+                    return Err(format!("the secret or its reference leaked: {line}"));
+                }
+            }
+        }
+        Ok(())
+    });
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn the_release_logs_one_info_line_when_it_starts_and_one_when_it_ends_with_the_request_id() {
+    let h = Harness::verified().await;
+    let mut purged = held(3);
+    purged.kept_secrets = (0..2)
+        .map(|i| super::HeldSecret {
+            tenant: Uuid::new_v4(),
+            secret_ref: format!("kept-{i}"),
+        })
+        .collect();
+    for entry in &purged.secrets {
+        h.secrets.seed(&entry.secret_ref, "plaintext");
+    }
+
+    let summary = h.admin.release_purged(purged, "req-info-42").await;
+    assert_eq!((summary.released, summary.failed), (3, 0));
+
+    logs_assert(|lines: &[&str]| {
+        let start: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("declaration purge: releasing credential store entries"))
+            .collect();
+        let end: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("declaration purge: credential store release finished"))
+            .collect();
+        if start.len() != 1 || end.len() != 1 {
+            return Err(format!("one start and one end line: {lines:?}"));
+        }
+        for line in [start[0], end[0]] {
+            if !line.contains("INFO") || !line.contains("request_id=req-info-42") {
+                return Err(format!("info level and the request id: {line}"));
+            }
+        }
+        if !start[0].contains("entries=3") || !start[0].contains("kept=2") {
+            return Err(format!(
+                "the start line counts entries and kept: {}",
+                start[0]
+            ));
+        }
+        if !end[0].contains("released=3") || !end[0].contains("failed=0") {
+            return Err(format!("the end line counts the outcome: {}", end[0]));
+        }
+        Ok(())
+    });
+}
+
+// ── A release that does not finish ───────────────────────────────────────────
+
+/// A store that panics on its second release.
+struct PanicsOnTheSecond {
+    calls: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl crate::domain::ports::SecretManager for PanicsOnTheSecond {
+    fn mint_reference(&self, _key: &str, _tenant: Uuid) -> String {
+        unreachable!("a release mints nothing")
+    }
+    async fn store_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+        _plaintext: &Value,
+    ) -> Result<(), DomainError> {
+        unreachable!("a release stores nothing")
+    }
+    async fn resolve_plaintext(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<SecretString, DomainError> {
+        unreachable!("a release reads nothing")
+    }
+    async fn delete_secret(
+        &self,
+        _key: &str,
+        _tenant: Uuid,
+        _secret_ref: &str,
+    ) -> Result<(), DomainError> {
+        let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        assert!(call != 2, "the store blew up on its second release");
+        Ok(())
+    }
+}
+
+#[tokio::test]
+#[tracing_test::traced_test]
+async fn a_release_task_that_panics_counts_every_entry_it_did_not_report_as_failed() {
+    let h = Harness::verified().await;
+    let admin = admin_over(&h, Arc::new(PanicsOnTheSecond { calls: 0.into() }));
+
+    let summary = admin.release_purged(held(5), "req-panic").await;
+
+    assert_eq!(
+        summary.released + summary.failed,
+        5,
+        "every entry is accounted for: {summary:?}"
+    );
+    assert_eq!(summary.released, 1, "only the first was reported");
+    assert_eq!(summary.failed, 4, "the unreached remainder is failed");
+    let counts = h.metrics.purge_releases.lock().expect("lock").clone();
+    assert_eq!(
+        counts.iter().filter(|r| **r == "ok").count(),
+        1,
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.iter().filter(|r| **r == "failed").count(),
+        4,
+        "{counts:?}"
+    );
+    logs_assert(|lines: &[&str]| {
+        let errors: Vec<&&str> = lines
+            .iter()
+            .filter(|l| l.contains("the release task did not finish"))
+            .collect();
+        match errors.as_slice() {
+            [line]
+                if line.contains("ERROR")
+                    && line.contains("request_id=req-panic")
+                    && line.contains("entries=5")
+                    && line.contains("key=gts.cf.core.settings.setting_type.v1~acme") =>
+            {
+                Ok(())
+            }
+            other => Err(format!(
+                "one error line with the key, id and count: {other:?}"
+            )),
+        }
+    });
 }

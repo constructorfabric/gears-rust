@@ -217,6 +217,10 @@ async fn an_unknown_currency_is_refused_by_the_book_and_the_settings() {
         assert_eq!(s, 400, "an unknown offered currency is refused");
         let (reason, description) = violation(&b);
         assert_eq!(reason, "CURRENCY_INVALID", "the settings name the list");
+        assert_eq!(
+            b["context"]["field_violations"][0]["field"], "currencies[0]",
+            "the violation names the code's place (D-538)"
+        );
         assert!(
             description.contains(&format!(
                 "\"{code}\" is not a currency the currency table knows"
@@ -228,6 +232,10 @@ async fn an_unknown_currency_is_refused_by_the_book_and_the_settings() {
     let (s, b, _) = put(&f, body(json!(["EUR", "ZZZ"]))).await;
     assert_eq!(s, 400, "one unknown code refuses the list");
     assert_eq!(violation(&b).0, "CURRENCY_INVALID", "the list is refused");
+    assert_eq!(
+        b["context"]["field_violations"][0]["field"], "currencies[1]",
+        "the second code is the one refused"
+    );
     // A code listed twice is named as repeated, not as unknown.
     let (s, b, _) = put(&f, body(json!(["EUR", "JPY", "EUR"]))).await;
     assert_eq!(s, 400, "a repeated code refuses the list");
@@ -235,6 +243,10 @@ async fn an_unknown_currency_is_refused_by_the_book_and_the_settings() {
         violation(&b),
         ("CURRENCY_INVALID", "EUR is listed more than once"),
         "the refusal names the repeated code"
+    );
+    assert_eq!(
+        b["context"]["field_violations"][0]["field"], "currencies[2]",
+        "the repeat is named at its place, not the first EUR"
     );
     assert_eq!(read(&f).await.1, "\"0\"", "no refusal wrote anything");
     // The ISO codes pass, at every scale.

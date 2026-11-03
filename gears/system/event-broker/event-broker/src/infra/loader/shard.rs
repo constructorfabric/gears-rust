@@ -20,13 +20,12 @@ use super::scheduler::DemandScheduler;
 use super::source::EventSource;
 use super::topics::TopicManager;
 
-/// How often the loader wakes when nothing has notified it.
+/// How often the loader wakes when no head has moved.
 ///
-/// A floor on latency rather than the mechanism for it: the notification seam
-/// (`domain::notify`) is what makes delivery prompt. This tick is what keeps the
-/// broker correct when a notification is lost, arrives before the backend
-/// assigned the sequence, or never comes because the events were published
-/// before the session opened.
+/// A floor on latency rather than the mechanism for it: a head reported by the
+/// head watch (`super::heads`) is what makes delivery prompt. This tick paces
+/// the fetches that do not wait on a head - backfills, and tails whose head is
+/// not known yet - and the reclamation sweep.
 pub const DEFAULT_TICK: Duration = Duration::from_millis(50);
 
 pub struct ShardLoader<S> {
@@ -72,11 +71,14 @@ impl<S: EventSource + Send + Sync + 'static> ShardLoader<S> {
                 );
             }
 
-            // A round that fetched something is likely to find more immediately,
-            // so only an idle round pays the tick.
-            if report.fetches_issued() == 0 {
+            if pays_tick(
+                report.fetches_issued(),
+                report.events_fetched(),
+                report.failures(),
+            ) {
                 tokio::select! {
                     () = tokio::time::sleep(self.tick) => {}
+                    () = self.topics.head_moved() => {}
                     () = shutdown.cancelled() => return,
                 }
             }
@@ -107,4 +109,15 @@ impl<S: EventSource + Send + Sync + 'static> ShardLoader<S> {
     pub fn spawn(self, shutdown: CancellationToken) -> JoinHandle<()> {
         tokio::spawn(self.run(shutdown))
     }
+}
+
+/// Whether a round waits out the tick, or a head move, before the next one.
+///
+/// An idle round waits. A round with failures waits only when it also
+/// delivered nothing: a persistently failing partition must not spin the loop,
+/// but it must not throttle the healthy partitions fetched in the same round
+/// either. A round whose fetches all came back empty does not wait: the
+/// empty-tail backoff already spaces those partitions.
+pub(super) fn pays_tick(fetches_issued: usize, events_fetched: usize, failures: usize) -> bool {
+    fetches_issued == 0 || (failures > 0 && events_fetched == 0)
 }

@@ -70,7 +70,7 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 | OoP Worker                      | A separate OS process or k8s pod running one or more application gears.                                                                                                                                                                                                                                                                                            |
 | System Gear                   | A gear providing platform infrastructure (directory, gateway, auth, types-registry).                                                                                                                                                                                                                                                                            |
 | Application Gear              | A business gear written by framework users.                                                                                                                                                                                                                                                                                                                        |
-| Deployment Profile              | A named, tested configuration of how gears are deployed (Embedded, Host+Workers, K8s Native).                                                                                                                                                                                                                                                                      |
+| Deployment Profile              | A named, tested configuration of how gears are deployed (Embedded, Self-Hosted, K8s Native).                                                                                                                                                                                                                                                                      |
 | ClientHub                       | A type-safe registry for inter-gear client resolution. Supports unscoped resolution (one impl per trait) and scoped resolution (keyed by GTS instance ID for plugins). The backing implementation may be in-process or a generated remote client.                                                                                                                  |
 | OperationBuilder                | A ToolKit DSL for declaring REST routes, request/response schemas, and OpenAPI metadata.                                                                                                                                                                                                                                                                              |
 | DirectoryService                | A gRPC-based service discovery registry. Gears register instances; consumers resolve endpoints.                                                                                                                                                                                                                                                                    |
@@ -160,7 +160,7 @@ application code remains deployment-agnostic. ToolKit Distributed Gears bring th
 
 **Priority 2:**
 
-- Deployment Profile 2 (Host + Workers): single-node on-premise (OoP Workers over UDS/pipes, bootstrap-token platform
+- Deployment Profile 2 (Self-Hosted): OoP Workers over UDS/pipes, bootstrap-token platform
   auth) and multi-node on-premise (mTLS). Deferred from P1 — the platform-plane `BootstrapToken` / `MtlsIdentity`
   credential variants are defined for forward-compatibility but are not validated/wired in P1 (which targets Profile 1 +
   Profile 3)
@@ -379,7 +379,7 @@ backends of it, so swapping does not change gear code.
 OoP Workers MUST register their REST endpoint and OpenAPI spec with DirectoryService on startup and deregister on
 graceful shutdown.
 
-Active heartbeat-timeout reaping of unresponsive workers by Flight Control is **Profile 2 (Host + Workers)** and is
+Active heartbeat-timeout reaping of unresponsive workers by Flight Control is **Profile 2 (Self-Hosted)** and is
 **deferred to P2**; in **Profile 3 (K8s)** k8s readiness probes + the Endpoints controller handle dead-pod removal.
 
 - **Rationale**: Stale service entries cause routing failures. Clean lifecycle management ensures the directory reflects

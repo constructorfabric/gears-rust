@@ -1,0 +1,6 @@
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.tasks_admin.v1",
+  "resource_type": "gts.cf.core.tasks.task.v1~",
+  "action": "admin",
+  "display_name": "Administer tasks: DLQ inspection and re-enqueue, reassignment (no lease token is returned), bulk reprioritize/retry/move (raising urgency to 'critical' also needs expedite)"
+}

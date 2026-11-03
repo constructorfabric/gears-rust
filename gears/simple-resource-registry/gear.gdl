@@ -1,0 +1,19 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox description for the simple-resource-registry gear, which has no crate yet.
+#
+# `implementation = "design"`: listed in the catalogue with its documents, and
+# not usable in a product (GBX0321). When the crate exists, describe it beside
+# the crate instead -- `package = cargo(...)` and a `maturity`, no `id`
+# (projected from #[toolkit::gear] then) -- and delete this file.
+
+gear(
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/simple-resource-registry"),
+    implementation = "design",
+    id = "simple-resource-registry",
+    name = "Durable Objects",
+    description = "Generic typed-resource CRUD storage with GTS validation and pluggable backends.",
+    category = "serverless",
+)

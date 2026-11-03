@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Where platform scope comes from.
 //!
 //! Platform scope is the root tenant's id — never `NULL`, never a sentinel

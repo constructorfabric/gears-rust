@@ -375,11 +375,107 @@ async fn publish_event_sequence_violation_returns_412_with_expected_previous() {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": "topic=gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 \
-                                     partition=0 expected_previous=1",
+                                     expected_previous=1",
                 }],
             },
         })
     );
+}
+
+/// A topic its backend does not hold yet cannot take events: the publish is
+/// answered `503`, retryable, and the same publish succeeds once the topic is
+/// provisioned (feature 0006 §4.2).
+#[tokio::test]
+async fn publish_to_a_topic_not_provisioned_returns_503_then_202_once_provisioned() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .without_provisioning()
+        .build()
+        .await;
+    let body = json!({
+        "id": "0190f1a2-0000-7000-8000-000000000001",
+        "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+        "tenant_id": "0190f1a2-0000-7000-8000-000000000002",
+        "source": "test-publish-before-provisioning",
+        "subject": "s-1",
+        "subject_type": "gts.x.eb.t1.subject.v1~",
+        "occurred_at": "2026-10-07T12:00:00Z",
+    });
+
+    let refused = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&body))
+        .send()
+        .await;
+    refused.assert_status(503);
+    assert_eq!(
+        refused.json(),
+        json!({
+            "type": "gts://gts.cf.core.errors.err.v1~cf.core.err.service_unavailable.v1~",
+            "title": "Service Unavailable",
+            "status": 503,
+            "detail": "topic 'gts.cf.core.events.topic.v1~x.eb.t1.topic.v1' is not provisioned on its storage backend yet",
+            "instance": "/event-broker/v1/events",
+            "context": {},
+        })
+    );
+
+    harness.provision_topics().await;
+    harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&body))
+        .send()
+        .await
+        .assert_status(202);
+}
+
+/// A producer's chain is kept per `(producer_id, topic)`, not per partition:
+/// two events of one topic with different partition keys continue one chain.
+#[tokio::test]
+async fn a_producers_chain_spans_every_key_of_a_topic() {
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 4 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .build()
+        .await;
+    let producer_id = register_test_producer(&harness).await;
+
+    for (tenant, previous, sequence) in [
+        ("0190f1a2-0000-7000-8000-00000000000a", 0, 1),
+        ("0190f1a2-0000-7000-8000-00000000000b", 1, 2),
+    ] {
+        harness
+            .api_v1()
+            .post_events()
+            .with_body(Json(&json!({
+                "id": Uuid::new_v4(),
+                "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "tenant_id": tenant,
+                "source": "test-a_producers_chain_spans_every_key_of_a_topic",
+                "subject": "s",
+                "subject_type": "gts.x.eb.t1.subject.v1~",
+                "occurred_at": Utc::now().to_rfc3339(),
+                "meta": { "version": 1, "producer_id": producer_id, "previous": previous, "sequence": sequence },
+            })))
+            .send()
+            .await
+            .assert_status(202);
+    }
 }
 
 #[tokio::test]
@@ -652,7 +748,7 @@ async fn publish_batch_mid_batch_sequence_violation_aborts_the_batch() {
                     "type": "sequence_mismatch",
                     "subject": "(producer)",
                     "description": "topic=gts.cf.core.events.topic.v1~x.eb.t1.topic.v1 \
-                                     partition=0 expected_previous=1",
+                                     expected_previous=1",
                 }],
             },
         })
@@ -755,6 +851,59 @@ async fn publish_rejected_for_unauthorized_tenant_id_returns_403() {
             },
         })
     );
+}
+
+#[tokio::test]
+async fn publish_checks_produce_on_the_events_own_type_not_a_family_label() {
+    let asked = Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+    let recorder = Arc::clone(&asked);
+    let harness = EventBrokerHarness::builder()
+        .with_type_registry(StaticTypesRegistry::of(json!([
+            { "id": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1", "partitions": 1 },
+            {
+                "id": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+                "topic": "gts.cf.core.events.topic.v1~x.eb.t1.topic.v1",
+                "allowed_subject_types": ["gts.x.eb.t1.subject.v1~"],
+            },
+        ])))
+        .with_policy_enforcer(PolicyEnforcer::new(Arc::new(DenyingAuthZ {
+            deny_if: move |req: &EvaluationRequest| {
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push((req.action.name.clone(), req.resource.resource_type.clone()));
+                false
+            },
+        })))
+        .build()
+        .await;
+
+    let resp = harness
+        .api_v1()
+        .post_events()
+        .with_body(Json(&json!({
+            "id": Uuid::new_v4(),
+            "type": "gts.cf.core.events.event.v1~x.eb.t1.foo.v1~",
+            "tenant_id": Uuid::new_v4(),
+            "source": "test-publish_checks_produce_on_the_events_own_type",
+            "subject": "s-publish_checks_produce_on_the_events_own_type",
+            "subject_type": "gts.x.eb.t1.subject.v1~",
+            "occurred_at": Utc::now().to_rfc3339(),
+        })))
+        .send()
+        .await;
+
+    resp.assert_status(202);
+    let produce: Vec<String> = asked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(action, resource)| {
+            action == "produce" && resource != "gts.cf.core.events.request.v1~"
+        })
+        .map(|(_, resource)| resource.clone())
+        .collect();
+    assert_eq!(produce, ["gts.cf.core.events.event.v1~x.eb.t1.foo.v1~"]);
 }
 
 #[tokio::test]

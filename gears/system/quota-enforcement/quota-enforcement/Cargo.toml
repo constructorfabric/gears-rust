@@ -1,6 +1,6 @@
 [package]
 name = "cf-gears-quota-enforcement"
-version = "0.1.0"
+version = "0.3.0"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -18,10 +18,6 @@ name = "quota_enforcement"
 [lints]
 workspace = true
 
-[package.metadata.cargo-shear]
-# Referenced only by the `api_dto` macro expansion.
-ignored = ["utoipa"]
-
 [features]
 # Forwarding feature for the deployed profile (cluster DESIGN section 3.17.7):
 # the image that runs quota-enforcement without a co-located cluster gear
@@ -31,6 +27,9 @@ ignored = ["utoipa"]
 grpc-client = ["cluster-sdk/grpc-client"]
 
 [dependencies]
+quota-enforcement-engine-cel = { workspace = true }
+quota-enforcement-engine-most-restrictive = { workspace = true }
+parking_lot = { workspace = true }
 quota-enforcement-sdk = { workspace = true }
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
@@ -47,9 +46,6 @@ toolkit-canonical-errors = { workspace = true, features = ["axum"] }
 # `api_dto` DTOs derive `utoipa::ToSchema` for the OpenAPI registry.
 utoipa = { workspace = true }
 gts = { workspace = true }
-# Contract envelopes are validated against JSON Schema documents compiled once
-# at bootstrap (projection-contracts feature, ADR-0007).
-jsonschema = { workspace = true }
 
 axum = { workspace = true }
 # Repeated list query parameters (`id=a&id=b`) and their OpenAPI declaration.
@@ -60,6 +56,8 @@ time = { workspace = true }
 # The lifecycle-gauge sample cell read by observable-gauge callbacks.
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+# The notification dispatcher calls every sink at once.
+futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -76,6 +74,7 @@ opentelemetry = { workspace = true }
 inventory = { workspace = true }
 
 [dev-dependencies]
+criterion.workspace = true
 quota-enforcement-sdk = { workspace = true, features = ["test-util"] }
 types-registry-sdk = { workspace = true, features = ["test-util"] }
 # A real cluster over the standalone backend for the adapter and gear tests.
@@ -85,3 +84,11 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
 # Router round trips in the REST tests.
 tower = { workspace = true, features = ["util"] }
+# The published SQL storage plugin over SQLite, for the end-to-end delivery test.
+quota-enforcement-storage-plugin = { package = "cf-gears-quota-enforcement-storage-plugin", path = "../plugins/quota-enforcement-storage-plugin" }
+toolkit-db = { workspace = true, features = ["sqlite"] }
+sea-orm-migration = { workspace = true }
+
+[[bench]]
+name = "debit"
+harness = false

@@ -5,7 +5,7 @@
 This is the versioned naming catalog mandated by [ADR-004](./ADR/004-observability-contract.md).
 It is the authoritative reference for the span, metric, and log-event names every
 cluster backend/plugin emits. The names are mirrored in code as constants in
-[`cluster_sdk::observability`](../cluster-sdk/src/observability.rs); this document
+[`cluster_sdk::observability`](../cluster-sdk/src/observability/mod.rs); this document
 catalogs them with their attributes, labels, and severities.
 
 **Stability**: names are a contract on par with the Rust trait signatures.

@@ -1,6 +1,6 @@
 # OAGW Scenario Guide
 
-Practical companion to [DESIGN.md](../DESIGN.md). Organized in two sections:
+Practical companion to [DESIGN.md](../docs/DESIGN.md). Organized in two sections:
 
 1. **How To** — what you CAN do with OAGW, organized by integration journey then by feature
 2. **Guardrails** — what is rejected, guarded, or explicitly unsupported

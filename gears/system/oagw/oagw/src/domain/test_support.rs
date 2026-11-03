@@ -33,6 +33,15 @@ pub fn allow_all_enforcer() -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(MockAuthZResolverClient))
 }
 
+/// Install the process-wide rustls `CryptoProvider` if none is set yet
+/// (idempotent). Tests skip the runtime bootstrap that installs it, and TLS
+/// configs fail closed without one under `fips`.
+pub fn ensure_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        toolkit::bootstrap::init_crypto_provider().expect("crypto provider initialization");
+    }
+}
+
 /// Build a self-signed `rustls::ServerConfig` for localhost / 127.0.0.1.
 ///
 /// Installs the process-wide rustls `CryptoProvider` if none is set yet
@@ -41,11 +50,7 @@ pub fn allow_all_enforcer() -> PolicyEnforcer {
 pub fn test_server_config() -> rustls::ServerConfig {
     use rustls_pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
-    // Ensure a crypto provider is available; tests don't go through the full
-    // bootstrap, so one may not be installed yet.
-    if rustls::crypto::CryptoProvider::get_default().is_none() {
-        toolkit::bootstrap::init_crypto_provider().expect("crypto provider initialization");
-    }
+    ensure_crypto_provider();
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let cert = rcgen::generate_simple_self_signed(subject_alt_names).expect("cert generation");
@@ -215,6 +220,25 @@ impl crate::domain::ports::OagwMetricsPort for ProvisioningMetrics {
     fn record_registry_provisioning_run(&self, outcome: &str) {
         self.runs.lock().unwrap().push(outcome.to_owned());
     }
+    fn record_proxy_cache_lookup(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheLookup,
+    ) {
+    }
+    fn record_proxy_cache_entries(&self, _: crate::domain::ports::metric_labels::CacheMap, _: u64) {
+    }
+    fn record_proxy_cache_evictions(
+        &self,
+        _: crate::domain::ports::metric_labels::CacheMap,
+        _: crate::domain::ports::metric_labels::CacheEviction,
+        _: u64,
+    ) {
+    }
+    fn record_proxy_cache_change(&self, _: &str) {}
+    fn record_proxy_cache_flush(&self, _: &str) {}
+    fn record_proxy_cache_load_discarded(&self, _: crate::domain::ports::metric_labels::CacheMap) {}
+    fn record_proxy_cache_publish_failures(&self, _: &str, _: u64) {}
 }
 
 #[cfg(test)]
@@ -636,6 +660,7 @@ impl TestCpBuilder {
             allow_all_enforcer(),
             credstore,
             Arc::new(SsrfGuard::disabled()),
+            None,
         ));
 
         cp
@@ -761,23 +786,25 @@ impl TestDpBuilder {
             .unwrap_or_else(|| Arc::new(MockAuthZResolverClient));
         let policy_enforcer = PolicyEnforcer::new(authz_client);
 
-        let server_conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        let pingora_proxy = crate::infra::proxy::pingora_proxy::PingoraProxy::new(
-            Duration::from_secs(10),
-            Duration::from_secs(30),
-            Duration::from_secs(3600),
-            Arc::new(SsrfGuard::disabled()),
-        )
-        .with_skip_upstream_tls_verify(self.skip_upstream_tls_verify);
-        let proxy = Arc::new(crate::infra::proxy::pingora_proxy::new_http_proxy(
-            &server_conf,
-            pingora_proxy,
-        ));
+        ensure_crypto_provider();
+        let engine = Arc::new(
+            crate::infra::proxy::engine::ProxyEngine::new(
+                &crate::infra::proxy::engine::EngineSettings {
+                    connect_timeout: Duration::from_secs(10),
+                    read_timeout: Duration::from_secs(30),
+                    protocol_cache_ttl: Duration::from_secs(3600),
+                    #[cfg(feature = "test-utils")]
+                    skip_upstream_tls_verify: self.skip_upstream_tls_verify,
+                },
+                Arc::new(SsrfGuard::disabled()),
+            )
+            .expect("test proxy engine"),
+        );
 
         let backend_selector: Arc<dyn EndpointSelector> =
             self.backend_selector.unwrap_or_else(|| {
                 Arc::new(
-                    crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                    crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
                         SsrfGuard::disabled(),
                     )),
                 )
@@ -790,7 +817,7 @@ impl TestDpBuilder {
             self.token_http_config,
             self.token_cache_config,
             backend_selector,
-            proxy,
+            engine,
             std::sync::Arc::new(crate::domain::ports::NoopMetrics),
         )
         .with_allow_http_upstream(true);
@@ -835,7 +862,7 @@ pub fn build_test_app_state(
     dp_builder: TestDpBuilder,
 ) -> TestAppState {
     let backend_selector: Arc<dyn EndpointSelector> = Arc::new(
-        crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+        crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
             SsrfGuard::disabled(),
         )),
     );
@@ -879,7 +906,7 @@ pub fn build_test_gateway(
     let backend_selector: Arc<dyn EndpointSelector> =
         dp_builder.backend_selector.clone().unwrap_or_else(|| {
             Arc::new(
-                crate::infra::proxy::pingora_proxy::PingoraEndpointSelector::new(Arc::new(
+                crate::infra::proxy::endpoint_selector::PoolEndpointSelector::new(Arc::new(
                     SsrfGuard::disabled(),
                 )),
             )
@@ -906,7 +933,7 @@ mod unavailable {
 
     use crate::domain::model::{ListQuery, Route, Upstream};
     use crate::domain::repo::{
-        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, Tags,
+        DeleteOutcome, RegistryRowRepository, RepositoryError, RouteRepository, RowKey, Tags,
         UpstreamRepository,
     };
 
@@ -985,6 +1012,12 @@ mod unavailable {
             _: &str,
             _: Tags,
         ) -> Result<Route, RepositoryError> {
+            Err(unavailable())
+        }
+        async fn list_proxy_routes(
+            &self,
+            _: &[RowKey],
+        ) -> Result<Vec<(RowKey, Vec<Route>)>, RepositoryError> {
             Err(unavailable())
         }
         async fn update(&self, _: Route) -> Result<Route, RepositoryError> {

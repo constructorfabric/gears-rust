@@ -1,0 +1,46 @@
+{
+  "id": "chatcmpl-AV7m9r0HcGxHqkF3e1pWm2ZtYbQ4s",
+  "object": "chat.completion",
+  "created": 1759823112,
+  "model": "gpt-4.1-mini-2025-04-14",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {
+            "id": "call_Qm2xY7nR4tVb8kLs1pZc0dEf",
+            "type": "function",
+            "function": {
+              "name": "replace",
+              "arguments": "{\"value_number\":1,\"value\":{\"work_history\":{\"organization\":\"Acme\",\"title\":\"School principal\"}}}"
+            }
+          },
+          {
+            "id": "call_Hj5wK2mN9pRt3vXy6aBc4dFg",
+            "type": "function",
+            "function": {
+              "name": "add",
+              "arguments": "{\"property\":\"skills\",\"value\":{\"name\":\"Curriculum design\"}}"
+            }
+          }
+        ],
+        "refusal": null,
+        "annotations": []
+      },
+      "logprobs": null,
+      "finish_reason": "tool_calls"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 1843,
+    "completion_tokens": 96,
+    "total_tokens": 1939,
+    "prompt_tokens_details": { "cached_tokens": 0, "audio_tokens": 0 },
+    "completion_tokens_details": { "reasoning_tokens": 0, "audio_tokens": 0 }
+  },
+  "service_tier": "default",
+  "system_fingerprint": "fp_6f2eabb9a5"
+}

@@ -1,4 +1,3 @@
-// Created: 2026-09-29 by Virtuozzo International GmbH
 //! The shared filter grammar: what it accepts, how it splits, what it refuses.
 
 use toolkit_odata::ast::Expr;

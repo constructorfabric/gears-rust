@@ -14,10 +14,10 @@ use graph_storage_sdk::models::{
     AdjacencyEntry, AdjacencySide, AdmissionBasis, ComponentReadiness, DeleteOutcome,
     DeleteRequest, EdgeKey, EdgeView, ElementEnvelope, GraphRevision, GtsTypeId, IngestOutcome,
     IngestRequest, ItemError, ItemFamily, ItemOutcome, NodeId, NodeKey, NodeRow, NodeView,
-    OnExisting, Page, ProjectionRequest, ReadSnapshot, ReadinessState, RegisteredType,
-    SchemaDiagnostic, SearchMode, SearchRequest, SearchResponse, SourceNamespaceOwner,
-    StoreCapabilities, Subject, TopologyPage, TopologyRequest, TypeChange, TypeChangeState,
-    TypeIdSet, TypeOutcome, TypeQuery, TypeRecord, TypeRegistration, TypeRegistrationOptions,
+    OnExisting, Page, ProjectionRequest, ReadSnapshot, RegisteredType, SchemaDiagnostic,
+    SearchMode, SearchRequest, SearchResponse, SourceNamespaceOwner, StoreCapabilities, Subject,
+    TopologyPage, TopologyRequest, TypeChange, TypeChangeState, TypeIdSet, TypeOutcome, TypeQuery,
+    TypeRecord, TypeRegistration, TypeRegistrationOptions,
 };
 use graph_storage_sdk::plugin_api::{
     EmbeddingPlan, EmbeddingState, GraphStoreError, GraphStoreV1, StoreCtx, VectorArm,
@@ -536,18 +536,10 @@ impl GraphStoreV1 for FakeGraphStore {
 
     async fn probe_readiness(&self) -> Vec<ComponentReadiness> {
         // An in-memory store has no database to be unreachable and no
-        // migrations to be pending; the traversal backend it offers is the
-        // two-query hop, which is what the built-in store falls back to.
-        vec![
-            ComponentReadiness::healthy(graph_storage_sdk::models::DATABASE),
-            ComponentReadiness::new(
-                graph_storage_sdk::models::SQLPGQ,
-                ReadinessState::Degraded,
-                "this store has no property graph",
-                "nothing: every traversal is served by the two-query hop",
-                "not applicable to an in-memory store",
-            ),
-        ]
+        // migrations to be pending.
+        vec![ComponentReadiness::healthy(
+            graph_storage_sdk::models::DATABASE,
+        )]
     }
 
     async fn list_source_namespaces(
@@ -1518,7 +1510,6 @@ impl graph_storage_sdk::plugin_api::GraphEngineV1 for FakeGraphEngine {
             degrees,
             edges: out_edges,
             truncated: None,
-            // The fake walks in memory; it has no pattern backend to decline.
             served_by: graph_storage_sdk::plugin_api::HopBackend::TwoQuery,
         })
     }

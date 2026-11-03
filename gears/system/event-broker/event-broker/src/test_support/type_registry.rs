@@ -25,10 +25,11 @@ use crate::config::EventBrokerConfig;
 const TOPIC_BASE: &str = TopicV1::TYPE_ID;
 const EVENT_BASE: &str = EventV1::TYPE_ID;
 
-/// The backend every fixture deployment names. A fixture never opens it - the
-/// harness builds the `SQLite` backend directly - but configuration has to name
-/// a backend type for the same reason production does.
-const SQLITE_BACKEND: &str = "gts.cf.core.events.backend.v1~cf.core.backend.sqlite.v1~";
+/// The backend every fixture deployment names. A fixture never builds it
+/// through configuration - the harness builds the memory backend directly - but
+/// configuration has to name a backend type for the same reason production does.
+const MEMORY_BACKEND: &str =
+    toolkit_gts::gts_id!("cf.core.events.backend.v1~cf.core.backend.memory.v1~");
 
 /// A stand-in for the registered base event type.
 ///
@@ -242,7 +243,8 @@ impl StaticTypesRegistry {
             event_types,
             config: serde_json::from_value(json!({
                 "mode": "standalone",
-                "default_storage_backend": SQLITE_BACKEND,
+                "backends": { "main": { "type": MEMORY_BACKEND } },
+                "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
                 "topics": settings,
             }))
             .expect("fixture configuration deserializes"),
@@ -255,7 +257,8 @@ impl StaticTypesRegistry {
     pub fn empty_config() -> EventBrokerConfig {
         serde_json::from_value(json!({
             "mode": "standalone",
-            "default_storage_backend": SQLITE_BACKEND,
+            "backends": { "main": { "type": MEMORY_BACKEND } },
+            "backend_routing": { "gts.cf.core.events.topic.v1~": "main" },
             "topics": {},
         }))
         .expect("fixture configuration deserializes")

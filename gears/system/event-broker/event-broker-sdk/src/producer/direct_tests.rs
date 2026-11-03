@@ -7,7 +7,6 @@ use crate::ids::ProducerId;
 use super::direct::{ProducerSequenceCursor, advance_cursor, producer_meta_for_last};
 
 const TOPIC: &str = gts_id!("cf.core.events.topic.v1~example.sdk.producer.unit_orders.v1");
-const PARTITION: u32 = 2;
 
 #[test]
 fn monotonic_batch_advances_sequence_between_prepared_events() {
@@ -27,13 +26,13 @@ fn chained_batch_advances_previous_between_prepared_events() {
 
 fn second_batch_meta(mode: ProducerMode) -> crate::models::ProducerMeta {
     let producer_id = ProducerId(Uuid::from_u128(1));
-    let first = producer_meta_for_last(mode, producer_id, -1, PARTITION).unwrap();
+    let first = producer_meta_for_last(mode, producer_id, -1).unwrap();
     let mut cursor = ProducerSequenceCursor::new();
-    advance_cursor(&mut cursor, TOPIC, PARTITION, Some(&first));
+    advance_cursor(&mut cursor, TOPIC, Some(&first));
     let last = cursor
-        .get(&(producer_id, TOPIC.to_owned(), PARTITION))
+        .get(&(producer_id, TOPIC.to_owned()))
         .copied()
         .unwrap();
 
-    producer_meta_for_last(mode, producer_id, last, PARTITION).unwrap()
+    producer_meta_for_last(mode, producer_id, last).unwrap()
 }

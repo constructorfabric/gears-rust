@@ -3989,15 +3989,37 @@ async fn wait_for_background_metric(
     metrics.background_indexing.lock().unwrap().clone()
 }
 
-/// Tracing subscriber that keeps the fields of every event as text.
+/// Tracing subscriber that keeps the fields of every `warn` and `error`
+/// event as text.
 #[derive(Default)]
 struct EventCapture {
     events: std::sync::Mutex<Vec<String>>,
 }
 
+/// The capture, installed once as this test binary's global subscriber.
+///
+/// Global, not `set_default`. With a single scoped dispatcher, tracing-core
+/// computes a callsite's interest against the default of whichever thread
+/// reaches the callsite first, and caches it for every thread. Another test
+/// reaching `mark_failed`'s `warn!` first, with no subscriber, left it
+/// disabled here, and the failure event never arrived. Events from every
+/// test land in it, so a test filters by its own attachment id.
+fn global_capture() -> &'static EventCapture {
+    static CAPTURE: std::sync::OnceLock<Arc<EventCapture>> = std::sync::OnceLock::new();
+    CAPTURE.get_or_init(|| {
+        let capture = Arc::new(EventCapture::default());
+        tracing::subscriber::set_global_default(Arc::clone(&capture))
+            .expect("no other global subscriber in this test binary");
+        capture
+    })
+}
+
 impl tracing::Subscriber for EventCapture {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
-        true
+    fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+        *metadata.level() <= tracing::Level::WARN
+    }
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::WARN)
     }
     fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
         tracing::span::Id::from_u64(1)
@@ -4027,8 +4049,7 @@ impl tracing::Subscriber for EventCapture {
 /// `timeout` once.
 #[tokio::test]
 async fn test_background_indexing_timeout_names_last_read_error() {
-    let capture = Arc::new(EventCapture::default());
-    let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
+    let capture = global_capture();
 
     let db = inmem_db().await;
     let tenant_id = Uuid::new_v4();
@@ -4076,10 +4097,11 @@ async fn test_background_indexing_timeout_names_last_read_error() {
     assert_eq!(row.error_code.as_deref(), Some("indexing_failed"));
     assert_eq!(wait_for_background_metric(&metrics).await, ["timeout"]);
 
+    let ours = format!("attachment_id={}", row.id);
     let events = capture.events.lock().unwrap();
     let failed = events
         .iter()
-        .find(|e| e.contains("background indexing: failed"))
+        .find(|e| e.contains(&ours) && e.contains("background indexing: failed"))
         .unwrap_or_else(|| panic!("no failure event in {events:?}"));
     assert!(
         failed.contains("indexing not finished in time; last status read error:"),

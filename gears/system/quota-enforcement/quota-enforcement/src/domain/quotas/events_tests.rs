@@ -14,7 +14,12 @@ fn quota_changed_carries_the_kind_the_target_and_the_discriminator() {
     let id = QuotaId::new(Uuid::from_u128(9));
     let event = quota_changed(tenant(), Some(id), None, ChangeKind::Updated, now);
     assert_eq!(event.kind, NotificationEventKind::QuotaChanged);
-    assert_eq!(event.tenant_id, tenant());
+    assert_eq!(
+        event.scope,
+        quota_enforcement_sdk::NotificationScope::Tenant {
+            tenant_id: tenant()
+        }
+    );
     assert_eq!(event.quota_id, Some(id));
     assert_eq!(event.policy_id, None);
     assert_eq!(event.payload, json!({ "change_kind": "updated" }));

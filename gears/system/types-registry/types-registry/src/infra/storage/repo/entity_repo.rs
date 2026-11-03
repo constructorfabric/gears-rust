@@ -480,6 +480,9 @@ fn join_segment(query: &mut sea_orm::Select<entity::Entity>, filter: &SegmentFil
     if let Some(minor) = filter.minor {
         on = on.add(col(Column::Minor).eq(minor));
     }
+    if filter.minor_required {
+        on = on.add(col(Column::Minor).is_not_null());
+    }
     if let Some(is_type) = filter.is_type {
         on = on.add(col(Column::IsType).eq(is_type));
     }

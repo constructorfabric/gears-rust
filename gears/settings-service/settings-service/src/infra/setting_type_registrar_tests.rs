@@ -1,4 +1,3 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Tests for the composed setting-type schema.
 
 use serde_json::json;

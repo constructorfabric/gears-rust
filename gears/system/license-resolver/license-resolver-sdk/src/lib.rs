@@ -16,7 +16,8 @@
 //!   mapping to `CanonicalError`, and the violation vocabulary ([`field`]).
 //! - [`LicenseResolverPluginSpecV1`] — GTS plugin spec used for discovery.
 //! - [`gts`] — the licensing base types (`gts.cf.core.lic.subj.v1~` /
-//!   `…res.v1~`) that consuming Gears derive their contract types from.
+//!   `…res.v1~`) that consuming Gears derive their contract types from, and the
+//!   well-known tenant Subject type ([`LicenseTenantSubjectV1`]).
 //!
 //! There is intentionally **no** listing or enumeration method: enumerating a
 //! platform's licensing surface is served natively by the types registry
@@ -46,7 +47,9 @@ pub mod rest;
 
 pub use api::{LicenseResolverApi, license_resolver_api_ir};
 pub use error::{FieldViolation, LicenseResolverError};
-pub use gts::{LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1};
+pub use gts::{
+    LicenseResolverPluginSpecV1, LicenseResourceV1, LicenseSubjectV1, LicenseTenantSubjectV1,
+};
 pub use models::{
     LicenseCheckContext, LicenseCheckContextBuildError, LicenseCheckContextBuilder,
     LicenseCheckRequest, LicenseDecision, Resource, Subject,

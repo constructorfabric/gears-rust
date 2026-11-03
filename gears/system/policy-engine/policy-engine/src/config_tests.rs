@@ -50,6 +50,10 @@ fn zero_bounds_and_a_blank_vendor_are_rejected() {
         not_positive("hierarchy_timeout")
     );
     assert_eq!(
+        rejected(|c| c.management_hierarchy_timeout = Duration::ZERO),
+        not_positive("management_hierarchy_timeout")
+    );
+    assert_eq!(
         rejected(|c| c.registry_timeout = Duration::ZERO),
         not_positive("registry_timeout")
     );
@@ -126,6 +130,21 @@ fn oversized_bounds_are_rejected() {
         ConfigError::TooLarge {
             field: "evaluation_timeout",
             max: "1s".to_owned()
+        }
+    );
+    assert_eq!(
+        rejected(|c| c.management_hierarchy_timeout = Duration::from_secs(61)),
+        ConfigError::TooLarge {
+            field: "management_hierarchy_timeout",
+            max: "60s".to_owned()
+        }
+    );
+    // Its own bound: the decision path's stays where it was.
+    assert_eq!(
+        rejected(|c| c.hierarchy_timeout = Duration::from_secs(11)),
+        ConfigError::TooLarge {
+            field: "hierarchy_timeout",
+            max: "10s".to_owned()
         }
     );
     assert_eq!(

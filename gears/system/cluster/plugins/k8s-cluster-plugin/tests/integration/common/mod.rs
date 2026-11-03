@@ -11,6 +11,15 @@
 //! The container lives in a `static`, so it is torn down at process exit (the
 //! testcontainers reaper reclaims it).
 //!
+//! ## A pinned k3s version
+//!
+//! The image is pinned to [`K3S_TAG`] rather than the module's default (v1.28),
+//! because the API server's answers change across versions: from 1.34, a guarded
+//! `PUT` on a custom resource deleted since the read is a `404`, where 1.33 and
+//! earlier answer `409` (DESIGN.md 10). `K8S-CACHE-018`/`019` reach that `404` only
+//! on 1.34 or later. Set `K8S_PLUGIN_K3S_TAG` to run the suite against another
+//! version, e.g. `v1.33.5-k3s1` for the `409` path.
+//!
 //! ## Client injection rather than `KUBECONFIG`
 //!
 //! The plugin's inference path (`Config::infer()`) reads `KUBECONFIG`, but this
@@ -58,6 +67,10 @@ use tokio::sync::OnceCell;
 /// The CRD manifest shipped with the plugin (docs/TESTING.md 3): applied once per
 /// container so a cache scenario never races the install.
 const CRD_YAML: &str = include_str!("../../../deploy/crd.yaml");
+
+/// The `rancher/k3s` tag the fixture runs (see the module docs), unless
+/// `K8S_PLUGIN_K3S_TAG` overrides it.
+const K3S_TAG: &str = "v1.37.1-k3s1";
 
 /// A single shared k3s cluster. Only the container and the port-rewritten
 /// kubeconfig are shared; **clients are built per scenario**, because a
@@ -135,8 +148,12 @@ async fn start_k3s() -> SharedCluster {
     ));
     std::fs::create_dir_all(&conf_dir).expect("create the k3s kubeconfig mount dir");
 
+    let tag = std::env::var("K8S_PLUGIN_K3S_TAG").unwrap_or_else(|_| K3S_TAG.to_owned());
     let container = K3s::default()
         .with_conf_mount(&conf_dir)
+        // After `with_conf_mount`: `with_tag` turns the `K3s` into a generic
+        // `ContainerRequest`, which has no `with_conf_mount`.
+        .with_tag(tag)
         .with_privileged(true)
         .with_userns_mode("host")
         // Tag the container so a leaked one can be reaped by the next run (see

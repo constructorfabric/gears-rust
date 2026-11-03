@@ -75,7 +75,7 @@ gts_instance! {
 
 #[derive(JsonSchema, serde::Serialize, GtsTraitsSchema)]
 pub struct EventTraits {
-    #[schemars(extend("x-gts-ref" = gts_id!("x.core.events.topic.v1~")))]
+    #[schemars(extend("x-gts-instance-ref" = gts_id!("x.core.events.topic.v1~")))]
     pub topic_ref: String,
 }
 

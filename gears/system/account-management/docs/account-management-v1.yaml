@@ -1220,6 +1220,7 @@ components:
           type: string
           minLength: 1
           maxLength: 255
+          description: Trimmed before validation and storage; an all-whitespace value is rejected with HTTP 400.
         parent_id:
           type: string
           format: uuid
@@ -1242,6 +1243,7 @@ components:
           type: string
           minLength: 1
           maxLength: 255
+          description: Trimmed before validation and storage; an all-whitespace value is rejected with HTTP 400.
       description: |
         Only `name` is mutable via PATCH. Lifecycle transitions
         (`active <-> suspended`) go through

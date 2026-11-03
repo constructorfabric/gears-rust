@@ -1,5 +1,6 @@
 //! Resolution budgets at the worker boundary, including rollback after writes.
 
+use gts::X_GTS_INSTANCE_REF;
 use sea_orm::EntityTrait;
 use toolkit_db::secure::SecureEntityExt;
 
@@ -147,7 +148,7 @@ async fn closure_counts_the_candidate_and_deduplicates_ref_and_derivation_target
 }
 
 #[tokio::test]
-async fn closure_counts_transitive_documents_and_ignores_x_gts_ref() {
+async fn closure_counts_transitive_documents_and_ignores_entity_refs() {
     let db = test_db().await;
     admit(&db, "base", BASE, base_schema("name"), None).await;
     admit(
@@ -160,7 +161,7 @@ async fn closure_counts_transitive_documents_and_ignores_x_gts_ref() {
     .await;
     let mut content = referencing_schema(SECOND);
     content["properties"]["subject"]["$ref"] = json!(format!("gts://{REFERRER}"));
-    content["properties"]["identifier"] = json!({"type": "string", "x-gts-ref": INSTANCE});
+    content["properties"]["identifier"] = json!({"type": "string", X_GTS_INSTANCE_REF: INSTANCE});
     let mut limits = Limits {
         resolution_closure: 2,
         ..Limits::default()

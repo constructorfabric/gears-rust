@@ -122,7 +122,7 @@ pub struct Tenant {
 /// is typed [`GtsTypeId`] rather than `String` so callers (REST
 /// handler, inter-gear Rust consumers) get a self-documenting
 /// contract and any generated JSON Schema annotates the field with
-/// `format: gts-schema-id`. Wire shape stays a string.
+/// `x-gts-type-ref: "gts.*"`. Wire shape stays a string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct CreateTenantRequest {

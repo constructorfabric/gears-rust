@@ -1,4 +1,3 @@
-// Created: 2026-09-23 by Virtuozzo International GmbH
 //! Text that may enter a log line.
 //!
 //! An error from a dependency carries whatever text the dependency chose — a

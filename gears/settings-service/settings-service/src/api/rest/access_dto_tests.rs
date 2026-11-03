@@ -1,4 +1,3 @@
-// Created: 2026-09-17 by Virtuozzo International GmbH
 //! Wire shapes of the restriction surface: the tag a mutation must present,
 //! and the difference between a stored row and an effective answer.
 
@@ -7,10 +6,11 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::{render_readout, render_restriction};
+use crate::api::rest::setting_dto::Reader;
 use crate::domain::access::{
     ABSENT_RESTRICTION_TAG, AccessReadout, EffectiveAccess, Restriction, TenantAccess,
 };
-use crate::domain::declaration::Declaration;
+use crate::domain::declaration::{Declaration, DeclarationStatus};
 use crate::domain::resolution::MASK_TOKEN;
 
 const KEY: &str = "gts.cf.core.settings.setting_type.v1~acme.settings.network.proxy.v1~";
@@ -28,7 +28,7 @@ fn declaration() -> Declaration {
         category_id: Uuid::nil(),
         scope_class: "cascading".to_owned(),
         mode: "standard".to_owned(),
-        status: "active".to_owned(),
+        status: DeclarationStatus::Active,
         domain_affinity: None,
         licence_feature: None,
         owner_module: None,
@@ -52,6 +52,7 @@ fn restriction(access: TenantAccess, tenant: Uuid) -> Restriction {
         tenant_id: tenant,
         access,
         set_by: "root-admin".to_owned(),
+        set_by_tenant: None,
         created_at: at(100),
         updated_at: at(200),
     }
@@ -60,7 +61,7 @@ fn restriction(access: TenantAccess, tenant: Uuid) -> Restriction {
 #[test]
 fn a_row_renders_its_stored_spelling_its_author_and_its_tag() {
     let tenant = Uuid::from_u128(3);
-    let dto = render_restriction(&restriction(TenantAccess::ReadOnly, tenant), true);
+    let dto = render_restriction(&restriction(TenantAccess::ReadOnly, tenant), true, true);
 
     assert_eq!(dto.tenant_id, tenant);
     assert_eq!(dto.access, "read_only");
@@ -70,7 +71,7 @@ fn a_row_renders_its_stored_spelling_its_author_and_its_tag() {
     assert_eq!(dto.etag, at(200).unix_timestamp_nanos().to_string());
 
     assert_eq!(
-        render_restriction(&restriction(TenantAccess::Hidden, tenant), true).access,
+        render_restriction(&restriction(TenantAccess::Hidden, tenant), true, true).access,
         "hidden"
     );
 }
@@ -82,8 +83,8 @@ fn the_tag_moves_with_the_row_so_a_changed_row_fails_the_comparison() {
     later.updated_at = at(300);
 
     assert_ne!(
-        render_restriction(&restriction(TenantAccess::ReadOnly, tenant), true).etag,
-        render_restriction(&later, true).etag
+        render_restriction(&restriction(TenantAccess::ReadOnly, tenant), true, true).etag,
+        render_restriction(&later, true, true).etag
     );
 }
 
@@ -98,9 +99,11 @@ fn a_pair_with_no_row_still_carries_a_tag_a_first_write_can_present() {
         stored: None,
         effective: EffectiveAccess::OVERRIDABLE,
         etag: crate::domain::access::restriction_tag(None),
+        chain: Vec::new(),
+        root: Uuid::nil(),
     };
 
-    let dto = render_readout(&readout, true);
+    let dto = render_readout(&readout, true, Reader::Platform);
     assert!(dto.stored.is_none());
     assert_eq!(dto.etag, ABSENT_RESTRICTION_TAG);
     assert_eq!(dto.effective.access, "overridable");
@@ -130,9 +133,11 @@ fn an_inherited_restriction_names_the_ancestor_that_supplies_it() {
             supplied_by: Some(ancestor),
         },
         etag: crate::domain::access::restriction_tag(None),
+        chain: Vec::new(),
+        root: Uuid::nil(),
     };
 
-    let dto = render_readout(&readout, true);
+    let dto = render_readout(&readout, true, Reader::Platform);
     assert_eq!(dto.key, KEY);
     assert!(
         dto.stored.is_none(),
@@ -158,9 +163,11 @@ fn a_stored_row_and_the_readout_agree_on_the_tag() {
             supplied_by: Some(tenant),
         },
         etag: crate::domain::access::restriction_tag(Some(&row)),
+        chain: Vec::new(),
+        root: Uuid::nil(),
     };
 
-    let dto = render_readout(&readout, true);
+    let dto = render_readout(&readout, true, Reader::Platform);
     let stored = dto.stored.expect("the row");
     assert_eq!(stored.etag, dto.etag);
     assert_eq!(stored.access, "hidden");
@@ -173,8 +180,8 @@ fn the_setter_is_masked_without_the_pii_entitlement_and_nothing_else_is() {
     // says, and the tag a write presents, are not.
     let tenant = Uuid::from_u128(3);
     let row = restriction(TenantAccess::ReadOnly, tenant);
-    let shown = render_restriction(&row, true);
-    let masked = render_restriction(&row, false);
+    let shown = render_restriction(&row, true, true);
+    let masked = render_restriction(&row, false, true);
     assert_eq!(masked.set_by, MASK_TOKEN);
     assert_eq!(
         (
@@ -194,16 +201,18 @@ fn the_setter_is_masked_without_the_pii_entitlement_and_nothing_else_is() {
             supplied_by: Some(tenant),
         },
         etag: crate::domain::access::restriction_tag(Some(&row)),
+        chain: Vec::new(),
+        root: Uuid::nil(),
     };
     assert_eq!(
-        render_readout(&readout, false)
+        render_readout(&readout, false, Reader::Platform)
             .stored
             .expect("the row")
             .set_by,
         MASK_TOKEN
     );
     assert_eq!(
-        render_readout(&readout, true)
+        render_readout(&readout, true, Reader::Platform)
             .stored
             .expect("the row")
             .set_by,

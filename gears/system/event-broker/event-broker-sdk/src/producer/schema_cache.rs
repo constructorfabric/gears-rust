@@ -53,32 +53,23 @@ impl PreparedEventType {
     }
 }
 
-/// Partition count a producer assumes for every topic it publishes to, unless it
-/// says otherwise. It matches the broker's own default; a producer talking to a
-/// broker configured differently must declare that count, since the topic does
-/// not report it.
-pub(crate) const DEFAULT_BROKER_PARTITIONS: u32 = 8;
-
 pub(crate) struct ProducerSchemaCache {
-    /// Topics confirmed to exist at the broker. A topic carries no partition
-    /// count, so the count below applies to all of them.
+    /// Topics confirmed to exist at the broker.
     topics: tokio::sync::RwLock<HashSet<String>>,
-    broker_partitions: u32,
     event_types: tokio::sync::RwLock<HashMap<String, PreparedEventType>>,
     resolved_type_ids: tokio::sync::RwLock<HashSet<String>>,
 }
 
 impl Default for ProducerSchemaCache {
     fn default() -> Self {
-        Self::new(DEFAULT_BROKER_PARTITIONS)
+        Self::new()
     }
 }
 
 impl ProducerSchemaCache {
-    pub(crate) fn new(broker_partitions: u32) -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             topics: tokio::sync::RwLock::new(HashSet::new()),
-            broker_partitions: broker_partitions.max(1),
             event_types: tokio::sync::RwLock::new(HashMap::new()),
             resolved_type_ids: tokio::sync::RwLock::new(HashSet::new()),
         }
@@ -218,12 +209,12 @@ impl ProducerSchemaCache {
             })
     }
 
-    pub(crate) async fn partition_count(&self, topic: &str) -> Result<u32, EventBrokerError> {
+    pub(crate) async fn ensure_topic(&self, topic: &str) -> Result<(), EventBrokerError> {
         self.topics
             .read()
             .await
             .contains(topic)
-            .then_some(self.broker_partitions)
+            .then_some(())
             .ok_or_else(|| EventBrokerError::TopicNotFound {
                 topic: topic.to_owned(),
                 detail: "topic was not prepared for this producer".to_owned(),

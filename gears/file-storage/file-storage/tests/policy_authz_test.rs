@@ -141,6 +141,8 @@ async fn build_harness() -> Harness {
     let policy_svc = Arc::new(PolicyService::new(
         Arc::clone(&policy_store),
         Arc::clone(&authorizer),
+        50,
+        1000,
     ));
     Harness {
         file_svc,
@@ -291,7 +293,7 @@ async fn create_retention_rule_file_scope_target_not_writable_is_denied() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create victim file");
     h.authz.deny_write_for_file(ticket.file_id);
@@ -329,7 +331,7 @@ async fn create_retention_rule_file_scope_target_writable_is_allowed() {
 
     let ticket = h
         .file_svc
-        .create_file(&ctx_a, new_file(owner), None)
+        .create_file(&ctx_a, new_file(owner), None, false)
         .await
         .expect("create file");
 

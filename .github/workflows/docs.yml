@@ -3,10 +3,6 @@ name: Docs
 on:
   pull_request:
     branches: [ main ]
-    paths:
-      - '**/*.md'
-      - 'docs/**'
-      - 'guidelines/**'
   workflow_dispatch:
 
 concurrency:
@@ -28,7 +24,7 @@ jobs:
           submodules: recursive
 
       - name: Install lychee
-        uses: taiki-e/install-action@861a07ce7084f55488e375df125cdc99bba60eb7 # v2.87.23
+        uses: taiki-e/install-action@86f7a0ffb25f40114606501a311ebcfaf882ea32 # v2.88.0
         with:
           tool: lychee
 

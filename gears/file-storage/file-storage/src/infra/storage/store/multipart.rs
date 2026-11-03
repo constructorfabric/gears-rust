@@ -1,10 +1,12 @@
 //! Multipart upload session intent methods.
 
 use time::OffsetDateTime;
+use toolkit_db::secure::TxConfig;
 use uuid::Uuid;
 
 use crate::domain::audit::AuditEntry;
 use crate::domain::error::DomainError;
+use crate::domain::error_convert::db_err;
 use crate::domain::multipart::{MultipartPart, MultipartUploadSession};
 use crate::infra::storage::store::Store;
 
@@ -17,9 +19,12 @@ impl Store {
         file_id: Uuid,
         version_id: Uuid,
         backend_upload_handle: &str,
+        backend_id: &str,
+        backend_path: &str,
         declared_mime: &str,
         declared_size: u64,
         part_size: u64,
+        auto_bind: bool,
         expires_at: OffsetDateTime,
         now: OffsetDateTime,
     ) -> Result<(), DomainError> {
@@ -32,9 +37,12 @@ impl Store {
                 file_id,
                 version_id,
                 backend_upload_handle,
+                backend_id,
+                backend_path,
                 declared_mime,
                 declared_size,
                 part_size,
+                auto_bind,
                 expires_at,
                 now,
             )
@@ -76,16 +84,12 @@ impl Store {
             .await
     }
 
-    /// Whether `file_id` has an `in_progress` session regardless of `expires_at`
-    /// (see `MultipartRepo::has_in_progress_for_file`).
-    pub async fn has_in_progress_multipart_for_file(
-        &self,
-        file_id: Uuid,
-    ) -> Result<bool, DomainError> {
+    /// Whether `file_id` has an active (`in_progress` or `completing`) session (orphan-reconciliation guard).
+    pub async fn has_active_multipart_for_file(&self, file_id: Uuid) -> Result<bool, DomainError> {
         let conn = self.db.conn().map_err(DomainError::from)?;
         self.repos
             .multipart
-            .has_in_progress_for_file(&conn, file_id)
+            .has_active_for_file(&conn, file_id)
             .await
     }
 
@@ -114,21 +118,34 @@ impl Store {
     }
 
     /// Mark a session `completed` (also setting `mime_validated`: the caller has already
-    /// sniffed and validated the assembled object) and record the audit row in the same
-    /// transaction. Returns `false` on a stale transition.
+    /// sniffed and validated the assembled object), persist the response snapshot and record
+    /// the audit row in the same transaction.
+    ///
+    /// `lease_owner` must still match (see `MultipartRepo::finish_complete`). Only reached via
+    /// `MultipartService::finish_session` (takeover / converge after a lost finalize CAS).
     pub async fn complete_multipart_upload(
         &self,
         upload_id: Uuid,
+        lease_owner: &str,
+        result_json: &str,
         audit: AuditEntry,
     ) -> Result<bool, DomainError> {
         let multipart = self.repos.multipart.clone();
         let audit_repo = self.repos.audit.clone();
+        let lease_owner = lease_owner.to_owned();
+        let result_json = result_json.to_owned();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let multipart = multipart.clone();
+                let audit_repo = audit_repo.clone();
+                let audit = audit.clone();
+                let lease_owner = lease_owner.clone();
+                let result_json = result_json.clone();
                 Box::pin(async move {
+                    // Terminal transition from `completing`; persists the snapshot for idempotent re-completes.
                     let updated = multipart
-                        .update_state(tx, upload_id, "in_progress", "completed", Some(true))
+                        .finish_complete(tx, upload_id, Some(&lease_owner), &result_json)
                         .await?;
                     if updated {
                         audit_repo.insert(tx, &audit).await?;
@@ -139,7 +156,35 @@ impl Store {
             .await
     }
 
-    /// Mark a session `aborted` and record the audit row in the same transaction.
+    /// Acquire (or take over an expired) lease; see `MultipartRepo::acquire_complete_lease`.
+    pub async fn acquire_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+        lease_until: OffsetDateTime,
+        now: OffsetDateTime,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        self.repos
+            .multipart
+            .acquire_complete_lease(&conn, upload_id, owner, lease_until, now)
+            .await
+    }
+
+    /// Release a held lease after a failed assembly; see `MultipartRepo::release_complete_lease`.
+    pub async fn release_multipart_complete_lease(
+        &self,
+        upload_id: Uuid,
+        owner: &str,
+    ) -> Result<bool, DomainError> {
+        let conn = self.db.conn().map_err(DomainError::from)?;
+        self.repos
+            .multipart
+            .release_complete_lease(&conn, upload_id, owner)
+            .await
+    }
+
+    /// Mark a session `aborted` and record the audit row in one transaction (user abort and cleanup sweep).
     pub async fn abort_multipart_upload(
         &self,
         upload_id: Uuid,
@@ -149,11 +194,20 @@ impl Store {
         let audit_repo = self.repos.audit.clone();
         self.db
             .db()
-            .transaction_ref_mapped(move |tx| {
+            .transaction_with_retry(TxConfig::default(), db_err, move |tx| {
+                let multipart = multipart.clone();
+                let audit_repo = audit_repo.clone();
+                let audit = audit.clone();
                 Box::pin(async move {
-                    let updated = multipart
+                    let mut updated = multipart
                         .update_state(tx, upload_id, "in_progress", "aborted", None)
                         .await?;
+                    if !updated {
+                        // An expired `completing` lease is abortable too; a live one never is (`lease_until < now`).
+                        updated = multipart
+                            .abort_expired_completing(tx, upload_id, OffsetDateTime::now_utc())
+                            .await?;
+                    }
                     if updated {
                         audit_repo.insert(tx, &audit).await?;
                     }

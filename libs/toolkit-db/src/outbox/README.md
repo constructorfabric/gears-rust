@@ -60,6 +60,13 @@ catalog instead of being rebuilt through default table-name replacement on every
 operation. Dynamic SQL is still built for runtime-cardinality cases such as
 multi-row inserts and `IN (...)` lists.
 
+Queue registration initializes metadata atomically. On PostgreSQL, MySQL and
+MariaDB its transaction uses `READ COMMITTED` so active processors cannot leave
+it reading an old repeatable-read snapshot. This applies only to registration, not to the
+connection's default isolation. When binary logging is enabled on MySQL or
+MariaDB, configure `ROW` or `MIXED`; statement-only logging does not support
+these read-committed writes.
+
 For MySQL, migrations also create `<prefix>_body_id_sequence` and
 `<prefix>_incoming_id_sequence`. Batch enqueue reserves body IDs first and
 incoming IDs second by locking the singleton row with `SELECT ... FOR UPDATE`,

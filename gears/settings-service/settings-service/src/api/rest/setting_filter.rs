@@ -1,4 +1,3 @@
-// Created: 2026-09-29 by Virtuozzo International GmbH
 //! The `$filter` grammar the settings surfaces share.
 //!
 //! Browse and search take the same expression — `category_id eq`, `key eq`,

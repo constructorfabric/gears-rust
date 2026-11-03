@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use types_registry::domain::ports::ListFilter;
 
+use gts::{X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::macros::datetime;
@@ -74,8 +75,9 @@ fn schema(gts_id: &str) -> Value {
     })
 }
 
-/// Equivalent holder schemas differing only in `$ref` versus `x-gts-ref`.
-/// Both use `type: "string"`, as required by `x-gts-ref`.
+/// Equivalent holder schemas differing only in `$ref` versus an entity reference
+/// (`x-gts-type-ref` / `x-gts-instance-ref`). Both use `type: "string"`, as
+/// required by an entity reference.
 fn holder(gts_id: &str, keyword: &str, value: &Value) -> Value {
     let mut doc = schema(gts_id);
     doc["properties"] = json!({ "target": { "type": "string", keyword: value } });
@@ -87,10 +89,10 @@ fn referencing(gts_id: &str, target: &str) -> Value {
     holder(gts_id, "$ref", &json!(format!("gts://{target}")))
 }
 
-/// The same shape with `x-gts-ref`, which is an instance-value constraint and
-/// creates **no** dependency edge (T18).
-fn constraining(gts_id: &str, pattern: &str) -> Value {
-    holder(gts_id, "x-gts-ref", &json!(pattern))
+/// The same shape with an entity reference `keyword`, which is an
+/// instance-value constraint and creates **no** dependency edge (T18).
+fn constraining(gts_id: &str, keyword: &str, pattern: &str) -> Value {
+    holder(gts_id, keyword, &json!(pattern))
 }
 
 async fn submit(
@@ -360,28 +362,36 @@ async fn a_transitive_dependant_does_not_block() {
     );
 }
 
-/// `x-gts-ref` is an instance-value constraint and creates no edge (T18), so
-/// there is no registered dependant to find. The paired `$ref` case above is
-/// otherwise identical, which is what makes this the distinction and not a
-/// coincidence.
+/// An entity reference is an instance-value constraint and creates no edge
+/// (T18), so there is no registered dependant to find. The paired `$ref` case
+/// above is otherwise identical, which is what makes this the distinction and
+/// not a coincidence.
 #[tokio::test]
-async fn an_x_gts_ref_holder_does_not_block_and_stays_readable() {
-    let db = test_db().await;
-    register(&db, "reg", TARGET, schema(TARGET)).await;
-    register(&db, "reg-holder", HOLDER, constraining(HOLDER, TARGET)).await;
+async fn an_entity_ref_holder_does_not_block_and_stays_readable() {
+    for keyword in [X_GTS_TYPE_REF, X_GTS_INSTANCE_REF] {
+        let db = test_db().await;
+        register(&db, "reg", TARGET, schema(TARGET)).await;
+        register(
+            &db,
+            "reg-holder",
+            HOLDER,
+            constraining(HOLDER, keyword, TARGET),
+        )
+        .await;
 
-    let item = delete(&db, "del", TARGET, 1).await;
+        let item = delete(&db, "del", TARGET, 1).await;
 
-    assert_eq!(
-        item.status,
-        OperationItemStatus::Succeeded,
-        "the keyword names an entity without depending on it: {:?}",
-        item.failure,
-    );
-    assert!(
-        entity_of(&db, HOLDER).await.is_some(),
-        "and the holder is unaffected",
-    );
+        assert_eq!(
+            item.status,
+            OperationItemStatus::Succeeded,
+            "{keyword} names an entity without depending on it: {:?}",
+            item.failure,
+        );
+        assert!(
+            entity_of(&db, HOLDER).await.is_some(),
+            "and the {keyword} holder is unaffected",
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

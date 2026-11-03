@@ -43,7 +43,7 @@ This document splits the Construct design (`cpt-cf-construct-design-construct-ge
 
 The DESIGN's largest component, subject control, is split across four features. Subject Control owns the component; Subject Settings, the Review Queue and Administrator Fact Management extend it.
 
-**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is. Its FEATURE document is [features/gear-foundation.md](./features/gear-foundation.md), and the shell code carries `@cpt` markers for it. It is a placeholder, not a DESIGN element. Its note table and entity have no DESIGN id and are not counted as Data. It registers its REST route with OperationBuilder (the toolkit's builder for REST operations) and its client in ClientHub (the platform's registry of in-process clients).
+**The gear foundation is built.** The backend shell already exists in `gears/construct/construct` and `gears/construct/construct-sdk`. The feature `cpt-cf-construct-feature-gear-foundation` describes that code as it is. Its FEATURE document is [features/gear-foundation.md](./features/gear-foundation.md), and the shell code carries `@cpt` markers for it. It is a placeholder, not a DESIGN element. It first carried a placeholder note route, client operations, entity and table, with no DESIGN id and not counted as Data; Record Intake retired them. Later features register their REST routes with OperationBuilder (the toolkit's builder for REST operations) and extend its client in ClientHub (the platform's registry of in-process clients).
 
 **Interfaces and contracts.** The REST API (`cpt-cf-construct-interface-rest-api`) is realized by the features that add routes. The MCP tools (`cpt-cf-construct-interface-mcp-tools`) are realized by Agent Access over MCP. The Rust SDK (`cpt-cf-construct-interface-rust-sdk`) has one primary owner, the Gear Foundation, which holds the client trait; each later feature extends it. The interface, contract and topology ids in this paragraph are tracked in prose and have no checkbox line. The deployment topology (`cpt-cf-construct-topology-deployment`) is Construct running as a gear on the platform. Record Intake takes the connector record types (`cpt-cf-construct-contract-gts-record`), and the Profile Writer uses Construct's person types (`cpt-cf-construct-contract-person-types`). Both are GTS (Global Type System) types, the platform's versioned and registered type identifiers.
 
@@ -78,7 +78,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 - One-step plan path: the Review Queue owns the path that turns an add or an edit into a plan with one add or replace step, and Administrator Fact Management uses it.
 - Root node of a new subject: the Profile Writer owns writing the root node, including creating it for a new subject, in the same write as the facts.
 - Drop audit event (with the review hooks, one of the two choices closest to a design call): Record Intake owns the shape of the content-free drop audit event, and the Planner, the Sensitive-Data Checks, Admission and the Profile Writer reuse it.
-- Placeholder retirement: the first feature that adds a real route or table replaces the foundation's placeholder route, client operations and table.
+- Placeholder retirement: Record Intake replaces the foundation's placeholder route, client operations and table, in the same migration that creates its own table. Subject Settings comes first with Construct's first own table and routes, and leaves the placeholder in place.
 - Node keys: the Planner gives new node keys, including to a returning deleted entity, and the one-step path of the Review Queue gives them the same way. The Profile Writer stores the keys the plan carries and finds the new root key after an erasure.
 - Erase route: Erasure owns the erase route and the call into Deletion, although the DESIGN credits the hand-off to the Subject control component, because Subject Control is built earlier.
 - Closing call from retention: Retention owns the closing call into the Review Queue for the facts it removes.
@@ -89,16 +89,16 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-gear-foundation`
 
-- **Purpose**: The gear shell on which every other feature is built. It gives Construct the standard gear anatomy, one authenticated route, tenant-scoped storage and a client in ClientHub. It proves the platform pattern that all later features copy: caller and tenant come from the platform, and each operation has its own permission. It already exists in code.
+- **Purpose**: The gear shell on which every other feature is built. It gives Construct the standard gear anatomy, a first authenticated route (a placeholder, retired by Record Intake), tenant-scoped storage and a client in ClientHub. It proves the platform pattern that all later features copy: caller and tenant come from the platform, and each operation has its own permission. It already exists in code.
 
 - **Depends On**: None
 
 - **Scope**:
   - The SDK crate in `construct-sdk` (package `cf-gears-construct-sdk`) with the client trait `ConstructClientV1` and its models, and the gear crate in `construct` (package `cf-gears-construct`) with API, domain and infrastructure layers (`cpt-cf-construct-adr-construct-is-a-gear`)
-  - One authenticated REST route that creates a foundation note in the caller's tenant, registered with OperationBuilder (the toolkit's builder for REST operations)
-  - A tenant-scoped entity `FoundationNote` over the secure ORM (the toolkit's tenant-scoped database layer), with migrations the gear supplies at runtime
-  - The table `construct__foundation_notes`. Database objects follow the `construct__` naming prefix of the object-namespacing ADR
-  - A client registered in ClientHub (the platform's registry of in-process clients) for in-process callers, with operations to create and to read one note
+  - One authenticated REST route that creates a foundation note in the caller's tenant, registered with OperationBuilder (the toolkit's builder for REST operations); retired by Record Intake
+  - A tenant-scoped entity `FoundationNote` over the secure ORM (the toolkit's tenant-scoped database layer), with migrations the gear supplies at runtime; retired by Record Intake
+  - The table `construct__foundation_notes`. Database objects follow the `construct__` naming prefix of the object-namespacing ADR. Record Intake's migration drops it
+  - A client registered in ClientHub (the platform's registry of in-process clients) for in-process callers, with operations to create and to read one note; Record Intake replaced the note operations with its own
   - One permission per operation, checked through the AuthZ resolver, and the tenant taken only from the security context
   - RFC 9457 Problem errors through the toolkit error mapping
 
@@ -106,7 +106,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - Any DESIGN table, entity, component or sequence. The note table and entity are a placeholder that Construct's own model replaces; they have no DESIGN id
   - Construct's own permissions and routes for records, profiles and subjects
   - The Rust SDK interface of the full design (`cpt-cf-construct-interface-rust-sdk`), which grows with each later feature; the foundation owns the client trait of the shell only
-  - Retiring the placeholder route, client operations and table: the first feature that adds a real route or table replaces them, which is Subject Settings (`cpt-cf-construct-feature-subject-settings`)
+  - Retiring the placeholder route, client operations and table: Record Intake (`cpt-cf-construct-feature-record-intake`) replaces them
 
 - **Requirements Covered**:
 
@@ -122,14 +122,14 @@ The DESIGN's largest component, subject control, is split across four features. 
   - None.
 
 - **Domain Model Entities**:
-  - `FoundationNote` (placeholder, no DESIGN id)
+  - `FoundationNote` (placeholder, no DESIGN id; retired by Record Intake)
 
 - **Design Components**:
 
   - None. The shell is not a DESIGN component. It realizes `cpt-cf-construct-adr-construct-is-a-gear` and the gear anatomy of `cpt-cf-construct-tech-rust-gear`.
 
 - **API**:
-  - POST /construct/v1/foundation-notes (as registered in code; the DESIGN's public paths carry an `/api` prefix that a deployment sets in the gateway's `prefix_path`)
+  - POST /construct/v1/foundation-notes, retired by Record Intake (it was registered in code; the DESIGN's public paths carry an `/api` prefix that a deployment sets in the gateway's `prefix_path`)
 
 - **Sequences**:
 
@@ -137,9 +137,9 @@ The DESIGN's largest component, subject control, is split across four features. 
 
 - **Data**:
 
-  - None. `construct__foundation_notes` is a placeholder without a DESIGN id and is not counted as Data.
+  - None. `construct__foundation_notes` was a placeholder without a DESIGN id and is not counted as Data; Record Intake's migration drops it.
 
-### 2.2 [Model Client](features/model-client.md) - HIGH
+### 2.2 Model Client - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-model-client`
 
@@ -191,7 +191,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None.
 
-### 2.3 [Subject Settings](features/subject-settings.md) - HIGH
+### 2.3 Subject Settings - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-subject-settings`
 
@@ -206,7 +206,6 @@ The DESIGN's largest component, subject control, is split across four features. 
   - Personalization off and an erasure under way as stored state that other features read
   - A setting change applies from the next request
   - The subject's settings shown in the subject's view and included in the export (the view and the export themselves belong to subject control)
-  - Replacing the foundation's placeholder route, client operations and table with its own, once its own table and routes exist
 
 - **Out of scope**:
   - Refusing records, dropping plans and hiding facts when personalization is off; intake, admission and the reader enforce that
@@ -248,7 +247,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - [ ] `p1` - `cpt-cf-construct-dbtable-subject-settings`
   - [ ] `p1` - `cpt-cf-construct-entity-subject-settings`
 
-### 2.4 [Record Intake](features/record-intake.md) - HIGH
+### 2.4 Record Intake - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-record-intake`
 
@@ -268,6 +267,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - The shape of the content-free drop audit event, which the Planner, the Sensitive-Data Checks, Admission and the Profile Writer reuse
   - Loss of a received record without an audit event when an instance stops
   - Depending only on the base record shape, never on a connector's type
+  - Replacing the foundation's placeholder route, client operations and table, in the same migration that creates `construct__record_ids`
 
 - **Out of scope**:
   - Deciding what a record means (planner), checks and admission rules, and storage
@@ -296,7 +296,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - [ ] `p1` - `cpt-cf-construct-component-results-api`
 
 - **API**:
-  - POST /api/construct/v1/records
+  - POST /api/construct/v1/records?tenant=<id> (the tenant is required; the platform must authorize the caller for it)
 
 - **Sequences**:
 
@@ -308,7 +308,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - [ ] `p1` - `cpt-cf-construct-dbtable-record-ids`
   - [ ] `p1` - `cpt-cf-construct-entity-record`
 
-### 2.5 [Planner](features/planner.md) - HIGH
+### 2.5 Planner - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-planner`
 
@@ -364,7 +364,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - [ ] `p1` - `cpt-cf-construct-entity-plan`
 
-### 2.6 [Sensitive-Data Checks](features/sensitive-data-checks.md) - HIGH
+### 2.6 Sensitive-Data Checks - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-sensitive-data-checks`
 
@@ -417,7 +417,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - [ ] `p1` - `cpt-cf-construct-entity-sensitive-data-verdict`
 
-### 2.7 [Admission](features/admission.md) - HIGH
+### 2.7 Admission - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-admission`
 
@@ -471,7 +471,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None. Admission only reads the subject settings table, which belongs to `cpt-cf-construct-feature-subject-settings`.
 
-### 2.8 [Profile Writer](features/profile-writer.md) - HIGH
+### 2.8 Profile Writer - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-profile-writer`
 
@@ -488,7 +488,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - The profile entity: the subject node as root, and entities that hang from it
   - Writing the profile's root node, including creating it for a new subject, in the same single write as the facts. How two first writes for the same new subject are kept from both succeeding is settled in the FEATURE document of the Profile Writer, as the DESIGN does not specify it
   - Finding the new root key of a profile created after an erasure; the Profile Writer owns it, and the mechanism is left to the feature design
-  - Using Construct's GTS person types for the profile's categories and facts, registered in the types registry and with graph storage (`cpt-cf-construct-contract-person-types`)
+  - Using Construct's GTS person types for the profile's categories and facts, registered with graph storage (`cpt-cf-construct-contract-person-types`)
   - Re-admission and a new write for a value without a planner, on a conflict
   - Making the next read return the stored value and never a replaced or removed one
   - Using graph storage's compare-and-set (a write that succeeds only while a node still has the expected version) as it is (`cpt-cf-construct-adr-graph-storage-as-is`)
@@ -531,7 +531,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - [ ] `p1` - `cpt-cf-construct-entity-profile`
 
-### 2.9 [Profile Reader](features/profile-reader.md) - HIGH
+### 2.9 Profile Reader - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-profile-reader`
 
@@ -587,7 +587,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None. The reader only reads graph storage and the subject settings table.
 
-### 2.10 [Subject Control](features/subject-control.md) - HIGH
+### 2.10 Subject Control - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-subject-control`
 
@@ -647,7 +647,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None. The view reads the settings table and graph storage.
 
-### 2.11 [Review Queue](features/review-queue.md) - HIGH
+### 2.11 Review Queue - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-review-queue`
 
@@ -717,7 +717,7 @@ The DESIGN's largest component, subject control, is split across four features. 
   - [ ] `p1` - `cpt-cf-construct-dbtable-review-requests`
   - [ ] `p1` - `cpt-cf-construct-entity-review-request`
 
-### 2.12 [Administrator Fact Management](features/admin-facts.md) - MEDIUM
+### 2.12 Administrator Fact Management - MEDIUM
 
 - [ ] `p2` - **ID**: `cpt-cf-construct-feature-admin-facts`
 
@@ -781,7 +781,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None.
 
-### 2.13 [Agent Access over MCP](features/mcp-tools.md) - MEDIUM
+### 2.13 Agent Access over MCP - MEDIUM
 
 - [ ] `p2` - **ID**: `cpt-cf-construct-feature-mcp-tools`
 
@@ -839,7 +839,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None.
 
-### 2.14 [Erasure](features/erasure.md) - HIGH
+### 2.14 Erasure - HIGH
 
 - [ ] `p1` - **ID**: `cpt-cf-construct-feature-erasure`
 
@@ -899,7 +899,7 @@ The DESIGN's largest component, subject control, is split across four features. 
 
   - None. Erasure removes rows from tables that other features own.
 
-### 2.15 [Retention and Tenant Exit](features/retention.md) - MEDIUM
+### 2.15 Retention and Tenant Exit - MEDIUM
 
 - [ ] `p2` - **ID**: `cpt-cf-construct-feature-retention`
 

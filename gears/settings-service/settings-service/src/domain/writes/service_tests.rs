@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The write path over the resolution harness: gates, commit, fallthrough.
 
 use std::sync::Arc;
@@ -19,8 +18,11 @@ use super::{
 use super::{ImpactPage, ImpactReport};
 use crate::audit::{AuditOperation, AuditValue};
 use crate::domain::access::{AccessRepository, RestrictionDraft, TenantAccess};
+use crate::domain::declaration::DeclarationStatus;
 use crate::domain::error::DomainError;
-use crate::domain::ports::{NoMetrics, NoSecretManager, SecretManager, ValueEvent};
+use crate::domain::ports::{
+    NoMetrics, NoSecretManager, SecretManager, StepUpOperation, ValueEvent,
+};
 use crate::domain::resolution::{ScopeTarget, TenantHierarchy, scope_class};
 use crate::domain::stepup::{StepUpRefusal, StepUpVerifier, USER_SUBJECT_TYPE};
 use crate::domain::value::ValueRepository;
@@ -211,7 +213,7 @@ impl WriteHarness {
                 &self.base.key(name),
                 target,
                 StepUpPolicy::Verify,
-                "set",
+                StepUpOperation::Set,
             )
             .await
     }
@@ -310,6 +312,7 @@ impl WriteHarness {
                     tenant_id: tenant,
                     access,
                     set_by: "root-admin".to_owned(),
+                    set_by_tenant: None,
                 },
                 None,
             )
@@ -523,7 +526,13 @@ async fn a_write_gated_before_a_retire_is_refused_at_commit_and_lands_nowhere() 
         use crate::domain::declaration::DeclarationRepository;
         let conn = h.base.db.conn().expect("connection");
         DeclarationRepo
-            .set_status(&conn, &AccessScope::allow_all(), id, "retired", None)
+            .set_status(
+                &conn,
+                &AccessScope::allow_all(),
+                id,
+                DeclarationStatus::Retired,
+                None,
+            )
             .await
             .expect("retired");
     }
@@ -566,7 +575,16 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
     // The comparison ran against a read; a row that moved since finds no
     // match at the write and the writer gets the same `412` a stale tag gets.
     let refused = ValueRepo
-        .update(&conn, &all, row.id, Some(json!(false)), None, "b", stale)
+        .update(
+            &conn,
+            &all,
+            row.id,
+            Some(json!(false)),
+            None,
+            "b",
+            None,
+            stale,
+        )
         .await
         .expect_err("moved");
     assert!(
@@ -603,6 +621,7 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
                 needs_review: false,
                 needs_review_detail: None,
                 set_by: "b".to_owned(),
+                set_by_tenant: None,
             },
         )
         .await
@@ -621,6 +640,7 @@ async fn the_row_write_itself_is_conditional_on_the_version_the_tag_was_compared
             Some(json!(false)),
             None,
             "b",
+            None,
             row.last_change_at,
         )
         .await
@@ -1214,7 +1234,7 @@ async fn a_record_that_cannot_be_written_rolls_the_value_back() {
             &base.key("strict"),
             None,
             StepUpPolicy::Verify,
-            "set",
+            StepUpOperation::Set,
         )
         .await
         .expect("gated");

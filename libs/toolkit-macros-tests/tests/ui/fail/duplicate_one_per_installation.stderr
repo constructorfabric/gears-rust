@@ -1,0 +1,5 @@
+error: duplicate `one_per_installation` parameter
+ --> tests/ui/fail/duplicate_one_per_installation.rs:3:70
+  |
+3 | #[gear(name="x", capabilities=[stateful], one_per_installation=true, one_per_installation=false)]
+  |                                                                      ^^^^^^^^^^^^^^^^^^^^

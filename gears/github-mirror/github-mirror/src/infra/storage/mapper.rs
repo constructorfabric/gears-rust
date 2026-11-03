@@ -368,6 +368,8 @@ impl From<review_comments::Model> for ReviewComment {
             start_side: m.start_side,
             subject_type: m.subject_type,
             pull_request_review_id: m.pull_request_review_id,
+            snippet_before: m.snippet_before,
+            snippet_after: m.snippet_after,
         }
     }
 }

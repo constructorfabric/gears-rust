@@ -257,25 +257,6 @@ pub struct ValidationFinding {
     pub message: String,
 }
 
-/// Outcome of validating a version. Validation never activates anything.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ValidationReport {
-    /// The version validated.
-    pub version_id: VersionId,
-    /// Every failure found; empty means valid.
-    pub findings: Vec<ValidationFinding>,
-    /// When the validation ran.
-    pub validated_at: OffsetDateTime,
-}
-
-impl ValidationReport {
-    /// `true` when no finding was reported.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        self.findings.is_empty()
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Assignments
 // ---------------------------------------------------------------------------
@@ -303,6 +284,38 @@ pub struct Assignment {
     pub updated_at: OffsetDateTime,
     /// Subject of the last modification (the creator until changed).
     pub updated_by: Uuid,
+    /// `true` when the assignment does not apply: its owner tenant no longer
+    /// reaches its target with barriers respected (a barrier was raised
+    /// between them). Its owner can no longer change it; an administrator
+    /// of the target tenant may withdraw it.
+    pub dormant: bool,
+}
+
+/// A publish operation, as
+/// [`check_publish`](super::PolicyManagementClientV1::check_publish) dry-runs
+/// it: the parameters its checks depend on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublishOperation {
+    /// [`activate_version`](super::PolicyManagementClientV1::activate_version).
+    Activate {
+        /// The version's bundle.
+        bundle_id: BundleId,
+        /// The version to activate.
+        version_id: VersionId,
+    },
+    /// [`assign`](super::PolicyManagementClientV1::assign).
+    Assign(AssignmentSpec),
+    /// [`update_assignment`](super::PolicyManagementClientV1::update_assignment);
+    /// its checks do not depend on the new flag.
+    UpdateAssignment {
+        /// The assignment to change.
+        assignment_id: AssignmentId,
+    },
+    /// [`unassign`](super::PolicyManagementClientV1::unassign).
+    Unassign {
+        /// The assignment to withdraw.
+        assignment_id: AssignmentId,
+    },
 }
 
 /// Request to assign a bundle to a tenant.

@@ -7,9 +7,9 @@
 //! and `validate_schema` yields the fully inlined body, the abstract flag, and
 //! the chain-merged traits. Neither SDK accessor is enough on its own: the
 //! SDK's `effective_schema()` inlines only the parent reference, and
-//! `GtsTypeSchema` does not surface `x-gts-abstract`. The resolved body keeps
-//! `$schema`, `$id`, and `x-gts-ref`: the Draft-07 dialect and the GTS value
-//! constraints are part of the contract the catalogue compiles.
+//! `GtsTypeSchema` does not surface `x-gts-abstract`. The resolved type compiles
+//! to the payload validator the catalogue uses, so the declared dialect and the
+//! GTS value constraints are part of the contract.
 //!
 //! Discovery (`derived_types`) reads the listing alone and follows no
 //! reference, so a contract nobody configured cannot fail bootstrap through a
@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use gts::{GtsInstanceId, GtsStore, GtsTypeId, extract_gts_refs};
+use gts::{GtsInstanceId, GtsRefValidation, GtsStore, GtsTypeId, extract_gts_refs};
 use quota_enforcement_sdk::OwnedDefinition;
 use serde_json::Value;
 use toolkit_canonical_errors::CanonicalError;
@@ -149,9 +149,12 @@ fn resolve(
             .register_schema(id, raw)
             .map_err(|e| drift(root, &e.to_string()))?;
     }
+    // The closure holds schema dependencies, not entity-reference targets. Match the
+    // registry's pattern-only policy; the catalogue checks target membership.
     let resolved = store
-        .validate_schema(root.type_id.as_ref())
+        .validate_schema_with(root.type_id.as_ref(), GtsRefValidation::None)
         .map_err(|e| drift(root, &e.to_string()))?;
+    let payload = resolved.compile_payload_validator();
     Ok(RegisteredType {
         id: root.type_id.clone(),
         is_abstract: resolved.is_abstract,
@@ -162,6 +165,7 @@ fn resolve(
             .collect(),
         effective_traits: resolved.effective_traits,
         schema: resolved.schema,
+        payload,
     })
 }
 

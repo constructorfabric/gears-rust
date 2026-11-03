@@ -7,6 +7,7 @@
 
 use std::sync::Arc;
 
+use gts::{X_GTS_INSTANCE_REF, X_GTS_TYPE_REF};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
@@ -95,6 +96,84 @@ async fn submit(db: &Arc<DBProvider<DbError>>, key: &str, gts_id: &str, content:
 
 fn worker(db: &Arc<DBProvider<DbError>>) -> DBProvider<WorkerError> {
     DBProvider::new(db.db())
+}
+
+/// Not registered anywhere: entity references match identifiers, never targets.
+const REF_TARGET: &str = gts_id!("cf.core.inst.target.v1~");
+/// An Instance of [`REF_TARGET`], equally unregistered.
+const REF_TARGET_INSTANCE: &str = gts_id!("cf.core.inst.target.v1~cf.core.inst.someone.v1");
+
+#[tokio::test]
+async fn entity_refs_check_instance_values_without_requiring_registered_targets() {
+    // Each keyword admits its own identifier kind under the operand and refuses the other kind.
+    let cases = [
+        (
+            X_GTS_TYPE_REF,
+            [
+                ("invalid-ref", "not-a-gts-id", true),
+                ("wrong-ref", TYPE_ID, true),
+                ("wrong-kind", REF_TARGET_INSTANCE, true),
+                ("matching-ref", REF_TARGET, false),
+            ],
+        ),
+        (
+            X_GTS_INSTANCE_REF,
+            [
+                ("invalid-ref", "not-a-gts-id", true),
+                ("wrong-ref", INSTANCE_ID, true),
+                ("wrong-kind", REF_TARGET, true),
+                ("matching-ref", REF_TARGET_INSTANCE, false),
+            ],
+        ),
+    ];
+    let tuning = Tuning {
+        limits: &common::limits(),
+        worker: &common::worker_settings(),
+        metrics: &common::metrics(),
+        allow_compatibility_force: false,
+    };
+    for (keyword, values) in cases {
+        let db = test_db().await;
+        let mut schema = conforming_schema();
+        schema["properties"]["name"][keyword] = json!(REF_TARGET);
+        let op = submit(&db, "ref-type", TYPE_ID, schema).await;
+        let outcome = run_operation(&stores(), &worker(&db), &allow_all(), tuning, op, LATER)
+            .await
+            .expect("the worker itself must not fail");
+        assert_eq!(
+            outcome.items[0].status,
+            domain_enums::OperationItemStatus::Succeeded,
+            "{keyword} must not require the target to be registered: {:?}",
+            outcome.items[0].failure,
+        );
+
+        for (key, value, expected_failure) in values {
+            let op = submit(&db, key, INSTANCE_ID, json!({ "name": value })).await;
+            let outcome = run_operation(&stores(), &worker(&db), &allow_all(), tuning, op, LATER)
+                .await
+                .expect("the worker itself must not fail");
+            let item = &outcome.items[0];
+            if expected_failure {
+                assert_eq!(
+                    item.status,
+                    domain_enums::OperationItemStatus::Failed,
+                    "{keyword} must refuse {value}",
+                );
+                assert_eq!(
+                    item.failure.as_ref().expect("failure").reason,
+                    AdmissionFailureReason::InvalidValue,
+                    "{keyword} refusing {value}",
+                );
+            } else {
+                assert_eq!(
+                    item.status,
+                    domain_enums::OperationItemStatus::Succeeded,
+                    "a matching identifier needs no registered target under {keyword}: {:?}",
+                    item.failure,
+                );
+            }
+        }
+    }
 }
 
 /// Admit the conforming type, then run one operation and return its outcome.

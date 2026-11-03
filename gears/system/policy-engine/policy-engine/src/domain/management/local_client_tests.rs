@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use policy_engine_sdk::management::{
-    AssignmentSpec, BundlePatch, NewBundle, PolicyManagementClientV1, VersionContent, VersionState,
+    AssignmentSpec, BundlePatch, NewBundle, PolicyManagementClientV1, PublishOperation,
+    VersionContent, VersionState,
 };
 use toolkit_odata::ODataQuery;
 
@@ -86,13 +87,20 @@ async fn every_method_round_trips_through_the_local_client() {
             .len(),
         1
     );
-    assert!(
-        client
-            .validate_version(&a, bundle.id, version.id)
-            .await
-            .unwrap()
-            .is_valid()
-    );
+    client
+        .validate_version(&a, bundle.id, version.id)
+        .await
+        .unwrap();
+    client
+        .check_publish(
+            &a,
+            PublishOperation::Activate {
+                bundle_id: bundle.id,
+                version_id: version.id,
+            },
+        )
+        .await
+        .unwrap();
     let activated = client
         .activate_version(&a, bundle.id, version.id)
         .await
@@ -115,6 +123,14 @@ async fn every_method_round_trips_through_the_local_client() {
     assert_eq!(
         client.get_assignment(&a, assigned.id).await.unwrap(),
         assigned
+    );
+    assert_eq!(
+        client
+            .list_assignments(&a, &ODataQuery::default())
+            .await
+            .unwrap()
+            .items,
+        vec![assigned.clone()]
     );
     let updated = client
         .update_assignment(&a, assigned.id, false)

@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! Tenant access restrictions: what one tenant may do with one setting.
 //!
 //! A restriction is a sparse row — `read_only` or `hidden` for one
@@ -24,7 +23,7 @@ use crate::domain::precondition::ETag;
 use crate::domain::resolution::{EffectiveCache, TenantHierarchy};
 
 pub use repo::AccessRepository;
-pub use service::{AccessActor, AccessReadout, AccessService};
+pub use service::{AccessActor, AccessListing, AccessReadout, AccessService};
 
 /// What a tenant may do with a setting.
 ///
@@ -96,6 +95,9 @@ pub struct Restriction {
     pub access: TenantAccess,
     /// The administrator of a strict ancestor who recorded it.
     pub set_by: String,
+    /// The tenant that administrator acted from; `None` on a row written
+    /// before it was recorded.
+    pub set_by_tenant: Option<Uuid>,
     /// When it was first recorded.
     pub created_at: OffsetDateTime,
     /// Row version, which the restriction state tag derives from.
@@ -114,6 +116,8 @@ pub struct RestrictionDraft {
     pub access: TenantAccess,
     /// Who recorded it.
     pub set_by: String,
+    /// The tenant they acted from.
+    pub set_by_tenant: Option<Uuid>,
 }
 
 /// A tenant's effective access for one setting, and where it comes from.

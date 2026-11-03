@@ -113,6 +113,7 @@ pub fn repo(err: RepoError, subject: Subject) -> ManagementError {
         RepoError::Query(query) => ManagementError::InvalidQuery {
             reason: query.to_string(),
         },
+        RepoError::TooLarge => ManagementError::SubtreeTooLarge,
         RepoError::Database(detail) => internal_logged(detail),
     }
 }

@@ -1,0 +1,51 @@
+gdl_version = "1.0"
+
+# Every GDL field: https://github.com/constructorfabric/gearbox/blob/main/docs/gdl.md
+#
+# Gearbox product metadata for the quota-enforcement gear.
+#
+# Projected from #[toolkit::gear] in src/gear.rs: id, runtime_caps (rest,
+# stateful) and lifecycle; deps below is an exact checked mirror (GBX0214).
+
+gear(
+    deps = ["authz-resolver", "types-registry"],
+    source = git(url = "https://github.com/constructorfabric/gears-rust", path = "gears/system/quota-enforcement/quota-enforcement"),
+    maturity = "experimental",
+    implementation = "in-progress",
+    name = "Quota Enforcer",
+    description = "Quota enforcement with validation, reservation, and commit/release lifecycle.",
+    category = "core-functionality",
+    visibility = "internal",
+
+    package = cargo(
+        crate_name = "cf-gears-quota-enforcement",
+        lib = "quota_enforcement",
+        path = ".",
+    ),
+
+    sdk = cargo(
+        crate_name = "cf-gears-quota-enforcement-sdk",
+        lib = "quota_enforcement_sdk",
+        path = "../quota-enforcement-sdk",
+    ),
+
+    # The storage point, selected by `storage_vendor`.
+    extension_points = [
+        extension_point(
+            "cf.core.qe.storage_plugin.v1~",
+            trait = "QuotaEnforcementStoragePluginV1",
+            selector = "storage_vendor",
+        ),
+    ],
+
+    config_schema = config(exposes = ["storage_vendor"]),
+
+    # One leader runs the sweeper (src/infra/cluster_coordination.rs).
+    requires = [
+        cluster.leader_election(profile = "quota-enforcement", capabilities = [cluster_cap.linearizable]),
+    ],
+
+    # `grpc-client` lets the cluster SDK reach a cluster pod over gRPC: an image
+    # without a co-located cluster gear enables it.
+    cargo_features = [feature("grpc-client", kinds = ["kubernetes"])],
+)

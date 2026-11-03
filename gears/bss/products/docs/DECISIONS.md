@@ -1355,7 +1355,7 @@ The owner decided who does what:
   - a derived type from this declaration: the canonical unit, the inputs and their versions, the formula version;
   - a raw type from the collector and the types registry.
 - **Not built yet.** Today a usage SKU declares exactly one metering unit, and Products has no formula store
-  (`gears/bss/rating/docs/SEAMS.md` RG2). Building the declaration (storage, authoring, and the read the provider serves) is a
+  (`gears/bss/rating/docs/DECISIONS.md` T-D-39 and R-31; formerly `SEAMS.md` RG2). Building the declaration (storage, authoring, and the read the provider serves) is a
   separate run. Until then no derived meter can be sold.
 - **Supersedes:**
   - the PriceBook spec's §3 item 11 disposition ("D — metering's concern") for derived meters; level aggregation stays

@@ -97,7 +97,7 @@ existing `deps` metadata for readiness gating.
   generated.
 * In Profile 1, topo-sort remains the primary mechanism. The readiness probes still exist but are trivially satisfied (
   all deps are in-process and already started).
-* In Profile 2 (Host+Workers), Flight Control starts first (it has no deps), then spawns workers. Workers retry
+* In Profile 2 (Self-Hosted), Flight Control starts first (it has no deps), then spawns workers. Workers retry
   registration until Flight Control is reachable (typically immediate since it starts first). Deps resolve quickly
   because the host can start workers in topo order, but correctness does not depend on this ordering.
 * Generated REST clients must handle `503` from not-yet-ready targets gracefully — retry with backoff, surface
@@ -244,7 +244,7 @@ The `deps` field semantics expand per profile:
 | Profile                  | `deps` used for                              | Blocking?                                  |
 |--------------------------|----------------------------------------------|--------------------------------------------|
 | Profile 1 (Embedded)     | Topo-sort startup order                      | Yes (sequential, in-process)               |
-| Profile 2 (Host+Workers) | Readiness gating + topo-hint for spawn order | No (eventual, spawn order is best-effort)  |
+| Profile 2 (Self-Hosted) | Readiness gating + topo-hint for spawn order | No (eventual, spawn order is best-effort)  |
 | Profile 3 (K8s Native)   | Readiness gating only                        | No (eventual, k8s schedules independently) |
 
 ## Traceability

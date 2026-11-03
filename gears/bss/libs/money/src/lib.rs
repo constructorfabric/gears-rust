@@ -11,7 +11,8 @@
 //!   zeros on output; a parser accepts trailing zeros on input).
 //! - `exact` (feature): [`exact::ExactAmount`], reduced fractions over big integers for
 //!   intermediate arithmetic, narrowed to a [`PostedMoney`] only at an explicit point,
-//!   either exactly or by one `HALF_EVEN` rounding; [`allocate::allocate`] for
+//!   either exactly or by one `HALF_EVEN` rounding, and written as canonical fraction
+//!   text (`{numerator, denominator}` integer strings); [`allocate::allocate`] for
 //!   proportional shares with a deterministic residual.
 //! - `serde` (feature): [`serde_text`], a `#[serde(with)]` adapter for canonical text.
 //! - [`iso_scale`]: the one ISO 4217 table of minor-unit scales for the active currency

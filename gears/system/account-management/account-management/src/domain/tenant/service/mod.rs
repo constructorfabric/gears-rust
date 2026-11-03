@@ -102,7 +102,8 @@ use crate::domain::tenant::closure::build_activation_rows;
 use crate::domain::tenant::context::TenantContext;
 use crate::domain::tenant::hooks::TenantHardDeleteHook;
 use crate::domain::tenant::model::{
-    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantStatus,
+    ChildCountFilter, NewTenant, TenantAncestorRow, TenantModel, TenantName, TenantStatus,
+    verify_tenant_name,
 };
 use crate::domain::tenant::repo::TenantRepo;
 use crate::domain::tenant::resource_checker::ResourceOwnershipChecker;
@@ -659,7 +660,8 @@ impl<R: TenantRepo> TenantService<R> {
     ///   caller access to the parent tenant.
     /// - [`DomainError::Validation`] when the parent is missing or not
     ///   `Active` (create under a suspended / deleted / provisioning
-    ///   parent is rejected).
+    ///   parent is rejected), or when `name` is empty or
+    ///   all-whitespace. A valid name is persisted trimmed.
     /// - [`DomainError::ServiceUnavailable`] when the provider reports a
     ///   clean compensable failure; the `provisioning` row is removed.
     /// - [`DomainError::UnsupportedOperation`] when the provider signals
@@ -743,9 +745,13 @@ impl<R: TenantRepo> TenantService<R> {
         // Runs AFTER the local parent precondition so a missing or
         // inactive parent fails fast on the local read instead of
         // burning a Types Registry round-trip first.
+        //
+        // Trim first: an all-whitespace name passes both `minLength: 1`
+        // and the DB CHECK, so the AM-side rule is the only gate.
+        let name = verify_tenant_name("create_tenant", input.name)?;
         if let Some(registry) = self.types_registry.as_ref() {
             crate::domain::gts_validation::validate_tenant_name_via_gts(
-                &input.name,
+                name.as_str(),
                 registry.as_ref(),
             )
             .await?;
@@ -851,7 +857,7 @@ impl<R: TenantRepo> TenantService<R> {
         let new_tenant = NewTenant {
             id: input.child_id,
             parent_id: Some(parent.id),
-            name: input.name.clone(),
+            name: name.as_str().to_owned(),
             self_managed: input.self_managed,
             tenant_type_uuid,
             depth: observed_depth,
@@ -867,7 +873,7 @@ impl<R: TenantRepo> TenantService<R> {
         let mut req = IdpProvisionTenantRequest::new(
             provisioning_row.id,
             parent.id,
-            input.name.clone(),
+            name.as_str().to_owned(),
             input.tenant_type.clone(),
         )
         .with_parent_context((&parent_ctx).into());
@@ -1100,7 +1106,7 @@ impl<R: TenantRepo> TenantService<R> {
                 &parent,
                 provisioning_row.id,
                 input.tenant_type.clone(),
-                input.name.clone(),
+                name.as_str().to_owned(),
                 idp_metadata.as_ref(),
             )
             .await;
@@ -1137,7 +1143,7 @@ impl<R: TenantRepo> TenantService<R> {
                 &parent,
                 provisioning_row.id,
                 input.tenant_type.clone(),
-                input.name.clone(),
+                name.as_str().to_owned(),
                 idp_metadata.as_ref(),
             )
             .await;
@@ -1162,7 +1168,7 @@ impl<R: TenantRepo> TenantService<R> {
                     &parent,
                     provisioning_row.id,
                     input.tenant_type.clone(),
-                    input.name.clone(),
+                    name.as_str().to_owned(),
                     idp_metadata.as_ref(),
                 )
                 .await;
@@ -1700,8 +1706,9 @@ impl<R: TenantRepo> TenantService<R> {
     ///
     /// - [`DomainError::CrossTenantDenied`] when the PDP denies the
     ///   caller access to the target tenant.
-    /// - [`DomainError::Validation`] when the patch is empty or the new
-    ///   name fails GTS validation.
+    /// - [`DomainError::Validation`] when the patch is empty, the new
+    ///   name is empty or all-whitespace, or it fails GTS validation.
+    ///   A valid name is persisted trimmed.
     /// - [`DomainError::Conflict`] when the target tenant is in
     ///   `Deleted` status (read-only during retention).
     /// - [`DomainError::NotFound`] when the target tenant does not exist or
@@ -1712,7 +1719,7 @@ impl<R: TenantRepo> TenantService<R> {
         &self,
         ctx: &SecurityContext,
         id: Uuid,
-        patch: UpdateTenantRequest,
+        mut patch: UpdateTenantRequest,
     ) -> Result<Tenant, DomainError> {
         if patch.is_empty() {
             return Err(DomainError::Validation {
@@ -1761,16 +1768,26 @@ impl<R: TenantRepo> TenantService<R> {
         // Mirrors the ordering in `create_tenant`. Skipped when the
         // patched name is identical to the current name (idempotent
         // PATCH — no shape change, no need to validate).
-        if let Some(ref new_name) = patch.name
-            && new_name != &current.name
+        //
+        // Trim BEFORE the same-name comparison so `" acme "` against a
+        // stored `"acme"` is the idempotent no-op it means, and reject
+        // an all-whitespace rename exactly as `create_tenant` does.
+        let new_name = patch
+            .name
+            .take()
+            .map(|name| verify_tenant_name("update_tenant", name))
+            .transpose()?;
+        if let Some(ref new_name) = new_name
+            && new_name.as_str() != current.name
             && let Some(registry) = self.types_registry.as_ref()
         {
             crate::domain::gts_validation::validate_tenant_name_via_gts(
-                new_name,
+                new_name.as_str(),
                 registry.as_ref(),
             )
             .await?;
         }
+        patch.name = new_name.map(TenantName::into_inner);
         let updated = self.repo.update_tenant_mutable(&scope, id, &patch).await?;
 
         // Suppress the lifecycle event log on an idempotent no-op.

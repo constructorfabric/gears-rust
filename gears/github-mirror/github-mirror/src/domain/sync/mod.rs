@@ -16,23 +16,29 @@
 //!   inside one of those syncs.
 
 pub mod change_gate;
+pub mod conversations;
 pub mod mirror_worker;
 pub mod pool;
 pub mod queue;
 pub mod runner;
 pub mod sweep_watermark;
 pub mod task;
+pub mod telemetry;
 pub mod verification;
 pub mod worker;
 
 pub use change_gate::{ChangeGate, GateInputs, GateReason};
+pub use conversations::{ConversationStats, group_conversations};
 pub use mirror_worker::{MirrorWorker, RunState};
 pub use pool::SyncPoolRunner;
-pub use queue::TaskQueue;
+pub use queue::{TaskCounts, TaskQueue};
 pub use runner::{RepoPhaseRunner, RunReport, TaskFailure};
 pub use sweep_watermark::SweepWatermark;
 pub use task::{
     Entity, ExtractionTask, Family, Lane, NewTask, TaskKind, TaskPhase, TaskPriority, TaskStatus,
+};
+pub use telemetry::{
+    GithubApi, RequestOutcome, SessionTelemetry, TelemetryEntry, TelemetryLine, TelemetrySnapshot,
 };
 pub use verification::{CountGap, GapOutcome, MAX_REPAIR};
 pub use worker::{Worker, WorkerContext, WorkerDispatcher};

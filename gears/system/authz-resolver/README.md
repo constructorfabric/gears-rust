@@ -8,8 +8,8 @@ Authorization resolution for Gears — evaluates access requests and produces SQ
 
 The authorization design that Gears operate on is described in [DESIGN.md](../../../docs/arch/authorization/DESIGN.md).
 The decision to use AuthZEN 1.0 with constraint extensions is documented in
-[ADR-0001](../../../docs/arch/authorization/adr/0001-pdp-pep-authorization-model.md) and
-the split from authentication in [ADR-0002](../../../docs/arch/authorization/adr/0002-split-authn-and-authz-resolvers.md).
+[ADR-0001](../../../docs/arch/authorization/ADR/0001-pdp-pep-authorization-model.md) and
+the split from authentication in [ADR-0002](../../../docs/arch/authorization/ADR/0002-split-authn-authz-resolvers.md).
 
 The **authz_resolver** gear is an integration point for authorization policy evaluation. It discovers and delegates to a vendor-specific plugin via the types-registry — the plugin acts as the **Policy Decision Point (PDP)**, evaluating Subject + Action + Resource requests and returning a decision with optional row-level constraints.
 

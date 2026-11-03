@@ -13,5 +13,8 @@ pub use coordination::{
 };
 pub use lifecycle_gauges::{LifecycleCounts, LifecycleGaugeSink, NoopGaugeSink};
 pub use metric_registry::{Classified, Freshness, MetricDescriptor, MetricMode, MetricRegistry};
-pub use metrics::{DenialReason, NoopMetrics, QeMetrics, ValidationReason, ValidationSurface};
+pub use metrics::{
+    DenialReason, LeaseBacklogSink, MetricLabel, NoopLeaseBacklog, NoopMetrics, QeMetrics,
+    ValidationReason, ValidationSurface,
+};
 pub use pdp::PdpProbe;

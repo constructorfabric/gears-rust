@@ -10,10 +10,9 @@
       "allOf": [
         {
           "description": "GTS instance identifier",
-          "format": "gts-instance-id",
           "title": "GTS Instance ID",
           "type": "string",
-          "x-gts-ref": "gts.*"
+          "x-gts-instance-ref": "gts.*"
         }
       ]
     },

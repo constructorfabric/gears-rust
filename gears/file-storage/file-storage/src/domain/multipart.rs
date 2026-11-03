@@ -12,6 +12,8 @@ use crate::infra::content::hash_mode::HashMode;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MultipartUploadState {
     InProgress,
+    /// A `complete` holds the lease and is assembling; after `lease_until` the next `complete` takes over.
+    Completing,
     Completed,
     Aborted,
 }
@@ -21,6 +23,7 @@ impl MultipartUploadState {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::InProgress => "in_progress",
+            Self::Completing => "completing",
             Self::Completed => "completed",
             Self::Aborted => "aborted",
         }
@@ -30,6 +33,7 @@ impl MultipartUploadState {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "in_progress" => Some(Self::InProgress),
+            "completing" => Some(Self::Completing),
             "completed" => Some(Self::Completed),
             "aborted" => Some(Self::Aborted),
             _ => None,
@@ -52,14 +56,125 @@ pub struct MultipartUploadSession {
     pub declared_size: u64,
     /// Server-chosen plan unit (bytes, uniform except the final part).
     pub part_size: u64,
+    pub auto_bind: bool,
+    pub lease_until: Option<OffsetDateTime>,
+    /// Persisted `StoredCompleteResult` JSON once `Completed`; a re-complete replays it.
+    pub complete_result: Option<String>,
+    /// `None` for a session written by a binary from before the upload-flow migration and not
+    /// backfilled (no version row); resolved as version, then this field, then the default
+    /// backend (see [`MultipartUploadSession::resolve_backend_id`]).
+    pub backend_id: Option<String>,
+    /// Backend object path; lets expired-session cleanup work after the `file_versions` row is gone.
+    pub backend_path: String,
     pub created_at: OffsetDateTime,
     pub expires_at: OffsetDateTime,
+}
+
+impl MultipartUploadSession {
+    /// Backend this session targets: the version row's backend, else the session's stored one,
+    /// else `default_id` (logged, since it is a guess).
+    #[must_use]
+    pub fn resolve_backend_id(&self, version_backend_id: Option<&str>, default_id: &str) -> String {
+        if let Some(id) = version_backend_id.or(self.backend_id.as_deref()) {
+            return id.to_owned();
+        }
+        tracing::warn!(
+            upload_id = %self.upload_id,
+            default_backend = default_id,
+            "multipart session has no stored backend and no version row; using the default backend"
+        );
+        default_id.to_owned()
+    }
+}
+
+/// Outcome of `complete_multipart_upload`: finished, or another caller holds the lease (`202`).
+#[allow(unknown_lints, de0309_must_have_domain_model)]
+#[derive(Debug, Clone)]
+pub enum MultipartCompleteOutcome {
+    Completed(CompletedMultipartUpload),
+    Completing { retry_after_secs: u64 },
+}
+
+/// Serializable snapshot of a successful complete response, persisted in the same transaction
+/// that flips the session to `completed`; carries no `manifest` (re-read from `version_hash_manifest`).
+#[domain_model]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct StoredCompleteResult {
+    pub version_id: Uuid,
+    pub size: i64,
+    pub content_hash: String,
+    pub hash_mode: String,
+    pub part_count: i32,
+    pub bind_state: String,
+    pub etag: Option<String>,
+    pub current_etag: Option<String>,
+}
+
+impl StoredCompleteResult {
+    #[must_use]
+    pub fn from_completed(c: &CompletedMultipartUpload) -> Self {
+        Self {
+            version_id: c.version_id,
+            size: c.size,
+            content_hash: hex::encode(&c.content_hash),
+            hash_mode: c.hash_mode.as_str().to_owned(),
+            part_count: c.part_count,
+            bind_state: c.bind_state.as_str().to_owned(),
+            etag: c.etag.clone(),
+            current_etag: c.current_etag.clone(),
+        }
+    }
+
+    /// Rebuild the response (`manifest` supplied by the caller). `None` for an unparsable or
+    /// inconsistent snapshot; the caller rebuilds from the version row.
+    #[must_use]
+    pub fn into_completed(self, manifest: Option<String>) -> Option<CompletedMultipartUpload> {
+        let hash_mode = HashMode::parse(&self.hash_mode)?;
+        let bind_state = match self.bind_state.as_str() {
+            "bound" => BindState::Bound,
+            "conflict" => BindState::Conflict,
+            "manual" => BindState::Manual,
+            _ => return None,
+        };
+        // An inconsistent snapshot is untrustworthy, so `None`. One part is `whole-sha256` with no
+        // manifest (ADR-0006); 2+ parts are `multipart-composite-sha256` with one; anything else is corruption.
+        match hash_mode {
+            HashMode::WholeSha256 if self.part_count != 1 || manifest.is_some() => return None,
+            HashMode::MultipartCompositeSha256 if self.part_count < 2 || manifest.is_none() => {
+                return None;
+            }
+            _ => {}
+        }
+        let consistent = match bind_state {
+            BindState::Bound => self.etag.is_some() && self.current_etag.is_none(),
+            BindState::Conflict => self.etag.is_none() && self.current_etag.is_some(),
+            BindState::Manual => self.etag.is_none() && self.current_etag.is_none(),
+        };
+        if !consistent {
+            return None;
+        }
+        let content_hash = hex::decode(&self.content_hash)
+            .ok()
+            .filter(|d| d.len() == 32)?;
+        Some(CompletedMultipartUpload {
+            version_id: self.version_id,
+            size: self.size,
+            hash_algorithm: crate::infra::content::hash::ALGORITHM,
+            content_hash,
+            hash_mode,
+            part_count: self.part_count,
+            manifest,
+            bind_state,
+            etag: self.etag,
+            current_etag: self.current_etag,
+        })
+    }
 }
 
 /// Result of a successful `complete_multipart_upload`.
 ///
 /// `manifest` lets a client re-verify the composite hash without a second round-trip
-/// (~90 bytes per part, ~1 MiB at the 10k-part ceiling).
+/// (~90 bytes per part, ~1 MiB at the [`MAX_PART_COUNT`] ceiling).
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct CompletedMultipartUpload {
@@ -67,13 +182,100 @@ pub struct CompletedMultipartUpload {
     pub size: i64,
     /// Always `"SHA-256"`.
     pub hash_algorithm: &'static str,
-    /// Composite root: `sha256(manifest)`.
     pub content_hash: Vec<u8>,
-    /// Always [`HashMode::MultipartCompositeSha256`] for this completion path.
     pub hash_mode: HashMode,
     pub part_count: i32,
-    /// Wire-format manifest text (`Manifest::to_wire_string`).
-    pub manifest: String,
+    pub manifest: Option<String>,
+    pub bind_state: BindState,
+    pub etag: Option<String>,
+    /// Current content `ETag` when the bind CAS was lost (`Conflict` only); the `If-Match` for a manual rebind.
+    pub current_etag: Option<String>,
+}
+
+/// Bind outcome shared by multipart `complete` (`bind_state`) and single-part `PUT` (`X-FS-Bound`).
+/// `Conflict` means the auto-bind CAS lost but the upload still SUCCEEDED; a manual `bind` makes it live.
+#[domain_model]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindState {
+    Bound,
+    Conflict,
+    Manual,
+}
+
+impl BindState {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Conflict => "conflict",
+            Self::Manual => "manual",
+        }
+    }
+}
+
+/// How a bind attempt came out, as the caller decided it; [`BindDecision::outcome`] is the one
+/// mapping to the reported `(bind_state, etag, current_etag)` for first calls and replays alike.
+#[domain_model]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindDecision {
+    /// This version is the file's content: `Bound` with this version's `ETag`.
+    Bound,
+    /// Auto-bind lost the CAS: `Conflict` with the `ETag` of the pointer that won.
+    Conflict { current_etag: Option<String> },
+    /// The upload never asked to bind: no bind outcome.
+    Manual,
+}
+
+impl BindDecision {
+    #[must_use]
+    pub fn outcome(
+        self,
+        file_id: Uuid,
+        version_id: Uuid,
+    ) -> (BindState, Option<String>, Option<String>) {
+        match self {
+            Self::Bound => (
+                BindState::Bound,
+                Some(crate::domain::etag::content_etag(file_id, version_id)),
+                None,
+            ),
+            Self::Conflict { current_etag } => (BindState::Conflict, None, current_etag),
+            Self::Manual => (BindState::Manual, None, None),
+        }
+    }
+}
+
+/// Bind outcome a replay reports (a single-part finalize retry or a multipart complete rebuilt
+/// from the version row): a bind won at finalize replays as `Bound` from the persisted
+/// `bound_on_finalize` flag (a retry must not turn `Bound` into `Conflict`), a manual upload
+/// never reports a bind outcome, and an auto-bind upload that lost the CAS reads the live pointer
+/// (`Bound` if the file now points at this version, else `Conflict` with the current `ETag`).
+///
+/// The auto-bind CAS is a strict `content_id IS NULL` and the pointer never goes back to NULL,
+/// so `auto_bind` without `bound_on_finalize` and an empty pointer means no bind ever ran (a
+/// binary without auto-bind finished the upload in the mixed-version window): `Manual`, and the
+/// client binds itself. `Conflict` therefore always carries the current `ETag`.
+#[must_use]
+pub fn replay_bind_state(
+    file_id: Uuid,
+    content_id: Option<Uuid>,
+    version_id: Uuid,
+    bound_on_finalize: bool,
+    auto_bind: bool,
+) -> (BindState, Option<String>, Option<String>) {
+    let decision = if bound_on_finalize {
+        BindDecision::Bound
+    } else if !auto_bind || content_id.is_none() {
+        // Manual upload, or auto-bind that never ran (see above): the client binds itself.
+        BindDecision::Manual
+    } else if content_id == Some(version_id) {
+        BindDecision::Bound
+    } else {
+        BindDecision::Conflict {
+            current_etag: content_id.map(|cid| crate::domain::etag::content_etag(file_id, cid)),
+        }
+    };
+    decision.outcome(file_id, version_id)
 }
 
 /// Result of `GET /files/{id}/multipart/{upload_id}`: session state plus received and
@@ -172,6 +374,10 @@ pub const DEFAULT_MIN_PART_SIZE: u64 = 5 * 1024 * 1024;
 /// arithmetic as defense-in-depth.
 pub const MAX_PART_SIZE: u64 = 5 * 1024 * 1024 * 1024;
 
+/// Hard ceiling on the parts of one plan, enforced by `compute_plan` (ADR-0006: unbounded
+/// manifests must not be possible). `10_000` matches S3's limit.
+pub const MAX_PART_COUNT: u64 = 10_000;
+
 /// One raw part entry from `compute_plan`: `(part_number, offset, size)`.
 pub type RawPartEntry = (u32, u64, u64);
 
@@ -179,11 +385,13 @@ pub type RawPartEntry = (u32, u64, u64);
 /// `MultipartService`). Returns `(part_size, parts)`.
 ///
 /// `part_size = max(preferred, backend_min)` rounded up to a multiple of the minimum;
-/// `parts = ceil(declared_size / part_size)`; the last part holds the remainder.
+/// `parts = ceil(declared_size / part_size)`, widening `part_size` (up to [`MAX_PART_SIZE`]) to
+/// stay within [`MAX_PART_COUNT`]. Runs before allocating the plan, so an attacker-controlled
+/// `declared_size` cannot drive allocation.
 ///
 /// # Errors
-/// Returns [`DomainError::Validation`] if the part-size arithmetic overflows `u64`
-/// (defense-in-depth; callers validate `preferred_part_size` first).
+/// Returns [`DomainError::Validation`] on `u64` overflow or if even [`MAX_PART_SIZE`] cannot fit
+/// `declared_size` within [`MAX_PART_COUNT`] parts.
 pub fn compute_plan(
     declared_size: u64,
     preferred_part_size: Option<u64>,
@@ -192,7 +400,7 @@ pub fn compute_plan(
     let min = backend_min_part_size.unwrap_or(DEFAULT_MIN_PART_SIZE);
     let preferred = preferred_part_size.unwrap_or(min);
     let raw = preferred.max(min);
-    let part_size = round_up_to(raw, min).ok_or_else(|| {
+    let mut part_size = round_up_to(raw, min).ok_or_else(|| {
         DomainError::validation(
             "preferred_part_size",
             format!("part-size computation overflowed for preferred={preferred}, min={min}"),
@@ -201,6 +409,21 @@ pub fn compute_plan(
 
     if declared_size == 0 {
         return Ok((part_size, vec![(1, 0, 0)]));
+    }
+
+    if declared_size.div_ceil(part_size) > MAX_PART_COUNT {
+        let minimal_required = declared_size.div_ceil(MAX_PART_COUNT);
+        if minimal_required > MAX_PART_SIZE {
+            return Err(DomainError::validation(
+                "declared_size",
+                format!(
+                    "declared_size {declared_size} bytes is too large for multipart upload on \
+                     this backend: even at the maximum part size of {MAX_PART_SIZE} bytes it \
+                     would require more than {MAX_PART_COUNT} parts"
+                ),
+            ));
+        }
+        part_size = minimal_required.max(part_size).min(MAX_PART_SIZE);
     }
 
     let n_parts = declared_size.div_ceil(part_size);
@@ -243,6 +466,30 @@ mod tests {
         assert_eq!(round_up_to(1, u64::MAX), Some(u64::MAX));
         assert_eq!(round_up_to(7, 5), Some(10));
         assert_eq!(round_up_to(10, 5), Some(10));
+    }
+
+    #[test]
+    fn replay_bind_state_auto_bind_without_bind_and_empty_pointer_is_manual() {
+        let (file_id, version_id) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let (state, etag, current) = replay_bind_state(file_id, None, version_id, false, true);
+        assert_eq!(state, BindState::Manual);
+        assert_eq!(etag, None);
+        assert_eq!(current, None);
+
+        // Existing cases stay as they were.
+        let (state, etag, _) =
+            replay_bind_state(file_id, Some(version_id), version_id, false, true);
+        assert_eq!(state, BindState::Bound);
+        assert!(etag.is_some());
+        let (state, etag, current) =
+            replay_bind_state(file_id, Some(Uuid::from_u128(3)), version_id, false, true);
+        assert_eq!(state, BindState::Conflict);
+        assert_eq!(etag, None);
+        assert!(current.is_some());
+        let (state, _, _) = replay_bind_state(file_id, None, version_id, true, true);
+        assert_eq!(state, BindState::Bound);
+        let (state, _, _) = replay_bind_state(file_id, None, version_id, false, false);
+        assert_eq!(state, BindState::Manual);
     }
 
     #[test]

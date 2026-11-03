@@ -1,12 +1,8 @@
-//! The built-in traversal engine: a directed one-hop primitive with two
-//! interchangeable backends that must return byte-identical answers.
+//! The built-in traversal engine: a directed one-hop primitive over two
+//! scoped statements, the incident edges and then the authorized endpoints.
 //!
-//! **SQL/PGQ** (`GRAPH_TABLE`, `PostgreSQL` 19+) expands the frontier in one
-//! statement, with the caller's scope embedded in every pattern element.
-//! **Two-query** is the universal fallback that needs no server capability.
+//! It needs no server capability beyond the schema.
 //!
-//! A scope the pattern cannot carry is never served with a weaker predicate:
-//! the pattern refuses, and the request falls back with a logged reason.
 //! Both directions are collected as one union rather than two membership
 //! tests under a disjunction — `id IN (out) OR id IN (inc)` cannot drive an
 //! index from two hashed subplans.
@@ -21,91 +17,23 @@ use graph_storage_sdk::plugin_api::{
     EngineCursor, ExpandRequest, ExpandResponse, GraphEngineError, GraphEngineV1, HopBackend,
     PathResponse, PatternRequest, PatternResponse, ShortestPathRequest, StoreCtx,
 };
-use sea_orm::sea_query::{Alias, Expr, ExprTrait as _};
-use sea_orm::{ColumnTrait, Condition, EntityTrait, FromQueryResult};
+use sea_orm::{ColumnTrait, Condition, EntityTrait};
 use toolkit_db::secure::{DBRunner, ScopeError, SecureEntityExt};
-use toolkit_security::AccessScope;
 use tracing::warn;
 
-use crate::config::HopStrategy;
 use crate::infra::logged;
 use crate::infra::projections::{
     EdgeHop, EndpointPair, NodeIdent, TypeId, TypeName, edge_hop_columns, endpoint_pair_columns,
     node_ident_columns, type_id_columns, type_name_columns,
 };
 use crate::infra::storage::entity::{edge, gts_type, node};
-use crate::infra::storage::graph::KnowledgeGraph;
 use crate::infra::store::PgGraphStore;
-
-/// Whether this server can actually serve `GRAPH_TABLE` over the declared
-/// property graph.
-///
-/// A gear cannot ask the catalog — the secure ORM's runner is sealed, on
-/// purpose — but it does not need to: the capability that matters is not "what
-/// major is this" but "will a pattern over `kb` execute here", and that is
-/// answered by attempting one. The probe runs the same builder every hop uses,
-/// under a scope that matches no rows, so it costs one empty result set and
-/// proves exactly the thing the hop depends on.
-///
-/// Called once at init. On a server without the property graph — `PostgreSQL` 16,
-/// or 19 where the conditional migration skipped the DDL — this returns
-/// `false` and every hop is served by the fallback backend, which is what
-/// ADR-0001 promises. Without it the gear would attempt a pattern per request
-/// and answer `500` on a configuration the specification calls supported.
-/// A capability that goes away *after* init is not re-probed: the request
-/// that meets the failure records it on the store (`PgGraphStore::pgq_lost`).
-pub async fn probe_pgq(db: &toolkit_db::secure::Db) -> bool {
-    let Ok(conn) = db.conn() else {
-        warn!("cannot probe SQL/PGQ: no connection; assuming it is unavailable");
-        return false;
-    };
-    // A tenant that owns nothing: the statement plans and runs, and returns
-    // no rows, so this observes the server's ability to parse and execute the
-    // pattern rather than any tenant's data.
-    let scope = AccessScope::for_tenant(uuid::Uuid::nil());
-    let probe: Result<Vec<Reached>, _> = node::Entity::find()
-        .secure()
-        .scope_with(&scope)
-        .with_graph::<KnowledgeGraph>()
-        .match_path(|p| {
-            p.vertex::<node::Entity>("a")
-                .edge_to::<edge::Entity>("e")
-                .to::<node::Entity>("b")
-        })
-        .column("b", "id", "neighbour")
-        .limit(1)
-        .all_as(&conn)
-        .await;
-
-    match probe {
-        Ok(_) => true,
-        Err(error) => {
-            warn!(
-                error = %logged(&error),
-                "this server does not serve SQL/PGQ over the declared property graph; \
-                 every hop will use the two-query backend"
-            );
-            false
-        }
-    }
-}
 
 /// What a hop says when a dependency failed it. The dependency's own text is
 /// logged where it failed and does not travel: an error message is read by
 /// the caller and logged again at the edge, and a server's diagnostic is
 /// neither bounded nor free of control characters.
 const NO_CONNECTION: &str = "the database gave no connection; the reason is in the gear's log";
-const PATTERN_DID_NOT_EXECUTE: &str =
-    "the pattern statement did not execute; the reason is in the gear's log";
-
-/// What one attempt at the pattern hop produced.
-enum PatternOutcome {
-    Answered(ExpandResponse),
-    /// The pattern did not execute here. What the request does with that is
-    /// the configuration's call -- served by the two-query hop under `auto`,
-    /// refused under `pgq` -- and the store learns of the loss either way.
-    Unavailable(String),
-}
 
 pub struct PgGraphEngine {
     store: Arc<PgGraphStore>,
@@ -115,32 +43,6 @@ impl PgGraphEngine {
     #[must_use]
     pub fn new(store: Arc<PgGraphStore>) -> Self {
         Self { store }
-    }
-
-    /// The backend a request will actually use, given configuration and what
-    /// the server can parse.
-    /// The backend this configuration resolves to on this server.
-    ///
-    /// `auto` falls back without a word per hop: on the `PostgreSQL` 16
-    /// baseline that is the normal path, and readiness already reports it.
-    /// `pgq` does not fall back at all. The gear does not substitute another
-    /// backend for one an operator asked for by name -- silently changing
-    /// traversal semantics would hide a deployment error -- so readiness
-    /// reports the deployment not ready, and a caller that reaches the engine
-    /// anyway (the in-process client does not pass through the readiness
-    /// gate) is refused with the reason.
-    fn effective_backend(&self) -> Result<HopBackend, GraphEngineError> {
-        let available = self.store.pgq_available();
-        match self.store.config().traversal_hop {
-            HopStrategy::Auto | HopStrategy::Pgq if available => Ok(HopBackend::Pattern),
-            HopStrategy::Auto | HopStrategy::TwoQuery => Ok(HopBackend::TwoQuery),
-            HopStrategy::Pgq => Err(GraphEngineError::Unavailable {
-                reason: "traversal_hop is `pgq` and this server does not provide SQL/PGQ; \
-                         set it to `auto` or `two_query`, or run on PostgreSQL 19 with the \
-                         property-graph migration applied"
-                    .to_owned(),
-            }),
-        }
     }
 }
 
@@ -201,16 +103,13 @@ impl GraphEngineV1 for PgGraphEngine {
                 what: "per-hop label filters",
             });
         }
-        // Nothing is walked on either of these paths, so the backend named is
-        // the one that would have walked it.
-        let would_serve = self.effective_backend()?;
         if req.frontier.is_empty() {
             return Ok(ExpandResponse {
                 reached: Vec::new(),
                 degrees: Vec::new(),
                 edges: Vec::new(),
                 truncated: None,
-                served_by: would_serve,
+                served_by: HopBackend::TwoQuery,
             });
         }
         if req.frontier.len() as u64 > u64::from(req.budget.max_frontier) {
@@ -219,55 +118,11 @@ impl GraphEngineV1 for PgGraphEngine {
                 degrees: Vec::new(),
                 edges: Vec::new(),
                 truncated: Some(TruncationReason::FrontierCap),
-                served_by: would_serve,
+                served_by: HopBackend::TwoQuery,
             });
         }
 
-        match self.effective_backend()? {
-            HopBackend::Pattern => match expand_pgq(&self.store, ctx, &req).await {
-                Ok(PatternOutcome::Answered(response)) => Ok(response),
-                // The pattern stopped executing after the probe said it
-                // would: the property graph is gone, or the server was
-                // replaced under the gear. The store records the loss, so
-                // readiness reports it from now on -- the probe at init was
-                // the last time anyone asked -- and this request gets what
-                // the configuration says. `auto` preferred the pattern and
-                // is served by the two-query hop with the reason logged;
-                // `pgq` demanded it and is refused, exactly as it would be
-                // after a restart, rather than quietly served by a backend
-                // the operator did not name. A refusal that readiness still
-                // called healthy was the gap.
-                Ok(PatternOutcome::Unavailable(reason)) => {
-                    self.store.pgq_lost();
-                    match self.store.config().traversal_hop {
-                        HopStrategy::Pgq => Err(GraphEngineError::Unavailable {
-                            reason: format!(
-                                "traversal_hop is `pgq` and the declared property graph stopped \
-                                 answering a pattern: {reason}; readiness reports it, and no \
-                                 other backend is substituted for one configured by name"
-                            ),
-                        }),
-                        HopStrategy::Auto | HopStrategy::TwoQuery => {
-                            warn!(
-                                reason = %reason,
-                                "graph pattern did not execute; serving the two-query hop, and \
-                                 readiness reports the loss from now on"
-                            );
-                            expand_two_query(&self.store, ctx, &req).await
-                        }
-                    }
-                }
-                // A scope the pattern cannot enforce is about this request,
-                // not the server: the two-query hop answers it under either
-                // strategy, with the reason logged (DESIGN § 2.2).
-                Err(GraphEngineError::ScopeNotEnforceable { reason }) => {
-                    warn!(reason = %reason, "graph pattern refused this scope; serving the two-query hop");
-                    expand_two_query(&self.store, ctx, &req).await
-                }
-                Err(other) => Err(other),
-            },
-            HopBackend::TwoQuery => expand_two_query(&self.store, ctx, &req).await,
-        }
+        expand_two_query(&self.store, ctx, &req).await
     }
 
     async fn shortest_path(
@@ -289,11 +144,6 @@ impl GraphEngineV1 for PgGraphEngine {
             what: "match_pattern",
         })
     }
-}
-
-#[derive(Debug, FromQueryResult)]
-struct Reached {
-    neighbour: i64,
 }
 
 /// Interned ids of the requested edge types, or `None` for "any type".
@@ -318,139 +168,11 @@ async fn edge_type_ids(
     Ok(Some(rows.into_iter().map(|r| r.id).collect()))
 }
 
-/// One-statement hop through `GRAPH_TABLE`, anchored on the frontier.
-///
-/// The pattern is a candidate producer (ADR-0005): it carries the caller's
-/// scope on every element, and the edge rows are then read back through an
-/// ordinary scoped query, which is where the tombstone and edge-type filters
-/// live — a column outside the element's `PROPERTIES` is invisible to
-/// `MATCH`, so `deleted_at` cannot be expressed there.
-async fn expand_pgq(
-    store: &PgGraphStore,
-    ctx: &StoreCtx<'_>,
-    req: &ExpandRequest,
-) -> Result<PatternOutcome, GraphEngineError> {
-    let conn = store.db().conn().map_err(|error| {
-        warn!(error = %logged(&error), "the database gave the hop no connection");
-        GraphEngineError::Unavailable {
-            reason: NO_CONNECTION.to_owned(),
-        }
-    })?;
-
-    let anchor_correlation = |variable: &'static str| {
-        Condition::all()
-            .add(
-                Expr::col((Alias::new(variable), Alias::new("tenant_id")))
-                    .eq(Expr::col((Alias::new("node"), Alias::new("tenant_id")))),
-            )
-            .add(
-                Expr::col((Alias::new(variable), Alias::new("id")))
-                    .eq(Expr::col((Alias::new("node"), Alias::new("id")))),
-            )
-    };
-
-    let mut reached: Vec<i64> = Vec::new();
-
-    // Outgoing and incoming are two directed patterns; their results are
-    // unioned here rather than expressed as a disjunction in one statement.
-    for direction in directions_of(req.direction) {
-        let rows: Result<Vec<Reached>, ScopeError> = {
-            let select = node::Entity::find()
-                .secure()
-                .scope_with(ctx.scope)
-                .with_graph::<KnowledgeGraph>();
-            let select = match direction {
-                // `correlate_with_anchor` is what keeps the anchor query in
-                // the FROM. It is no longer inferred from `where_`, and this
-                // predicate names the anchor's own columns, so without the
-                // opt-in the pattern would reference a relation that is not
-                // there -- and the failure would look like "this server has no
-                // property graph", quietly costing every traversal its
-                // single-statement path.
-                Direction::Outgoing => select.match_path(|p| {
-                    p.vertex::<node::Entity>("a")
-                        .where_(anchor_correlation("a"))
-                        .correlate_with_anchor()
-                        .edge_to::<edge::Entity>("e")
-                        .to::<node::Entity>("b")
-                }),
-                _ => select.match_path(|p| {
-                    p.vertex::<node::Entity>("a")
-                        .where_(anchor_correlation("a"))
-                        .correlate_with_anchor()
-                        .edge_from::<edge::Entity>("e")
-                        .to::<node::Entity>("b")
-                }),
-            };
-            select
-                .column("b", "id", "neighbour")
-                .filter(Condition::all().add(node::Column::Id.is_in(req.frontier.clone())))
-                .filter(Condition::all().add(node::Column::DeletedAt.is_null()))
-                .limit(u64::from(req.budget.max_frontier) + 1)
-                .all_as(&conn)
-                .await
-        };
-        let rows = match rows {
-            Ok(rows) => rows,
-            // Two refusals are re-raised rather than treated as "this server
-            // cannot serve the pattern": an unresolved scope property is about
-            // *this* caller and its reason must survive, and a syntax refusal
-            // is a malformed declaration of ours that falling back would hide
-            // for as long as nobody looks.
-            Err(
-                error @ (ScopeError::UnresolvedScopeProperty { .. } | ScopeError::GraphSyntax(_)),
-            ) => {
-                return Err(scope_error(error));
-            }
-            // Anything else the pattern statement did — most often that this
-            // server has no property graph at all, because the conditional
-            // migration skipped the DDL on a major below 19 — means the
-            // pattern cannot serve the request here.
-            // The server's own text is logged here, once, and does not
-            // travel: it is a dependency's words, and they used to reach the
-            // refusal's reason and be logged again unescaped at the REST edge.
-            Err(error) => {
-                warn!(error = %logged(&error), "the pattern statement did not execute");
-                return Ok(PatternOutcome::Unavailable(
-                    PATTERN_DID_NOT_EXECUTE.to_owned(),
-                ));
-            }
-        };
-        reached.extend(rows.into_iter().map(|r| r.neighbour));
-    }
-
-    reached.sort_unstable();
-    reached.dedup();
-
-    // The pattern embedded the caller's scope on every element, so its
-    // candidates are authorized. What it could not express are the columns
-    // outside the elements' `PROPERTIES` — `deleted_at` and the interned edge
-    // type — so an ordinary scoped read applies those and produces the edges.
-    let incidence = live_edges(ctx, &conn, req, Some(&reached)).await?;
-
-    Ok(PatternOutcome::Answered(ExpandResponse {
-        truncated: hop_truncation(req, &incidence),
-        reached: incidence.reached,
-        degrees: incidence.degrees,
-        edges: incidence.edges,
-        served_by: HopBackend::Pattern,
-    }))
-}
-
-fn directions_of(direction: Direction) -> Vec<Direction> {
-    match direction {
-        Direction::Outgoing => vec![Direction::Outgoing],
-        Direction::Incoming => vec![Direction::Incoming],
-        Direction::Either => vec![Direction::Outgoing, Direction::Incoming],
-    }
-}
-
 /// The scoped, tombstone-free edge rows incident to the frontier, and the far
 /// endpoints reached through them.
 ///
-/// `candidates`, when present, restricts the far side to a set a pattern
-/// already authorized; when absent every far endpoint is authorized here by
-/// the scoped node read, which is the two-query hop's second query.
+/// Every far endpoint is authorized by the scoped node read, which is the
+/// two-query hop's second query.
 /// One hop's incident edges and the authorized far endpoints they reach,
 /// plus whether the edge-scan budget cut the scan short.
 struct Incidence {
@@ -469,7 +191,6 @@ async fn live_edges(
     ctx: &StoreCtx<'_>,
     runner: &impl DBRunner,
     req: &ExpandRequest,
-    candidates: Option<&[i64]>,
 ) -> Result<Incidence, GraphEngineError> {
     let type_ids = edge_type_ids(ctx, runner, req.edge_types.as_ref()).await?;
 
@@ -497,22 +218,6 @@ async fn live_edges(
         select =
             select.filter(Condition::all().add(edge::Column::GtsEdgeTypeId.is_in(ids.clone())));
     }
-    if let Some(candidates) = candidates {
-        if candidates.is_empty() {
-            return Ok(Incidence {
-                edges: Vec::new(),
-                reached: Vec::new(),
-                degrees: Vec::new(),
-                over_edge_budget: false,
-            });
-        }
-        // Only edges whose far endpoint survived the pattern's scope.
-        let far = Condition::any()
-            .add(edge::Column::DstNodeId.is_in(candidates.to_vec()))
-            .add(edge::Column::SrcNodeId.is_in(candidates.to_vec()));
-        select = select.filter(far);
-    }
-
     // One row past the budget, so the difference between "exactly the budget"
     // and "more than the budget" is observable; the extra row is then dropped.
     let mut rows: Vec<EdgeHop> = select
@@ -678,9 +383,6 @@ async fn degrees_of(
 /// Two scoped queries: the incident live edges, then the authorized far
 /// endpoints. Needs no server capability and serves every scope shape.
 ///
-/// It shares its second query with the pattern hop — the two backends differ
-/// only in where the candidate set comes from, which is what lets the parity
-/// tests hold them to byte-identical answers.
 async fn expand_two_query(
     store: &PgGraphStore,
     ctx: &StoreCtx<'_>,
@@ -693,7 +395,7 @@ async fn expand_two_query(
         }
     })?;
 
-    let incidence = live_edges(ctx, &conn, req, None).await?;
+    let incidence = live_edges(ctx, &conn, req).await?;
 
     Ok(ExpandResponse {
         truncated: hop_truncation(req, &incidence),

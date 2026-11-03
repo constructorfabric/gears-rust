@@ -6,24 +6,24 @@ use http::header::{AUTHORIZATION, HeaderName};
 use http::{HeaderValue, Request, Response};
 use tower::{Layer, Service};
 
-use super::token::Token;
+use super::token::TokenProvider;
 use toolkit_http::HttpError;
 
 /// Tower layer that injects a bearer token into outbound HTTP requests.
 ///
-/// Wraps an [`Token`] handle and sets the `Authorization: Bearer <token>`
+/// Wraps a [`TokenProvider`] handle and sets the `Authorization: Bearer <token>`
 /// header (or a custom header) on every request before forwarding it to the
 /// inner service.
 #[derive(Clone, Debug)]
 pub struct BearerAuthLayer {
-    token: Token,
+    token: TokenProvider,
     header_name: HeaderName,
 }
 
 impl BearerAuthLayer {
     /// Create a layer that injects `Authorization: Bearer <token>`.
     #[must_use]
-    pub fn new(token: Token) -> Self {
+    pub fn new(token: TokenProvider) -> Self {
         Self {
             token,
             header_name: AUTHORIZATION,
@@ -32,7 +32,7 @@ impl BearerAuthLayer {
 
     /// Create a layer that injects `<header_name>: Bearer <token>`.
     #[must_use]
-    pub fn with_header_name(token: Token, header_name: HeaderName) -> Self {
+    pub fn with_header_name(token: TokenProvider, header_name: HeaderName) -> Self {
         Self { token, header_name }
     }
 }
@@ -56,7 +56,7 @@ impl<S> Layer<S> for BearerAuthLayer {
 #[derive(Clone, Debug)]
 pub struct BearerAuthService<S> {
     inner: S,
-    token: Token,
+    token: TokenProvider,
     header_name: HeaderName,
 }
 
@@ -79,28 +79,22 @@ where
     }
 
     fn call(&mut self, mut req: Request<B>) -> Self::Future {
-        let mut bearer_value = match self.token.get() {
-            Ok(secret) => {
-                let raw = zeroize::Zeroizing::new(format!("Bearer {}", secret.expose()));
-                match HeaderValue::from_str(&raw) {
-                    Ok(v) => v,
-                    Err(e) => return Box::pin(async { Err(HttpError::InvalidHeaderValue(e)) }),
-                }
-            }
-            Err(e) => {
-                return Box::pin(async { Err(HttpError::Transport(Box::new(e))) });
-            }
-        };
-        bearer_value.set_sensitive(true);
-
-        req.headers_mut()
-            .insert(self.header_name.clone(), bearer_value);
-
-        // Clone-swap pattern (Tower Service contract).
+        let token = self.token.clone();
+        let header_name = self.header_name.clone();
+        // Move the service whose readiness was established by poll_ready.
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-
-        Box::pin(async move { inner.call(req).await })
+        Box::pin(async move {
+            let secret = token
+                .get()
+                .await
+                .map_err(|e| HttpError::Transport(Box::new(e)))?;
+            let raw = zeroize::Zeroizing::new(format!("Bearer {}", secret.expose()));
+            let mut value = HeaderValue::from_str(&raw).map_err(HttpError::InvalidHeaderValue)?;
+            value.set_sensitive(true);
+            req.headers_mut().insert(header_name, value);
+            inner.call(req).await
+        })
     }
 }
 
@@ -186,6 +180,7 @@ mod tests {
 
     // -- header injection -----------------------------------------------------
 
+    /// An idle provider acquires a token before the layer sends its first request.
     #[tokio::test]
     async fn injects_authorization_header() {
         let server = MockServer::start();
@@ -197,7 +192,7 @@ mod tests {
                 .body(token_json("tok-layer-test", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
         let inner = CaptureHeaderService {
             expected_header: AUTHORIZATION,
             expected_value: "Bearer tok-layer-test".into(),
@@ -215,6 +210,7 @@ mod tests {
         Service::call(&mut svc, req).await.unwrap();
     }
 
+    /// The plain layer supports a custom credential header.
     #[tokio::test]
     async fn custom_header_name() {
         let server = MockServer::start();
@@ -226,7 +222,8 @@ mod tests {
                 .body(token_json("tok-custom-hdr", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         let custom_header = HeaderName::from_static("x-api-key");
         let inner = CaptureHeaderService {
             expected_header: custom_header.clone(),
@@ -247,6 +244,7 @@ mod tests {
 
     // -- error path -----------------------------------------------------------
 
+    /// An expired cached token is never sent when replacement fails.
     #[tokio::test]
     async fn returns_error_when_token_expired() {
         let server = MockServer::start();
@@ -259,7 +257,8 @@ mod tests {
                 .body(token_json("tok-short-lived", 2));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         assert_eq!(success_mock.calls(), 1);
 
         // Remove the success mock; refresh attempts will now fail.
@@ -297,6 +296,7 @@ mod tests {
 
     // -- debug safety ---------------------------------------------------------
 
+    /// Layer debugging never exposes its provider's cached bearer value.
     #[tokio::test]
     async fn token_value_not_in_debug() {
         let server = MockServer::start();
@@ -308,7 +308,8 @@ mod tests {
                 .body(token_json("super-secret-layer", 3600));
         });
 
-        let token = Token::new(test_config(&server)).await.unwrap();
+        let token = TokenProvider::new(test_config(&server)).unwrap();
+        token.get().await.unwrap();
         let layer = BearerAuthLayer::new(token);
         let dbg = format!("{layer:?}");
 

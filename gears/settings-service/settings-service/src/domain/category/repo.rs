@@ -1,4 +1,3 @@
-// Created: 2026-08-13 by Virtuozzo International GmbH
 //! The category repository contract.
 //!
 //! Declared in the domain and implemented in `infra`, so the service depends on

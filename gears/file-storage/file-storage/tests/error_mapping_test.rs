@@ -7,8 +7,8 @@ use file_storage::domain::error::DomainError;
 use toolkit::api::canonical_prelude::CanonicalError;
 use uuid::Uuid;
 
-/// Number of `DomainError` variants; a backstop for `all_variant_instances` staying in sync.
-const EXPECTED_VARIANT_COUNT: usize = 24;
+/// Guards `expected_status` and `all_variant_instances` against a new variant being forgotten.
+const EXPECTED_VARIANT_COUNT: usize = 26;
 
 /// Expected HTTP status per variant, per the canonical-error taxonomy (`status_code()`).
 /// No wildcard arm on purpose.
@@ -23,7 +23,9 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::PolicyMimeNotAllowed { .. }
         | DomainError::PolicySizeExceeded { .. }
         | DomainError::PolicyMetadataExceeded { .. }
-        | DomainError::MultipartNotSupported { .. } => 400,
+        | DomainError::MultipartNotSupported { .. }
+        // Delegated to `toolkit_odata`: every cursor failure is `InvalidArgument` -> 400.
+        | DomainError::Pagination(_) => 400,
         DomainError::TokenInvalid { .. } | DomainError::Forbidden => 403,
         DomainError::FileNotFound { .. }
         | DomainError::VersionNotFound { .. }
@@ -34,6 +36,7 @@ fn expected_status(err: &DomainError) -> u16 {
         | DomainError::MultipartPartsMissing { .. }
         | DomainError::VersionedFileMigrationNotSupported { .. } => 409,
         DomainError::QuotaExceeded { .. } => 429,
+        DomainError::BackendUnavailable { .. } => 503,
         DomainError::Database { .. } | DomainError::Backend { .. } | DomainError::InternalError => {
             500
         }
@@ -52,6 +55,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         },
         DomainError::Database {
             message: "db down".into(),
+            source: None,
         },
         DomainError::Validation {
             field: "name".into(),
@@ -77,6 +81,10 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::Backend {
             backend_id: "s3".into(),
             message: "put failed".into(),
+        },
+        DomainError::BackendUnavailable {
+            backend_id: "s3".into(),
+            message: "timeout".into(),
         },
         DomainError::UnknownBackend {
             backend_id: "nope".into(),
@@ -116,6 +124,7 @@ fn all_variant_instances() -> Vec<DomainError> {
         DomainError::VersionedFileMigrationNotSupported {
             file_id: Uuid::nil(),
         },
+        DomainError::Pagination(toolkit_odata::Error::InvalidCursor),
     ]
 }
 
@@ -172,4 +181,25 @@ fn declared_routes_match_the_pinned_status_table() {
             "{operation_id}'s declared route status must be 400 per the 2.5 fix"
         );
     }
+}
+
+/// A transient backend failure is a `503` carrying `Retry-After: 5` on the wire.
+#[test]
+fn backend_unavailable_maps_to_503_with_retry_after() {
+    use axum::response::IntoResponse;
+
+    let canonical: CanonicalError = DomainError::BackendUnavailable {
+        backend_id: "s3".into(),
+        message: "timeout".into(),
+    }
+    .into();
+    let response = toolkit::api::canonical_prelude::Problem::from(canonical).into_response();
+    assert_eq!(response.status().as_u16(), 503);
+    assert_eq!(
+        response
+            .headers()
+            .get(axum::http::header::RETRY_AFTER)
+            .expect("Retry-After header"),
+        "5"
+    );
 }

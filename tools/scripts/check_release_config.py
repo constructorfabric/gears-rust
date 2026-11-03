@@ -18,7 +18,8 @@ Three invariants, all of which have broken a real release before:
        not inert: the crate inherits the `[workspace]` defaults and silently
        starts writing its own changelog section and its own Release page.
      - `gears/**` gets its own changelog section and Release from those same
-       defaults, so it must have no entry at all.
+       defaults, so it must have no entry, except one that sets nothing but
+       `semver_check` (an opt-out for a crate the check cannot build).
      - A crate with `publish = false` in its manifest is skipped by release-plz
        entirely, so an entry for it is dead config -- UNLESS the entry sets
        `git_only = true`, which makes release-plz version-manage and git-tag it
@@ -60,6 +61,10 @@ FRAMEWORK_RELEASE_CRATE = "cf-gears-toolkit"
 
 # Flags a folded-in `libs/**` crate must set, and the values it must set them to.
 FOLDED_IN_FLAGS = {"changelog_update": False, "git_release_enable": False}
+
+# The only keys a `gears/**` entry may set: everything else comes from the
+# [workspace] defaults.
+GEARS_ENTRY_KEYS = {"name", "semver_check"}
 
 
 def is_release_target(package: dict) -> bool:
@@ -243,10 +248,11 @@ def check_release_plz(config: dict, crates: Dict[str, dict]) -> List[str]:
                 f"release-plz.toml: entry for `{name}` sets `publish` -> the Cargo "
                 f"manifest is the only source of truth for that, remove the key"
             )
-        if info["area"] == "gears":
+        if info["area"] == "gears" and not set(entry) <= GEARS_ENTRY_KEYS:
             problems.append(
                 f"release-plz.toml: entry for `{name}` ({info['rel_path']}) -> crates "
-                f"under gears/** inherit the [workspace] defaults, remove the entry"
+                f"under gears/** inherit the [workspace] defaults, remove the entry "
+                f"(only `semver_check` may be set)"
             )
 
     for name, info in sorted(crates.items()):

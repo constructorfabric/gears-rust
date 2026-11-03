@@ -258,10 +258,29 @@ class LibraryConsumerTests(unittest.TestCase):
         (self.project / "Makefile").write_text(CONSUMER_DRIVER, encoding="utf-8")
         (self.project / "my-gear.mk").write_text(CONSUMER_LOCAL, encoding="utf-8")
 
-    def make(self, *arguments):
+    def make(self, *arguments, env=None):
         return subprocess.run([MAKE, "--no-print-directory", 'PYTHON_BOOTSTRAP="' + Path(sys.executable).as_posix() + '"',
-                               *arguments], cwd=self.project, env=clean_env(), text=True, encoding="utf-8", errors="replace",
+                               *arguments], cwd=self.project, env=clean_env() if env is None else env, text=True, encoding="utf-8", errors="replace",
                               capture_output=True)
+
+    def test_preinstalled_tools_checks_each_executable_without_installing(self):
+        bin_dir = self.project / "bin"
+        bin_dir.mkdir()
+        suffix = ".exe" if os.name == "nt" else ""
+        for tool in ("fixture-first", "fixture-second"):
+            executable = bin_dir / f"cargo-{tool}{suffix}"
+            shutil.copyfile(sys.executable, executable)
+            executable.chmod(0o755)
+        env = clean_env()
+        env["PATH"] = str(bin_dir) + os.pathsep + env.get("PATH", "")
+        present = self.make("install-tools", "CI_PREINSTALLED_TOOLS=fixture-first fixture-second", env=env)
+        self.assertEqual(present.returncode, 0, present.stdout + present.stderr)
+        self.assertNotIn("Installing", present.stdout)
+        for tools in ("fixture-missing fixture-second", "fixture-first fixture-missing"):
+            with self.subTest(tools=tools):
+                missing = self.make("install-tools", f"CI_PREINSTALLED_TOOLS={tools}", env=env)
+                self.assertNotEqual(missing.returncode, 0, missing.stdout + missing.stderr)
+                self.assertIn("cargo-fixture-missing is not installed", missing.stdout + missing.stderr)
 
     def test_help_lists_library_and_project_targets(self):
         result = self.make("help")

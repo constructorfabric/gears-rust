@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 //! The adapter against a store that behaves like credstore's client: entries
 //! keyed by tenant, owner and reference, create-only conflicts, existence
 //! preconditions.

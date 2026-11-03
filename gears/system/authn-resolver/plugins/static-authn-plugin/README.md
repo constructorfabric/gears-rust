@@ -37,6 +37,24 @@ gears:
       tokens: []                      # populated in static_tokens mode
 ```
 
+### Secrets from the environment
+
+`tokens[].token`, `s2s_credentials[].client_secret` and
+`s2s_credentials[].bearer_token` expand `${NAME}` and `${NAME:-default}` from the
+environment when the plugin starts, as other plugins' secret fields do (static
+credstore, Keycloak). An unset variable without a default fails startup.
+
+A literal value is therefore read as a placeholder when it contains `${` followed
+by a variable name and `}`. There is no escape syntax: to use such a value
+literally, put it in an environment variable and reference that. An expanded
+value is never expanded again.
+
+```yaml
+      tokens:
+        - token: "${E2E_ADMIN_TOKEN}"
+          identity: { subject_id: "...", subject_tenant_id: "...", token_scopes: ["*"] }
+```
+
 ## Feature Flag
 
 The server binary includes this plugin only when built with the `static-authn` feature:

@@ -1,7 +1,7 @@
 [package]
 name = "cf-gears-github-mirror"
-version = "0.1.0"
-publish = false
+version = "0.1.2"
+publish = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,15 +19,21 @@ name = "github_mirror"
 [lints]
 workspace = true
 
+[features]
+integration = ["toolkit-db/pg", "toolkit-db/mysql"]
+
 [dependencies]
-github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.1.0", path = "../github-mirror-sdk" }
+github-mirror-sdk = { package = "cf-gears-github-mirror-sdk", version = "0.2.2", path = "../github-mirror-sdk" }
 
 authz-resolver-sdk = { workspace = true }
 authz-resolver = { workspace = true }
+credstore-sdk = { workspace = true }
+credstore = { workspace = true }
 
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+opentelemetry = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -44,6 +50,7 @@ toolkit = { workspace = true }
 toolkit-canonical-errors = { workspace = true }
 toolkit-db = { workspace = true, features = ["sqlite"] }
 toolkit-db-macros = { workspace = true }
+toolkit-gts = { workspace = true }
 toolkit-macros = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
@@ -53,13 +60,14 @@ strum = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-aws-lc-rs = { workspace = true }
 hex = { workspace = true }
 flate2 = { workspace = true }
 url = { workspace = true }
 
 [dev-dependencies]
 httpmock = { workspace = true }
+tempfile = { workspace = true }
+credstore-sdk = { workspace = true, features = ["test-util"] }
 tokio = { workspace = true, features = ["test-util"] }
 tokio-util = { workspace = true }
 tower = { workspace = true, features = ["util"] }
@@ -68,3 +76,4 @@ uuid = { workspace = true }
 toolkit-odata = { workspace = true, features = ["with-utoipa"] }
 toolkit-security = { workspace = true }
 async-trait = { workspace = true }
+tracing-subscriber = { workspace = true }

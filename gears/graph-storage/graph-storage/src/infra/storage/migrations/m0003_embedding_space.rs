@@ -9,8 +9,7 @@
 //! UUID. The table is deployment-wide, so DESIGN gives it no tenant column,
 //! but every runtime read in this gear goes through the secure ORM and needs a
 //! scopable entity. `graph_meta` already carries deployment-level keys the
-//! same way, and `probe_pgq` already reads under a nil-tenant scope, so this
-//! is the gear's existing device rather than a new one. Recorded in
+//! same way, so this is the gear's existing device rather than a new one. Recorded in
 //! the note on the `embedding_space` table in DESIGN § 3.7.
 
 use sea_orm_migration::prelude::*;

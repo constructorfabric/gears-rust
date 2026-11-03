@@ -1,0 +1,70 @@
+error[E0277]: the trait bound `u32: CheckpointReference` is not satisfied
+ --> tests/ui/wrong_checkpoint.rs:3:47
+  |
+3 |     let _:u32 = client.step_result(ctx,handle,&42u32).await.unwrap();
+  |                        -----------            ^^^^^^ the trait `CheckpointReference` is not implemented for `u32`
+  |                        |
+  |                        required by a bound introduced by this call
+  |
+help: the following other types implement trait `CheckpointReference`
+ --> src/workflow.rs
+  |
+  | impl<T: Payload> CheckpointReference for StepRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `StepRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for ParallelStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ParallelStageRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for FanOutStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `FanOutStageRef<T>`
+note: required by a bound in `toolkit_durable_execution::ExecutionClient::step_result`
+ --> src/client.rs
+  |
+  |     pub async fn step_result<I, O, R: CheckpointReference>(
+  |                                       ^^^^^^^^^^^^^^^^^^^ required by this bound in `ExecutionClient::step_result`
+
+error[E0277]: the trait bound `u32: CheckpointReference` is not satisfied
+ --> tests/ui/wrong_checkpoint.rs:3:17
+  |
+3 |     let _:u32 = client.step_result(ctx,handle,&42u32).await.unwrap();
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `CheckpointReference` is not implemented for `u32`
+  |
+help: the following other types implement trait `CheckpointReference`
+ --> src/workflow.rs
+  |
+  | impl<T: Payload> CheckpointReference for StepRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `StepRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for ParallelStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ParallelStageRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for FanOutStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `FanOutStageRef<T>`
+note: required by a bound in `toolkit_durable_execution::ExecutionClient::step_result`
+ --> src/client.rs
+  |
+  |     pub async fn step_result<I, O, R: CheckpointReference>(
+  |                                       ^^^^^^^^^^^^^^^^^^^ required by this bound in `ExecutionClient::step_result`
+
+error[E0277]: the trait bound `u32: CheckpointReference` is not satisfied
+ --> tests/ui/wrong_checkpoint.rs:3:55
+  |
+3 |     let _:u32 = client.step_result(ctx,handle,&42u32).await.unwrap();
+  |                                                       ^^^^^ the trait `CheckpointReference` is not implemented for `u32`
+  |
+help: the following other types implement trait `CheckpointReference`
+ --> src/workflow.rs
+  |
+  | impl<T: Payload> CheckpointReference for StepRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `StepRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for ParallelStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `ParallelStageRef<T>`
+...
+  | impl<T: Payload> CheckpointReference for FanOutStageRef<T> {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `FanOutStageRef<T>`
+note: required by a bound in `toolkit_durable_execution::ExecutionClient::step_result`
+ --> src/client.rs
+  |
+  |     pub async fn step_result<I, O, R: CheckpointReference>(
+  |                                       ^^^^^^^^^^^^^^^^^^^ required by this bound in `ExecutionClient::step_result`

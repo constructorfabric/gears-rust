@@ -58,7 +58,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime
 # ---------------------------------------------------------------------------
-FROM debian:13.7-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a
+FROM debian:13.7-slim@sha256:62bd423aeee912639ca8ee681c2b762cb3e25137e0a92b20be455898a9f034ad
 
 # Default gear config baked into the image; override by mounting a ConfigMap
 # over /app/config/gear.yaml in Kubernetes.

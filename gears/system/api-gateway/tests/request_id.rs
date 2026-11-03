@@ -9,6 +9,7 @@ use axum::{
     routing::get,
 };
 use serde_json::json;
+use std::sync::{Arc, Mutex};
 use tower::util::ServiceExt; // for `oneshot`
 
 use api_gateway::middleware::request_id::{MakeReqId, XRequestId, header};
@@ -91,6 +92,90 @@ async fn includes_request_id_in_error_json() {
     assert_eq!(json["error"], "Test error");
     assert_eq!(json["code"], 500);
     assert_eq!(json["request_id"], "error-test-123");
+}
+
+/// Inbound `x-request-id` must reach the handler's `current_request_id()`
+/// through the full gateway layering — the carrier install the cross-gear
+/// correlation depends on.
+#[tokio::test]
+async fn scopes_inbound_request_id_as_carrier() {
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let app = carrier_app(Arc::clone(&captured));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/carrier")
+                .header("x-request-id", "edge-req-1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        captured.lock().unwrap().as_deref(),
+        Some("edge-req-1"),
+        "handler's current_request_id must equal the inbound x-request-id"
+    );
+}
+
+/// With no inbound id, `SetRequestId` mints one; the carrier must hold it,
+/// matching the `x-request-id` echoed on the response.
+#[tokio::test]
+async fn scopes_generated_request_id_as_carrier() {
+    let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let app = carrier_app(Arc::clone(&captured));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/carrier")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let header_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    assert!(header_id.is_some(), "x-request-id should be generated");
+    assert_eq!(
+        *captured.lock().unwrap(),
+        header_id,
+        "handler's current_request_id must equal the generated x-request-id"
+    );
+}
+
+// App that captures the task-local carrier the handler observes, built the
+// production way so the generated-id path is exercised.
+fn carrier_app(captured: Arc<Mutex<Option<String>>>) -> Router {
+    use axum::middleware::from_fn;
+    use tower_http::request_id::{PropagateRequestIdLayer, SetRequestIdLayer};
+
+    let x_request_id = header();
+
+    Router::new()
+        .route(
+            "/carrier",
+            get(move || {
+                let captured = Arc::clone(&captured);
+                async move {
+                    *captured.lock().unwrap() = toolkit::api::current_request_id();
+                    StatusCode::OK
+                }
+            }),
+        )
+        .layer(from_fn(
+            api_gateway::middleware::request_id::push_req_id_to_extensions,
+        ))
+        .layer(PropagateRequestIdLayer::new(x_request_id.clone()))
+        .layer(SetRequestIdLayer::new(x_request_id, MakeReqId))
 }
 
 // Test app with success and error routes

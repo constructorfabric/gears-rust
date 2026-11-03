@@ -1,5 +1,5 @@
 //! `Storage`'s producer-registration row (backs `ProducerRegistry`,
-//! eb-single-process-implementation D2/decision log entry 28).
+//! eb-single-process-implementation D2).
 //! `tenant_id` is a new field vs. today's in-memory stand-in - captured from
 //! `ctx.subject_tenant_id()` at `register()` time, never overridable, matching
 //! `ConsumerGroup`'s own `tenant_id`/`owner_principal_id` shape.

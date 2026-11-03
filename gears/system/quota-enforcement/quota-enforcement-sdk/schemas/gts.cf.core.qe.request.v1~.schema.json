@@ -9,14 +9,12 @@
     "properties": {
       "metric": {
         "type": "string",
-        "format": "gts-instance-id",
-        "x-gts-ref": "gts.cf.core.qe.metric_type.v1~",
+        "x-gts-instance-ref": "gts.cf.core.qe.metric_type.v1~",
         "description": "The single registered metric governed by this request contract."
       },
       "constraint_contract": {
         "type": "string",
-        "format": "gts-type-id",
-        "x-gts-ref": "gts.cf.core.qe.constraint.v1~",
+        "x-gts-type-ref": "gts.cf.core.qe.constraint.v1~",
         "description": "The concrete arbitration-constraint contract attached to this metric request contract."
       }
     },
@@ -30,8 +28,7 @@
   "properties": {
     "type": {
       "type": "string",
-      "format": "gts-type-id",
-      "x-gts-ref": "gts.cf.core.qe.request.v1~",
+      "x-gts-type-ref": "/$id",
       "description": "The concrete owner-published metric request contract selected by QE; consumers do not supply this type."
     },
     "metadata": {

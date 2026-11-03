@@ -1,0 +1,159 @@
+[
+  {
+    "name": "a-wish-for-detail-is-the-detailed-tone",
+    "profile": [],
+    "record": { "user_says": "Please give me thorough, detailed explanations." },
+    "expect": { "tone_preference": "add" }
+  },
+  {
+    "name": "a-changed-tone-replaces-the-old-one",
+    "profile": [{ "property": "tone_preference", "value": "detailed" }],
+    "record": { "user_says": "Actually, shorter answers work better for me." },
+    "expect": { "tone_preference": "replace" },
+    "gone": [{ "property": "tone_preference", "value": "detailed" }]
+  },
+  {
+    "name": "an-answer-language-is-added-as-a-code",
+    "profile": [],
+    "record": { "user_says": "Please answer me in German from now on." },
+    "expect": { "answer_language": "add" },
+    "holds": [{ "property": "answer_language", "value": "de" }]
+  },
+  {
+    "name": "a-new-answer-language-replaces-the-old-one",
+    "profile": [{ "property": "answer_language", "value": "de" }],
+    "record": { "user_says": "Switch to English answers, please." },
+    "expect": { "answer_language": "replace" },
+    "gone": [{ "property": "answer_language", "value": "de" }]
+  },
+  {
+    "name": "bullet-points-are-a-preferred-format",
+    "profile": [],
+    "record": { "user_says": "I like bullet points much more than long paragraphs." },
+    "expect": { "preferred_format": "add" },
+    "holds": [{ "property": "preferred_format", "value": "bullets" }]
+  },
+  {
+    "name": "a-study-time-is-a-study-window",
+    "profile": [],
+    "record": { "user_says": "I usually study on Tuesdays from 18:00 to 20:00." },
+    "expect": { "study_window": "add" }
+  },
+  {
+    "name": "a-goal-for-this-month-is-short-term",
+    "profile": [],
+    "record": { "user_says": "This month I want to finish the SQL basics course." },
+    "expect": { "short_term_goals": "add" }
+  },
+  {
+    "name": "a-career-goal-is-long-term",
+    "profile": [],
+    "record": { "user_says": "In the long run I'd like to become a data engineer." },
+    "expect": { "long_term_goals": "add" }
+  },
+  {
+    "name": "imperial-units-are-the-unit-preference",
+    "profile": [],
+    "record": { "user_says": "Please use imperial units, feet and pounds." },
+    "expect": { "units": "add" },
+    "holds": [{ "property": "units", "value": "imperial" }]
+  },
+  {
+    "name": "a-citation-style-is-added",
+    "profile": [],
+    "record": { "user_says": "For my papers I always cite in APA style." },
+    "expect": { "citation_style": "add" }
+  },
+  {
+    "name": "a-phone-only-learner-is-mobile-only",
+    "profile": [],
+    "record": { "user_says": "I study only on my phone, I don't have a laptop." },
+    "expect": { "technology_constraint": "add" }
+  },
+  {
+    "name": "a-stopped-notification-is-removed",
+    "profile": [
+      { "property": "notification_type", "value": "weekly_recap" },
+      { "property": "notification_type", "value": "deadlines" }
+    ],
+    "record": { "user_says": "Stop sending me the weekly recap." },
+    "expect": { "notification_type": "remove" },
+    "gone": [{ "property": "notification_type", "value": "weekly_recap" }],
+    "holds": [{ "property": "notification_type", "value": "deadlines" }]
+  },
+  {
+    "name": "a-code-language-is-the-programming-target",
+    "profile": [],
+    "record": { "user_says": "I want all code examples in Java." },
+    "expect": { "programming_language_target": "add" }
+  },
+  {
+    "name": "a-held-tone-in-other-words-is-not-added",
+    "profile": [{ "property": "tone_preference", "value": "concise" }],
+    "record": { "user_says": "Keep it brief, please." }
+  },
+  {
+    "name": "a-request-for-bullets-is-a-format",
+    "profile": [],
+    "record": { "user_says": "Can you use bullet points from now on?" },
+    "expect": { "preferred_format": "add" },
+    "holds": [{ "property": "preferred_format", "value": "bullets" }]
+  },
+  {
+    "name": "a-request-in-german-for-english-answers",
+    "profile": [],
+    "record": { "user_says": "Bitte antworte mir auf Englisch." },
+    "expect": { "answer_language": "add" },
+    "holds": [{ "property": "answer_language", "value": "en" }]
+  },
+  {
+    "name": "high-contrast-is-added",
+    "profile": [],
+    "record": { "user_says": "I prefer high-contrast colors on screen." },
+    "expect": { "high_contrast": "add" }
+  },
+  {
+    "name": "a-weekly-recap-is-a-notification",
+    "profile": [],
+    "record": { "user_says": "Send me a weekly recap of my progress." },
+    "expect": { "notification_type": "add" }
+  },
+  {
+    "name": "a-second-notification-is-added",
+    "profile": [{ "property": "notification_type", "value": "deadlines" }],
+    "record": { "user_says": "Also remind me about quizzes." },
+    "expect": { "notification_type": "add" }
+  },
+  {
+    "name": "theory-first-is-the-presentation-order",
+    "profile": [],
+    "record": { "user_says": "I learn better when you explain the theory before the examples." },
+    "expect": { "presentation_order": "add" }
+  },
+  {
+    "name": "changed-units-replace-the-old-ones",
+    "profile": [{ "property": "units", "value": "imperial" }],
+    "record": { "user_says": "Use metric units, please." },
+    "expect": { "units": "replace" },
+    "gone": [{ "property": "units", "value": "imperial" }]
+  },
+  {
+    "name": "a-study-window-given-up-is-removed",
+    "profile": [{ "property": "study_window", "value": { "day": "sat", "start": "18:00", "end": "20:00" } }],
+    "record": { "user_says": "I can't study on Saturday evenings anymore." },
+    "expect": { "study_window": "remove" },
+    "gone": [{ "property": "study_window", "value": { "day": "sat", "start": "18:00", "end": "20:00" } }]
+  },
+  {
+    "name": "captions-are-added",
+    "profile": [],
+    "record": { "user_says": "I need captions on all videos." },
+    "expect": { "captions": "add" }
+  },
+  {
+    "name": "guiding-questions-are-the-socratic-feedback-style",
+    "profile": [],
+    "record": { "user_says": "I'd rather you guide me with questions than give me the answer." },
+    "expect": { "feedback_style": "add" }
+  }
+]

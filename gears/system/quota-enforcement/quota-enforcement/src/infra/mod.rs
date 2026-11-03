@@ -5,6 +5,7 @@
 
 pub mod canonical_mapping;
 pub mod cluster_coordination;
+pub mod lease_backlog;
 pub mod lifecycle_gauges;
 pub mod metric_registry;
 pub mod metrics;

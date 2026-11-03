@@ -1,6 +1,6 @@
 //! Integration test for the full outbound `OAuth2` client-credentials flow.
 //!
-//! Wires up: mock token endpoint → `Token::new()` → `HttpClient` with bearer
+//! Wires up: mock token endpoint → `TokenProvider::new()` → `HttpClient` with bearer
 //! auth → mock downstream API → verifies the Authorization header is injected.
 
 use std::time::Duration;
@@ -8,7 +8,7 @@ use std::time::Duration;
 use httpmock::prelude::*;
 use toolkit_auth::HttpClientBuilderExt;
 use toolkit_auth::oauth2::config::OAuthClientConfig;
-use toolkit_auth::oauth2::token::Token;
+use toolkit_auth::oauth2::token::TokenProvider;
 use toolkit_utils::SecretString;
 use url::Url;
 
@@ -52,7 +52,8 @@ async fn full_oauth2_bearer_flow() {
         ..Default::default()
     };
 
-    let token = Token::new(config).await.unwrap();
+    let token = TokenProvider::new(config).unwrap();
+    token.get().await.unwrap();
 
     let client = toolkit_http::HttpClientBuilder::new()
         .with_bearer_auth(token)
@@ -124,7 +125,8 @@ async fn full_oauth2_with_oidc_discovery() {
         ..Default::default()
     };
 
-    let token = Token::new(config).await.unwrap();
+    let token = TokenProvider::new(config).unwrap();
+    token.get().await.unwrap();
 
     let client = toolkit_http::HttpClientBuilder::new()
         .with_bearer_auth(token)

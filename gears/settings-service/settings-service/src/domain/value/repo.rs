@@ -1,5 +1,6 @@
-// Created: 2026-09-06 by Virtuozzo International GmbH
 //! Persistence port over `setting_values`.
+
+use std::collections::HashSet;
 
 use async_trait::async_trait;
 use toolkit_db::secure::DBRunner;
@@ -8,7 +9,7 @@ use uuid::Uuid;
 
 use toolkit_odata::Page;
 
-use super::{ReviewRequest, StoredValue, ValueDraft};
+use super::{DistinctValue, ListedValue, ReviewRequest, StoredValue, ValueDraft};
 use crate::domain::error::DomainError;
 
 /// Persistence operations on stored values.
@@ -41,6 +42,64 @@ pub trait ValueRepository: Send + Sync {
         conn: &C,
         scope: &AccessScope,
         declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<StoredValue>, DomainError>;
+
+    /// How many rows of one declaration sit at `tenant_ids` — the count of
+    /// what [`Self::find_in_tenants`] would return, without the rows.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn count_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<u64, DomainError>;
+
+    /// The distinct `(value, classification)` pairs of the rows
+    /// [`Self::find_in_tenants`] would return, each with its multiplicity — one
+    /// grouped read that moves the distinct values, not the rows.
+    ///
+    /// Secret rows (no inline value) form their own groups. A backend that
+    /// groups JSON textually may return one equal value in two groups; the
+    /// caller merges by value.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn distinct_values_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<DistinctValue>, DomainError>;
+
+    /// The tenant, value and classification of the rows
+    /// [`Self::find_in_tenants`] would return, and only those columns.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn list_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_id: Uuid,
+        tenant_ids: &[Uuid],
+    ) -> Result<Vec<ListedValue>, DomainError>;
+
+    /// The rows of several declarations whose tenant is in `tenant_ids` — a
+    /// browse batch's one read, where [`Self::find_in_tenants`] is one
+    /// declaration's.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the read fails.
+    async fn find_many_in_tenants<C: DBRunner>(
+        &self,
+        conn: &C,
+        scope: &AccessScope,
+        declaration_ids: &[Uuid],
         tenant_ids: &[Uuid],
     ) -> Result<Vec<StoredValue>, DomainError>;
 
@@ -77,6 +136,38 @@ pub trait ValueRepository: Send + Sync {
         scope: &AccessScope,
         declaration_id: Uuid,
     ) -> Result<Vec<StoredValue>, DomainError>;
+
+    /// `(tenant_id, secret_ref)` of every row of one declaration that holds a
+    /// secret reference, at any scope and with or without a subject.
+    ///
+    /// Deliberately unscoped: a purge's cascade removes every row whatever the
+    /// caller's scope, so the collect of what to release must see them all.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the database cannot answer.
+    async fn secret_refs<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+    ) -> Result<Vec<(Uuid, String)>, DomainError>;
+
+    /// Which of `refs` a value row of a declaration **other than**
+    /// `declaration_id` still holds.
+    ///
+    /// Deliberately unscoped, for the reason [`Self::secret_refs`] gives: an
+    /// evolution copies a predecessor's references into its successor's rows,
+    /// so a reference can be held by two declarations, and a purge may release
+    /// only what no other row names. The query runs in chunks, so the set of
+    /// references does not bound the statement.
+    ///
+    /// # Errors
+    /// [`DomainError`] when the database cannot answer.
+    async fn references_held_by_others<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration_id: Uuid,
+        refs: &[String],
+    ) -> Result<HashSet<String>, DomainError>;
 
     /// Flag one row for review with the detail that explains it, or clear the
     /// flag when `detail` is `None`.
@@ -166,6 +257,7 @@ pub trait ValueRepository: Send + Sync {
         value: Option<serde_json::Value>,
         secret_ref: Option<String>,
         set_by: &str,
+        set_by_tenant: Option<Uuid>,
         expected: time::OffsetDateTime,
     ) -> Result<StoredValue, DomainError>;
 

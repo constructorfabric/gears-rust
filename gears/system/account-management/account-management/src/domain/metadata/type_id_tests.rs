@@ -43,6 +43,11 @@ fn parse_normalises_leading_trailing_whitespace() {
     let with_ws = format!("   {VALID_TYPE_ID}   ");
     let parsed = ParsedTypeId::parse(&with_ws).expect("ws-padded valid id");
     assert_eq!(parsed.as_str(), VALID_TYPE_ID, "trimmed string stored");
+    assert_eq!(
+        parsed.uuid(),
+        Uuid::parse_str(VALID_SCHEMA_UUID).expect("hardcoded literal"),
+        "surrounding whitespace must not change the schema UUID"
+    );
 }
 
 #[test]

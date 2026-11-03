@@ -1,0 +1,6 @@
+{
+  "id": "gts.cf.toolkit.authz.permission.v1~cf.task_engine._.task_delete.v1",
+  "resource_type": "gts.cf.core.tasks.task.v1~",
+  "action": "delete",
+  "display_name": "Administrative hard-deletion of tasks (reserved)"
+}

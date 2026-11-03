@@ -65,29 +65,7 @@ impl Gear for GraphStorage {
         let db_raw = ctx.db_required()?;
         let db = Arc::new(db_raw.db());
 
-        // SQL/PGQ is a probed backend capability, not a gear requirement:
-        // the property-graph migration is skipped on an older server, and the
-        // engine then serves every hop on the fallback backend.
-        let pgq_available = crate::infra::engine::probe_pgq(&db).await;
-        if !pgq_available {
-            match cfg.traversal_hop {
-                crate::config::HopStrategy::Auto => warn!(
-                    "this server does not provide SQL/PGQ; traversal will use the two-query hop"
-                ),
-                crate::config::HopStrategy::Pgq => error!(
-                    "traversal_hop is `pgq` and this server does not provide SQL/PGQ; the gear \
-                     reports not ready and refuses traversal rather than substitute another \
-                     backend"
-                ),
-                crate::config::HopStrategy::TwoQuery => {}
-            }
-        }
-
-        let store = Arc::new(PgGraphStore::new(
-            Arc::clone(&db),
-            cfg.clone(),
-            pgq_available,
-        ));
+        let store = Arc::new(PgGraphStore::new(Arc::clone(&db), cfg.clone()));
         let engine = Arc::new(PgGraphEngine::new(Arc::clone(&store)));
         let enforcer = PolicyEnforcer::new(ctx.client_hub().get()?);
 
@@ -102,7 +80,7 @@ impl Gear for GraphStorage {
         ctx.client_hub()
             .register::<dyn GraphStorageClientV1>(Arc::new(GraphStorageLocalClient::new(services)));
 
-        info!(pgq_available, "graph-storage gear initialized");
+        info!("graph-storage gear initialized");
         Ok(())
     }
 }

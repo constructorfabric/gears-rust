@@ -1,4 +1,3 @@
-// Created: 2026-09-08 by Virtuozzo International GmbH
 //! What the dialect admits, and what it refuses with a reason.
 
 use super::{is_known, parse};

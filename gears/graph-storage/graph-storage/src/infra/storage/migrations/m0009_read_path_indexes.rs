@@ -1,17 +1,9 @@
 //! Indexes the two hot read paths could not use.
 //!
-//! **The SQL/PGQ hop.** Every edge index is partial on `deleted_at IS NULL`,
-//! and the pattern cannot say `deleted_at IS NULL`: the column is outside the
-//! edge element's `PROPERTIES`, so `MATCH` does not see it, and the tombstone
-//! filter is applied afterwards by an ordinary scoped read. A predicate the
-//! planner never sees cannot license a partial index, so each hop through
-//! `GRAPH_TABLE` read the whole edge table (a parallel sequential scan) to
-//! find a frontier's few edges. Measured on the Studio stand (2026-09-27/28):
-//! 39 / 100 / 144 ms at depth 1 / 2 / 3 against 4 / 6 / 8 ms for the
-//! two-query hop over the same graph, and 537 ms for one hop from a hub of a
-//! 638 000-edge graph. With the endpoint indexes below, not partial, that hop
-//! is an index scan (0.4 ms). The partial ones stay: the two-query hop and
-//! adjacency reads name `deleted_at` and keep using them.
+//! **Edge endpoints, not partial.** Added for the SQL/PGQ hop (gears-rust
+//! #5267), whose pattern could not state `deleted_at IS NULL`. Kept: a read of
+//! `edge` by endpoint that does not name `deleted_at` uses them, and dropping
+//! them is a measured decision of its own.
 //!
 //! **A projection filtered on a payload path.** The statement is `tenant AND
 //! deleted_at IS NULL AND gts_node_type_id IN (…) AND payload @> … ORDER BY

@@ -1,0 +1,25 @@
+//! Canonical persistence entities. All writes go through scoped repositories.
+pub mod acceptance;
+pub mod approval_reflection;
+pub mod audit_checkpoint;
+pub mod audit_checkpoint_member;
+pub mod commercial_attempt;
+pub mod date_policy;
+pub mod draft_content;
+pub mod fulfillment_control;
+pub mod fulfillment_grant;
+pub mod gate_outcome;
+pub mod idempotency;
+pub mod inflight_overlap_claim;
+pub mod line_fulfillment;
+pub mod order;
+pub mod order_admin;
+pub mod order_line;
+pub mod order_line_admin;
+pub mod order_line_identity;
+pub mod order_version;
+pub mod policy_election;
+pub mod read_access_log;
+pub mod resolved_total;
+pub mod state_ttl_policy;
+pub mod transition_audit;

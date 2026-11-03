@@ -1,4 +1,3 @@
-// Created: 2026-09-07 by Virtuozzo International GmbH
 // @cpt-dod:cpt-cf-settings-service-dod-value-writes-observability:p1
 //! The write path's counters, and the Change Publisher binding of this
 //! release.
@@ -8,7 +7,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use tracing::info;
 
-use crate::domain::ports::{ChangePublisher, ValueEvent, WriteMetrics};
+use crate::domain::ports::{ChangePublisher, StepUpOperation, ValueEvent, WriteMetrics};
 use crate::log_text::LogSafe;
 
 /// `settings_value_writes_total` and `settings_step_up_total` on the
@@ -16,6 +15,7 @@ use crate::log_text::LogSafe;
 pub struct OtelWriteMetrics {
     writes: Counter<u64>,
     step_ups: Counter<u64>,
+    purge_releases: Counter<u64>,
 }
 
 impl OtelWriteMetrics {
@@ -32,6 +32,10 @@ impl OtelWriteMetrics {
                 .u64_counter("settings_step_up_total")
                 .with_description("Step-up verifications by operation and result")
                 .build(),
+            purge_releases: meter
+                .u64_counter("settings_declaration_purge_secret_releases_total")
+                .with_description("Credential Store releases after a declaration purge, by result")
+                .build(),
         }
     }
 }
@@ -47,14 +51,23 @@ impl WriteMetrics for OtelWriteMetrics {
         self.writes.add(1, &[KeyValue::new("result", result)]);
     }
 
-    fn step_up(&self, operation: &'static str, result: &'static str) {
+    fn step_up(&self, operation: StepUpOperation, result: &'static str) {
         self.step_ups.add(
             1,
             &[
-                KeyValue::new("operation", operation),
+                KeyValue::new("operation", operation.label()),
                 KeyValue::new("result", result),
             ],
         );
+    }
+
+    fn purge_released(&self) {
+        self.purge_releases.add(1, &[KeyValue::new("result", "ok")]);
+    }
+
+    fn purge_release_failed(&self) {
+        self.purge_releases
+            .add(1, &[KeyValue::new("result", "failed")]);
     }
 }
 

@@ -232,8 +232,10 @@ mod tests {
             owner: "acme".to_owned(),
             name: name.to_owned(),
             scope: ScopeConfig::default(),
-            force: false,
+            force: crate::domain::ports::github::ForceMode::None,
             since: None,
+            telemetry_file: None,
+            max_concurrent_tasks: None,
             access_scope: AccessScope::default(),
             claim: None,
         }

@@ -1,4 +1,3 @@
-// Created: 2026-08-12 by Virtuozzo International GmbH
 //! The client traits consuming gears bind through `ClientHub`.
 //!
 //! # Error contract
