@@ -68,7 +68,7 @@ The steps, states, and formulas are in [DESIGN §3.6](../DESIGN.md#36-interactio
 * A run-deadline arithmetic test for seed and uninstall.
 * An operation past its deadline ends interrupted, no call starts after it, and no replica resumes it.
 * No plugin call starts unless `plugin_call_timeout` + 2 × `storage_call_timeout` fit before the run deadline.
-* With the smallest margin and storage calls that reach `storage_call_timeout`, every plugin receives its call and the operation completes; a request task delayed past the margin marks the remaining plugins `not_dispatched` and completes as internal failure, never succeeded.
+* With the smallest margin, storage calls that reach `storage_call_timeout`, and free `plugin_max_in_flight` capacity at every plugin, every plugin receives its call and the operation completes; a request task delayed past the margin marks the remaining plugins `not_dispatched` and completes as internal failure, never succeeded.
 * A timed-out call is dropped and dispatch proceeds.
 
 ## Pros and Cons of the Options

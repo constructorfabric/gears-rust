@@ -174,7 +174,7 @@ No plugin receives anything until the operation and its accepted event have comm
 
 - [ ] `p2` - **ID**: `cpt-cf-application-manager-principle-honest-outcomes`
 
-Every seed and uninstall ends in exactly one category from the outcome table in [§3.3](#33-api-contracts). The gear fails closed, and every write to an operation is guarded, so an operation has one final state.
+Every seed and uninstall that is not interrupted ends in exactly one category from the outcome table in [§3.3](#33-api-contracts); an interrupted operation ends with the interrupted marker and no category. The gear fails closed, and every write to an operation is guarded, so an operation has one final state.
 
 #### Bounded Waiting
 
@@ -818,7 +818,7 @@ allowed_callers:
 
 **Synchronous time budget.** At most 3 × `storage_call_timeout` (storage step, acceptance, and refusal or lost-race transaction); `init` fails when this exceeds `GATEWAY_REQUEST_DEADLINE`.
 
-**Run window.** The run deadline is the acceptance commit time plus N × (`plugin_call_timeout` + `storage_call_timeout`) for the plugin calls and their outcome writes, plus 2 × `storage_call_timeout` for mark running and the final transaction, plus `run_window_margin`, with N the number of plugins, for a seed or an uninstall. Every plugin therefore receives its call unless the request task is delayed by more than the margin.
+**Run window.** The run deadline is the acceptance commit time plus N × (`plugin_call_timeout` + `storage_call_timeout`) for the plugin calls and their outcome writes, plus 2 × `storage_call_timeout` for mark running and the final transaction, plus `run_window_margin`, with N the number of plugins, for a seed or an uninstall. The window therefore leaves time to start every plugin call unless the request task is delayed by more than the margin; a call can still be refused as `not_sent` when its plugin has no free `plugin_max_in_flight` capacity.
 
 ### 4.3 Platform Deviations
 
