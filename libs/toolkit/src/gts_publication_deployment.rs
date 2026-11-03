@@ -95,6 +95,9 @@ pub async fn publish(
     deadline: Duration,
     cancel: &CancellationToken,
 ) -> anyhow::Result<GtsDeploymentReport> {
+    let deadline_at = tokio::time::Instant::now()
+        .checked_add(deadline)
+        .ok_or_else(|| anyhow::anyhow!("the publication deadline cannot be represented"))?;
     let hub = ClientHub::new();
     let resolver: Arc<dyn crate::discovery::EndpointResolver> =
         Arc::new(StaticEndpointResolver::new(registry_endpoint));
@@ -104,7 +107,7 @@ pub async fn publish(
             .map_err(|e| e.context(format!("{}: registry wiring", descriptor.gear)))?;
         prepared.push((
             descriptor.gear,
-            PreparedGtsPublication::prepare(descriptor, config, &hub)?,
+            PreparedGtsPublication::prepare(descriptor, config, &hub)?.with_deadline(deadline_at),
         ));
     }
     check_ownership(prepared.iter().map(|(_, plan)| plan.gts_manifest()))?;
@@ -123,13 +126,14 @@ pub async fn publish(
     );
     tokio::pin!(all);
     let results = tokio::select! {
-        results = &mut all => results,
-        () = tokio::time::sleep(deadline) => {
+        biased;
+        () = tokio::time::sleep_until(deadline_at) => {
             // Every unfinished publication ends: past the deadline.
             deadline_passed.store(true, Ordering::SeqCst);
             stop.cancel();
             all.await
-        }
+        },
+        results = &mut all => results,
     };
     let publishers = prepared
         .iter()

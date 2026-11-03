@@ -31,12 +31,13 @@ pub mod adapter {
     }
     impl std::error::Error for Never {}
 
-    pub async fn publish(
+    pub async fn publish_with_deadline(
         _: &Registry,
         _: &str,
         _: &str,
         _: &[(String, serde_json::Value)],
         _: &tokio_util::sync::CancellationToken,
+        _: Option<tokio::time::Instant>,
         _: impl FnMut(&str) + Send,
     ) -> Result<(), Never> {
         Ok(())

@@ -213,10 +213,12 @@ async fn a_refused_instance_fails_the_publication() {
     assert!(err.to_string().contains("publishing instance"), "{err}");
 }
 
-/// An admission that never completes keeps the publication pending past the startup
-/// deadline, retrying and reporting why, instead of failing; cancellation then ends it.
+/// An accepted admission that never completes is polled within the publication
+/// budget, submitted once; cancellation before the deadline ends it as cancelled.
+/// (Pending progress is reported between reconciliation passes, so a single
+/// polled operation reports none.)
 #[tokio::test(start_paused = true)]
-async fn a_pending_instance_keeps_retrying_until_cancelled() {
+async fn a_pending_instance_is_polled_within_the_budget_until_cancelled() {
     let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
     let hub = ClientHub::new();
     registry.install(&hub);
@@ -227,34 +229,44 @@ async fn a_pending_instance_keeps_retrying_until_cancelled() {
     )
     .expect("prepared");
     let cancel = CancellationToken::new();
-    let pending = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let record = Arc::clone(&pending);
 
-    let running = publication.publish(
-        &cancel,
-        Arc::new(move |d: &str| record.lock().unwrap().push(d.to_owned())),
-    );
+    let running = publication.publish(&cancel, Arc::new(|_: &str| {}));
     tokio::pin!(running);
     tokio::select! {
-        _ = &mut running => panic!("never admitted"),
-        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 3) => {}
+        result = &mut running => panic!("settled within the budget: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE / 2) => {}
     }
 
-    assert!(
-        pending
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|d| d.contains("pending")),
-        "{:?}",
-        pending.lock().unwrap()
-    );
-    assert!(registry.calls(Call::Register) > 1, "retried");
+    assert_eq!(registry.calls(Call::Register), 1, "submitted once");
+    assert!(registry.calls(Call::GetOperation) > 1, "polled");
     cancel.cancel();
     assert!(matches!(
         running.await,
         Err(GtsPublicationError::Cancelled { .. })
     ));
+}
+
+/// An admission still pending when the publication budget runs out is refused
+/// with the deadline as the reconciliation stop.
+#[tokio::test(start_paused = true)]
+async fn a_pending_instance_is_refused_once_the_budget_runs_out() {
+    let registry = Arc::new(MockTypesRegistry::new().completing_after(u32::MAX));
+
+    let result = published(Some(&registry), &json!({}), &CancellationToken::new()).await;
+
+    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+        panic!("expected a refusal: {result:?}");
+    };
+    let stop = source
+        .chain()
+        .find_map(|e| e.downcast_ref::<types_registry_sdk::PublicationError>())
+        .and_then(types_registry_sdk::PublicationError::report)
+        .map(|report| report.stop);
+    assert_eq!(
+        stop,
+        Some(types_registry_sdk::ReconcileStop::Deadline),
+        "{source:#}"
+    );
 }
 
 /// No registry API in the hub: the publication cannot bind its backend.

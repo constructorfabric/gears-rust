@@ -165,6 +165,28 @@ fn the_generated_descriptor_is_linked_with_the_crate_version() {
 }
 
 #[tokio::test]
+async fn the_generated_backend_forwards_the_callers_absolute_deadline() {
+    let hub = ClientHub::new();
+    let registry = Arc::new(LocalRegistry::default());
+    hub.register::<fake_publisher::Registry>(registry.clone());
+    let config = Config(json!({ "widget-publisher": { "config": { "vendor": "acme" } } }));
+    let descriptor = WidgetPublisher::default().descriptor();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let publication =
+        toolkit::gts_publication::PreparedGtsPublication::prepare(descriptor, &config, &hub)
+            .unwrap()
+            .with_deadline(deadline);
+
+    publication
+        .publish(&CancellationToken::new(), Arc::new(|_| {}))
+        .await
+        .unwrap();
+
+    assert_eq!(*registry.deadlines.lock(), [Some(deadline)]);
+    assert_eq!(registry.admitted.lock().len(), 1);
+}
+
+#[tokio::test]
 async fn the_runtime_publishes_through_the_local_registry_before_init() {
     let hub = Arc::new(ClientHub::new());
     let registry = Arc::new(LocalRegistry::default());

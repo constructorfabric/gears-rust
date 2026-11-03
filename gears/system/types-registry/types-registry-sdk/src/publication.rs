@@ -1,31 +1,169 @@
-//! Await a gear's startup publications with shared tuning and diagnostics.
+//! Publish a gear's declared documents through reconciliation.
+//!
+//! The runtime wires [`Registry`] from [`PROVIDER`] and calls [`publish_with_deadline`].
+//! This module prepares the publisher and documents, supplies the platform context and
+//! budget, and formats publication diagnostics. The reconciliation layer owns admission,
+//! progress and retries. This module does not depend on `toolkit`.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use toolkit_canonical_errors::CanonicalError;
 use toolkit_security::PlatformSecurityContext;
 
-use crate::reconcile::error_fields;
+use crate::reconciliation::error_fields;
 use crate::{
     EntityKind, GtsId, JsonDocument, PlatformTypesRegistryApi, PlatformTypesRegistryApiExt,
     PublisherContext, ReconcileOptions, ReconcileOutcome, ReconcilePendingCause, ReconcileReport,
-    ReconcileStop, Reconciliation, STARTUP_PUBLICATION_DEADLINE,
+    Reconciliation, STARTUP_PUBLICATION_DEADLINE,
 };
+
+/// The registry contract the publication uses: the client-hub key.
+pub type Registry = dyn crate::PlatformTypesRegistryApi;
+
+/// The directory name of the registry provider.
+pub const PROVIDER: &str = "types-registry";
+
+/// The resolving REST client wired when no local registry is present.
+#[cfg(feature = "rest-client")]
+pub use crate::PlatformTypesRegistryApiRestResolvingClient as ResolvingClient;
+
+/// Reconcile `documents` as `publisher_name`/`publisher_version` until every
+/// one is admitted. Retryable conditions (an absent dependency, a conflict, an
+/// unavailable registry) are retried with jittered exponential backoff (1 s up to 30 s) and
+/// reported to `on_pending`, within the shared startup budget. Cancellation ends the wait.
+///
+/// # Errors
+/// [`GtsPublishError::Input`] for an invalid id or version;
+/// [`GtsPublishError::Publication`] for a terminal refusal or cancellation.
+pub async fn publish(
+    registry: &Registry,
+    publisher_name: &str,
+    publisher_version: &str,
+    documents: &[(String, serde_json::Value)],
+    cancel: &CancellationToken,
+    on_pending: impl FnMut(&str) + Send,
+) -> Result<(), GtsPublishError> {
+    publish_with_deadline(
+        registry,
+        publisher_name,
+        publisher_version,
+        documents,
+        cancel,
+        None,
+        on_pending,
+    )
+    .await
+}
+
+/// Publish within the caller's absolute deadline, or the default startup budget.
+/// The deadline covers every reconciliation pass; it is never renewed on a retry.
+///
+/// # Errors
+/// Invalid input, a terminal refusal, cancellation, or an expired publication budget.
+pub async fn publish_with_deadline(
+    registry: &Registry,
+    publisher_name: &str,
+    publisher_version: &str,
+    documents: &[(String, serde_json::Value)],
+    cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
+    mut on_pending: impl FnMut(&str) + Send,
+) -> Result<(), GtsPublishError> {
+    let publisher = PublisherContext {
+        name: publisher_name.to_owned(),
+        version: publisher_version.parse().map_err(|e| {
+            GtsPublishError::Input(format!(
+                "{publisher_name}: publisher version {publisher_version}: {e}"
+            ))
+        })?,
+    };
+    let desired = documents
+        .iter()
+        .map(|(id, document)| {
+            GtsId::try_new(id)
+                .map(|id| (id, document.clone()))
+                .map_err(|e| GtsPublishError::Input(format!("{publisher_name}: GTS id {id}: {e}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let options = ReconcileOptions {
+        passes: NonZeroU32::MAX,
+        retry_backoff: Duration::from_secs(1),
+        retry_backoff_max: Duration::from_secs(30),
+        deadline: deadline.map_or(crate::STARTUP_PUBLICATION_DEADLINE, |deadline| {
+            deadline.saturating_duration_since(tokio::time::Instant::now())
+        }),
+        absolute_deadline: deadline,
+        ..ReconcileOptions::default()
+    };
+    crate::reconciliation::reconcile_with_progress(
+        registry,
+        &PlatformSecurityContext::outbound_marker(),
+        &publisher,
+        &desired,
+        &options,
+        cancel,
+        |report| {
+            let error = report
+                .clone()
+                .into_canonical()
+                .unwrap_or_else(|error| error);
+            let error = PublicationError::new(&publisher, &desired, error);
+            tracing::warn!(
+                publisher = %publisher.name,
+                error = %error,
+                "startup publication not admitted yet; retrying"
+            );
+            on_pending(&error.to_string());
+        },
+    )
+    .await
+    .map(drop)
+    .map_err(|error| {
+        GtsPublishError::Publication(PublicationError::new(&publisher, &desired, error))
+    })
+}
+
+/// Why [`publish`] did not succeed.
+#[derive(Debug)]
+pub enum GtsPublishError {
+    /// The manifest has an invalid GTS id or publisher version.
+    Input(String),
+    /// A terminal refusal or cancellation.
+    Publication(PublicationError),
+}
+
+impl fmt::Display for GtsPublishError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(message) => f.write_str(message),
+            Self::Publication(error) => fmt::Display::fmt(error, f),
+        }
+    }
+}
+
+impl Error for GtsPublishError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Input(_) => None,
+            Self::Publication(error) => Some(error),
+        }
+    }
+}
 
 /// Reconcile a gear's documents and await admission before binding dependent clients.
 ///
-/// Uses the platform outbound marker and [`STARTUP_PUBLICATION_DEADLINE`], with the
-/// other [`ReconcileOptions`] defaults. `Ok` means every identifier is admitted or
+/// Uses the platform outbound marker and [`STARTUP_PUBLICATION_DEADLINE`], retrying
+/// within that budget. Batching and backoff use [`ReconcileOptions`] defaults. `Ok` means every identifier is admitted or
 /// already up to date. The publisher's name and version belong to the calling gear.
 ///
 /// Runs in the current task, without spawning or changing lifecycle phases. Call only
-/// when the registry client is available: a remote client is wired after `init`.
+/// when the registry client is available; application preparation wires it before `init`.
 /// For custom tuning or a different security context, use
-/// [`PlatformTypesRegistryApiExt::reconcile_entities_and_await`] directly.
+/// [`crate::PlatformTypesRegistryApiExt::reconcile_entities_and_await`] directly.
 ///
 /// # Errors
 /// Returns [`PublicationError`] on refusal, incomplete admission, deadline or
@@ -38,6 +176,7 @@ pub async fn publish_startup_entities(
     cancel: &CancellationToken,
 ) -> Result<Reconciliation, PublicationError> {
     let options = ReconcileOptions {
+        passes: NonZeroU32::MAX,
         deadline: STARTUP_PUBLICATION_DEADLINE,
         ..ReconcileOptions::default()
     };
@@ -51,106 +190,6 @@ pub async fn publish_startup_entities(
         )
         .await
         .map_err(|error| PublicationError::new(publisher, desired, error))
-}
-
-/// Pauses between [`publish_until_admitted`] attempts: `initial`, doubling up to `max`.
-#[derive(Debug, Clone, Copy)]
-pub struct PublicationRetry {
-    pub initial: Duration,
-    pub max: Duration,
-}
-
-impl Default for PublicationRetry {
-    fn default() -> Self {
-        Self {
-            initial: Duration::from_secs(1),
-            max: Duration::from_secs(30),
-        }
-    }
-}
-
-impl PublicationRetry {
-    /// The pause before each retry, in order.
-    pub(crate) fn pauses(self) -> impl Iterator<Item = Duration> {
-        std::iter::successors(Some(self.initial.min(self.max)), move |pause| {
-            Some(pause.saturating_mul(2).min(self.max))
-        })
-    }
-}
-
-/// [`publish_startup_entities`] again and again, until every identifier is admitted
-/// or an attempt fails for good.
-///
-/// An attempt failing with a [transient](PublicationError::is_transient) error is
-/// reported to `on_retry` and repeated after a pause; each attempt has the whole
-/// [`STARTUP_PUBLICATION_DEADLINE`]. Meant for a supervised task: it awaits the registry
-/// for as long as it takes, so never call it from a lifecycle hook directly.
-///
-/// An identifier admitted by one attempt stays admitted: later attempts submit only
-/// the others, so a later change by another writer is not overwritten. Errors, those
-/// passed to `on_retry` included, cover the whole `desired` set, earlier admissions
-/// included. `Ok` once every identifier has been admitted.
-///
-/// # Errors
-/// The first non-transient [`PublicationError`]: a rejection, a call-level refusal or
-/// invalid input; or caller cancellation, as a `Cancelled` error, whenever it comes.
-pub async fn publish_until_admitted(
-    registry: &dyn PlatformTypesRegistryApi,
-    publisher: &PublisherContext,
-    desired: &[(GtsId, JsonDocument)],
-    retry: &PublicationRetry,
-    cancel: &CancellationToken,
-    mut on_retry: impl FnMut(&PublicationError) + Send,
-) -> Result<Reconciliation, PublicationError> {
-    let mut admitted: HashMap<GtsId, ReconcileOutcome> = HashMap::new();
-    let mut remaining: Vec<(GtsId, JsonDocument)> = desired.to_vec();
-    let mut pauses = retry.pauses();
-    loop {
-        let error = match publish_startup_entities(registry, publisher, &remaining, cancel).await {
-            Ok(Reconciliation::UpToDate) if admitted.is_empty() => {
-                return Ok(Reconciliation::UpToDate);
-            }
-            Ok(reconciliation) => {
-                let outcomes = match reconciliation {
-                    Reconciliation::UpToDate => HashMap::new(),
-                    Reconciliation::Reconciled(outcomes) => outcomes,
-                };
-                admitted.extend(outcomes);
-                for (id, _) in remaining {
-                    admitted.entry(id).or_insert(ReconcileOutcome::Admitted);
-                }
-                return Ok(Reconciliation::Reconciled(admitted));
-            }
-            Err(error) => error,
-        };
-        if let Some(report) = error.report() {
-            for (id, outcome) in &report.outcomes {
-                if matches!(outcome, ReconcileOutcome::Admitted) {
-                    admitted.insert(id.clone(), ReconcileOutcome::Admitted);
-                }
-            }
-        }
-        remaining.retain(|(id, _)| !admitted.contains_key(id));
-        let error = error.covering(desired, &admitted);
-        if !error.is_transient() {
-            return Err(error);
-        }
-        if cancel.is_cancelled() {
-            return Err(PublicationError::cancelled(publisher, desired));
-        }
-        let pause = pauses.next().unwrap_or(retry.max);
-        tracing::warn!(
-            publisher = %publisher.name,
-            error = %error,
-            retry_in_ms = u64::try_from(pause.as_millis()).unwrap_or(u64::MAX),
-            "startup publication not admitted yet; retrying"
-        );
-        on_retry(&error);
-        tokio::select! {
-            () = cancel.cancelled() => return Err(PublicationError::cancelled(publisher, desired)),
-            () = tokio::time::sleep(pause) => {}
-        }
-    }
 }
 
 /// A startup publication failure with the original canonical error as its source.
@@ -190,42 +229,6 @@ impl PublicationError {
         &self.error
     }
 
-    /// Caller cancellation of a publication of `desired`.
-    fn cancelled(publisher: &PublisherContext, desired: &[(GtsId, JsonDocument)]) -> Self {
-        Self::new(
-            publisher,
-            desired,
-            crate::gts::OperationResource::cancelled().create(),
-        )
-    }
-
-    /// This error, about part of `desired`, as one about all of it: requested
-    /// identifiers are all of `desired`, and the report adds the `admitted` ones, in
-    /// [`report`](Self::report) and the canonical error alike.
-    fn covering(
-        mut self,
-        desired: &[(GtsId, JsonDocument)],
-        admitted: &HashMap<GtsId, ReconcileOutcome>,
-    ) -> Self {
-        let mut requested: Vec<_> = desired.iter().map(|(id, _)| id.clone()).collect();
-        requested.sort_unstable_by(|left, right| left.id().cmp(right.id()));
-        requested.dedup();
-        self.requested = requested;
-        if let Some(report) = &mut self.report {
-            for id in admitted.keys() {
-                report
-                    .outcomes
-                    .entry(id.clone())
-                    .or_insert(ReconcileOutcome::Admitted);
-            }
-            // Encoding a decoded report succeeds; keep the attempt's error otherwise.
-            if let Ok(error) = report.clone().into_canonical() {
-                *self.error = error;
-            }
-        }
-        self
-    }
-
     /// Decoded per-identifier outcomes and stop reason, when the error carries them.
     #[must_use]
     pub fn report(&self) -> Option<&ReconcileReport> {
@@ -242,20 +245,7 @@ impl PublicationError {
     #[must_use]
     pub fn is_transient(&self) -> bool {
         match &self.report {
-            Some(report) => {
-                report.stop != ReconcileStop::InvalidInput
-                    && report.outcomes.values().all(|outcome| {
-                        matches!(
-                            outcome,
-                            ReconcileOutcome::Admitted
-                                | ReconcileOutcome::Pending(
-                                    ReconcilePendingCause::Dependency(_)
-                                        | ReconcilePendingCause::Conflict(_)
-                                        | ReconcilePendingCause::Unavailable(_)
-                                )
-                        )
-                    })
-            }
+            Some(report) => report.is_transient(),
             None => matches!(
                 ReconcilePendingCause::of((*self.error).clone()),
                 ReconcilePendingCause::Unavailable(_)

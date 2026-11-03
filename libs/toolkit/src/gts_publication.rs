@@ -7,7 +7,7 @@
 //!     name = "my-gear",
 //!     gts(
 //!         crates = [crate, my_gear_sdk],
-//!         publisher = types_registry_sdk::gts_publisher,
+//!         publisher = types_registry_sdk::publication,
 //!         entities = Self::configured_entities, // optional
 //!     ),
 //! )]
@@ -38,19 +38,21 @@
 //! pub type Registry = dyn SomeRegistryApi;          // client-hub key
 //! pub const PROVIDER: &str = "provider-gear";       // directory name
 //! pub use some::ResolvingClient;                    // ::new(resolver, PROVIDER, tuning)
-//! pub async fn publish(
+//! pub async fn publish_with_deadline(
 //!     registry: &Registry,
 //!     publisher_name: &str,
 //!     publisher_version: &str,
 //!     documents: &[(String, serde_json::Value)],
 //!     cancel: &CancellationToken,
+//!     deadline: Option<tokio::time::Instant>,
 //!     on_pending: impl FnMut(&str) + Send,
 //! ) -> Result<(), impl std::error::Error + Send + Sync + 'static>;
 //! ```
 //!
-//! `publish` returns `Ok` only after every document is admitted. It retries
-//! retryable conditions itself and returns an error only for a terminal
-//! refusal or cancellation. Toolkit does not depend on the adapter's crate.
+//! `publish_with_deadline` returns `Ok` only after every document is admitted. It retries
+//! retryable conditions within the caller's deadline (or its startup default), returning
+//! an error for expiry, a terminal refusal or cancellation.
+//! Toolkit does not depend on the adapter's crate.
 
 use std::fmt;
 use std::future::Future;
@@ -203,6 +205,7 @@ pub struct GtsPublicationRequest {
     manifest: Arc<GtsManifest>,
     cancel: CancellationToken,
     progress: Arc<dyn Fn(&str) + Send + Sync>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl GtsPublicationRequest {
@@ -216,6 +219,7 @@ impl GtsPublicationRequest {
             manifest,
             cancel,
             progress,
+            deadline: None,
         }
     }
 
@@ -227,6 +231,12 @@ impl GtsPublicationRequest {
     #[must_use]
     pub fn cancel(&self) -> &CancellationToken {
         &self.cancel
+    }
+
+    /// The caller's absolute publication deadline, when supplied (e.g. a deployment job).
+    #[must_use]
+    pub fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.deadline
     }
 
     /// Record why the publication is not complete yet.
@@ -254,7 +264,7 @@ impl GtsPublicationBackend {
         Self(Arc::new(move |request| Box::pin(publish(request))))
     }
 
-    /// Publish until admitted. `Err` is a terminal refusal or cancellation.
+    /// Publish within the budget. `Err` is expiry, a terminal refusal or cancellation.
     ///
     /// # Errors
     /// See above.
@@ -378,6 +388,7 @@ pub struct PreparedGtsPublication {
     manifest: Arc<GtsManifest>,
     /// `None` for an empty manifest: nothing to send.
     backend: Option<GtsPublicationBackend>,
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl PreparedGtsPublication {
@@ -420,7 +431,15 @@ impl PreparedGtsPublication {
             gear,
             manifest,
             backend,
+            deadline: None,
         })
+    }
+
+    /// Use the caller's deadline instead of the adapter's default publication budget.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: tokio::time::Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
     }
 
     #[must_use]
@@ -439,7 +458,7 @@ impl PreparedGtsPublication {
         Arc::clone(&self.manifest)
     }
 
-    /// Publish until admitted or refused. An empty manifest succeeds at once.
+    /// Publish until admitted, refused or expired. An empty manifest succeeds at once.
     ///
     /// # Errors
     /// [`GtsPublicationError::Refused`] or [`GtsPublicationError::Cancelled`].
@@ -455,8 +474,9 @@ impl PreparedGtsPublication {
         let Some(backend) = &self.backend else {
             return Ok(());
         };
-        let request =
+        let mut request =
             GtsPublicationRequest::new(Arc::clone(&self.manifest), cancel.clone(), progress);
+        request.deadline = self.deadline;
         let result = tokio::select! {
             biased;
             () = cancel.cancelled() => return Err(GtsPublicationError::Cancelled { gear }),

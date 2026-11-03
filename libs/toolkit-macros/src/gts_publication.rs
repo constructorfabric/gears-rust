@@ -8,7 +8,7 @@
 //! )
 //! ```
 //!
-//! The publisher adapter defaults to `::types_registry_sdk::gts_publisher`: the
+//! The publisher adapter defaults to `::types_registry_sdk::publication`: the
 //! publishing gear depends on `types-registry-sdk` under its library name, with
 //! the `rest-client` feature. `publisher = ...` overrides it, e.g. for a test
 //! adapter or a dependency under another name. Toolkit itself never depends on
@@ -49,7 +49,7 @@ fn expect_path(expr: Expr, what: &str) -> syn::Result<Path> {
 }
 
 /// Parse the `gts(...)` list of `#[toolkit::gear]`. `publisher` defaults to
-/// `::types_registry_sdk::gts_publisher`.
+/// `::types_registry_sdk::publication`.
 ///
 /// # Errors
 /// An unknown, removed or duplicate argument, a value that is not a path or a
@@ -116,7 +116,7 @@ pub fn parse(list: &MetaList) -> syn::Result<GtsCfg> {
     })?;
 
     let publisher =
-        publisher.unwrap_or_else(|| syn::parse_quote!(::types_registry_sdk::gts_publisher));
+        publisher.unwrap_or_else(|| syn::parse_quote!(::types_registry_sdk::publication));
     let crates = crates.unwrap_or_default();
     if crates.is_empty() && entities.is_none() {
         return Err(syn::Error::new_spanned(
@@ -200,12 +200,13 @@ pub fn expand(cfg: &GtsCfg, ident: &Ident, name: &LitStr) -> TokenStream {
                         let registry = ::std::sync::Arc::clone(&registry);
                         async move {
                             let manifest = request.gts_manifest();
-                            #publisher::publish(
+                            #publisher::publish_with_deadline(
                                 &*registry,
                                 manifest.publisher_name(),
                                 manifest.publisher_version(),
                                 manifest.documents(),
                                 request.cancel(),
+                                request.deadline(),
                                 |detail: &str| request.report_pending(detail),
                             )
                             .await

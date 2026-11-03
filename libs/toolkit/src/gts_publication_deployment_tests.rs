@@ -19,6 +19,7 @@ const DERIVED: &str = "gts.cf.test.base.v1~cf.test.derived.v1~";
 /// credential it got, and admits `DERIVED` only once `BASE` is admitted.
 #[derive(Default)]
 struct RemoteRegistry {
+    deadlines: Mutex<Vec<Option<tokio::time::Instant>>>,
     endpoint: Mutex<Option<String>>,
     token: Mutex<Option<String>>,
     admitted: Mutex<Vec<String>>,
@@ -62,6 +63,7 @@ fn backend(hub: &ClientHub) -> anyhow::Result<GtsPublicationBackend> {
         move |request: GtsPublicationRequest| {
             let registry = Arc::clone(&registry);
             async move {
+                registry.deadlines.lock().push(request.deadline());
                 for (id, document) in request.gts_manifest().documents() {
                     if document.get("refuse").is_some() {
                         anyhow::bail!("{id}: rejected");
@@ -217,8 +219,11 @@ async fn a_refusal_fails_the_job_and_names_the_publisher() {
 #[tokio::test(start_paused = true)]
 async fn the_deadline_ends_pending_publishers() {
     let _serial = SERIAL.lock().await;
-    let (report, _) = run(&[&HANGING_PUB, &BASE_PUB], Duration::from_secs(30)).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (report, registry) = run(&[&HANGING_PUB, &BASE_PUB], Duration::from_secs(30)).await;
     let report = report.unwrap();
+
+    assert_eq!(*registry.deadlines.lock(), [Some(deadline), Some(deadline)]);
 
     assert!(!report.succeeded());
     assert_eq!(

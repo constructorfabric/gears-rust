@@ -177,19 +177,22 @@ with the stop reason and machine-readable cause. `canonical_error()` and the err
 chain stays intact. Cancellation still names the requested identifiers even without a report.
 For custom budgets, batching or security contexts, call `reconcile_entities_and_await` directly.
 
-**Supervised publication.** `publish_until_admitted` repeats `publish_startup_entities` until
-every identifier is admitted, pausing per `PublicationRetry` (1 s doubling to 30 s by default)
-after a transient failure, reported to its `on_retry` callback. `PublicationError::is_transient`
-decides per identifier from the decoded report — the outer `FailedPrecondition` says nothing:
-pending on a dependency, a concurrent write or availability is transient; a rejection, a
-call-level refusal (authentication, permission, invalid request), invalid input and
-cancellation are not. An identifier admitted by one attempt stays admitted: later attempts
-submit only the rest, and every error covers the whole desired set, in `report()` and in the
-canonical error alike. Caller cancellation, whenever it comes, is a `Cancelled` error.
+**Bounded publication.** The `publication::publish_with_deadline` adapter calls
+reconciliation directly with one publication budget. It supplies the platform context,
+formats progress and failure diagnostics, and configures the reconciliation options.
+Transient reads, dependencies and conflicts retry within that budget, with equal-jitter
+exponential backoff (1 s up to 30 s). `on_pending` receives a diagnostic before each
+retrying pass. Admitted identifiers are never re-read or resubmitted, so another writer's
+later changes are left alone. Rejections and call-level refusals stop retries;
+cancellation returns `Cancelled`. Budget expiry reports `deadline`, retaining each
+identifier's last known cause. Accepted writes continue after the caller stops waiting.
 
-A gear does not call it directly. `#[toolkit::gear(..., gts(...))]` uses the
-[`gts_publisher`](src/gts_publisher.rs) adapter, which calls `publish_until_admitted` from the
-runtime's application preparation, before any application `init`:
+`#[toolkit::gear(..., gts(...))]` invokes this adapter during application preparation,
+before any application `init`. Ordinary startup uses a 120-second budget; a deployment
+job supplies its absolute deadline instead, shared by every publisher.
+Custom `publisher = ...` adapters must provide `publish_with_deadline(registry, name,
+version, documents, cancel, deadline: Option<tokio::time::Instant>, on_pending)`;
+the existing SDK `publication::publish` remains a wrapper using the startup default.
 
 ```rust,ignore
 #[toolkit::gear(
@@ -204,7 +207,7 @@ pub struct MyGear { /* ... */ }
 
 `init` uses `GearCtx::gts_publication_manifest()` to bind plugin clients from declared instances
 after admission. The returned `GtsManifest` holds publisher name/version and authored
-GTS Type Schemas and Instances; it is a ToolKit data structure, not a GTS entity.
+GTS Type Schemas and Instances; it is a `ToolKit` data structure, not a GTS entity.
 The gear crate depends on this SDK, as `types_registry_sdk`, with the `rest-client` feature.
 See [GTS publication by gears](../docs/DESIGN.md#inventory-and-startup-reconciliation).
 
@@ -338,7 +341,11 @@ on a later call. Caller cancellation and an unrepresentable deadline return `Can
 `ReconcileOptions::batch_size` must fit the registry's configured `limits.batch_candidates`
 (both default to 100). Passes (default 5) re-read and resubmit what a conflict or a dependency in
 a later batch left pending; a caller whose desired set is complete can set `stop_when_stalled` to
-end the call as `stalled` once a pass admits nothing and only dependencies remain. A permanent submission refusal stops the call immediately:
+end the call as `stalled` once a pass admits nothing and only dependencies remain. Transient
+read errors retry under the same deadline and pass limit; permanent read refusals and malformed
+responses stop as `read_failed`. A terminal item rejection stops further passes after the current
+pass's batches, reporting `rejected` when other identifiers remain pending. A permanent submission
+refusal stops the call immediately:
 `InvalidArgument`, `FailedPrecondition`, `Unauthenticated`, `PermissionDenied`, `NotFound`,
 `AlreadyExists`, `OutOfRange`, `Cancelled`, or `ResourceExhausted` without a quota
 `retry_after_seconds`. A `ResourceExhausted` with that hint resends the same request under the same

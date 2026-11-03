@@ -1,4 +1,4 @@
-//! Without `publisher = ...` the adapter is `::types_registry_sdk::gts_publisher`:
+//! Without `publisher = ...` the adapter is `::types_registry_sdk::publication`:
 //! a gear crate without that dependency does not compile.
 use toolkit_macros::gear;
 

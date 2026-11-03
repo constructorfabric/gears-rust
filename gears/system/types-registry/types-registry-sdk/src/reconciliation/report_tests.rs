@@ -78,6 +78,8 @@ fn reports_and_nested_errors_survive_the_problem_json_round_trip() {
         ReconcileStop::ReadFailed,
         ReconcileStop::InvalidInput,
         ReconcileStop::Stalled,
+        ReconcileStop::Rejected,
+        ReconcileStop::Retrying,
     ] {
         let label = match stop {
             ReconcileStop::Completed => "completed",
@@ -86,6 +88,8 @@ fn reports_and_nested_errors_survive_the_problem_json_round_trip() {
             ReconcileStop::ReadFailed => "read_failed",
             ReconcileStop::InvalidInput => "invalid_input",
             ReconcileStop::Stalled => "stalled",
+            ReconcileStop::Rejected => "rejected",
+            ReconcileStop::Retrying => "retrying",
         };
         assert_eq!(stop.as_str(), label);
         assert_eq!(ReconcileStop::from_wire(label), Some(stop));

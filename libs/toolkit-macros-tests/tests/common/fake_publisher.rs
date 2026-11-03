@@ -13,6 +13,7 @@ pub trait FakeRegistryApi: Send + Sync {
         &self,
         publisher: (String, String),
         documents: Vec<(String, serde_json::Value)>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(), String>;
 }
 
@@ -40,6 +41,7 @@ impl FakeRegistryApi for ResolvingClient {
         &self,
         _publisher: (String, String),
         _documents: Vec<(String, serde_json::Value)>,
+        _deadline: Option<tokio::time::Instant>,
     ) -> Result<(), String> {
         Err("unreachable".to_owned())
     }
@@ -56,18 +58,20 @@ impl std::fmt::Display for PublishError {
 
 impl std::error::Error for PublishError {}
 
-pub async fn publish(
+pub async fn publish_with_deadline(
     registry: &Registry,
     publisher_name: &str,
     publisher_version: &str,
     documents: &[(String, serde_json::Value)],
     _cancel: &CancellationToken,
+    deadline: Option<tokio::time::Instant>,
     _on_pending: impl FnMut(&str) + Send,
 ) -> Result<(), PublishError> {
     registry
         .register(
             (publisher_name.to_owned(), publisher_version.to_owned()),
             documents.to_vec(),
+            deadline,
         )
         .await
         .map_err(PublishError)
@@ -80,6 +84,7 @@ pub type Admitted = ((String, String), Vec<(String, serde_json::Value)>);
 #[derive(Default)]
 pub struct LocalRegistry {
     pub admitted: Mutex<Vec<Admitted>>,
+    pub deadlines: Mutex<Vec<Option<tokio::time::Instant>>>,
 }
 
 #[async_trait::async_trait]
@@ -88,8 +93,10 @@ impl FakeRegistryApi for LocalRegistry {
         &self,
         publisher: (String, String),
         documents: Vec<(String, serde_json::Value)>,
+        deadline: Option<tokio::time::Instant>,
     ) -> Result<(), String> {
         self.admitted.lock().push((publisher, documents));
+        self.deadlines.lock().push(deadline);
         Ok(())
     }
 }

@@ -101,8 +101,10 @@ async fn a_refused_plugin_instance_prevents_publication_completion_and_binding()
     );
 }
 
+/// An unreachable registry is retried within the publication budget;
+/// cancellation before the deadline ends the publication as cancelled.
 #[tokio::test(start_paused = true)]
-async fn an_unreachable_registry_keeps_publication_pending_until_cancelled() {
+async fn an_unreachable_registry_is_retried_within_the_budget_until_cancelled() {
     let registry = common::registry();
     registry.inject(
         Fault::on(Call::Register)
@@ -120,10 +122,50 @@ async fn an_unreachable_registry_keeps_publication_pending_until_cancelled() {
     let publishing = publication.publish(&cancel, Arc::new(|_: &str| {}));
     tokio::pin!(publishing);
     tokio::select! {
-        result = &mut publishing => panic!("unreachable registry admitted: {result:?}"),
-        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE * 2) => {}
+        result = &mut publishing => panic!("settled within the budget: {result:?}"),
+        () = tokio::time::sleep(types_registry_sdk::STARTUP_PUBLICATION_DEADLINE / 2) => {}
     }
     assert!(registry.calls(Call::Register) > 1);
     cancel.cancel();
-    assert!(publishing.await.is_err());
+    assert!(matches!(
+        publishing.await,
+        Err(GtsPublicationError::Cancelled { .. })
+    ));
+}
+
+/// A registry still unreachable when the publication budget runs out is
+/// refused with the deadline as the reconciliation stop.
+#[tokio::test(start_paused = true)]
+async fn an_unreachable_registry_is_refused_once_the_budget_runs_out() {
+    let registry = common::registry();
+    registry.inject(
+        Fault::on(Call::Register)
+            .fail(toolkit_canonical_errors::CanonicalError::service_unavailable().create()),
+    );
+    let hub = toolkit::ClientHub::new();
+    registry.install(&hub);
+    let publication = PreparedGtsPublication::prepare(
+        PolicyEngine::default().descriptor(),
+        &common::MockConfigProvider::new(&config()),
+        &hub,
+    )
+    .unwrap();
+
+    let result = publication
+        .publish(&CancellationToken::new(), Arc::new(|_: &str| {}))
+        .await;
+
+    let Err(GtsPublicationError::Refused { source, .. }) = result else {
+        panic!("expected a refusal: {result:?}");
+    };
+    let stop = source
+        .chain()
+        .find_map(|e| e.downcast_ref::<types_registry_sdk::PublicationError>())
+        .and_then(types_registry_sdk::PublicationError::report)
+        .map(|report| report.stop);
+    assert_eq!(
+        stop,
+        Some(types_registry_sdk::ReconcileStop::Deadline),
+        "{source:#}"
+    );
 }
