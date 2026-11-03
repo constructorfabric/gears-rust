@@ -33,20 +33,18 @@ Plugin implementation  (validates tokens, returns SecurityContext)
 
 ## Plugin catalogue
 
-The resolver and its plugins `#[toolkit::consumes]` the registry's `PlatformTypesRegistryApi`;
-none of them depends on the registry gear crate or declares it in `deps`.
+The resolver and its plugins use `PlatformTypesRegistryApi`, wired by their `gts(...)`
+publication capability. None depends on the registry gear crate or declares it in `deps`.
 
-- System plugins build in `init`; after proxy wiring, `post_init` reconciles
-  `PluginV1<AuthNResolverPluginSpecV1>`, awaits admission and binds the scoped
-  `AuthNResolverPluginClient`. Refused, pending, cancelled or unreachable
-  publication fails boot without a client.
-- First authentication lists all platform catalogue pages, retains locally bound
-  clients and selects by vendor/lowest priority. Failures are uncached; legacy
-  is never consulted.
-- Hosts linking plugins need `gears.types-registry.database`; resolver-only
-  `auth_disabled` hosts remain unchanged.
-- Schemas come from the registry process's `toolkit-gts` inventory. Publication
-  to another process is not covered yet.
+- The resolver and plugins are application gears. `gts(...)` declares the resolver's SDK
+  schemas and the plugins' configured instances; runtime publication precedes application `init`.
+- Plugins build and bind their scoped `AuthNResolverPluginClient` in `init`, after admission.
+  Refusal or publication-budget expiry prevents application initialization.
+- First authentication lists the platform catalogue, retains locally bound clients and selects
+  by vendor/lowest priority. Failures are uncached; legacy is never consulted.
+- Publication uses the local platform API or a remote endpoint with platform credentials.
+  An embedded full registry needs a database even in a resolver-only `auth_disabled` host;
+  the resolver itself publishes its plugin specification.
 
 ## Usage
 

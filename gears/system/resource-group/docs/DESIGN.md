@@ -766,30 +766,23 @@ This is the fixed boundary:
 
 **ID**: `cpt-cf-resource-group-seq-init-order`
 
-RG Management API depends on AuthZ SDK; AuthZ plugin depends on RG Access API SDK. This circular dependency is resolved by phased initialization:
+RG Management API consumes AuthZ; an AuthZ plugin can consume RG's read API.
+Both are application gears. Their `init` hooks register local clients without calling each other;
+AuthZ plugin discovery and authorization happen on use, after application client wiring.
 
-```
-Phase 1 (SystemCapability):
-  1. RG gear init
-     → registers ResourceGroupClient in ClientHub
-     → registers ResourceGroupReadHierarchy in ClientHub
-     → REST/gRPC endpoints NOT yet accepting traffic
+```text
+Application init:
+  RG    -> registers ResourceGroupClient and ResourceGroupReadHierarchy
+  AuthZ -> registers AuthZResolverApi; plugin selection stays lazy
 
-  2. AuthZ Resolver init (deps: [types-registry])
-     → registers AuthZResolverApi in ClientHub
-     → plugin discovery is lazy (first evaluate() call)
-
-Phase 2 (ready):
-  3. RG Gear starts accepting REST/gRPC traffic
-     → write operations call PolicyEnforcer → AuthZResolverApi (available since step 2)
-     → seed operations run as pre-deployment step with system SecurityContext (bypass AuthZ)
-
-  4. AuthZ plugin on first evaluate() call
-     → lazy-discovers RG plugin via types-registry
-     → calls ResourceGroupReadHierarchy (available since step 1)
+After application init and client wiring:
+  post_init -> REST/gRPC composition -> serving
+  RG write -> PolicyEnforcer -> AuthZ -> RG read API
 ```
 
-There is no deadlock: RG registers its read clients before AuthZ initializes, and AuthZ registers its client before RG starts accepting write traffic. Seed operations run as a pre-deployment step with a system-level `SecurityContext` and bypass the AuthZ evaluation path.
+Neither gear needs `SystemCapability`, and this interaction does not require RG's `init`
+to precede AuthZ's. RG's separate `ResourceGroupTypeBootstrap` is a narrow local bootstrap
+exception described below; it is not a general authorization bypass for seed operations.
 
 #### End-to-End Authorization Flow (Example)
 
@@ -1298,7 +1291,7 @@ Notes:
   - Standard action vocabulary: `list` (collection), `read` (single resource), `create`, `update`, `delete` — aligned with [AuthZ usage scenarios](../../../../docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md).
   - The AuthZ plugin reads hierarchy in-process via `ResourceGroupReadHierarchy` registered in `ClientHub` and **bypasses `PolicyEnforcer` invocation** on those reads (`AccessScope::allow_all()`); the plugin still produces AuthZ tenant/subtree constraints from the returned hierarchy — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
   - MTLS-authenticated requests (AuthZ plugin only) **also** bypass `PolicyEnforcer` entirely — `p2`, **deferred / not implemented yet**, planned for the future microservice split — see [RG Authentication Modes: JWT vs MTLS](#rg-authentication-modes-jwt-vs-mtls).
-  - `ResourceGroupTypeBootstrap` is a narrow, deliberately un-gated SDK trait registered in `ClientHub`, backed by `TypeService`'s unscoped methods. Its one permitted caller is account-management's `register_user_group_types`, which registers the RG type schemas it owns from its own `Gear::init` — a phase at which no gated call can both find a plugin (types-registry keeps registrations in a staging buffer until `post_init`) and be admitted by it (the only actor a gear-init path has is platform-scoped, which the static AuthZ plugin rejects). Guardrail: it must never be exposed through REST, pinned by `bootstrap_bypasses_policy_enforcer_while_gated_path_denies`. Sunset: the carve-out exists only because the GTS type registry lives inside this gear, and should not survive a split of the registry.
+  - `ResourceGroupTypeBootstrap` is a narrow, deliberately un-gated SDK trait registered in `ClientHub`, backed by `TypeService`'s unscoped methods. Its one permitted caller is account-management's `register_user_group_types`, which registers the RG type schemas it owns from its own `Gear::init` — before all application clients are wired and before legacy registry finalization; the init path uses a platform-scoped actor, which the static AuthZ plugin rejects on the normal gated API. Guardrail: it must never be exposed through REST, pinned by `bootstrap_bypasses_policy_enforcer_while_gated_path_denies`. Sunset: the carve-out exists only because the GTS type registry lives inside this gear, and should not survive a split of the registry.
   - `listGroupHierarchy` shares `resource_group` + `read` permission with `getGroup` — both are group read operations; the AuthZ policy may differentiate them if needed.
 
 ### Reliability Architecture

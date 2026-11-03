@@ -21,21 +21,32 @@ registry from the declared `deps`, and wires the system from those declarations.
 
 ## The lifecycle
 
-The runtime (`HostRuntime`) drives all gears through one shared, ordered sequence of phases:
+The runtime (`HostRuntime`) drives gears in two groups. The **system group** — the few
+platform gears with the `system` capability (types registry, service discovery, cluster,
+API gateway, gRPC hub) — runs its whole startup first; the **application group** (every
+other gear) follows. Each group runs the same ordered phases, every gear's hooks once, in
+dependency order:
 
 ```text
-pre_init → DB migration → init → post_init → REST wiring → gRPC wiring → start → OoP spawn → wait for cancellation → stop
+system group:      pre_init → DB migration → init → client wiring → post_init → REST/gRPC → start
+                   → OoP spawn
+application group: pre_init → DB migration → GTS publication (admission barrier) → init
+                   → client wiring → post_init → REST/gRPC → start
+                   → wait for cancellation → stop (application group, then system group)
 ```
 
-- **`pre_init`** — setup before migrations run (system gears only).
+- **`pre_init`** — optional hook of any gear before its group's migrations run.
 - **DB migration** — gear-owned migrations executed by the runtime (gears with `db` capability).
-- **`init`** — build services, resolve dependencies via `ClientHub`, and register the gear's
-  own SDK implementation.
-- **`post_init`** — a **barrier**: it begins only after every gear's `init` has completed, so
-  any cross-gear wiring is safe here (system gears only).
+- **GTS publication** — the GTS types and instances application gears declare with `gts(...)`
+  are published concurrently and admitted before any application `init`.
+- **`init`** — build the gear's own services and register its own SDK implementation in the
+  `ClientHub`. Ordinary consumed clients are wired only after every `init` of the group, so
+  keep handles for lazy use (or resolve them in `post_init`) rather than calling another gear.
+- **`post_init`** — optional hook of any gear; a **barrier** within its group: it begins only
+  after every `init` of the group completed and its consumed clients are wired.
 - **REST / gRPC wiring** — routes and gRPC services are registered.
 - **`start`** — background work starts for stateful gears.
-- **`OoP spawn`** — out-of-process gears are spawned after the gRPC hub is listening, so they
+- **`OoP spawn`** — out-of-process gears are spawned once the system group started, so they
   can connect to the directory endpoint.
 - **Wait for cancellation** — the runtime blocks until a cancellation signal is received
   (Ctrl-C, SIGTERM, or programmatic).

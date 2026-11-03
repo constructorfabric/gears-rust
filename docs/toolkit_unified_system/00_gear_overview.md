@@ -70,7 +70,10 @@ API gateway, flight control, cred store).
 
 Gears fall into a few categories depending on their role in the platform —
 system Gears (resolvers, gateways, registries), domain Gears (business
-capabilities), and plugins:
+capabilities), and plugins. These are repository/product categories, not startup groups:
+only `capabilities = [system]` selects the early system group; resolvers and plugins are
+application gears. See [Lifecycle](08_lifecycle_stateful_tasks.md).
+
 
 ![Gear categories](../img/gears_categories.drawio.png)
 

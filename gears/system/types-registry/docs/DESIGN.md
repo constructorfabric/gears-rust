@@ -1802,9 +1802,9 @@ Content duplicates across Context Tenants even when only availability and owners
 
 - [ ] `p2` - **ID**: `cpt-cf-types-registry-tech-inventory-registration`
 
-Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::gts_publisher` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
+Declaring crates expose `gts_declarations()` through `declare_gts_inventory!()`. The owning gear lists them in `#[toolkit::gear(…, gts(crates = [crate, some_sdk]))]`; optional config-only `entities` adds configured documents. The default `types_registry_sdk::publication` adapter owns reconciliation and retries. Linking a crate alone does not publish its declarations.
 
-Infrastructure (registry, discovery, cluster, REST and gRPC hosts) starts serving first. After application DB migrations and client wiring, the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, before any application `init`. Pending admission holds `application/preparation` and `/readyz`; a terminal refusal fails application preparation. Plugins bind their clients in `init` using their declared instances after admission. `SystemCapability::post_init` remains system-only. Business bootstrap still runs in `serve`; a separate business-availability gate is future work (#5547, #5562).
+The system group (registry, discovery, cluster, REST and gRPC hosts — the only gears with the `system` capability) starts serving first. After application DB migrations and client wiring, the runtime publishes application gears’ GTS Type Schemas and Instances concurrently, before any application `init`. Pending admission holds `application/preparation` and `/readyz`; a terminal refusal fails application preparation. Plugins bind their clients in `init` using their declared instances after admission. Publication is not a lifecycle hook: the general `Gear::pre_init`/`post_init` hooks run per gear within its startup group and must not wait for a remote service. Business bootstrap still runs in `serve`; a separate business-availability gate is future work (#5547, #5562).
 
 **Stateless services** reconcile on every publication: read current entities, compare authored content, submit missing/changed documents with observed versions, and poll admission. Retryable failures retain operation identity while polling; rejection is not success. `cf-gears-example-server publish-gts` publishes the same GTS Type Schemas and Instances as a deployment step without starting gears.
 
@@ -1833,8 +1833,10 @@ Registry and DB available → migrate → publish-gts → Roll out application p
 
 - `migrate` runs `pre_init` and DB migrations, then exits.
 - `publish-gts --registry <url> --deadline-secs 300` publishes the linked gears’ GTS Type Schemas and Instances
-  without running their lifecycle. It requires a platform credential and exits unsuccessfully
+  without running their lifecycle, under one absolute job deadline passed to every publisher.
+  SDK retries do not renew it. It requires a platform credential and exits unsuccessfully
   on refusal or timeout. Success means admission, not just request acceptance.
+- Ordinary startup uses one 120-second publication budget; exhaustion leaves applications uninitialized.
 - The job and application must use the same image and effective publication configuration.
 
 **Helm:** a `pre-install,pre-upgrade` Job can run these commands sequentially. Registry, DB
