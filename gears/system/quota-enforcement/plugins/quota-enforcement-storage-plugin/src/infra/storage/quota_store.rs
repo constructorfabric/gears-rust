@@ -12,7 +12,7 @@
 //! Seams for later features are marked `2.5` (consumption counters in the cap
 //! guard) and `2.6` (the lease cascade in deactivation).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -291,6 +291,23 @@ impl SqlQuotaStore {
         .map_err(|err| counter_failure(OPERATION, err))
     }
 
+    /// Lock the counter row [`Self::consumed_under_lock`] reads (rank 5), so an
+    /// envelope can take its targets' counters in one order before any item.
+    async fn lock_counter_of(
+        runner: &impl DBRunner,
+        scope: &AccessScope,
+        row: &quota::Model,
+    ) -> Result<(), TxError> {
+        let wait = lease_repo::RowWait::Wait;
+        if row.quota_type == QuotaType::Allocation.as_gts_id() {
+            consumption_counter_repo::find_allocation_for_update(runner, scope, row.id, wait)
+                .await?;
+        } else {
+            consumption_counter_repo::find_latest_for_update(runner, scope, row.id, wait).await?;
+        }
+        Ok(())
+    }
+
     /// Insert one prepared Quota with its capacity row, counter row,
     /// operation-log row and events: the body of `create_quota`, inside the
     /// caller's transaction.
@@ -392,8 +409,52 @@ impl SqlQuotaStore {
         Ok(quota_mapping::row_to_quota(committed)?)
     }
 
+    /// Lock what the cascades of `targets` write past their Quota rows, rank by
+    /// rank: the live leases holding any of them, ascending by token, then
+    /// those leases' capacity rows, then the counter of every hold of those
+    /// leases, whichever Quota it is on, ascending. Each cascade then finds its
+    /// rows held, so neither one deactivation nor an envelope of them goes back
+    /// a rank. The targets' Quota rows are held, so no lease joins them.
+    async fn lock_cascades(
+        tx: &impl DBRunner,
+        targets: &[(Uuid, &AccessScope)],
+        now: OffsetDateTime,
+    ) -> Result<(), TxError> {
+        let wait = lease_repo::RowWait::Wait;
+        let mut leases: BTreeMap<Uuid, &AccessScope> = BTreeMap::new();
+        for (quota_id, scope) in targets {
+            for lease in lease_repo::active_on_quota(tx, scope, *quota_id, now).await? {
+                leases.entry(lease.token).or_insert(*scope);
+            }
+        }
+        let mut capacity: BTreeMap<(Uuid, String), &AccessScope> = BTreeMap::new();
+        let mut counters: BTreeMap<(Uuid, Option<Uuid>), &AccessScope> = BTreeMap::new();
+        for (token, scope) in leases {
+            if let Some(lease) = lease_repo::find_for_update(tx, scope, token, wait).await? {
+                capacity
+                    .entry((lease.tenant_id, lease.metric))
+                    .or_insert(scope);
+            }
+            for hold in lease_repo::holds_of(tx, scope, token).await? {
+                counters
+                    .entry((hold.quota_id, hold.period_id))
+                    .or_insert(scope);
+            }
+        }
+        for ((tenant_id, metric), scope) in capacity {
+            lease_repo::lock_capacity_row(tx, scope, tenant_id, &metric, wait).await?;
+        }
+        for ((quota_id, period_id), scope) in counters {
+            counter_value_of(tx, scope, quota_id, period_id, wait)
+                .await
+                .map_err(|err| counter_failure("deactivate quota", err))?;
+        }
+        Ok(())
+    }
+
     /// Deactivate the locked row and resolve its live leases: the cascade of
-    /// `deactivate_quota`, inside the caller's transaction.
+    /// `deactivate_quota`, inside the caller's transaction, which holds the
+    /// cascade's rows through [`Self::lock_cascades`].
     #[allow(clippy::too_many_arguments)]
     async fn deactivate_locked(
         tx: &impl DBRunner,
@@ -658,6 +719,7 @@ impl QuotaStore for SqlQuotaStore {
             self.db.transaction_ref_mapped(move |tx| {
                 Box::pin(async move {
                     let row = Self::lock_active_row(tx, &scope, quota_id).await?;
+                    Self::lock_cascades(tx, &[(row.id, &scope)], now).await?;
                     Self::deactivate_locked(tx, &scope, &actor, row, &events, now, &*enqueuer).await
                 })
             }),
