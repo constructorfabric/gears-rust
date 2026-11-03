@@ -137,7 +137,7 @@ setup: .setup-stamp py-env
 dylint: dylint-oagw-cluster
 dylint-oagw-cluster:
 	$(call print_target_banner)
-	$(call check_tool,cargo-gears)
+	$(call check_tool_version,cargo-gears,>=$(CARGO_GEARS_VERSION))
 	cargo gears lint --dylint -P cf-gears-oagw -F cluster
 
 .PHONY: ensure-submodules lychee web-docs-check geiger gts-docs docker-pins validate-gear-names pr-review-lint pr-review-test check-packaging-metadata check-release-config check-release-resolver

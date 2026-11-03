@@ -19,7 +19,3 @@ impl FileStorageClientV1 for FileStorageLocalClient {
         "file-storage"
     }
 }
-
-#[cfg(test)]
-#[path = "local_client_tests.rs"]
-mod local_client_tests;
