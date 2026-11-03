@@ -34,6 +34,7 @@ rule_count=$(jq '(.rules // []) | length' "$CONFIG_FILE")
 
 mapfile -t GLOBAL_EXCLUDES < <(jq -r '.excludePaths // [] | .[]' "$CONFIG_FILE")
 
+# matches_any_glob <path> <glob...>: succeed if the path matches any non-empty glob.
 matches_any_glob() {
   local path="$1"; shift
   local glob

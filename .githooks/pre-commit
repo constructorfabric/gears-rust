@@ -20,6 +20,7 @@ IFS='
 set -f
 staged=$(git -c core.quotePath=false diff --cached --name-only --diff-filter=ACMR)
 [ -n "$staged" ] || exit 0
+# pick <regex>: print the staged paths that match the extended regex, one per line.
 pick() { printf '%s\n' "$staged" | grep -E "$1" || true; }
 
 # rustfmt checks the staged blob of each file (from the repo root, so rustfmt.toml applies)

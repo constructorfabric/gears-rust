@@ -41,8 +41,10 @@ real_path=$PATH
 PATH="$T/stubs:$PATH"
 
 nfail=0
+# pass <case>: print a PASS line for the case.
 pass() { echo "PASS $1"; }
 fail() { echo "FAIL $1"; nfail=$((nfail + 1)); }
+# skip <case> [reason]: print a SKIP line for the case, with the reason in parentheses if given.
 skip() { echo "SKIP $1${2:+ ($2)}"; }
 # assert <case> <cmd...>: PASS if the command succeeds.
 assert() { name=$1; shift; if "$@"; then pass "$name"; else fail "$name"; fi; }
@@ -69,8 +71,10 @@ hook() {
     rc=0
     (cd "$hr" && sh ".githooks/$hh" "$@") > "$T/out" 2>&1 || rc=$?
 }
+# marker <repo>: print the repo's local gears.hooks config value (empty if unset).
 marker() { git -C "$1" config --local --get gears.hooks; }
 is_true() { [ "$(marker "$1")" = true ]; }
+# is_false <repo>: succeed if the repo's gears.hooks marker is exactly false.
 is_false() { [ "$(marker "$1")" = false ]; }
 # link_hook <hook> <where>: symlink to the source hook, falling back to a copy (Git Bash).
 link_hook() { ln -sf "$1" "$2" 2>/dev/null || cp "$1" "$2"; }
@@ -261,6 +265,7 @@ push() {
     echo "refs/heads/feat $1 refs/heads/feat $zeros" |
         (cd "$r" && sh .githooks/pre-push) > "$T/out" 2>&1 || rc=$?
 }
+# head_sha: print the HEAD commit SHA of the test repo $r.
 head_sha() { git -C "$r" rev-parse HEAD; }
 
 echo '# x' >> "$r/Cargo.toml"; git -C "$r" commit -qam c1

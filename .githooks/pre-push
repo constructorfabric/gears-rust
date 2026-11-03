@@ -30,6 +30,7 @@ pkg_of() {
     done
 }
 
+# check_ref <sha>: run the pre-push checks on the files changed since the merge-base with main.
 check_ref() {
     sha=$1
     base_ref=origin/main
