@@ -234,6 +234,9 @@ fn collect_slide_node(
 }
 
 /// Emit an optional heading for a grouped section then recurse into children.
+///
+/// The group heading is skipped when the first child is a `Heading`/`Title`
+/// node carrying the same text (as DOCX produces), so it is emitted only once.
 fn collect_group_node(
     heading_level: Option<u8>,
     heading_text: Option<&str>,
@@ -243,7 +246,15 @@ fn collect_group_node(
 ) {
     if let (Some(lvl), Some(txt)) = (heading_level, heading_text) {
         let t = txt.trim();
-        if !t.is_empty() {
+        let first_child_repeats = node
+            .children
+            .first()
+            .and_then(|idx| doc.get(*idx))
+            .is_some_and(|child| match &child.content {
+                NodeContent::Heading { text, .. } | NodeContent::Title { text } => text.trim() == t,
+                _ => false,
+            });
+        if !t.is_empty() && !first_child_repeats {
             out.push(ParsedBlock::Heading {
                 level: clamp_heading_level(lvl),
                 inlines: vec![Inline::plain(t)],
@@ -356,4 +367,82 @@ pub fn kreuzberg_table_to_block(table: &kreuzberg::Table) -> Option<ParsedBlock>
         })
         .collect();
     Some(ParsedBlock::Table(TableBlock { rows }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kreuzberg::types::document_structure::{ContentLayer, NodeId};
+
+    fn node(content: NodeContent) -> DocumentNode {
+        DocumentNode {
+            id: NodeId::new("n"),
+            content,
+            parent: None,
+            children: Vec::new(),
+            content_layer: ContentLayer::default(),
+            page: None,
+            page_end: None,
+            bbox: None,
+            annotations: Vec::new(),
+            attributes: None,
+        }
+    }
+
+    fn group_doc(first_child: NodeContent) -> DocumentStructure {
+        let mut doc = DocumentStructure::new();
+        let group = doc.push_node(node(NodeContent::Group {
+            label: None,
+            heading_level: Some(2),
+            heading_text: Some("X".to_owned()),
+        }));
+        let first = doc.push_node(node(first_child));
+        let body = doc.push_node(node(NodeContent::Paragraph {
+            text: "body".to_owned(),
+        }));
+        doc.add_child(group, first);
+        doc.add_child(group, body);
+        doc
+    }
+
+    fn blocks_of(doc: &DocumentStructure) -> Vec<ParsedBlock> {
+        let mut out = Vec::new();
+        collect_blocks_from_node(&doc.nodes[0], doc, &mut out);
+        out
+    }
+
+    #[test]
+    fn group_heading_not_repeated_when_first_child_is_same_heading() {
+        let doc = group_doc(NodeContent::Heading {
+            level: 2,
+            text: " X ".to_owned(),
+        });
+        let blocks = blocks_of(&doc);
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [ParsedBlock::Heading { .. }, ParsedBlock::Paragraph { .. }]
+            ),
+            "got {blocks:?}"
+        );
+    }
+
+    #[test]
+    fn group_heading_emitted_when_first_child_is_paragraph() {
+        let doc = group_doc(NodeContent::Paragraph {
+            text: "X".to_owned(),
+        });
+        let blocks = blocks_of(&doc);
+        assert!(
+            matches!(
+                blocks.as_slice(),
+                [
+                    ParsedBlock::Heading { .. },
+                    ParsedBlock::Paragraph { .. },
+                    ParsedBlock::Paragraph { .. }
+                ]
+            ),
+            "got {blocks:?}"
+        );
+    }
 }
