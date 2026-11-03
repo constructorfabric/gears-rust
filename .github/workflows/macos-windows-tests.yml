@@ -77,6 +77,7 @@ jobs:
           sort -k1,1nr | awk -F '\t' '!seen[$2]++' |
           while IFS=$'\t' read -r id artifact; do
             gh api "repos/$REPO/actions/artifacts/$id/zip" > "$RUNNER_TEMP/report.zip"
+            mkdir -p "reports/${artifact#rust-tests-}"
             unzip -q "$RUNNER_TEMP/report.zip" -d "reports/${artifact#rust-tests-}"
           done
           gh api --paginate "repos/$REPO/actions/runs/$RUN_ID/jobs" \
