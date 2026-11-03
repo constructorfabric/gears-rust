@@ -295,7 +295,7 @@ Consumer gear requests parsing of a file already present on the server filesyste
 |---|---|---|---|
 | kreuzberg upstream relicenses again (it went MIT → EL-2.0 → MIT) | Low | High | Exact `=` pin; upgrade requires explicit license review; `cargo-deny` license allow-list with no exception for kreuzberg |
 | PPTX multi-slide / table limitations persist in future kreuzberg releases | Medium | Low | Tests marked `#[ignore]` with strict assertions (fixtures are required, not skipped); re-evaluate on upgrade — still present at 4.10.4 |
-| PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; the PDFium build is pinned by `PDFIUM_VERSION` in `.cargo/config.toml` — bump it there (re-check e2e goldens) |
+| PDFium bundled binary lags security patches | Low | Medium | Track pdfium releases; the PDFium build is pinned by `PDFIUM_VERSION` in `.cargo/config.toml` — bump it there, then run `cargo clean -p kreuzberg` (its build script does not rerun on `PDFIUM_VERSION` changes and reuses the cached PDFium in `OUT_DIR`) and re-check e2e goldens |
 | Large document OOM under concurrency | Low | Medium | Configurable size limit enforced before any plugin is invoked; monitor memory usage in production |
 | Plugin registration order conflict (two plugins claim same extension) | Low | Low | First-match semantics are deterministic; document registration order in `gear.rs` |
 | `docx-rust` does not support all DOCX features | Medium | Low | Known limitation; `DocxParser` extracts text and basic structure; rich formatting may be lost |

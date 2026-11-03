@@ -4,17 +4,10 @@ use file_parser::domain::parser::FileParserBackend;
 use file_parser::infra::parsers::kreuzberg_parser::KreuzbergParser;
 use std::path::PathBuf;
 
-/// Helper to get the path to test data files
+mod common;
+
 fn get_test_file_path(filename: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("testing/e2e/testdata/pptx")
-        .join(filename)
+    common::fixture_path("pptx", filename)
 }
 
 #[tokio::test]

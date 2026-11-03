@@ -6,7 +6,7 @@ File parsing gear for Gears / ToolKit.
 
 The `cf-gears-file-parser` crate implements the `file-parser` gear and registers REST routes.
 
-All document extraction is handled by a single unified backend — [`kreuzberg =4.9.4`](https://github.com/kreuzberg-dev/kreuzberg) — which replaces the previous per-format library set (`tl`, `pdf-extract`, `calamine`, `pptx-to-md`).
+All document extraction is handled by a single unified backend — [`kreuzberg =4.10.4`](https://github.com/kreuzberg-dev/kreuzberg) — which replaces the previous per-format library set (`tl`, `pdf-extract`, `calamine`, `pptx-to-md`).
 
 Supported formats:
 

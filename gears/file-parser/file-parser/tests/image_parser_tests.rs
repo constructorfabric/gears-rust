@@ -6,18 +6,10 @@ use file_parser::domain::parser::FileParserBackend;
 use file_parser::infra::parsers::image_parser::ImageParser;
 use std::path::PathBuf;
 
-/// Helper to get the path to test data files
+mod common;
+
 fn get_test_file_path(filename: &str) -> PathBuf {
-    // Path relative to workspace root
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("testing/e2e/testdata/images")
-        .join(filename)
+    common::fixture_path("images", filename)
 }
 
 #[tokio::test]
