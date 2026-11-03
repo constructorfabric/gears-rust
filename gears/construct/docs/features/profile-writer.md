@@ -58,7 +58,7 @@ profile's root node and the edge from the root to a fact; the write of an admitt
 the registration of the types.
 
 **The layout.** Each subject has one root node, and every fact hangs from it by one has-fact edge. The root is an
-owned node of Construct's type `cf.construct.profile.root.v1`. It is not a reference node: a reference node's
+owned node of Construct's type `gts.cf.core.graph.node.v1~cf.core.graph.owned_node.v1~cf.construct.profile.root.v1~`. It is not a reference node: a reference node's
 `source.system` claims a source namespace per tenant for the first writer, so a root that stood for the platform user
 would claim the account management's namespace, or be refused once account management claims it, and it would gain
 nothing over an owned node. The edge is a static edge with no payload, because the fact carries its own origin. The
