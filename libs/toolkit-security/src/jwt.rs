@@ -1,21 +1,49 @@
-//! JWT signature verification through the facade, with jsonwebtoken's existing
-//! claim validation. This adapter owns the signature-disabled second pass;
-//! callers cannot obtain claims without first verifying the original token.
+//! JWT signing and signature verification through the facade, with
+//! jsonwebtoken's existing claim validation. This adapter owns the
+//! signature-disabled second pass; callers cannot obtain claims without first
+//! verifying the original token. Signing never constructs a jsonwebtoken
+//! signer: the compact JWS is assembled here over a facade signature.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use jsonwebtoken::errors::{ErrorKind, Result};
 use jsonwebtoken::{
     Algorithm, AlgorithmFamily, DecodingKey, DecodingKeyKind, Header, TokenData, Validation,
 };
-use pkcs1::der::{Decode, Encode};
-use serde::de::DeserializeOwned;
+use pkcs1::der::Decode;
+use serde::{Serialize, de::DeserializeOwned};
 
 use crate::crypto::{
     CryptoError,
     signature::{
-        EcdsaAlgorithm, RsaAlgorithm, verify_ecdsa as verify_ecdsa_der, verify_rsa_components,
+        EcdsaAlgorithm, EcdsaP256KeyPair, RsaAlgorithm, fixed_to_der,
+        verify_ecdsa as verify_ecdsa_der, verify_rsa_components,
     },
 };
+
+/// Encode and sign a JWT with `ES256` through the configured OS backend.
+///
+/// The header and claims are serialized exactly as `jsonwebtoken::encode`
+/// does, so `kid`, `typ` and custom claims round-trip through either decoder.
+/// Only `ES256` is supported: the facade owns P-256 keys and no other curve.
+/// `header.alg` must already say so; the header is signed as given.
+///
+/// # Errors
+/// Returns `InvalidAlgorithm` for any other `alg`, `Json` when the header or
+/// claims do not serialize, and `Provider` when the backend cannot sign.
+pub fn encode<T: Serialize>(header: &Header, claims: &T, key: &EcdsaP256KeyPair) -> Result<String> {
+    if header.alg != Algorithm::ES256 {
+        return Err(ErrorKind::InvalidAlgorithm.into());
+    }
+    let mut token = URL_SAFE_NO_PAD.encode(serde_json::to_vec(header)?);
+    token.push('.');
+    token.push_str(&URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?));
+    let signature = key
+        .sign_fixed(token.as_bytes())
+        .map_err(|error| ErrorKind::Provider(error.to_string()))?;
+    token.push('.');
+    token.push_str(&URL_SAFE_NO_PAD.encode(signature));
+    Ok(token)
+}
 
 /// Decode a JWT, verifying its signature with the configured OS backend and
 /// validating claims with the caller's original jsonwebtoken policy.
@@ -167,19 +195,8 @@ fn verify_ecdsa(
     if message.len() > u32::MAX as usize {
         return Err(CryptoError::MessageTooLong);
     }
-    // JOSE uses fixed-width r||s; the TLS verifier expects an ASN.1 sequence
-    // of positive INTEGERs. Each encoded scalar and the sequence are <128B.
-    let mut der = vec![0x30, 0];
-    for scalar in signature.chunks_exact(size) {
-        let integer = pkcs1::UintRef::new(scalar).map_err(|_| CryptoError::InvalidSignature)?;
-        der.extend(
-            integer
-                .to_der()
-                .map_err(|_| CryptoError::InvalidSignature)?,
-        );
-    }
-    der[1] = u8::try_from(der.len() - 2).map_err(|_| CryptoError::InvalidSignature)?;
-    verify_ecdsa_der(primitive, key, message, &der)
+    // JOSE uses fixed-width r||s; the TLS verifier expects ASN.1 DER.
+    verify_ecdsa_der(primitive, key, message, &fixed_to_der(signature, size)?)
 }
 
 fn family(algorithm: Algorithm) -> AlgorithmFamily {
