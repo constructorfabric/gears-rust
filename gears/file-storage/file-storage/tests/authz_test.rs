@@ -292,41 +292,56 @@ async fn invalid_policy_and_retention_inputs_are_rejected_without_writing() {
     }
 }
 
-/// Listing another user's files needs the admin scope; without it the call is denied.
+/// A listing returns only the requested owner's files: one's own need no admin scope, another
+/// owner's are denied without it and, with it, still exclude the caller's own files.
 #[tokio::test]
-async fn list_files_of_another_owner_needs_admin_scope() {
+async fn list_files_returns_only_the_listed_owner_and_another_owner_needs_admin() {
     let h = authz_harness("authz", true).await;
     let tenant = Uuid::now_v7();
     let user_a = Uuid::now_v7();
+    let user_b = Uuid::now_v7();
     let ticket = h
         .file_svc
         .create_file(&ctx(tenant, user_a), owned_file(user_a), None, false)
         .await
         .expect("user A creates own file");
-    let ctx_b = ctx(tenant, Uuid::now_v7());
-    let list_as_b = || {
+    let ctx_b = ctx(tenant, user_b);
+    let file_b = h
+        .file_svc
+        .create_file(&ctx_b, owned_file(user_b), None, false)
+        .await
+        .expect("user B creates own file")
+        .file_id;
+    let list_of = |owner_id: Uuid| {
         h.file_svc.list_files(
             &ctx_b,
             OwnerFilter {
                 owner_kind: OwnerKind::User,
-                owner_id: user_a,
+                owner_id,
             },
             Some(10),
             None,
         )
     };
 
-    let denied = list_as_b().await;
+    let own = list_of(user_b)
+        .await
+        .expect("listing one's own files needs no admin scope");
+    let own_ids: Vec<Uuid> = own.items.iter().map(|f| f.file_id).collect();
+    assert_eq!(own_ids, vec![file_b], "only B's own file");
+
+    let denied = list_of(user_a).await;
     assert!(
         matches!(denied, Err(DomainError::Forbidden)),
         "expected Forbidden, got {denied:?}"
     );
 
     h.authz.set_admin(true);
-    let found = list_as_b()
+    let found = list_of(user_a)
         .await
         .expect("an admin may list another owner's files");
-    assert!(found.items.iter().any(|f| f.file_id == ticket.file_id));
+    let found_ids: Vec<Uuid> = found.items.iter().map(|f| f.file_id).collect();
+    assert_eq!(found_ids, vec![ticket.file_id], "only A's file, not B's");
 }
 
 /// A revoked caller must not replay a stored ticket (authorize runs before the lookup).

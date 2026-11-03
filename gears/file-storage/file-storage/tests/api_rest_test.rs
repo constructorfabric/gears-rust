@@ -11,6 +11,7 @@ use axum::body::Body;
 use axum::http::Request;
 use axum::response::Response;
 use axum::routing::{get, patch, post};
+use bytes::Bytes;
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use toolkit::api::canonical_prelude::CanonicalError;
@@ -20,14 +21,15 @@ use uuid::Uuid;
 
 use file_storage::api::rest::handlers;
 use file_storage::domain::error::DomainError;
+use file_storage::domain::etag::content_etag;
 use file_storage::infra::backend::{InMemoryBackend, StorageBackend};
 use file_storage::infra::signed_url::Verifier;
 use file_storage_sdk::NewFile;
 
 mod common;
 use common::{
-    Stack, StackBuilder, body_json, ctx_for, get_req, insert_composite_version, problem_body,
-    seed_file_with_versions, token_of, violations,
+    Stack, StackBuilder, body_json, content_id_of, ctx_for, get_req, insert_composite_version,
+    problem_body, seed_file_with_versions, token_of, violations,
 };
 
 const BASE: &str = "/api/file-storage/v1";
@@ -68,6 +70,7 @@ impl Rest {
                 &format!("{BASE}/files/{{id}}/versions"),
                 get(handlers::list_versions),
             )
+            .route(&format!("{BASE}/files/{{id}}/bind"), post(handlers::bind))
             .route(
                 &format!("{BASE}/files/{{file_id}}/versions/{{version_id}}/finalize"),
                 post(handlers::finalize_version),
@@ -479,6 +482,95 @@ async fn patch_metadata_if_match_header_handling() {
         applied.status().as_u16(),
         200,
         "an absent header applies unconditionally"
+    );
+}
+
+/// `POST /files/{id}/bind` through the router: `If-Match` reaches the service (a stale value, even an
+/// unparseable one, is a precondition failure; the handler does not parse it, unlike
+/// `If-Match-Metadata`), and a matching one binds and answers the re-read file.
+#[tokio::test]
+async fn bind_through_the_router_honours_if_match_and_returns_the_bound_version() {
+    let rest = Rest::new().await;
+    let svc = &rest.stack.svc;
+    let ticket = svc
+        .create_file(&rest.ctx, new_file(rest.owner), None, false)
+        .await
+        .expect("create file");
+    let (file_id, first) = (ticket.file_id, ticket.version_id);
+    rest.stack
+        .dp
+        .put_content(
+            &rest.ctx,
+            file_id,
+            first,
+            "text/plain",
+            Bytes::from_static(b"one"),
+        )
+        .await
+        .expect("upload first version");
+    svc.bind(&rest.ctx, file_id, first, None)
+        .await
+        .expect("first bind needs no If-Match");
+    let second = svc
+        .presign_version(&rest.ctx, file_id)
+        .await
+        .expect("presign second version")
+        .version_id;
+    rest.stack
+        .dp
+        .put_content(
+            &rest.ctx,
+            file_id,
+            second,
+            "text/plain",
+            Bytes::from_static(b"two"),
+        )
+        .await
+        .expect("upload second version");
+
+    let bind_with = |if_match: Option<&str>| {
+        let mut req = Request::builder()
+            .method("POST")
+            .uri(format!("{BASE}/files/{file_id}/bind"))
+            .header("content-type", "application/json");
+        if let Some(value) = if_match {
+            req = req.header("if-match", value);
+        }
+        rest.send(
+            req.body(Body::from(json!({ "version_id": second }).to_string()))
+                .expect("build request"),
+        )
+    };
+
+    let stale_etag = content_etag(file_id, Uuid::now_v7());
+    for (row, header) in [
+        ("stale", stale_etag.as_str()),
+        ("unparseable", "not-an-etag"),
+    ] {
+        let body = problem_body(bind_with(Some(header)).await, 400).await;
+        assert!(
+            body["context"]["field_violations"].is_null(),
+            "{row}: a precondition failure, not a field validation error: {body}"
+        );
+        assert!(body.to_string().contains("IF_MATCH"), "{row}: {body}");
+    }
+    assert_eq!(
+        content_id_of(&rest.stack.store, file_id).await,
+        Some(first),
+        "rejected binds must not move the pointer"
+    );
+
+    let current = content_etag(file_id, first);
+    let reply = bind_with(Some(&current)).await;
+    assert_eq!(reply.status().as_u16(), 200);
+    let bound = body_json(reply).await;
+    assert_eq!(bound["file_id"], file_id.to_string());
+    assert_eq!(bound["content_id"], second.to_string(), "{bound}");
+    assert_eq!(bound["etag"], content_etag(file_id, second), "{bound}");
+    assert_eq!(
+        content_id_of(&rest.stack.store, file_id).await,
+        Some(second),
+        "the file pointer must have switched to the new version"
     );
 }
 
