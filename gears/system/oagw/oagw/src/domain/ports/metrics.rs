@@ -106,6 +106,13 @@ pub trait OagwMetricsPort: Send + Sync {
     /// [`super::metric_labels::provisioning_outcome`].
     fn record_registry_provisioning_run(&self, outcome: &str);
 
+    /// `{prefix}_credentials_withheld_total` — counter
+    ///
+    /// An ancestor's auth or headers not sent because the resolved upstream
+    /// serves the alias on endpoints their owner did not configure, by
+    /// `outcome` from [`super::metric_labels::withheld_outcome`].
+    fn record_credential_withheld(&self, host: &str, outcome: &'static str);
+
     /// `{prefix}_proxy_cache_lookups_total` — counter
     ///
     /// One key looked up in the proxy configuration cache section `map`
@@ -182,6 +189,7 @@ impl OagwMetricsPort for NoopMetrics {
     fn record_rate_limit_sweep(&self, _: u64, _: u64) {}
     fn record_registry_provisioning_failure(&self, _: &str, _: &str) {}
     fn record_registry_provisioning_run(&self, _: &str) {}
+    fn record_credential_withheld(&self, _: &str, _: &'static str) {}
     fn record_proxy_cache_lookup(&self, _: CacheMap, _: CacheLookup) {}
     fn record_proxy_cache_entries(&self, _: CacheMap, _: u64) {}
     fn record_proxy_cache_evictions(&self, _: CacheMap, _: CacheEviction, _: u64) {}

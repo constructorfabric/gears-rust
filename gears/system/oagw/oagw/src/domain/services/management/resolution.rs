@@ -1,5 +1,7 @@
 use super::alias::{normalize_alias, validate_alias};
-use super::merge::{compute_effective_config, is_visible_to_descendant};
+use super::merge::{
+    compute_effective_config, compute_effective_config_reporting, is_visible_to_descendant,
+};
 use super::validation::validate_endpoint_hostnames_ssrf;
 
 use std::collections::HashSet;
@@ -136,7 +138,15 @@ impl ControlPlaneServiceImpl {
         let mut merge_vec: Vec<Upstream> = merge_chain.into_iter().rev().collect();
         merge_vec.push(selected_upstream);
 
-        let effective = compute_effective_config(&merge_vec, route.as_ref())?;
+        // Reported on the proxy path only: the SDK's resolve (`Tags::Load`)
+        // sends nothing.
+        let report = matches!(tags, Tags::Skip);
+        let effective =
+            compute_effective_config_reporting(&merge_vec, route.as_ref(), &mut |withheld| {
+                if report {
+                    self.withheld_log.report(self.metrics.as_deref(), &withheld);
+                }
+            })?;
         Ok((effective, route))
     }
 

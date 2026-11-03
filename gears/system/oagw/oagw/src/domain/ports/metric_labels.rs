@@ -102,6 +102,17 @@ pub mod provisioning_reason {
     pub const UNEXPECTED: &str = "unexpected";
 }
 
+/// Why an ancestor's credential was not sent (`outcome` label of
+/// `credentials_withheld_total`).
+pub mod withheld_outcome {
+    /// The ancestor's auth was dropped: the request went out without it.
+    pub const DROPPED_AUTH: &str = "dropped_auth";
+    /// The ancestor's request headers were dropped.
+    pub const DROPPED_HEADERS: &str = "dropped_headers";
+    /// The ancestor's auth is enforced: the request was refused.
+    pub const ENFORCED_REFUSED: &str = "enforced_refused";
+}
+
 /// How a registry reconcile run ended (`outcome` label of
 /// `registry_provisioning_runs_total`).
 pub mod provisioning_outcome {

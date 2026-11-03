@@ -330,15 +330,18 @@ impl Gear for OutboundApiGatewayGear {
         // the enforcer resolves it from the hub per call.
         let policy_enforcer = PolicyEnforcer::from_hub(ctx.client_hub());
 
-        let cp_impl = Arc::new(ControlPlaneServiceImpl::new(
-            upstream_repo,
-            route_repo,
-            tenant_resolver.clone(),
-            policy_enforcer.clone(),
-            credstore.clone(),
-            ssrf_guard.clone(),
-            proxy_reader,
-        ));
+        let cp_impl = Arc::new(
+            ControlPlaneServiceImpl::new(
+                upstream_repo,
+                route_repo,
+                tenant_resolver.clone(),
+                policy_enforcer.clone(),
+                credstore.clone(),
+                ssrf_guard.clone(),
+                proxy_reader,
+            )
+            .with_metrics(metrics.clone()),
+        );
         // The registry reconcile only; handlers and the SDK get `cp`.
         self.registry_provisioner
             .set(Arc::new(RegistryProvisionerImpl::new(
