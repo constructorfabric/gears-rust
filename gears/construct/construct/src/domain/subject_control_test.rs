@@ -463,7 +463,71 @@ async fn a_delete_gives_up_as_unavailable_once_its_budget_is_spent() {
         matches!(deleted, Err(DomainError::Unavailable(_))),
         "{deleted:?}"
     );
-    assert_eq!(fixture.writer.plans().len(), 1, "no rerun past the budget");
+    assert!(
+        fixture.writer.plans().is_empty(),
+        "no write past the budget"
+    );
+    assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
+    assert!(fixture.events.taken().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_read_past_the_budget_is_cut_off_and_nothing_is_written() {
+    let fixture = Fixture::new(0);
+    *fixture.profile.delay.lock().unwrap() = Duration::from_secs(30);
+    let service = fixture
+        .service(Arc::new(AllowResolver))
+        .with_budget(Duration::from_secs(20));
+    let started = tokio::time::Instant::now();
+
+    let deleted = service
+        .delete(
+            &fixture.owner(),
+            fixture.subject,
+            &fixture.fact_id(Category::Skill),
+        )
+        .await;
+
+    assert!(
+        matches!(deleted, Err(DomainError::Unavailable(_))),
+        "{deleted:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        Duration::from_secs(20),
+        "answered when the budget ran out, not when the read did"
+    );
+    assert!(fixture.writer.plans().is_empty());
+    assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
+    assert!(fixture.events.taken().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_rerun_whose_read_outlasts_the_budget_writes_nothing_more() {
+    let fixture = Fixture::new(10);
+    // The first read ends at 15 s, inside the budget, so the first write
+    // runs; the rerun's read would end at 30 s.
+    *fixture.profile.delay.lock().unwrap() = Duration::from_secs(15);
+    let service = fixture
+        .service(Arc::new(AllowResolver))
+        .with_budget(Duration::from_secs(20));
+    let started = tokio::time::Instant::now();
+
+    let deleted = service
+        .delete(
+            &fixture.owner(),
+            fixture.subject,
+            &fixture.fact_id(Category::Skill),
+        )
+        .await;
+
+    assert!(
+        matches!(deleted, Err(DomainError::Unavailable(_))),
+        "{deleted:?}"
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(20));
+    assert_eq!(fixture.writer.plans().len(), 1, "only the first write");
+    assert_eq!(fixture.profile.live().len(), 2, "nothing was deleted");
 }
 
 #[tokio::test]

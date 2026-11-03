@@ -35,8 +35,10 @@ pub(crate) mod actions {
     pub const EXPORT: &str = "export";
 }
 
-/// How long one delete may take, its reruns and their pauses included; well
-/// below the gateway's request timeout, so the caller hears how it ended.
+/// How long one delete may read and start writes, its reruns and their
+/// pauses included; past it the delete answers unavailable. A write once
+/// started runs to its end under the writer's own timeouts, since cutting it
+/// off could leave the fact deleted without its event.
 pub const DELETE_BUDGET: Duration = Duration::from_secs(20);
 
 /// The fields a subject's facts list filters and orders by. Exists only to
@@ -285,15 +287,14 @@ impl SubjectControlService {
     /// within the budget.
     ///
     /// NOT cancel-safe: a drop after the writer stored the plan leaves the
-    /// fact deleted without its delete event. The budget keeps the delete
-    /// well inside the gateway's timeout, so a drop comes only from the
-    /// caller going away.
+    /// fact deleted without its delete event. So the budget cuts off a read
+    /// and starts no write past its end, but never cuts off a write.
     ///
     /// # Errors
     ///
     /// [`DomainError::NoSuchFact`] when the subject has no such live fact,
     /// also when a concurrent write removed it before a rerun; unavailable
-    /// when the profile kept changing past the reruns or the budget;
+    /// when the profile kept changing past the reruns or the budget ran out;
     /// otherwise as [`Self::view`].
     ///
     /// @cpt-dod:cpt-cf-construct-dod-subject-control-delete:p1
@@ -311,7 +312,13 @@ impl SubjectControlService {
         // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-own
         for attempt in 0..=self.max_reruns {
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
-            let current = self.ports.profiles.facts(&construct, key).await?;
+            // A read writes nothing, so the budget may cut it off.
+            let current = tokio::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                self.ports.profiles.facts(&construct, key),
+            )
+            .await
+            .map_err(|_| out_of_time(fact_id))??;
             let fact = current
                 .facts
                 .iter()
@@ -319,6 +326,10 @@ impl SubjectControlService {
                 .ok_or_else(|| no_such_fact(fact_id))?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-read
             // @cpt-begin:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
+            // A write is never cut off, so none starts past the budget.
+            if Instant::now() >= deadline {
+                return Err(out_of_time(fact_id));
+            }
             let plan = removal(key, current.version, fact);
             let written = self.ports.writer.write(&construct, &plan).await?;
             // @cpt-end:cpt-cf-construct-algo-subject-control-delete:p1:inst-del-write
@@ -502,6 +513,13 @@ fn rerun_pause(attempt: u32) -> Duration {
 
 fn categories_of(facts: &[StoredFact]) -> BTreeSet<Category> {
     facts.iter().map(|fact| fact.category).collect()
+}
+
+fn out_of_time(fact_id: &NodeKey) -> DomainError {
+    DomainError::Unavailable(format!(
+        "the delete ran out of time; fact {} was not deleted",
+        fact_id.0
+    ))
 }
 
 fn no_such_fact(fact_id: &NodeKey) -> DomainError {

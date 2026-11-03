@@ -1071,11 +1071,13 @@ pub fn stored_fact(
 
 /// One subject's profile in memory: its version and live facts. It keeps
 /// each read: the subject of the context it was read with, and the key.
+/// Each read takes `delay` first.
 #[derive(Default)]
 pub struct MemoryProfile {
     pub version: std::sync::Mutex<Option<u64>>,
     pub facts: std::sync::Mutex<Vec<crate::domain::profile_read::StoredFact>>,
     pub reads: std::sync::Mutex<Vec<(Uuid, SubjectKey)>>,
+    pub delay: std::sync::Mutex<std::time::Duration>,
 }
 
 impl MemoryProfile {
@@ -1084,6 +1086,7 @@ impl MemoryProfile {
             version: std::sync::Mutex::new(Some(1)),
             facts: std::sync::Mutex::new(facts),
             reads: std::sync::Mutex::default(),
+            delay: std::sync::Mutex::default(),
         })
     }
 
@@ -1100,6 +1103,10 @@ impl crate::domain::subject_control::SubjectProfiles for MemoryProfile {
         key: SubjectKey,
     ) -> Result<crate::domain::subject_control::SubjectFacts, DomainError> {
         self.reads.lock().unwrap().push((ctx.subject_id(), key));
+        let delay = *self.delay.lock().unwrap();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         Ok(crate::domain::subject_control::SubjectFacts {
             version: *self.version.lock().unwrap(),
             facts: self.live(),
