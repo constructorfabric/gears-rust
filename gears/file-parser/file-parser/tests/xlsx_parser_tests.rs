@@ -15,6 +15,8 @@ fn get_test_file_path(filename: &str) -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .parent()
+        .unwrap()
         .join("testing/e2e/testdata/xlsx")
         .join(filename)
 }
@@ -39,10 +41,7 @@ async fn test_xlsx_parser_with_simple_file() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -72,10 +71,7 @@ async fn test_xlsx_parser_with_multisheet_file() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("multi_sheet.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -128,10 +124,7 @@ async fn test_xlsx_parser_parse_bytes() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_content = std::fs::read(&test_file).expect("Failed to read test file");
     let bytes = bytes::Bytes::from(file_content);
@@ -185,10 +178,7 @@ async fn test_xlsx_parser_extracts_tables() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_data.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
     let document = result.expect("Failed to parse XLSX");
@@ -211,10 +201,7 @@ async fn test_xlsx_parser_merged_cells() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("merged_cells.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -257,10 +244,7 @@ async fn test_xlsx_parser_formula_cells() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("formula_cells.xlsx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 

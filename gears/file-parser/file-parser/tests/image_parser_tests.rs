@@ -14,6 +14,8 @@ fn get_test_file_path(filename: &str) -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .parent()
+        .unwrap()
         .join("testing/e2e/testdata/images")
         .join(filename)
 }
@@ -34,10 +36,7 @@ async fn test_image_parser_png() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.png");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -85,10 +84,7 @@ async fn test_image_parser_jpg() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.jpg");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -118,10 +114,7 @@ async fn test_image_parser_webp() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.webp");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -154,10 +147,7 @@ async fn test_image_parser_gif() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.gif");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -187,10 +177,7 @@ async fn test_image_parser_parse_bytes_with_filename_hint() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.png");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_bytes = std::fs::read(&test_file).unwrap();
     let bytes = bytes::Bytes::from(file_bytes);
@@ -209,10 +196,7 @@ async fn test_image_parser_parse_bytes_with_content_type() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.jpg");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_bytes = std::fs::read(&test_file).unwrap();
     let bytes = bytes::Bytes::from(file_bytes);
@@ -231,10 +215,7 @@ async fn test_image_parser_parse_bytes_no_hints() {
     let parser = ImageParser::new();
     let test_file = get_test_file_path("tiny.png");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_bytes = std::fs::read(&test_file).unwrap();
     let bytes = bytes::Bytes::from(file_bytes);

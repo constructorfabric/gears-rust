@@ -11,6 +11,8 @@ fn get_test_file_path(filename: &str) -> PathBuf {
         .unwrap()
         .parent()
         .unwrap()
+        .parent()
+        .unwrap()
         .join("testing/e2e/testdata/pptx")
         .join(filename)
 }
@@ -31,10 +33,7 @@ async fn test_pptx_parser_with_simple_file() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_presentation.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -60,18 +59,15 @@ async fn test_pptx_parser_with_simple_file() {
 }
 
 #[tokio::test]
-#[ignore = "kreuzberg 4.9.4 emits slides as `##` headings with no per-slide separation \
-— all slide content is flattened; heading_count == 1 regardless of slide count. \
+#[ignore = "kreuzberg (still as of 4.10.4) emits slides as `##` headings with no per-slide \
+separation — all slide content is flattened; heading_count == 1 regardless of slide count. \
 Re-enable when upgrading to a kreuzberg version that emits one Slide node per slide \
 and produces PageBreak between consecutive Slide root nodes."]
 async fn test_pptx_parser_with_multislide_file() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("multi_slide.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -134,10 +130,7 @@ async fn test_pptx_parser_parse_bytes() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_presentation.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let file_content = std::fs::read(&test_file).expect("Failed to read test file");
     let bytes = bytes::Bytes::from(file_content);
@@ -161,10 +154,7 @@ async fn test_pptx_parser_extracts_text() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("simple_presentation.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
     let document = result.expect("Failed to parse PPTX");
@@ -183,18 +173,15 @@ async fn test_pptx_parser_extracts_text() {
 }
 
 #[tokio::test]
-#[ignore = "kreuzberg 4.9.4 PptxExtractor hardcodes include_structure: false and rebuilds \
-from plain text — table cells are not pipe-formatted so no Table nodes are produced. \
+#[ignore = "kreuzberg (still as of 4.10.4) PptxExtractor hardcodes include_structure: false and \
+rebuilds from plain text — table cells are not pipe-formatted so no Table nodes are produced. \
 result.tables is empty and result.document contains only Paragraph nodes with cell text. \
 Re-enable when upgrading to a kreuzberg version that emits NodeContent::Table for PPTX tables."]
 async fn test_pptx_parser_with_tables() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("presentation_with_table.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
@@ -224,10 +211,7 @@ async fn test_pptx_parser_with_lists() {
     let parser = KreuzbergParser::new();
     let test_file = get_test_file_path("presentation_with_list.pptx");
 
-    if !test_file.exists() {
-        eprintln!("Skipping test: test file not found at {test_file:?}");
-        return;
-    }
+    assert!(test_file.exists(), "test fixture missing: {test_file:?}");
 
     let result = parser.parse_local_path(&test_file, None).await;
 
