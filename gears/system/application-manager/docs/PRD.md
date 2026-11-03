@@ -132,7 +132,7 @@ There is no formal user-satisfaction metric, because the user group is small, kn
 | Run window | The time an operation may run before it is interrupted. It is bounded and follows from the operator-set section-plugin time limit and the number of section plugins. |
 | Request id | The id that links a refusal or an operation report to its history events; for an accepted request it is the operation id. |
 | Allowed callers | The configured list of platform workload identities, each with the actions it may take: seed, uninstall, read schemas, and read operations. |
-| Installed application | An application with a record in the system: its last seed reached a final state, including interrupted, and no uninstall of it has succeeded since. |
+| Installed application | An application with a record in the system: its last seed that did not end as invalid manifest reached a final state, including interrupted, and no uninstall of it has succeeded since. |
 | Operation history | The append-only table that holds the history events of every seed and uninstall request (`cpt-cf-application-manager-fr-history-event`). Reads are not recorded. |
 
 ## 2. Actors
@@ -456,7 +456,7 @@ The system **MUST** let a caller with the read operations permission read an ope
 
 - [ ] `p1` - **ID**: `cpt-cf-application-manager-fr-list-applications`
 
-The system **MUST** keep one record per installed application. A seed operation that reaches a final state **MUST** record its application, or update the record, with the version, the operation id, the outcome category or the interrupted marker, and the finish time, in the same change that finishes the operation. An uninstall that completes as succeeded **MUST** remove the record in the same change; any other uninstall outcome **MUST** leave it unchanged. The system **MUST** let a caller with the read applications permission list the records page by page, and **MUST** give them no meaning beyond this rule. A list **MUST NOT** call any section plugin. Lists end as invalid query, not permitted, or temporarily unavailable.
+The system **MUST** keep one record per installed application. A seed operation that reaches a final state, other than one that ends as invalid manifest, **MUST** record its application, or update the record, with the version, the operation id, the outcome category or the interrupted marker, and the finish time, in the same change that finishes the operation. A seed that ends as invalid manifest **MUST NOT** create or update a record. A seed in which some sections failed is recorded with its outcome category, and an interrupted seed with the interrupted marker. An uninstall that completes as succeeded **MUST** remove the record in the same change; any other uninstall outcome **MUST** leave it unchanged. The system **MUST** let a caller with the read applications permission list the records page by page, and **MUST** give them no meaning beyond this rule. A list **MUST NOT** call any section plugin. Lists end as invalid query, not permitted, or temporarily unavailable.
 
 - **Rationale**: Services such as a navigation menu need one trusted answer to which applications are installed.
 - **Actors**: `cpt-cf-application-manager-actor-operator`
@@ -779,7 +779,7 @@ The system **MUST** give operators a visible signal for history events that fail
 - [ ] An uninstall asks every section plugin to remove the application, in priority order, even one never seeded, and continues after failures (`cpt-cf-application-manager-fr-uninstall`).
 - [ ] A caller not allowed for the action causes no section-plugin call, and each of the seed, uninstall, read schemas, read operations, read history, and read applications permissions is separate (`cpt-cf-application-manager-fr-authorization`).
 - [ ] Seed, uninstall, discovery, and operation reads are granted only to platform identities in the allowed callers, for their listed actions, and history reads and the application list only by platform access control.
-- [ ] A finished seed records or updates its application, a succeeded uninstall removes it, any other uninstall outcome leaves it, and listing applications returns the records page by page with no section-plugin call (`cpt-cf-application-manager-fr-list-applications`).
+- [ ] A finished seed records or updates its application unless it ends as invalid manifest, a succeeded uninstall removes it, any other uninstall outcome leaves it, and listing applications returns the records page by page with no section-plugin call (`cpt-cf-application-manager-fr-list-applications`).
 - [ ] A second request for an application with an accepted or running operation is refused as conflict naming that operation, while other applications proceed.
 - [ ] Reading an operation returns its status and, once final, its report, ends as not found for an unknown or purged id, and makes no section-plugin call.
 - [ ] Listing history events returns them page by page, narrowing by an operation id or a refusal's request id returns only that request's events, an id with no events gives an empty list, and no read makes a section-plugin call (`cpt-cf-application-manager-fr-history-read`).
