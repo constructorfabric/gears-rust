@@ -77,6 +77,55 @@ pub struct AccessListing {
     pub root: Uuid,
 }
 
+/// The tenant hierarchy chains a restriction change reads, resolved by
+/// [`AccessService::authorized_hierarchy_chains`] before the settings
+/// transaction opens.
+///
+/// The tenant resolver opens its own database connection, which the
+/// task-local transaction guard forbids inside another gear's transaction, so
+/// these lookups cannot run in the transaction that changes the restriction.
+/// Only hierarchy facts are kept here: declaration visibility, stored
+/// restrictions, preconditions and audit writes still go through the
+/// transaction's runner.
+///
+/// The chains are a request-local snapshot. Account Management's hierarchy is
+/// not locked: a tenant moved or made standalone after the lookup is seen by
+/// the next request, the same consistency model the value-write gate uses.
+/// The stored row is keyed by declaration and tenant, never by chain, so a
+/// stale chain can only affect the readout returned by this one request.
+///
+/// The fields are private so that only the authorizing lookup can build one;
+/// [`AccessService::set`] and [`AccessService::clear`] refuse chains that do
+/// not end at the actor's tenant and the target they are given.
+#[domain_model]
+pub struct TenantHierarchyChains {
+    /// The caller's ancestry, root first and ending at the caller's tenant:
+    /// what the caller's own visibility of the declaration is judged over.
+    caller_chain: Vec<Uuid>,
+    /// The target's ancestry, root first and ending at the target: what the
+    /// returned effective access is computed over.
+    target_chain: Vec<Uuid>,
+    /// The platform root tenant.
+    root: Uuid,
+}
+
+impl TenantHierarchyChains {
+    /// Refuse chains resolved for a different caller or target than the
+    /// mutation is asked to change. A mismatch is a programming error in the
+    /// caller, never a client error, so it surfaces as an internal error.
+    fn ensure_for(&self, caller: Uuid, target: Uuid) -> Result<(), DomainError> {
+        if self.caller_chain.last() != Some(&caller) || self.target_chain.last() != Some(&target) {
+            return Err(DomainError::Internal {
+                diagnostic: format!(
+                    "tenant hierarchy chains were resolved for another caller or target \
+                     than {caller} -> {target}"
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// The service.
 #[domain_model]
 pub struct AccessService<D, A, S> {
@@ -160,6 +209,21 @@ where
         actor: &AccessActor,
         key: &SettingKey,
     ) -> Result<Declaration, DomainError> {
+        let (_, chain) = self.root_and_chain(actor.ctx.subject_tenant_id()).await?;
+        self.visible_declaration_on_chain(conn, actor, key, &chain)
+            .await
+    }
+
+    /// As [`Self::visible_declaration`], over the caller's chain already
+    /// resolved — the form a transaction uses, since it cannot ask the tenant
+    /// resolver itself.
+    async fn visible_declaration_on_chain<C: DBRunner>(
+        &self,
+        conn: &C,
+        actor: &AccessActor,
+        key: &SettingKey,
+        chain: &[Uuid],
+    ) -> Result<Declaration, DomainError> {
         let declaration = self
             .declarations
             .find_by_key(conn, &AccessScope::allow_all(), key.as_str())
@@ -169,7 +233,7 @@ where
             return Err(absent());
         }
         if self
-            .effective_for(conn, declaration.id, actor.ctx.subject_tenant_id())
+            .effective_on_chain(conn, declaration.id, chain)
             .await?
             .is_hidden()
         {
@@ -178,7 +242,8 @@ where
         Ok(declaration)
     }
 
-    /// The root tenant and one tenant's chain from it, root first.
+    /// The root tenant and one tenant's chain from it, root first. Asks the
+    /// tenant resolver, so it must not run inside a settings transaction.
     async fn root_and_chain(&self, tenant: Uuid) -> Result<(Uuid, Vec<Uuid>), DomainError> {
         let root = self.platform.root_tenant().await?;
         let chain = if tenant == root {
@@ -189,8 +254,39 @@ where
         Ok((root, chain))
     }
 
-    /// Effective access over a chain already obtained.
-    async fn effective_over<C: DBRunner>(
+    /// Run the strict-descendant target check, then resolve the caller's and
+    /// the target's hierarchy chains for [`Self::set`] or [`Self::clear`].
+    ///
+    /// Call this before opening the transaction: both steps ask the tenant
+    /// resolver, which opens its own database connection, and the task-local
+    /// transaction guard forbids that inside another gear's transaction.
+    ///
+    /// # Errors
+    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
+    /// descendant of the caller — a caller that could restrict itself could
+    /// lift the restriction again; [`DomainError::NotFound`] for an unknown
+    /// tenant and [`DomainError::Unavailable`] when the tenant resolver or the
+    /// platform root cannot answer.
+    pub async fn authorized_hierarchy_chains(
+        &self,
+        actor: &AccessActor,
+        target: Uuid,
+    ) -> Result<TenantHierarchyChains, DomainError> {
+        let caller = actor.ctx.subject_tenant_id();
+        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
+            return Err(denied());
+        }
+        let (_, caller_chain) = self.root_and_chain(caller).await?;
+        let (root, target_chain) = self.root_and_chain(target).await?;
+        Ok(TenantHierarchyChains {
+            caller_chain,
+            target_chain,
+            root,
+        })
+    }
+
+    /// Query current restrictions using a previously resolved hierarchy chain.
+    async fn effective_on_chain<C: DBRunner>(
         &self,
         conn: &C,
         declaration_id: Uuid,
@@ -201,17 +297,6 @@ where
             .find_in_tenants(conn, &AccessScope::allow_all(), declaration_id, chain)
             .await?;
         Ok(strictest(&rows))
-    }
-
-    /// Effective access of one tenant for one declaration.
-    async fn effective_for<C: DBRunner>(
-        &self,
-        conn: &C,
-        declaration_id: Uuid,
-        tenant: Uuid,
-    ) -> Result<EffectiveAccess, DomainError> {
-        let (_, chain) = self.root_and_chain(tenant).await?;
-        self.effective_over(conn, declaration_id, &chain).await
     }
 
     /// The target of a read: the caller's own tenant or a descendant that is
@@ -226,20 +311,36 @@ where
         Ok(())
     }
 
+    /// One tenant's readout, resolving its chain first; for reads, which run
+    /// outside a transaction.
     async fn readout<C: DBRunner>(
         &self,
         conn: &C,
         declaration: Declaration,
         tenant_id: Uuid,
     ) -> Result<AccessReadout, DomainError> {
+        let (root, chain) = self.root_and_chain(tenant_id).await?;
+        self.readout_on_chain(conn, declaration, tenant_id, root, &chain)
+            .await
+    }
+
+    /// One tenant's readout over its chain already resolved: the stored row,
+    /// the effective access over the chain, and the tag. The chain is also
+    /// what the upward disclosure boundary reads the path from the reader
+    /// tenant down to the target off.
+    async fn readout_on_chain<C: DBRunner>(
+        &self,
+        conn: &C,
+        declaration: Declaration,
+        tenant_id: Uuid,
+        root: Uuid,
+        chain: &[Uuid],
+    ) -> Result<AccessReadout, DomainError> {
         let stored = self
             .access
             .find_one(conn, &AccessScope::allow_all(), declaration.id, tenant_id)
             .await?;
-        // The target's chain is what the upward disclosure boundary reads the
-        // path from the reader tenant down to the target off.
-        let (root, chain) = self.root_and_chain(tenant_id).await?;
-        let effective = self.effective_over(conn, declaration.id, &chain).await?;
+        let effective = self.effective_on_chain(conn, declaration.id, chain).await?;
         let etag = restriction_tag(stored.as_ref());
         Ok(AccessReadout {
             declaration,
@@ -247,7 +348,7 @@ where
             stored,
             effective,
             etag,
-            chain,
+            chain: chain.to_vec(),
             root,
         })
     }
@@ -283,28 +384,29 @@ where
     /// Store `read_only` or `hidden` for a strict descendant, inside the
     /// caller's transaction.
     ///
+    /// `chains` come from [`Self::authorized_hierarchy_chains`] for this
+    /// `actor` and `target`, resolved before the transaction opened; that call
+    /// is also where the strict-descendant target check runs.
+    ///
     /// # Errors
-    /// [`DomainError::Unauthorized`] unless the target is a reachable strict
-    /// descendant; [`DomainError::Validation`] for `overridable`;
+    /// [`DomainError::Internal`] for chains resolved for another caller or
+    /// target; [`DomainError::Validation`] for `overridable`;
     /// [`DomainError::NotFound`] for a declaration absent or hidden;
     /// [`DomainError::Retired`] for a retired one;
     /// [`DomainError::PreconditionRequired`] and
     /// [`DomainError::PreconditionFailed`] on the tag.
+    #[allow(clippy::too_many_arguments)]
     pub async fn set<C: DBRunner>(
         &self,
         conn: &C,
         actor: &AccessActor,
+        chains: &TenantHierarchyChains,
         key: &SettingKey,
         target: Uuid,
         access: TenantAccess,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let caller = actor.ctx.subject_tenant_id();
-        // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
-        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
-            return Err(denied());
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-4
+        chains.ensure_for(actor.ctx.subject_tenant_id(), target)?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         if access == TenantAccess::Overridable {
             return Err(DomainError::Validation {
@@ -315,7 +417,9 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-5
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-6
-        let declaration = self.visible_declaration(conn, actor, key).await?;
+        let declaration = self
+            .visible_declaration_on_chain(conn, actor, key, &chains.caller_chain)
+            .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-14
         refuse_retired(&declaration)?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-14
@@ -381,12 +485,15 @@ where
             .append(conn, &AccessScope::allow_all(), record)
             .await?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-set:p1:inst-ta-set-11
-        self.readout(conn, declaration, target).await
+        self.readout_on_chain(conn, declaration, target, chains.root, &chains.target_chain)
+            .await
     }
 
     /// Delete a strict descendant's row, inside the caller's transaction.
     /// Clearing an already absent row is a no-op that still requires the
     /// absent-state tag.
+    ///
+    /// `chains` are as for [`Self::set`].
     ///
     /// # Errors
     /// As [`Self::set`], without the access validation.
@@ -394,18 +501,16 @@ where
         &self,
         conn: &C,
         actor: &AccessActor,
+        chains: &TenantHierarchyChains,
         key: &SettingKey,
         target: Uuid,
         if_match: Option<&str>,
     ) -> Result<AccessReadout, DomainError> {
-        let caller = actor.ctx.subject_tenant_id();
-        // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
-        if !may_restrict(self.hierarchy.as_ref(), caller, target).await? {
-            return Err(denied());
-        }
-        // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-3
+        chains.ensure_for(actor.ctx.subject_tenant_id(), target)?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-4
-        let declaration = self.visible_declaration(conn, actor, key).await?;
+        let declaration = self
+            .visible_declaration_on_chain(conn, actor, key, &chains.caller_chain)
+            .await?;
         // @cpt-begin:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-10
         refuse_retired(&declaration)?;
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-10
@@ -449,7 +554,8 @@ where
         }
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-7
         // @cpt-end:cpt-cf-settings-service-flow-tenant-access-clear:p1:inst-ta-clear-6
-        self.readout(conn, declaration, target).await
+        self.readout_on_chain(conn, declaration, target, chains.root, &chains.target_chain)
+            .await
     }
 
     /// Evict the target and its descendants after an access change; called
