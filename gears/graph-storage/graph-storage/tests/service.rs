@@ -1414,7 +1414,7 @@ async fn an_oversized_hit_list_is_cut_and_reported() {
 /// The first version measured the nodes and appended the edges afterwards,
 /// which is a budget on half the answer -- and on the half that grows
 /// fastest, since a dense neighbourhood has many more edges than nodes and
-/// each carries four caller-controlled strings.
+/// each carries up to five caller-controlled strings.
 ///
 /// The seed invariant is asserted here too, but it is not what this case
 /// proves. Seeds are hydrated at the front of the list, so a cut reaches one
@@ -1503,6 +1503,80 @@ async fn the_byte_budget_charges_the_edges_too() {
             "an edge names two returned nodes: {edge:?}"
         );
     }
+}
+
+/// An edge's discriminator is charged with the rest of the edge.
+///
+/// Two stars of the same shape under one budget: the plain one fits whole,
+/// and the one whose edges carry long discriminators does not. The edges
+/// return the discriminator on `EdgeRef`, so a budget that left it out
+/// would answer both stars whole and the response would outgrow the bound
+/// it reports.
+#[tokio::test]
+async fn the_byte_budget_charges_an_edges_discriminator() {
+    const LEAVES: usize = 8;
+    // About 2 KiB for the plain star, 4 KiB with the discriminators: the
+    // budget sits between, a kilobyte from each.
+    let budget = GraphStorageConfig {
+        response_max_bytes: 3 * 1024,
+        ..GraphStorageConfig::default()
+    };
+    let harness = Harness::configured(Arc::new(support::AllowInOwnTenant), budget);
+    let ctx = harness.ctx();
+    harness.seed_ontology(&ctx).await;
+
+    // The base edge schema caps a discriminator at 256 characters.
+    let long = "d".repeat(256);
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+    for hub in ["plain", "tagged"] {
+        nodes.push(conformance::node(hub, hub));
+        for index in 0..LEAVES {
+            let leaf = format!("{hub}-{index}");
+            nodes.push(conformance::node(&leaf, &leaf));
+            edges.push(graph_storage_sdk::models::EdgeSpec {
+                discriminator: (hub == "tagged").then(|| long.clone()),
+                ..conformance::edge(hub, &leaf)
+            });
+        }
+    }
+    harness
+        .services
+        .ingest(&ctx, conformance::batch(nodes, edges))
+        .await
+        .expect("the batch commits");
+
+    let walk = |seed: &str| TraverseRequest {
+        seeds: vec![seed.to_owned()],
+        depth: 1,
+        edge_type_patterns: Vec::new(),
+        node_type_patterns: Vec::new(),
+        max_nodes: Some(100),
+        direction: None,
+        edge_discriminators: Vec::new(),
+    };
+    let plain = harness
+        .services
+        .traverse(&ctx, walk("plain"))
+        .await
+        .expect("the plain star answers");
+    assert_eq!(
+        (plain.edges.len(), plain.truncated),
+        (LEAVES, None),
+        "the fixture: without discriminators the star fits the budget whole"
+    );
+    let tagged = harness
+        .services
+        .traverse(&ctx, walk("tagged"))
+        .await
+        .expect("the tagged star answers");
+    assert_eq!(
+        tagged.truncated,
+        Some(TruncationReason::ResponseBytes),
+        "{LEAVES} discriminators of {} bytes are charged to the budget",
+        long.len()
+    );
+    assert!(tagged.edges.len() < LEAVES, "{} edges", tagged.edges.len());
 }
 
 /// Seeds that do not fit are a refusal, not a silent short answer.

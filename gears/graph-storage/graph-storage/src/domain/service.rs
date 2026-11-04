@@ -1407,12 +1407,6 @@ impl GraphServices {
     }
 }
 
-/// What one hydrated node costs to hold and to encode.
-///
-/// The payload dominates and the adjacency is the other half that grows: a
-/// node carries its neighbours' keys and types too, and a traversal returns
-/// many such nodes. Counting only the payload would make this a payload
-/// budget rather than a response budget.
 /// The most rows one traversal hydration piece asks for, whatever the budget
 /// would allow: it bounds the id list a single statement carries.
 const HYDRATION_PIECE_MAX: usize = 256;
@@ -1426,22 +1420,58 @@ fn budgeted_piece(remaining: u64, item_ceiling: u64) -> usize {
     fits.clamp(1, HYDRATION_PIECE_MAX)
 }
 
+/// What one hydrated node costs to hold and to encode.
+///
+/// The payload dominates and the adjacency is the other half that grows: a
+/// node carries its neighbours' keys and types too, and a traversal returns
+/// many such nodes. Counting only the payload would make this a payload
+/// budget rather than a response budget.
+///
+/// Every field is named, none behind `..`, here and in every `*_bytes`
+/// function below: a string added to a response type is a compile error here until it
+/// is counted, rather than bytes the budget silently never sees. The envelope
+/// is the one thing left out -- its key repeats `node_key` and the rest is
+/// gear-assigned and fixed in size.
 fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
-    let payload = view.payload.as_ref().map_or(0, |value| {
+    let graph_storage_sdk::models::NodeView {
+        node_key,
+        type_id,
+        name,
+        payload,
+        has_embedding: _,
+        labels,
+        adjacency,
+        adjacency_truncated: _,
+        envelope: _,
+    } = view;
+    let payload = payload.as_ref().map_or(0, |value| {
         serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
     });
-    let adjacency: u64 = view
-        .adjacency
-        .iter()
-        .map(|entry| {
-            (entry.edge_key.len() + entry.edge_type_id.len() + entry.neighbor_key.len()) as u64
-        })
-        .sum();
+    let adjacency: u64 = adjacency.iter().map(adjacency_bytes).sum();
+    let labels: u64 = labels.iter().map(|label| label.len() as u64).sum();
     payload
         .saturating_add(adjacency)
-        .saturating_add(view.node_key.len() as u64)
-        .saturating_add(view.type_id.len() as u64)
-        .saturating_add(view.name.as_ref().map_or(0, |name| name.len() as u64))
+        .saturating_add(labels)
+        .saturating_add(node_key.len() as u64)
+        .saturating_add(type_id.len() as u64)
+        .saturating_add(name.as_ref().map_or(0, |name| name.len() as u64))
+}
+
+/// What one adjacency entry costs: five caller-controlled strings.
+fn adjacency_bytes(entry: &graph_storage_sdk::models::AdjacencyEntry) -> u64 {
+    let graph_storage_sdk::models::AdjacencyEntry {
+        edge_key,
+        edge_type_id,
+        side: _,
+        neighbor_key,
+        neighbor_type_id,
+        discriminator,
+    } = entry;
+    (edge_key.len()
+        + edge_type_id.len()
+        + neighbor_key.len()
+        + neighbor_type_id.len()
+        + discriminator.as_ref().map_or(0, String::len)) as u64
 }
 
 /// What one search hit costs to carry.
@@ -1450,25 +1480,51 @@ fn hydrated_bytes(view: &graph_storage_sdk::models::NodeView) -> u64 {
 /// payload, which is what the ranking projection exists to avoid reading. It
 /// is still caller-controlled text, so it is still measured.
 fn hit_bytes(hit: &graph_storage_sdk::models::SearchHit) -> u64 {
-    (hit.node_key.len()
-        + hit.type_id.len()
-        + hit.name.as_ref().map_or(0, String::len)
-        + hit.snippet.as_ref().map_or(0, String::len)
-        + hit.arms.len() * std::mem::size_of::<graph_storage_sdk::models::ArmHit>()) as u64
+    let graph_storage_sdk::models::SearchHit {
+        node_key,
+        type_id,
+        name,
+        score: _,
+        arms,
+        snippet,
+    } = hit;
+    (node_key.len()
+        + type_id.len()
+        + name.as_ref().map_or(0, String::len)
+        + snippet.as_ref().map_or(0, String::len)
+        + arms.len() * std::mem::size_of::<graph_storage_sdk::models::ArmHit>()) as u64
 }
 
 /// What one projected row costs to carry.
 fn row_bytes(row: &NodeRow) -> u64 {
-    let payload = row.payload.as_ref().map_or(0, |value| {
+    let NodeRow {
+        node_key,
+        type_id,
+        name,
+        payload,
+        envelope: _,
+    } = row;
+    let payload = payload.as_ref().map_or(0, |value| {
         serde_json::to_vec(value).map_or(u64::MAX, |bytes| bytes.len() as u64)
     });
     payload
-        .saturating_add(row.node_key.len() as u64)
-        .saturating_add(row.type_id.len() as u64)
-        .saturating_add(row.name.as_ref().map_or(0, |name| name.len() as u64))
+        .saturating_add(node_key.len() as u64)
+        .saturating_add(type_id.len() as u64)
+        .saturating_add(name.as_ref().map_or(0, |name| name.len() as u64))
 }
 
-/// What one traversed edge costs to carry: four caller-controlled strings.
+/// What one traversed edge costs to carry: five caller-controlled strings.
 fn edge_bytes(edge: &graph_storage_sdk::models::EdgeRef) -> u64 {
-    (edge.edge_key.len() + edge.edge_type_id.len() + edge.src.len() + edge.dst.len()) as u64
+    let graph_storage_sdk::models::EdgeRef {
+        edge_key,
+        edge_type_id,
+        src,
+        dst,
+        discriminator,
+    } = edge;
+    (edge_key.len()
+        + edge_type_id.len()
+        + src.len()
+        + dst.len()
+        + discriminator.as_ref().map_or(0, String::len)) as u64
 }
