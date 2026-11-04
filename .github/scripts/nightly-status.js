@@ -101,7 +101,7 @@ module.exports = async ({ github, context, core }) => {
   }
 
   const created = await github.rest.issues.create({
-    owner, repo, title: TITLE, body, labels: ['ci'],
+    owner, repo, title: TITLE, body, labels: ['ci', 'nightly'],
   });
   const number = created.data.number;
   core.info(`Created #${number}`);
