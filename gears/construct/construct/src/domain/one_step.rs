@@ -269,7 +269,8 @@ impl OneStepPath {
         PF: Future<Output = Result<(), DomainError>>,
     {
         // @cpt-begin:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
-        let (construct, scope) = writes.construct(key.tenant_id).await?;
+        let (construct, scope) =
+            ProfileWrites::before_write(deadline, what, writes.construct(key.tenant_id)).await?;
         let (construct, scope, build, pend) = (&construct, &scope, &build, &pend);
         // @cpt-end:cpt-cf-construct-algo-review-queue-correct:p1:inst-correct-start
         writes

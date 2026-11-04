@@ -12,6 +12,7 @@ use std::sync::Arc;
 use authz_resolver_sdk::PolicyEnforcer;
 use authz_resolver_sdk::pep::AccessRequest;
 use serde_json::Value;
+use tokio::time::Instant;
 use toolkit_macros::domain_model;
 use toolkit_odata::{ODataQuery, Page};
 use toolkit_security::{AccessScope, SecurityContext, pep_properties};
@@ -191,7 +192,9 @@ impl AdminFactsService {
     ) -> Result<NewFact, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-authorize
         let deadline = self.ports.writes.deadline();
-        let (key, _) = self.administrator(ctx, subject_id).await?;
+        let (key, _) =
+            ProfileWrites::before_write(deadline, "add", self.administrator(ctx, subject_id))
+                .await?;
         let one_step = self.one_step()?;
         // @cpt-end:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-authorize
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-add:p2:inst-add-write
@@ -256,12 +259,11 @@ impl AdminFactsService {
     ) -> Result<NewFact, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-read
         let deadline = self.ports.writes.deadline();
-        let (key, scope) = self.administrator(ctx, subject_id).await?;
+        let (key, scope) =
+            ProfileWrites::before_write(deadline, "edit", self.administrator(ctx, subject_id))
+                .await?;
         let one_step = self.one_step()?;
-        let fact = self
-            .ports
-            .writes
-            .facts(key)
+        let fact = ProfileWrites::before_write(deadline, "edit", self.ports.writes.facts(key))
             .await?
             .facts
             .into_iter()
@@ -276,7 +278,10 @@ impl AdminFactsService {
         let by = ctx.subject_id();
         // @cpt-end:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-read
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-edit:p2:inst-edit-review
-        if let Some(request) = self.open_request(&scope, key, fact_id).await? {
+        if let Some(request) = self
+            .open_request(&scope, key, fact_id, "edit", deadline)
+            .await?
+        {
             let settled = self
                 .ports
                 .review_queue
@@ -289,6 +294,7 @@ impl AdminFactsService {
                         value: value.clone(),
                         reason: None,
                     },
+                    deadline,
                 )
                 .await;
             let settled = match settled {
@@ -398,11 +404,16 @@ impl AdminFactsService {
     ) -> Result<(), DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-authorize
         let deadline = self.ports.writes.deadline();
-        let (key, scope) = self.administrator(ctx, subject_id).await?;
+        let (key, scope) =
+            ProfileWrites::before_write(deadline, "delete", self.administrator(ctx, subject_id))
+                .await?;
         let by = ctx.subject_id();
         // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-authorize
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-review
-        if let Some(request) = self.open_request(&scope, key, fact_id).await? {
+        if let Some(request) = self
+            .open_request(&scope, key, fact_id, "delete", deadline)
+            .await?
+        {
             let settled = self
                 .ports
                 .review_queue
@@ -411,6 +422,7 @@ impl AdminFactsService {
                     request.key(),
                     Resolver::Administrator(by),
                     Resolution::Deleted { reason: None },
+                    deadline,
                 )
                 .await?;
             return match settled.wrote {
@@ -440,7 +452,12 @@ impl AdminFactsService {
         }
         // @cpt-end:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-review
         // @cpt-begin:cpt-cf-construct-flow-admin-facts-delete:p2:inst-delete-write
-        let (construct, _) = self.ports.writes.construct(key.tenant_id).await?;
+        let (construct, _) = ProfileWrites::before_write(
+            deadline,
+            "delete",
+            self.ports.writes.construct(key.tenant_id),
+        )
+        .await?;
         let removed = self
             .ports
             .writes
@@ -535,17 +552,21 @@ impl AdminFactsService {
         })
     }
 
-    /// The open review request on the subject's fact, if there is one.
+    /// The open review request on the subject's fact, if there is one, read
+    /// before `deadline`, the budget of the `what` it is read for.
     async fn open_request(
         &self,
         scope: &AccessScope,
         key: SubjectKey,
         fact_id: &NodeKey,
+        what: &str,
+        deadline: Instant,
     ) -> Result<Option<ReviewRequest>, DomainError> {
-        Ok(self
+        let latest = self
             .ports
             .reviews
-            .latest_on(scope, key, std::slice::from_ref(fact_id))
+            .latest_on(scope, key, std::slice::from_ref(fact_id));
+        Ok(ProfileWrites::before_write(deadline, what, latest)
             .await?
             .into_iter()
             .find(ReviewRequest::is_open))

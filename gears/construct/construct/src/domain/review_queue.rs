@@ -957,6 +957,7 @@ impl ReviewQueueService {
         resolution: Resolution,
     ) -> Result<ReviewRequest, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
+        let deadline = self.writes.deadline();
         let scope = self.reviewer(ctx).await?;
         let reviewer = ctx.subject_id();
         let key = RequestKey {
@@ -980,15 +981,22 @@ impl ReviewQueueService {
             )));
         }
         // @cpt-end:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-read
-        self.settle(&scope, key, Resolver::Reviewer(reviewer), resolution)
-            .await?
-            .closed
+        self.settle(
+            &scope,
+            key,
+            Resolver::Reviewer(reviewer),
+            resolution,
+            deadline,
+        )
+        .await?
+        .closed
     }
 
     /// Claim the open request `key` for `resolver`, carry out `resolution`
-    /// on its fact, and close it: a reviewer's resolution, or an
-    /// administrator's edit or delete of a fact under review. What is about
-    /// to be written is recorded on the claim first; a resolution that stores
+    /// on its fact before `deadline`, and close it: a reviewer's resolution,
+    /// or an administrator's edit or delete of a fact under review, which
+    /// spends the budget the edit or delete started. What is about to be
+    /// written is recorded on the claim first; a resolution that stores
     /// nothing gives the claim back.
     ///
     /// NOT cancel-safe, as [`Self::resolve`].
@@ -1004,9 +1012,9 @@ impl ReviewQueueService {
         key: RequestKey,
         resolver: Resolver,
         resolution: Resolution,
+        deadline: Instant,
     ) -> Result<Settled, DomainError> {
         // @cpt-begin:cpt-cf-construct-flow-review-queue-resolve:p1:inst-resolve-claim
-        let deadline = self.writes.deadline();
         let request_id = key.id;
         let hold = Hold {
             requests: self.requests.as_ref(),

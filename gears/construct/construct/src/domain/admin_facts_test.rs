@@ -2,6 +2,7 @@
 //! review store, with stub policy services.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use std::sync::atomic::Ordering;
 
@@ -33,14 +34,17 @@ use crate::infra::processing_contexts::ServiceIdentity;
 use crate::test_support::{
     AllowResolver, DenyResolver, FixedRules, FixedSubjectSettings, MemoryProfile, MemoryReviews,
     MemoryWriter, OwnerOnlyResolver, RecordingAdminEvents, RecordingAdmissionEvents,
-    RecordingEvents, RecordingResolver, RecordingReviewEvents, SubstringCheck, context_of,
-    open_rules, stored_fact,
+    RecordingEvents, RecordingResolver, RecordingReviewEvents, SlowResolver, SubstringCheck,
+    context_of, open_rules, stored_fact,
 };
 
 const ON: SubjectSettings = SubjectSettings {
     personalization_enabled: true,
     erasure_in_progress: false,
 };
+
+/// The budget of one write in these tests.
+const BUDGET: Duration = Duration::from_secs(5);
 
 const OFF: SubjectSettings = SubjectSettings {
     personalization_enabled: false,
@@ -139,7 +143,7 @@ impl Fixture {
                 Arc::new(ServiceIdentity::new(Uuid::new_v4())),
                 2,
             )
-            .with_budget(std::time::Duration::from_secs(5)),
+            .with_budget(BUDGET),
         );
         let one_step = settings.map(|settings| one_step_path(settings, checks));
         let enforcer = PolicyEnforcer::new(resolver);
@@ -1276,4 +1280,102 @@ async fn an_edit_closes_a_request_flagged_after_its_check_unless_a_reviewer_hold
         matches!(held.status(), ReviewStatus::Open { .. }),
         "left to the reviewer who holds it"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_policy_service_that_outlasts_the_budget_cuts_off_an_add_edit_or_delete() {
+    let fixture = Fixture::new();
+    let service = fixture.service_over(Arc::new(SlowResolver(BUDGET * 2)), Some(ON), Vec::new());
+    let skill = fixture.fact("skills");
+
+    let started = tokio::time::Instant::now();
+    let added = service
+        .add(
+            &fixture.admin(),
+            fixture.subject,
+            "headline",
+            &json!("Lead"),
+        )
+        .await;
+    assert!(
+        matches!(added, Err(DomainError::Unavailable(_))),
+        "{added:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        BUDGET,
+        "the add answered with the budget"
+    );
+
+    let started = tokio::time::Instant::now();
+    let edited = service
+        .edit(
+            &fixture.admin(),
+            fixture.subject,
+            &skill,
+            "skills",
+            &json!({ "name": "Go" }),
+        )
+        .await;
+    assert!(
+        matches!(edited, Err(DomainError::Unavailable(_))),
+        "{edited:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        BUDGET,
+        "the edit answered with the budget"
+    );
+
+    let started = tokio::time::Instant::now();
+    let deleted = service
+        .delete(&fixture.admin(), fixture.subject, &skill)
+        .await;
+    assert!(
+        matches!(deleted, Err(DomainError::Unavailable(_))),
+        "{deleted:?}"
+    );
+    assert_eq!(
+        started.elapsed(),
+        BUDGET,
+        "the delete answered with the budget"
+    );
+
+    assert!(fixture.profile.reads.lock().unwrap().is_empty());
+    assert!(fixture.writer.plans().is_empty());
+    assert_eq!(fixture.profile.live().len(), 2);
+    assert!(fixture.events.taken().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_edit_of_a_fact_under_review_resolves_it_within_the_edits_budget() {
+    let fixture = Fixture::new();
+    let request = fixture.flagged().await;
+    // The edit's own read ends at 3 s; the resolution's read would end at
+    // 6 s, past the edit's budget though within a budget of its own.
+    *fixture.profile.delay.lock().unwrap() = Duration::from_secs(3);
+    let started = tokio::time::Instant::now();
+
+    let edited = fixture
+        .service()
+        .edit(
+            &fixture.admin(),
+            fixture.subject,
+            &request.fact_id,
+            "skills",
+            &json!({ "name": "Go" }),
+        )
+        .await;
+
+    assert!(
+        matches!(edited, Err(DomainError::Unavailable(_))),
+        "{edited:?}"
+    );
+    assert_eq!(started.elapsed(), BUDGET);
+    assert!(fixture.writer.plans().is_empty());
+    assert!(
+        matches!(fixture.status(), ReviewStatus::Open { .. }),
+        "the claim was given back"
+    );
+    assert!(fixture.events.taken().is_empty());
 }
