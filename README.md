@@ -26,7 +26,7 @@ See also:
 
 1. **Secure XaaS framework with defense-in-depth** — Every API handler enforces authentication, authorization, tenant isolation, and scoped DB access by default. Security is structural, not opt-in, validated at build time using integrated dynamic lints.
 
-2. **Three-tier gear hierarchy** — *Gears Toolkit* (`libs/` — ToolKit, DB access, error model, API middleware), *System gears* (`gears/system/` — API gateway, authn/authz, tenancy, event system, resource groups, type registry), and *Service gears* (`gears/` — serverless runtime, GenAI subsystems, and domain-specific libraries).
+2. **Three-tier gear hierarchy** — *Gears Toolkit* (`libs/` — ToolKit, DB access, error model, API middleware), *Core gears* (`gears/system/` — API gateway, authn/authz, tenancy, event system, resource groups, type registry), and *Service gears* (`gears/` — serverless runtime, GenAI subsystems, and domain-specific libraries).
 
 3. **Composable libraries, vendor-controlled deployment** — Each gear owns its API surface and database, communicates via a Rust-native SDK that facades local vs. remote calls, and is fully infrastructure-agnostic. Vendors choose which gears to bundle and whether to deploy single-process (edge/on-prem), multi-node (bare metal), or on Kubernetes.
 
@@ -147,7 +147,7 @@ gears:
 
 See [TOOLKIT UNIFIED SYSTEM](docs/toolkit_unified_system/README.md) and [TOOLKIT_PLUGINS.md](docs/TOOLKIT_PLUGINS.md) for details.
 
-Individual gears live under `gears/<name>/`, usually with a gear crate and an SDK crate. The Makefile builds a single gear by selecting those packages, while `make run GEAR=<name>` composes the example server with `--no-default-features` and the gear feature plus the static local development system gears. Runtime settings stay in YAML under `gears:<gear_name>:` with separate `config` and optional gear-owned `database` sections.
+Individual gears live under `gears/<name>/`, usually with a gear crate and an SDK crate. The Makefile builds a single gear by selecting those packages, while `make run GEAR=<name>` composes the example server with `--no-default-features` and the gear feature plus the static local development core gears. Runtime settings stay in YAML under `gears:<gear_name>:` with separate `config` and optional gear-owned `database` sections.
 
 ## Documentation
 

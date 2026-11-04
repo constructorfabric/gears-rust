@@ -68,9 +68,20 @@ static GATE_REACHED_START: tokio::sync::Semaphore = tokio::sync::Semaphore::cons
 static CLUSTER_WAS_STARTED_BEFORE_INIT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Holds application `start` open for deterministic probe assertions.
-/// Its `init` also checks that the real cluster gear has bound its profiles,
-/// relying on system-group ordering without a `deps` edge (see `consumer_wiring.rs`).
+/// A gear whose only behaviour is to make the start phase observably long.
+///
+/// It is not a stand-in for cluster — cluster's own gear starts in this same
+/// process, from this same config, and publishes its profiles before this gear is
+/// reached (cluster is `system`-tier, so the topological order puts it first).
+/// This gear exists only to keep the *phase* from finishing, so the mid-startup
+/// probe assertions are taken at a known point rather than a lucky one.
+/// It also carries a second observation, cheap because this gear is already in the
+/// right place to make it: **cluster's `start` runs before a non-`system` gear's
+/// `init` with no `deps` edge anywhere in this process.** The system group starts
+/// before application preparation. This lets a consumer omit `deps = [cluster]`,
+/// which is fatal in Profile 3 because that consumer links no cluster gear
+/// (`tests/consumer_wiring.rs`). The claim is load-bearing enough to measure
+/// rather than cite.
 #[toolkit::gear(name = "d1-start-gate", capabilities = [stateful])]
 #[derive(Default)]
 struct StartGate;
@@ -357,7 +368,10 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
         .expect("the gate-reached semaphore is never closed")
         .forget();
 
-    // 1. Liveness answers while application `start` is still blocked.
+    // 1. Liveness answers while application `start` is still blocked on the gate. This
+    //    is the criterion's "binds probes before `start`", and it is checked
+    //    against a phase that provably has not returned rather than against a
+    //    stopwatch.
     let body = await_status(addr, "/healthz", 200, Duration::from_secs(10)).await;
     assert_eq!(body.trim(), "ok", "/healthz body");
     assert_eq!(
@@ -415,8 +429,12 @@ async fn probes_serve_before_start_completes_and_all_four_answer_after() {
     // 5. Release the gate: application startup completes and final routes attach.
     START_GATE.add_permits(1);
 
-    // 6. Cluster's composite check remains healthy with the final routes too.
-    //    Its component must appear, so an empty report cannot satisfy the check.
+    // 6. Cluster's own component must still appear with the final routes attached,
+    //    so an empty report cannot satisfy the check. This is what
+    //    makes the next assertion attributable to cluster rather than to an empty
+    //    registry: `compose_oop_router` collects `RestApiCapability::healthcheck`
+    //    from every REST-capable gear, so `cluster` in `components` means
+    //    `ClusterReadiness` is the thing being asked.
     let health = await_body(
         addr,
         "/health",

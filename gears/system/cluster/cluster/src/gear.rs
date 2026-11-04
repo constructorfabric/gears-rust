@@ -34,11 +34,7 @@ use crate::domain::registry::ProfileRegistry;
 use crate::domain::wiring::{ClusterHandle, ClusterWiring};
 use cluster_sdk::grpc::stubs;
 
-#[toolkit::gear(
-    name = "cluster",
-    // `system`: started before the application group is prepared.
-    capabilities = [stateful, system, grpc, rest]
-)]
+#[toolkit::gear(name = "cluster", capabilities = [stateful, system, grpc, rest])]
 // The four coordination contracts this gear serves, over gRPC only. In-process
 // consumers reach the
 // same services through the `ClusterClient` seam (`LocalClusterClient`), so no
@@ -70,9 +66,14 @@ struct ClusterGear {
     hub: OnceLock<Arc<ClientHub>>,
     /// Parsed operator config, captured in `init` and consumed in `start`.
     config: OnceLock<ClusterConfig>,
-    /// Created empty in `init`, populated in `start` (DESIGN §5.2).
-    /// gRPC services capture this live registry before `start`; requests before
-    /// binding return `ProfileNotBound` (§4.2, invariant I3).
+    /// The profile index: created **empty** in `init` and populated by `start`
+    /// (DESIGN §5.2).
+    ///
+    /// The split matters. gRPC services are collected before
+    /// `start` runs, so they must capture this registry rather than a backend
+    /// (§4.2's lifecycle constraint) — and a request arriving in the window
+    /// between the two resolves to `ProfileNotBound`, which is the correct answer
+    /// and needs no new error variant (invariant I3).
     profiles: OnceLock<Arc<ProfileRegistry>>,
     /// The election subscription table — the only server-side coordination state
     /// (§5.4).
@@ -215,7 +216,8 @@ impl Gear for ClusterGear {
         self.config
             .set(config)
             .map_err(|_| anyhow!("{} already initialized", Self::MODULE_NAME))?;
-        // gRPC services and healthchecks share this registry; `start` populates it.
+        // Created here, empty, because the gear's gRPC services are
+        // collected before `start` populates it (DESIGN §4.2, §5.2).
         self.profiles
             .set(Arc::new(ProfileRegistry::new()))
             .map_err(|_| anyhow!("{} already initialized", Self::MODULE_NAME))?;
@@ -255,9 +257,17 @@ impl Gear for ClusterGear {
     }
 }
 
-/// Cluster wires no runtime internals: `init` creates the profile registry and
-/// `start` binds its backends. Its system group runs both before application
-/// preparation, so coordination is available before any application `init`.
+/// Platform tier, so cluster initialises and starts in the system group ahead of
+/// application preparation (§4.2).
+///
+/// Empty on purpose: every `SystemCapability` method is defaulted. Cluster needs
+/// no runtime-internal wiring — `init` creates the profile registry and `start`
+/// binds its backends, before any application `init`.
+///
+/// It is still a trait that must be implemented:
+/// the `#[toolkit::gear]` macro emits no *assertion* for `system` but its
+/// registration casts to `Arc<dyn SystemCapability>`, so omitting this is a
+/// build error from the macro rather than the documented no-op.
 impl toolkit::contracts::SystemCapability for ClusterGear {}
 
 #[async_trait]

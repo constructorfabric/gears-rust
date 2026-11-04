@@ -68,10 +68,26 @@ static RESOLVE_WAS_A_PROXY: AtomicBool = AtomicBool::new(false);
 /// to assert nothing.
 static START_COMPLETED: AtomicBool = AtomicBool::new(false);
 
-/// Resolves in `start` (§4.9.1), without `deps = [cluster]`: Profile 3
-/// does not link cluster, so that edge would cause `UnknownDependency`.
-/// In Profile 1, the system group starts cluster before application init.
-/// SDK consumer registration gates `/readyz` in both profiles (§4.9.2).
+/// A minimal consumer: a `resolve()` in `start`, never in `init` (§4.9.1), and
+/// **no `deps = [cluster]`**.
+///
+/// That omission is not a shortcut, and it is the correction §4.9.2 needs. `deps`
+/// is a *hard* topo-sort edge: `RegistryBuilder` fails the whole registry build with
+/// `RegistryError::UnknownDependency` when a named gear is not linked, and a
+/// Profile 3 consumer by definition does not link the cluster gear. So
+/// `deps = [cluster]` is not merely unnecessary here — it makes the
+/// process refuse to start, which is how this was found.
+///
+/// Nothing is lost by omitting it, because neither thing `deps` would buy depends on
+/// it:
+///
+/// - **Ordering.** The runtime completes the system group before application
+///   preparation. Cluster declares `system`, so its `start` precedes any
+///   application consumer's `init` in Profile 1 without any `deps` edge at all.
+/// - **Readiness gating.** The `/readyz` dependency on `cluster` comes from
+///   cluster-sdk's `ConsumerRegistration::dep_gear`, which the wiring phase feeds to
+///   the `DependencyChecker` — so a consumer gets the gate in *both* profiles, and
+///   gets it without writing anything.
 #[toolkit::gear(name = "reservations", capabilities = [stateful])]
 #[derive(Default)]
 struct Reservations {
@@ -81,7 +97,8 @@ struct Reservations {
 #[async_trait]
 impl toolkit::Gear for Reservations {
     async fn init(&self, ctx: &GearCtx) -> anyhow::Result<()> {
-        // Capture the hub here; resolve in `start`, after consumer wiring.
+        // Captured, not resolved: consumer wiring runs after application `init`,
+        // so the remote client is not available yet in Profile 3.
         drop(self.hub.set(ctx.client_hub()));
         Ok(())
     }

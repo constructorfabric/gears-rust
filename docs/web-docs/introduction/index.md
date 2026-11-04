@@ -51,7 +51,7 @@ Gears ships a substantial substrate so you build features, not plumbing:
   workspaces, generating runnable servers, managing runtime config, building,
   deploying, and linting. See the [CLI documentation](/cli/).
 
-See [Why Gears](./why-gears/) for the Rust and framework rationale, [Where Gears fits](./where-gears-fits/) for adoption scenarios, and [Capabilities](../capabilities/) for the full catalog of toolkit libraries and ready-made system gears.
+See [Why Gears](./why-gears/) for the Rust and framework rationale, [Where Gears fits](./where-gears-fits/) for adoption scenarios, and [Capabilities](../capabilities/) for the full catalog of toolkit libraries and ready-made core gears.
 
 ## One codebase, three deployment shapes
 

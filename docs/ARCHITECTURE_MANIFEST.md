@@ -65,12 +65,15 @@ This is a shift-left quality mechanism: the repository pushes correctness, consi
 Constructor Fabric Gears organizes its codebase into three tiers:
 
 - **Toolkit** (`libs/`) — a set of libraries providing the low-level substrate: API middleware, DB access, error definitions, transport abstractions, security primitives, observability, macros, and shared utilities.
-- **System gears** (`gears/system/`) — Pre-built system gears that form the control plane: inbound/outbound API gateway, authn/authz resolvers, tenant resolver, resource groups, type registry, node registry, usage collection, and related cross-cutting services.
+- **Core gears** (`gears/system/`) — Pre-built core gears that form the control plane: inbound/outbound API gateway, authn/authz resolvers, tenant resolver, resource groups, type registry, node registry, usage collection, and related cross-cutting services.
 - **Service gears** (`gears/`) — Ready-to-use and vendor-developed business gears built on top of the platform: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and domain-specific services.
 
-The `gears/system/` category does not imply the runtime `system` capability. Only Types Registry,
-Service Discovery, Cluster and gRPC Hub belong to the early system group;
-the API Gateway, resolvers and other platform gears belong to the application group.
+**Core gears** means all gears under `gears/system/`, including their plugins. The directory
+may be renamed to `gears/core/` in the future. The **system gear group** contains gears with
+the runtime `system` capability: currently Types Registry, Service Discovery, Cluster and gRPC Hub. The other core
+gears, including the API Gateway, resolvers and plugins, belong to the application gear group.
+See [the system capability](toolkit_unified_system/08_lifecycle_stateful_tasks.md#the-system-capability)
+for its startup guarantees and restrictions.
 
 See: [GEARS.md](GEARS.md)
 
@@ -94,7 +97,7 @@ Constructor Fabric Gears composes systems by declaration and discovery rather th
 
 Gears do not invent their own startup and shutdown semantics. The platform defines an explicit lifecycle with ordered phases, barrier points, and dependency-aware teardown, and gears integrate into that lifecycle through capabilities.
 
-**How.** `HostRuntime` runs a shared sequence of phases including `pre_init`, DB migration, `init`, `post_init`, REST wiring, gRPC wiring, start/stop, and OoP orchestration. The few platform gears with the `system` capability form the system group, which completes its startup before the application group is prepared; within each group `post_init` is a barrier phase that begins only after all of the group's `init` hooks complete, and shutdown runs in reverse dependency order (the application group first) with a platform deadline for graceful stop. Cancellation tokens propagate through the runtime so background work cooperates with shutdown rather than outliving the host.
+**How.** `HostRuntime` runs a shared sequence of phases including `pre_init`, DB migration, `init`, `post_init`, REST wiring, gRPC wiring, start/stop, and OoP orchestration. The few platform gears with the `system` capability form the system gear group, which completes its startup before the application gear group is prepared; within each group `post_init` is a barrier phase that begins only after all of the group's `init` hooks complete, and shutdown runs in reverse dependency order (the application gear group first) with a platform deadline for graceful stop. Cancellation tokens propagate through the runtime so background work cooperates with shutdown rather than outliving the host.
 
 **Why.** This gives all gears one predictable operational model. Contributors can rely on stable ordering guarantees, shared cancellation semantics, and consistent startup/shutdown behavior instead of encoding lifecycle assumptions ad hoc in each gear.
 
@@ -257,13 +260,13 @@ The repository maps directly to the three-tier gear hierarchy described in §3.2
   - Libraries providing the low-level substrate: API middleware, DB access, error definitions, transport abstractions, security primitives, observability, macros, and shared utilities.
   - This layer defines the engineering rules and runtime substrate that higher tiers reuse.
 
-- **`gears/system/` — System gears**
-  - Control-plane and cross-cutting system gears: API ingress, gear orchestration, authn/authz, tenancy, resource groups, types registry, nodes registry, outbound API gateway, and related services.
+- **`gears/system/` — Core gears**
+  - Control-plane and cross-cutting core gears: API ingress, gear orchestration, authn/authz, tenancy, resource groups, types registry, nodes registry, outbound API gateway, and related services.
   - These gears carry much of the architectural weight of the repository because they establish the runtime model and platform guarantees.
 
 - **`gears/` — Service gears**
   - Outside `gears/system/`, the broader `gears/` tree contains business and domain gears that deliver product functionality: serverless runtime, GenAI subsystems, event system, chat engine, file parser, and more (see [GEARS.md ](GEARS.md ) for the full inventory and roadmap).
-  - All service gears follow the same ToolKit patterns, SDK conventions, and security model established by the toolkit and system gear tiers.
+  - All service gears follow the same ToolKit patterns, SDK conventions, and security model established by the toolkit and core gear tiers.
 
 Additional assembly lives in `apps/`, where executable applications compose gears into examples of runnable systems.
 
@@ -447,7 +450,7 @@ Constructor Fabric Gears uses a PEP → PDP → `AccessScope` pipeline for autho
 - [ ] A default `authz-resolver` implementation with a built-in role model.
 - [ ] Custom role definition by tenant admins.
 - [ ] Documentation for attaching existing policy managers to Constructor Fabric Gears.
-- [ ] Documentation of which resource types and actions each system gear exposes.
+- [ ] Documentation of which resource types and actions each core gear exposes.
 - [ ] A platform-level role catalog with roles available out of the box.
 
 Example PEP call pattern from `gears/simple-user-settings/simple-user-settings/src/domain/service.rs`:

@@ -1371,7 +1371,7 @@ service discovery state. Persistent state (if needed for multi-host P2) will be 
 └────────────┘  └────────────┘
 ```
 
-- Flight Control runs system-group gears and its application AuthN resolver/plugin; repository placement under `gears/system/` does not select the startup group.
+- Flight Control runs selected core gears: gears in the system gear group and its application AuthN resolver/plugin. Core gears are all gears under `gears/system/` (possibly `gears/core/` in the future); only the `system` capability selects the early startup group.
 - OoP gears are separate processes on the same host (UDS) or remote hosts (TCP, P2: mTLS).
 - api-gateway reverse-proxies public OoP routes via `ToolKitGatewayProvider`.
 - DirectoryService tracks all gear endpoints.

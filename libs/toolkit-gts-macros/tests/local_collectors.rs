@@ -94,6 +94,9 @@ fn local_declarations_stay_in_the_process_wide_inventory() {
     }
 }
 
+// Match the other ToolKit trybuild suites: snapshots record stable diagnostics,
+// while coverage uses a nightly compiler with different import suggestions.
+#[cfg(not(coverage_nightly))]
 #[test]
 fn ui() {
     trybuild::TestCases::new().compile_fail("tests/ui/*.rs");

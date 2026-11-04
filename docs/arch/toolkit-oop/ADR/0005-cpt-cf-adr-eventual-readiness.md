@@ -117,7 +117,7 @@ existing `deps` metadata for readiness gating.
 ### Option A: Init Containers + Deployment Ordering
 
 Helm charts generate init containers that poll Flight Control's `/health`. Argo CD sync-waves or Helm hooks enforce
-Flight Control → system gears → app gears ordering.
+Flight Control → core gears → business gears deployment ordering.
 
 * Good, because familiar k8s pattern — ops engineers understand init containers.
 * Good, because guarantees Flight Control is ready before any gear starts.

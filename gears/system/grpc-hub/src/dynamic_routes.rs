@@ -22,6 +22,7 @@ pub struct DynamicRoutes {
 }
 
 impl DynamicRoutes {
+    /// Create shared routing state initialized with the given route snapshot.
     #[must_use]
     pub fn new(routes: Routes) -> Self {
         Self {

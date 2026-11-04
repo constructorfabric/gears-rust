@@ -88,7 +88,7 @@ platform API, then reads them back. Its `Cargo.toml` depends on this SDK and on 
 registry gear crate, `cf-gears-types-registry`: `deps = [types_registry]` re-exports that
 crate to keep its registration linked, and orders the two `init()` calls.
 
-Ordinary gears can omit the registry dependency: its system-gear init runs first.
+Ordinary gears can omit the registry dependency: the registry initializes in the system gear group first.
 The host must then link a database-backed registry or consumer init fails.
 This consumer-migration branch moves
 AM and AuthZ/TR publishers onto this local-only path. AM request-path reads use

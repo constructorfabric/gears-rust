@@ -31,9 +31,14 @@ All interaction between gears and between gears and their plugins happens strict
 
 ## Gears Categories
 
+**Core gears** are all gears under `gears/system/`, including their plugins. The directory
+may be renamed to `gears/core/` in the future. This repository category is separate from
+the runtime startup groups: the **system gear group** contains gears with the `system` capability; all others
+belong to the application gear group. See [the system capability](toolkit_unified_system/08_lifecycle_stateful_tasks.md#the-system-capability).
+
 All gears can be divided into several categories:
 - **API Ingress** - the public ingress layer for external traffic; currently represented by API gateway
-- **Business Logic Gears** - gears implementing the main SaaS service logic built on top of CF/Gears Toolkit and system gears
+- **Business Logic Gears** - gears implementing the main SaaS service logic built on top of CF/Gears Toolkit and core gears
 - **Gen AI Gears** - foundational generative AI capabilities such as chat, model management, agents, memory, search, crawling, scheduling, and MCP integration
 - **Serverless** - functions/workflows, runtimes, durable state, settings, and cluster coordination gears
 - **BSS (Business Support System)** - monetization and commercial gears: product catalog, pricing, rating, billing, subscriptions, payments, invoicing, contracts, and marketplace
